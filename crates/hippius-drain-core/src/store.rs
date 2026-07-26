@@ -410,6 +410,36 @@ impl Store {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
+    /// The age in whole seconds of `node`'s oldest `pending` replication row, or 0 when none
+    /// — the per-node starvation signal that would have caught 2026-07-26 at ~03:40: one
+    /// node's oldest pending age past 30min while its peers sat near zero (a part landed
+    /// 03:48 sat unclaimed 3.5h, diagnosable only by hand-written SQL at the time).
+    ///
+    /// `pending` ONLY — a `draining` row is being worked, so the signal is specifically
+    /// "claimable-or-backed-off work nobody has finished". Deferred rows are deliberately
+    /// INCLUDED (a backed-off row is still `pending`): an in-progress/abandoned-MPU wall
+    /// aging past hours is exactly what the operator must see.
+    ///
+    /// Served index-only by `cephor_replication_status_pending` (0006: `(node_id, landed_at)
+    /// WHERE status = 'pending'`) — the min is the first entry under the node prefix.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn node_oldest_pending_age_secs(&self, node: &str) -> Result<u64> {
+        let (secs,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(landed_at)))::bigint, 0) \
+             FROM cephor_replication_status \
+             WHERE node_id = $1 AND status = 'pending'",
+        )
+        .bind(node)
+        .fetch_one(&self.pool)
+        .await?;
+        // Clock skew could put min(landed_at) marginally in the future; clamp to 0 rather
+        // than wrap into an absurd u64 age.
+        Ok(u64::try_from(secs).unwrap_or(0))
+    }
+
     /// R4 re-drive: reset this node's `corrupt` parts back to `pending` for a fresh SSD->pool
     /// copy (overwriting the corrupt pool copy from the intact SSD source), bounded by
     /// `max_attempts`. Only rows still under the cap are reset; each reset bumps
@@ -1760,6 +1790,62 @@ mod part_tests {
         assert_eq!(store.node_undrained_count("node-b").await?, 1, "counts only this node's rows");
         assert_eq!(store.node_undrained_count("node-c").await?, 0, "a node with no rows is idle");
         Ok(())
+    }
+
+    /// Backdates a status row's `landed_at` by `secs`, to age it for the starvation gauge.
+    async fn backdate_landed(pool: &PgPool, object: &str, version: i64, number: i64, secs: i64) {
+        sqlx::query(
+            "UPDATE cephor_replication_status SET landed_at = now() - (interval '1 second' * $4) \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(object)
+        .bind(version)
+        .bind(number)
+        .bind(secs)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn node_oldest_pending_age_secs_is_the_age_of_the_oldest_pending_row_only(pool: PgPool) {
+        let store = Store::from_pool(pool.clone());
+        assert_eq!(
+            store.node_oldest_pending_age_secs("node-a").await.unwrap(),
+            0,
+            "a node with no pending rows reports zero age, not an error"
+        );
+
+        // node-a: two pending rows, 90s and 300s old — the oldest wins. The 300s row is
+        // ALSO backed off (deferred_until in the future): a deferred row is still
+        // `pending`, and an MPU wall aging past hours is exactly what the gauge must show.
+        seed_status_node(&pool, UUID_A, 1, 1, "pending", "node-a").await;
+        backdate_landed(&pool, UUID_A, 1, 1, 90).await;
+        seed_status_node(&pool, UUID_A, 1, 2, "pending", "node-a").await;
+        backdate_landed(&pool, UUID_A, 1, 2, 300).await;
+        sqlx::query("UPDATE cephor_replication_status SET deferred_until = now() + interval '10 minutes' WHERE part_number = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Far older draining/replicated/failed rows: a draining row is being worked and
+        // terminal rows are done — none is starving claimable work, so none counts.
+        seed_status_node(&pool, UUID_A, 1, 3, "draining", "node-a").await;
+        backdate_landed(&pool, UUID_A, 1, 3, 9_000).await;
+        seed_status_node(&pool, UUID_A, 1, 4, "replicated", "node-a").await;
+        backdate_landed(&pool, UUID_A, 1, 4, 9_000).await;
+        seed_status_node(&pool, UUID_A, 1, 5, "failed", "node-a").await;
+        backdate_landed(&pool, UUID_A, 1, 5, 9_000).await;
+        // A peer node's even older pending row is that node's starvation, not this one's.
+        seed_status_node(&pool, UUID_B, 2, 1, "pending", "node-b").await;
+        backdate_landed(&pool, UUID_B, 2, 1, 9_000).await;
+
+        let age = store.node_oldest_pending_age_secs("node-a").await.unwrap();
+        assert!(
+            (300..330).contains(&age),
+            "the oldest pending row (deferred, 300s) wins over the younger one and the non-pending rows, got {age}"
+        );
+        let peer = store.node_oldest_pending_age_secs("node-b").await.unwrap();
+        assert!(peer >= 9_000, "the peer's pending age is scoped to the peer, got {peer}");
     }
 
     #[sqlx::test]

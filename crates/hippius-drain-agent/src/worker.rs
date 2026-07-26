@@ -182,6 +182,13 @@ pub async fn drain_next<E: UploadEnqueuer>(
                         tracing::debug!(observations, "part source missing; part deferred, burst continues");
                     }
                     MissingSourceOutcome::Failed => {
+                        // The DURABLE write-off record: `node_undrained_count` excludes
+                        // `failed` and the terminal GC deletes the row, so without this
+                        // counter the disposition survives only as the WARN below. Still
+                        // NOT counted in `failed`/error_bps — not a Ceph-write failure.
+                        if let Some(snapshot) = snapshot {
+                            snapshot.record_written_off(1);
+                        }
                         tracing::warn!(
                             object_id = %claim.part().object().as_str(),
                             version = claim.part().version().get(),
@@ -864,6 +871,10 @@ mod tests {
         let counts = snapshot.load();
         assert_eq!(counts.failed, 0, "a write-off is not a Ceph-write failure");
         assert_eq!(counts.error_bps(), 0, "the write-off stays out of the Ceph failure rate");
+        assert_eq!(
+            counts.written_off, 1,
+            "the write-off is durably counted — the WARN log and the (GC'd) failed row are not a signal"
+        );
         assert_eq!(
             enforcer.lock().unwrap().try_drain(1, Instant::now()),
             DrainDecision::Allowed,

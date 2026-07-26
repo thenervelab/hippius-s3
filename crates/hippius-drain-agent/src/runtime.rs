@@ -216,8 +216,9 @@ async fn run_drain<E: UploadEnqueuer>(token: CancellationToken, period: Duration
 /// Probes SSD disk pressure off the async runtime (statvfs blocks) and upserts
 /// this node's heartbeat. Probe or upsert failures are logged and skipped — the
 /// next tick retries; a missed heartbeat only ages the node out of the fleet.
-/// Refreshes this node's two DB-sourced drain-demand gauges: the byte backlog
-/// (`drain_ssd_backlog_bytes`) and the undrained-row COUNT (the C8 readiness wedge signal).
+/// Refreshes this node's three DB-sourced drain-demand gauges: the byte backlog
+/// (`drain_ssd_backlog_bytes`), the undrained-row COUNT (the C8 readiness wedge signal),
+/// and the oldest-pending age (`drain_pending_oldest_age_seconds`, the starvation signal).
 ///
 /// The byte backlog is the TRUE undrained-bytes gauge — the DB sum of this node's
 /// pending/draining part bytes — NOT raw disk occupancy (`usage.used_bytes`), which the
@@ -234,6 +235,14 @@ async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotC
     match store.node_undrained_count(node.as_str()).await {
         Ok(count) => snapshot.record_undrained_count(count),
         Err(err) => tracing::warn!(error = %err, "undrained-count query failed; keeping the last value"),
+    }
+    // The Task F starvation gauge: the age of this node's oldest still-pending row. The
+    // 2026-07-26 incident's earliest unambiguous signal — one node's oldest pending age
+    // exploding while peers sat near zero — existed only as hand-written SQL; this tick
+    // makes it a standing gauge at the same cadence as the other DB-sourced signals.
+    match store.node_oldest_pending_age_secs(node.as_str()).await {
+        Ok(secs) => snapshot.record_oldest_pending_age_secs(secs),
+        Err(err) => tracing::warn!(error = %err, "oldest-pending-age query failed; keeping the last value"),
     }
 }
 
@@ -889,6 +898,41 @@ mod tests {
         assert!(
             !tracker.observe(0, snapshot.undrained_count(), t0 + Duration::from_mins(2)),
             "undrained rows + no progress past the stall -> NotReady (keying on the 0-byte backlog would stay Ready)"
+        );
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn record_drain_signals_refreshes_the_oldest_pending_age(pool: PgPool) {
+        // Task F starvation gauge, wired at the same tick as the undrained count: a pending
+        // row backdated 300s must surface as this node's oldest-pending age, while an even
+        // older DRAINING row (being worked) must not — the signal is claimable-or-backed-off
+        // work nobody has finished, the 2026-07-26 tell.
+        let store = Store::from_pool(pool.clone());
+        // node_backlog_bytes joins `parts`, which the cephor-only migrations do not create.
+        sqlx::query(
+            "CREATE TABLE parts (object_id uuid NOT NULL, object_version bigint NOT NULL, part_number bigint NOT NULL, \
+             size_bytes bigint, upload_id uuid)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id, landed_at) VALUES \
+             ($1, 1, 1, 'pending', 'node-x', now() - interval '300 seconds'), \
+             ($1, 1, 2, 'draining', 'node-x', now() - interval '9000 seconds')",
+        )
+        .bind(UUID)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let node = NodeId::from_str("node-x").unwrap();
+        let snapshot = SnapshotCell::new();
+        record_drain_signals(&store, &node, &snapshot).await;
+        let age = snapshot.oldest_pending_age_secs();
+        assert!(
+            (300..330).contains(&age),
+            "the tick records the oldest PENDING row's age (the draining row is being worked), got {age}"
         );
     }
 
