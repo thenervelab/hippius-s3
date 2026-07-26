@@ -999,6 +999,127 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn the_incident_backlog_shape_cannot_starve_the_ready_parts(pool: PgPool) {
+        // The 2026-07-26 incident, end to end. One node's backlog, in landed order:
+        //   (a) a WALL of 20 not-ready parts — registered pending but with no SSD
+        //       source, the abandoned/in-progress-MPU rows that wedged node1 (the
+        //       enqueue-not-ready shape now commits Replicated under the Tier-2
+        //       decoupled commit, so the vanished/never-finalized source is the
+        //       not-ready deferral shape that still exists at the admission gate);
+        //   (b) ONE oversized part (100 B > the 64 B burst) while an EARLIER
+        //       overdraft's debt is still being paid off — prod had two 2 GiB parts
+        //       against a ~2 MB/s budget, i.e. hours of outstanding debt;
+        //   (c) 10 READY parts landed LAST. Zero-byte on purpose: while overdraft
+        //       debt is outstanding the bucket holds zero tokens, so a zero-byte
+        //       charge is the only admittable follower — which is exactly what makes
+        //       this discriminate ORDERING starvation from budget exhaustion.
+        // Pre-fix, the wall churned the oldest-first claim head (released un-backed-
+        // off, denied again every burst) and the ready parts starved for hours
+        // (64 parts/hour vs 10-17k healthy). The fix defers part-specific denials out
+        // of the claim set and keeps the burst going, so the ready parts must all
+        // replicate within a bounded number of poll cycles.
+        //
+        // Cycle bound: after its FIRST deferral a wall/oversized part is parked for
+        // >= the 5s base backoff (doubling per attempt), so on any sane machine the
+        // whole wall defers exactly once and the ready parts drain in cycle 1. 30
+        // cycles is ~30x margin for a stalled CI box where backoffs expire mid-test —
+        // each expiry only re-defers with a doubled park, and even a minutes-long
+        // stall yields a handful of observations per wall part, far under the
+        // 20-observation missing-source write-off threshold (the wall must stay
+        // pending-with-backoff, not get written off).
+        const CYCLE_BOUND: usize = 30;
+        let db = pool.clone();
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let pool_dir = tempfile::tempdir().unwrap();
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let ceph = LocalFs::new(pool_dir.path());
+        let store = Store::from_pool(pool);
+        let snapshot = SnapshotCell::new();
+        // Rate 1 B/s, burst 64 B, with ~10 KB of pre-booked overdraft debt: repayment
+        // takes hours, so the debt is deterministically outstanding for the whole test.
+        let enforcer = Arc::new(Mutex::new(Enforcer::new(
+            CircuitBreaker::new(BreakerConfig {
+                failure_threshold: 3,
+                cooldown: Duration::from_secs(5),
+            }),
+            TokenBucket::new(ByteRate::new(1), Bytes::new(64), Instant::now()),
+            ConcurrencyLimiter::new(4),
+        )));
+        {
+            let mut guard = enforcer.lock().unwrap();
+            assert_eq!(guard.try_drain(10_000, Instant::now()), DrainDecision::Allowed, "book the incident's debt");
+            guard.record_outcome(BreakerSignal::Deferred, Instant::now());
+        }
+
+        // (a) The wall lands first: pending rows whose SSD source does not exist.
+        let wall: Vec<PartKey> = (1..=20_u32).map(|number| part_at(1, number)).collect();
+        for part in &wall {
+            store.record_landed_part(part).await.unwrap();
+        }
+        // (b) Then the oversized part (a real, complete SSD part).
+        let oversized = part_at(2, 1);
+        seed_part(ssd_dir.path(), &store, &oversized, &[&[7_u8; 100]]).await;
+        // (c) The ready parts land last — youngest, so oldest-first claiming reaches
+        // them only after the wall and the oversized part have been dealt with.
+        let ready: Vec<PartKey> = (1..=10_u32).map(|number| part_at(3, number)).collect();
+        for part in &ready {
+            seed_part(ssd_dir.path(), &store, part, &[b""]).await;
+        }
+
+        let token = CancellationToken::new();
+        let mut total_drained = 0_u64;
+        let mut total_skipped = 0_u64;
+        let mut cycles = 0_usize;
+        while cycles < CYCLE_BOUND {
+            cycles += 1;
+            // concurrency 1 keeps the oldest-first claim order observable, which is
+            // the ordering the incident's starvation depended on.
+            let tally = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot), &token, 1)
+                .await
+                .unwrap();
+            total_drained += tally.drained;
+            total_skipped += tally.skipped;
+            let mut all_replicated = true;
+            for part in &ready {
+                if status_of(&store, part).await != Some(ReplicationState::Replicated) {
+                    all_replicated = false;
+                    break;
+                }
+            }
+            if all_replicated {
+                break;
+            }
+        }
+
+        for part in &ready {
+            assert_eq!(
+                status_of(&store, part).await,
+                Some(ReplicationState::Replicated),
+                "ready part {} must drain within {CYCLE_BOUND} cycles despite the wall (took {cycles} cycles; \
+                 drained {total_drained}, skipped {total_skipped})",
+                part.part().get(),
+            );
+        }
+        // The burst tally shows work continuing: the skips did not zero out the drains.
+        assert_eq!(total_drained, 10, "every ready part drained exactly once");
+        assert!(
+            total_skipped >= 21,
+            "the wall (20) and the oversized part (1) were each skipped at least once, got {total_skipped}"
+        );
+        // The wall stays pending-with-backoff — deferred out of the claim head, not
+        // written off and not churning as promptly-reclaimable releases.
+        for part in &wall {
+            assert_eq!(status_of(&store, part).await, Some(ReplicationState::Pending), "the wall is not written off");
+            let (backed_off, attempts) = defer_state(&db, part).await;
+            assert!(backed_off && attempts >= 1, "wall part {} is deferred with backoff", part.part().get());
+        }
+        // The oversized part is deferred too: its debt-denial is part-specific.
+        assert_eq!(status_of(&store, &oversized).await, Some(ReplicationState::Pending));
+        let (backed_off, attempts) = defer_state(&db, &oversized).await;
+        assert!(backed_off && attempts >= 1, "the oversized part is deferred out of the claim head");
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
     async fn a_missing_ssd_source_defers_and_the_burst_continues(pool: PgPool) {
         // Burst-level counterpart of the vanished-source skip: with the missing-source
         // part claimed FIRST (oldest), the ready part behind it must still drain in the
