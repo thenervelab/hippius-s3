@@ -199,7 +199,7 @@ async fn run_drain<E: UploadEnqueuer>(token: CancellationToken, period: Duration
         )
         .await
         {
-            Ok(drained) => tracing::debug!(drained, "drain cycle complete"),
+            Ok(tally) => tracing::debug!(drained = tally.drained, skipped = tally.skipped, "drain cycle complete"),
             // Debug-format the error so the `PartDrainError` variant + `DrainStep` + the
             // underlying io errno surface; `%err` (Display) only prints the opaque
             // "draining a part failed" and hides which step/errno actually failed.
