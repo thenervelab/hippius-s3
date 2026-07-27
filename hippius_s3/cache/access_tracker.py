@@ -71,7 +71,10 @@ class AccessTracker:
         """Write pending keys in chunked batched UPDATEs. Returns rows attempted."""
         if not self._pending:
             return 0
-        batch = list(self._pending)
+        # Sort by key tuple so every pod locks the same fs_cache_inventory rows
+        # in one canonical order; set-iteration (hash) order let two pods with
+        # overlapping keys acquire locks in opposite orders and deadlock.
+        batch = sorted(self._pending)
         self._pending.clear()
         for start in range(0, len(batch), FLUSH_CHUNK_SIZE):
             chunk = batch[start : start + FLUSH_CHUNK_SIZE]

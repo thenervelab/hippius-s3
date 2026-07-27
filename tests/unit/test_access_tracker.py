@@ -49,6 +49,35 @@ async def test_note_read_batches_and_flushes():
 
 
 @pytest.mark.asyncio
+async def test_flush_arrays_are_sorted_regardless_of_insertion_order():
+    """The unnest arrays must come out sorted by (object_id, version, part) so
+    every pod locks the same rows in one order — cross-pod deadlock avoidance.
+    Insertion order (and set-hash order) must not leak into the emitted arrays."""
+    oid_a = "11111111-1111-1111-1111-111111111111"
+    oid_b = "22222222-2222-2222-2222-222222222222"
+    keys = [
+        (oid_b, 2, 5),
+        (oid_a, 1, 9),
+        (oid_a, 3, 1),
+        (oid_a, 1, 2),
+        (oid_b, 1, 7),
+    ]
+
+    pool = FakePool()
+    tracker = AccessTracker(pool, hot_window_seconds=14400)
+    for oid, ver, part in keys:
+        tracker.note_read(oid, ver, part)
+
+    flushed = await tracker.flush_once()
+
+    assert flushed == len(keys)
+    assert len(pool.execute_calls) == 1
+    _sql, args = pool.execute_calls[0]
+    emitted = list(zip(args[0], args[1], args[2], strict=False))
+    assert emitted == sorted(keys)
+
+
+@pytest.mark.asyncio
 async def test_sampling_suppresses_repeat_notes_within_window():
     pool = FakePool()
     tracker = AccessTracker(pool, hot_window_seconds=14400)
