@@ -1944,8 +1944,8 @@ async def evict_from_inventory(
     async with pool.acquire() as conn:
         cursor = _load_evict_cursor(await get_janitor_state(conn, "sql_evict_cursor"))
 
-    async def handle(conn: asyncpg.Connection, item: tuple[str, int, int]) -> bool:
-        object_id, object_version, part_number = item
+    async def handle(conn: asyncpg.Connection, item: tuple[str, int, int, datetime | None]) -> bool:
+        object_id, object_version, part_number, last_access = item
         st = await asyncio.to_thread(fs_store.stat_part, object_id, object_version, part_number)
         if st is None:
             await clear_cached(conn, object_id, object_version, part_number)  # stale row: self-heal
@@ -1956,15 +1956,10 @@ async def evict_from_inventory(
             if st.st_atime > (now - hot_window):
                 return False
             # Read recency: recorded by the api's AccessTracker into
-            # last_access_at. NULL = not read since the column shipped, which
-            # degrades to the old write-recency-only behavior. PK lookup.
-            last_access = await conn.fetchval(
-                "SELECT last_access_at FROM fs_cache_inventory "
-                "WHERE object_id = $1 AND object_version = $2 AND part_number = $3",
-                object_id,
-                object_version,
-                part_number,
-            )
+            # last_access_at, carried inline on the candidate row (no per-item
+            # fetchval — the missing-column failure surfaces at discovery, not
+            # here under the pool's per-item swallow). NULL = not read since the
+            # column shipped, which degrades to the old write-recency-only path.
             if last_access is not None and last_access.timestamp() > (now - hot_window):
                 return False  # recently read — hot retention protects it
         # ABSOLUTE safety gate — identical call to the walk's, never bypassed by the prefilter.
@@ -1986,11 +1981,11 @@ async def evict_from_inventory(
             _janitor_deleted_counter.add(1, attributes={"reason": "sql_evict"})
         return True
 
-    async def candidates(page: list[Any]) -> AsyncIterator[tuple[str, int, int]]:
+    async def candidates(page: list[Any]) -> AsyncIterator[tuple[str, int, int, datetime | None]]:
         for r in page:
             if r["object_id"] in dlq_object_ids:
                 continue  # DLQ-parked: an in-flight op owns this object's data
-            yield (r["object_id"], r["object_version"], r["part_number"])
+            yield (r["object_id"], r["object_version"], r["part_number"], r["last_access_at"])
 
     deleted_total = 0
     pages = 0

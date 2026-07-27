@@ -36,12 +36,21 @@ COLD = 1.0  # atime far in the past → never hot
 HOT = None  # sentinel replaced with time.time() at build → always hot under normal pressure
 
 
-def _row(oid: str, ov: int = 1, pn: int = 1, cached_at: datetime | None = None) -> dict:
+def _row(
+    oid: str,
+    ov: int = 1,
+    pn: int = 1,
+    cached_at: datetime | None = None,
+    last_access_at: datetime | None = None,
+) -> dict:
+    # last_access_at rides on the candidate row (janitor_evictable_candidates LEFT-joins
+    # fs_cache_inventory), so the worker consumes it inline instead of a per-item fetchval.
     return {
         "object_id": oid,
         "object_version": ov,
         "part_number": pn,
         "cached_at": cached_at or datetime(2020, 1, 1, tzinfo=timezone.utc),
+        "last_access_at": last_access_at,
     }
 
 
@@ -90,15 +99,12 @@ class _RouterConn:
     serves that page's candidate rows, advancing to the next page after the filter fetch. A page's
     slice or cand entry may be an Exception instance to inject a timeout on that specific fetch."""
 
-    def __init__(self, pages: list[tuple[Any, Any]], last_access: Any = None) -> None:
+    def __init__(self, pages: list[tuple[Any, Any]]) -> None:
         self._pages = pages
         self._i = 0
         self.slice_args: list[tuple] = []
         self.filter_args: list[tuple] = []
         self.fetch = AsyncMock(side_effect=self._fetch)
-        # handle()'s read-recency probe (fs_cache_inventory.last_access_at).
-        # None = never read, which preserves the legacy write-recency-only path.
-        self.fetchval = AsyncMock(return_value=last_access)
 
     async def _fetch(self, query: str, *args: Any, **_kwargs: Any) -> Any:
         if query == "janitor_inventory_slice":
@@ -134,11 +140,11 @@ def _config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(janitor, "_janitor_deleted_counter", MagicMock())
 
 
-def _conn(*pages: tuple[Any, Any], last_access: Any = None) -> _RouterConn:
+def _conn(*pages: tuple[Any, Any]) -> _RouterConn:
     """Build a router conn from (slice_rows, cand_rows) pages. For the common case where every slice
-    row is also a candidate, pass the same list for both. `last_access` seeds the read-recency
-    probe (fs_cache_inventory.last_access_at); None = never read."""
-    return _RouterConn(list(pages), last_access=last_access)
+    row is also a candidate, pass the same list for both. Seed read-recency via a row's
+    last_access_at (it rides on the candidate row now, not a separate fetchval)."""
+    return _RouterConn(list(pages))
 
 
 def _same(rows: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -222,16 +228,32 @@ async def test_replicated_cold_candidate_is_deleted_cleared_and_counted(monkeypa
 
 @pytest.mark.asyncio
 async def test_recently_read_candidate_is_protected_via_last_access(monkeypatch: pytest.MonkeyPatch) -> None:
-    # atime is COLD (the read path no longer touches it), but the inventory's
+    # atime is COLD (the read path no longer touches it), but the candidate row's
     # last_access_at is fresh — hot retention must protect the part.
     monkeypatch.setattr(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=True))
     fs = _FakeFs(stat_map={(OID_A, 1, 1): _stat(COLD)})
-    conn = _conn(_same([_row(OID_A)]), ([], []), last_access=datetime.now(timezone.utc))
+    conn = _conn(_same([_row(OID_A, last_access_at=datetime.now(timezone.utc))]), ([], []))
 
     deleted = await _evict(conn, fs)
 
     assert deleted == 0
     assert fs.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_stale_last_access_does_not_pin_and_part_is_evicted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A STALE last_access_at (read long ago) must NOT pin the part forever: atime is COLD and the
+    # recorded read is older than the hot window, so recency lets the part fall through to the
+    # replication gate and be evicted. Guards against a stale recency value becoming a permanent pin.
+    monkeypatch.setattr(janitor, "is_replicated_on_all_backends", AsyncMock(return_value=True))
+    fs = _FakeFs(stat_map={(OID_A, 1, 1): _stat(COLD)})
+    stale = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    conn = _conn(_same([_row(OID_A, last_access_at=stale)]), ([], []))
+
+    deleted = await _evict(conn, fs)
+
+    assert deleted == 1
+    assert fs.deleted == [(OID_A, 1, 1)]
 
 
 @pytest.mark.asyncio
