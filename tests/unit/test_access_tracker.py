@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 import hippius_s3.cache.access_tracker as at
@@ -63,15 +65,55 @@ async def test_sampling_suppresses_repeat_notes_within_window():
 
 
 @pytest.mark.asyncio
-async def test_flush_failure_drops_batch_without_raising():
+async def test_flush_failure_requeues_and_unsuppresses():
     pool = FakePool(fail=True)
     tracker = AccessTracker(pool, hot_window_seconds=14400)
     tracker.note_read(OID, 1, 1)
 
     assert await tracker.flush_once() == 1  # attempted
+    # A transient error must not blind a continuously-read part: the key is
+    # requeued and its sampling suppression cleared so recency is not lost.
+    assert (OID, 1, 1) in tracker._pending
+    assert (OID, 1, 1) not in tracker._last_noted
     pool.fail = False
-    # Batch was dropped, not requeued: nothing to flush now.
-    assert await tracker.flush_once() == 0
+    assert await tracker.flush_once() == 1  # retried and recorded
+
+
+def test_pending_is_bounded_under_key_diverse_storm():
+    """`_pending` drains only on flush; a key-diverse storm during a stalled
+    flush must not grow it past the bound."""
+    tracker = AccessTracker(FakePool(), hot_window_seconds=3600)
+    for i in range(at.MAX_TRACKED_KEYS + 5000):
+        tracker.note_read(OID, 1, i)
+
+    assert len(tracker._pending) <= at.MAX_TRACKED_KEYS
+
+
+@pytest.mark.asyncio
+async def test_flush_failure_then_continued_read_re_notes():
+    pool = FakePool(fail=True)
+    tracker = AccessTracker(pool, hot_window_seconds=14400)
+    tracker.note_read(OID, 1, 1)
+    assert await tracker.flush_once() == 1  # attempted, failed, unsuppressed
+
+    # Suppression was dropped, so a read still inside the sample window re-notes.
+    tracker._pending.clear()
+    tracker.note_read(OID, 1, 1)
+    assert (OID, 1, 1) in tracker._pending
+
+
+@pytest.mark.asyncio
+async def test_zero_row_flush_is_surfaced(caplog):
+    class ZeroPool:
+        async def execute(self, sql, *args):
+            return "UPDATE 0"
+
+    tracker = AccessTracker(ZeroPool(), hot_window_seconds=14400)
+    tracker.note_read(OID, 1, 1)
+
+    with caplog.at_level(logging.WARNING, logger="hippius_s3.cache.access_tracker"):
+        assert await tracker.flush_once() == 1
+    assert any("0/1" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,17 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _parse_update_count(status: Any) -> int:
+    """Affected-row count from an asyncpg command tag ("UPDATE N"); 0 if unparseable."""
+    if not isinstance(status, str):
+        return 0
+    parts = status.split()
+    if len(parts) >= 2 and parts[-1].isdigit():
+        return int(parts[-1])
+    return 0
+
+
 FLUSH_INTERVAL_SECONDS = 30.0
 # Bound on the sampling map so a pathological key scan can't grow it forever;
 # pruning drops the oldest entries, which only means earlier re-sampling.
@@ -62,6 +73,13 @@ class AccessTracker:
         last = self._last_noted.get(key)
         if last is not None and now - last < self._sample_window:
             return
+        # _pending drains only on flush; a failing flush (DB outage) plus a
+        # key-diverse read stream would otherwise grow it without bound. Cap it
+        # at the sampling-map bound and drop-newest — leaving _last_noted
+        # untouched so the very next read re-notes the dropped part (no lost
+        # recency), same cheap outcome as a lost flush.
+        if key not in self._pending and len(self._pending) >= MAX_TRACKED_KEYS:
+            return
         self._last_noted[key] = now
         self._pending.add(key)
         if len(self._last_noted) > MAX_TRACKED_KEYS:
@@ -76,7 +94,7 @@ class AccessTracker:
         for start in range(0, len(batch), FLUSH_CHUNK_SIZE):
             chunk = batch[start : start + FLUSH_CHUNK_SIZE]
             try:
-                await self._pool.execute(
+                status = await self._pool.execute(
                     """
                     UPDATE fs_cache_inventory AS f SET last_access_at = now()
                     FROM unnest($1::text[], $2::bigint[], $3::bigint[]) AS u(oid, ver, pnum)
@@ -87,10 +105,25 @@ class AccessTracker:
                     [k[2] for k in chunk],
                 )
             except Exception as exc:
-                # Advisory data: dropping the chunk (not re-queueing) keeps a DB
-                # outage from growing an unbounded buffer; the parts re-sample
-                # on their next read after the sample window.
-                logger.warning("last_access_at flush failed (%s keys dropped): %s", len(chunk), exc)
+                # Advisory data, but a transient failure must not leave these
+                # keys sampling-suppressed with their recency silently lost.
+                # Re-queue them and drop their suppression so the next flush
+                # retries and any continued read re-notes them; _pending stays
+                # bounded (see note_read), so a sustained outage can't grow it
+                # without limit.
+                for k in chunk:
+                    self._last_noted.pop(k, None)
+                self._pending.update(chunk)
+                logger.warning("last_access_at flush failed (%s keys requeued): %s", len(chunk), exc)
+                continue
+            affected = _parse_update_count(status)
+            if affected < len(chunk):
+                # A zero/partial UPDATE means inventory rows are missing for keys
+                # we thought were hot — used to be silent. Surface it: warn when
+                # the whole chunk missed, debug for the expected trickle of parts
+                # evicted from inventory between note and flush.
+                level = logging.WARNING if affected == 0 else logging.DEBUG
+                logger.log(level, "last_access_at flush updated %s/%s rows", affected, len(chunk))
         return len(batch)
 
     def _enforce_bound(self, now: float) -> None:
