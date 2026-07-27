@@ -44,7 +44,7 @@ notify:obj:<object_id>:v:<object_version>:part:<part_number>:chunk:<chunk_index>
 download_in_progress:<object_id>:v:<object_version>:part:<part_number>
 ```
 
-TTL `DOWNLOAD_COALESCE_LOCK_TTL` (default 120 s). Set by the streamer in `build_stream_context`, deleted by the downloader after the part is processed.
+TTL `DOWNLOAD_COALESCE_LOCK_TTL` (default 600 s, `config.py:289`). Set by the streamer in `build_stream_context`, deleted by the downloader after the part is processed.
 
 ### Replication gate (janitor)
 
@@ -63,7 +63,7 @@ Entry: `hippius_s3/api/s3/objects/put_object_endpoint.py::handle_put_object`.
 1. **Gateway → API.** Gateway validated auth + ACL, forwarded with `X-Hippius-*` headers. API's `parse_internal_headers_middleware` populates `request.state.account`.
 2. **User + bucket resolution.** `get_or_create_user_by_main_account`, `get_bucket_by_name`. 404 if bucket missing.
 3. **Branch on `x-amz-meta-append`.** If present → jump to §1.4 (Append). Else continue.
-4. **Delegate to `ObjectWriter.put_simple_stream_full`** (`object_writer.py:170`).
+4. **Delegate to `ObjectWriter.put_simple_stream_full`** (`object_writer.py:180`).
 5. **Reserve version.** `upsert_object_basic` creates/updates the `objects` + `object_versions` rows with placeholder md5/size. DB is authoritative for `object_id` under concurrent creates.
 6. **Envelope encryption setup.** Generate per-version DEK, wrap with bucket KEK, write `(enc_suite_id, kek_id, wrapped_dek)` to `object_versions` immediately. This prevents concurrent GETs from seeing a NULL envelope during the write window.
 7. **Streaming encrypt + write loop** (`object_writer.py:335-399`):
@@ -73,7 +73,7 @@ Entry: `hippius_s3/api/s3/objects/put_object_endpoint.py::handle_put_object`.
 8. **Write meta.json AFTER all chunks on disk.** `writer.write_meta(...)` via `WriteThroughPartsWriter` (`write_through_writer.py`). Until meta exists, readers don't see the part.
 9. **Finalise DB metadata.** `update_object_version_metadata` sets final `size_bytes`, `md5`, `content_type`, `metadata`. Only *now* does the new version become visible to `get_object_for_download_with_permissions` (it filters out rows with size=0 / md5=''). **This is the atomicity boundary of a PutObject.**
 10. **Insert `parts` + `part_chunks` rows.** `ensure_upload_row` + `upsert_part_placeholder` with per-chunk cipher sizes.
-11. **Enqueue upload.** `writer.queue.enqueue_upload` fans out one `UploadChainRequest` to each backend queue (`{backend}_upload_requests`, e.g. `arion_upload_requests`).
+11. **Persist the upload identity — do NOT enqueue** (drain-direct, s3-2.1). The api writes the main-account address (`set_object_version_address`, `multipart.py:1193`) but does **not** enqueue the backend upload. The api writes chunks to the api-local SSD; the Rust **drain-agent** then replicates each part SSD→CephFS, writes `cephor_replication_status`, and `LPUSH`es one `UploadChainRequest` per part to `{backend}_upload_requests` (e.g. `arion_upload_requests`) as the part replicates. The drain is the sole upload producer; `hippius_s3/queue.py::enqueue_upload_to_backends` / `enqueue_upload_request` (~124 / ~160) are now called only by the drain and by manual/backstop scripts.
 12. **Return 200** with ETag = md5 hash.
 
 ### 1.2 Multipart upload
@@ -81,9 +81,9 @@ Entry: `hippius_s3/api/s3/objects/put_object_endpoint.py::handle_put_object`.
 Entry: `hippius_s3/api/s3/multipart.py`.
 
 - **1.2.1 CreateMultipartUpload** (`multipart.py` handler): insert `multipart_uploads` + `object_versions` rows, no FS writes. Return `upload_id`.
-- **1.2.2 UploadPart**: same streaming pipeline as PutObject, but keyed by `(upload_id, part_number)`. Calls `ObjectWriter.mpu_upload_part_stream` (`object_writer.py:768`). Writes chunks + meta to `part_<part_number>/`. Returns part ETag = md5 of ciphertext.
+- **1.2.2 UploadPart**: same streaming pipeline as PutObject, but keyed by `(upload_id, part_number)`. Calls `ObjectWriter.mpu_upload_part_stream` (`object_writer.py:684`). Writes chunks + meta to `part_<part_number>/`. Returns part ETag = md5 of ciphertext.
   - **Does NOT enqueue** a backend upload — enqueue happens at Complete.
-- **1.2.3 CompleteMultipartUpload**: validates the client-supplied ETag list against DB, calls `ObjectWriter.mpu_complete` to finalise `object_versions.status → 'published'` with a combined ETag (`md5(concat(part_etags))-N`). **No chunk writes** — UploadPart already wrote them. Then enqueues ONE `UploadChainRequest` covering all parts. Idempotent on re-invocation.
+- **1.2.3 CompleteMultipartUpload**: validates the client-supplied ETag list against DB, calls `ObjectWriter.mpu_complete` to finalise the version with a combined ETag (`md5(concat(part_etags))-N`). **No chunk writes** — UploadPart already wrote them. **Does NOT enqueue** (drain-direct): the api persists the upload identity (`set_object_version_address`, `multipart.py:1193`); the drain-agent enqueues each part's `UploadChainRequest` as it replicates SSD→CephFS. Idempotent on re-invocation.
 - **1.2.4 AbortMultipartUpload**: calls `fs_store.delete_part(...)` for each part, tombstones the DB row, returns 204.
 
 ### 1.3 CopyObject
@@ -104,7 +104,7 @@ Net effect: a CopyObject is one GET and one PUT chained in-process, never materi
 Entry: `hippius_s3/api/s3/extensions/append.py::handle_append`.
 
 1. Parse `x-amz-meta-append-if-version` (CAS token). Missing / non-integer → 400.
-2. `ObjectWriter.append_stream` (`object_writer.py:961`):
+2. `ObjectWriter.append_stream` (`object_writer.py:1014`):
    - Take a row-level lock on the current `object_versions` row.
    - CAS: if `append_version` doesn't match the client's token → 412 Precondition Failed.
    - Reserve `part_number = MAX(existing) + 1`.
@@ -119,6 +119,8 @@ Entry: `hippius_s3/api/s3/extensions/append.py::handle_append`.
 ### 1.5 Uploader worker
 
 Entry: `workers/run_arion_uploader_in_loop.py` → `hippius_s3/workers/uploader.py::Uploader.process_upload`.
+
+Post drain-direct (s3-2.1) the **producer** of `arion_upload_requests` is the Rust drain-agent, not the api at PUT/MPU-complete — the drain enqueues each part once it has replicated SSD→CephFS. The uploader consumer loop below is otherwise unchanged.
 
 1. `BRPOP arion_upload_requests`.
 2. Check that `object_versions.status != 'deleted'`; skip if gone.
@@ -165,7 +167,7 @@ Location: `hippius_s3/services/object_reader.py:47-236`. **See the deep-dive in 
 
 1. `read_parts_list` + `build_chunk_plan` → `ChunkPlanItem[]` covering only in-range (part, chunk) pairs.
 2. `obj_cache.chunks_exist_batch` → parallel `list[bool]`. All True → `source="cache"`, skip to step 5.
-3. **Coalescing** (pipeline branch): per missing part, `SET NX EX download_in_progress:{oid}:v:{ov}:part:{pn} <ray> 120`.
+3. **Coalescing** (pipeline branch): per missing part, `SET NX EX download_in_progress:{oid}:v:{ov}:part:{pn} <ray> 600`.
    - Acquired → this streamer owns that part's enqueue.
    - Held by peer → skip enqueue, just wait via pub/sub later.
    - Redis error → fail open (enqueue anyway; downloader deduplicates).
@@ -313,13 +315,13 @@ Entry: `hippius_s3/api/s3/objects/head_object_endpoint.py::handle_head_object`.
 - **No chunk is written in-place.** Every write is `tmp.<uuid>` → `os.replace`. Concurrent writers can't interleave bytes.
 - **No part is deleted by the janitor unless replication check returns True** on every required backend (upload + backup). Disk-pressure modes tighten the hot-window but never bypass the replication gate.
 - **No PutObject is visible to readers until `update_object_version_metadata` runs** — this is the atomicity boundary. Upstream concurrent overwrites can temporarily read the previous version via the envelope-fallback path, never an in-progress one.
-- **At most one enqueued `DownloadChainRequest` per (object_id, version, part)** within the 120 s lock window (unless Redis is flaky and we fail-open — then the downloader's chunk_exists skip prevents duplicate backend fetches).
+- **At most one enqueued `DownloadChainRequest` per (object_id, version, part)** within the 600 s lock window (unless Redis is flaky and we fail-open — then the downloader's chunk_exists skip prevents duplicate backend fetches).
 
 ---
 
 ## 6. Known hardening follow-ups (not blockers)
 
 - `cache_ttl_seconds` default (3600 s) → streamer chunk-wait ceiling is too long. Recommend 120–300 s so hung downloaders surface as 5xx quickly.
-- Coalescing lock TTL (120 s) shorter than large-object download time → duplicate backend bandwidth. Recommend heartbeat-extend from the downloader, or raise default.
+- Coalescing lock TTL (600 s) shorter than very-large-object download time → duplicate backend bandwidth. Recommend heartbeat-extend from the downloader, or raise default.
 - No periodic re-probe in `wait_for_chunk` → a lost pub/sub message (Redis reconnect) forces a 1 h timeout. Cheap to fix with an N-second poll inside `_listen`.
 - No negative-path signal for terminally failed chunks → waiters time out rather than fail fast. A `failed:{chunk_key}` sentinel channel would let waiters short-circuit.

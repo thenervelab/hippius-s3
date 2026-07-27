@@ -21,7 +21,7 @@ Full detail in [../../../CLAUDE.md section 3.1](../../../../CLAUDE.md). Summary 
 1. Resolve bucket. 404 NoSuchBucket if missing ([put_object_endpoint.py:55-61](put_object_endpoint.py)).
 2. Detect append ([put_object_endpoint.py:68-79](put_object_endpoint.py)).
 3. Build metadata dict from `x-amz-meta-*` headers (stripping append control keys).
-4. Pre-check existing object to reuse its `object_id` on overwrite ([put_object_endpoint.py:96-113](put_object_endpoint.py)).
+4. Always allocate a fresh `candidate_object_id = uuid4()` and trust the DB-returned id — the pre-check `SELECT` was removed (WU-3). `upsert_object_basic`'s `ON CONFLICT (bucket_id, object_key) ... RETURNING object_id` resolves the authoritative id, so overwrites are handled by the upsert; nothing keys off the previous row ([put_object_endpoint.py:137-142](put_object_endpoint.py)).
 5. Call [ObjectWriter.put_simple_stream_full](../../../writer/object_writer.py) with a streaming body iterator.
 6. Persist the SSD address only — **no upload enqueue on the write path** (drain-direct cutover: the Rust drain is the sole producer, enqueuing after it replicates the part to the pool). The old `writer.queue.enqueue_upload` producer was removed.
 7. Mark `multipart_uploads.is_completed = TRUE` so DELETE doesn't cascade the chunk_backend rows before the worker has had a chance to upload.
@@ -44,17 +44,9 @@ Soft delete on `object_versions` / `chunk_backend`. Enqueues `unpin_requests` en
 
 ## Gotchas
 
-### Pre-check overwrite race
+### Object identity is DB-atomic (pre-check dropped)
 
-[put_object_endpoint.py:105-108](put_object_endpoint.py):
-
-```python
-# TODO: Make object identity/version allocation fully DB-atomic by removing this
-#       pre-check and always passing a generated candidate UUID. The writer already
-#       treats the DB-returned object_id/object_version as authoritative.
-```
-
-The endpoint does a `SELECT` to find an existing `object_id` for the (bucket, key) pair, then the writer does an `INSERT ... ON CONFLICT` that's itself atomic. Two concurrent PUTs on the same key both see the same `prev`, both reuse the same candidate_object_id, and the writer deterministically resolves the race via DB. Works today, but could be simplified.
+The old `get_object_by_path` pre-check `SELECT` was deliberately removed (WU-3, [put_object_endpoint.py:137-142](put_object_endpoint.py)). The endpoint now always passes a fresh `candidate_object_id = uuid4()`; `upsert_object_basic`'s `INSERT ... ON CONFLICT (bucket_id, object_key) ... RETURNING object_id` resolves the authoritative id atomically, and everything downstream keys off `put_res.object_id`. This removed a DB round trip per PUT and closed a TOCTOU window — overwrites and concurrent PUTs on the same key are resolved by the upsert, not by reading the previous row.
 
 ### Master-token object_id reuse
 
