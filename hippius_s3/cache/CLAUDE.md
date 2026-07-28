@@ -6,7 +6,7 @@ Chunk cache. Backed by a shared filesystem volume; Redis is used only for pub/su
 
 | File | Purpose |
 |---|---|
-| [fs_store.py](fs_store.py) | `FileSystemPartsStore` — the actual on-disk cache. Atomic writes, meta-gated reads, hot-retention touch. |
+| [fs_store.py](fs_store.py) | `FileSystemPartsStore` — the actual on-disk cache. Atomic writes, meta-gated reads, read-recency tracking (`note_read` → `fs_cache_inventory.last_access_at`). |
 | [object_parts.py](object_parts.py) | `RedisObjectPartsCache` — facade composing `FileSystemPartsStore` + `ChunkNotifier`. Name retained for compat; chunk I/O is FS-backed. |
 | [notifier.py](notifier.py) | `ChunkNotifier` — Redis pub/sub wrapper for chunk-ready notifications. |
 | [dual_fs_store.py](dual_fs_store.py) | `DualFileSystemPartsStore` — primary + fallback read-only store for migration. |
@@ -45,7 +45,7 @@ Anything else → `ValueError`. This is both a security guard (path traversal) a
 
 ## Hot retention
 
-Every successful read calls `os.utime` on the chunk file AND the meta file ([fs_store.py:183-186](fs_store.py)). Janitor uses mtime/atime to keep "recently read" parts regardless of age. `HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS` (default 10800 = 3h) defines the window.
+Reads no longer `os.utime` the chunk/meta files — the per-read atime touch was removed (it was silently dead on read-only mounts and an MDS metadata write everywhere else). Every successful read instead records recency via `tracker.note_read(...)` into `fs_cache_inventory.last_access_at` ([fs_store.py:180-195](fs_store.py)); the tracker is a sampled no-op in processes that never initialize it (workers/janitor). Janitor uses `last_access_at` to keep "recently read" parts regardless of age. `HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS` (default 14400 = 4h) defines the window.
 
 `touch_part(...)` ([fs_store.py:276](fs_store.py)) bulk-touches every file in a part dir — used by the uploader after a successful backend upload to extend the part's "hotness".
 

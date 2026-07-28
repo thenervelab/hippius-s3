@@ -1762,6 +1762,30 @@ async def cleanup_parts_unified(
         await _flush_backfill()  # final partial batch of kept parts
 
     async def handle(conn: asyncpg.Connection, item: _UnifiedCandidate) -> bool:
+        # F3 read-recency KEEP gate. On this walk path atime/mtime are WRITE recency only — the read
+        # path stopped bumping atime (fs_store.get_chunk's per-read os.utime was removed) and now
+        # records fs_cache_inventory.last_access_at via the AccessTracker. So a part that is actively
+        # READ but not re-written for >gc_max_age (age-GC) or >mpu_stale (stale-reap) would be reaped
+        # and re-hydrated from Arion (read amplification). Protect it here: if it was read within the
+        # effective hot window, KEEP it — regardless of which rule (stale-reap or age-GC) fired.
+        # Gated behind hot_window>0 so CRITICAL pressure (hot_window==0) still reaps, exactly like the
+        # SQL-evict path. A part with NO inventory row (last_access_at NULL/absent) falls through to
+        # the write-recency-only behavior — a missing row is never made un-evictable. The absolute
+        # replication gate below is untouched; this only changes WHEN a part becomes evictable.
+        # TODO: batch this last_access_at lookup across the walk's delete-candidates (mirror the
+        # producer's backfill_batch) rather than one fetchval per candidate. Only delete-candidates —
+        # a small fraction of the O(resident) walk — reach here, so the per-part cost is bounded now.
+        if hot_window > 0:
+            last_access = await conn.fetchval(
+                "SELECT last_access_at FROM fs_cache_inventory "
+                "WHERE object_id = $1 AND object_version = $2 AND part_number = $3",
+                item.object_id,
+                item.object_version,
+                item.part_number,
+            )
+            if last_access is not None and last_access.timestamp() > (now - hot_window):
+                return False  # recently read — hot retention protects it from stale-reap and age-GC
+
         # Evaluate stale-reap FIRST (matches the old serial order: stale phase ran before age-GC,
         # so a part deletable by both is attributed to stale). If stale protects it, fall through
         # to age-GC — a not-replicated part is protected by both, a stale-recent-but-replicated
@@ -1964,8 +1988,8 @@ async def evict_from_inventory(
     async with pool.acquire() as conn:
         cursor = _load_evict_cursor(await get_janitor_state(conn, "sql_evict_cursor"))
 
-    async def handle(conn: asyncpg.Connection, item: tuple[str, int, int]) -> bool:
-        object_id, object_version, part_number = item
+    async def handle(conn: asyncpg.Connection, item: tuple[str, int, int, datetime | None]) -> bool:
+        object_id, object_version, part_number, last_access = item
         st = await asyncio.to_thread(fs_store.stat_part, object_id, object_version, part_number)
         if st is None:
             await clear_cached(conn, object_id, object_version, part_number)  # stale row: self-heal
@@ -1976,15 +2000,10 @@ async def evict_from_inventory(
             if st.st_atime > (now - hot_window):
                 return False
             # Read recency: recorded by the api's AccessTracker into
-            # last_access_at. NULL = not read since the column shipped, which
-            # degrades to the old write-recency-only behavior. PK lookup.
-            last_access = await conn.fetchval(
-                "SELECT last_access_at FROM fs_cache_inventory "
-                "WHERE object_id = $1 AND object_version = $2 AND part_number = $3",
-                object_id,
-                object_version,
-                part_number,
-            )
+            # last_access_at, carried inline on the candidate row (no per-item
+            # fetchval — the missing-column failure surfaces at discovery, not
+            # here under the pool's per-item swallow). NULL = not read since the
+            # column shipped, which degrades to the old write-recency-only path.
             if last_access is not None and last_access.timestamp() > (now - hot_window):
                 return False  # recently read — hot retention protects it
         # ABSOLUTE safety gate — identical call to the walk's, never bypassed by the prefilter.
@@ -2006,11 +2025,11 @@ async def evict_from_inventory(
             _janitor_deleted_counter.add(1, attributes={"reason": "sql_evict"})
         return True
 
-    async def candidates(page: list[Any]) -> AsyncIterator[tuple[str, int, int]]:
+    async def candidates(page: list[Any]) -> AsyncIterator[tuple[str, int, int, datetime | None]]:
         for r in page:
             if r["object_id"] in dlq_object_ids:
                 continue  # DLQ-parked: an in-flight op owns this object's data
-            yield (r["object_id"], r["object_version"], r["part_number"])
+            yield (r["object_id"], r["object_version"], r["part_number"], r["last_access_at"])
 
     deleted_total = 0
     pages = 0

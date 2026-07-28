@@ -3,7 +3,7 @@
 > **What this is.** The engineering build spec for the WI-19 prod-readiness harness: precisely what to build, the
 > interfaces, and the pass/fail criteria — self-contained so a harness engineer can start cold. The *gate/decision*
 > context (the full failure surface C1–C13, adjacent blind spots A1–A20, known-risks R1–R6, SLO ratification, GO/NO-GO,
-> open decisions) lives in [`../s3-2.1-todo.md`](../s3-2.1-todo.md) → **PRODUCTION-READINESS GATE (WI-19)**. This doc is
+> open decisions) was tracked in the s3-2.1 PRODUCTION-READINESS GATE (WI-19), now shipped (see git history). This doc is
 > the *how to build the machine that runs that gate*.
 >
 > Ground truth was verified against the tree on 2026-07-02. Where this doc states a `file:line`, it was read.
@@ -364,7 +364,7 @@ lag SLO looks healthy while the SSD fills and every PUT 503s. Build a **zero-thr
 (SQL/Redis-derived) that is **independent of the lag histogram**; F4/agent-kill must trip it within a RATIFY bound. The lag
 SLO alone is proven insufficient.
 
-The full 17-item GO/NO-GO checklist and the 15 open decisions live in [`../s3-2.1-todo.md`](../s3-2.1-todo.md).
+The full 17-item GO/NO-GO checklist and the 15 open decisions were tracked in the s3-2.1 production-readiness gate (shipped; see git history).
 
 ---
 

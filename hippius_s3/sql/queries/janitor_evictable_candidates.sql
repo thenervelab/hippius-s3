@@ -43,9 +43,19 @@
 -- candidates through a concurrent pool, so order affects only stable/deterministic processing, not
 -- correctness; matching the slice keeps oldest-first intent without re-reading cached_at here.
 --
+-- last_access_at: the read-recency signal (fs_cache_inventory.last_access_at, written by the api's
+-- AccessTracker) is LEFT-JOINed back and returned on every candidate row so the worker consumes it
+-- inline instead of a per-part fetchval (kills an N+1). Selecting the column here also makes a
+-- pre-migration schema (column absent — e.g. the janitor image rolled ahead of the API that runs
+-- migrations) fail LOUDLY once at discovery: the whole page raises UndefinedColumnError and the
+-- phase surfaces it, rather than the old per-item fetchval throwing under the worker pool's swallow,
+-- which froze eviction while logging one warning per candidate and freed zero. LEFT (not INNER) join
+-- so a row cleared between the slice and this filter yields NULL (treated as "not read"), never
+-- dropping a candidate — the candidate population is unchanged when the column is present.
+--
 -- CONTRACT (LOCKED — the SQL-eviction worker binds positionally against this exact order; do NOT
 -- reorder/renumber params or reorder the returned columns). Returns exactly (object_id,
--- object_version, part_number).
+-- object_version, part_number, last_access_at).
 --
 -- Parameters:
 --   $1 object_ids               TEXT[]   — slice tuples' object_id (parallel array; unnest WITH ORDINALITY)
@@ -74,7 +84,7 @@ required_sets AS (
         ) AS required
     FROM object_versions ov
 )
-SELECT s.oid AS object_id, s.ver AS object_version, s.pnum AS part_number
+SELECT s.oid AS object_id, s.ver AS object_version, s.pnum AS part_number, fci.last_access_at AS last_access_at
 FROM slice s
 JOIN parts p
   ON p.object_id = s.oid::uuid
@@ -82,6 +92,8 @@ JOIN parts p
  AND p.part_number = s.pnum
 JOIN required_sets rs
   ON rs.object_id = p.object_id AND rs.object_version = p.object_version
+LEFT JOIN fs_cache_inventory fci
+  ON fci.object_id = s.oid AND fci.object_version = s.ver AND fci.part_number = s.pnum
 WHERE ($7 OR p.uploaded_at < now() - make_interval(secs => $6))
   -- Expected chunk population fully present (not mid-materialisation), in ONE part_chunks probe:
   -- count >= GREATEST(expected, 1) folds in the old "> 0" guard — a part whose size implies 0 chunks

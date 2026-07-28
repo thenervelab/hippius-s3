@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 
 import hippius_s3.pressure_signal as ps
 from hippius_s3.fs_pressure import should_reject_fs_cache_write
@@ -159,6 +162,37 @@ async def test_publisher_hysteresis_across_ticks(monkeypatch, tmp_path: Path):
     assert modes == [2, 2, 1]
 
 
+# The mgr pool series shape (pool 5 fullest at ~95%), mirrored from test_janitor_pool_gate.
+_HEALTHY = "ceph_cluster_total_bytes 115222679470080.0\nceph_cluster_total_used_bytes 31791022084096.0\n"
+_POOL_SERIES = (
+    'ceph_pool_metadata{pool_id="5",name="ceph-filesystem-data0",type="replicated"} 1.0\n'
+    'ceph_pool_percent_used{pool_id="5"} 0.9600000000000000\n'
+)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_publish_reflects_pool_ratio_when_it_exceeds_local(monkeypatch, tmp_path: Path):
+    """With a configured mgr URL the published mode must track the fullest pool,
+    not the local NVMe: ratio = max(local, pool). Local is calm (10%) but the
+    backing pool is at the cliff (96%) — the exact 2026-07-24 blind spot. Reducing
+    the max() back to `local` would publish mode 0 here."""
+    url = "http://mgr.test/metrics"
+    monkeypatch.setattr("hippius_s3.pressure_signal.shutil.disk_usage", lambda p: _usage(10, 100))
+    respx.get(url).mock(return_value=httpx.Response(200, text=_HEALTHY + _POOL_SERIES))
+    redis = FakeRedis()
+    pub = PressurePublisher(
+        redis, tmp_path, mgr_metrics_url=url, pools=["ceph-filesystem-data0"], probe_timeout_seconds=2.0
+    )
+
+    await pub.publish_once()
+
+    assert len(redis.set_calls) == 1
+    payload = json.loads(redis.set_calls[0][1])
+    assert payload["mode"] == 2  # driven by the 96% pool, not the 10% local disk
+    assert payload["ratio"] == pytest.approx(0.96)
+
+
 # ------------------------------------------------------------------ janitor staleness gauge
 
 
@@ -218,6 +252,17 @@ async def test_consumer_holds_last_good_mode_on_read_error():
     ps._published_cache = (2, -100.0)  # expire the memo, keep _last_good
     redis.fail = True
     assert await get_published_pressure_mode(redis) == 2
+
+
+@pytest.mark.asyncio
+async def test_consumer_last_good_expires_past_ttl_on_read_error():
+    """last-good only survives a read ERROR *within* the publish TTL — once it
+    ages past PRESSURE_TTL_SECONDS a dead Redis must fall back to None, never
+    pin a stale mode-2 forever (dropping the `< PRESSURE_TTL_SECONDS` clause)."""
+    ps._published_cache = (None, -100.0)  # memo expired → force a fresh read
+    ps._last_good = (2, time.monotonic() - PRESSURE_TTL_SECONDS - 5.0)  # aged past the TTL
+    redis = FakeRedis(fail=True)
+    assert await get_published_pressure_mode(redis) is None
 
 
 @pytest.mark.asyncio

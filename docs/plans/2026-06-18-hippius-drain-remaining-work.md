@@ -63,17 +63,10 @@ SIGTERM/SIGINT shutdown, and the agent observability snapshot (`SnapshotCell`/`A
 
 ### Tier 1 — spec'd components not built (functional)
 
-1. **Live Ceph-mgr ceiling probe (design M7 `CephProbe`).** *Highest value.* Today the ceiling is
-   `StaticCeiling(CephCeiling::Open(configured))` — `crates/hippius-drain-core/src/tick.rs`. The
-   allocator backs off on fleet latency/error saturation but is **blind to real Ceph near-full**,
-   which is the condition the whole service exists to manage. The seam is ready: implement a new
-   `CephCeilingSource` (the trait in `tick.rs`) that probes the Ceph mgr REST API (OSD near-full +
-   MDS load) and `classify()`s the result into `CephCeiling::{Open,NearFull,Critical}`; pass it to
-   `run_allocator<C: CephCeilingSource>` (`crates/hippius-drain-allocator/src/run.rs`) instead of
-   `StaticCeiling`. Fail-safe: on probe error, decay the last-known ceiling — never mint a fake
-   `NearFull`. This is the natural integration point with this repo's existing Ceph/IPFS layer.
-   **Blocked on:** the Ceph mgr REST flavor/version/DTO (see §5). Needs `reqwest` (not yet a dep);
-   gate it behind an `http` feature so `--no-default-features` still builds.
+1. **✅ SHIPPED — Live Ceph-mgr ceiling probe (design M7 `CephProbe`).** Built: the Ceph-mgr probe
+   lives in `crates/hippius-drain-allocator/src/probe.rs` (+ `crates/hippius-drain-core/src/mgr.rs`),
+   implements the `CephCeilingSource` seam (`tick.rs`), and is wired into `run_allocator` in place of
+   `StaticCeiling`. No longer blind to real Ceph near-full.
 
 2. **Redis `drain_requests` eager trigger (design M8 `RedisQueueConsumer`).** The fast-path
    per-chunk trigger. Only the Postgres `LISTEN` path + reconciler backstop exist today (no `redis`
@@ -85,13 +78,9 @@ SIGTERM/SIGINT shutdown, and the agent observability snapshot (`SnapshotCell`/`A
    publish, to wake readers). Missing (depends on redis). Durability does not depend on it — readers
    fall back to DB status. Confirm the DB-status fallback with the read-path team before relying on it.
 
-4. **Observability / OTel (design M9).** No metrics today. The agent already exposes a snapshot seam
-   (`SnapshotCell`/`AgentSnapshot` in `crates/hippius-drain-core/src/snapshot.rs`) to read from, but
-   **the allocator-side `FleetWeights` snapshot seam was never built** — add it to
-   `run_allocator`/the allocator runtime first. Then build typed metric registries (integer-coded
-   enum gauges derived by exhaustive match over the canonical domain enums — no string-label escape
-   hatch) and alert hysteresis over the `Clock` trait, exported via OTLP. Gate behind an `otel`
-   feature.
+4. **✅ SHIPPED — Observability / OTel (design M9).** Metrics now exist on both binaries:
+   `crates/hippius-drain-agent/src/metrics.rs` and `crates/hippius-drain-allocator/src/metrics.rs`
+   (exported via OTLP behind the `otel` feature).
 
 5. **`verify_hash_contract` boot self-check (design M5→M10).** Fail-fast at agent startup if the
    hash algorithm/encoding diverges from the api's part-key derivation (the single failure mode:
@@ -106,10 +95,10 @@ SIGTERM/SIGINT shutdown, and the agent observability snapshot (`SnapshotCell`/`A
 7. **`trybuild` compile-fail tests.** M6: assert the covariant `GcClaim` variance is rejected
    (the invariant `PhantomData<&'tx mut ()>` compiles, a covariant `&'tx ()` must not). M9: assert
    the metric API has no string-label method. Absent.
-8. **CI workflow + integration harness.** No `.github/workflows/ci.yml` for the Rust crates, and the
-   `#[sqlx::test]` cases need an external Postgres. The spec called for a testcontainers strategy
-   (pinned `postgres:17`, Docker-gated job) so `cargo test` without Docker still runs the pure tiers.
-   Wire a Rust CI job here (this repo's existing CI is Python-only).
+8. **CI workflow (✅ SHIPPED) + integration harness (remaining).** The Rust CI job now exists —
+   `.github/workflows/test-and-lint.yml` builds/lints/tests the crates. What is still open is the
+   testcontainers integration strategy the spec called for (pinned `postgres:17`, Docker-gated job)
+   so the `#[sqlx::test]` cases run in CI while `cargo test` without Docker still runs the pure tiers.
 
 ### Tier 3 — production wiring / spec divergences
 
@@ -138,7 +127,8 @@ These are confirmations/contracts owned outside the drain service — track them
 
 ## 6. Suggested order
 
-`#1 (live Ceph probe)` first — without it the allocator cannot see the condition it manages, and it
-is the natural hippius-s3 integration point. Then `#4 (observability)` for operability, then
-`#5 (hash self-check)` as a cheap safety win. `#2`/`#3` (redis trigger + bell) are latency-only and
-can wait. `#6`–`#8` and `#9` are quality hardening. `#10` unblocks once the api write-fence lands.
+`#1 (live Ceph probe)` and `#4 (observability)` have shipped, and the Rust CI workflow (`#8`) exists.
+The real remaining tail: `#5 (hash self-check)` as a cheap safety win; `#2`/`#3` (redis trigger + bell)
+are latency-only and can wait; `#6`/`#7` (loom + trybuild) and the `#8` testcontainers integration
+harness are quality hardening; `#10` (CephFS GC, still feature-gated off via `gc-cephfs`) unblocks once
+the api write-fence lands.

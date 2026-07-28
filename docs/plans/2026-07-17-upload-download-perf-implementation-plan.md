@@ -15,6 +15,19 @@ item carries three mandatory gates before it can merge:
 
 ---
 
+## Status (updated 2026-07-27) — several waves have SHIPPED
+
+Do not re-plan the items below; they are in `staging` already. The **genuinely-unshipped** work is the
+**Design track** (CP-1 v6 `content_key_id` — confirmed *not* in the code; AP-1 append CAS) and the
+**Wave 4** capacity/connection tuning (benchmark-gated). Shipped items are marked `✅ SHIPPED` inline.
+
+- ✅ **RD-1** — `hippius_s3/sql/queries/get_chunk_backend_identifiers_by_part.sql` exists; downloader batches per part.
+- ✅ **RD-2 / WU-1** — crypto offload landed: `hippius_s3/services/crypto_pool.py` (`HIPPIUS_CRYPTO_POOL_WORKERS`, default 4), used by `reader/decrypter.py` + `writer/object_writer.py`.
+- ✅ **RQ-1** — single pattern subscription landed: `RedisObjectPartsCache.stream_subscription`, gated by `HIPPIUS_STREAM_SINGLE_SUBSCRIPTION` (`config.py:340`, default off), streamer falls back to per-chunk when off.
+- ✅ **GW-4** — reads skip `fetch_account_by_main_address`; only PUT/POST/DELETE fetch the real account (`gateway/middlewares/account.py:194`).
+
+---
+
 ## 0. Standing engineering rules for this whole effort
 
 These are non-negotiable and apply to every wave below.
@@ -113,7 +126,7 @@ Each wave is a mergeable PR (or small PR set). Within a row: **Change** / **Blas
 
 All add-a-new-query-file per §0. All P1/P2, all breaking-change **NO** unless noted.
 
-- **RD-1** — batch the downloader per-chunk identifier lookup. *Change:* new
+- **RD-1** — ✅ SHIPPED. batch the downloader per-chunk identifier lookup. *Change:* new
   `get_chunk_backend_identifiers_by_part.sql` returning `(part_number, chunk_index, backend_identifier)`; run once
   per DCR into a dict; on **dict-miss keep `return True` skip AND fall back to the singular
   `get_chunk_backend_identifier`** to close the mid-upload race. *Blast:* `downloader.py` only; singular query
@@ -207,7 +220,7 @@ All add-a-new-query-file per §0. All P1/P2, all breaking-change **NO** unless n
 
 ### Wave 3 — Crypto offload + pub/sub coalescing (highest correctness care; §0 hazards apply)
 
-- **RD-2** (P1) — offload AES-GCM decrypt to the shared crypto executor; fold decrypt into the pipelined `_fetch`
+- **RD-2** (P1) — ✅ SHIPPED (`crypto_pool.py`). offload AES-GCM decrypt to the shared crypto executor; fold decrypt into the pipelined `_fetch`
   task so decrypt(N+1) overlaps send(N); **await/yield in plan order**; bound in-flight to `prefetch+1`. Keep the
   guards (`require_supported_storage_version`, `key_bytes is None` legacy passthrough) on the loop. Auth-tag failure
   must still propagate and break the stream; first-chunk timeout must still map to 503. *Break:* NO (wire format
@@ -215,7 +228,7 @@ All add-a-new-query-file per §0. All P1/P2, all breaking-change **NO** unless n
   k+1); loop-not-blocked (N concurrent GETs wall-time << N×single-decrypt). **e2e: REQUIRED** (parallel large-object
   GET + range fan, byte-exact). **Property-test:** `GET(range) == plaintext[start:end]` for random sizes/ranges at
   prefetch 0/1/4. Needs the prefetch>0 e2e from §2.
-- **WU-1** (P1) — offload AES-GCM encrypt to the shared crypto executor in both streaming write paths
+- **WU-1** (P1) — ✅ SHIPPED (`crypto_pool.py`). offload AES-GCM encrypt to the shared crypto executor in both streaming write paths
   (`put_simple_stream_full`, `mpu_upload_part_stream`). **md5 stays inline+sequential** (running hash — ETag
   correctness). **`chunk_cipher_sizes` recorded by index** (pre-size the list / carry `(index, ct)`), never
   append-order. Encrypt uses the global `next_chunk_index` assigned on the loop before dispatch. Bound in-flight to
@@ -223,7 +236,7 @@ All add-a-new-query-file per §0. All P1/P2, all breaking-change **NO** unless n
   *Test:* unit (reordered encrypt completion → correct per-index sizes + md5==full-plaintext md5; mid-stream raise →
   no serveable version). **e2e: REQUIRED** (PUT→GET + parallel-part MPU→Complete→GET byte-exact, ETag==md5).
   **Property-test:** random sizes (chunk multiples, off-by-one, empty final) → PUT/GET identity, ETag==md5.
-- **RQ-1** (P1 mechanism; impact P3) — one subscription per stream/part instead of per cold chunk
+- **RQ-1** (P1 mechanism; impact P3) — ✅ SHIPPED behind `HIPPIUS_STREAM_SINGLE_SUBSCRIPTION` (default off). one subscription per stream/part instead of per cold chunk
   (`notifier.py:64-72`). `psubscribe notify:...:part:{pn}:chunk:*` (or subscribe planned channels up front) and
   demux to per-chunk `asyncio.Event`s; **preserve the post-subscribe FS re-check race guard** and the transient-miss
   retry. *Break:* **YES (correctness-sensitive)** — the demux/race guard is the subtlest change in the whole plan; a
@@ -292,7 +305,7 @@ clusters together (see §4).
 
 ### Wave 5 — Gateway fixed floor (after GW-2 makes it measurable)
 
-- **GW-4** (biggest clean win) — skip `fetch_account_by_main_address` for GET/HEAD on the access-key path; still
+- **GW-4** (biggest clean win) — ✅ SHIPPED (`gateway/middlewares/account.py:194`). skip `fetch_account_by_main_address` for GET/HEAD on the access-key path; still
   set `request.state.account_id` + a lightweight `account`. **Confirmed safe:** `has_credits`/`upload`/`delete` are
   set in `parse_internal_headers` but **never read** anywhere on any method; credit gating only runs for
   PUT/POST/DELETE (which still fetch). *Blast:* access-key GET/HEAD; audit log will show the sub-account instead of
@@ -386,7 +399,7 @@ Deferred:
 
 ### Design track (needs a decision before implementation)
 
-- **CP-1 → v6 (Structural, P1 impact)** — the copy fast path is dead because per-chunk AAD binds `object_id`, so
+- **CP-1 → v6 (Structural, P1 impact)** — ⏳ NOT SHIPPED (no `content_key_id` anywhere in the code as of 2026-07-27). the copy fast path is dead because per-chunk AAD binds `object_id`, so
   CID-reuse copy isn't decryptable at the dest; **every copy is O(size)**. Fix = a **v6 suite** binding per-chunk
   AAD/nonce to a **copy-stable `content_key_id`** (drop `object_id`), so copy = duplicate `chunk_backend`/`part_chunks`
   rows + rewrap the DEK, zero byte copy. **Critical crypto invariant:** copied ciphertext reuses `(DEK, nonce)`

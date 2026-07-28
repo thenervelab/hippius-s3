@@ -2,6 +2,15 @@
 
 This document describes the observability stack and how telemetry data flows through the system.
 
+> **Scope:** this document covers the **local-dev docker-compose** monitoring stack only
+> (`docker-compose.monitoring.yml`: OTEL collector → Prometheus/Loki/Tempo → Grafana → Discord).
+> **Production is different.** Prod ships telemetry to the LGTM stack in the `monitoring`
+> namespace, and prod **alerting rules live in the external
+> [thenervelab/hippius-otel](https://github.com/thenervelab/hippius-otel) repo and page
+> Mattermost** (see [grafana-alerting.md](grafana-alerting.md)) — not the docker-compose
+> Grafana→Discord path shown below. Prod also adds the s3-2.1 drain-direct components
+> (api-local SSD tier + Rust drain fleet) that this local stack does not model.
+
 ## Overview
 
 The monitoring stack consists of:
@@ -22,9 +31,13 @@ graph TB
     end
 
     subgraph "Infrastructure"
-        Redis[(Redis Cache<br/>:6379)]
+        Redis[(Redis general cache<br/>:6379 — short-lived state only)]
         RedisAccounts[(Redis Accounts<br/>:6380)]
+        RedisQueues[(Redis Queues<br/>:6382 — work queues + pub/sub)]
+        RedisRateLimit[(Redis Rate-Limiting<br/>:6383)]
+        RedisAcl[(Redis ACL<br/>:6384)]
         Postgres[(PostgreSQL<br/>:5432)]
+        FsCache[FS chunk cache<br/>/var/lib/hippius/object_cache]
         Arion[Arion Service]
         DockerLogs[/var/lib/docker/containers]
     end
@@ -81,7 +94,7 @@ graph TB
     classDef observability fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
 
     class API,Workers appLayer
-    class Redis,RedisAccounts,Postgres,Arion,DockerLogs infra
+    class Redis,RedisAccounts,RedisQueues,RedisRateLimit,RedisAcl,Postgres,FsCache,Arion,DockerLogs infra
     class RedisExp,RedisAccExp,PostgresExp exporter
     class OTEL,Prom,Loki,Tempo,Promtail,Grafana observability
 ```
@@ -111,8 +124,15 @@ Redis/Postgres → Exporter → Prometheus (scrape)
 
 **Example Metrics:**
 - `http_request_duration_seconds` (from OTEL)
+- `fs_cache_disk_used_bytes`, `fs_cache_pressure_mode`, `fs_cache_hot_parts` (FS chunk cache, from the janitor/api)
+- `fs_store_parts_on_disk`, `fs_store_oldest_age_seconds` (FS chunk store gauges)
 - `redis_connected_clients` (from Redis Exporter)
 - `pg_stat_database_tup_returned` (from Postgres Exporter)
+
+> **Where object data lives:** actual object chunks are stored on the **filesystem chunk cache**
+> at `/var/lib/hippius/object_cache`, not in Redis. Redis `:6379` is a short-lived **general
+> cache** only; `redis-queues :6382` carries work queues + chunk-ready pub/sub. The `fs_cache_*`
+> / `fs_store_*` gauges above are the ones to watch for object-storage capacity/pressure.
 
 ### Traces Flow (Push Model)
 
@@ -156,10 +176,12 @@ Docker Containers → /var/lib/docker/containers/*.log → Promtail → Loki (:3
 Prometheus → Grafana Alert Rules → Alertmanager → Discord Webhook
 ```
 
-- Alert rules defined in `monitoring/grafana/provisioning/alerting/`
-- Grafana evaluates rules against Prometheus data
-- Alerts routed by severity (critical/high/medium)
-- Discord webhook receives formatted alert messages
+- **Local dev only:** alert rules in `monitoring/grafana/provisioning/alerting/` → Grafana
+  evaluates against Prometheus → Discord webhook.
+- **Production is different:** the prod alert rules live in the external
+  [thenervelab/hippius-otel](https://github.com/thenervelab/hippius-otel) repo, are evaluated by
+  the LGTM Grafana in the `monitoring` namespace, and page **Mattermost** (not Discord). See
+  [grafana-alerting.md](grafana-alerting.md).
 
 ## Port Reference
 
