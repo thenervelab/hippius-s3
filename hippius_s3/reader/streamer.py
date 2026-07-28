@@ -107,30 +107,8 @@ async def stream_plan(
     # Fallback only; object_reader passes the wired default HTTP_STREAM_PREFETCH_CHUNKS (16 in prod).
     prefetch_chunks: int = 0,
     chunk_timeout: float | None = None,
-    # F1: called with a part_number when a chunk is missing from FS at stream time, to (idempotently)
-    # re-enqueue that part's download. Without it a mid-stream eviction on a cache-source read waits on
-    # a `notify:` no producer will ever publish and times out inside the response body (silent
-    # truncation). None (HEAD/copy/migrate callers) keeps the pure wait-on-pub/sub behavior.
-    ensure_part_fn: Callable[[int], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[bytes, None]:
     prefetch = max(0, int(prefetch_chunks))
-
-    # Parts we've already re-enqueued this stream. ensure_part_fn covers the WHOLE part's needed
-    # chunks in one call, so a part is only ensured once even if several of its chunks miss.
-    ensured_parts: set[int] = set()
-
-    async def _maybe_ensure(item: ChunkPlanItem) -> None:
-        # Only a genuine FS miss triggers the enqueue — a present chunk (the common case) pays a
-        # single stat and no Redis/DB work, keeping the cache-source fast path fast.
-        if ensure_part_fn is None:
-            return
-        pn = int(item.part_number)
-        if pn in ensured_parts:
-            return
-        if await obj_cache.chunk_exists(object_id, int(object_version), pn, int(item.chunk_index)):
-            return
-        ensured_parts.add(pn)
-        await ensure_part_fn(pn)
 
     async def _decrypt(c: bytes, item: ChunkPlanItem) -> bytes:
         return await decrypt_chunk_if_needed(
@@ -154,7 +132,6 @@ async def stream_plan(
         async with obj_cache.stream_subscription(object_id, int(object_version)) as sub:
 
             async def _wait_sub(item: ChunkPlanItem) -> bytes:
-                await _maybe_ensure(item)
                 return await sub.wait_for_chunk(int(item.part_number), int(item.chunk_index), timeout=sub_timeout)
 
             async for out in _emit(
@@ -169,7 +146,6 @@ async def stream_plan(
         return
 
     async def _wait(item: ChunkPlanItem) -> bytes:
-        await _maybe_ensure(item)
         return await obj_cache.wait_for_chunk(
             object_id,
             int(object_version),
