@@ -118,3 +118,68 @@ async def test_non_put_bypasses_the_gate_entirely(tmp_path):
 
     assert await fs_cache_pressure_middleware(request, call_next) is sentinel
     assert await FakeRedis(value=None).get(PRESSURE_KEY) is None  # signal untouched
+
+
+# ---------------------------------------------------------------------------
+# A shed request must leave a metric behind, not just a log line
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_shed_request_is_recorded(tmp_path, monkeypatch):
+    """This gate is the OUTERMOST middleware — it has to answer before the body is read — while
+    metrics_middleware is the innermost. So metrics never runs on a shed request and the 503
+    lands in no request or error counter on either side. Without this call a pressure event is
+    invisible outside the log.
+    """
+    recorded: list[tuple[str, str]] = []
+
+    class _Collector:
+        def record_fs_cache_shed(self, reason: str, pressure_mode: str) -> None:
+            recorded.append((reason, pressure_mode))
+
+    monkeypatch.setattr(
+        "hippius_s3.api.middlewares.fs_cache_pressure.get_metrics_collector",
+        lambda: _Collector(),
+    )
+    monkeypatch.setattr(ps, "_CACHE", None, raising=False)
+
+    config = _config(tmp_path)
+    redis_client = FakeRedis(json.dumps({"mode": 2}).encode())
+    request = _make_put_request(config, redis_client)
+
+    async def _call_next(_req):  # pragma: no cover - must not be reached
+        raise AssertionError("a shed request must not reach the handler")
+
+    response = await fs_cache_pressure_middleware(request, _call_next)
+
+    assert response.status_code == 503
+    assert recorded == [("pool", "2")], "the shed must be attributed to the pool signal"
+
+
+@pytest.mark.asyncio
+async def test_passthrough_records_nothing(tmp_path, monkeypatch):
+    """Blast-radius guard: only an actual rejection increments the counter."""
+    recorded: list[tuple[str, str]] = []
+
+    class _Collector:
+        def record_fs_cache_shed(self, reason: str, pressure_mode: str) -> None:
+            recorded.append((reason, pressure_mode))
+
+    monkeypatch.setattr(
+        "hippius_s3.api.middlewares.fs_cache_pressure.get_metrics_collector",
+        lambda: _Collector(),
+    )
+    monkeypatch.setattr(ps, "_CACHE", None, raising=False)
+
+    config = _config(tmp_path)
+    redis_client = FakeRedis(json.dumps({"mode": 0}).encode())
+    request = _make_put_request(config, redis_client)
+
+    async def _call_next(_req):
+        return Response(status_code=200)
+
+    response = await fs_cache_pressure_middleware(request, _call_next)
+
+    assert response.status_code == 200
+    assert recorded == []

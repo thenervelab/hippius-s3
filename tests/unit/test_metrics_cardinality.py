@@ -40,6 +40,12 @@ BOUNDED_LABELS = {
     # Cachet component status, mapped through _STATUS_LABELS from {1, 3, 4} with an
     # "unknown" fallback — four values, fixed in code.
     "status",
+    # FS-cache shed attribution. `reason` is returned by should_reject_fs_cache_write as one of
+    # "threshold" | "pool" ("ok" never reaches the counter — it is the not-rejected case), and
+    # `pressure_mode` is the janitor's published signal stringified: "0" | "1" | "2" | "None".
+    # Both are closed sets fixed in code, not caller- or object-derived.
+    "reason",
+    "pressure_mode",
 }
 
 
