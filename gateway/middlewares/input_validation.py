@@ -8,6 +8,7 @@ import logging
 import re
 from typing import Awaitable
 from typing import Callable
+from urllib.parse import unquote
 
 from fastapi import Request
 from fastapi import Response
@@ -19,6 +20,30 @@ from gateway.utils.errors import s3_error_response
 
 logger = logging.getLogger(__name__)
 config = get_config()
+
+
+def _decoded_path(request: Request) -> str:
+    """The request path, percent-decoded exactly once, with nothing dropped.
+
+    NOT `request.url.path`. Starlette builds that with `urlsplit` over the already-decoded URL,
+    and `urlsplit` treats `#` as the fragment delimiter — so a key sent as `report%23v1.txt`
+    decodes to `report#v1.txt` and then loses everything from the `#`, leaving `report`. The
+    truncated key reached storage, so `report#v1.txt` and `report#v2.txt` both landed as
+    `report` and the second silently overwrote the first: a 200 OK on both, one object destroyed,
+    nothing in the logs. It also meant `#` could never be caught below, despite being in
+    OBJECT_KEY_AVOID_CHARS all along.
+
+    `scope["raw_path"]` is the undecoded bytes as the client sent them, so decoding it here keeps
+    the `#`. This is the same discipline `sigv4.py` already uses to canonicalize — key extraction
+    just never adopted it.
+    """
+    raw = request.scope.get("raw_path")
+    if raw is None:
+        # Not every ASGI server populates raw_path. Falling back to the truncating path is still
+        # better than 500-ing; uvicorn (what we run) always provides it.
+        return request.url.path
+    return unquote(raw.decode("utf-8", "surrogateescape"))
+
 
 # S3 bucket name validation (AWS S3 compatible)
 # Must be 3-63 characters, lowercase letters/numbers/dots/hyphens only
@@ -46,7 +71,7 @@ async def input_validation_middleware(
 ) -> Response:
     """Validate S3 inputs for security and AWS compatibility."""
 
-    path_parts = request.url.path.strip("/").split("/")
+    path_parts = _decoded_path(request).strip("/").split("/")
 
     # Skip validation for non-S3 endpoints
     if path_parts[0] in SKIP_PREFIXES:
