@@ -62,7 +62,7 @@ Notes:
 | GetBucketTagging                                | ✔         | XML response                                                | GET /{bucket}?tagging                         | test_BucketTagging.py                                                |
 | GetBucketVersioning                             |           |                                                             |                                               |                                                                      |
 | GetBucketWebsite                                |           |                                                             |                                               |                                                                      |
-| GetObject                                       | ✔         | Supports Range; S3-like headers                             | GET /{bucket}/{key}                           | test_GetObject.py, test_GetObject_Range.py, test_GetObject_Errors.py |
+| GetObject                                       | ✔         | Supports Range; If-None-Match (304); S3-like headers        | GET /{bucket}/{key}                           | test_GetObject.py, test_GetObject_Range.py, test_GetObject_Errors.py |
 | GetObjectAcl                                    | ✔         | ACL XML response via gateway                                | GET /{bucket}/{key}?acl                       | test_acl_access_keys_minio.py                                        |
 | GetObjectAttributes                             |           |                                                             |                                               |                                                                      |
 | GetObjectLegalHold                              |           |                                                             |                                               |                                                                      |
@@ -72,7 +72,7 @@ Notes:
 | GetObjectTorrent                                |           |                                                             |                                               |                                                                      |
 | GetPublicAccessBlock                            |           |                                                             |                                               |                                                                      |
 | HeadBucket                                      | ✔         | 200 if exists, 404 if not (empty body)                      | HEAD /{bucket}                                | test_CreateBucket.py                                                 |
-| HeadObject                                      | ✔         | Returns metadata headers (size, content type, ETag, version) | HEAD /{bucket}/{key}                          | test_HeadObject.py, test_HeadObject_Pending.py                       |
+| HeadObject                                      | ✔         | Metadata headers (size, content type, ETag, version); If-None-Match (304) | HEAD /{bucket}/{key}                          | test_HeadObject.py, test_HeadObject_Pending.py                       |
 | ListBucketAnalyticsConfigurations               |           |                                                             |                                               |                                                                      |
 | ListBucketIntelligentTieringConfigurations      |           |                                                             |                                               |                                                                      |
 | ListBucketInventoryConfigurations               |           |                                                             |                                               |                                                                      |
@@ -81,7 +81,7 @@ Notes:
 | ListDirectoryBuckets                            |           |                                                             |                                               |                                                                      |
 | ListMultipartUploads                            | ✔         | Lists ongoing multipart uploads                             | GET /{bucket}?uploads                         | test_ListMultipartUploads.py                                         |
 | ListObjects                                     | ✔         | Optional prefix filtering                                   | GET /{bucket}                                 | test_ListObjects.py                                                  |
-| ListObjectsV2                                   | ✔         | Basic listing + Prefix only; no ContinuationToken/StartAfter/Delimiter; IsTruncated always false | GET /{bucket}                                 | test_ListObjects.py                                                  |
+| ListObjectsV2                                   | ✔         | Prefix, Delimiter/CommonPrefixes, ContinuationToken/NextContinuationToken, StartAfter, and real IsTruncated | GET /{bucket}                                 | test_ListObjects.py                                                  |
 | ListObjectVersions                              |           |                                                             |                                               |                                                                      |
 | ListParts                                       | ✔         | Lists parts; supports pagination                            | GET /{bucket}/{key}?uploadId=...              | test_ListParts.py                                                    |
 | PutBucketAccelerateConfiguration                |           |                                                             |                                               |                                                                      |
@@ -190,6 +190,11 @@ Notes:
   - `GET /{bucket}/{key}` with `Range: bytes=...` — 206 Partial Content with `Content-Range`, `Accept-Ranges: bytes`
   - Validates and returns 416 with `Content-Range: bytes */{size}` for invalid ranges
 
+- **Conditional reads**
+
+  - `GET`/`HEAD` support `If-None-Match` — returns `304 Not Modified` when the client's ETag matches the current object (`get_object_endpoint.py:218`, `head_object_endpoint.py:205`, `common/headers.py:53`)
+  - `If-Match` and conditional writes (`If-None-Match` on PUT) are not yet supported
+
 ### Hippius extensions
 
 - **Append semantics (non-S3 extension)**
@@ -209,7 +214,7 @@ Notes:
 
   - `GET /{bucket}` — List objects (optional `prefix` filtering)
   - Returns standard XML with `Contents` entries; includes custom summary headers
-  - `ListObjectsV2` compatibility: basic listing works with common SDKs (e.g. boto3 `list_objects_v2`), but v2 pagination (`ContinuationToken`/`StartAfter`), delimiter, and related fields are not yet implemented
+  - `ListObjectsV2` compatibility: supports `Prefix`, `Delimiter`/`CommonPrefixes`, v2 pagination (`ContinuationToken`/`NextContinuationToken`), `StartAfter`, and a real `IsTruncated` (`hippius_s3/api/s3/buckets/list_objects_endpoint.py`)
 
 - **Multipart uploads**
 

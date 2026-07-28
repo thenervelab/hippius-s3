@@ -174,9 +174,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         asyncio.create_task(collect_pool_metrics())
         logger.info("Pool metrics collection task started")
 
+        # Read-recency tracker: feeds fs_cache_inventory.last_access_at so the
+        # janitor's hot retention sees reads (atime can't — see access_tracker).
+        from hippius_s3.cache.access_tracker import initialize_access_tracker
+
+        tracker = initialize_access_tracker(
+            app.state.postgres_pool,
+            hot_window_seconds=float(config.fs_cache_hot_retention_seconds),
+        )
+        app.state.access_tracker_task = asyncio.create_task(tracker.run())
+        logger.info("Access tracker flush task started")
+
         yield
 
     finally:
+        try:
+            if hasattr(app.state, "access_tracker_task"):
+                app.state.access_tracker_task.cancel()
+                import contextlib
+
+                with contextlib.suppress(asyncio.CancelledError):
+                    await app.state.access_tracker_task
+        except Exception:
+            logger.exception("Error stopping access tracker task")
+
         try:
             # Stop background metrics collection
             if hasattr(app.state, "background_metrics_collector"):

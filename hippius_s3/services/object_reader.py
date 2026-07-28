@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+# `db` LIFETIME — READ BEFORE ADDING A QUERY HERE.
+# get_object_endpoint does `db = await pool.acquire()` and releases it in a `finally` that runs
+# when the endpoint RETURNS — i.e. when the StreamingResponse object is handed to the ASGI
+# server, before a single body byte is produced. So `db` is only ours until build_stream_context
+# finishes. Anything reached from inside the response body (stream_plan's wait/decrypt path)
+# must do ZERO DB work: by then the connection is back in the pool and probably owned by another
+# request, and asyncpg Connections are not safe for concurrent use. Violating this raises
+# `InterfaceError: another operation is in progress` — which surfaces as a 500 before the first
+# byte, or a 200 with a full Content-Length and a truncated body after it, and can also break the
+# unrelated request that now legitimately holds that connection. If the body genuinely needs
+# something from the DB, resolve it in build_stream_context and close over the VALUE, never `db`.
 import asyncio
 import contextlib
 import logging
@@ -82,33 +93,28 @@ async def _release_coalesce_locks(
 _CID_ADDRESSED_BACKENDS: frozenset[str] = frozenset({"ipfs"})
 
 
-async def _enqueue_missing_downloads(
+async def _enqueue_download_for_parts(
     db: Any,
     redis: Any,
     info: dict,
     *,
     object_version: int,
     storage_version: int,
-    plan: list[ChunkPlanItem],
-    exist_results: list[bool],
+    indices_by_part: dict[int, set[int]],
     address: str,
     cfg: Any,
 ) -> None:
-    """Enqueue a DownloadChainRequest for the chunks in `plan` that are missing from the FS cache.
+    """Coalesce-lock the given parts and enqueue ONE DownloadChainRequest for the un-coalesced ones.
 
-    Coalesces concurrent misses per (object_id, version, part) via a Redis NX lock so only one
-    streamer enqueues; the rest wait on the downloader's pub/sub notification. Shared by the primary
-    read path AND the envelope-race version fallback — the fallback used to return a `pipeline`
-    source without enqueuing anything, so a cold read of the fallback version hung on pub/sub until
-    the wait timed out.
+    Shared core of two call sites, BOTH of which run before streaming starts while this request
+    still legitimately owns `db`: the primary cold-read miss and the envelope-race version fallback.
+    Nothing may call this from inside the response body — see the module note on `db` lifetime.
+    Idempotent: the per-part SET NX lock guarantees only one enqueue per (object_id, version, part)
+    until the lock TTL, so calling it again for a part already being fetched is a no-op.
     """
-    object_id = info["object_id"]
-    indices_by_part: dict[int, set[int]] = {}
-    for item, cached in zip(plan, exist_results, strict=True):
-        if not cached:
-            indices_by_part.setdefault(int(item.part_number), set()).add(int(item.chunk_index))
     if not indices_by_part:
         return
+    object_id = info["object_id"]
 
     # Coalesce concurrent misses on the same part: only one streamer
     # actually enqueues a download request per (object_id, version, part).
@@ -209,6 +215,42 @@ async def _enqueue_missing_downloads(
             expire_at=time.time() + float(cfg.cache_ttl_seconds),
         )
         await enqueue_download_request(req)
+
+
+async def _enqueue_missing_downloads(
+    db: Any,
+    redis: Any,
+    info: dict,
+    *,
+    object_version: int,
+    storage_version: int,
+    plan: list[ChunkPlanItem],
+    exist_results: list[bool],
+    address: str,
+    cfg: Any,
+) -> None:
+    """Enqueue a DownloadChainRequest for the chunks in `plan` that are missing from the FS cache.
+
+    Coalesces concurrent misses per (object_id, version, part) via a Redis NX lock so only one
+    streamer enqueues; the rest wait on the downloader's pub/sub notification. Shared by the primary
+    read path AND the envelope-race version fallback — the fallback used to return a `pipeline`
+    source without enqueuing anything, so a cold read of the fallback version hung on pub/sub until
+    the wait timed out.
+    """
+    indices_by_part: dict[int, set[int]] = {}
+    for item, cached in zip(plan, exist_results, strict=True):
+        if not cached:
+            indices_by_part.setdefault(int(item.part_number), set()).add(int(item.chunk_index))
+    await _enqueue_download_for_parts(
+        db,
+        redis,
+        info,
+        object_version=object_version,
+        storage_version=storage_version,
+        indices_by_part=indices_by_part,
+        address=address,
+        cfg=cfg,
+    )
 
 
 async def build_stream_context(

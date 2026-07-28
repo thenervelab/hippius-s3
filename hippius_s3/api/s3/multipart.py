@@ -25,6 +25,7 @@ from starlette.requests import ClientDisconnect
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3.common import format_s3_timestamp
+from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
@@ -678,11 +679,11 @@ async def upload_part(
                 await request.app.state.redis_client.delete(*keys)
                 logger.info(f"Cleaned up {len(keys)} cached parts for disconnected upload {upload_id}")
 
-            return s3_error_response(
-                "RequestTimeout",
-                "Client disconnected during upload",
-                status_code=408,
-            )
+            # Same event as the simple-PUT path and the gateway hop, so it carries the same code.
+            # Previously 408 RequestTimeout, which made one abort look like three different
+            # failures depending on which hop you were reading. Nothing is delivered either way —
+            # the peer is gone — so this only affects how we classify it.
+            return Response(status_code=CLIENT_CLOSED_REQUEST)
         except ValueError as exc:
             if "part_size_exceeds_max" in str(exc):
                 return s3_error_response(

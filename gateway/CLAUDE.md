@@ -6,7 +6,7 @@ See [../CLAUDE.md](../CLAUDE.md) for the full architectural map. This file cover
 
 ## Entry
 
-- [gateway/main.py:35 `factory()`](main.py) — FastAPI factory. Launched by uvicorn with `factory=True`.
+- [gateway/main.py:43 `factory()`](main.py) — FastAPI factory. Launched by uvicorn with `factory=True`.
 - Startup ([main.py:52](main.py)) creates the Postgres pool, four Redis clients (general, accounts, rate-limiting, ACL), the `ForwardService` / `ACLService` / `DocsProxyService` / `ArionClient`, and a background task that exports Postgres pool metrics every 60s.
 - Shutdown ([main.py:131](main.py)) closes all of them in reverse order.
 

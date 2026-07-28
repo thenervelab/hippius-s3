@@ -22,9 +22,9 @@ Disk-pressure modes (all still replication-gated):
 """
 
 import asyncio
+import contextlib
 import json
 import logging
-import math
 import os
 import shutil
 import sys
@@ -58,6 +58,14 @@ from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.otel_setup import build_resource
+from hippius_s3.pressure_signal import PRESSURE_CRITICAL
+from hippius_s3.pressure_signal import PRESSURE_CRITICAL_EXIT
+from hippius_s3.pressure_signal import PRESSURE_ELEVATED
+from hippius_s3.pressure_signal import PRESSURE_ELEVATED_EXIT
+from hippius_s3.pressure_signal import PressurePublisher
+from hippius_s3.pressure_signal import parse_pool_percent_used
+from hippius_s3.queue_metrics import QueueDepthSampler
+from hippius_s3.redis_utils import create_redis_client
 from hippius_s3.repositories import fs_cache_inventory
 from hippius_s3.repositories.fs_cache_inventory import clear_cached
 from hippius_s3.repositories.fs_cache_inventory import get_janitor_state
@@ -83,13 +91,9 @@ AGE_BUCKET_BOUNDARIES = [
 ]
 AGE_BUCKET_NAMES = [b[0] for b in AGE_BUCKET_BOUNDARIES] + ["7d+"]
 
-# Disk pressure thresholds (fraction of total disk used). Enter thresholds are higher than exit
-# thresholds (hysteresis) so a disk hovering at a boundary doesn't flap the mode — and with it the
-# hot-retention window and loop-sleep — every cycle. C2.
-PRESSURE_ELEVATED = 0.85
-PRESSURE_ELEVATED_EXIT = 0.83
-PRESSURE_CRITICAL = 0.95
-PRESSURE_CRITICAL_EXIT = 0.93
+# Disk pressure thresholds live in hippius_s3.pressure_signal (imported below):
+# the janitor's cycle gating and the published fs_cache:pressure signal must
+# key off the SAME watermarks or consumers would disagree with the evictor.
 
 # Maximum age of an orphan `.tmp.*` file before we delete it. Atomic writes
 # finish in milliseconds; anything older than this is a crashed-write orphan.
@@ -153,6 +157,11 @@ _aged_pending_orphans = 0
 _janitor_phase = 0  # index into JANITOR_PHASES; 0 = idle/sleeping
 _janitor_last_cycle_completed_at = 0.0
 _janitor_cycle_seconds = 0.0
+
+# Unixtime of the last SUCCESSFUL fs_cache:pressure publish; 0 = none since start. The published
+# key is otherwise invisible to monitoring — it expires PRESSURE_TTL_SECONDS after the last success
+# and every api pod silently reverts to node-local statvfs. This makes that lapse observable.
+_fs_pressure_last_publish_at = 0.0
 
 JANITOR_PHASES = (
     "idle",
@@ -226,57 +235,21 @@ def _obs_cycle_seconds(_: object) -> list[otel_metrics.Observation]:
     return [otel_metrics.Observation(_janitor_cycle_seconds, {})]
 
 
+def _obs_pressure_signal_age(_: object) -> list[otel_metrics.Observation]:
+    # Seconds since the last SUCCESSFUL fs_cache:pressure publish (-1 = none since start). Climbs
+    # without bound once publishes fail (cache Redis down / MOVED / janitor stalled); crossing
+    # PRESSURE_TTL_SECONDS means the key has expired and api pods silently fell back to node-local
+    # statvfs — the 2026-07-24 blind spot re-opened, with disk-fill protection degraded.
+    if _fs_pressure_last_publish_at <= 0:
+        return [otel_metrics.Observation(-1.0, {})]
+    return [otel_metrics.Observation(max(0.0, time.time() - _fs_pressure_last_publish_at), {})]
+
+
 def _classify_age_bucket(age_seconds: float) -> str:
     for name, upper in AGE_BUCKET_BOUNDARIES:
         if age_seconds < upper:
             return name
     return "7d+"
-
-
-def _label_value(line: str, needle: str) -> str | None:
-    """The prometheus label value following `needle` (e.g. `pool_id="`), up to its closing quote."""
-    start = line.find(needle)
-    if start < 0:
-        return None
-    start += len(needle)
-    end = line.find('"', start)
-    return line[start:end] if end >= 0 else None
-
-
-def _parse_pool_percent_used(body: str, pools: list[str]) -> float | None:
-    """The fullest of `pools` from a mgr prometheus scrape, resolving each name to its id via
-    `ceph_pool_metadata` then reading `ceph_pool_percent_used`. Returns None if ANY pool is absent
-    — a missing pool must fail safe (fall back to statvfs), never silently shrink the gate. Pure so
-    the parse is unit-testable without a live exporter."""
-    name_to_id: dict[str, str] = {}
-    id_to_pct: dict[str, float] = {}
-    for line in body.splitlines():
-        if line.startswith("ceph_pool_metadata{"):
-            name = _label_value(line, 'name="')
-            pool_id = _label_value(line, 'pool_id="')
-            if name is not None and pool_id is not None and name in pools:
-                name_to_id[name] = pool_id
-        elif line.startswith("ceph_pool_percent_used{"):
-            pool_id = _label_value(line, 'pool_id="')
-            if pool_id is None:
-                continue
-            try:
-                value = float(line.rsplit(" ", 1)[1])
-            except (ValueError, IndexError):
-                continue
-            if math.isfinite(value):  # a NaN/inf is not a ratio — drop it so the pool reads missing
-                id_to_pct[pool_id] = value
-
-    fullest: float | None = None
-    for pool in pools:
-        pool_id = name_to_id.get(pool)
-        pct = id_to_pct.get(pool_id) if pool_id is not None else None
-        if pct is None:
-            logger.warning("janitor pool-fullness probe: pool %r absent from mgr output; falling back to statvfs", pool)
-            return None
-        pct = min(max(pct, 0.0), 1.0)  # exporter rounding can nudge just past 1.0
-        fullest = pct if fullest is None else max(fullest, pct)
-    return fullest
 
 
 async def _fetch_pool_percent_used() -> float | None:
@@ -304,7 +277,7 @@ async def _fetch_pool_percent_used() -> float | None:
     except httpx.HTTPError as exc:
         logger.warning("janitor pool-fullness probe failed (%s); falling back to statvfs", exc)
         return None
-    return _parse_pool_percent_used(body, pools)
+    return parse_pool_percent_used(body, pools)
 
 
 def _pressure_mode(root: Path) -> int:
@@ -866,6 +839,11 @@ def _setup_janitor_metrics() -> None:
         name="fs_janitor_cycle_seconds",
         callbacks=[_obs_cycle_seconds],
         description="Duration of the last completed janitor cycle",
+    )
+    meter.create_observable_gauge(
+        name="fs_cache_pressure_signal_age_seconds",
+        callbacks=[_obs_pressure_signal_age],
+        description="Seconds since the last SUCCESSFUL fs_cache:pressure publish (-1 = none since start). Past PRESSURE_TTL_SECONDS the shared signal has expired and api pods silently fell back to node-local statvfs — disk-fill protection degraded",
     )
     _janitor_deleted_counter = meter.create_counter(
         name="fs_janitor_deleted_total",
@@ -1502,29 +1480,17 @@ async def cleanup_old_parts_by_mtime(
 
             # Check mtime (for age) and atime (for hot retention).
             #
-            # ZFS + noatime note: in prod the local-cache volume is a ZFS
-            # dataset mounted `noatime` (see `mount | grep local_object_cache`
-            # → `rw,noatime,xattr,noacl,casesensitive`). `noatime` only
-            # blocks VFS-triggered atime updates on reads (the
-            # `file_accessed() → atime_needs_update() → dirty_inode()`
-            # path). It does NOT block explicit `utimensat(2)` metadata
-            # writes, which go through `setattr()`. Our reader refreshes
-            # atime on every chunk read via `os.utime(path, None)` in
-            # `fs_store.get_chunk`, so hot-retention works correctly here.
-            # OpenZFS PR #4482 ("Fix atime handling and relatime") made
-            # this behaviour consistent — atime is handled purely by VFS
-            # and explicit setattr writes are always honoured regardless
-            # of the mount's noatime flag.
-            #
-            # Side effect: `os.utime(path, None)` sets BOTH atime and
-            # mtime to "now" (UTIME_NOW on both). Recently-read chunks
-            # therefore show `atime == mtime` to the nanosecond — that's
-            # expected, not a bug. It also means reads push mtime
-            # forward, so the mtime-based age check below is more
-            # conservative on actively-read content (treats hot chunks
-            # as younger than their original landing time). Replication
-            # is still the absolute gate, so this only relaxes, never
-            # tightens, what we delete.
+            # WRITE recency only: the read path no longer refreshes atime
+            # (fs_store.get_chunk's per-read os.utime was removed — it was
+            # silently dead on read-only mounts and an MDS metadata write
+            # elsewhere; read recency now lives in
+            # fs_cache_inventory.last_access_at via the AccessTracker).
+            # So on this walk path atime/mtime reflect the last WRITE, and
+            # the hot check protects fresh materializations, not active
+            # readers. Read-hot protection is enforced by the SQL-eviction
+            # path, which consults last_access_at; replication remains the
+            # absolute gate for both paths, so this difference only affects
+            # WHEN a part becomes evictable, never whether it is safe.
             try:
                 mtime = part.mtime
                 atime = part.atime
@@ -1796,6 +1762,30 @@ async def cleanup_parts_unified(
         await _flush_backfill()  # final partial batch of kept parts
 
     async def handle(conn: asyncpg.Connection, item: _UnifiedCandidate) -> bool:
+        # F3 read-recency KEEP gate. On this walk path atime/mtime are WRITE recency only — the read
+        # path stopped bumping atime (fs_store.get_chunk's per-read os.utime was removed) and now
+        # records fs_cache_inventory.last_access_at via the AccessTracker. So a part that is actively
+        # READ but not re-written for >gc_max_age (age-GC) or >mpu_stale (stale-reap) would be reaped
+        # and re-hydrated from Arion (read amplification). Protect it here: if it was read within the
+        # effective hot window, KEEP it — regardless of which rule (stale-reap or age-GC) fired.
+        # Gated behind hot_window>0 so CRITICAL pressure (hot_window==0) still reaps, exactly like the
+        # SQL-evict path. A part with NO inventory row (last_access_at NULL/absent) falls through to
+        # the write-recency-only behavior — a missing row is never made un-evictable. The absolute
+        # replication gate below is untouched; this only changes WHEN a part becomes evictable.
+        # TODO: batch this last_access_at lookup across the walk's delete-candidates (mirror the
+        # producer's backfill_batch) rather than one fetchval per candidate. Only delete-candidates —
+        # a small fraction of the O(resident) walk — reach here, so the per-part cost is bounded now.
+        if hot_window > 0:
+            last_access = await conn.fetchval(
+                "SELECT last_access_at FROM fs_cache_inventory "
+                "WHERE object_id = $1 AND object_version = $2 AND part_number = $3",
+                item.object_id,
+                item.object_version,
+                item.part_number,
+            )
+            if last_access is not None and last_access.timestamp() > (now - hot_window):
+                return False  # recently read — hot retention protects it from stale-reap and age-GC
+
         # Evaluate stale-reap FIRST (matches the old serial order: stale phase ran before age-GC,
         # so a part deletable by both is attributed to stale). If stale protects it, fall through
         # to age-GC — a not-replicated part is protected by both, a stale-recent-but-replicated
@@ -1998,14 +1988,24 @@ async def evict_from_inventory(
     async with pool.acquire() as conn:
         cursor = _load_evict_cursor(await get_janitor_state(conn, "sql_evict_cursor"))
 
-    async def handle(conn: asyncpg.Connection, item: tuple[str, int, int]) -> bool:
-        object_id, object_version, part_number = item
+    async def handle(conn: asyncpg.Connection, item: tuple[str, int, int, datetime | None]) -> bool:
+        object_id, object_version, part_number, last_access = item
         st = await asyncio.to_thread(fs_store.stat_part, object_id, object_version, part_number)
         if st is None:
             await clear_cached(conn, object_id, object_version, part_number)  # stale row: self-heal
             return False
-        if hot_window > 0 and st.st_atime > (now - hot_window):
-            return False  # recently read — hot retention protects it (skipped when window==0)
+        if hot_window > 0:
+            # Write recency: atime reflects the last write now that the read
+            # path no longer touches it (fs_store.get_chunk dropped os.utime).
+            if st.st_atime > (now - hot_window):
+                return False
+            # Read recency: recorded by the api's AccessTracker into
+            # last_access_at, carried inline on the candidate row (no per-item
+            # fetchval — the missing-column failure surfaces at discovery, not
+            # here under the pool's per-item swallow). NULL = not read since the
+            # column shipped, which degrades to the old write-recency-only path.
+            if last_access is not None and last_access.timestamp() > (now - hot_window):
+                return False  # recently read — hot retention protects it
         # ABSOLUTE safety gate — identical call to the walk's, never bypassed by the prefilter.
         try:
             fully_replicated = await is_replicated_on_all_backends(conn, object_id, object_version, part_number)
@@ -2025,11 +2025,11 @@ async def evict_from_inventory(
             _janitor_deleted_counter.add(1, attributes={"reason": "sql_evict"})
         return True
 
-    async def candidates(page: list[Any]) -> AsyncIterator[tuple[str, int, int]]:
+    async def candidates(page: list[Any]) -> AsyncIterator[tuple[str, int, int, datetime | None]]:
         for r in page:
             if r["object_id"] in dlq_object_ids:
                 continue  # DLQ-parked: an in-flight op owns this object's data
-            yield (r["object_id"], r["object_version"], r["part_number"])
+            yield (r["object_id"], r["object_version"], r["part_number"], r["last_access_at"])
 
     deleted_total = 0
     pages = 0
@@ -2204,12 +2204,86 @@ async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
 async def run_janitor_loop():
     """Main janitor loop: periodically clean stale and old parts."""
     concurrency = max(1, config.janitor_concurrency)
-    db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=concurrency + 4)
-    fs_store = create_fs_store(config)
-    redis_client = Redis.from_url(config.redis_queues_url)
+    # Pre-declared so _shutdown can tear down exactly what was created — a
+    # mid-setup exception must not skip cleanup (review finding: setup used to
+    # sit outside the try, so a failed constructor leaked the earlier task and
+    # left clients unclosed).
+    db_pool = None
+    redis_client = None
+    cache_redis_client = None
+    queue_sampler_task = None
+    pressure_publish_task = None
 
-    # Initialize janitor-owned OTel metrics
-    _setup_janitor_metrics()
+    async def _shutdown() -> None:
+        # Idempotent teardown shared by the setup-failure path and the main
+        # finally; closures read the current values of the names above.
+        for task in (queue_sampler_task, pressure_publish_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        if cache_redis_client is not None:
+            await cache_redis_client.close()
+        if redis_client is not None:
+            await redis_client.close()
+        if db_pool is not None:
+            await db_pool.close()
+
+    try:
+        db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=concurrency + 4)
+        fs_store = create_fs_store(config)
+        redis_client = Redis.from_url(config.redis_queues_url)
+
+        # Initialize janitor-owned OTel metrics
+        _setup_janitor_metrics()
+
+        # Queue depth/age gauges (2026-07-25 audit: 136k payloads accumulated
+        # unseen in ovh_download_requests). Janitor hosts the sampler because it
+        # is single-instance and already holds the queues-Redis client; the task
+        # runs off the cycle path so a slow walk never blinds the queue gauges.
+        queue_sampler = QueueDepthSampler(redis_client, config)
+        queue_sampler_task = asyncio.create_task(queue_sampler.run())
+
+        # Publish the shared pressure signal (fs_cache:pressure on the CACHE
+        # Redis — where the api middleware and the s3-backup hydrator read it).
+        # Sampled every 30s rather than once per cycle: a mass writer can move
+        # the pool percent materially inside one ~20min cycle. The janitor's own
+        # per-cycle _pressure_mode stays authoritative for eviction pacing; both
+        # key off the same watermarks in hippius_s3.pressure_signal.
+        # create_redis_client (not Redis.from_url): the cache Redis may be a
+        # cluster (cluster=true / redis-cluster URLs) — a standalone client
+        # there gets MOVED errors, every publish fails, and consumers silently
+        # stay on local-only pressure forever. Same factory the api uses.
+        #
+        # ADVISORY-signal isolation: consumers fall back to node-local statvfs on the key's
+        # absence (TTL lapse), so a broken publisher must NOT crashloop the janitor — the one
+        # process that actually frees cache space. This narrow except degrades ONLY the pressure
+        # publisher; the DB pool / fs_store / queues Redis above stay fatal.
+        def _record_pressure_publish() -> None:
+            global _fs_pressure_last_publish_at
+            _fs_pressure_last_publish_at = time.time()
+
+        try:
+            cache_redis_client = create_redis_client(config.redis_url)
+            pressure_publisher = PressurePublisher(
+                cache_redis_client,
+                Path(config.object_cache_dir),
+                mgr_metrics_url=config.janitor_ceph_mgr_metrics_url,
+                pools=config.janitor_ceph_pools.split(","),
+                probe_timeout_seconds=config.janitor_ceph_probe_timeout_seconds,
+                on_publish=_record_pressure_publish,
+            )
+            pressure_publish_task = asyncio.create_task(pressure_publisher.run())
+        except Exception as exc:
+            # fs_cache_pressure_signal_age_seconds stays at -1 and the absence alert fires.
+            logger.warning(
+                "pressure publisher setup failed (%s); janitor continues WITHOUT publishing "
+                "fs_cache:pressure — api pods fall back to node-local statvfs",
+                exc,
+            )
+    except BaseException:
+        await _shutdown()
+        raise
 
     logger.info("Starting janitor service...")
     logger.info(f"FS store root: {config.object_cache_dir}")
@@ -2351,10 +2425,7 @@ async def run_janitor_loop():
             _janitor_phase = 0
             await asyncio.sleep(sleep_interval)
     finally:
-        if redis_client:
-            await redis_client.close()
-        if db_pool:
-            await db_pool.close()
+        await _shutdown()
 
 
 if __name__ == "__main__":

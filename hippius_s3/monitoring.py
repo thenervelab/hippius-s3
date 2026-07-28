@@ -84,6 +84,12 @@ class MetricsCollector:
             name="s3_errors_total", description="Total S3 errors by type", unit="1"
         )
 
+        self.fs_cache_shed_total = self.meter.create_counter(
+            name="fs_cache_shed_total",
+            description="Writes rejected by the FS-cache-pressure gate, by reason and pressure mode",
+            unit="1",
+        )
+
         self.cache_hits = self.meter.create_counter(name="cache_hits_total", description="Total cache hits", unit="1")
 
         self.cache_misses = self.meter.create_counter(
@@ -451,6 +457,16 @@ class MetricsCollector:
 
         self.s3_errors_total.add(1, attributes=attributes)
 
+    def record_fs_cache_shed(self, reason: str, pressure_mode: str) -> None:
+        """Record a write rejected by the FS-cache-pressure gate.
+
+        The gate short-circuits as the OUTERMOST middleware (it must answer before the body is
+        read), so metrics_middleware — the innermost — never runs on a shed request and the 503
+        appears in no request counter. Recording here is what makes a pressure event visible;
+        without it the only evidence is a log line.
+        """
+        self.fs_cache_shed_total.add(1, attributes={"reason": reason, "pressure_mode": pressure_mode})
+
     def record_cache_operation(
         self,
         hit: bool,
@@ -712,6 +728,9 @@ class NullMetricsCollector:
         pass
 
     def record_error(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_fs_cache_shed(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_cache_operation(self, *args: object, **kwargs: object) -> None:

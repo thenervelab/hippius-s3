@@ -8,13 +8,42 @@ spec:
     spec:
       containers:
         - name: gateway
+          # Memory is surge-driven, not a leak. The gateway is a streaming proxy: each
+          # in-flight request is individually bounded, but memory scales with CONCURRENT
+          # streams x buffered bytes, so a request surge costs GB while steady state sits
+          # at 0.4-1.5 GB. Measured 2026-07-26 (container_memory_working_set_bytes, 30s
+          # resolution — a 15min step undersamples these spikes badly and reads ~2.4 GB):
+          #   steady state, 8h+ flat, zero drift ...... 0.56-1.53 GB
+          #   rolling-deploy spike (11:53) ............ 4.10 GB  <- 95.5% of the old 4Gi
+          #   recovery-wave spike (12:19) ............. 4.20 GB  <- OOMKilled, exit 137
+          # Two OOMKills at 12:19 during the #356 recovery wave, then flat again for hours.
+          #
+          # Note the 11:53 number: that spike was the ROLLING DEPLOY itself, not the
+          # incident. Draining one pod shifts its in-flight streams onto the survivors, so
+          # every routine gateway deploy was already running within 4% of the limit. This
+          # is not headroom for one unusual day; the old ceiling was breached by normal ops.
+          #
+          # 8Gi ~= 2x the worst observed spike (the usual rule is p99 + 30-50%, which would
+          # give ~6Gi). Capacity is a non-issue: nodes are 251-377 GB allocatable and the
+          # whole namespace uses ~90 Gi, so 5 x 8Gi is a rounding error.
+          #
+          # Deliberate deviation: the common pattern is memory request == limit (Guaranteed
+          # QoS). Not used here — request==limit would reserve 40 Gi for a fleet that uses
+          # ~5 Gi at rest, and Guaranteed QoS only prevents EVICTION, not container OOMKill,
+          # so it would not have saved these pods. request is set to 3Gi (above the 1.5 GB
+          # steady-state ceiling) purely for scheduler honesty, keeping the pods Burstable.
+          #
+          # This raises the ceiling; it does not bound the cause. The durable fix is a byte
+          # budget with backpressure (Envoy's per_connection_buffer_limit_bytes + watermark
+          # model) rather than a request-count cap — concurrency is the wrong unit when one
+          # request may be a HEAD and the next a 2 GiB GET. Tracked separately.
           resources:
             requests:
               cpu: 500m
-              memory: 2Gi
+              memory: 3Gi
             limits:
               cpu: 2000m
-              memory: 4Gi
+              memory: 8Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
