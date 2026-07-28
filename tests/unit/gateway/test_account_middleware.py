@@ -458,9 +458,7 @@ async def test_can_upload_cache_key_is_per_account(mock_config_no_bypass: Any, m
 
 
 @pytest.mark.asyncio
-async def test_gw4_get_skips_account_fetch_but_put_fetches(
-    mock_config_no_bypass: Any, monkeypatch: Any
-) -> None:
+async def test_gw4_get_skips_account_fetch_but_put_fetches(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
     """GW-4: access-key GET/HEAD carry no credit gate and the API ignores the credit fields, so the
     redis-accounts fetch is skipped on reads; mutating methods still fetch and gate."""
     from gateway.middlewares import account as account_mod
@@ -500,3 +498,103 @@ async def test_gw4_get_skips_account_fetch_but_put_fetches(
         r_put = await client.put("/b/k", content=b"x", headers={"content-length": "1"})
         assert r_put.status_code == 200
         assert calls["n"] == 1, "PUT must still fetch the account for the credit gate"
+
+
+# ---------------------------------------------------------------------------
+# Arion unreachable => transient, not a hard verification failure
+# ---------------------------------------------------------------------------
+
+
+def _http_status_error(status: int) -> httpx.HTTPStatusError:
+    """What ArionClient.can_upload's raise_for_status() produces on an upstream 5xx."""
+    request = httpx.Request("POST", "https://arion.hippius.com/can_upload")
+    response = httpx.Response(status, request=request, text="Next Hop Connection Failed")
+    return httpx.HTTPStatusError("server error", request=request, response=response)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+async def test_arion_5xx_surfaces_slowdown_not_account_verification_error(
+    mock_config_no_bypass: Any, monkeypatch: Any, status: int
+) -> None:
+    """ArionClient.can_upload ends in raise_for_status(), so an upstream 5xx leaves as an
+    exception rather than a CanUploadResponse. That used to skip the transient ladder entirely
+    and land in the blanket `except Exception`, answering AccountVerificationError — a code no
+    S3 SDK knows to retry. Observed on prod when the ATS edge in front of Arion had all next
+    hops down: 5948 such failures in 48h on 2026-07-26..28.
+    """
+    mock_arion = MockArionService(raise_on_can_upload=_http_status_error(status))
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 503
+    assert b"SlowDown" in response.content
+    assert b"AccountVerificationError" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_arion_5xx_is_retried_before_giving_up(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    mock_arion = MockArionService(raise_on_can_upload=_http_status_error(502))
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    # initial attempt + can_upload_transient_retries
+    assert len(mock_arion.can_upload_calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_arion_transport_failure_is_also_transient(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """'Billing backend is unreachable' is not a credit verdict however it manifests."""
+    mock_arion = MockArionService(raise_on_can_upload=httpx.ConnectError("connection refused"))
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 503
+    assert b"SlowDown" in response.content
+
+
+@pytest.mark.asyncio
+async def test_genuine_denial_still_hard_fails(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """Blast-radius guard: only unreachability became transient. A real out-of-credit verdict
+    must stay a 402, never get softened into a retry-forever SlowDown."""
+    mock_arion = MockArionService(allow_upload=False, upload_error="insufficient billing balance")
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 402
+    assert len(mock_arion.can_upload_calls) == 1, "a genuine denial must not be retried"
+
+
+@pytest.mark.asyncio
+async def test_arion_4xx_is_not_treated_as_transient(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """A 4xx from Arion is a bad request on our side, not a blip — it must not be retried into
+    a SlowDown that hides the bug."""
+    mock_arion = MockArionService(raise_on_can_upload=_http_status_error(400))
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 503
+    assert b"AccountVerificationError" in response.content
+
+
+@pytest.mark.asyncio
+async def test_arion_429_is_transient(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """429 is Arion explicitly asking us to back off — the one 4xx that is a blip."""
+    mock_arion = MockArionService(raise_on_can_upload=_http_status_error(429))
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert response.status_code == 503
+    assert b"SlowDown" in response.content

@@ -517,7 +517,13 @@ class ArionClient:
         upload_response.size_bytes = len(file_data)
         return upload_response
 
-    @retry_on_error(retries=3, backoff=5.0)
+    # Unlike every other call on this client, can_upload runs inside the gateway's request path:
+    # account_middleware awaits it before a PUT/POST is allowed through. The shared 3x5s ladder
+    # would pin a worker for 15s per request while the billing backend is down — with a few
+    # hundred concurrent uploads that is the gateway's capacity, spent waiting. Keep it short and
+    # let the caller's own transient-retry loop own the backoff; between them there are still
+    # more attempts than before, inside ~2s instead of 15s.
+    @retry_on_error(retries=1, backoff=0.5)
     async def can_upload(
         self,
         account_ss58: str,
