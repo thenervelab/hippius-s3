@@ -6,11 +6,11 @@ See [../../CLAUDE.md](../../CLAUDE.md) for the full request lifecycle; this file
 
 ## Entry
 
-- [hippius_s3/main.py:237 `factory()`](../main.py) — FastAPI factory.
-- [hippius_s3/main.py:85 `lifespan`](../main.py) — async lifespan that creates:
+- [hippius_s3/main.py:248 `factory()`](../main.py) — FastAPI factory.
+- [hippius_s3/main.py:87 `lifespan`](../main.py) — async lifespan that creates:
   - Postgres pool via [postgres_create_pool](../main.py)
-  - Redis clients (general, accounts, chain, rate-limiting, queues)
-  - Queue/chain/cache client singletons ([main.py:118-128](../main.py))
+  - Redis clients (general, accounts, rate-limiting, queues) ([main.py:104-113](../main.py))
+  - Queue/cache client singletons ([main.py:119-122](../main.py))
   - KMS client via [init_kms_client](../services/kek_service.py) — fail-fast in `required` mode, no-op in `disabled`
   - `app.state.fs_store` (FS cache) via [create_fs_store](../cache/__init__.py)
   - `app.state.obj_cache` = `RedisObjectPartsCache(redis_client, queues_client=redis_queues_client, fs_store=fs_store)` ([main.py:137-141](../main.py))
@@ -19,7 +19,7 @@ See [../../CLAUDE.md](../../CLAUDE.md) for the full request lifecycle; this file
 
 ## Middleware chain
 
-Registered at [main.py:293-299](../main.py). Reverse order means on the request path: `metrics → tracing → parse_internal_headers → ip_whitelist → fs_cache_pressure` (outer → inner).
+Registered at [main.py:304-308](../main.py). Reverse order means on the request path: `metrics → tracing → parse_internal_headers → ip_whitelist → fs_cache_pressure` (outer → inner).
 
 - **`metrics_middleware`** ([hippius_s3/api/middlewares/metrics.py](middlewares/metrics.py)) — OTel request-level metrics.
 - **`tracing_middleware`** ([hippius_s3/api/middlewares/tracing.py](middlewares/tracing.py)) — OTel spans.
@@ -30,22 +30,18 @@ Registered at [main.py:293-299](../main.py). Reverse order means on the request 
 
 ## Routers
 
-Registered at [main.py:357-359](../main.py):
+Registered at [main.py:362-365](../main.py):
 
 - `/user` prefix — [hippius_s3/api/user/](user/) — user-management endpoints (unban, etc.).
+- `/user/sub-tokens` prefix — sub-token scopes router.
 - Public router (no prefix) — [hippius_s3/api/s3/public_router.py](s3/public_router.py) — public-read GET for buckets that allow it.
 - S3 router (no prefix) — [hippius_s3/api/s3/router.py](s3/router.py) — full S3 surface.
 
-Plus: `/robots.txt` ([main.py:317-350](../main.py)) blocks crawlers, `/health` ([main.py:352-355](../main.py)) reports simple status, `/static/...` serves the FastAPI favicon.
+Plus: `/robots.txt` ([main.py:322](../main.py)) blocks crawlers, `/health` ([main.py:357](../main.py)) reports simple status, `/static/...` serves the FastAPI favicon.
 
 ## Global exception handler
 
-[main.py:301-315](../main.py) handles two specific exceptions before falling through:
-
-- `DownloadNotReadyError` or literal `"initial_stream_timeout"` → **503 SlowDown** with "Object not ready for download yet. Please retry."
-- `UnsupportedStorageVersionError` → **501 NotImplemented** with a message asking to migrate to v5.
-
-Everything else re-raises and uvicorn handles it (usually 500).
+[main.py:312-320](../main.py) delegates to `s3_errors.map_read_path_exception(exc)` — a testable pure function in [errors.py](s3/errors.py) that maps the read path (not-ready → 503 SlowDown, pool saturation → 503, key/crypto → 503/500, unsupported storage/suite → 501 NotImplemented, terminal chunk miss → 503 SlowDown). A recognized failure returns a well-formed S3 error; anything else re-raises to uvicorn's 500.
 
 ## S3 surface
 
@@ -68,7 +64,7 @@ Implication: if anything except the gateway could reach the API's port, it could
 ## Gotchas
 
 - **`DownloadNotReadyError` is a plain `Exception` subclass** (see [object_reader.py:31-32](../services/object_reader.py)). The global handler ([main.py:303](../main.py)) also matches the literal string `"initial_stream_timeout"` from another code path — retained for backward compat with tests that raised strings.
-- **PutObject pre-check race**: see [s3/objects/CLAUDE.md](s3/objects/CLAUDE.md) and the `TODO` at [put_object_endpoint.py:105-108](s3/objects/put_object_endpoint.py).
+- **PutObject object identity is DB-atomic**: the old pre-check `SELECT` was removed (WU-3); the endpoint always passes a fresh `candidate_object_id` and trusts the DB-returned id ([put_object_endpoint.py:137-142](s3/objects/put_object_endpoint.py)). See [s3/objects/CLAUDE.md](s3/objects/CLAUDE.md).
 - **CORS on PutBucket**: returns 200 OK for `?cors` query, logs an "Ignored" line, but doesn't store anything. Added in commit `afc0a94` to avoid `BucketAlreadyExists` errors from AWS SDKs attempting to configure CORS on existing buckets.
 - **Lifecycle XML parsed then discarded** — same pattern for `?lifecycle` at [bucket_create_endpoint.py:78](s3/buckets/bucket_create_endpoint.py). See [todo.md](../../todo.md) P2.
 
