@@ -1742,6 +1742,30 @@ async def cleanup_parts_unified(
         await _flush_backfill()  # final partial batch of kept parts
 
     async def handle(conn: asyncpg.Connection, item: _UnifiedCandidate) -> bool:
+        # F3 read-recency KEEP gate. On this walk path atime/mtime are WRITE recency only — the read
+        # path stopped bumping atime (fs_store.get_chunk's per-read os.utime was removed) and now
+        # records fs_cache_inventory.last_access_at via the AccessTracker. So a part that is actively
+        # READ but not re-written for >gc_max_age (age-GC) or >mpu_stale (stale-reap) would be reaped
+        # and re-hydrated from Arion (read amplification). Protect it here: if it was read within the
+        # effective hot window, KEEP it — regardless of which rule (stale-reap or age-GC) fired.
+        # Gated behind hot_window>0 so CRITICAL pressure (hot_window==0) still reaps, exactly like the
+        # SQL-evict path. A part with NO inventory row (last_access_at NULL/absent) falls through to
+        # the write-recency-only behavior — a missing row is never made un-evictable. The absolute
+        # replication gate below is untouched; this only changes WHEN a part becomes evictable.
+        # TODO: batch this last_access_at lookup across the walk's delete-candidates (mirror the
+        # producer's backfill_batch) rather than one fetchval per candidate. Only delete-candidates —
+        # a small fraction of the O(resident) walk — reach here, so the per-part cost is bounded now.
+        if hot_window > 0:
+            last_access = await conn.fetchval(
+                "SELECT last_access_at FROM fs_cache_inventory "
+                "WHERE object_id = $1 AND object_version = $2 AND part_number = $3",
+                item.object_id,
+                item.object_version,
+                item.part_number,
+            )
+            if last_access is not None and last_access.timestamp() > (now - hot_window):
+                return False  # recently read — hot retention protects it from stale-reap and age-GC
+
         # Evaluate stale-reap FIRST (matches the old serial order: stale phase ran before age-GC,
         # so a part deletable by both is attributed to stale). If stale protects it, fall through
         # to age-GC — a not-replicated part is protected by both, a stale-recent-but-replicated
