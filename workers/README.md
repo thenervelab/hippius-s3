@@ -13,6 +13,9 @@ Background workers that process async operations via Redis queues. Each worker r
 | Account Cacher | `run_account_cacher_in_loop.py` | N/A (scheduled) | Single instance | Warm account credit cache in Redis |
 | Orphan Checker | `run_orphan_checker_in_loop.py` | N/A (scheduled) | Single instance | Detect blockchain orphan files, enqueue cleanup |
 | Migrator | `run_migrator_once.py` | N/A (one-shot) | One-shot | Run DB migrations on startup, then exit |
+| Downloader (v2) | `run_downloader_in_loop.py` | `arion_download_requests` | Horizontal | Backend-agnostic downloader entry point |
+| Unpinner (v2) | `run_unpinner_in_loop.py` | `{backend}_unpin_requests` | Single instance | Backend-agnostic unpin entry point |
+| MPU Reaper | `run_mpu_reaper_in_loop.py` | N/A (polling) | Single instance | Reaps abandoned in-flight multipart uploads |
 
 ### Scaling Notes
 
@@ -20,7 +23,7 @@ The uploader and unpinner must run as single instances to avoid exceeding Hippiu
 
 ## Data Flow
 
-**Upload path**: Client write → API write pipeline → chunks to Redis queue + FS cache → Arion uploader dequeues → uploads to Arion → publishes to Hippius blockchain
+**Upload path (drain-direct, s3-2.1)**: Client write → API write pipeline → chunks to the **api-local SSD** FS cache (the API no longer enqueues the backend upload at PUT/MPU-complete) → the Rust **drain-agent** replicates each part SSD→CephFS and `LPUSH`es one `UploadChainRequest` per part to `arion_upload_requests` (sole producer) → Arion uploader dequeues → uploads to Arion → publishes to Hippius blockchain
 
 **Download path**: Client read → API read pipeline → check FS cache → cache miss enqueues to Redis → Arion downloader fetches from Arion → caches locally → streams to client
 
@@ -30,9 +33,9 @@ The uploader and unpinner must run as single instances to avoid exceeding Hippiu
 
 Workers use a retry strategy with exponential backoff:
 
-- **Transient failures** (network timeouts, 5xx responses): Retry with backoff up to `HIPPIUS_UPLOADER_MAX_ATTEMPTS` (default: 2) or `HIPPIUS_UNPINNER_MAX_ATTEMPTS` (default: 5)
+- **Transient failures** (network timeouts, 5xx responses): Retry with backoff up to `HIPPIUS_UPLOADER_MAX_ATTEMPTS` (default: 7) or `HIPPIUS_UNPINNER_MAX_ATTEMPTS` (default: 5)
 - **Permanent failures** (4xx responses, data corruption): Move to Dead Letter Queue (DLQ)
-- **DLQ persistence**: Failed operations saved to filesystem at `HIPPIUS_DLQ_DIR` (default: `/tmp/hippius_dlq`)
+- **DLQ persistence**: Failed operations are `LPUSH`ed onto a Redis list on `redis-queues` (`{backend}_upload_requests:dlq`, `unpin_requests:dlq`), not the filesystem — see `hippius_s3/dlq/base.py:85`. (`HIPPIUS_DLQ_DIR` still exists in config but is not the DLQ store.)
 
 Requeue DLQ entries with:
 ```bash
@@ -45,7 +48,7 @@ Key environment variables for workers:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HIPPIUS_UPLOADER_MAX_ATTEMPTS` | `2` | Max retry attempts for uploads |
+| `HIPPIUS_UPLOADER_MAX_ATTEMPTS` | `7` | Max retry attempts for uploads |
 | `HIPPIUS_UPLOADER_BACKOFF_BASE_MS` | `100` | Base backoff delay (ms) |
 | `HIPPIUS_UPLOADER_BACKOFF_MAX_MS` | `500` | Max backoff delay (ms) |
 | `HIPPIUS_UNPINNER_MAX_ATTEMPTS` | `5` | Max retry attempts for unpins |

@@ -66,7 +66,11 @@ async def metrics_middleware(
             span.set_attribute("timing.gateway_overhead_ms", request.state.gateway_overhead_ms)
             span.set_attribute("timing.body_streaming_ms", max(0.0, body_streaming_ms))
 
-    if response.status_code >= 400:
+    # 499 is "client closed the request before we answered" (see ForwardService). It is a client
+    # abort, not an error we served, and it is high-volume — counting it would put ~13k events/48h
+    # onto the gateway error-rate panels that were previously never recorded at all, because the
+    # exception used to escape before this middleware ran.
+    if response.status_code >= 400 and response.status_code != 499:
         error_type = f"http_{response.status_code}"
 
         collector.record_error(

@@ -9,6 +9,13 @@ from lxml import etree as ET  # ty: ignore[unresolved-import]
 from hippius_s3.db_pool import PoolAcquireTimeout
 
 
+# Non-standard status (nginx) for "client closed the request before we answered". Nothing is
+# written to the socket on this path — the peer is already gone — so it exists only to classify
+# the abort for our own logs and metrics instead of letting an exception escape as a 500.
+# The gateway's ForwardService uses the same value for the same event at its hop.
+CLIENT_CLOSED_REQUEST = 499
+
+
 class S3Error(Exception):
     """Exception class for S3-specific errors."""
 

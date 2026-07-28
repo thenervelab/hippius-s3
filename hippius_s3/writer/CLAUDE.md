@@ -32,7 +32,7 @@ _(`queue.py` was removed: its `enqueue_upload` was the dead PUT-path upload prod
 7. **Write FS meta** via `WriteThroughPartsWriter.write_meta` ([line 420](object_writer.py)). `meta.json` is the "part is complete" signal for readers. Must land AFTER every chunk is safely on disk — otherwise readers could see a completed part with missing chunks.
 8. **Update object_versions** with final `size_bytes`, `md5_hash`, `content_type`, `metadata`, `updated_at` ([line 442](object_writer.py)). **Until this runs, the version is invisible to downloads** (the download query filters `size_bytes=0 AND md5=""` to avoid serving reserved-but-incomplete rows).
 9. **Upsert upload row + part placeholder** ([line 455-474](object_writer.py)) — links the object_version to a multipart_uploads row (used for append and MPU; simple PUT still creates one for structural consistency).
-10. **Return `PutResult`**. The endpoint then enqueues to `arion_upload_requests`.
+10. **Return `PutResult`**. The endpoint does NOT enqueue the backend upload (drain-direct cutover) — it persists the version address (`set_object_version_address`); the Rust drain replicates the part to Ceph and LPUSHes the `UploadChainRequest` to `{backend}_upload_requests` itself, as the sole producer (see line 18).
 
 ## Multipart upload
 

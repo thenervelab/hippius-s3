@@ -561,6 +561,60 @@ groups:
         labels:
           severity: critical
 
+      # fs_cache:pressure signal staleness/absence. The janitor is the SOLE publisher of the
+      # shared fs_cache:pressure key (30s interval, 120s TTL); every api pod reads it to shed PUTs
+      # when the BACKING POOL fills — the node-local statvfs check alone misses that (2026-07-24).
+      # fs_cache_pressure_signal_age_seconds is seconds since the last SUCCESSFUL publish: it climbs
+      # once publishes fail (cache Redis down / MOVED / stalled publisher). 180 > the 120s TTL, so a
+      # breach means the key has ALREADY expired and consumers have silently reverted to statvfs.
+      # noDataState: Alerting is load-bearing — if the janitor DIES the gauge stops being scraped
+      # entirely (no threshold breach possible), so absence itself must page, same as s3-system-down.
+      - uid: fs-cache-pressure-signal-stale
+        title: FS Cache Pressure Signal Stale - API Pods on Local statvfs Only
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'max(fs_cache_pressure_signal_age_seconds{job="otel-collector"})'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 180
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: Alerting
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: 'Last successful fs_cache:pressure publish was {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }}s ago (key TTL is 120s). The janitor is the only publisher — if it died or every publish is failing (cache Redis down / MOVED), the key has expired and every api pod reverted to its node-local statvfs check, which is blind to the backing Ceph pool filling (2026-07-24). Check the janitor pod and the cache Redis; look for the "pressure publish failed" / "pressure publisher setup failed" warnings.'
+          summary: API pods silently fell back to node-local statvfs; disk-fill protection degraded.
+        labels:
+          severity: critical
+
       # G2 replication-gate sentinel. janitor_underreplicated_live_chunks counts live,
       # serveable chunks lacking full-union backend coverage — the exact chunks the janitor
       # gate refuses to reclaim, so any nonzero value is a standing data-loss risk (a chunk

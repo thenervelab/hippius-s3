@@ -61,6 +61,7 @@ Sources: [AWS S3 API Reference (April 2026)](https://docs.aws.amazon.com/AmazonS
 | DeleteObject | ✅ | ✅ | ✅ | |
 | DeleteObjects (batch) | ✅ | ✅ | ✅ | |
 | CopyObject | ✅ | ✅ | ✅ | |
+| ListObjects / ListObjectsV2 | ✅ | ✅ | ✅ | Hippius V2: Delimiter/CommonPrefixes, ContinuationToken, StartAfter, real IsTruncated |
 | RenameObject | ⚠️ | ❌ | ❌ | S3 Express One Zone only [8] |
 | GetObjectAttributes | ✅ | ❌ | ❌ | |
 | RestoreObject | ✅ | ❌ | ❌ | Glacier retrieval |
@@ -72,7 +73,7 @@ Sources: [AWS S3 API Reference (April 2026)](https://docs.aws.amazon.com/AmazonS
 | User Metadata (`x-amz-meta-*`) | ✅ | ✅ | ✅ | |
 | Object Tagging (Get/Put/Delete) | ✅ | ❌ | ✅ | |
 | Range Requests | ✅ | ✅ | ✅ | |
-| Conditional Reads (If-Match etc.) | ✅ | ✅ | ❌ | |
+| Conditional Reads (If-Match etc.) | ✅ | ✅ | ⚠️ | Hippius: If-None-Match on GET/HEAD (304); If-Match not supported |
 | Conditional Writes (If-None-Match) | ✅ | ✅ | ❌ | |
 | Conditional Deletes (If-Match) | ✅ | ❌ | ❌ | |
 | ETag (MD5) | ✅ | ✅ | ✅ | |

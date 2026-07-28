@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 from typing import AsyncGenerator
+from typing import Awaitable
+from typing import Callable
 
 from fastapi import Response
 from fastapi.responses import StreamingResponse
@@ -47,6 +49,10 @@ class StreamContext:
     suite_id: str | None
     bucket_id: str
     upload_id: str
+    # F1: idempotent per-part re-enqueue hook the streamer calls when a chunk is missing from FS at
+    # stream time (e.g. the janitor evicted a still-to-be-streamed part on a cache-source read). None
+    # for non-streaming callers (HEAD/copy) that never hit the streamer miss path.
+    ensure_part_download: Callable[[int], Awaitable[None]] | None = None
 
 
 # RQ-4: compare-and-delete Lua — delete the coalesce lock only while it still holds our token, so we
@@ -82,33 +88,27 @@ async def _release_coalesce_locks(
 _CID_ADDRESSED_BACKENDS: frozenset[str] = frozenset({"ipfs"})
 
 
-async def _enqueue_missing_downloads(
+async def _enqueue_download_for_parts(
     db: Any,
     redis: Any,
     info: dict,
     *,
     object_version: int,
     storage_version: int,
-    plan: list[ChunkPlanItem],
-    exist_results: list[bool],
+    indices_by_part: dict[int, set[int]],
     address: str,
     cfg: Any,
 ) -> None:
-    """Enqueue a DownloadChainRequest for the chunks in `plan` that are missing from the FS cache.
+    """Coalesce-lock the given parts and enqueue ONE DownloadChainRequest for the un-coalesced ones.
 
-    Coalesces concurrent misses per (object_id, version, part) via a Redis NX lock so only one
-    streamer enqueues; the rest wait on the downloader's pub/sub notification. Shared by the primary
-    read path AND the envelope-race version fallback — the fallback used to return a `pipeline`
-    source without enqueuing anything, so a cold read of the fallback version hung on pub/sub until
-    the wait timed out.
+    Shared core of three call sites: the primary cold-read miss, the envelope-race version fallback,
+    and F1's mid-stream re-enqueue (`ensure_part_download_enqueued`). Idempotent: the per-part SET NX
+    lock guarantees only one enqueue per (object_id, version, part) until the lock TTL, so calling it
+    again for a part already being fetched is a no-op.
     """
-    object_id = info["object_id"]
-    indices_by_part: dict[int, set[int]] = {}
-    for item, cached in zip(plan, exist_results, strict=True):
-        if not cached:
-            indices_by_part.setdefault(int(item.part_number), set()).add(int(item.chunk_index))
     if not indices_by_part:
         return
+    object_id = info["object_id"]
 
     # Coalesce concurrent misses on the same part: only one streamer
     # actually enqueues a download request per (object_id, version, part).
@@ -211,6 +211,75 @@ async def _enqueue_missing_downloads(
         await enqueue_download_request(req)
 
 
+async def _enqueue_missing_downloads(
+    db: Any,
+    redis: Any,
+    info: dict,
+    *,
+    object_version: int,
+    storage_version: int,
+    plan: list[ChunkPlanItem],
+    exist_results: list[bool],
+    address: str,
+    cfg: Any,
+) -> None:
+    """Enqueue a DownloadChainRequest for the chunks in `plan` that are missing from the FS cache.
+
+    Coalesces concurrent misses per (object_id, version, part) via a Redis NX lock so only one
+    streamer enqueues; the rest wait on the downloader's pub/sub notification. Shared by the primary
+    read path AND the envelope-race version fallback — the fallback used to return a `pipeline`
+    source without enqueuing anything, so a cold read of the fallback version hung on pub/sub until
+    the wait timed out.
+    """
+    indices_by_part: dict[int, set[int]] = {}
+    for item, cached in zip(plan, exist_results, strict=True):
+        if not cached:
+            indices_by_part.setdefault(int(item.part_number), set()).add(int(item.chunk_index))
+    await _enqueue_download_for_parts(
+        db,
+        redis,
+        info,
+        object_version=object_version,
+        storage_version=storage_version,
+        indices_by_part=indices_by_part,
+        address=address,
+        cfg=cfg,
+    )
+
+
+async def ensure_part_download_enqueued(
+    db: Any,
+    redis: Any,
+    info: dict,
+    *,
+    object_version: int,
+    storage_version: int,
+    part_number: int,
+    chunk_indices: set[int],
+    address: str,
+    cfg: Any,
+) -> None:
+    """F1: idempotently ensure `part_number`'s `chunk_indices` are being fetched to the FS cache.
+
+    Called by the streamer when a chunk is missing at stream time. Enqueues the WHOLE part's needed
+    chunks (not just the one that missed) so a mid-stream eviction of a multi-chunk part is refetched
+    in one DCR. Idempotent via the same per-part coalesce lock as the cold-read path, so a part
+    already in flight (e.g. enqueued by `build_stream_context`) is not re-enqueued.
+    """
+    if not chunk_indices:
+        return
+    await _enqueue_download_for_parts(
+        db,
+        redis,
+        info,
+        object_version=object_version,
+        storage_version=storage_version,
+        indices_by_part={int(part_number): {int(i) for i in chunk_indices}},
+        address=address,
+        cfg=cfg,
+    )
+
+
 async def build_stream_context(
     db: Any,
     redis: Any,
@@ -224,6 +293,30 @@ async def build_stream_context(
     cfg = get_config()
     storage_version = require_supported_storage_version(int(info["storage_version"]))
     # v4-only policy: always decrypt at read time.
+
+    def _make_ensure_part(
+        info_local: dict, ov_local: int, plan_local: list[ChunkPlanItem]
+    ) -> Callable[[int], Awaitable[None]]:
+        # Precompute the plan's needed chunk indices per part so a mid-stream miss re-enqueues the
+        # whole part (all chunks this stream still needs), not just the one chunk that missed.
+        idx_by_part: dict[int, set[int]] = {}
+        for it in plan_local:
+            idx_by_part.setdefault(int(it.part_number), set()).add(int(it.chunk_index))
+
+        async def _ensure(part_number: int) -> None:
+            await ensure_part_download_enqueued(
+                db,
+                redis,
+                info_local,
+                object_version=ov_local,
+                storage_version=storage_version,
+                part_number=int(part_number),
+                chunk_indices=idx_by_part.get(int(part_number), set()),
+                address=address,
+                cfg=cfg,
+            )
+
+        return _ensure
 
     ov = int(info.get("object_version") or info.get("current_object_version") or 1)
     # RD-3: the GET endpoint already built the parts catalog; reuse it instead of re-reading. HEAD and
@@ -325,6 +418,7 @@ async def build_stream_context(
                     suite_id=suite_id,
                     bucket_id=bucket_id,
                     upload_id=str(info.get("upload_id") or ""),
+                    ensure_part_download=_make_ensure_part(info, object_version, plan),
                 )
         raise RuntimeError("v5_missing_envelope_metadata")
     kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
@@ -341,6 +435,7 @@ async def build_stream_context(
         suite_id=suite_id,
         bucket_id=bucket_id,
         upload_id=upload_id,
+        ensure_part_download=_make_ensure_part(info, object_version, plan),
     )
 
 
@@ -382,6 +477,7 @@ async def read_response(
         bucket_name=str(info.get("bucket_name", "")),
         prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
         chunk_timeout=float(cfg.stream_chunk_timeout_seconds),
+        ensure_part_fn=ctx.ensure_part_download,
     )
     # A2: bound the wait for the FIRST chunk. `stream_plan` otherwise waits up to cache_ttl_seconds
     # (~1h) per chunk, so an un-drained object whose part is on no backend yet would hang the whole
@@ -486,6 +582,7 @@ async def stream_object(
         bucket_name=str(info.get("bucket_name", "")),
         prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
         chunk_timeout=float(cfg.stream_chunk_timeout_seconds),
+        ensure_part_fn=ctx.ensure_part_download,
     )
     if not bound_first_chunk:
         return gen

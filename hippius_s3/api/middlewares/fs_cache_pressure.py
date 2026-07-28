@@ -9,6 +9,7 @@ from fastapi import Response
 
 from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.fs_pressure import should_reject_fs_cache_write
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.pressure_signal import get_published_pressure_mode
 
 
@@ -63,6 +64,14 @@ async def fs_cache_pressure_middleware(
     reject, retry_after, pressure, reason = should_reject_fs_cache_write(config=config, published_mode=published_mode)
     if not reject:
         return await call_next(request)
+
+    # This middleware is registered LAST, i.e. it is the OUTERMOST — it has to answer before the
+    # body is read. metrics_middleware is registered first, i.e. innermost, so it never runs on a
+    # shed request: the 503 lands in no request counter and no error counter on either side (the
+    # gateway just proxies it through). Record it here or a pressure event is invisible outside
+    # the log line below.
+    # Both labels are bounded: reason is threshold|pool, published_mode is 0|1|2|None.
+    get_metrics_collector().record_fs_cache_shed(reason=reason, pressure_mode=str(published_mode))
 
     # IMPORTANT: return BEFORE reading request body to avoid moving pressure to RAM.
     logger.warning(

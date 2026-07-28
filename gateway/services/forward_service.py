@@ -5,12 +5,20 @@ import typing
 
 import httpx
 from fastapi import Request
+from fastapi import Response
 from fastapi.responses import StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from hippius_s3.monitoring import get_metrics_collector
 
 
 logger = logging.getLogger(__name__)
+
+# Non-standard status used by nginx for "client closed the request before we answered".
+# Nothing is written to the socket — uvicorn's send() short-circuits on a disconnected peer, so
+# this never reaches the access log either. It exists purely so the gateway's own audit/metrics
+# middlewares see a classified response instead of an exception tearing through the stack.
+_CLIENT_CLOSED_REQUEST = 499
 
 # Methods that are safe to re-send when the upstream connection dies before any response
 # byte exists. Deliberately excludes DELETE: it is idempotent by S3 semantics, but a retry
@@ -103,7 +111,7 @@ class ForwardService:
         )
         logger.info(f"ForwardService initialized with backend: {backend_url}")
 
-    async def forward_request(self, request: Request) -> StreamingResponse:
+    async def forward_request(self, request: Request) -> Response:
         headers = dict(request.headers)
 
         # SECURITY: Strip any client-provided X-Hippius-* headers to prevent header injection attacks
@@ -162,6 +170,34 @@ class ForwardService:
             try:
                 upstream_response = await stream_cm.__aenter__()
                 break
+            except ClientDisconnect:
+                # The client hung up while we were still pumping its body upstream. This is normal
+                # client behaviour (SDK timeout, ^C, reset), not a server fault, and it is not
+                # retryable — request.stream() is one-shot. Letting it escape makes uvicorn log a
+                # full middleware-deep ASGI traceback and ship it to Sentry, which drowns the real
+                # 5xx. Measured on prod 2026-07-26..28: 13650 of these in 48h, ~71% of all gateway
+                # ASGI exceptions, and ~9% of one customer's part uploads.
+                #
+                # WARNING rather than INFO on purpose: an abort is not always the client's fault.
+                # The API can answer early (fs_cache_pressure sheds PUTs with a 503 before reading
+                # the body), but httpx will not surface that response until the whole body is sent,
+                # so our own backpressure reaches this same branch looking like a client abort.
+                # Losing the ERROR that used to fire here must not mean losing the signal entirely.
+                logger.warning(
+                    "Client disconnected while sending request body: %s %s (%d bytes received, no upstream response)",
+                    request.method,
+                    request.url.path,
+                    bytes_received,
+                )
+                # Ingress already pulled off the client still counts. This is the only place it can
+                # be recorded — iter_upstream()'s finally, which normally does it, never runs here.
+                get_metrics_collector().record_gateway_bandwidth(
+                    bytes_received=bytes_received,
+                    bytes_sent=0,
+                    method=request.method,
+                    status_code=_CLIENT_CLOSED_REQUEST,
+                )
+                return Response(status_code=_CLIENT_CLOSED_REQUEST)
             except (httpx.RemoteProtocolError, httpx.ConnectError) as exc:
                 if not can_retry or attempt == 1:
                     raise

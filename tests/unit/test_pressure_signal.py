@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 
 import hippius_s3.pressure_signal as ps
 from hippius_s3.fs_pressure import should_reject_fs_cache_write
@@ -14,6 +17,7 @@ from hippius_s3.pressure_signal import PRESSURE_TTL_SECONDS
 from hippius_s3.pressure_signal import PressurePublisher
 from hippius_s3.pressure_signal import compute_mode
 from hippius_s3.pressure_signal import get_published_pressure_mode
+from workers import run_janitor_in_loop as janitor
 
 
 class FakeRedis:
@@ -55,6 +59,7 @@ def _reset_consumer_memo():
 
 # ------------------------------------------------------------------ compute_mode
 
+
 def test_compute_mode_enter_and_exit_hysteresis():
     assert compute_mode(0.5, 0) == 0
     assert compute_mode(0.86, 0) == 1
@@ -68,13 +73,12 @@ def test_compute_mode_enter_and_exit_hysteresis():
 
 # ------------------------------------------------------------------ publisher
 
+
 @pytest.mark.asyncio
 async def test_publish_once_sets_key_with_ttl(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("hippius_s3.pressure_signal.shutil.disk_usage", lambda p: _usage(96, 100))
     redis = FakeRedis()
-    pub = PressurePublisher(
-        redis, tmp_path, mgr_metrics_url="", pools=[], probe_timeout_seconds=1.0
-    )
+    pub = PressurePublisher(redis, tmp_path, mgr_metrics_url="", pools=[], probe_timeout_seconds=1.0)
 
     await pub.publish_once()
 
@@ -95,9 +99,7 @@ async def test_publish_skipped_when_statvfs_fails(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr("hippius_s3.pressure_signal.shutil.disk_usage", _boom)
     redis = FakeRedis()
-    pub = PressurePublisher(
-        redis, tmp_path, mgr_metrics_url="", pools=[], probe_timeout_seconds=1.0
-    )
+    pub = PressurePublisher(redis, tmp_path, mgr_metrics_url="", pools=[], probe_timeout_seconds=1.0)
 
     await pub.publish_once()
 
@@ -106,15 +108,51 @@ async def test_publish_skipped_when_statvfs_fails(monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_publisher_hysteresis_across_ticks(monkeypatch, tmp_path: Path):
-    ratios = iter([0.96, 0.94, 0.92])
-    monkeypatch.setattr(
-        "hippius_s3.pressure_signal.shutil.disk_usage", lambda p: _usage(int(next(ratios) * 100), 100)
-    )
+async def test_publish_invokes_on_publish_callback(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("hippius_s3.pressure_signal.shutil.disk_usage", lambda p: _usage(50, 100))
+    stamps: list[float] = []
     redis = FakeRedis()
     pub = PressurePublisher(
-        redis, tmp_path, mgr_metrics_url="", pools=[], probe_timeout_seconds=1.0
+        redis,
+        tmp_path,
+        mgr_metrics_url="",
+        pools=[],
+        probe_timeout_seconds=1.0,
+        on_publish=lambda: stamps.append(1.0),
     )
+
+    await pub.publish_once()
+
+    # Freshness gauge is fed only on a real SET landing on the key.
+    assert len(redis.set_calls) == 1
+    assert stamps == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_on_publish_not_invoked_when_publish_skipped(monkeypatch, tmp_path: Path):
+    def _boom(p):
+        raise OSError("mount gone")
+
+    monkeypatch.setattr("hippius_s3.pressure_signal.shutil.disk_usage", _boom)
+    stamps: list[float] = []
+    redis = FakeRedis()
+    pub = PressurePublisher(
+        redis, tmp_path, mgr_metrics_url="", pools=[], probe_timeout_seconds=1.0, on_publish=lambda: stamps.append(1.0)
+    )
+
+    await pub.publish_once()
+
+    # No SET landed, so freshness must not advance (that would mask a dead signal).
+    assert redis.set_calls == []
+    assert stamps == []
+
+
+@pytest.mark.asyncio
+async def test_publisher_hysteresis_across_ticks(monkeypatch, tmp_path: Path):
+    ratios = iter([0.96, 0.94, 0.92])
+    monkeypatch.setattr("hippius_s3.pressure_signal.shutil.disk_usage", lambda p: _usage(int(next(ratios) * 100), 100))
+    redis = FakeRedis()
+    pub = PressurePublisher(redis, tmp_path, mgr_metrics_url="", pools=[], probe_timeout_seconds=1.0)
 
     await pub.publish_once()  # 0.96 -> 2
     await pub.publish_once()  # 0.94 holds 2 (exit is 0.93)
@@ -124,7 +162,60 @@ async def test_publisher_hysteresis_across_ticks(monkeypatch, tmp_path: Path):
     assert modes == [2, 2, 1]
 
 
+# The mgr pool series shape (pool 5 fullest at ~95%), mirrored from test_janitor_pool_gate.
+_HEALTHY = "ceph_cluster_total_bytes 115222679470080.0\nceph_cluster_total_used_bytes 31791022084096.0\n"
+_POOL_SERIES = (
+    'ceph_pool_metadata{pool_id="5",name="ceph-filesystem-data0",type="replicated"} 1.0\n'
+    'ceph_pool_percent_used{pool_id="5"} 0.9600000000000000\n'
+)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_publish_reflects_pool_ratio_when_it_exceeds_local(monkeypatch, tmp_path: Path):
+    """With a configured mgr URL the published mode must track the fullest pool,
+    not the local NVMe: ratio = max(local, pool). Local is calm (10%) but the
+    backing pool is at the cliff (96%) — the exact 2026-07-24 blind spot. Reducing
+    the max() back to `local` would publish mode 0 here."""
+    url = "http://mgr.test/metrics"
+    monkeypatch.setattr("hippius_s3.pressure_signal.shutil.disk_usage", lambda p: _usage(10, 100))
+    respx.get(url).mock(return_value=httpx.Response(200, text=_HEALTHY + _POOL_SERIES))
+    redis = FakeRedis()
+    pub = PressurePublisher(
+        redis, tmp_path, mgr_metrics_url=url, pools=["ceph-filesystem-data0"], probe_timeout_seconds=2.0
+    )
+
+    await pub.publish_once()
+
+    assert len(redis.set_calls) == 1
+    payload = json.loads(redis.set_calls[0][1])
+    assert payload["mode"] == 2  # driven by the 96% pool, not the 10% local disk
+    assert payload["ratio"] == pytest.approx(0.96)
+
+
+# ------------------------------------------------------------------ janitor staleness gauge
+
+
+def test_pressure_signal_age_gauge_before_first_publish(monkeypatch):
+    """No successful publish yet reads as -1 (matches the cycle-age gauge convention),
+    below the alert threshold so a fresh janitor does not self-page."""
+    monkeypatch.setattr(janitor, "_fs_pressure_last_publish_at", 0.0)
+    (obs,) = janitor._obs_pressure_signal_age(None)
+    assert obs.value == -1.0
+
+
+def test_pressure_signal_age_gauge_after_publish(monkeypatch):
+    """A recorded publish makes the gauge report a small, non-negative age — this is the
+    freshness the absence alert watches; it climbs past the TTL once publishes stop."""
+    import time as _time
+
+    monkeypatch.setattr(janitor, "_fs_pressure_last_publish_at", _time.time())
+    (obs,) = janitor._obs_pressure_signal_age(None)
+    assert 0.0 <= obs.value < 5.0
+
+
 # ------------------------------------------------------------------ consumer
+
 
 @pytest.mark.asyncio
 async def test_consumer_reads_published_mode():
@@ -164,6 +255,17 @@ async def test_consumer_holds_last_good_mode_on_read_error():
 
 
 @pytest.mark.asyncio
+async def test_consumer_last_good_expires_past_ttl_on_read_error():
+    """last-good only survives a read ERROR *within* the publish TTL — once it
+    ages past PRESSURE_TTL_SECONDS a dead Redis must fall back to None, never
+    pin a stale mode-2 forever (dropping the `< PRESSURE_TTL_SECONDS` clause)."""
+    ps._published_cache = (None, -100.0)  # memo expired → force a fresh read
+    ps._last_good = (2, time.monotonic() - PRESSURE_TTL_SECONDS - 5.0)  # aged past the TTL
+    redis = FakeRedis(fail=True)
+    assert await get_published_pressure_mode(redis) is None
+
+
+@pytest.mark.asyncio
 async def test_consumer_key_absence_is_not_masked_by_last_good():
     """Key ABSENCE is the publisher's honest 'signal unavailable' — last-good
     must not override it (that's how a retired publisher would haunt the gate)."""
@@ -177,6 +279,7 @@ async def test_consumer_key_absence_is_not_masked_by_last_good():
 
 # ------------------------------------------------------------------ fs_pressure integration
 
+
 def _config(tmp_path: Path):
     from types import SimpleNamespace
 
@@ -189,9 +292,7 @@ def _config(tmp_path: Path):
 
 
 def test_reject_on_published_critical_even_with_local_headroom(tmp_path: Path):
-    reject, retry_after, _pressure, reason = should_reject_fs_cache_write(
-        config=_config(tmp_path), published_mode=2
-    )
+    reject, retry_after, _pressure, reason = should_reject_fs_cache_write(config=_config(tmp_path), published_mode=2)
     assert reject is True
     assert reason == "pool"
     assert retry_after >= 1.0
