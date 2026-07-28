@@ -226,9 +226,16 @@ class ForwardService:
                     method=request.method,
                     status_code=upstream_response.status_code,
                 )
-                # Detect truncated responses before uvicorn raises RuntimeError
+                # Detect truncated responses before uvicorn raises RuntimeError.
+                # Skip replies that carry a Content-Length but legitimately have NO body, or this
+                # fires on every one of them: a HEAD reply advertises the length GET *would* return
+                # (RFC 9110 9.3.2) and 204/304 are defined bodyless, so bytes_sent is always 0 and
+                # always < Content-Length. That was ~561-1373/hr of pure noise on this gateway,
+                # which is enough to bury the genuine mid-stream truncations this line exists to
+                # surface — on 2026-07-28 a real one was indistinguishable from the HEAD chatter.
                 expected_raw = upstream_response.headers.get("content-length")
-                if expected_raw and bytes_sent < int(expected_raw):
+                bodyless = request.method == "HEAD" or upstream_response.status_code in (204, 304)
+                if not bodyless and expected_raw and bytes_sent < int(expected_raw):
                     logger.warning(
                         "Incomplete upstream stream: sent=%d expected=%s method=%s path=%s status=%d",
                         bytes_sent,
