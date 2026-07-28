@@ -217,12 +217,18 @@ class FileSystemPartsStore:
         """
         part_dir = Path(self.part_path(object_id, object_version, part_number))
         meta_path = self._meta_file(part_dir)
-
-        if not meta_path.exists():
-            return False
-
         chunk_path = self._chunk_file(part_dir, chunk_index)
-        return chunk_path.exists()
+
+        # Threaded like every other stat in this store: each exists() is a CephFS metadata
+        # round-trip, and the streamer's mid-stream-miss check now calls this once per chunk
+        # on every read, so doing it inline would block the API event loop for all requests
+        # on the pod. Path building above is pure CPU and stays out of the thread.
+        def _check() -> bool:
+            if not meta_path.exists():
+                return False
+            return chunk_path.exists()
+
+        return await asyncio.to_thread(_check)
 
     async def chunks_exist_batch(
         self, object_id: str, object_version: int, checks: list[tuple[int, int]]
