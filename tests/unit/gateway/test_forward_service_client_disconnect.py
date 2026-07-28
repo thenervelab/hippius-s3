@@ -3,7 +3,8 @@
 `request.stream()` raises ClientDisconnect when the peer goes away while we are still pumping
 its body upstream. That happens inside the body iterator httpx consumes from
 `client.stream(...).__aenter__()`, so it escapes through the whole middleware chain and uvicorn
-records the request as a 500 — for what is ordinary client behaviour (SDK timeout, ^C, reset).
+logs a full ASGI exception traceback — for what is ordinary client behaviour (SDK timeout, ^C,
+reset). No access-log line is written and no response is sent: the peer is already gone.
 
 These tests pin the abort to 499 and, just as importantly, pin that a *real* upstream failure
 is still allowed to surface.
@@ -11,6 +12,7 @@ is still allowed to surface.
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import Mock
@@ -100,14 +102,56 @@ async def test_client_abort_partway_through_a_body_is_still_499(service: Forward
 
 
 @pytest.mark.asyncio
-async def test_client_abort_is_not_retried(service: ForwardService) -> None:
-    """request.stream() is one-shot — a re-send would ship a truncated body."""
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"content-length": "17"},
+        {"transfer-encoding": "chunked"},
+        # AWS CLI v2 / SigV4 streaming: a real content-length plus aws-chunked framing.
+        {"content-length": "17", "content-encoding": "aws-chunked", "x-amz-decoded-content-length": "5"},
+    ],
+    ids=["content-length", "chunked", "aws-chunked"],
+)
+async def test_every_body_framing_reaches_the_handler(service: ForwardService, headers: dict[str, str]) -> None:
+    """`has_body` gates whether the body iterator is consumed at all — if a refactor drops the
+    transfer-encoding clause, that framing silently stops hitting the ClientDisconnect branch."""
     stub = _ConsumingStreamStub()
     service.client.stream = stub  # type: ignore[method-assign]
 
-    await service.forward_request(_request("PUT"))
+    response = await service.forward_request(_request("PUT", headers))
 
-    assert stub.calls == 1
+    assert response.status_code == 499
+
+
+@pytest.mark.asyncio
+async def test_client_abort_logs_what_was_received(service: ForwardService, caplog: Any) -> None:
+    """With the client gone there is no response and no access-log line, so this WARNING is the
+    only artifact the abort leaves behind. It has to carry the byte count to be worth anything."""
+    stub = _ConsumingStreamStub()
+    service.client.stream = stub  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING, logger="gateway.services.forward_service"):
+        await service.forward_request(_request("PUT", disconnect_after=3))
+
+    assert "Client disconnected while sending request body" in caplog.text
+    assert "15 bytes received" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_body_bearing_request_is_never_eligible_for_retry(service: ForwardService) -> None:
+    """The reason the abort is safe to swallow: ClientDisconnect can only arise when a body is
+    being sent, and a body-bearing request is never retriable, so the two can never interact.
+    Asserting the invariant directly — a call-count check on a PUT would hold with or without
+    the fix, since PUT is already single-attempt.
+    """
+    for method in ("GET", "HEAD", "PUT", "POST", "DELETE"):
+        for headers in ({"content-length": "17"}, {"transfer-encoding": "chunked"}):
+            stub = _ConsumingStreamStub()
+            service.client.stream = stub  # type: ignore[method-assign]
+
+            await service.forward_request(_request(method, headers))
+
+            assert stub.calls == 1, f"{method} with a body must be single-attempt"
 
 
 @pytest.mark.asyncio
