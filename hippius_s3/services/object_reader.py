@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+# `db` LIFETIME — READ BEFORE ADDING A QUERY HERE.
+# get_object_endpoint does `db = await pool.acquire()` and releases it in a `finally` that runs
+# when the endpoint RETURNS — i.e. when the StreamingResponse object is handed to the ASGI
+# server, before a single body byte is produced. So `db` is only ours until build_stream_context
+# finishes. Anything reached from inside the response body (stream_plan's wait/decrypt path)
+# must do ZERO DB work: by then the connection is back in the pool and probably owned by another
+# request, and asyncpg Connections are not safe for concurrent use. Violating this raises
+# `InterfaceError: another operation is in progress` — which surfaces as a 500 before the first
+# byte, or a 200 with a full Content-Length and a truncated body after it, and can also break the
+# unrelated request that now legitimately holds that connection. If the body genuinely needs
+# something from the DB, resolve it in build_stream_context and close over the VALUE, never `db`.
 import asyncio
 import contextlib
 import logging
@@ -7,8 +18,6 @@ import time
 from dataclasses import dataclass
 from typing import Any
 from typing import AsyncGenerator
-from typing import Awaitable
-from typing import Callable
 
 from fastapi import Response
 from fastapi.responses import StreamingResponse
@@ -49,10 +58,6 @@ class StreamContext:
     suite_id: str | None
     bucket_id: str
     upload_id: str
-    # F1: idempotent per-part re-enqueue hook the streamer calls when a chunk is missing from FS at
-    # stream time (e.g. the janitor evicted a still-to-be-streamed part on a cache-source read). None
-    # for non-streaming callers (HEAD/copy) that never hit the streamer miss path.
-    ensure_part_download: Callable[[int], Awaitable[None]] | None = None
 
 
 # RQ-4: compare-and-delete Lua — delete the coalesce lock only while it still holds our token, so we
@@ -101,10 +106,11 @@ async def _enqueue_download_for_parts(
 ) -> None:
     """Coalesce-lock the given parts and enqueue ONE DownloadChainRequest for the un-coalesced ones.
 
-    Shared core of three call sites: the primary cold-read miss, the envelope-race version fallback,
-    and F1's mid-stream re-enqueue (`ensure_part_download_enqueued`). Idempotent: the per-part SET NX
-    lock guarantees only one enqueue per (object_id, version, part) until the lock TTL, so calling it
-    again for a part already being fetched is a no-op.
+    Shared core of two call sites, BOTH of which run before streaming starts while this request
+    still legitimately owns `db`: the primary cold-read miss and the envelope-race version fallback.
+    Nothing may call this from inside the response body — see the module note on `db` lifetime.
+    Idempotent: the per-part SET NX lock guarantees only one enqueue per (object_id, version, part)
+    until the lock TTL, so calling it again for a part already being fetched is a no-op.
     """
     if not indices_by_part:
         return
@@ -247,39 +253,6 @@ async def _enqueue_missing_downloads(
     )
 
 
-async def ensure_part_download_enqueued(
-    db: Any,
-    redis: Any,
-    info: dict,
-    *,
-    object_version: int,
-    storage_version: int,
-    part_number: int,
-    chunk_indices: set[int],
-    address: str,
-    cfg: Any,
-) -> None:
-    """F1: idempotently ensure `part_number`'s `chunk_indices` are being fetched to the FS cache.
-
-    Called by the streamer when a chunk is missing at stream time. Enqueues the WHOLE part's needed
-    chunks (not just the one that missed) so a mid-stream eviction of a multi-chunk part is refetched
-    in one DCR. Idempotent via the same per-part coalesce lock as the cold-read path, so a part
-    already in flight (e.g. enqueued by `build_stream_context`) is not re-enqueued.
-    """
-    if not chunk_indices:
-        return
-    await _enqueue_download_for_parts(
-        db,
-        redis,
-        info,
-        object_version=object_version,
-        storage_version=storage_version,
-        indices_by_part={int(part_number): {int(i) for i in chunk_indices}},
-        address=address,
-        cfg=cfg,
-    )
-
-
 async def build_stream_context(
     db: Any,
     redis: Any,
@@ -293,30 +266,6 @@ async def build_stream_context(
     cfg = get_config()
     storage_version = require_supported_storage_version(int(info["storage_version"]))
     # v4-only policy: always decrypt at read time.
-
-    def _make_ensure_part(
-        info_local: dict, ov_local: int, plan_local: list[ChunkPlanItem]
-    ) -> Callable[[int], Awaitable[None]]:
-        # Precompute the plan's needed chunk indices per part so a mid-stream miss re-enqueues the
-        # whole part (all chunks this stream still needs), not just the one chunk that missed.
-        idx_by_part: dict[int, set[int]] = {}
-        for it in plan_local:
-            idx_by_part.setdefault(int(it.part_number), set()).add(int(it.chunk_index))
-
-        async def _ensure(part_number: int) -> None:
-            await ensure_part_download_enqueued(
-                db,
-                redis,
-                info_local,
-                object_version=ov_local,
-                storage_version=storage_version,
-                part_number=int(part_number),
-                chunk_indices=idx_by_part.get(int(part_number), set()),
-                address=address,
-                cfg=cfg,
-            )
-
-        return _ensure
 
     ov = int(info.get("object_version") or info.get("current_object_version") or 1)
     # RD-3: the GET endpoint already built the parts catalog; reuse it instead of re-reading. HEAD and
@@ -418,7 +367,6 @@ async def build_stream_context(
                     suite_id=suite_id,
                     bucket_id=bucket_id,
                     upload_id=str(info.get("upload_id") or ""),
-                    ensure_part_download=_make_ensure_part(info, object_version, plan),
                 )
         raise RuntimeError("v5_missing_envelope_metadata")
     kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
@@ -435,7 +383,6 @@ async def build_stream_context(
         suite_id=suite_id,
         bucket_id=bucket_id,
         upload_id=upload_id,
-        ensure_part_download=_make_ensure_part(info, object_version, plan),
     )
 
 
@@ -477,7 +424,6 @@ async def read_response(
         bucket_name=str(info.get("bucket_name", "")),
         prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
         chunk_timeout=float(cfg.stream_chunk_timeout_seconds),
-        ensure_part_fn=ctx.ensure_part_download,
     )
     # A2: bound the wait for the FIRST chunk. `stream_plan` otherwise waits up to cache_ttl_seconds
     # (~1h) per chunk, so an un-drained object whose part is on no backend yet would hang the whole
@@ -582,7 +528,6 @@ async def stream_object(
         bucket_name=str(info.get("bucket_name", "")),
         prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
         chunk_timeout=float(cfg.stream_chunk_timeout_seconds),
-        ensure_part_fn=ctx.ensure_part_download,
     )
     if not bound_first_chunk:
         return gen
