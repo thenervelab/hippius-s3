@@ -5,6 +5,7 @@ import logging
 import re
 from typing import Callable
 
+import httpx
 from fastapi import Request
 from fastapi import Response
 from starlette import status
@@ -13,6 +14,7 @@ from gateway.config import get_config
 from gateway.services.account_service import fetch_account_by_main_address
 from gateway.utils.errors import s3_error_response
 from hippius_s3.models.account import HippiusAccount
+from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.services.arion_service import CanUploadResponse
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
@@ -48,6 +50,49 @@ def _is_transient_billing_error(error: str | None) -> bool:
     return any(marker in lowered for marker in _TRANSIENT_BILLING_ERROR_MARKERS)
 
 
+# Transport failures that mean "we could not reach Arion". Deliberately NOT httpx.RequestError,
+# which also covers UnsupportedProtocol (a malformed HIPPIUS_ARION_BASE_URL), LocalProtocolError
+# (we built an invalid request), DecodingError and TooManyRedirects. Those are our bugs; folding
+# them in would turn a total upload outage into a fleet-wide "please retry" that never resolves
+# and carries no stack trace. They stay on the blanket handler where they stay loud.
+_UNREACHABLE_ERRORS = (httpx.TimeoutException, httpx.NetworkError, httpx.ProxyError, httpx.RemoteProtocolError)
+
+
+async def _can_upload(
+    arion_client: ArionClient,
+    main_account: str,
+    content_length: int,
+) -> tuple[CanUploadResponse, bool]:
+    """Call Arion can_upload, mapping an unreachable billing backend onto a transient verdict.
+
+    ArionClient.can_upload ends in `raise_for_status()`, so an upstream 5xx — in practice
+    `502 Next Hop Connection Failed` from the ATS edge in front of Arion — leaves as an
+    exception rather than a CanUploadResponse. That skips the transient handling below
+    entirely and lands in account_middleware's blanket `except Exception`, which answers
+    `AccountVerificationError`, a non-standard code. The retry ladder and SlowDown response
+    written for exactly this case never got a chance to run.
+
+    Returns (verdict, worth_retrying). The flag exists so a backend that told us to slow down
+    is not immediately hammered again — see the 429 branch.
+    """
+    try:
+        return await arion_client.can_upload(main_account, content_length), True
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        # 429 IS transient, but re-driving it is the one response guaranteed to be wrong: Arion
+        # just said "too many requests". Surface the SlowDown without running the ladder.
+        if status_code == 429:
+            return CanUploadResponse(result=False, error="billing service unavailable (upstream 429)"), False
+        # 507 means Arion is full; retry_on_error re-raises it precisely because retrying cannot
+        # help, so don't undo that here. Other 4xx means we sent something it rejected — our bug,
+        # and retrying it into a SlowDown would hide it. Both fall through to the blanket handler.
+        if status_code == 507 or status_code < 500:
+            raise
+        return CanUploadResponse(result=False, error=f"billing service unavailable (upstream {status_code})"), True
+    except _UNREACHABLE_ERRORS as exc:
+        return CanUploadResponse(result=False, error=f"billing service unavailable ({type(exc).__name__})"), True
+
+
 async def _check_can_upload(
     request: Request,
     logger: logging.Logger | logging.LoggerAdapter,
@@ -77,7 +122,7 @@ async def _check_can_upload(
         logger.debug(f"can_upload cache hit for {main_account}, skipping Arion call")
         return None
 
-    response: CanUploadResponse = await arion_client.can_upload(main_account, content_length)
+    response, worth_retrying = await _can_upload(arion_client, main_account, content_length)
     logger.info(
         f"can_upload billing check for {main_account}: size_bytes={content_length}, result={response.result}, error={response.error}"
     )
@@ -86,6 +131,7 @@ async def _check_can_upload(
     attempts = 0
     while (
         not response.result
+        and worth_retrying
         and _is_transient_billing_error(response.error)
         and attempts < config.can_upload_transient_retries
     ):
@@ -94,7 +140,7 @@ async def _check_can_upload(
             f"can_upload transient billing failure for {main_account} (attempt {attempts}/{config.can_upload_transient_retries}): {response.error}"
         )
         await asyncio.sleep(config.can_upload_transient_retry_delay_seconds)
-        response = await arion_client.can_upload(main_account, content_length)
+        response, worth_retrying = await _can_upload(arion_client, main_account, content_length)
 
     if not response.result:
         # Still failing on a transient billing error after retries: surface a retryable 503

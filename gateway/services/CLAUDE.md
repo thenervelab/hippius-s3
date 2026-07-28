@@ -111,4 +111,10 @@ Proxies `/docs` to the internal Swagger UI when `ENABLE_API_DOCS=true`. Redis-ca
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
 | #8876 | 11:36 AM | 🔵 | Current Upload Architecture Uses Streaming Encryption with 16-Slot AsyncIO Queue | ~810 |
+
+### Jul 1, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #9719 | 1:29 PM | 🔵 | Account service has fallback for missing credits cache | ~347 |
 </claude-mem-context>

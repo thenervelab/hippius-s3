@@ -101,6 +101,10 @@ class Config:
     arion_rate_limiting_proxy_bypass_key: str = env("ARION_RATE_LIMITING_PROXY_BYPASS_KEY:")
     arion_base_url: str = env("HIPPIUS_ARION_BASE_URL:https://arion.hippius.com/")
     arion_verify_ssl: bool = env("HIPPIUS_ARION_VERIFY_SSL:true", convert=lambda x: x.lower() == "true")
+    # Per-attempt cap for the can_upload billing gate specifically. Unlike every other call on
+    # ArionClient this one runs inside the gateway's request path, so its worst case is gateway
+    # capacity, not worker throughput. Tunable so an incident can shorten it without a deploy.
+    can_upload_timeout_seconds: float = env("CAN_UPLOAD_TIMEOUT_SECONDS:3.0", convert=float)
 
     # Redis for caching/rate limiting
     redis_url: str = env("REDIS_URL")
