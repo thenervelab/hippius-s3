@@ -8,6 +8,7 @@ from fastapi import Request
 from fastapi import Response
 from opentelemetry import trace
 
+from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.monitoring import enrich_span_with_account_info
 from hippius_s3.monitoring import get_metrics_collector
 
@@ -76,7 +77,12 @@ async def metrics_middleware(
         handler=endpoint_name,
     )
 
-    if response.status_code >= 400:
+    # 499 is a client abort (see errors.CLIENT_CLOSED_REQUEST), not a failure we served. Returning
+    # it above stops these being counted as internal_error, but without this they would simply
+    # reappear as http_499 on the same error-rate panels — at the same ~13k/48h volume. The
+    # gateway's metrics middleware excludes it for exactly this reason; both hops must agree or
+    # the abort is still an "error" on one of them.
+    if response.status_code >= 400 and response.status_code != CLIENT_CLOSED_REQUEST:
         error_type = f"http_{response.status_code}"
 
         if hasattr(response, "body"):
