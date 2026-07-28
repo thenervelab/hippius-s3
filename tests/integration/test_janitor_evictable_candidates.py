@@ -375,9 +375,9 @@ async def test_explain_keeps_parts_indexed_off_the_slice_arrays(pg_tx: asyncpg.C
         await _seed_candidate(pg_tx, bucket, per_chunk_live=[["arion"]], upload_backends=["arion"])
     object_ids, versions, part_numbers = await _resident_tuples(pg_tx)
 
-    # The filter no longer touches fs_cache_inventory (it unnests the given arrays); the load-bearing
-    # property is that the join into parts still drives off an object_id-leading index rather than a
-    # seq scan. The test DB is tiny, so force seqscan off to prove the query CAN be served by an index
+    # The filter only re-touches fs_cache_inventory via a PK LEFT JOIN for last_access_at (index-only);
+    # the load-bearing property is that the join into parts still drives off an object_id-leading index
+    # rather than a seq scan. The test DB is tiny, so force seqscan off to prove the query CAN be served by an index
     # — reachable only because the ::uuid cast is on the slice side (s.oid::uuid), keeping
     # parts.object_id a bare indexed column. Casting parts.object_id::text would defeat every parts
     # index and force a seq scan.
