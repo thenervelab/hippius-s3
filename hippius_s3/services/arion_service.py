@@ -550,6 +550,13 @@ class ArionClient:
             "/can_upload",
             json=payload.model_dump(),
             headers=headers,
+            # The client-wide 60s read timeout is sized for bulk uploads. This is a small JSON
+            # RPC on the request path, and retry COUNTS cannot bound latency when the per-attempt
+            # cost is unbounded: a blackholed Arion (TCP accepted, nothing returned) would cost
+            # 60s per attempt. Transport errors are not retried by retry_on_error, so pre-cap that
+            # was one 60s stall; once the caller treats them as transient and re-drives, it becomes
+            # minutes. Cap the attempt instead of trusting the ladder.
+            timeout=httpx.Timeout(self._config.can_upload_timeout_seconds, connect=2.0),
         )
         logger.info(f"Raw response content {response.content}")
         response.raise_for_status()

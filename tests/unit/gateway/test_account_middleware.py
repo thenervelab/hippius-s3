@@ -588,8 +588,9 @@ async def test_arion_4xx_is_not_treated_as_transient(mock_config_no_bypass: Any,
 
 
 @pytest.mark.asyncio
-async def test_arion_429_is_transient(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
-    """429 is Arion explicitly asking us to back off — the one 4xx that is a blip."""
+async def test_arion_429_is_transient_but_not_hammered(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """429 is transient, but re-driving it is the one response guaranteed to be wrong: Arion just
+    said 'too many requests'. Surface the SlowDown without running the retry ladder."""
     mock_arion = MockArionService(raise_on_can_upload=_http_status_error(429))
     app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
 
@@ -598,3 +599,108 @@ async def test_arion_429_is_transient(mock_config_no_bypass: Any, monkeypatch: A
 
     assert response.status_code == 503
     assert b"SlowDown" in response.content
+    assert len(mock_arion.can_upload_calls) == 1, "must not re-drive a backend that asked us to back off"
+
+
+@pytest.mark.asyncio
+async def test_arion_507_stays_non_retryable(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """retry_on_error re-raises 507 precisely because 'server is full' cannot be retried away.
+    Treating it as a 5xx blip here would silently undo that."""
+    mock_arion = MockArionService(raise_on_can_upload=_http_status_error(507))
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert b"AccountVerificationError" in response.content
+    assert len(mock_arion.can_upload_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_broken_base_url_stays_loud(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """A malformed HIPPIUS_ARION_BASE_URL is a config bug, not a blip. If it were folded into the
+    transient set it would become a fleet-wide 'please retry' that never resolves."""
+    mock_arion = MockArionService(raise_on_can_upload=httpx.UnsupportedProtocol("missing scheme"))
+    app = _make_can_upload_app(mock_config_no_bypass, mock_arion, monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert b"AccountVerificationError" in response.content
+    assert b"SlowDown" not in response.content
+
+
+# ---------------------------------------------------------------------------
+# Real ArionClient: what actually lands on Arion, and the latency bound
+#
+# MockArionService raises the injected exception directly, so every test above
+# measures middleware-level attempts and never exercises @retry_on_error. These
+# drive the real client over a MockTransport so the numbers are the real ones.
+# ---------------------------------------------------------------------------
+
+
+def _real_arion_over(handler: Any, monkeypatch: Any) -> Any:
+    from hippius_s3.services import arion_service as arion_mod
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(arion_mod.asyncio, "sleep", _no_sleep)
+
+    client = arion_mod.ArionClient(base_url="http://arion.test", service_key="k")
+    client._client = httpx.AsyncClient(
+        base_url="http://arion.test",
+        transport=httpx.MockTransport(handler),
+    )
+    return client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,expected_requests",
+    [
+        (502, 6),  # decorator 2 x middleware 3
+        (429, 2),  # decorator 2, ladder skipped
+        (400, 2),  # decorator 2, then re-raised to the blanket handler
+        (507, 1),  # decorator re-raises immediately
+    ],
+)
+async def test_real_request_amplification_against_arion(
+    mock_config_no_bypass: Any, monkeypatch: Any, status: int, expected_requests: int
+) -> None:
+    """Pins how many requests a single client PUT actually costs a struggling billing backend."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(status)
+
+    app = _make_can_upload_app(mock_config_no_bypass, _real_arion_over(handler, monkeypatch), monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    assert len(seen) == expected_requests
+
+
+@pytest.mark.asyncio
+async def test_can_upload_attempt_is_time_bounded(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
+    """Regression guard: retry COUNTS cannot bound latency when the per-attempt cost is unbounded.
+
+    A blackholed Arion (TCP accepted, nothing returned) would otherwise cost the client-wide 60s
+    read timeout per attempt, and the transient ladder re-drives it — minutes on a single PUT,
+    holding a gateway worker the whole time. can_upload must carry its own short cap.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(502)
+
+    app = _make_can_upload_app(mock_config_no_bypass, _real_arion_over(handler, monkeypatch), monkeypatch)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.put("/test-bucket/test-key", content=b"hello", headers={"content-length": "5"})
+
+    read_timeouts = {r.extensions["timeout"]["read"] for r in seen}
+    assert read_timeouts == {3.0}, "can_upload must not inherit the client-wide 60s bulk-upload timeout"
