@@ -25,6 +25,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import Any
+from typing import Callable
 
 import httpx
 
@@ -116,6 +117,7 @@ class PressurePublisher:
         mgr_metrics_url: str,
         pools: list[str],
         probe_timeout_seconds: float,
+        on_publish: Callable[[], None] | None = None,
     ) -> None:
         self._redis = redis_client
         self._root = root
@@ -123,6 +125,9 @@ class PressurePublisher:
         self._pools = [p.strip() for p in pools if p.strip()]
         self._probe_timeout = probe_timeout_seconds
         self._prev_mode = 0
+        # Called after each SUCCESSFUL publish so the janitor can gauge signal freshness — the
+        # published key is invisible to monitoring on its own (it expires silently on the TTL).
+        self._on_publish = on_publish
 
     async def _pool_ratio(self) -> float | None:
         if not self._mgr_metrics_url or not self._pools:
@@ -160,6 +165,8 @@ class PressurePublisher:
         if payload is None:
             return
         await self._redis.set(PRESSURE_KEY, json.dumps(payload), ex=PRESSURE_TTL_SECONDS)
+        if self._on_publish is not None:
+            self._on_publish()
 
     async def run(self, interval: float = PUBLISH_INTERVAL_SECONDS) -> None:
         while True:

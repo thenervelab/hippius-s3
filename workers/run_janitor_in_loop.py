@@ -158,6 +158,11 @@ _janitor_phase = 0  # index into JANITOR_PHASES; 0 = idle/sleeping
 _janitor_last_cycle_completed_at = 0.0
 _janitor_cycle_seconds = 0.0
 
+# Unixtime of the last SUCCESSFUL fs_cache:pressure publish; 0 = none since start. The published
+# key is otherwise invisible to monitoring — it expires PRESSURE_TTL_SECONDS after the last success
+# and every api pod silently reverts to node-local statvfs. This makes that lapse observable.
+_fs_pressure_last_publish_at = 0.0
+
 JANITOR_PHASES = (
     "idle",
     "parts_unified",
@@ -228,6 +233,16 @@ def _obs_cycle_age(_: object) -> list[otel_metrics.Observation]:
 
 def _obs_cycle_seconds(_: object) -> list[otel_metrics.Observation]:
     return [otel_metrics.Observation(_janitor_cycle_seconds, {})]
+
+
+def _obs_pressure_signal_age(_: object) -> list[otel_metrics.Observation]:
+    # Seconds since the last SUCCESSFUL fs_cache:pressure publish (-1 = none since start). Climbs
+    # without bound once publishes fail (cache Redis down / MOVED / janitor stalled); crossing
+    # PRESSURE_TTL_SECONDS means the key has expired and api pods silently fell back to node-local
+    # statvfs — the 2026-07-24 blind spot re-opened, with disk-fill protection degraded.
+    if _fs_pressure_last_publish_at <= 0:
+        return [otel_metrics.Observation(-1.0, {})]
+    return [otel_metrics.Observation(max(0.0, time.time() - _fs_pressure_last_publish_at), {})]
 
 
 def _classify_age_bucket(age_seconds: float) -> str:
@@ -824,6 +839,11 @@ def _setup_janitor_metrics() -> None:
         name="fs_janitor_cycle_seconds",
         callbacks=[_obs_cycle_seconds],
         description="Duration of the last completed janitor cycle",
+    )
+    meter.create_observable_gauge(
+        name="fs_cache_pressure_signal_age_seconds",
+        callbacks=[_obs_pressure_signal_age],
+        description="Seconds since the last SUCCESSFUL fs_cache:pressure publish (-1 = none since start). Past PRESSURE_TTL_SECONDS the shared signal has expired and api pods silently fell back to node-local statvfs — disk-fill protection degraded",
     )
     _janitor_deleted_counter = meter.create_counter(
         name="fs_janitor_deleted_total",
@@ -2234,15 +2254,33 @@ async def run_janitor_loop():
         # cluster (cluster=true / redis-cluster URLs) — a standalone client
         # there gets MOVED errors, every publish fails, and consumers silently
         # stay on local-only pressure forever. Same factory the api uses.
-        cache_redis_client = create_redis_client(config.redis_url)
-        pressure_publisher = PressurePublisher(
-            cache_redis_client,
-            Path(config.object_cache_dir),
-            mgr_metrics_url=config.janitor_ceph_mgr_metrics_url,
-            pools=config.janitor_ceph_pools.split(","),
-            probe_timeout_seconds=config.janitor_ceph_probe_timeout_seconds,
-        )
-        pressure_publish_task = asyncio.create_task(pressure_publisher.run())
+        #
+        # ADVISORY-signal isolation: consumers fall back to node-local statvfs on the key's
+        # absence (TTL lapse), so a broken publisher must NOT crashloop the janitor — the one
+        # process that actually frees cache space. This narrow except degrades ONLY the pressure
+        # publisher; the DB pool / fs_store / queues Redis above stay fatal.
+        def _record_pressure_publish() -> None:
+            global _fs_pressure_last_publish_at
+            _fs_pressure_last_publish_at = time.time()
+
+        try:
+            cache_redis_client = create_redis_client(config.redis_url)
+            pressure_publisher = PressurePublisher(
+                cache_redis_client,
+                Path(config.object_cache_dir),
+                mgr_metrics_url=config.janitor_ceph_mgr_metrics_url,
+                pools=config.janitor_ceph_pools.split(","),
+                probe_timeout_seconds=config.janitor_ceph_probe_timeout_seconds,
+                on_publish=_record_pressure_publish,
+            )
+            pressure_publish_task = asyncio.create_task(pressure_publisher.run())
+        except Exception as exc:
+            # fs_cache_pressure_signal_age_seconds stays at -1 and the absence alert fires.
+            logger.warning(
+                "pressure publisher setup failed (%s); janitor continues WITHOUT publishing "
+                "fs_cache:pressure — api pods fall back to node-local statvfs",
+                exc,
+            )
     except BaseException:
         await _shutdown()
         raise
