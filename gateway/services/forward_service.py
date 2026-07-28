@@ -5,12 +5,19 @@ import typing
 
 import httpx
 from fastapi import Request
+from fastapi import Response
 from fastapi.responses import StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from hippius_s3.monitoring import get_metrics_collector
 
 
 logger = logging.getLogger(__name__)
+
+# Non-standard status used by nginx for "client closed the request before we answered".
+# Nothing is ever written to the socket — the peer is already gone — so this only decides how
+# the abort is recorded in the access log.
+_CLIENT_CLOSED_REQUEST = 499
 
 # Methods that are safe to re-send when the upstream connection dies before any response
 # byte exists. Deliberately excludes DELETE: it is idempotent by S3 semantics, but a retry
@@ -103,7 +110,7 @@ class ForwardService:
         )
         logger.info(f"ForwardService initialized with backend: {backend_url}")
 
-    async def forward_request(self, request: Request) -> StreamingResponse:
+    async def forward_request(self, request: Request) -> Response:
         headers = dict(request.headers)
 
         # SECURITY: Strip any client-provided X-Hippius-* headers to prevent header injection attacks
@@ -162,6 +169,20 @@ class ForwardService:
             try:
                 upstream_response = await stream_cm.__aenter__()
                 break
+            except ClientDisconnect:
+                # The client hung up while we were still pumping its body upstream. This is normal
+                # client behaviour (SDK timeout, ^C, reset), not a server fault, and it is not
+                # retryable — request.stream() is one-shot. Letting it escape makes uvicorn log the
+                # request as a 500 and ships a full middleware-deep traceback to Sentry, which both
+                # hides real 5xx and misattributes client-side aborts to us. Measured on prod
+                # 2026-07-26..28: 13650 of these in 48h, ~9% of one customer's part uploads.
+                logger.info(
+                    "Client disconnected while sending request body: %s %s (%d bytes received)",
+                    request.method,
+                    request.url.path,
+                    bytes_received,
+                )
+                return Response(status_code=_CLIENT_CLOSED_REQUEST)
             except (httpx.RemoteProtocolError, httpx.ConnectError) as exc:
                 if not can_retry or attempt == 1:
                     raise
