@@ -128,8 +128,7 @@ def test_raises_on_body_that_is_not_well_formed() -> None:
 
 
 def test_raises_on_entity_reference_in_etag() -> None:
-    """An unresolved entity would read as an empty ETag, and an empty ETag skips the part
-    comparison downstream — so the body must be refused rather than silently accepted."""
+    """An unresolved entity reads as an empty ETag, so the body must be refused."""
     body = (
         "<?xml version='1.0'?><!DOCTYPE d [<!ENTITY e 'xxxxxxxxxx'>]>"
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>"
@@ -137,3 +136,46 @@ def test_raises_on_entity_reference_in_etag() -> None:
     )
     with pytest.raises(ValueError):
         _parse(body)
+
+
+@pytest.mark.parametrize(
+    ("label", "etag"),
+    [
+        ("empty element", ""),
+        ("whitespace only", "   "),
+        ("quotes with nothing between them", '""'),
+        ("quotes around whitespace", '"  "'),
+    ],
+)
+def test_raises_on_an_empty_etag(label: str, etag: str) -> None:
+    """Callers treat the ETag as present, so an empty one must never get through.
+
+    The handler compares each client-asserted ETag against the stored part and rejects a
+    mismatch with InvalidPart. An empty string makes that comparison vacuous, which is the
+    integrity check quietly opting itself out. Quote-stripping is what makes this more than
+    a theoretical case: a literal '""' is a non-empty body that normalises to nothing.
+    """
+    with pytest.raises(ValueError, match="empty ETag"):
+        _parse(_one_part(etag))
+
+
+def test_raises_on_a_self_closing_etag() -> None:
+    """Same hole as an empty element, spelled the way a serialiser would emit it."""
+    body = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag/></Part></CompleteMultipartUpload>"
+    with pytest.raises(ValueError, match="empty ETag"):
+        _parse(body)
+
+
+def test_ignores_a_part_nested_below_the_root() -> None:
+    """S3 specifies Part as a direct child of CompleteMultipartUpload.
+
+    Accepting one at any depth means a body whose real part list is empty can still smuggle
+    parts in through an unrelated wrapper — leniency that buys nothing, since no client sends
+    this shape.
+    """
+    body = (
+        "<CompleteMultipartUpload><Wrapper>"
+        "<Part><PartNumber>1</PartNumber><ETag>abc</ETag></Part>"
+        "</Wrapper></CompleteMultipartUpload>"
+    )
+    assert _parse(body) == []

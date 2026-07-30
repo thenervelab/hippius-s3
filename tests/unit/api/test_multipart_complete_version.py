@@ -395,6 +395,35 @@ async def test_complete_rejects_malformed_xml_with_malformed_xml_code(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_complete_rejects_an_empty_etag_instead_of_skipping_verification(
+    monkeypatch: Any,
+) -> None:
+    """An empty ETag must not complete an upload with its parts unverified.
+
+    The per-part comparison used to be skipped for a falsy ETag, so this body would have
+    completed with a 200 having checked nothing. A literal '""' is the sharp version: a
+    non-empty body that normalises to the empty string during quote-stripping.
+    """
+    _patch_common(monkeypatch)
+    completed: dict[str, Any] = {"ok": False}
+    _completing_writer(monkeypatch, completed)
+    monkeypatch.setattr(
+        multipart,
+        "get_request_body",
+        _body_returning(
+            b'<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>""</ETag></Part></CompleteMultipartUpload>'
+        ),
+    )
+
+    db = _FakeDb(current_version=1, upload_version=1)
+    resp = await multipart.complete_multipart_upload("b", "k", "up-1", _request(), db)
+
+    assert resp.status_code == 400
+    assert b"MalformedXML" in bytes(resp.body)
+    assert completed["ok"] is False
+
+
+@pytest.mark.asyncio
 async def test_complete_does_not_expand_entity_bomb(monkeypatch: Any) -> None:
     """A DTD-declared entity must not be expanded: a parser with default settings would inflate
     this body in memory. The reference stays unresolved, and because an empty ETag would skip

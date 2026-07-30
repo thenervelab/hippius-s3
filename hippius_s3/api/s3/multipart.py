@@ -54,9 +54,18 @@ def parse_complete_multipart_upload(body: bytes) -> list[tuple[int, str]]:
 
     Matched by local-name so a namespace-prefixed or default-namespaced body parses the same,
     and paired within each ``<Part>`` so a stray element elsewhere in the document cannot shift
-    the pairing. ETag quoting is normalised after parsing, which is what makes every client
-    encoding agree: boto3 sends ``"abc"``, Go and Rust send the quotes escaped, and some
-    clients send bare hex — all three arrive here as ``abc``.
+    the pairing. Parts are read as direct children of the root, the way S3 specifies the
+    document, so a ``<Part>`` buried in some unrelated wrapper is not silently honoured.
+
+    ETag quoting is normalised after parsing, which is what makes every client encoding agree:
+    boto3 sends ``"abc"``, Go and Rust send the quotes escaped, and some clients send bare hex
+    — all three arrive here as ``abc``.
+
+    Every part must name a non-empty ETag. That is a guarantee callers rely on: the handler
+    compares each ETag against the stored part, and an empty string would make that comparison
+    vacuous. Enforcing it here means one place has to be right instead of every consumer, and
+    the empty string is reachable more ways than it looks — ``<ETag/>``, whitespace, an
+    unresolved entity reference, and a literal ``""`` that survives quote-stripping.
 
     Args:
         body: Raw request body.
@@ -69,7 +78,7 @@ def parse_complete_multipart_upload(body: bytes) -> list[tuple[int, str]]:
     """
     root = parse_untrusted_xml(body)
     parts: list[tuple[int, str]] = []
-    for part in root.xpath(".//*[local-name()='Part']"):
+    for part in root.xpath("./*[local-name()='Part']"):
         numbers = part.xpath("./*[local-name()='PartNumber']")
         etags = part.xpath("./*[local-name()='ETag']")
         if not numbers or not etags:
@@ -78,7 +87,10 @@ def parse_complete_multipart_upload(body: bytes) -> list[tuple[int, str]]:
             number = int(_plain_text(numbers[0]).strip())
         except ValueError as exc:
             raise ValueError(f"PartNumber {numbers[0].text!r} is not an integer") from exc
-        parts.append((number, _plain_text(etags[0]).strip().strip('"')))
+        etag = _plain_text(etags[0]).strip().strip('"').strip()
+        if not etag:
+            raise ValueError(f"part {number} has an empty ETag")
+        parts.append((number, etag))
     return parts
 
 
@@ -111,10 +123,12 @@ def _plain_text(element: Any) -> str:
     """Text of an element that must contain nothing but text.
 
     Entity references survive parsing as child nodes because the parser leaves them
-    unresolved, and reading ``.text`` would silently return ``None`` for them. An empty ETag
-    skips the part-ETag comparison downstream, so a body carrying ``<ETag>&bomb;</ETag>`` would
-    complete an upload without its parts ever being verified. Rejecting the body is correct:
-    no real client sends entity references here.
+    unresolved, and reading ``.text`` would silently return ``None`` for them — so a body
+    carrying ``<ETag>&bomb;</ETag>`` would read as an empty ETag. Rejecting it is correct: no
+    real client sends entity references here.
+
+    This closes one route to an empty value; the caller rejects the empty string itself, which
+    covers the rest.
 
     Raises:
         ValueError: The element has child nodes.
@@ -1204,6 +1218,11 @@ async def complete_multipart_upload(
         # uploaded; S3 rejects the completion (InvalidPart) if the part is missing OR the
         # ETag does not match. Without the ETag check a client could assemble the object
         # from the wrong part bytes and still receive a 200 — a silent data-integrity hole.
+        #
+        # Compared unconditionally: this used to skip a falsy client_etag, which meant any
+        # body encoding an empty ETag opted itself out of the check the comment above
+        # describes. parse_complete_multipart_upload now rejects those bodies outright, so
+        # every ETag reaching here is non-empty and there is nothing to guard against.
         missing_parts = []
         mismatched_parts = []
         for pn, client_etag in part_info:
@@ -1212,7 +1231,7 @@ async def complete_multipart_upload(
                 missing_parts.append(pn)
                 continue
             stored_etag = str(db_part["etag"]).replace('"', "").strip()
-            if client_etag and client_etag.lower() != stored_etag.lower():
+            if client_etag.lower() != stored_etag.lower():
                 mismatched_parts.append(pn)
         if missing_parts:
             return s3_error_response(
