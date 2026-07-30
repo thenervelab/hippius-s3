@@ -42,10 +42,63 @@ from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.xml_helpers import add_subelement
 from hippius_s3.xml_helpers import create_element
+from hippius_s3.xml_helpers import parse_untrusted_xml
 from hippius_s3.xml_helpers import to_xml_bytes
 
 
 logger = logging.getLogger(__name__)
+
+
+def parse_complete_multipart_upload(body: bytes) -> list[tuple[int, str]]:
+    """Parse a CompleteMultipartUpload body into (part_number, etag) pairs in document order.
+
+    Matched by local-name so a namespace-prefixed or default-namespaced body parses the same,
+    and paired within each ``<Part>`` so a stray element elsewhere in the document cannot shift
+    the pairing. ETag quoting is normalised after parsing, which is what makes every client
+    encoding agree: boto3 sends ``"abc"``, Go and Rust send the quotes escaped, and some
+    clients send bare hex — all three arrive here as ``abc``.
+
+    Args:
+        body: Raw request body.
+
+    Returns:
+        The listed parts, empty if the body carries none.
+
+    Raises:
+        ValueError: Not well-formed, or a ``<Part>`` missing/misusing PartNumber or ETag.
+    """
+    root = parse_untrusted_xml(body)
+    parts: list[tuple[int, str]] = []
+    for part in root.xpath(".//*[local-name()='Part']"):
+        numbers = part.xpath("./*[local-name()='PartNumber']")
+        etags = part.xpath("./*[local-name()='ETag']")
+        if not numbers or not etags:
+            raise ValueError("every Part must carry a PartNumber and an ETag")
+        try:
+            number = int(_plain_text(numbers[0]).strip())
+        except ValueError as exc:
+            raise ValueError(f"PartNumber {numbers[0].text!r} is not an integer") from exc
+        parts.append((number, _plain_text(etags[0]).strip().strip('"')))
+    return parts
+
+
+def _plain_text(element: Any) -> str:
+    """Text of an element that must contain nothing but text.
+
+    Entity references survive parsing as child nodes because the parser leaves them
+    unresolved, and reading ``.text`` would silently return ``None`` for them. An empty ETag
+    skips the part-ETag comparison downstream, so a body carrying ``<ETag>&bomb;</ETag>`` would
+    complete an upload without its parts ever being verified. Rejecting the body is correct:
+    no real client sends entity references here.
+
+    Raises:
+        ValueError: The element has child nodes.
+    """
+    if len(element):
+        raise ValueError("element must contain text only")
+    return element.text or ""
+
+
 router = APIRouter(tags=["s3-multipart"])
 
 config = get_config()
@@ -1068,36 +1121,20 @@ async def complete_multipart_upload(
                 status_code=200,
             )
 
-        # Parse the XML request body to get parts list
-        body_text = ""
         try:
-            body_text = (await get_request_body(request)).decode("utf-8")
-        except Exception:
-            body_text = "<CompleteMultipartUpload></CompleteMultipartUpload>"
-
-        # Parse part numbers and ETags
-        part_numbers = re.findall(r"<PartNumber>(\d+)</PartNumber>", body_text)
-        etags = re.findall(r"<ETag>([^<]+)</ETag>", body_text)
-
-        if not part_numbers or not etags or len(part_numbers) != len(etags):
+            part_info = parse_complete_multipart_upload(await get_request_body(request))
+        except ValueError:
             return s3_error_response(
-                "InvalidRequest",
-                "The XML provided was not well-formed",
+                "MalformedXML",
+                "The XML you provided was not well-formed or did not validate against our published schema",
                 status_code=400,
             )
 
-        # Create part info list
-        part_info = []
-        for num, tag in zip(
-            part_numbers,
-            etags,
-            strict=True,
-        ):
-            part_info.append(
-                (
-                    int(num),
-                    tag.replace('"', "").strip(),
-                ),
+        if not part_info:
+            return s3_error_response(
+                "MalformedXML",
+                "The XML you provided was not well-formed or did not validate against our published schema",
+                status_code=400,
             )
         # S3 requires the parts to be listed in strictly ascending part-number order.
         # We used to silently sort here, which masked a malformed part list; reject it
