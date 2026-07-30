@@ -82,6 +82,31 @@ def parse_complete_multipart_upload(body: bytes) -> list[tuple[int, str]]:
     return parts
 
 
+def build_complete_result_xml(host: str, bucket_name: str, object_key: str, etag: str) -> bytes:
+    """Serialise a CompleteMultipartUploadResult.
+
+    Shared by the success and idempotent-replay paths so both report the same Location; the
+    replay path used to hardcode ``http://localhost:8000``, which is wrong for every
+    deployment. The Host header is client-controlled, so it is written as element text and
+    escaped rather than interpolated into the document.
+
+    Args:
+        host: Value of the request's Host header.
+        bucket_name: Bucket the upload targeted.
+        object_key: Key the upload targeted.
+        etag: Final object ETag, unquoted.
+
+    Returns:
+        The serialised XML document.
+    """
+    root = create_element("CompleteMultipartUploadResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+    add_subelement(root, "Location", f"http://{host}/{bucket_name}/{object_key}")
+    add_subelement(root, "Bucket", bucket_name)
+    add_subelement(root, "Key", object_key)
+    add_subelement(root, "ETag", f'"{etag}"')
+    return to_xml_bytes(root)
+
+
 def _plain_text(element: Any) -> str:
     """Text of an element that must contain nothing but text.
 
@@ -411,15 +436,11 @@ async def initiate_multipart_upload(
             uuid.UUID(object_id),
         )
 
-        # Create XML response using a hardcoded template
-        xml_string = f"""<?xml version="1.0" encoding="UTF-8"?>
-<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Bucket>{bucket_name}</Bucket>
-  <Key>{object_key}</Key>
-  <UploadId>{upload_id}</UploadId>
-</InitiateMultipartUploadResult>
-"""
-        xml_bytes = xml_string.encode("utf-8")
+        root = create_element("InitiateMultipartUploadResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+        add_subelement(root, "Bucket", bucket_name)
+        add_subelement(root, "Key", object_key)
+        add_subelement(root, "UploadId", upload_id)
+        xml_bytes = to_xml_bytes(root)
 
         # Return response with proper headers
         return Response(
@@ -792,12 +813,10 @@ async def upload_part(
         # Return response
         if copy_source:
             # AWS-style XML body for UploadPartCopy
-            xml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<CopyPartResult>
-  <ETag>\"{part_result["etag"]}\"</ETag>
-  <LastModified>{format_s3_timestamp(datetime.now(timezone.utc))}</LastModified>
-</CopyPartResult>
-""".encode("utf-8")
+            root = create_element("CopyPartResult")
+            add_subelement(root, "ETag", f'"{part_result["etag"]}"')
+            add_subelement(root, "LastModified", format_s3_timestamp(datetime.now(timezone.utc)))
+            xml = to_xml_bytes(root)
             return Response(content=xml, media_type="application/xml", status_code=200)
         return Response(
             status_code=200,
@@ -1108,17 +1127,18 @@ async def complete_multipart_upload(
                     final_etag = await hash_all_etags(object_id, object_version, db)
                 except Exception:
                     final_etag = "completed"
-            xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Location>http://localhost:8000/{bucket_name}/{object_key}</Location>
-    <Bucket>{bucket_name}</Bucket>
-    <Key>{object_key}</Key>
-    <ETag>"{final_etag}"</ETag>
-</CompleteMultipartUploadResult>"""
+            xml_content = build_complete_result_xml(
+                request.headers.get("Host", ""), bucket_name, object_key, final_etag
+            )
             return Response(
                 content=xml_content,
                 media_type="application/xml",
                 status_code=200,
+                headers={
+                    "Content-Type": "application/xml; charset=utf-8",
+                    "x-amz-request-id": str(uuid.uuid4()),
+                    "Content-Length": str(len(xml_content)),
+                },
             )
 
         try:
@@ -1257,15 +1277,9 @@ async def complete_multipart_upload(
                 exc_info=True,
             )
 
-        # Create XML response
-        xml_bytes = f"""<?xml version="1.0" encoding="UTF-8"?>
-<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Location>http://{request.headers.get("Host", "")}/{bucket_name}/{object_key}</Location>
-  <Bucket>{bucket_name}</Bucket>
-  <Key>{object_key}</Key>
-  <ETag>"{complete_res.etag}"</ETag>
-</CompleteMultipartUploadResult>
-""".encode("utf-8")
+        xml_bytes = build_complete_result_xml(
+            request.headers.get("Host", ""), bucket_name, object_key, str(complete_res.etag)
+        )
 
         get_metrics_collector().record_s3_operation(
             operation="complete_multipart_upload",
