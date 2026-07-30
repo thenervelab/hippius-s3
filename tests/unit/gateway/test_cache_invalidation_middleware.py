@@ -114,13 +114,15 @@ def _make_cached_acl_repo() -> Any:
 def _make_acl_service(repo: Any) -> Any:
     service = MagicMock()
     service.acl_repo = repo
+    service.invalidate_bucket_meta = AsyncMock()
     return service
 
 
 @pytest.mark.asyncio
 async def test_fires_on_delete_bucket_204() -> None:
     repo = _make_cached_acl_repo()
-    app = _make_app(_make_acl_service(repo), Response(status_code=204))
+    service = _make_acl_service(repo)
+    app = _make_app(service, Response(status_code=204))
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.delete("/alpha")
@@ -128,6 +130,33 @@ async def test_fires_on_delete_bucket_204() -> None:
     assert resp.status_code == 204
     repo.invalidate_bucket_acl.assert_awaited_once_with("alpha")
     repo.invalidate_all_bucket_objects.assert_awaited_once_with("alpha")
+    service.invalidate_bucket_meta.assert_awaited_once_with("alpha")
+
+
+@pytest.mark.asyncio
+async def test_purges_bucket_meta_even_when_repo_is_uncached() -> None:
+    """The bucket-meta entry lives on ACLService's own Redis handle, not the repo's, so it must be
+    purged independently of whether acl_repo is the cached variant."""
+    service = _make_acl_service(MagicMock())  # bare repo, NOT a CachedACLRepository
+    app = _make_app(service, Response(status_code=204))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/alpha")
+
+    assert resp.status_code == 204
+    service.invalidate_bucket_meta.assert_awaited_once_with("alpha")
+
+
+@pytest.mark.asyncio
+async def test_skips_bucket_meta_purge_on_tagging_query() -> None:
+    service = _make_acl_service(_make_cached_acl_repo())
+    app = _make_app(service, Response(status_code=204))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/alpha?tagging")
+
+    assert resp.status_code == 204
+    service.invalidate_bucket_meta.assert_not_awaited()
 
 
 @pytest.mark.asyncio

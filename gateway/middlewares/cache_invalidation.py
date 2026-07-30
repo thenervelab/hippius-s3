@@ -24,6 +24,12 @@ async def cache_invalidation_middleware(
     DeleteBucket. Without this, cached public-bucket grants would keep
     authorizing anonymous reads against a soft-deleted bucket for up to the
     cache TTL — a real authz hole.
+
+    Same call also purges the bucket-meta entry (owner_id + bucket_id, keyed by
+    bucket NAME). Soft-delete frees the name for any account immediately, so a
+    surviving entry would resolve the previous owner against the next account's
+    bucket of that name — granting them the master-token ownership bypass and
+    the "private" canned-ACL owner match, while 403'ing the rightful owner.
     """
     response = await call_next(request)
 
@@ -66,6 +72,9 @@ def _bucket_from_path(path: str) -> str | None:
 
 
 async def _invalidate_bucket_acl_cache(acl_service: ACLService, bucket_name: str) -> None:
+    # The bucket-meta entry (owner_id + bucket_id, keyed by NAME) lives on ACLService's own Redis
+    # handle rather than the repo's, so purge it before the isinstance gate below.
+    await acl_service.invalidate_bucket_meta(bucket_name)
     if not isinstance(acl_service.acl_repo, CachedACLRepository):
         return
     cached = acl_service.acl_repo

@@ -66,6 +66,23 @@ class ACLService:
         except RedisError as exc:
             logger.warning(f"bucket-meta cache: redis SETEX failed (best-effort, continuing): {exc}")
 
+    async def invalidate_bucket_meta(self, bucket: str) -> None:
+        """Drop the cached owner/id for a bucket NAME. Required on DeleteBucket: the name is
+        reusable by any account the moment the row is soft-deleted, so the entry outlives the
+        bucket it describes."""
+        if self._redis is None:
+            return
+        # Best-effort, mirroring CachedACLRepository.invalidate_bucket_acl: the soft-delete has
+        # already committed upstream, so raising here would only turn a successful 204 into a 500
+        # while leaving the same stale entry behind. Staleness stays bounded by the TTL.
+        try:
+            deleted = await self._redis.delete(self._bucket_meta_key(bucket))
+        except RedisError as exc:
+            logger.warning(f"bucket-meta cache: redis DELETE failed for {bucket} (best-effort, continuing): {exc}")
+            return
+        if deleted:
+            logger.info(f"Invalidated bucket-meta cache for bucket {bucket}")
+
     async def canned_acl_to_acl(self, canned_acl: str, owner_id: str, bucket: str | None = None) -> ACL:
         """Convert canned ACL name to ACL object with grants."""
         from hippius_s3.services.acl_helper import canned_acl_to_acl as shared_canned_acl_to_acl
