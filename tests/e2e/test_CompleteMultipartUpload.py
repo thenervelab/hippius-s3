@@ -47,3 +47,51 @@ def test_complete_multipart_upload_returns_combined_etag(
     # HEAD should expose the same ETag
     head = boto3_client.head_object(Bucket=bucket, Key=key)
     assert head["ETag"].strip('"') == etag_xml
+
+
+def test_multipart_upload_with_ampersand_key(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    """'&' is legal in an object key but must be escaped in the XML responses.
+
+    Unescaped it opens an entity reference, so the document is not well-formed and botocore
+    fails to parse it — CreateMultipartUpload never yields an UploadId and the upload dies
+    before any data is sent. Only an end-to-end client proves the response is readable.
+    """
+    bucket = unique_bucket_name("mpu-amp")
+    cleanup_buckets(bucket)
+    boto3_client.create_bucket(Bucket=bucket)
+    key = "report&final.pdf"
+
+    create = boto3_client.create_multipart_upload(Bucket=bucket, Key=key, ContentType="application/pdf")
+    upload_id = create["UploadId"]
+    assert create["Key"] == key
+
+    part_size = 5 * 1024 * 1024
+    etag1 = boto3_client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=1, Body=b"a" * part_size)[
+        "ETag"
+    ]
+    etag2 = boto3_client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=2, Body=b"b" * part_size)[
+        "ETag"
+    ]
+
+    completed = boto3_client.complete_multipart_upload(
+        Bucket=bucket,
+        Key=key,
+        UploadId=upload_id,
+        MultipartUpload={
+            "Parts": [
+                {"ETag": etag1, "PartNumber": 1},
+                {"ETag": etag2, "PartNumber": 2},
+            ]
+        },
+    )
+    assert completed["Key"] == key
+    etag_xml = completed["ETag"].strip('"')
+    assert etag_xml.endswith("-2")
+
+    head = boto3_client.head_object(Bucket=bucket, Key=key)
+    assert head["ETag"].strip('"') == etag_xml

@@ -15,6 +15,7 @@ from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.utils import get_query
+from hippius_s3.xml_helpers import parse_untrusted_xml
 
 
 logger = logging.getLogger(__name__)
@@ -75,8 +76,8 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
             )
 
         try:
-            root = ET.fromstring(body)
-        except Exception:
+            root = parse_untrusted_xml(body)
+        except ValueError:
             logger.exception("Malformed XML for DeleteObjects")
             return errors.s3_error_response(
                 "MalformedXML",
