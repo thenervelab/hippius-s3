@@ -67,6 +67,7 @@ Implication: if anything except the gateway could reach the API's port, it could
 - **PutObject object identity is DB-atomic**: the old pre-check `SELECT` was removed (WU-3); the endpoint always passes a fresh `candidate_object_id` and trusts the DB-returned id ([put_object_endpoint.py:137-142](s3/objects/put_object_endpoint.py)). See [s3/objects/CLAUDE.md](s3/objects/CLAUDE.md).
 - **CORS on PutBucket**: returns 200 OK for `?cors` query, logs an "Ignored" line, but doesn't store anything. Added in commit `afc0a94` to avoid `BucketAlreadyExists` errors from AWS SDKs attempting to configure CORS on existing buckets.
 - **Lifecycle XML parsed then discarded** — same pattern for `?lifecycle` at [bucket_create_endpoint.py:78](s3/buckets/bucket_create_endpoint.py). See [todo.md](../../todo.md) P2.
+- **Client XML goes through `parse_untrusted_xml`** ([xml_helpers.py](../xml_helpers.py)), never a bare `ET.fromstring` — a default parser loads DTDs and expands entities. Responses are built with `create_element`/`add_subelement`/`to_xml_bytes` so values are escaped: a key containing `&` is legal and an f-string template produces a document no client can parse. Match on `local-name()` when reading, since SDKs disagree about namespacing the body.
 
 ## Where things live
 
