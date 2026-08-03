@@ -64,6 +64,23 @@ PROHIBITED_BUCKET_SUFFIXES = ["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table
 
 SKIP_PREFIXES = {"health", "user", "docs", "robots.txt", "openapi.json"}
 
+# First path segments owned by gateway/API routes. Several middlewares special-case
+# these paths before any identity is stamped, so a bucket created under one of these
+# names lands ownerless yet permanently locks the globally-unique name (prod incident
+# 2026-08-03: buckets "docs" and "docs2"). Prefixes are banned too, as robustness
+# against any startswith-style route matching elsewhere in the stack.
+RESERVED_BUCKET_SEGMENTS = (
+    "acl",
+    "docs",
+    "health",
+    "metrics",
+    "openapi.json",
+    "redoc",
+    "robots.txt",
+    "static",
+    "user",
+)
+
 
 async def input_validation_middleware(
     request: Request,
@@ -72,10 +89,6 @@ async def input_validation_middleware(
     """Validate S3 inputs for security and AWS compatibility."""
 
     path_parts = _decoded_path(request).strip("/").split("/")
-
-    # Skip validation for non-S3 endpoints
-    if path_parts[0] in SKIP_PREFIXES:
-        return await call_next(request)
 
     # Validate bucket name only on CreateBucket (PUT /{bucket} with no object key and no
     # tagging/lifecycle/policy query params). Existing buckets with non-compliant names
@@ -88,6 +101,22 @@ async def input_validation_middleware(
         and "lifecycle" not in request.query_params
         and "policy" not in request.query_params
     )
+
+    # Reserved-name rejection must run BEFORE the SKIP_PREFIXES bypass: PUT /docs is
+    # CreateBucket-shaped, and skipping it is exactly how the ownerless "docs" bucket
+    # got written.
+    if is_create_bucket:
+        reserved = next((seg for seg in RESERVED_BUCKET_SEGMENTS if path_parts[0].startswith(seg)), None)
+        if reserved:
+            return s3_error_response(
+                code="InvalidBucketName",
+                message=f"Bucket name cannot start with '{reserved}': reserved for gateway routes",
+                status_code=400,
+            )
+
+    # Skip validation for non-S3 endpoints
+    if path_parts[0] in SKIP_PREFIXES:
+        return await call_next(request)
 
     if is_create_bucket:
         bucket_name = path_parts[0]

@@ -216,7 +216,67 @@ async def test_delete_request_skips_bucket_validation(validation_app: Any) -> No
 
 
 # ---------------------------------------------------------------------------
-# Non-S3 endpoint paths bypass all validation
+# Reserved gateway route names — CreateBucket must never collide with them.
+# A bucket named "docs" (exact) or "docs2" (prefix) previously slipped through
+# and was written with an empty/anonymous owner (prod incident 2026-08-03).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "docs",
+        "docs2",
+        "docsite",
+        "health",
+        "healthcheck",
+        "metrics",
+        "metrics-test",
+        "user",
+        "userdata",
+        "openapi.json",
+        "robots.txt",
+        "acl",
+        "acl-backups",
+        "static",
+        "redoc",
+    ],
+)
+@pytest.mark.asyncio
+async def test_reserved_bucket_names_and_prefixes_rejected(validation_app: Any, name: str) -> None:
+    async with AsyncClient(transport=ASGITransport(app=validation_app), base_url="http://test") as client:
+        resp = await client.put(f"/{name}")
+    assert resp.status_code == 400
+    assert "InvalidBucketName" in resp.text
+
+
+@pytest.mark.parametrize("name", ["documents", "do-docs", "my-metrics", "healer", "endless-static"])
+@pytest.mark.asyncio
+async def test_non_reserved_lookalike_names_pass(validation_app: Any, name: str) -> None:
+    """Names that don't START with a reserved segment are unaffected."""
+    async with AsyncClient(transport=ASGITransport(app=validation_app), base_url="http://test") as client:
+        resp = await client.put(f"/{name}")
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_reserved_name_with_key_is_not_create_bucket(validation_app: Any) -> None:
+    """PUT /docs/{key} is PutObject-shaped, not CreateBucket — still skipped."""
+    async with AsyncClient(transport=ASGITransport(app=validation_app), base_url="http://test") as client:
+        resp = await client.put("/docs/some-object")
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_reserved_name_with_tagging_is_not_create_bucket(validation_app: Any) -> None:
+    async with AsyncClient(transport=ASGITransport(app=validation_app), base_url="http://test") as client:
+        resp = await client.put("/docs?tagging=")
+    assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Non-S3 endpoint paths bypass all validation (reads — CreateBucket-shaped
+# PUTs on these paths are now rejected, covered above)
 # ---------------------------------------------------------------------------
 
 
@@ -224,7 +284,7 @@ async def test_delete_request_skips_bucket_validation(validation_app: Any) -> No
 @pytest.mark.asyncio
 async def test_non_s3_paths_bypass_validation(validation_app: Any, path: str) -> None:
     async with AsyncClient(transport=ASGITransport(app=validation_app), base_url="http://test") as client:
-        resp = await client.put(path)
+        resp = await client.get(path)
     assert resp.status_code == 200
 
 

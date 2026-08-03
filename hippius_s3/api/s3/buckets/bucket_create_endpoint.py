@@ -180,15 +180,27 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
 
     # Handle standard bucket creation if not a tagging, lifecycle, or policy request
     else:
-        if is_valid_ss58_address(bucket_name):
-            main_account_id = request.state.account.main_account
-            if bucket_name != main_account_id:
-                return errors.s3_error_response(
-                    "AccessDenied",
-                    "You are not allowed to create this bucket, you can only create a bucket of your own SS58 account address",
-                    status_code=403,
-                    BucketName=bucket_name,
-                )
+        main_account_id = request.state.account.main_account
+
+        # An empty or anonymous main_account means gateway identity stamping was
+        # bypassed (reserved-path holes). Inserting would create an ownerless row
+        # that permanently locks the globally-unique bucket name (prod incident
+        # 2026-08-03: buckets "docs" and "docs2").
+        if not main_account_id or main_account_id == "anonymous":
+            return errors.s3_error_response(
+                "AccessDenied",
+                "CreateBucket requires an authenticated account",
+                status_code=403,
+                BucketName=bucket_name,
+            )
+
+        if is_valid_ss58_address(bucket_name) and bucket_name != main_account_id:
+            return errors.s3_error_response(
+                "AccessDenied",
+                "You are not allowed to create this bucket, you can only create a bucket of your own SS58 account address",
+                status_code=403,
+                BucketName=bucket_name,
+            )
         try:
             bucket_id = str(uuid.uuid4())
             created_at = datetime.now(timezone.utc)
@@ -197,7 +209,6 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
             is_public = False
 
             # Get or create user record for the main account
-            main_account_id = request.state.account.main_account
             await db.fetchrow(
                 get_query("get_or_create_user_by_main_account"),
                 main_account_id,

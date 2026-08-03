@@ -91,3 +91,49 @@ async def test_create_bucket_allows_own_ss58_address() -> None:
         response = await client.put(f"/{ss58_bucket}")
 
     assert response.status_code == 200
+
+
+@pytest.mark.parametrize("main_account", ["", "anonymous"])
+@pytest.mark.asyncio
+async def test_create_bucket_refuses_unauthenticated_identity(main_account: str) -> None:
+    """Defense-in-depth: an empty or anonymous main_account means gateway identity
+    stamping was bypassed. Inserting would create an ownerless row that permanently
+    locks the bucket name (prod incident 2026-08-03: buckets 'docs' and 'docs2')."""
+    mock_db = AsyncMock()
+
+    @asynccontextmanager
+    async def dummy_transaction() -> Any:
+        yield
+
+    mock_db.transaction = dummy_transaction
+    mock_db.fetchrow = AsyncMock()
+
+    @asynccontextmanager
+    async def acquire() -> Any:
+        yield mock_db
+
+    mock_pool = AsyncMock()
+    mock_pool.acquire = acquire
+
+    app = FastAPI()
+    app.include_router(router)
+
+    @app.middleware("http")
+    async def inject_account(request: Request, call_next: Any) -> Any:
+        request.state.account = HippiusAccount(
+            id=main_account,
+            main_account=main_account,
+            upload=True,
+            delete=True,
+            has_credits=True,
+        )
+        return await call_next(request)
+
+    app.dependency_overrides[get_db_pool] = lambda: mock_pool
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/perfectly-valid-name")
+
+    assert response.status_code == 403
+    assert "AccessDenied" in response.text
+    assert mock_db.fetchrow.await_count == 0

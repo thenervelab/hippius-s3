@@ -56,6 +56,23 @@ def test_create_bucket_rejects_too_short(
     assert excinfo.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
+@pytest.mark.local
+@pytest.mark.parametrize("bucket_name", ["docs", "docs2", "metrics-test"])
+def test_create_bucket_rejects_reserved_gateway_names(
+    docker_services: Any,
+    boto3_client: Any,
+    bucket_name: str,
+) -> None:
+    """Names colliding with (or prefixing) reserved gateway routes must be rejected
+    outright — previously they were silently created with an empty/anonymous owner."""
+    with pytest.raises(ClientError) as excinfo:
+        boto3_client.create_bucket(Bucket=bucket_name)
+
+    error = excinfo.value.response.get("Error", {})
+    assert error.get("Code") == "InvalidBucketName"
+    assert excinfo.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
 def test_create_bucket_accepts_valid_lowercase(
     docker_services: Any,
     boto3_client: Any,

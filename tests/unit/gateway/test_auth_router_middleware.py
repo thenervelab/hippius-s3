@@ -46,6 +46,10 @@ def auth_router_app() -> Any:
     async def health_endpoint() -> dict[str, str]:
         return {"status": "healthy"}
 
+    @app.api_route("/{path:path}", methods=["GET", "PUT"])
+    async def catch_all(request: Request, path: str) -> dict[str, Any]:
+        return {"auth_method": getattr(request.state, "auth_method", None)}
+
     app.middleware("http")(auth_router_middleware)
 
     return app
@@ -56,6 +60,35 @@ async def test_exempt_paths_bypass_auth(auth_router_app: Any) -> None:
     """Test that exempt paths bypass authentication"""
     async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
         response = await client.get("/health")
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    ["/docs2", "/docsite", "/metrics-test", "/healthz", "/robots.txt.bak", "/openapi.json2", "/userdata"],
+)
+async def test_reserved_prefixed_bucket_names_still_require_auth(auth_router_app: Any, path: str) -> None:
+    """A bucket name that merely STARTS with a reserved segment must still be
+    authenticated. The old bare startswith() match let PUT /docs2 skip SigV4
+    entirely and land as an anonymous-owned bucket (prod incident 2026-08-03)."""
+    async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+        response = await client.put(path, content=b"test data")
+
+    assert response.status_code == 403
+    assert b"InvalidAccessKeyId" in response.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    ["/docs", "/docs/cache", "/user", "/user/profile", "/metrics", "/health", "/openapi.json", "/robots.txt"],
+)
+async def test_reserved_paths_and_subpaths_bypass_auth(auth_router_app: Any, path: str) -> None:
+    """Exact reserved segments (and their subpaths) stay auth-exempt."""
+    async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+        response = await client.put(path, content=b"test data")
 
     assert response.status_code == 200
 

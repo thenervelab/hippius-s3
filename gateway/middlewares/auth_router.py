@@ -21,13 +21,16 @@ async def auth_router_middleware(
     ray_id = getattr(request.state, "ray_id", "no-ray-id")
     logger = get_logger_with_ray_id(__name__, ray_id)
 
-    exempt_paths = ["/docs", "/openapi.json", "/user/", "/robots.txt", "/metrics", "/health"]
+    # Exact first-segment match (same discipline as input_validation.SKIP_PREFIXES).
+    # A bare startswith() also matched bucket names like /docs2, which then skipped
+    # SigV4 verification entirely and landed as anonymous-owned buckets (prod
+    # incident 2026-08-03).
+    exempt_segments = {"docs", "openapi.json", "user", "robots.txt", "metrics", "health"}
 
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    path = request.url.path
-    if any(path.startswith(exempt_path) or path == exempt_path for exempt_path in exempt_paths):
+    if request.url.path.strip("/").split("/", 1)[0] in exempt_segments:
         return await call_next(request)
 
     # PURGE from the gateway → ATS bounces back here via authproxy. There is
