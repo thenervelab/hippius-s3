@@ -93,12 +93,9 @@ async def test_create_bucket_allows_own_ss58_address() -> None:
     assert response.status_code == 200
 
 
-@pytest.mark.parametrize("main_account", ["", "anonymous"])
-@pytest.mark.asyncio
-async def test_create_bucket_refuses_unauthenticated_identity(main_account: str) -> None:
-    """Defense-in-depth: an empty or anonymous main_account means gateway identity
-    stamping was bypassed. Inserting would create an ownerless row that permanently
-    locks the bucket name (prod incident 2026-08-03: buckets 'docs' and 'docs2')."""
+def _app_with_identity(main_account: str) -> tuple[FastAPI, Any]:
+    """App wired with an injected identity; returns the app and the mock db so
+    tests can assert nothing was written."""
     mock_db = AsyncMock()
 
     @asynccontextmanager
@@ -130,9 +127,36 @@ async def test_create_bucket_refuses_unauthenticated_identity(main_account: str)
         return await call_next(request)
 
     app.dependency_overrides[get_db_pool] = lambda: mock_pool
+    return app, mock_db
+
+
+@pytest.mark.parametrize("main_account", ["", "anonymous"])
+@pytest.mark.asyncio
+async def test_create_bucket_refuses_unauthenticated_identity(main_account: str) -> None:
+    """Defense-in-depth: an empty or anonymous main_account means gateway identity
+    stamping was bypassed. Inserting would create an ownerless row that permanently
+    locks the bucket name (prod incident 2026-08-03: buckets 'docs' and 'docs2')."""
+    app, mock_db = _app_with_identity(main_account)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.put("/perfectly-valid-name")
+
+    assert response.status_code == 403
+    assert "AccessDenied" in response.text
+    assert mock_db.fetchrow.await_count == 0
+
+
+@pytest.mark.parametrize("query", ["tagging", "lifecycle", "policy", "cors"])
+@pytest.mark.parametrize("main_account", ["", "anonymous"])
+@pytest.mark.asyncio
+async def test_bucket_config_refuses_unauthenticated_identity(main_account: str, query: str) -> None:
+    """The tagging/lifecycle/policy/cors branches must refuse a missing identity
+    too — an unauthenticated PUT /docs?tagging= previously reached
+    get_or_create_user and inserted junk user rows with an empty main_account."""
+    app, mock_db = _app_with_identity(main_account)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put(f"/perfectly-valid-name?{query}=")
 
     assert response.status_code == 403
     assert "AccessDenied" in response.text
