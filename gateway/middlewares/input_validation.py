@@ -16,6 +16,7 @@ from substrateinterface.utils.ss58 import is_valid_ss58_address
 from gateway.config import get_config
 from gateway.utils.errors import s3_error_response
 from gateway.utils.paths import decoded_path
+from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
 
 
 logger = logging.getLogger(__name__)
@@ -47,32 +48,16 @@ PROHIBITED_BUCKET_SUFFIXES = ["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table
 
 SKIP_PREFIXES = {"health", "user", "docs", "robots.txt", "openapi.json"}
 
-# First path segments that never reach the S3 forwarder as a bucket. Two sources, both
-# of which strand a bucket created under that name (prod incident 2026-08-03, "docs"):
-#   - a real gateway route swallows the request  -> /health, /docs, /redoc, /openapi.json
-#   - auth_router exempts it, so no identity is stamped -> + /user, /robots.txt, /metrics
+# Re-exported so this module keeps reading as the place bucket-name policy is enforced. The set
+# itself is defined in hippius_s3/reserved_bucket_names.py — the audit script needs it too, and a
+# second copy drifting is the exact failure this rejection exists to prevent.
 #
-# Matched EXACTLY, not by prefix. auth_router was the only place that ever matched route
-# names by prefix and it no longer does, so `docs2` is a perfectly serviceable bucket now —
-# banning every name merely starting with one of these would reject `user-uploads`,
-# `metrics-prod`, `static-assets` and friends for no security benefit.
+# Deliberately NOT in it: `acl` (acl_router mounts /{bucket} at the ROOT — there is no /acl path)
+# and `static` (no StaticFiles mount anywhere in the gateway).
 #
-# Deliberately NOT here: `acl` (acl_router mounts /{bucket} at the ROOT — there is no /acl
-# path) and `static` (no StaticFiles mount anywhere in the gateway).
-#
-# Keep in sync with auth_router.ALL_EXEMPT_SEGMENTS (enforced by
-# test_every_auth_exempt_segment_is_a_reserved_bucket_name).
-RESERVED_BUCKET_SEGMENTS = frozenset(
-    {
-        "docs",
-        "health",
-        "metrics",
-        "openapi.json",
-        "redoc",
-        "robots.txt",
-        "user",
-    }
-)
+# auth_router.ALL_EXEMPT_SEGMENTS must stay a subset — enforced by
+# test_every_auth_exempt_segment_is_a_reserved_bucket_name.
+__all__ = ["RESERVED_BUCKET_SEGMENTS", "input_validation_middleware"]
 
 
 async def input_validation_middleware(
