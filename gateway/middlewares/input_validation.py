@@ -8,7 +8,6 @@ import logging
 import re
 from typing import Awaitable
 from typing import Callable
-from urllib.parse import unquote
 
 from fastapi import Request
 from fastapi import Response
@@ -16,33 +15,17 @@ from substrateinterface.utils.ss58 import is_valid_ss58_address
 
 from gateway.config import get_config
 from gateway.utils.errors import s3_error_response
+from gateway.utils.paths import decoded_path
 
 
 logger = logging.getLogger(__name__)
 config = get_config()
 
 
-def _decoded_path(request: Request) -> str:
-    """The request path, percent-decoded exactly once, with nothing dropped.
-
-    NOT `request.url.path`. Starlette builds that with `urlsplit` over the already-decoded URL,
-    and `urlsplit` treats `#` as the fragment delimiter — so a key sent as `report%23v1.txt`
-    decodes to `report#v1.txt` and then loses everything from the `#`, leaving `report`. The
-    truncated key reached storage, so `report#v1.txt` and `report#v2.txt` both landed as
-    `report` and the second silently overwrote the first: a 200 OK on both, one object destroyed,
-    nothing in the logs. It also meant `#` could never be caught below, despite being in
-    OBJECT_KEY_AVOID_CHARS all along.
-
-    `scope["raw_path"]` is the undecoded bytes as the client sent them, so decoding it here keeps
-    the `#`. This is the same discipline `sigv4.py` already uses to canonicalize — key extraction
-    just never adopted it.
-    """
-    raw = request.scope.get("raw_path")
-    if raw is None:
-        # Not every ASGI server populates raw_path. Falling back to the truncating path is still
-        # better than 500-ing; uvicorn (what we run) always provides it.
-        return request.url.path
-    return unquote(raw.decode("utf-8", "surrogateescape"))
+# Moved to gateway/utils/paths.py so every middleware that keys a security decision off the
+# first path segment shares one decoder. Aliased rather than renamed: the call sites below and
+# the tests reference `_decoded_path`.
+_decoded_path = decoded_path
 
 
 # S3 bucket name validation (AWS S3 compatible)
@@ -64,21 +47,31 @@ PROHIBITED_BUCKET_SUFFIXES = ["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table
 
 SKIP_PREFIXES = {"health", "user", "docs", "robots.txt", "openapi.json"}
 
-# First path segments owned by gateway/API routes. Several middlewares special-case
-# these paths before any identity is stamped, so a bucket created under one of these
-# names lands ownerless yet permanently locks the globally-unique name (prod incident
-# 2026-08-03: buckets "docs" and "docs2"). Prefixes are banned too, as robustness
-# against any startswith-style route matching elsewhere in the stack.
-RESERVED_BUCKET_SEGMENTS = (
-    "acl",
-    "docs",
-    "health",
-    "metrics",
-    "openapi.json",
-    "redoc",
-    "robots.txt",
-    "static",
-    "user",
+# First path segments that never reach the S3 forwarder as a bucket. Two sources, both
+# of which strand a bucket created under that name (prod incident 2026-08-03, "docs"):
+#   - a real gateway route swallows the request  -> /health, /docs, /redoc, /openapi.json
+#   - auth_router exempts it, so no identity is stamped -> + /user, /robots.txt, /metrics
+#
+# Matched EXACTLY, not by prefix. auth_router was the only place that ever matched route
+# names by prefix and it no longer does, so `docs2` is a perfectly serviceable bucket now —
+# banning every name merely starting with one of these would reject `user-uploads`,
+# `metrics-prod`, `static-assets` and friends for no security benefit.
+#
+# Deliberately NOT here: `acl` (acl_router mounts /{bucket} at the ROOT — there is no /acl
+# path) and `static` (no StaticFiles mount anywhere in the gateway).
+#
+# Keep in sync with auth_router.ALL_EXEMPT_SEGMENTS (enforced by
+# test_every_auth_exempt_segment_is_a_reserved_bucket_name).
+RESERVED_BUCKET_SEGMENTS = frozenset(
+    {
+        "docs",
+        "health",
+        "metrics",
+        "openapi.json",
+        "redoc",
+        "robots.txt",
+        "user",
+    }
 )
 
 
@@ -105,14 +98,12 @@ async def input_validation_middleware(
     # Reserved-name rejection must run BEFORE the SKIP_PREFIXES bypass: PUT /docs is
     # CreateBucket-shaped, and skipping it is exactly how the ownerless "docs" bucket
     # got written.
-    if is_create_bucket:
-        reserved = next((seg for seg in RESERVED_BUCKET_SEGMENTS if path_parts[0].startswith(seg)), None)
-        if reserved:
-            return s3_error_response(
-                code="InvalidBucketName",
-                message=f"Bucket name cannot start with '{reserved}': reserved for gateway routes",
-                status_code=400,
-            )
+    if is_create_bucket and path_parts[0] in RESERVED_BUCKET_SEGMENTS:
+        return s3_error_response(
+            code="InvalidBucketName",
+            message=f"Bucket name '{path_parts[0]}' is reserved for gateway routes",
+            status_code=400,
+        )
 
     # Skip validation for non-S3 endpoints
     if path_parts[0] in SKIP_PREFIXES:

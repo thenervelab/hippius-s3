@@ -1,6 +1,7 @@
 """Unit tests for input_validation_middleware — bucket name validation on CreateBucket."""
 
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi import FastAPI
@@ -217,46 +218,65 @@ async def test_delete_request_skips_bucket_validation(validation_app: Any) -> No
 
 # ---------------------------------------------------------------------------
 # Reserved gateway route names — CreateBucket must never collide with them.
-# A bucket named "docs" (exact) or "docs2" (prefix) previously slipped through
-# and was written with an empty/anonymous owner (prod incident 2026-08-03).
+# A bucket named "docs" previously slipped through and was written with an
+# empty owner (prod incident 2026-08-03).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "name",
-    [
-        "docs",
-        "docs2",
-        "docsite",
-        "health",
-        "healthcheck",
-        "metrics",
-        "metrics-test",
-        "user",
-        "userdata",
-        "openapi.json",
-        "robots.txt",
-        "acl",
-        "acl-backups",
-        "static",
-        "redoc",
-    ],
+    ["docs", "health", "metrics", "user", "openapi.json", "robots.txt", "redoc"],
 )
 @pytest.mark.asyncio
-async def test_reserved_bucket_names_and_prefixes_rejected(validation_app: Any, name: str) -> None:
+async def test_reserved_bucket_names_rejected(validation_app: Any, name: str) -> None:
     async with AsyncClient(transport=ASGITransport(app=validation_app), base_url="http://test") as client:
         resp = await client.put(f"/{name}")
     assert resp.status_code == 400
     assert "InvalidBucketName" in resp.text
 
 
-@pytest.mark.parametrize("name", ["documents", "do-docs", "my-metrics", "healer", "endless-static"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        # Names merely PREFIXED by a reserved segment. auth_router matches exactly now, so
+        # these authenticate normally and get a real owner — banning them would reject
+        # ordinary customer names for no security benefit.
+        "docs2",
+        "docsite",
+        "healthcheck",
+        "metrics-test",
+        "user-uploads",
+        "userdata",
+        # Never route names in the first place: acl_router mounts /{bucket} at the ROOT (no
+        # /acl prefix), and there is no /static mount anywhere in the gateway.
+        "acl",
+        "acl-backups",
+        "static",
+        "static-assets",
+        # Plain lookalikes.
+        "documents",
+        "do-docs",
+        "my-metrics",
+        "healer",
+    ],
+)
 @pytest.mark.asyncio
-async def test_non_reserved_lookalike_names_pass(validation_app: Any, name: str) -> None:
-    """Names that don't START with a reserved segment are unaffected."""
+async def test_non_reserved_names_pass(validation_app: Any, name: str) -> None:
     async with AsyncClient(transport=ASGITransport(app=validation_app), base_url="http://test") as client:
         resp = await client.put(f"/{name}")
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_reserved_check_uses_raw_path_not_url_path() -> None:
+    """The reserved check must read the same decoded path every other security-relevant
+    middleware reads. request.url.path is built with urlsplit, which truncates at '#', so
+    `PUT /docs%23x` would look like the bare reserved name `docs` through that lens."""
+    from gateway.utils.paths import first_path_segment
+
+    request = MagicMock()
+    request.scope = {"raw_path": b"/docs%23x"}
+    assert first_path_segment(request) == "docs#x"
 
 
 @pytest.mark.asyncio
@@ -275,16 +295,39 @@ async def test_reserved_name_with_tagging_is_not_create_bucket(validation_app: A
 
 
 # ---------------------------------------------------------------------------
-# Non-S3 endpoint paths bypass all validation (reads — CreateBucket-shaped
-# PUTs on these paths are now rejected, covered above)
+# Non-S3 endpoint paths bypass all validation. Reads bypass; a CreateBucket-shaped
+# PUT on the bare segment is now rejected instead (the two cases are split rather
+# than the PUT coverage being dropped).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("path", ["/health", "/user", "/docs", "/openapi.json", "/robots.txt"])
 @pytest.mark.asyncio
-async def test_non_s3_paths_bypass_validation(validation_app: Any, path: str) -> None:
+async def test_non_s3_paths_bypass_validation_on_reads(validation_app: Any, path: str) -> None:
     async with AsyncClient(transport=ASGITransport(app=validation_app), base_url="http://test") as client:
         resp = await client.get(path)
+    assert resp.status_code == 200
+
+
+@pytest.mark.parametrize("path", ["/health", "/user", "/docs", "/openapi.json", "/robots.txt"])
+@pytest.mark.asyncio
+async def test_create_bucket_shaped_put_on_non_s3_paths_is_rejected(validation_app: Any, path: str) -> None:
+    """The counterpart to the read case above: PUT /<segment> with no key and no sub-resource
+    query is CreateBucket, and letting it through the SKIP_PREFIXES bypass is exactly how the
+    ownerless "docs" bucket got written."""
+    async with AsyncClient(transport=ASGITransport(app=validation_app), base_url="http://test") as client:
+        resp = await client.put(path)
+    assert resp.status_code == 400
+    assert "InvalidBucketName" in resp.text
+
+
+@pytest.mark.parametrize("path", ["/user/profile", "/docs/cache"])
+@pytest.mark.asyncio
+async def test_non_s3_subpath_puts_still_bypass(validation_app: Any, path: str) -> None:
+    """PUT on a sub-path is not CreateBucket-shaped — the frontend /user/... endpoints and
+    the /docs/cache purge must keep working."""
+    async with AsyncClient(transport=ASGITransport(app=validation_app), base_url="http://test") as client:
+        resp = await client.put(path)
     assert resp.status_code == 200
 
 
