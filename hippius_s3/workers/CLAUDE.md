@@ -79,7 +79,7 @@ Key config ([../config.py](../config.py)):
 - `DOWNLOADER_SEMAPHORE=20` — concurrent chunk fetches per DCR.
 - `DOWNLOADER_MAX_INFLIGHT=10` — concurrent DCRs per pod. Range-heavy reads produce many single-part DCRs; parallelizing them is what delivers real backend throughput.
 - `DOWNLOADER_CHUNK_RETRIES=3`.
-- `DOWNLOAD_COALESCE_LOCK_TTL=120` — upper bound on how long a streamer can wait for a crashed downloader.
+- `DOWNLOAD_COALESCE_LOCK_TTL=600` — upper bound on how long a streamer can wait for a crashed downloader.
 
 ## Unpinner
 

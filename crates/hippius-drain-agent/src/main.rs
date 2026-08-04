@@ -58,6 +58,7 @@ async fn main() -> Result<ExitCode, StartupError> {
             .await?
             .with_claim_lease(config.claim_lease)
             .with_defer_backoff(config.defer_backoff)
+            .with_defer_backoff_cap(config.defer_backoff_cap)
             .with_node_id(config.node_id.as_str()),
     );
 

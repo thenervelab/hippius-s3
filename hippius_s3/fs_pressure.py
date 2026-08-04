@@ -27,19 +27,31 @@ def get_fs_cache_pressure(config: Config) -> FsCachePressure:
 def should_reject_fs_cache_write(
     *,
     config: Config,
+    published_mode: int | None = None,
 ) -> tuple[bool, float, FsCachePressure, str]:
-    """Reject when current free-space is below configured thresholds."""
+    """Reject when local free-space OR the published pool signal says stop.
+
+    The local statvfs check sees only the mount under `object_cache_dir` — on
+    prod api-local that is the node NVMe, which stayed green on 2026-07-24
+    while the backing Ceph pool filled to the read-only cliff. The janitor's
+    published `fs_cache:pressure` mode (pressure_signal.py) closes that blind
+    spot; `None` (signal unavailable) preserves the local-only behavior.
+    """
     pressure = get_fs_cache_pressure(config)
 
     threshold_hit = pressure.free_bytes <= int(config.fs_cache_min_free_bytes) or pressure.free_ratio <= float(
         config.fs_cache_min_free_ratio
     )
+    reason = "threshold"
+    if not threshold_hit and published_mode == 2:
+        threshold_hit = True
+        reason = "pool"
     if threshold_hit:
         # C2: jitter Retry-After ±25% so a fleet of throttled clients doesn't retry in a
         # synchronized wave (thundering herd) the instant a shared window elapses — which would
         # re-spike disk pressure and re-trigger the gate. Floor at 1s.
         base = float(config.fs_cache_retry_after_seconds)
         jittered = max(1.0, base * random.uniform(0.75, 1.25))
-        return True, jittered, pressure, "threshold"
+        return True, jittered, pressure, reason
 
     return False, 0.0, pressure, "ok"

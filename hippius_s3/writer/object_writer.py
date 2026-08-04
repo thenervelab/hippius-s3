@@ -21,6 +21,7 @@ from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.db_retry import retry_on_object_version_conflict
+from hippius_s3.repositories import fs_cache_inventory
 from hippius_s3.services.crypto_pool import run_crypto
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.parts_service import upsert_part_placeholder
@@ -443,45 +444,53 @@ class ObjectWriter:
                 "storage_version": resolved_storage_version,
             },
         ):
-            async with acquire_with_timeout(self.pool, self.config.db_pool_acquire_timeout) as conn, conn.transaction():
-                # Until this UPDATE sets non-empty size/md5 the version is invisible to downloads.
-                await conn.execute(
-                    get_query("update_object_version_metadata"),
-                    int(total_size),
-                    md5_hash,
-                    content_type,
-                    json.dumps(metadata),
-                    datetime.now(timezone.utc),
-                    object_id,
-                    int(object_version),
-                )
-                # Envelope (kek_id, wrapped_dek) was already written in the head transaction
-                # to prevent the read-race on concurrent overwrites.
+            async with acquire_with_timeout(self.pool, self.config.db_pool_acquire_timeout) as conn:
+                async with conn.transaction():
+                    # Until this UPDATE sets non-empty size/md5 the version is invisible to downloads.
+                    await conn.execute(
+                        get_query("update_object_version_metadata"),
+                        int(total_size),
+                        md5_hash,
+                        content_type,
+                        json.dumps(metadata),
+                        datetime.now(timezone.utc),
+                        object_id,
+                        int(object_version),
+                    )
+                    # Envelope (kek_id, wrapped_dek) was already written in the head transaction
+                    # to prevent the read-race on concurrent overwrites.
 
-                upload_id = await ensure_upload_row(
-                    conn,
-                    object_id=object_id,
-                    bucket_id=bucket_id,
-                    object_key=object_key,
-                    content_type=content_type,
-                    metadata=metadata,
-                )
+                    upload_id = await ensure_upload_row(
+                        conn,
+                        object_id=object_id,
+                        bucket_id=bucket_id,
+                        object_key=object_key,
+                        content_type=content_type,
+                        metadata=metadata,
+                    )
 
-                await upsert_part_placeholder(
-                    conn,
-                    object_id=object_id,
-                    upload_id=str(upload_id),
-                    part_number=int(part_number),
-                    size_bytes=int(total_size),
-                    etag=md5_hash,
-                    chunk_size_bytes=int(chunk_size),
-                    object_version=int(object_version),
-                    chunk_cipher_sizes=chunk_cipher_sizes,
-                )
-                # NOTE: `multipart_uploads.is_completed = TRUE` is intentionally NOT set here.
-                # It must be set only AFTER the upload is enqueued (the endpoint does it), so that
-                # if the enqueue fails the row stays is_completed=FALSE and remains eligible for the
-                # DELETE cascade cleanup instead of becoming an un-uploadable, un-evictable orphan.
+                    await upsert_part_placeholder(
+                        conn,
+                        object_id=object_id,
+                        upload_id=str(upload_id),
+                        part_number=int(part_number),
+                        size_bytes=int(total_size),
+                        etag=md5_hash,
+                        chunk_size_bytes=int(chunk_size),
+                        object_version=int(object_version),
+                        chunk_cipher_sizes=chunk_cipher_sizes,
+                    )
+                    # NOTE: `multipart_uploads.is_completed = TRUE` is intentionally NOT set here.
+                    # It must be set only AFTER the upload is enqueued (the endpoint does it), so that
+                    # if the enqueue fails the row stays is_completed=FALSE and remains eligible for the
+                    # DELETE cascade cleanup instead of becoming an un-uploadable, un-evictable orphan.
+
+                # The part's chunks+meta are on FS; record it so the janitor's SQL discovery finds it.
+                # MUST run AFTER the tail transaction commits: a failed INSERT inside the open txn
+                # would poison it and turn the block-exit COMMIT into a silent ROLLBACK, losing the
+                # part rows above. Reuses the still-held conn (autocommit per statement outside the
+                # txn block) so there is no extra pool checkout on the hot PUT path.
+                await fs_cache_inventory.record_cached(conn, object_id, int(object_version), int(part_number))
         perf_post_ms = (time.monotonic() - perf_post_start) * 1000
 
         throughput_mbps = (
@@ -727,15 +736,13 @@ class ObjectWriter:
         consumer_error: BaseException | None = None
 
         async def _cleanup_partial() -> None:
-            try:
-                await self.fs_store.delete_part(str(object_id), int(object_version), int(part_number))
-            except Exception:
-                logger.warning(
-                    "Failed to cleanup partial part on FS: object_id=%s v=%s part=%s",
-                    object_id,
-                    int(object_version),
-                    int(part_number),
-                )
+            # Deliberately NO fs_store.delete_part here. Hedged duplicate UploadPart attempts
+            # share one part dir; chunk files are atomic-rename + byte-identical across
+            # duplicates and invisible to readers/reconciler until meta.json lands — so a
+            # failure-path deletion is pure hazard: on 2026-07-26 a cancelled duplicate's
+            # cleanup wiped a completed part's data after its 200 was already returned.
+            # A never-published dir merely leaks until SSD GC; leak beats loss (same doctrine
+            # as the drain reclaim).
             if written_chunk_indices:
                 try:
                     keys = [
@@ -868,6 +875,25 @@ class ObjectWriter:
                 await _cleanup_partial()
             raise
 
+        # Publish-time exact-set trim (covers MPU and append, which materializes its delta
+        # part here). The drain replicates a part only when the SSD chunk set is EXACTLY
+        # {0..num_chunks-1} (partdrain.rs completeness gate → IncompleteSource); a stale tail
+        # from a LARGER earlier attempt would strand the part forever — never replicated,
+        # never evicted. Races, honestly: an identical concurrent duplicate never writes
+        # indices >= our N (same content ⇒ same N), so this only ever deletes another
+        # attempt's bytes when that attempt has DIFFERENT content — and there S3 semantics
+        # are already last-writer-wins for concurrent same-part uploads. Different-content
+        # attempts interleave arbitrarily; whichever publishes last rewrites meta and its
+        # trim enforces its own N, so any transiently mixed (meta, chunk set) state resolves
+        # to the last publisher's. A drain that catches the mid-window mismatch defers once
+        # as IncompleteSource and retries — benign, not permanent, because the settled state
+        # is exact. Trim never raises by contract (failures are ERROR-logged inside —
+        # stranded-part risk — but the part itself is durable on SSD), and it sits outside
+        # the try above so a bug in it can never masquerade as a stream failure.
+        await self.fs_store.trim_chunks_from(
+            str(object_id), int(object_version), int(part_number), int(next_chunk_index)
+        )
+
         perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
         md5_hash = hasher.hexdigest()
 
@@ -883,6 +909,13 @@ class ObjectWriter:
             object_version=int(object_version),
             chunk_cipher_sizes=chunk_cipher_sizes,
         )
+        # The part's chunks+meta are on FS; record it so the janitor's SQL discovery finds it.
+        # Advisory-only, on the autocommit pool (no open transaction here — upsert_part_placeholder
+        # above also writes via self.pool). This hook also covers the APPEND path, which materializes
+        # its delta part through mpu_upload_part_stream. The dead CacheWriter (todo.md) and the
+        # script-only non-streaming put paths are intentionally unhooked — the janitor walk sweep
+        # backfills any inventory rows they would have written.
+        await fs_cache_inventory.record_cached(self.pool, str(object_id), int(object_version), int(part_number))
         perf_post_ms = (time.monotonic() - perf_post_start) * 1000
 
         throughput_mbps = (
@@ -1101,15 +1134,16 @@ class ObjectWriter:
             )
 
         async def _cleanup_part(num_chunks: int | None) -> None:
-            try:
-                await self.fs_store.delete_part(str(object_id), int(cov), int(next_part))
-            except Exception:
-                logging.getLogger(__name__).warning(
-                    "Failed to cleanup append part on FS: object_id=%s v=%s part=%s",
-                    object_id,
-                    int(cov),
-                    int(next_part),
-                )
+            # This runs ONLY from the finalize-CAS-loser branch, AFTER mpu_upload_part_stream
+            # returned — so the loser's meta.json HAS landed and the dir IS visible to readers
+            # and the drain reconciler, while _delete_part_row is about to remove its parts row.
+            # Part-number reservation is FOR-UPDATE-serialized, so no live winner shares this
+            # dir: deleting ONLY meta.json is safe and un-publishes it (restores the meta-last
+            # invariant), preventing (a) the drain replicating a part with no DB row and (b) a
+            # future append that reuses this part number inheriting stale readiness over mixed
+            # content (nonce-reuse-on-disk for different plaintext). Chunk files stay — failure
+            # paths never delete chunk data (the 2026-07-22/26 incidents); leak beats loss.
+            await self.fs_store.delete_meta(str(object_id), int(cov), int(next_part))
             try:
                 meta_key = self.obj_cache.build_meta_key(str(object_id), int(cov), int(next_part))
                 keys = [meta_key]

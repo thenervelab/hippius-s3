@@ -1,10 +1,10 @@
-# Staging trial: node-local-SSD ingest tier (s3-2.0 prototype)
+# Staging: node-local-SSD ingest tier (s3-2.1 drain-direct)
 
-Prototype the [s3-2.0](../../s3-2.0.html) upload flow on staging: run the **entire staging `api`
-fleet on node-local SSD** (2 pods, one per ingest node), served through the **normal `api`
-Service / gateway front door**, while all workers stay on CephFS exactly as today.
-**The `hippius-drain` stack (per-node `drain-agent` DaemonSet + `drain-allocator`) is now installed
-and draining local→ceph** — uploads complete e2e (see the drain-gating caveat under "Uploads" below).
+The node-local-SSD ingest tier on staging: run the **entire staging `api` fleet on node-local SSD**
+(2 pods, one per ingest node), served through the **normal `api` Service / gateway front door**,
+while all workers stay on CephFS. **The `hippius-drain` stack (per-node `drain-agent` DaemonSet +
+`drain-allocator`) is live and is the sole producer of backend upload requests** — the api no longer
+self-enqueues at PUT; uploads complete e2e via the drain.
 
 ## What this adds / changes (all under `k8s/staging/`)
 
@@ -76,11 +76,12 @@ copies each complete part local→ceph (meta-last) and the read path serves from
 cross-node GET returns the object once its parts are drained. Replication lag is bounded by the drain
 throughput (measured ~2.5 min for a 1GB / 128-part object on staging, fsync-bound by ceph-backed PG).
 
-> **Known caveat (tracked in `s3-2.1-todo.md`, PR-7):** the api still enqueues the Arion/OVH backend
-> upload at PUT/MPU-complete, *before* the drain has copied to ceph. For large objects the uploader's
-> 30s meta-wait can expire before the drain finishes → the backend upload DLQs (`object_version=failed`)
-> even though the object is on ceph and downloadable. The drain-gated upload (PR-7) fixes this; until it
-> ships, keep large-object trial traffic bounded.
+> **Resolved (PR-7, drain-direct):** the api **no longer** enqueues the Arion/OVH backend upload at
+> PUT/MPU-complete. The drain-agent is now the sole producer — it enqueues each part's
+> `UploadChainRequest` only *after* it has replicated the part SSD→ceph. This removes the earlier
+> race where the uploader's 30s meta-wait expired before the drain finished and DLQ'd
+> (`object_version=failed`) a still-durable object. Large-object traffic is no longer bounded by that
+> caveat.
 
 ## Deploy & verify
 
@@ -101,8 +102,8 @@ kubectl -n hippius-s3-staging exec postgres-1 -c postgres -- psql -U postgres -d
 ```
 
 The `drain-agent` copies local→ceph (meta-last) + rings `notify:`; a cross-node GET returns the object
-once its parts are `replicated`. (Backend upload to Arion/OVH is still PUT-time enqueued — see the PR-7
-caveat above.)
+once its parts are `replicated`. The drain-agent is also the sole producer of the Arion/OVH backend
+upload — it enqueues each part's `UploadChainRequest` as it replicates (no PUT-time enqueue).
 
 ## Teardown
 

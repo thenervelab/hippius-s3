@@ -25,6 +25,7 @@ from starlette.requests import ClientDisconnect
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3.common import format_s3_timestamp
+from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
@@ -34,16 +35,109 @@ from hippius_s3.services.envelope_service import generate_dek
 from hippius_s3.services.envelope_service import wrap_dek
 from hippius_s3.services.kek_service import get_or_create_active_bucket_kek
 from hippius_s3.services.mpu_cleanup import fail_version_replication
+from hippius_s3.services.mpu_cleanup import wake_version_replication
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.xml_helpers import add_subelement
 from hippius_s3.xml_helpers import create_element
+from hippius_s3.xml_helpers import parse_untrusted_xml
 from hippius_s3.xml_helpers import to_xml_bytes
 
 
 logger = logging.getLogger(__name__)
+
+
+def parse_complete_multipart_upload(body: bytes) -> list[tuple[int, str]]:
+    """Parse a CompleteMultipartUpload body into (part_number, etag) pairs in document order.
+
+    Matched by local-name so a namespace-prefixed or default-namespaced body parses the same,
+    and paired within each ``<Part>`` so a stray element elsewhere in the document cannot shift
+    the pairing. Parts are read as direct children of the root, the way S3 specifies the
+    document, so a ``<Part>`` buried in some unrelated wrapper is not silently honoured.
+
+    ETag quoting is normalised after parsing, which is what makes every client encoding agree:
+    boto3 sends ``"abc"``, Go and Rust send the quotes escaped, and some clients send bare hex
+    — all three arrive here as ``abc``.
+
+    Every part must name a non-empty ETag. That is a guarantee callers rely on: the handler
+    compares each ETag against the stored part, and an empty string would make that comparison
+    vacuous. Enforcing it here means one place has to be right instead of every consumer, and
+    the empty string is reachable more ways than it looks — ``<ETag/>``, whitespace, an
+    unresolved entity reference, and a literal ``""`` that survives quote-stripping.
+
+    Args:
+        body: Raw request body.
+
+    Returns:
+        The listed parts, empty if the body carries none.
+
+    Raises:
+        ValueError: Not well-formed, or a ``<Part>`` missing/misusing PartNumber or ETag.
+    """
+    root = parse_untrusted_xml(body)
+    parts: list[tuple[int, str]] = []
+    for part in root.xpath("./*[local-name()='Part']"):
+        numbers = part.xpath("./*[local-name()='PartNumber']")
+        etags = part.xpath("./*[local-name()='ETag']")
+        if not numbers or not etags:
+            raise ValueError("every Part must carry a PartNumber and an ETag")
+        try:
+            number = int(_plain_text(numbers[0]).strip())
+        except ValueError as exc:
+            raise ValueError(f"PartNumber {numbers[0].text!r} is not an integer") from exc
+        etag = _plain_text(etags[0]).strip().strip('"').strip()
+        if not etag:
+            raise ValueError(f"part {number} has an empty ETag")
+        parts.append((number, etag))
+    return parts
+
+
+def build_complete_result_xml(host: str, bucket_name: str, object_key: str, etag: str) -> bytes:
+    """Serialise a CompleteMultipartUploadResult.
+
+    Shared by the success and idempotent-replay paths so both report the same Location; the
+    replay path used to hardcode ``http://localhost:8000``, which is wrong for every
+    deployment. The Host header is client-controlled, so it is written as element text and
+    escaped rather than interpolated into the document.
+
+    Args:
+        host: Value of the request's Host header.
+        bucket_name: Bucket the upload targeted.
+        object_key: Key the upload targeted.
+        etag: Final object ETag, unquoted.
+
+    Returns:
+        The serialised XML document.
+    """
+    root = create_element("CompleteMultipartUploadResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+    add_subelement(root, "Location", f"http://{host}/{bucket_name}/{object_key}")
+    add_subelement(root, "Bucket", bucket_name)
+    add_subelement(root, "Key", object_key)
+    add_subelement(root, "ETag", f'"{etag}"')
+    return to_xml_bytes(root)
+
+
+def _plain_text(element: Any) -> str:
+    """Text of an element that must contain nothing but text.
+
+    Entity references survive parsing as child nodes because the parser leaves them
+    unresolved, and reading ``.text`` would silently return ``None`` for them — so a body
+    carrying ``<ETag>&bomb;</ETag>`` would read as an empty ETag. Rejecting it is correct: no
+    real client sends entity references here.
+
+    This closes one route to an empty value; the caller rejects the empty string itself, which
+    covers the rest.
+
+    Raises:
+        ValueError: The element has child nodes.
+    """
+    if len(element):
+        raise ValueError("element must contain text only")
+    return element.text or ""
+
+
 router = APIRouter(tags=["s3-multipart"])
 
 config = get_config()
@@ -356,15 +450,11 @@ async def initiate_multipart_upload(
             uuid.UUID(object_id),
         )
 
-        # Create XML response using a hardcoded template
-        xml_string = f"""<?xml version="1.0" encoding="UTF-8"?>
-<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Bucket>{bucket_name}</Bucket>
-  <Key>{object_key}</Key>
-  <UploadId>{upload_id}</UploadId>
-</InitiateMultipartUploadResult>
-"""
-        xml_bytes = xml_string.encode("utf-8")
+        root = create_element("InitiateMultipartUploadResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+        add_subelement(root, "Bucket", bucket_name)
+        add_subelement(root, "Key", object_key)
+        add_subelement(root, "UploadId", upload_id)
+        xml_bytes = to_xml_bytes(root)
 
         # Return response with proper headers
         return Response(
@@ -677,11 +767,11 @@ async def upload_part(
                 await request.app.state.redis_client.delete(*keys)
                 logger.info(f"Cleaned up {len(keys)} cached parts for disconnected upload {upload_id}")
 
-            return s3_error_response(
-                "RequestTimeout",
-                "Client disconnected during upload",
-                status_code=408,
-            )
+            # Same event as the simple-PUT path and the gateway hop, so it carries the same code.
+            # Previously 408 RequestTimeout, which made one abort look like three different
+            # failures depending on which hop you were reading. Nothing is delivered either way —
+            # the peer is gone — so this only affects how we classify it.
+            return Response(status_code=CLIENT_CLOSED_REQUEST)
         except ValueError as exc:
             if "part_size_exceeds_max" in str(exc):
                 return s3_error_response(
@@ -737,12 +827,10 @@ async def upload_part(
         # Return response
         if copy_source:
             # AWS-style XML body for UploadPartCopy
-            xml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<CopyPartResult>
-  <ETag>\"{part_result["etag"]}\"</ETag>
-  <LastModified>{format_s3_timestamp(datetime.now(timezone.utc))}</LastModified>
-</CopyPartResult>
-""".encode("utf-8")
+            root = create_element("CopyPartResult")
+            add_subelement(root, "ETag", f'"{part_result["etag"]}"')
+            add_subelement(root, "LastModified", format_s3_timestamp(datetime.now(timezone.utc)))
+            xml = to_xml_bytes(root)
             return Response(content=xml, media_type="application/xml", status_code=200)
         return Response(
             status_code=200,
@@ -1053,49 +1141,34 @@ async def complete_multipart_upload(
                     final_etag = await hash_all_etags(object_id, object_version, db)
                 except Exception:
                     final_etag = "completed"
-            xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Location>http://localhost:8000/{bucket_name}/{object_key}</Location>
-    <Bucket>{bucket_name}</Bucket>
-    <Key>{object_key}</Key>
-    <ETag>"{final_etag}"</ETag>
-</CompleteMultipartUploadResult>"""
+            xml_content = build_complete_result_xml(
+                request.headers.get("Host", ""), bucket_name, object_key, final_etag
+            )
             return Response(
                 content=xml_content,
                 media_type="application/xml",
                 status_code=200,
+                headers={
+                    "Content-Type": "application/xml; charset=utf-8",
+                    "x-amz-request-id": str(uuid.uuid4()),
+                    "Content-Length": str(len(xml_content)),
+                },
             )
 
-        # Parse the XML request body to get parts list
-        body_text = ""
         try:
-            body_text = (await get_request_body(request)).decode("utf-8")
-        except Exception:
-            body_text = "<CompleteMultipartUpload></CompleteMultipartUpload>"
-
-        # Parse part numbers and ETags
-        part_numbers = re.findall(r"<PartNumber>(\d+)</PartNumber>", body_text)
-        etags = re.findall(r"<ETag>([^<]+)</ETag>", body_text)
-
-        if not part_numbers or not etags or len(part_numbers) != len(etags):
+            part_info = parse_complete_multipart_upload(await get_request_body(request))
+        except ValueError:
             return s3_error_response(
-                "InvalidRequest",
-                "The XML provided was not well-formed",
+                "MalformedXML",
+                "The XML you provided was not well-formed or did not validate against our published schema",
                 status_code=400,
             )
 
-        # Create part info list
-        part_info = []
-        for num, tag in zip(
-            part_numbers,
-            etags,
-            strict=True,
-        ):
-            part_info.append(
-                (
-                    int(num),
-                    tag.replace('"', "").strip(),
-                ),
+        if not part_info:
+            return s3_error_response(
+                "MalformedXML",
+                "The XML you provided was not well-formed or did not validate against our published schema",
+                status_code=400,
             )
         # S3 requires the parts to be listed in strictly ascending part-number order.
         # We used to silently sort here, which masked a malformed part list; reject it
@@ -1145,6 +1218,11 @@ async def complete_multipart_upload(
         # uploaded; S3 rejects the completion (InvalidPart) if the part is missing OR the
         # ETag does not match. Without the ETag check a client could assemble the object
         # from the wrong part bytes and still receive a 200 — a silent data-integrity hole.
+        #
+        # Compared unconditionally: this used to skip a falsy client_etag, which meant any
+        # body encoding an empty ETag opted itself out of the check the comment above
+        # describes. parse_complete_multipart_upload now rejects those bodies outright, so
+        # every ETag reaching here is non-empty and there is nothing to guard against.
         missing_parts = []
         mismatched_parts = []
         for pn, client_etag in part_info:
@@ -1153,7 +1231,7 @@ async def complete_multipart_upload(
                 missing_parts.append(pn)
                 continue
             stored_etag = str(db_part["etag"]).replace('"', "").strip()
-            if client_etag and client_etag.lower() != stored_etag.lower():
+            if client_etag.lower() != stored_etag.lower():
                 mismatched_parts.append(pn)
         if missing_parts:
             return s3_error_response(
@@ -1200,15 +1278,27 @@ async def complete_multipart_upload(
             address=request.state.account.main_account,
         )
 
-        # Create XML response
-        xml_bytes = f"""<?xml version="1.0" encoding="UTF-8"?>
-<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Location>http://{request.headers.get("Host", "")}/{bucket_name}/{object_key}</Location>
-  <Bucket>{bucket_name}</Bucket>
-  <Key>{object_key}</Key>
-  <ETag>"{complete_res.etag}"</ETag>
-</CompleteMultipartUploadResult>
-""".encode("utf-8")
+        # Drain wake: the address write above removes the cause of this version's defer
+        # backoff (rationale, incl. the deliberate defer_attempts reset, lives in
+        # wake_replication_status_for_version.sql). Best-effort (narrow exception to the
+        # no-try/except rule): the complete is already committed, the wake is only an
+        # optimization — the backoff self-heals within the cap — and this handler's
+        # outer catch-all would otherwise turn a wake failure into a 500 for a success.
+        try:
+            await wake_version_replication(db, object_id=object_id, object_version=object_version)
+        except Exception:
+            logger.warning(
+                "drain wake failed after CompleteMultipartUpload bucket=%s upload_id=%s object_id=%s version=%s",
+                bucket_name,
+                upload_id,
+                object_id,
+                object_version,
+                exc_info=True,
+            )
+
+        xml_bytes = build_complete_result_xml(
+            request.headers.get("Host", ""), bucket_name, object_key, str(complete_res.etag)
+        )
 
         get_metrics_collector().record_s3_operation(
             operation="complete_multipart_upload",

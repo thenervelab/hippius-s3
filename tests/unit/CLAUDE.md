@@ -32,12 +32,12 @@ pytest tests/unit/cache -xvs
 
 - **Mock external services**: `httpx`, asyncpg, Redis all mocked with `pytest-mock` fixtures or `unittest.mock`. DO NOT hit a real Redis or Postgres from here — use the integration tier.
 - **Deterministic seed phrases / access keys**: [conftest.py](conftest.py) pins a fixed seed for repeatable SigV4 generation.
-- **Bypass credit check**: `HIPPIUS_BYPASS_CREDIT_CHECK=true` is set in test env (enforced at [config.py:282](../../hippius_s3/config.py)).
+- **Bypass credit check**: `HIPPIUS_BYPASS_CREDIT_CHECK=true` is set in test env (enforced at [config.py:538](../../hippius_s3/config.py)).
 - **ENABLE_BANHAMMER=false** in test env so the rate-limiter doesn't interfere.
 
 ## Tests worth knowing about
 
-- [test_download_coalescing.py](test_download_coalescing.py) — validates the Redis lock key format (`download_in_progress:{object_id}:v:{ov}:part:{pn}`), TTL (120s), and the "only first streamer enqueues" invariant. Catches regressions in the format that cause streamers to hang waiting for downloaders holding a differently-shaped lock.
+- [test_download_coalescing.py](test_download_coalescing.py) — validates the Redis lock key format (`download_in_progress:{object_id}:v:{ov}:part:{pn}`), the lock TTL (`DOWNLOAD_COALESCE_LOCK_TTL`, default 600s — [config.py:289](../../hippius_s3/config.py); the test injects a `120` fixture value and asserts the lock's `EX` matches it), and the "only first streamer enqueues" invariant. Catches regressions in the format that cause streamers to hang waiting for downloaders holding a differently-shaped lock.
 - [test_janitor_hot_retention.py](test_janitor_hot_retention.py) — exercises the absolute "no-deletion-of-non-replicated-data" invariant, including the critical-pressure ERROR-log-and-refuse branch.
 - [test_downloader_batching.py](test_downloader_batching.py) — per-part chunk batching + per-request part batching. Prevents OOM regressions from the May 2026 MPU fix (PR #147).
 - [test_inflight_pool_behaviour.py](test_inflight_pool_behaviour.py) — downloader inflight task reaping and reconnect-on-error logic.

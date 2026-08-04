@@ -20,6 +20,8 @@ from typing import Any
 from typing import Optional
 from uuid import UUID
 
+from hippius_s3.cache.access_tracker import get_access_tracker
+
 
 logger = logging.getLogger(__name__)
 
@@ -149,8 +151,10 @@ class FileSystemPartsStore:
         """Read a chunk from filesystem.
 
         Gated on meta.json existence — readers only see chunks once the part
-        is marked ready. Also touches the chunk file to update atime/mtime,
-        which the janitor uses for hot-file retention.
+        is marked ready. Read recency is recorded via the AccessTracker (into
+        fs_cache_inventory.last_access_at) rather than atime; the hook lives
+        HERE, at the store level, because the streamer passes fetch_fn =
+        fs.get_chunk directly and bypasses every higher-level wrapper.
 
         Args:
             object_id: Object UUID
@@ -173,20 +177,22 @@ class FileSystemPartsStore:
             return None
 
         try:
+            # Read-recency for hot retention is recorded in
+            # fs_cache_inventory.last_access_at (cache/access_tracker.py), not
+            # via atime: the old per-read os.utime was silently dead on
+            # read-only mounts (prod api-local) and an MDS metadata WRITE on
+            # every read elsewhere. stat atime now reflects write recency only.
 
-            def _read_and_touch() -> bytes:
+            def _read() -> bytes:
                 with chunk_path.open("rb") as f:
-                    data = f.read()
-                # Update atime/mtime so janitor treats this as recently-read.
-                # Janitor's hot-retention check uses stat() on the part dir /
-                # meta, so touch both the chunk file AND the part dir's mtime.
-                with contextlib.suppress(OSError):
-                    os.utime(chunk_path, None)
-                with contextlib.suppress(OSError):
-                    os.utime(meta_path, None)
-                return data
+                    return f.read()
 
-            data = await asyncio.to_thread(_read_and_touch)
+            data = await asyncio.to_thread(_read)
+            # Sync, sampled, no-op in processes that never initialize the
+            # tracker (workers/janitor).
+            tracker = get_access_tracker()
+            if tracker is not None:
+                tracker.note_read(object_id, int(object_version), int(part_number))
             logger.debug(
                 f"FS: read chunk object_id={object_id} v={object_version} part={part_number} chunk={chunk_index} size={len(data)}"
             )
@@ -356,6 +362,92 @@ class FileSystemPartsStore:
             logger.error(f"FS meta write failed: object_id={object_id} v={object_version} part={part_number}: {e}")
             raise
 
+    async def trim_chunks_from(self, object_id: str, object_version: int, part_number: int, first_index: int) -> int:
+        """Delete chunk files with index >= first_index; the publish-time exact-set trim.
+
+        Called right after meta.json lands with num_chunks == first_index. The drain
+        replicates a part only when the SSD chunk set is EXACTLY {0..num_chunks-1}
+        (partdrain.rs completeness gate → IncompleteSource); a stale tail left by a
+        larger earlier attempt would strand the part forever — never replicated, never
+        evicted. Never touches meta.json or chunks below first_index.
+
+        Per-file failures are logged at ERROR — a surviving tail IS the stranded-part
+        risk and operators must see it — but never raised: the upload itself is durable
+        on SSD and the client's success must not hinge on tail cleanup.
+
+        Returns:
+            Number of chunk files removed.
+        """
+        part_dir = Path(self.part_path(object_id, object_version, part_number))
+
+        def _trim() -> int:
+            removed = 0
+            try:
+                entries = list(part_dir.iterdir())
+            except FileNotFoundError:
+                return 0
+            except OSError as e:
+                # Same loudness as a per-file failure: an unscannable dir may hide a tail.
+                logger.error(
+                    f"FS trim failed — could not scan part dir, a stale chunk tail may strand the "
+                    f"part as IncompleteSource in the drain: object_id={object_id} "
+                    f"v={object_version} part={part_number}: {e}"
+                )
+                return 0
+            for entry in entries:
+                name = entry.name
+                if not (name.startswith("chunk_") and name.endswith(".bin")):
+                    continue
+                try:
+                    idx = int(name[len("chunk_") : -len(".bin")])
+                except ValueError:
+                    continue  # tmp files etc. — the janitor's orphan sweep owns those
+                if idx < int(first_index):
+                    continue
+                try:
+                    entry.unlink()
+                    removed += 1
+                except OSError as e:
+                    logger.error(
+                        f"FS trim failed — stale chunk tail survives and the part may strand as "
+                        f"IncompleteSource in the drain: object_id={object_id} v={object_version} "
+                        f"part={part_number} chunk={idx}: {e}"
+                    )
+            return removed
+
+        removed = await asyncio.to_thread(_trim)
+        if removed:
+            logger.debug(
+                f"FS: trimmed {removed} stale chunk(s) >= {first_index}: "
+                f"object_id={object_id} v={object_version} part={part_number}"
+            )
+        return removed
+
+    async def delete_meta(self, object_id: str, object_version: int, part_number: int) -> None:
+        """Delete meta.json only, un-publishing a part dir while keeping its chunks.
+
+        Used by the append CAS-loser cleanup: part-number reservation is FOR-UPDATE
+        serialized, so no live winner shares the loser's dir — removing meta makes the
+        dir invisible to readers and the drain reconciler again (restores meta-last)
+        and stops a future append that reuses the number from inheriting stale
+        readiness over mixed content. Idempotent; failures are logged at ERROR (stale
+        readiness left behind) but not raised — the caller is already propagating the
+        CAS failure.
+        """
+        part_dir = Path(self.part_path(object_id, object_version, part_number))
+        meta_path = self._meta_file(part_dir)
+
+        def _unlink() -> None:
+            meta_path.unlink(missing_ok=True)
+
+        try:
+            await asyncio.to_thread(_unlink)
+        except OSError as e:
+            logger.error(
+                f"FS meta delete failed — part stays published with stale readiness: "
+                f"object_id={object_id} v={object_version} part={part_number}: {e}"
+            )
+
     async def get_meta(self, object_id: str, object_version: int, part_number: int) -> Optional[dict]:
         """Read metadata from filesystem.
 
@@ -412,6 +504,27 @@ class FileSystemPartsStore:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 2.0)
 
+    def stat_part(self, object_id: str, object_version: int, part_number: int) -> os.stat_result | None:
+        """Stat a part's readiness marker for the janitor's SQL-eviction candidate check.
+
+        BLOCKING — callers wrap in `asyncio.to_thread` (each stat is a CephFS metadata
+        roundtrip that must not run on the loop). Stats `meta.json` when present, else the part
+        dir, returning None when neither exists — the same "meta.json is the part-complete
+        signal, fall back to the dir" rule the walk gates on (see `_descend_object`). The
+        returned atime drives the hot-retention skip; a None tells the caller the inventory row
+        is stale (the dir is already gone) so it can self-heal by clearing the row.
+        """
+        part_dir = Path(self.part_path(object_id, object_version, part_number))
+        meta_path = self._meta_file(part_dir)
+        try:
+            return meta_path.stat()
+        except OSError:
+            pass
+        try:
+            return part_dir.stat()
+        except OSError:
+            return None
+
     async def delete_part(self, object_id: str, object_version: int, part_number: int) -> None:
         """Delete a part directory and attempt to prune empty parent directories.
 
@@ -425,40 +538,33 @@ class FileSystemPartsStore:
         """
         part_dir = Path(self.part_path(object_id, object_version, part_number))
 
-        if not part_dir.exists():
-            logger.debug(
-                f"FS: delete_part no-op (not present) object_id={object_id} v={object_version} part={part_number}"
-            )
-            return
+        def _delete_and_prune() -> bool:
+            # One thread hop for the whole sequence: the exists-check, rmtree,
+            # and the empty-parent prunes are each a CephFS metadata roundtrip;
+            # doing them on-loop serialized every janitor worker behind MDS
+            # latency.
+            if not part_dir.exists():
+                return False
+            shutil.rmtree(part_dir)
+            for parent in (part_dir.parent, part_dir.parent.parent):
+                with contextlib.suppress(OSError):
+                    parent.rmdir()  # only succeeds if empty — race-safe by contract
+            return True
 
         try:
-            # Remove all files in the part directory
-            await asyncio.to_thread(shutil.rmtree, part_dir)
-            logger.info(f"FS: deleted part object_id={object_id} v={object_version} part={part_number}")
+            deleted = await asyncio.to_thread(_delete_and_prune)
         except Exception as e:
             logger.warning(
                 f"FS: failed to delete part object_id={object_id} v={object_version} part={part_number}: {e}"
             )
             return
-
-        # Attempt to remove parent directories if empty (race-safe)
-        try:
-            version_dir = part_dir.parent
-            if version_dir.exists():
-                with contextlib.suppress(OSError):
-                    version_dir.rmdir()  # Only succeeds if empty
-                logger.debug(f"FS: pruned empty version dir {version_dir}")
-        except OSError:
-            pass  # Directory not empty or other race; ignore
-
-        try:
-            object_dir = version_dir.parent if version_dir else None
-            if object_dir and object_dir.exists():
-                with contextlib.suppress(OSError):
-                    object_dir.rmdir()  # Only succeeds if empty
-                logger.debug(f"FS: pruned empty object dir {object_dir}")
-        except (OSError, AttributeError):
-            pass  # Directory not empty or other race; ignore
+        if deleted:
+            # DEBUG, not INFO — this fires ~11k times per janitor cycle on prod.
+            logger.debug(f"FS: deleted part object_id={object_id} v={object_version} part={part_number}")
+        else:
+            logger.debug(
+                f"FS: delete_part no-op (not present) object_id={object_id} v={object_version} part={part_number}"
+            )
 
     async def delete_object(self, object_id: str, object_version: Optional[int] = None) -> None:
         """Delete an entire object or specific version.

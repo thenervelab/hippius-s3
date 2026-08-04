@@ -101,6 +101,10 @@ class Config:
     arion_rate_limiting_proxy_bypass_key: str = env("ARION_RATE_LIMITING_PROXY_BYPASS_KEY:")
     arion_base_url: str = env("HIPPIUS_ARION_BASE_URL:https://arion.hippius.com/")
     arion_verify_ssl: bool = env("HIPPIUS_ARION_VERIFY_SSL:true", convert=lambda x: x.lower() == "true")
+    # Per-attempt cap for the can_upload billing gate specifically. Unlike every other call on
+    # ArionClient this one runs inside the gateway's request path, so its worst case is gateway
+    # capacity, not worker throughput. Tunable so an incident can shorten it without a deploy.
+    can_upload_timeout_seconds: float = env("CAN_UPLOAD_TIMEOUT_SECONDS:3.0", convert=float)
 
     # Redis for caching/rate limiting
     redis_url: str = env("REDIS_URL")
@@ -238,10 +242,23 @@ class Config:
     # stream breaks and the client retries). Generous (5 min) so a healthy-but-slow drain never
     # trips it, but far below the 1h cache TTL.
     stream_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_CHUNK_TIMEOUT_SECONDS:300", convert=int)
-    # Hot-retention window for the FS cache: chunks read within this window
-    # are protected from janitor deletion so frequently-accessed content
-    # stays on NVMe. Touched on every read by the API/streamer.
-    fs_cache_hot_retention_seconds: int = env("HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS:10800", convert=int)
+    # Hot-retention window for the FS cache: chunks read within this window are protected from
+    # janitor deletion so frequently-accessed content stays on NVMe. Touched on every read by the
+    # API/streamer, and HALVED at elevated pressure / zeroed at critical (_effective_hot_retention).
+    #
+    # 4h, raised from 1h on 2026-07-25. The 1h value (itself tightened from 3h earlier the same day,
+    # on the theory that "a missed re-fetch is one backend read, cheap next to a full pool") turned
+    # out to have the causality backwards: the janitor has NO LRU — it evicts on a binary atime
+    # threshold in filesystem-walk order — so this window IS the working-set protection. Too short
+    # and the live working set reads as "cold", gets evicted, is re-read, re-fetched from a backend
+    # and re-written into the pool. That refill flywheel is what pinned the CephFS pool near-full
+    # during the 2026-07-24 incident: pool writes ran at 172 MiB/s of pure churn and eviction never
+    # got ahead. Raising the window collapsed it to ~54 MiB/s and the pool finally drained.
+    #
+    # 4h is empirically cheap: it retains only ~6% of walked parts (hot_parts 3546 / parts_seen
+    # 56666 at pressure 0). Prod carries the same value in k8s/base/workers-deployments.yaml — keep
+    # the two in step, and do not "optimise" this downward without re-checking the churn rate.
+    fs_cache_hot_retention_seconds: int = env("HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS:14400", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
     object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
     # Downloader behavior (default: no whole-part backfill)
@@ -348,7 +365,9 @@ class Config:
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
     object_cache_fallback_dir: str = env("HIPPIUS_OBJECT_CACHE_FALLBACK_DIR:", convert=str)
-    # 24h since last access — reads bump mtime (os.utime sets both atime+mtime), so this gates on idle time.
+    # 24h since last WRITE — the read path no longer bumps timestamps (read
+    # recency lives in fs_cache_inventory.last_access_at), so this gates on
+    # time since the part landed, not since it was last streamed.
     fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:86400", convert=int)
     # An MPU is "abandoned" only after this long with NO part activity (not just since
     # initiation) — a user can pause a multipart upload and resume it, so the window must
@@ -402,7 +421,7 @@ class Config:
     # Bounded concurrency for the janitor's per-part DB checks + deletes. The
     # cleanup loops are DB-roundtrip bound; this is how many parts are processed
     # in parallel (each over its own pooled connection).
-    janitor_concurrency: int = env("HIPPIUS_JANITOR_CONCURRENCY:16", convert=int)
+    janitor_concurrency: int = env("HIPPIUS_JANITOR_CONCURRENCY:32", convert=int)
     # Concurrency for the FS *walk* itself (distinct from janitor_concurrency, which is the
     # per-part DB roundtrip fan-out). The cache root is a single flat directory of millions of
     # object dirs on CephFS; a single-threaded walk is metadata-latency bound (~40 objects/s
@@ -417,7 +436,7 @@ class Config:
     # completes and the phases after it — plus the DB-only durability sentinel + aged-orphan
     # gauge which now run FIRST regardless — keep ticking. 0 = unbounded. Automatically lifted to
     # unbounded under CRITICAL disk pressure — freeing space must never be capped by a clock.
-    janitor_walk_budget_seconds: int = env("HIPPIUS_JANITOR_WALK_BUDGET_SECONDS:240", convert=int)
+    janitor_walk_budget_seconds: int = env("HIPPIUS_JANITOR_WALK_BUDGET_SECONDS:480", convert=int)
     # Number of hash-shards the FS walk rotates through, one per cycle, for FAIR coverage: each
     # cycle descends only into object dirs where crc32(object_id) % shards == cycle_shard, so a
     # full sweep of the tree takes `shards` cycles and no object waits behind an always-truncated
@@ -426,12 +445,45 @@ class Config:
     # concurrency 8 (~8× the ~40 obj/s serial rate measured on prod) and a 240s budget, one shard
     # is ~44k objects → comfortably inside budget; a full sweep is ~64 cycles (~10h at the 600s
     # normal sleep). Raise it if the cache grows or the walk logs truncated=True; 1 = walk the
-    # whole tree every cycle. Forced to 1 under disk pressure so eviction sees the whole tree.
+    # whole tree every cycle. Forced to 1 under CRITICAL disk pressure so eviction sees the whole
+    # tree in a single unbounded walk.
     janitor_walk_shards: int = env("HIPPIUS_JANITOR_WALK_SHARDS:64", convert=int)
+    # Under ELEVATED pressure keep rotating a small number of shards instead of collapsing to a
+    # single head-restarting whole-tree walk (the 480s budget truncates a 15.6M-entry readdir long
+    # before the tail; with shards=1 the tail is never reached). CRITICAL still forces shards=1 +
+    # unbounded budget — freeing space beats coverage fairness there.
+    janitor_elevated_walk_shards: int = env("HIPPIUS_JANITOR_ELEVATED_WALK_SHARDS:8", convert=int)
+    # Sleep between cycles while under any disk pressure. 120s of a ~600s cycle was dead time
+    # exactly when eviction throughput mattered most.
+    janitor_pressure_sleep_seconds: int = env("HIPPIUS_JANITOR_PRESSURE_SLEEP_SECONDS:15", convert=int)
+    # Pool-fullness gate for the janitor's disk-pressure probe. _pressure_mode reads statvfs on the
+    # cache mount, which sees the CephFS *PVC quota* — NOT the backing pool. On 2026-07-24 statvfs
+    # read 69% while ceph-filesystem-data0 sat at 94%, so the janitor stayed in Normal mode (10min
+    # sleep, 64-shard sweep, hot retention honored) while the pool filled to the read-only cliff.
+    # When BOTH are set, the janitor also scrapes ceph_pool_percent_used for these pools from the
+    # mgr exporter (the same signal PR #337 gave the drain allocator) and takes the MAX of that and
+    # the local statvfs ratio: the pool signal can only ever RAISE pressure, never mask it. Empty =
+    # statvfs-only (pre-incident behavior). Point the URL at the mgr exporter and list the same
+    # pools as the drain's CEPHOR_CEPH_POOLS.
+    janitor_ceph_mgr_metrics_url: str = env("HIPPIUS_JANITOR_CEPH_MGR_METRICS_URL:")
+    janitor_ceph_pools: str = env("HIPPIUS_JANITOR_CEPH_POOLS:")
+    # Per-scrape timeout for the pool-fullness probe; short relative to the cycle so a hung mgr
+    # falls back to statvfs rather than stalling the loop.
+    janitor_ceph_probe_timeout_seconds: float = env("HIPPIUS_JANITOR_CEPH_PROBE_TIMEOUT_SECONDS:5", convert=float)
     # Max soft-deleted objects hard-deleted per janitor cycle. The find query is
     # an index-probe over this many candidates; keep it bounded so a large
     # backlog drains gradually instead of in one DELETE-cascade burst.
     janitor_hard_delete_batch: int = env("HIPPIUS_JANITOR_HARD_DELETE_BATCH:30000", convert=int)
+    # SQL discovery phase: inventory ROWS SCANNED per keyset page (the slice window that then gets
+    # filtered for evictability — not the candidate count), and the per-cycle delete budget (0
+    # disables the phase entirely — the runtime kill switch for prod rollback).
+    janitor_sql_page_size: int = env("HIPPIUS_JANITOR_SQL_PAGE_SIZE:1000", convert=int)
+    janitor_sql_max_deletes_per_cycle: int = env("HIPPIUS_JANITOR_SQL_MAX_DELETES_PER_CYCLE:50000", convert=int)
+    # Per-page asyncpg query timeout for candidate discovery. A sparse ring (a head of young/hot/
+    # under-replicated rows) can make one keyset page scan the whole inventory before it fills, so
+    # this bounds per-page scan volume: a timeout ENDS discovery this cycle with the cursor left at
+    # the last completed page, and the next cycle resumes from that spot.
+    janitor_sql_query_timeout_seconds: float = env("HIPPIUS_JANITOR_SQL_QUERY_TIMEOUT_SECONDS:30", convert=float)
 
     # Filesystem cache disk-pressure backoff (ingress control).
     # Threshold can be expressed as either absolute bytes or ratio; we trigger if ANY threshold is hit.

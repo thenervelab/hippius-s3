@@ -178,9 +178,7 @@ def test_evaluate_create_bucket_denied_on_specific_scope() -> None:
         bucket_scope="specific",
         bucket_ids=("b",),
     )
-    allowed, reason = evaluate(
-        scope=scope_admin_specific, bucket_id=None, method="PUT", has_key=False, query_params={}
-    )
+    allowed, reason = evaluate(scope=scope_admin_specific, bucket_id=None, method="PUT", has_key=False, query_params={})
     assert allowed is False
     assert reason == "create_bucket_requires_scope_all"
 
@@ -253,9 +251,7 @@ def _expected(tier: str, bucket_scope: str, target_in_scope: bool, op: str) -> t
 @pytest.mark.parametrize("bucket_scope", ["all", "specific"])
 @pytest.mark.parametrize("target_in_scope", [True, False])
 @pytest.mark.parametrize("op_input", OP_INPUTS, ids=lambda oi: oi[3])
-def test_full_evaluate_matrix(
-    tier: str, bucket_scope: str, target_in_scope: bool, op_input: tuple
-) -> None:
+def test_full_evaluate_matrix(tier: str, bucket_scope: str, target_in_scope: bool, op_input: tuple) -> None:
     method, has_key, qparams, op = op_input
 
     # Under bucket_scope='all', target_in_scope is irrelevant — skip one duplicate.
@@ -310,8 +306,11 @@ def test_full_evaluate_matrix(
 def test_object_read_on_scoped_bucket_mirrors_r2_readonly_token() -> None:
     """R2 'Object Read only' → GET/HEAD allowed on listed bucket; writes/deletes denied."""
     scope = SubTokenScope(
-        access_key_id="hip_r", account_id="acct",
-        permission="object_read", bucket_scope="specific", bucket_ids=("books",),
+        access_key_id="hip_r",
+        account_id="acct",
+        permission="object_read",
+        bucket_scope="specific",
+        bucket_ids=("books",),
     )
     assert evaluate(scope=scope, bucket_id="books", method="GET", has_key=True, query_params={})[0] is True
     assert evaluate(scope=scope, bucket_id="books", method="HEAD", has_key=True, query_params={})[0] is True
@@ -322,8 +321,11 @@ def test_object_read_on_scoped_bucket_mirrors_r2_readonly_token() -> None:
 def test_object_read_write_on_scoped_bucket_mirrors_r2_rw_token() -> None:
     """R2 'Object Read & Write' → GET/HEAD/PUT/DELETE all allowed on listed bucket."""
     scope = SubTokenScope(
-        access_key_id="hip_rw", account_id="acct",
-        permission="object_read_write", bucket_scope="specific", bucket_ids=("books",),
+        access_key_id="hip_rw",
+        account_id="acct",
+        permission="object_read_write",
+        bucket_scope="specific",
+        bucket_ids=("books",),
     )
     for method in ("GET", "HEAD", "PUT", "DELETE"):
         ok, _ = evaluate(scope=scope, bucket_id="books", method=method, has_key=True, query_params={})
@@ -333,8 +335,11 @@ def test_object_read_write_on_scoped_bucket_mirrors_r2_rw_token() -> None:
 def test_admin_read_only_mirrors_r2_admin_read_token() -> None:
     """R2 'Admin Read only' → object reads + bucket listing + metadata reads; no writes."""
     scope = SubTokenScope(
-        access_key_id="hip_ar", account_id="acct",
-        permission="admin_read", bucket_scope="all", bucket_ids=(),
+        access_key_id="hip_ar",
+        account_id="acct",
+        permission="admin_read",
+        bucket_scope="all",
+        bucket_ids=(),
     )
     assert evaluate(scope=scope, bucket_id="b", method="GET", has_key=True, query_params={})[0] is True
     # list_bucket (object listing within a bucket) permitted
@@ -351,8 +356,11 @@ def test_admin_read_only_mirrors_r2_admin_read_token() -> None:
 def test_admin_read_write_with_scope_all_can_create_and_delete_buckets() -> None:
     """R2 'Admin Read & Write' with all-buckets scope → full control including create/delete."""
     scope = SubTokenScope(
-        access_key_id="hip_arw", account_id="acct",
-        permission="admin_read_write", bucket_scope="all", bucket_ids=(),
+        access_key_id="hip_arw",
+        account_id="acct",
+        permission="admin_read_write",
+        bucket_scope="all",
+        bucket_ids=(),
     )
     # CreateBucket
     assert evaluate(scope=scope, bucket_id=None, method="PUT", has_key=False, query_params={})[0] is True
@@ -367,8 +375,11 @@ def test_admin_read_write_specific_scope_cannot_create_new_buckets() -> None:
     """Admin R&W scoped to specific buckets: full access *within* those buckets,
     but no CreateBucket because the new bucket wouldn't be in the list."""
     scope = SubTokenScope(
-        access_key_id="hip_arw_specific", account_id="acct",
-        permission="admin_read_write", bucket_scope="specific", bucket_ids=("alpha",),
+        access_key_id="hip_arw_specific",
+        account_id="acct",
+        permission="admin_read_write",
+        bucket_scope="specific",
+        bucket_ids=("alpha",),
     )
     # Full control of listed bucket
     for method in ("GET", "HEAD", "PUT", "DELETE"):

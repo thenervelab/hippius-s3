@@ -10,7 +10,11 @@ from hippius_s3.writer.object_writer import ObjectWriter
 
 
 @pytest.mark.asyncio
-async def test_mpu_upload_part_stream_cleans_up_on_oversize(tmp_path, monkeypatch):
+async def test_mpu_upload_part_stream_oversize_leaves_no_published_part(tmp_path, monkeypatch):
+    """A failed stream must leave the part unpublished (no meta.json) but must NOT delete the
+    part dir: hedged duplicate attempts share it, so a failure-path dir wipe can destroy a
+    concurrent winner's acknowledged data (2026-07-22/26 incidents). Orphan chunk files are an
+    accepted leak until SSD GC."""
     cfg = get_config()
     original_chunk_size = cfg.object_chunk_size_bytes
     original_max_part = cfg.max_multipart_part_size
@@ -66,7 +70,9 @@ async def test_mpu_upload_part_stream_cleans_up_on_oversize(tmp_path, monkeypatc
             )
 
         part_dir = Path(fs_store.part_path(object_id, 1, 1))
-        assert not part_dir.exists()
+        assert not (part_dir / "meta.json").exists(), "a failed stream must never publish meta.json"
+        assert await fs_store.get_meta(object_id, 1, 1) is None
+        assert await fs_store.get_chunk(object_id, 1, 1, 0) is None, "unpublished chunks must be unreadable"
     finally:
         cfg.object_chunk_size_bytes = original_chunk_size
         cfg.max_multipart_part_size = original_max_part
@@ -120,8 +126,8 @@ async def test_mpu_part_uses_passed_bucket_id_no_internal_query(tmp_path, monkey
                 part_number=1,
                 body_iter=body_iter(),
             )
-        assert not any(
-            "bucket_id" in (q or "") for q in fetchrow_queries
-        ), "must not run the internal bucket_id/storage_version resolution query"
+        assert not any("bucket_id" in (q or "") for q in fetchrow_queries), (
+            "must not run the internal bucket_id/storage_version resolution query"
+        )
     finally:
         cfg.object_chunk_size_bytes, cfg.max_multipart_part_size, cfg.cache_ttl_seconds = saved

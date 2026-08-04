@@ -17,7 +17,7 @@ What makes this stack different from a normal S3 proxy:
 1. **Server-side envelope encryption with OVH KMS.** Every object chunk is AES-256-GCM encrypted with a per-object-version DEK; the DEK is wrapped by a per-bucket KEK; KEK is wrapped by an OVH KMS master key reachable only via mTLS from our API pods. Decryption therefore cannot be done on the client — every read flows through our API for decryption.
 2. **Two FastAPI services: a gateway and an internal API.** The gateway does auth, ACL, rate-limit decisions, and forwards to the internal API with trusted `X-Hippius-*` headers. This is a full streaming proxy, not a redirect.
 3. **Filesystem-first cache.** Chunk data lives on a shared NVMe/CephFS volume (`/var/lib/hippius/object_cache`). Redis is used for pub/sub chunk-ready notifications and for work queues — **not** for chunk storage. This is new as of 2026-04-21 (the old Redis download cache is gone — see [todo.md](todo.md)).
-4. **Async backend writes.** Client PUT returns success once data hits the FS cache + DB row + Redis queue. A dedicated uploader worker drains the queue and uploads to Arion and publishes to the Hippius chain. State progresses `pending → uploading → uploaded → published`.
+4. **Async backend writes (drain-direct).** Client PUT returns success once data hits the node SSD cache + DB row. The API does **not** enqueue the backend upload; it persists the version address. A Rust drain-agent replicates the part SSD→Ceph and then LPUSHes the `UploadChainRequest` itself, so the arion-uploader only ever dequeues Ceph-ready data. Replication state lives in the drain's `cephor_replication_status` (`pending → draining → replicated | failed`); `object_versions.status` no longer progresses through `uploading/uploaded/published`.
 5. **S4 append extension.** On top of standard S3 we support atomic O(delta) appends with compare-and-swap semantics, spec at [docs/s4.md](docs/s4.md).
 
 The pipeline is deliberately split so the user-facing path (gateway + API) is fast and bounded in memory, while slow/brittle work (Arion uploads, chain publishing, cleanup) is pushed to workers that can retry independently.
@@ -72,7 +72,7 @@ A **subsystem index** with links to per-directory `CLAUDE.md` files is in sectio
 3. **Auth orchestrator** ([gateway/services/auth_orchestrator.py:39](gateway/services/auth_orchestrator.py)) picks one of five methods (presigned URL, bearer, access key SigV4, seed-phrase SigV4, anonymous), verifies the signature, and attaches `request.state.account_id` / `request.state.account` / etc.
 4. **ACL middleware** ([gateway/middlewares/acl.py:70](gateway/middlewares/acl.py)) checks bucket ownership + permission. Master tokens bypass.
 5. **Forward** ([gateway/services/forward_service.py:67](gateway/services/forward_service.py)). Gateway strips client-supplied `X-Hippius-*` headers ([forward_service.py:71-74](gateway/services/forward_service.py)), then adds trusted headers: `X-Hippius-Ray-ID`, `X-Hippius-Request-User`, `X-Hippius-Bucket-Owner`, `X-Hippius-Main-Account`, `X-Hippius-Seed` (if seed auth), `X-Hippius-Has-Credits`, `X-Hippius-Can-Upload`, `X-Hippius-Can-Delete`, `X-Hippius-Gateway-Time-Ms`. Body is **streamed** (`request.stream()`), not buffered.
-6. **API middleware chain** ([hippius_s3/main.py:293-299](hippius_s3/main.py)): `metrics → tracing → parse_internal_headers → ip_whitelist → fs_cache_pressure`. `fs_cache_pressure` ([hippius_s3/api/middlewares/fs_cache_pressure.py](hippius_s3/api/middlewares/fs_cache_pressure.py)) short-circuits PUTs with 503 + Retry-After **before reading the body** if the cache disk is ≥90% full.
+6. **API middleware chain** ([hippius_s3/main.py:304-308](hippius_s3/main.py)): `metrics → tracing → parse_internal_headers → ip_whitelist → fs_cache_pressure`. `fs_cache_pressure` ([hippius_s3/api/middlewares/fs_cache_pressure.py](hippius_s3/api/middlewares/fs_cache_pressure.py)) short-circuits PUTs with 503 + Retry-After **before reading the body** if the cache disk is ≥90% full.
 7. **PutObject endpoint** ([hippius_s3/api/s3/objects/put_object_endpoint.py:29](hippius_s3/api/s3/objects/put_object_endpoint.py)). Resolves bucket, decides if this is an S4 append (`x-amz-meta-append: true` → [extensions/append.py](hippius_s3/api/s3/extensions/append.py)), builds metadata.
 8. **Object writer** ([hippius_s3/writer/object_writer.py:169 `put_simple_stream_full`](hippius_s3/writer/object_writer.py)):
    - **Reserve version**: `upsert_object_basic` inserts/bumps `object_versions` with placeholder size/md5 ([object_writer.py:210](hippius_s3/writer/object_writer.py)). **The DB-returned `object_id` is authoritative** — a concurrent create on the same (bucket, key) may override the client-generated candidate UUID ([object_writer.py:222-227](hippius_s3/writer/object_writer.py)).
@@ -81,8 +81,8 @@ A **subsystem index** with links to per-directory `CLAUDE.md` files is in sectio
    - **Write FS meta** last ([object_writer.py:420](hippius_s3/writer/object_writer.py)) — `meta.json` is the "part complete" signal, so it must land after every chunk.
    - **Update object_versions** with final size/md5 ([object_writer.py:442](hippius_s3/writer/object_writer.py)). Until this runs, the download query skips the version — it's reserved but not serveable.
    - **Return**. Client sees 200 OK.
-9. **Enqueue upload** to `arion_upload_requests` Redis queue ([put_object_endpoint.py:162](hippius_s3/api/s3/objects/put_object_endpoint.py)).
-10. **Arion uploader worker** ([workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py)) picks up the request, reads chunks from FS, uploads to Arion, records `chunk_backend` rows, publishes to the Hippius chain via [hippius_s3/services/hippius_api_service.py](hippius_s3/services/hippius_api_service.py).
+9. **Persist version address** ([put_object_endpoint.py:186-200 `set_object_version_address`](hippius_s3/api/s3/objects/put_object_endpoint.py)). No upload is enqueued on the write path (drain-direct cutover) — the API records the main-account address and returns.
+10. **Rust drain-agent** replicates the part SSD→Ceph, then LPUSHes the `UploadChainRequest` to `arion_upload_requests` itself (sole producer). The **Arion uploader worker** ([workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py)) then dequeues the (Ceph-ready) request, reads chunks, uploads to Arion, records `chunk_backend` rows, and publishes to the Hippius chain via [hippius_s3/services/hippius_api_service.py](hippius_s3/services/hippius_api_service.py).
 
 ### 3.2 GET (full object or Range)
 
@@ -154,7 +154,7 @@ Chunk ciphertext     (AES-256-GCM per chunk; AAD binds bucket_id:object_id:versi
 
 - **Atomic writes**: each worker writes to a unique `.tmp.<uuid4>` file and `os.replace`s onto the final path ([hippius_s3/cache/fs_store.py:92](hippius_s3/cache/fs_store.py), [fs_store.py:123-131](hippius_s3/cache/fs_store.py)). Concurrent writers of the same chunk are safe — content is deterministic per (object_id, version, part, chunk_index), so last rename wins is harmless.
 - **Meta is the readiness signal**: `get_chunk` returns `None` if `meta.json` is missing ([fs_store.py:168](hippius_s3/cache/fs_store.py)) — even if the chunk file exists. Uploaders write meta **last** (after all chunks); downloaders write meta **first** (so per-chunk visibility works as chunks land).
-- **Hot retention via `os.utime`**: reads touch both chunk and meta atime/mtime ([fs_store.py:183-186](hippius_s3/cache/fs_store.py)). Janitor uses this to keep hot parts on NVMe for `HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS` (default 3h).
+- **Hot retention via read-recency tracking**: reads no longer `os.utime` the files — the per-read atime touch was removed (dead on read-only mounts, an MDS metadata write elsewhere). Instead a successful read records recency via `tracker.note_read(...)` into `fs_cache_inventory.last_access_at` ([fs_store.py:180-195](hippius_s3/cache/fs_store.py)). Janitor uses `last_access_at` to keep hot parts on NVMe for `HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS` (default 4h). `os.utime` still applies on the set/touch write paths, so stat atime now reflects write recency only.
 - **UUID coercion**: asyncpg may hand back `UUID` objects OR strings. `_safe_object_id` handles both ([fs_store.py:48-62](hippius_s3/cache/fs_store.py)) and rejects anything else to prevent path traversal.
 
 ### 5.2 Janitor (FS cache GC)
@@ -179,7 +179,7 @@ Five separate services for blast-radius isolation:
 |---|---|---|---|
 | `redis` | 6379 | General cache / short-lived state | Ephemeral |
 | `redis-accounts` | 6380 | Account credit cache | Persistent (AOF) |
-| `redis-queues` | 6382 | Work queues + chunk pub/sub notifications | Persistent, 2GB, LRU |
+| `redis-queues` | 6382 | Work queues + chunk pub/sub notifications | Persistent, 1GB, LRU |
 | `redis-rate-limiting` | 6383 | Rate limit counters | Ephemeral, 1GB |
 | `redis-acl` | 6384 | ACL cache | Ephemeral, 2GB, LRU |
 
@@ -223,13 +223,13 @@ Canonicalization uses `request.scope["raw_path"]` (bytes) rather than `request.u
 - [gateway/CLAUDE.md](gateway/CLAUDE.md) — entry, middleware order, ForwardService.
 - [gateway/middlewares/CLAUDE.md](gateway/middlewares/CLAUDE.md) — per-middleware behavior.
 - [gateway/services/CLAUDE.md](gateway/services/CLAUDE.md) — auth_orchestrator, ACLService, ForwardService, sub_token_scope (dormant).
-- Entry: [gateway/main.py](gateway/main.py) — `factory()` at line 35.
+- Entry: [gateway/main.py](gateway/main.py) — `factory()` at line 43.
 
 ### Internal API
 - [hippius_s3/api/CLAUDE.md](hippius_s3/api/CLAUDE.md) — router structure, lifespan, middleware chain.
 - [hippius_s3/api/middlewares/CLAUDE.md](hippius_s3/api/middlewares/CLAUDE.md) — `fs_cache_pressure`, `parse_internal_headers`, `ip_whitelist`.
 - [hippius_s3/api/s3/objects/CLAUDE.md](hippius_s3/api/s3/objects/CLAUDE.md) — PUT/GET/HEAD/DELETE/COPY endpoints.
-- Entry: [hippius_s3/main.py](hippius_s3/main.py) — `factory()` at line 237, `lifespan` at 85.
+- Entry: [hippius_s3/main.py](hippius_s3/main.py) — `factory()` at line 248, `lifespan` at 87.
 
 ### Upload pipeline
 - [hippius_s3/writer/CLAUDE.md](hippius_s3/writer/CLAUDE.md) — `ObjectWriter`, `WriteThroughPartsWriter`, chunker, DB.
@@ -295,7 +295,7 @@ Config is a typed dataclass: [hippius_s3/config.py](hippius_s3/config.py). Value
 | `HIPPIUS_OBJECT_CACHE_FALLBACK_DIR` | — | If set, wraps FS store in `DualFileSystemPartsStore` for read-only migration fallback. |
 | `HIPPIUS_CHUNK_SIZE_BYTES` | `4194304` (4 MiB) | Must be consistent across upload/download code paths. |
 | `HIPPIUS_CACHE_TTL` | `3600` | Pub/sub wait timeout. |
-| `HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS` | `10800` (3h) | Janitor keeps recently-read parts. |
+| `HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS` | `14400` (4h) | Janitor keeps recently-read parts. |
 | `DOWNLOAD_COALESCE_LOCK_TTL` | `600` | Lock expiry guards downloader crashes. |
 | `DOWNLOADER_SEMAPHORE` | `20` | Concurrent chunk fetches per DCR. |
 | `DOWNLOADER_MAX_INFLIGHT` | `10` | Concurrent `DownloadChainRequest`s per pod. |
@@ -350,7 +350,7 @@ pytest tests/e2e/test_GetObject_Range.py -xvs
 # Code quality
 ruff check . --fix
 ruff format .
-mypy hippius_s3
+ty check hippius_s3 gateway
 pre-commit run --all-files
 
 # Run stack
@@ -375,7 +375,7 @@ Note on dev loop: python code changes **auto-restart the container** (uvicorn `r
 ### 9.3 Repo conventions
 
 - Line length 120.
-- ruff+ mypy (strict). Single-line imports (isort `force-single-line = true`).
+- ruff + ty. Single-line imports (isort `force-single-line = true`).
 - **Avoid `try/except` unless absolutely necessary.** Let errors bubble up and kill the request; otherwise debugging is painful. Only swallow in narrow, well-justified spots (resource cleanup, best-effort Redis).
 - Keep inline comments minimal; write them only where the **why** is non-obvious. Never explain what code does, only why it deviates from the obvious.
 - Never add docstrings at the top of modules. Per-function/class is fine when behavior is non-trivial.
@@ -467,7 +467,7 @@ Response shape: `{"status":"success","data":{"resultType":"streams","result":[{"
 - **E2E** ([tests/e2e/](tests/e2e/)) — real API stack with [docker-compose.e2e.yml](docker-compose.e2e.yml): `mock-arion`, `mock-kms`, `mock-hippius-api`, `toxiproxy` (fault injection for resilience tests).
 - **Smoke** ([tests/smoke/](tests/smoke/)) — post-deploy verification, run as part of the k8s pipeline.
 
-Test env flags: `HIPPIUS_BYPASS_CREDIT_CHECK=true` is enforced in test env at [config.py:282](hippius_s3/config.py). `RUN_REAL_AWS=1` (or `AWS=1`) routes e2e tests against real AWS for parity checks.
+Test env flags: `HIPPIUS_BYPASS_CREDIT_CHECK=true` is enforced in test env at [config.py:538](hippius_s3/config.py). `RUN_REAL_AWS=1` (or `AWS=1`) routes e2e tests against real AWS for parity checks.
 
 ---
 

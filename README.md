@@ -137,7 +137,7 @@ See `.env.defaults` for the full list of configurable values.
 
 | File | Purpose |
 |------|---------|
-| `docker-compose.yml` | Base config: API, gateway, PostgreSQL, 6 Redis instances, Arion workers |
+| `docker-compose.yml` | Base config: API, gateway, PostgreSQL, 5 Redis instances, Arion workers |
 | `docker-compose.prod.yml` | Production overrides: performance tuning, backup, health monitoring |
 | `docker-compose.staging.yml` | Staging configuration |
 | `docker-compose.e2e.yml` | E2E testing: mock services (mock-arion, mock-kms, mock-hippius-api, toxiproxy) |
@@ -235,7 +235,7 @@ Get access keys at: https://console.hippius.com/dashboard/settings
 
 ## GitHub Actions Secrets
 
-Secrets required for CI/CD deployment (configured in `.github/workflows/production.yaml`):
+Secrets required for CI/CD deployment (configured in `.github/workflows/production-deploy.yaml`):
 
 | Category | Secret | Description |
 |----------|--------|-------------|

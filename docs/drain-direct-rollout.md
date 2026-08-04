@@ -51,25 +51,26 @@ For each row, the object's parts can be re-enqueued by resetting the part to `pe
 an `UploadChainRequest` directly via `hippius_s3.queue.enqueue_upload_to_backends`. Prefer
 resetting to `pending` so the single producer (the drain) stays authoritative.
 
-## Production manifests (not in this PR — staging-only)
+## Production manifests (prod cutover completed 2026-07-20–27)
 
-Only `k8s/staging/*` carries the drain stack today. Before prod can run the drain, the
-prod overlay needs (mirroring `k8s/staging/`, with **prod** node labels / hostPaths /
-PVCs):
+The prod overlay now ships the full drain stack. `k8s/production/kustomization.yaml:9-26`
+lists the ingest tier as `resources:` — `api-local-deployments-production.yaml`,
+`drain-allocator-deployment.yaml` (the cephor_* schema owner + allocator, deploy first),
+`drain-agent-daemonset.yaml` (one per labeled ingest node), and `mpu-reaper-deployment.yaml`
+— plus the `s3-ingest-priorityclass.yaml` and the full-swap patch pointing the existing `api`
+Service at `app: api-local` (base `api` scaled to 0). Prod ingest nodes `node1..node5` are
+prepared (dedicated NVMe `/s3-data`, labeled `s3-prod-local-ingest=true`).
 
-- the `drain` image added to `k8s/production/kustomization.yaml` `images:`,
-- `drain-allocator-deployment.yaml` (the cephor_* schema owner + allocator),
-- `drain-agent-daemonset.yaml` — must set `CEPHOR_SSD_ROOT` to the prod api-local cache
-  path, `CEPHOR_POOL_ROOT` to the Ceph pool mount, **`REDIS_QUEUES_URL`**, and
-  **`HIPPIUS_UPLOAD_BACKENDS`** (the drain is now the producer). `REDIS_QUEUES_URL` is
-  `required()` — a missing var crash-loops the agent (fail-fast, not silent), but uploads
-  stop until corrected, so wire it before the api cutover.
-- `mpu-reaper-deployment.yaml` (DB + redis-queues only; single replica).
-- prod ingest-node labels so the DaemonSet schedules exactly where api-local pods land.
+The drain-agent env is sourced (not hardcoded): it sets `CEPHOR_SSD_ROOT`/`CEPHOR_POOL_ROOT`,
+`REDIS_QUEUES_URL` (`required()` — a missing var crash-loops the agent fail-fast), and
+`HIPPIUS_UPLOAD_BACKENDS`.
 
-Staging hardcodes `HIPPIUS_UPLOAD_BACKENDS=arion` on the daemonset; for prod confirm it
-matches the api/uploader fleet (e.g. `arion,ovh`) — the value the drain stamps onto every
-`UploadChainRequest.upload_backends`.
+Both staging and prod pull `HIPPIUS_UPLOAD_BACKENDS` from a `secretKeyRef`
+(`{name: hippius-s3-secrets, key: HIPPIUS_UPLOAD_BACKENDS}`) —
+`k8s/staging/drain-agent-daemonset.yaml:125-129` and
+`k8s/production/drain-agent-daemonset.yaml:137-141` — so the drain stamps the same
+`UploadChainRequest.upload_backends` value as the api/uploader fleet reads from that secret.
+It is **not** hardcoded to `arion` on either environment.
 
 ## bypass_billing (P4)
 

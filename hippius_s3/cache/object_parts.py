@@ -117,6 +117,9 @@ class RedisObjectPartsCache:
     async def get_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
     ) -> Optional[bytes]:
+        # Read-recency tracking happens inside fs.get_chunk (store level): the
+        # streamer bypasses this wrapper with fetch_fn = fs.get_chunk, so a
+        # hook here would miss all streamed GET traffic.
         data = await self.fs.get_chunk(object_id, int(object_version), int(part_number), int(chunk_index))
         _get_metrics_collector().record_cache_operation(hit=data is not None, operation="get_chunk")
         return data

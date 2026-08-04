@@ -189,3 +189,28 @@ async def test_kek_lookup_happens_outside_the_reserve_transaction(monkeypatch: A
 
     ops = _op_names(db)
     assert ops.index("kek_lookup") < ops.index("txn_enter"), f"KEK must resolve before the txn; {ops}"
+
+
+@pytest.mark.asyncio
+async def test_initiate_response_is_wellformed_with_ampersand_key(stub_crypto: None) -> None:
+    """'&' is legal in a Hippius object key. Interpolated into the response unescaped it opens an
+    entity reference, so the document is not well-formed and clients cannot read the UploadId —
+    the upload fails before any data is sent."""
+    from lxml import etree
+
+    db = _FakeDb()
+
+    resp = await multipart.initiate_multipart_upload(
+        bucket_name="b",
+        object_key="a&b.txt",
+        request=_fake_request(),
+        db=db,
+    )
+
+    assert resp.status_code == 200, resp.body
+    body = bytes(resp.body)
+    root = etree.fromstring(body)
+    keys = root.xpath("./*[local-name()='Key']")
+    assert keys[0].text == "a&b.txt"
+    assert root.xpath("./*[local-name()='UploadId']")[0].text
+    assert resp.headers["content-length"] == str(len(body))

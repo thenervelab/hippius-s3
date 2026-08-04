@@ -608,6 +608,37 @@ spec:
               value: "hippius-s3-janitor"
             - name: WORKER_SCRIPT
               value: "workers/run_janitor_in_loop.py"
+            # Pool-fullness gate (2026-07-24 incident). statvfs on the cache PVC sees the CephFS
+            # quota (~69%), not the backing pool (~94%), so the janitor stayed in Normal mode as
+            # the pool filled to the read-only cliff. These make _pressure_mode take max(statvfs,
+            # fullest pool %USED) from the mgr exporter — the same signal + pools the drain
+            # allocator uses (CEPHOR_CEPH_*). Cross-namespace reach to rook-ceph confirmed.
+            - name: HIPPIUS_JANITOR_CEPH_MGR_METRICS_URL
+              value: "http://rook-ceph-mgr.rook-ceph.svc.cluster.local:9283/metrics"
+            - name: HIPPIUS_JANITOR_CEPH_POOLS
+              value: "ceph-filesystem-data0,ceph-filesystem-metadata,ceph-blockpool"
+            # Hot-retention window = 4h (2026-07-24 incident follow-up). The janitor evicts by a
+            # binary atime threshold in walk order (no LRU), so the window IS the working-set
+            # protection: anything read inside it is kept. The emergency value set during the acute
+            # climb was 900s → 450s at elevated pressure — short enough that the live working set
+            # looked "cold", got evicted, then re-read + re-fetched (the refill flywheel), pinning
+            # the pool full without freeing real space. 4h (2h effective at elevated) protects the
+            # working set so only the genuinely-cold tail is evicted and STAYS evicted. Backs up
+            # what was a live `set env` override so the manifest is the source of truth (was drift).
+            - name: HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS
+              value: "14400"
+            # Walk throughput (2026-07-24 incident follow-up). The eviction limiter is COVERAGE,
+            # not eligibility: a cycle deletes ~54% of the parts it walks, but the budget truncates
+            # the crawl long before it reaches the whole ~2.8M-object tree, so raising these is what
+            # actually frees more space. Doubling the crawl (8→16) and lengthening the budget
+            # (480s→1200s) measured ~2.5x the deletes per cycle (11k→28k, objects_scanned 19k→44k)
+            # with NO impact on live reads (held at 1.6 GiB/s; the MDS was not saturated).
+            # CAUTION: the walk shares the CephFS MDS with live GET/PUT — raise further only while
+            # watching MDS req/s and read latency. Backs up live `set env` overrides (was drift).
+            - name: HIPPIUS_JANITOR_WALK_CONCURRENCY
+              value: "16"
+            - name: HIPPIUS_JANITOR_WALK_BUDGET_SECONDS
+              value: "1200"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
