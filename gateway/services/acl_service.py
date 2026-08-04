@@ -127,10 +127,18 @@ class ACLService:
         on hot paths (e.g. acl_middleware). Returns None when the bucket does
         not exist.
 
-        Redis-cached (hits only) to spare every request a buckets-table query. Owner/id are
-        immutable for a bucket's lifetime; is_cache_warm can flip, so it lags by at most the TTL.
-        Non-existent buckets are never cached, so a freshly-created bucket is visible immediately.
-        The cache is a pure optimization — a Redis outage transparently falls back to the DB.
+        Redis-cached (hits only) to spare every request a buckets-table query. Non-existent
+        buckets are never cached, so a freshly-created bucket is visible immediately. The cache
+        is a pure optimization — a Redis outage transparently falls back to the DB.
+
+        The key is a bucket NAME, not a bucket. Owner/id are immutable for one bucket's
+        *lifetime*, but a name outlives it: uniqueness is enforced by the partial index
+        `buckets_bucket_name_active_key` over `deleted_at IS NULL` rows, so any account can claim
+        the name the instant the previous bucket is soft-deleted. A cached entry that survives
+        that hands the previous owner the master-token bypass and the "private" canned-ACL owner
+        match on someone else's bucket. Anything that creates or removes a bucket MUST call
+        invalidate_bucket_meta — cache_invalidation_middleware does this for both. is_cache_warm
+        can flip independently and lags by at most the TTL.
         """
         cached = await self._cache_get_bucket_meta(bucket)
         if cached is not None:

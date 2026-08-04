@@ -9,6 +9,7 @@ from fastapi import Response
 
 from gateway.repositories.cached_acl_repository import CachedACLRepository
 from gateway.services.acl_service import ACLService
+from gateway.utils.paths import decoded_path
 
 
 logger = logging.getLogger(__name__)
@@ -30,13 +31,23 @@ async def cache_invalidation_middleware(
     surviving entry would resolve the previous owner against the next account's
     bucket of that name — granting them the master-token ownership bypass and
     the "private" canned-ACL owner match, while 403'ing the rightful owner.
+
+    Every cache key here is keyed by bucket NAME, and a name outlives the bucket
+    that held it, so a successful CreateBucket purges too. Delete-side purging
+    alone is not sufficient: (1) `get_bucket_owner_and_id` is a plain read-through
+    with no write guard, so a request that read the row before the soft-delete
+    committed can SETEX it back *after* this middleware purged, resurrecting the
+    old owner for a full TTL; (2) buckets also disappear out of band —
+    `scripts/purge_buckets.py` hard-DELETEs rows with no gateway in the path.
+    CreateBucket is the moment the name→owner mapping actually changes and is the
+    only point where a stale entry can do harm, so purging there closes both.
     """
     response = await call_next(request)
 
-    if not _is_successful_bucket_delete(request, response):
+    if not (_is_successful_bucket_delete(request, response) or _is_successful_bucket_create(request, response)):
         return response
 
-    bucket_name = _bucket_from_path(request.url.path)
+    bucket_name = _bucket_from_path(decoded_path(request))
     if not bucket_name:
         return response
 
@@ -61,6 +72,14 @@ def _is_successful_bucket_delete(request: Request, response: Response) -> bool:
         return False
     # DELETE /<bucket>?tagging removes only tags; bucket itself stays.
     return "tagging" not in request.query_params
+
+
+def _is_successful_bucket_create(request: Request, response: Response) -> bool:
+    if request.method != "PUT" or response.status_code != 200:
+        return False
+    # Any query param makes this a sub-resource write (?acl, ?tagging, ?lifecycle, ?policy,
+    # ?cors) — those mutate bucket config, not the name→owner mapping this cache holds.
+    return not request.query_params
 
 
 def _bucket_from_path(path: str) -> str | None:
