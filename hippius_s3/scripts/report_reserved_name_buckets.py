@@ -9,6 +9,8 @@ from typing import Any
 import asyncpg
 
 from hippius_s3.config import get_config
+from hippius_s3.reserved_bucket_names import ACL_BYPASSED_SEGMENTS
+from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
 
 
 logger = logging.getLogger("report-reserved-name-buckets")
@@ -16,29 +18,6 @@ logger = logging.getLogger("report-reserved-name-buckets")
 EXIT_CLEAN = 0
 EXIT_FINDINGS = 1
 EXIT_OPERATIONAL_FAILURE = 2
-
-# First path segments the gateway never forwards as a bucket: either a real route swallows the
-# request, or auth_router exempts it from SigV4 so no identity is stamped. A bucket sitting on one
-# of these is unreachable by its owner yet permanently holds the globally-unique name (prod
-# incident 2026-08-03, buckets "docs" and "docs2").
-#
-# TODO: import gateway.middlewares.input_validation.RESERVED_BUCKET_SEGMENTS once PR #388 lands —
-# it defines the same set for the CreateBucket rejection. Duplicated here so this script works
-# against staging today; the sync obligation is the whole reason it exists.
-RESERVED_SEGMENTS = (
-    "docs",
-    "health",
-    "metrics",
-    "openapi.json",
-    "redoc",
-    "robots.txt",
-    "user",
-)
-
-# acl_middleware returns before any permission check for these, so objects under a bucket of this
-# name are readable and writable with no auth AND no ACL — strictly worse than merely stranded.
-# See gateway/middlewares/acl.py: `path == "/health" or path.startswith("/user/")`.
-ACL_BYPASSED_SEGMENTS = frozenset({"user", "health"})
 
 _QUERY = """
 SELECT b.bucket_name,
@@ -82,7 +61,7 @@ def _severity(row: dict[str, Any]) -> str:
 async def _collect(conn: asyncpg.Connection, statement_timeout_ms: int) -> dict[str, Any]:
     await conn.execute(f"SET statement_timeout = {int(statement_timeout_ms)}")
 
-    reserved = [dict(r) for r in await conn.fetch(_QUERY, list(RESERVED_SEGMENTS))]
+    reserved = [dict(r) for r in await conn.fetch(_QUERY, sorted(RESERVED_BUCKET_SEGMENTS))]
     for row in reserved:
         row["severity"] = _severity(row)
 

@@ -6,8 +6,8 @@ from typing import Any
 
 import pytest
 
-from hippius_s3.scripts.report_reserved_name_buckets import ACL_BYPASSED_SEGMENTS
-from hippius_s3.scripts.report_reserved_name_buckets import RESERVED_SEGMENTS
+from hippius_s3.reserved_bucket_names import ACL_BYPASSED_SEGMENTS
+from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
 from hippius_s3.scripts.report_reserved_name_buckets import _severity
 
 
@@ -37,4 +37,4 @@ def test_soft_deleted_rows_are_resolved() -> None:
 
 
 def test_acl_bypassed_segments_are_a_subset_of_reserved() -> None:
-    assert ACL_BYPASSED_SEGMENTS <= set(RESERVED_SEGMENTS)
+    assert ACL_BYPASSED_SEGMENTS <= RESERVED_BUCKET_SEGMENTS
