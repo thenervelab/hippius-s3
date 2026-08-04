@@ -27,3 +27,8 @@ def decoded_path(request: Request) -> str:
         # better than 500-ing; uvicorn (what we run) always provides it.
         return request.url.path
     return unquote(raw.decode("utf-8", "surrogateescape"))
+
+
+def first_path_segment(request: Request) -> str:
+    """The first path segment, decoded. `""` for `/`."""
+    return decoded_path(request).strip("/").split("/", 1)[0]
