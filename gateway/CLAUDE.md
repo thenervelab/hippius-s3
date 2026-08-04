@@ -37,9 +37,9 @@ Registered at [main.py:181-197](main.py). FastAPI's `@app.middleware("http")` st
 
 [main.py:171-179](main.py):
 
-- `GET /docs` — proxied to the docs service via [gateway/routers/docs.py](routers/docs.py).
-- `/acl/...` — ACL management endpoints via [gateway/routers/acl.py](routers/acl.py).
-- `/{path:path}` — **catch-all** forwards everything else to the internal API through `ForwardService.forward_request` ([gateway/services/forward_service.py:67](services/forward_service.py)).
+- `GET /docs`, `GET /redoc`, `GET /openapi.json`, `DELETE /docs/cache` — via [gateway/routers/docs.py](routers/docs.py).
+- **`gateway/routers/acl.py` has NO `/acl` prefix.** `router = APIRouter()` is included bare ([main.py:190](main.py)), so it registers `GET|PUT /{bucket}` and `GET|PUT /{bucket}/{key:path}` **at the root** — every S3 request matches one of these first. Each handler takes `acl: str | None = Query(default=None)` and calls `forward_service.forward_request(request)` when `?acl` is absent, so normal traffic is forwarded from inside the ACL handler rather than from the catch-all. There is no `/acl` path in the gateway, and no `/static` mount either.
+- `/{path:path}` — catch-all for methods the ACL router doesn't declare (POST, DELETE, HEAD, PATCH), forwarding through `ForwardService.forward_request` ([gateway/services/forward_service.py:67](services/forward_service.py)).
 - `GET /health` — simple 200 `{"status": "healthy", "service": "gateway"}`. Does **not** check downstream deps (noted as a P1 improvement in [ha.md](../ha.md)).
 
 ## Forwarding model (important)
