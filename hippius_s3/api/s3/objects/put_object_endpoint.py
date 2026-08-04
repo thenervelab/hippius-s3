@@ -12,10 +12,12 @@ from fastapi import Request
 from fastapi import Response
 from opentelemetry import trace
 from redis.exceptions import RedisError
+from starlette.requests import ClientDisconnect
 
 from hippius_s3 import utils
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
@@ -243,6 +245,26 @@ async def handle_put_object(
                 "x-amz-meta-append-version": "0",
             },
         )
+
+    except ClientDisconnect:
+        # iter_request_body drives request.stream(), which raises when the peer goes away mid-body
+        # — on both the simple and the append path. Without this clause it falls into the
+        # catch-all below and is answered as a 500 InternalError AND counted as
+        # s3_errors_total{error_type="internal_error"}, so ordinary client behaviour (SDK timeout,
+        # ^C, reset) shows up as the API failing. Unlike the gateway, where the exception escaped
+        # before metrics ran, here it genuinely poisoned the error counter.
+        #
+        # The version reserved by upsert_object_basic is deliberately left in place. It is inert —
+        # downloads skip a version until the finalizing UPDATE writes size/md5 — and deleting it
+        # here would race the objects.current_object_version counter and could strand FS chunks
+        # the janitor can no longer reason about. Reclaiming the backlog (75978 such rows on prod
+        # as of 2026-07-28, oldest 2025-12-12) belongs in the orphan checker, off the request path.
+        logger.warning(
+            "Client disconnected during PutObject %s/%s (a reserved object version is left unfinalized)",
+            bucket_name,
+            object_key,
+        )
+        return Response(status_code=CLIENT_CLOSED_REQUEST)
 
     except Exception as e:
         # DB connection-pool saturation (acquire timeout / too-many-connections) is retryable:

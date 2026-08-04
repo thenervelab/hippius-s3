@@ -2,7 +2,7 @@
 
 API-side middleware. All of these assume `X-Hippius-*` headers are trustworthy — the gateway is responsible for setting/stripping them.
 
-Registration order at [hippius_s3/main.py:293-299](../../main.py): `metrics → tracing → parse_internal_headers → ip_whitelist → fs_cache_pressure`. Reverse order = outer-most → inner-most on the request path.
+Registration order at [hippius_s3/main.py:304-308](../../main.py): `metrics → tracing → parse_internal_headers → ip_whitelist → fs_cache_pressure`. Reverse order = outer-most → inner-most on the request path.
 
 ## [parse_internal_headers.py](parse_internal_headers.py) — `parse_internal_headers_middleware`
 
@@ -53,7 +53,7 @@ Gated by `ENABLE_REQUEST_PROFILING`. When on, captures a flame-graph-style profi
 
 ## Adding a new middleware
 
-Register it in [hippius_s3/main.py:293-299](../../main.py) with `app.middleware("http")(my_middleware)`. Remember that registration order is **reversed** on the request path — put the outermost (runs first) last in registration order.
+Register it in [hippius_s3/main.py:304-308](../../main.py) with `app.middleware("http")(my_middleware)`. Remember that registration order is **reversed** on the request path — put the outermost (runs first) last in registration order.
 
 
 <claude-mem-context>

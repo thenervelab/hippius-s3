@@ -15,10 +15,35 @@ from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.utils import get_query
+from hippius_s3.xml_helpers import parse_untrusted_xml
 
 
 logger = logging.getLogger(__name__)
 config = get_config()
+
+
+def parse_delete_request(root: Any) -> tuple[bool, list[tuple[str, str]]]:
+    """Parse a DeleteObjects body into (quiet, [(key, version_id), ...]).
+
+    S3 clients disagree on whether to namespace this body: botocore/aws-cli send
+    xmlns="http://s3.amazonaws.com/doc/2006-03-01/", minio-go (mc, and anything
+    built on it) sends bare elements. Real S3 accepts both, so match on
+    local-name() instead of a namespace-qualified path — a namespace-qualified
+    XPath silently yields zero <Object> nodes for the bare form, which turns a
+    delete into a 200 OK that deletes nothing.
+    """
+    quiet_nodes = root.xpath("./*[local-name()='Quiet']")
+    quiet = bool(quiet_nodes) and str(quiet_nodes[0].text or "").strip().lower() == "true"
+
+    objects: list[tuple[str, str]] = []
+    for obj in root.xpath(".//*[local-name()='Object']"):
+        key_nodes = obj.xpath("./*[local-name()='Key']")
+        version_nodes = obj.xpath("./*[local-name()='VersionId']")
+        key = str(key_nodes[0].text) if key_nodes and key_nodes[0].text else ""
+        version_id = str(version_nodes[0].text) if version_nodes and version_nodes[0].text else ""
+        objects.append((key, version_id))
+
+    return quiet, objects
 
 
 async def handle_delete_objects(bucket_name: str, request: Request, db: Any, redis_client: Any) -> Response:
@@ -51,8 +76,8 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
             )
 
         try:
-            root = ET.fromstring(body)
-        except Exception:
+            root = parse_untrusted_xml(body)
+        except ValueError:
             logger.exception("Malformed XML for DeleteObjects")
             return errors.s3_error_response(
                 "MalformedXML",
@@ -60,17 +85,9 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                 status_code=400,
             )
 
-        ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
-
-        # Quiet flag
-        quiet_nodes = root.xpath("./s3:Quiet", namespaces=ns)
-        quiet = False
-        if quiet_nodes and quiet_nodes[0].text:
-            quiet = str(quiet_nodes[0].text).strip().lower() == "true"
-
-        # Collect objects
-        object_elems = root.xpath(".//s3:Object", namespaces=ns)
-        if len(object_elems) > 1000:
+        # Quiet flag + collect objects
+        quiet, object_entries = parse_delete_request(root)
+        if len(object_entries) > 1000:
             return errors.s3_error_response(
                 "MalformedXML",
                 "The XML you provided was not well-formed or did not validate against our published schema.",
@@ -81,12 +98,7 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
         deleted_keys: list[str] = []
         errors_list: list[dict[str, str]] = []
 
-        for obj in object_elems:
-            key_nodes = obj.xpath("./s3:Key", namespaces=ns)
-            version_nodes = obj.xpath("./s3:VersionId", namespaces=ns)
-            key = str(key_nodes[0].text) if key_nodes and key_nodes[0].text else ""
-            version_id = str(version_nodes[0].text) if version_nodes and version_nodes[0].text else ""
-
+        for key, version_id in object_entries:
             if not key:
                 # Skip invalid entries
                 errors_list.append({"Key": "", "Code": "MalformedXML", "Message": "Invalid Delete Object entry"})

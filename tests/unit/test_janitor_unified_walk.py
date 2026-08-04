@@ -20,6 +20,9 @@ import os
 import shutil
 import time
 import uuid
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -99,12 +102,21 @@ class _FakePool:
 
 
 class _FakeConn:
-    """Answers only the stale-phase `parts` recency query; replication / abandoned checks are
-    patched at module level so they never touch this conn."""
+    """Answers the stale-phase `parts` recency query (fetchrow) and the F3 read-recency
+    last_access_at lookup (fetchval); replication / abandoned checks are patched at module level so
+    they never touch this conn. `last_access` maps object_id -> a tz-aware datetime for the walk's
+    read-recency gate; a missing key returns None (no inventory row -> write-recency-only, as prod)."""
+
+    def __init__(self, last_access: dict[str, "datetime"] | None = None):
+        self._last_access = last_access or {}
 
     async def fetchrow(self, query, *args):
         object_id = args[0]
         return PARTS_ROWS.get(object_id)
+
+    async def fetchval(self, query, *args):
+        object_id = args[0]
+        return self._last_access.get(object_id)
 
 
 class _FakeFsStore:
@@ -532,3 +544,120 @@ async def test_unified_backfill_flushes_at_batch_size_boundary(tmp_path: Path, m
     assert sorted(len(b) for b in batch.batches) == [1, 2, 2], "flushes at each boundary plus a final partial"
     assert batch.rows == {(oid, 1, 1) for oid in survivors}
     assert store.deleted == []
+
+
+# ============================================================================================
+# F3: read-recency (last_access_at) KEEP gate in the FS-walk age-GC + stale-reap paths
+# ============================================================================================
+#
+# After the read path stopped bumping atime (it records fs_cache_inventory.last_access_at via the
+# AccessTracker instead), the walk's atime/mtime are WRITE recency only. A fully-replicated part
+# that is actively READ but not re-written would be reaped by age-GC (>gc_max_age) or stale-reap
+# (>mpu_stale) and re-hydrated from Arion (read amplification). The unified walk now consults
+# last_access_at and KEEPS a part read within the effective hot window — unless hot_window==0
+# (critical pressure), where reaping resumes to free space. Replication stays the absolute gate.
+
+READ_HOT_GC = f"{0x11:032x}"  # replicated, gc-aged mtime, write-cold atime -> age-GC would delete
+READ_HOT_STALE = f"{0x12:032x}"  # orphan (no parts row), stale-aged -> stale-reap would reap
+
+
+async def _always_replicated(conn, oid, ov, pn):
+    return True
+
+
+def _fresh_access() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _stale_access() -> datetime:
+    return datetime.now(timezone.utc) - timedelta(hours=6)
+
+
+@pytest.mark.asyncio
+async def test_read_recency_keeps_age_gc_part_with_fresh_last_access(tmp_path: Path, monkeypatch):
+    """(a) A replicated, write-cold, gc-aged part that age-GC would otherwise evict is KEPT when it
+    was READ within the hot window (fresh last_access_at), even though its atime/mtime are old."""
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
+    janitor.config.fs_cache_hot_retention_seconds = 3600
+    root = tmp_path / "t"
+    _make_part(root, READ_HOT_GC, mtime_ago=7200, atime_ago=7200)  # gc-aged + write-cold
+    store = _FakeFsStore(root)
+    conn = _FakeConn(last_access={READ_HOT_GC: _fresh_access()})
+    with (
+        patch.object(janitor, "is_replicated_on_all_backends", _always_replicated),
+        patch.object(janitor, "is_terminally_abandoned", _fake_abandoned),
+        patch.object(janitor.fs_cache_inventory, "record_cached_batch", AsyncMock()),
+    ):
+        res = await janitor.cleanup_parts_unified(
+            _FakePool(conn), store, _redis(), pressure=0, shard=0, shards=1, walk_concurrency=1
+        )
+    assert store.deleted == [], "read-hot part must NOT be evicted by age-GC despite old atime/mtime"
+    assert res["gc"] == 0
+
+
+@pytest.mark.asyncio
+async def test_read_recency_keeps_stale_reap_part_with_fresh_last_access(tmp_path: Path, monkeypatch):
+    """(b) An orphan (no parts row), stale-aged part that stale-reap would otherwise reap is KEPT
+    when it was READ within the hot window (fresh last_access_at), despite its old mtime."""
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
+    janitor.config.fs_cache_hot_retention_seconds = 3600
+    root = tmp_path / "t"
+    _make_part(root, READ_HOT_STALE, mtime_ago=200_000, atime_ago=200_000)  # stale-aged, orphan
+    store = _FakeFsStore(root)
+    conn = _FakeConn(last_access={READ_HOT_STALE: _fresh_access()})
+    with (
+        patch.object(janitor, "is_replicated_on_all_backends", _always_replicated),
+        patch.object(janitor, "is_terminally_abandoned", _fake_abandoned),
+        patch.object(janitor.fs_cache_inventory, "record_cached_batch", AsyncMock()),
+    ):
+        res = await janitor.cleanup_parts_unified(
+            _FakePool(conn), store, _redis(), pressure=0, shard=0, shards=1, walk_concurrency=1
+        )
+    assert store.deleted == [], "read-hot part must NOT be reaped by stale-reap despite old mtime"
+    assert res["stale_mtime"] == 0 and res["abandoned"] == 0
+
+
+@pytest.mark.asyncio
+async def test_read_recency_stale_last_access_still_evicts_both_paths(tmp_path: Path, monkeypatch):
+    """(c) With a STALE last_access_at (read outside the hot window) both an age-GC candidate and a
+    stale-reap candidate are still evicted/reaped exactly as before the read-recency gate."""
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 0)
+    janitor.config.fs_cache_hot_retention_seconds = 3600
+    root = tmp_path / "t"
+    _make_part(root, READ_HOT_GC, mtime_ago=7200, atime_ago=7200)  # gc-aged + write-cold
+    _make_part(root, READ_HOT_STALE, mtime_ago=200_000, atime_ago=200_000)  # stale-aged, orphan
+    store = _FakeFsStore(root)
+    conn = _FakeConn(last_access={READ_HOT_GC: _stale_access(), READ_HOT_STALE: _stale_access()})
+    with (
+        patch.object(janitor, "is_replicated_on_all_backends", _always_replicated),
+        patch.object(janitor, "is_terminally_abandoned", _fake_abandoned),
+        patch.object(janitor.fs_cache_inventory, "record_cached_batch", AsyncMock()),
+    ):
+        res = await janitor.cleanup_parts_unified(
+            _FakePool(conn), store, _redis(), pressure=0, shard=0, shards=1, walk_concurrency=1
+        )
+    assert set(store.deleted) == {(READ_HOT_GC, 1, 1), (READ_HOT_STALE, 1, 1)}
+    assert res["gc"] == 1 and res["stale_mtime"] == 1
+
+
+@pytest.mark.asyncio
+async def test_read_recency_bypassed_under_critical_pressure(tmp_path: Path, monkeypatch):
+    """(d) Under CRITICAL pressure hot_window==0, so the read-recency check is bypassed: even a part
+    with FRESH last_access_at is evicted — matching the SQL-evict path and freeing space to survive
+    the disk-full spiral (replication remains the absolute gate)."""
+    monkeypatch.setattr(janitor, "_pressure_mode", lambda root: 2)
+    janitor.config.fs_cache_hot_retention_seconds = 3600
+    root = tmp_path / "t"
+    _make_part(root, READ_HOT_GC, mtime_ago=7200, atime_ago=7200)  # gc-aged, replicated
+    store = _FakeFsStore(root)
+    conn = _FakeConn(last_access={READ_HOT_GC: _fresh_access()})
+    with (
+        patch.object(janitor, "is_replicated_on_all_backends", _always_replicated),
+        patch.object(janitor, "is_terminally_abandoned", _fake_abandoned),
+        patch.object(janitor.fs_cache_inventory, "record_cached_batch", AsyncMock()),
+    ):
+        res = await janitor.cleanup_parts_unified(
+            _FakePool(conn), store, _redis(), pressure=2, shard=0, shards=1, walk_concurrency=1
+        )
+    assert store.deleted == [(READ_HOT_GC, 1, 1)], "critical pressure (hot_window==0) bypasses read recency"
+    assert res["gc"] == 1

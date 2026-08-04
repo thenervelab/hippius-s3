@@ -149,6 +149,27 @@ param that is stored but never read (`hippius_s3/writer/write_through_writer.py:
 the `ExplodingCache` arg in `tests/unit/test_write_through_writer.py` in a dedicated cleanup;
 consider renaming the class to `FSPartsWriter`.
 
+### P1 — Accepted SSD leak from the UploadPart cleanup-race fix (unbounded until ov-row cleanup lands)
+
+**Context**: branch `fix/upload-part-cleanup-race` stopped failure-path cleanups from deleting shared FS part data — a duplicate UploadPart's loser used to destroy the winner's *published* chunks (drain then wrote the part off as unrecoverable). The fix deletes nothing on failure and enforces the exact chunk set at publish time instead ([hippius_s3/writer/object_writer.py:893](hippius_s3/writer/object_writer.py), [hippius_s3/cache/fs_store.py:359 `trim_chunks_from`](hippius_s3/cache/fs_store.py)).
+
+**The accepted cost** — two leak shapes now accumulate on SSD:
+
+1. **Meta-less MPU orphan dirs**: a failed UploadPart attempt that never published leaves its chunk files behind with no `meta.json`.
+2. **Append CAS-loser chunk-only dirs**: the CAS loser is un-published (`meta.json` deleted) but its chunks are deliberately kept.
+
+Both shapes have no cephor row, or a failed one. Post-PR-#359 reclaim semantics HOLD any part whose `object_versions` row exists, and **nothing today deletes an abandoned version's `object_versions` row** — so the leak is unbounded, not self-limiting.
+
+**Follow-up that closes it**: a reaper that deletes the abandoned version's `object_versions` row once its parts are dropped. That is the unlock — with the ov row gone, #359's absence-proof reclaim takes over and the leaked dirs become reclaimable instead of held forever.
+
+### Follow-up — janitor exact-set sweep for stale chunk tails
+
+The publish-time trim only covers parts published after the fix. For inventoried parts with meta present, a janitor sweep should delete `chunk_i` where `i >= meta.num_chunks`. This retro-heals the pre-existing stranded stale-tail population and self-heals publish-time trim failures (trim is best-effort by contract — ERROR-logged, never raised). It matters because the drain gate ([crates/hippius-drain-core/src/partdrain.rs:445-461](crates/hippius-drain-core/src/partdrain.rs)) requires the on-disk set to be EXACTLY `{0..num_chunks-1}` — extras mean permanent IncompleteSource deferral: never replicated, never evicted.
+
+### Follow-up — hippius-otel alert on servable write-offs
+
+Add `increase(drain_parts_written_off_servable_total[1h]) > 0` to hippius-otel. A servable write-off is data loss for a part a client could still read — always operator-worthy, and the counter exists precisely so this alert can be cheap.
+
 ### P1 — Meta.json rewrites on concurrent upload + download
 
 **What**: Upload writes `meta.json` once after all chunks ([object_writer.py:420](hippius_s3/writer/object_writer.py), [object_writer.py:~865 `mpu_upload_part_stream`](hippius_s3/writer/object_writer.py)). Downloader writes `meta.json` **eagerly** per part at the start of processing ([hippius_s3/workers/downloader.py:49-91](hippius_s3/workers/downloader.py)). For an object that was just uploaded and is immediately read via a cold-miss downloader path, the meta is written twice with identical content.
@@ -305,6 +326,7 @@ Low-risk deletions; each one should be a one-PR cleanup:
 2. **Redis download-cache residue**. Grep for `REDIS_DOWNLOAD_CACHE_URL`, `redis_download_cache_url`, `DOWNLOAD_CACHE_TTL`, `redis-download-cache`. Should all be gone after the FS migration. Patch any stragglers in docker-compose files and k8s manifests.
 3. **`set_download_chunk`** shim in [hippius_s3/cache/object_parts.py](hippius_s3/cache/object_parts.py) — if still present (prior memory says it was removed), verify. Old download-cache API.
 4. **Any references to `manifest_cid` or `manifest_service`**. Replaced by `chunk_backend` tracking long ago.
+5. **[hippius_s3/workers/fs_cleanup.py](hippius_s3/workers/fs_cleanup.py)** — zero importers (`rg fs_cleanup` hits only the module itself; no entry point in `workers/` runs it). Confirm and delete.
 
 ---
 

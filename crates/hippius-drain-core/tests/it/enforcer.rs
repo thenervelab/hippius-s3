@@ -18,6 +18,7 @@ fn label(decision: DrainDecision) -> String {
         DrainDecision::Allowed => "ALLOW".to_owned(),
         DrainDecision::Denied(DenyReason::BreakerOpen) => "DENY (breaker open)".to_owned(),
         DrainDecision::Denied(DenyReason::RateLimited) => "DENY (rate limited)".to_owned(),
+        DrainDecision::Denied(DenyReason::OverdraftOutstanding) => "DENY (overdraft outstanding)".to_owned(),
         DrainDecision::Denied(DenyReason::AtConcurrencyLimit) => "DENY (at concurrency limit)".to_owned(),
     }
 }

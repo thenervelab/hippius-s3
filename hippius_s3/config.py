@@ -101,6 +101,10 @@ class Config:
     arion_rate_limiting_proxy_bypass_key: str = env("ARION_RATE_LIMITING_PROXY_BYPASS_KEY:")
     arion_base_url: str = env("HIPPIUS_ARION_BASE_URL:https://arion.hippius.com/")
     arion_verify_ssl: bool = env("HIPPIUS_ARION_VERIFY_SSL:true", convert=lambda x: x.lower() == "true")
+    # Per-attempt cap for the can_upload billing gate specifically. Unlike every other call on
+    # ArionClient this one runs inside the gateway's request path, so its worst case is gateway
+    # capacity, not worker throughput. Tunable so an incident can shorten it without a deploy.
+    can_upload_timeout_seconds: float = env("CAN_UPLOAD_TIMEOUT_SECONDS:3.0", convert=float)
 
     # Redis for caching/rate limiting
     redis_url: str = env("REDIS_URL")
@@ -238,12 +242,23 @@ class Config:
     # stream breaks and the client retries). Generous (5 min) so a healthy-but-slow drain never
     # trips it, but far below the 1h cache TTL.
     stream_chunk_timeout_seconds: int = env("HIPPIUS_STREAM_CHUNK_TIMEOUT_SECONDS:300", convert=int)
-    # Hot-retention window for the FS cache: chunks read within this window
-    # are protected from janitor deletion so frequently-accessed content
-    # stays on NVMe. Touched on every read by the API/streamer. Tightened from
-    # 3h to 1h (2026-07-24): a fuller default eviction floor clears cold cache
-    # sooner; a missed re-fetch is one backend read, cheap next to a full pool.
-    fs_cache_hot_retention_seconds: int = env("HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS:3600", convert=int)
+    # Hot-retention window for the FS cache: chunks read within this window are protected from
+    # janitor deletion so frequently-accessed content stays on NVMe. Touched on every read by the
+    # API/streamer, and HALVED at elevated pressure / zeroed at critical (_effective_hot_retention).
+    #
+    # 4h, raised from 1h on 2026-07-25. The 1h value (itself tightened from 3h earlier the same day,
+    # on the theory that "a missed re-fetch is one backend read, cheap next to a full pool") turned
+    # out to have the causality backwards: the janitor has NO LRU — it evicts on a binary atime
+    # threshold in filesystem-walk order — so this window IS the working-set protection. Too short
+    # and the live working set reads as "cold", gets evicted, is re-read, re-fetched from a backend
+    # and re-written into the pool. That refill flywheel is what pinned the CephFS pool near-full
+    # during the 2026-07-24 incident: pool writes ran at 172 MiB/s of pure churn and eviction never
+    # got ahead. Raising the window collapsed it to ~54 MiB/s and the pool finally drained.
+    #
+    # 4h is empirically cheap: it retains only ~6% of walked parts (hot_parts 3546 / parts_seen
+    # 56666 at pressure 0). Prod carries the same value in k8s/base/workers-deployments.yaml — keep
+    # the two in step, and do not "optimise" this downward without re-checking the churn rate.
+    fs_cache_hot_retention_seconds: int = env("HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS:14400", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
     object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
     # Downloader behavior (default: no whole-part backfill)
@@ -350,7 +365,9 @@ class Config:
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
     object_cache_fallback_dir: str = env("HIPPIUS_OBJECT_CACHE_FALLBACK_DIR:", convert=str)
-    # 24h since last access — reads bump mtime (os.utime sets both atime+mtime), so this gates on idle time.
+    # 24h since last WRITE — the read path no longer bumps timestamps (read
+    # recency lives in fs_cache_inventory.last_access_at), so this gates on
+    # time since the part landed, not since it was last streamed.
     fs_cache_gc_max_age_seconds: int = env("HIPPIUS_FS_CACHE_GC_MAX_AGE_SECONDS:86400", convert=int)
     # An MPU is "abandoned" only after this long with NO part activity (not just since
     # initiation) — a user can pause a multipart upload and resume it, so the window must
