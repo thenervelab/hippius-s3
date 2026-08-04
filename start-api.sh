@@ -10,6 +10,13 @@ UVICORN_MAX_REQUESTS_JITTER=${UVICORN_MAX_REQUESTS_JITTER:-1000}
 # Must be < terminationGracePeriodSeconds minus the preStop sleep, or the kubelet
 # SIGKILLs us mid-drain and we are back to severed connections.
 UVICORN_GRACEFUL_TIMEOUT=${UVICORN_GRACEFUL_TIMEOUT:-25}
+# Must stay ABOVE the keepalive_expiry of every pool that holds a connection to us — the
+# gateway's ForwardService httpx pool is 30s (forward_service.py:109). uvicorn's default is
+# 5s, so the pooling side was holding sockets 6x longer than we keep them, and a request
+# dispatched onto one we just closed dies after the header is written. Whoever pools the
+# connection must be the one to retire it; the server closing first is what turns an idle
+# socket into a failed request.
+UVICORN_KEEP_ALIVE=${UVICORN_KEEP_ALIVE:-75}
 
 echo "Running database migrations..."
 python -m hippius_s3.scripts.migrate
@@ -45,6 +52,7 @@ exec uvicorn \
     --log-level=$UVICORN_LOG_LEVEL \
     --access-log \
     --timeout-graceful-shutdown="$UVICORN_GRACEFUL_TIMEOUT" \
+    --timeout-keep-alive="$UVICORN_KEEP_ALIVE" \
     "${MAX_REQUESTS_ARGS[@]+"${MAX_REQUESTS_ARGS[@]}"}" \
     --factory \
     $RELOAD_FLAG \
