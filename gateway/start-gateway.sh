@@ -10,6 +10,15 @@ UVICORN_MAX_REQUESTS_JITTER=${UVICORN_MAX_REQUESTS_JITTER:-1000}
 # Must be < terminationGracePeriodSeconds minus the preStop sleep, or the kubelet
 # SIGKILLs us mid-drain and we are back to severed connections.
 UVICORN_GRACEFUL_TIMEOUT=${UVICORN_GRACEFUL_TIMEOUT:-25}
+# Must stay ABOVE the ATS edge's proxy.config.http.keep_alive_no_activity_timeout_out (60s
+# on every host in hippius-ats), so ATS always retires a pooled origin connection before we
+# do. uvicorn's default is 5s, which had it closing 12x sooner than the proxy that pools it:
+# for the other 55s ATS believes those sockets are live, and a request dispatched onto one we
+# just closed dies after the header is written. ATS retries that for a GET; for a PUT it is
+# non-idempotent, so ATS marks the origin down instead and the client gets a hard 502
+# "Next Hop Connection Failed" (apache/trafficserver#7290). Raise ATS's value and this must
+# move with it.
+UVICORN_KEEP_ALIVE=${UVICORN_KEEP_ALIVE:-75}
 
 RELOAD_FLAG=""
 if [ "${DEBUG:-false}" = "true" ]; then
@@ -41,6 +50,7 @@ exec uvicorn \
     --log-level=$UVICORN_LOG_LEVEL \
     --access-log \
     --timeout-graceful-shutdown="$UVICORN_GRACEFUL_TIMEOUT" \
+    --timeout-keep-alive="$UVICORN_KEEP_ALIVE" \
     "${MAX_REQUESTS_ARGS[@]+"${MAX_REQUESTS_ARGS[@]}"}" \
     --factory \
     $RELOAD_FLAG \
