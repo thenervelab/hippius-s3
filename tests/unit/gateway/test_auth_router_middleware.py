@@ -13,6 +13,10 @@ from httpx import ASGITransport
 from httpx import AsyncClient
 from nacl.secret import SecretBox
 
+from gateway.middlewares.auth_router import ALL_EXEMPT_SEGMENTS
+from gateway.middlewares.input_validation import RESERVED_BUCKET_SEGMENTS
+from gateway.utils.paths import first_path_segment
+
 
 @pytest.fixture  # type: ignore[misc]
 def auth_router_app() -> Any:
@@ -46,6 +50,10 @@ def auth_router_app() -> Any:
     async def health_endpoint() -> dict[str, str]:
         return {"status": "healthy"}
 
+    @app.api_route("/{path:path}", methods=["GET", "PUT"])
+    async def catch_all(request: Request, path: str) -> dict[str, Any]:
+        return {"auth_method": getattr(request.state, "auth_method", None)}
+
     app.middleware("http")(auth_router_middleware)
 
     return app
@@ -58,6 +66,66 @@ async def test_exempt_paths_bypass_auth(auth_router_app: Any) -> None:
         response = await client.get("/health")
 
     assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    ["/docs2", "/docsite", "/metrics-test", "/healthz", "/robots.txt.bak", "/openapi.json2", "/userdata"],
+)
+async def test_reserved_prefixed_bucket_names_still_require_auth(auth_router_app: Any, path: str) -> None:
+    """A bucket name that merely STARTS with a reserved segment must still be
+    authenticated. The old bare startswith() match let PUT /docs2 skip SigV4
+    entirely and land as an anonymous-owned bucket (prod incident 2026-08-03)."""
+    async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+        response = await client.put(path, content=b"test data")
+
+    assert response.status_code == 403
+    assert b"InvalidAccessKeyId" in response.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    ["/docs", "/docs/cache", "/user/profile", "/metrics", "/health", "/openapi.json", "/robots.txt"],
+)
+async def test_reserved_paths_and_subpaths_bypass_auth(auth_router_app: Any, path: str) -> None:
+    """Exact reserved segments (and their subpaths) stay auth-exempt."""
+    async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+        response = await client.put(path, content=b"test data")
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_bare_user_path_still_requires_auth(auth_router_app: Any) -> None:
+    """Only `/user/...` is a frontend route; a bare `/user` is bucket-shaped. acl.py and
+    account.py both special-case `/user/` WITH the slash, so exempting the bare segment here
+    would make auth_router the only layer treating it as non-S3 — a widening, in a change
+    whose whole point is narrowing."""
+    async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
+        response = await client.put("/user", content=b"test data")
+
+    assert response.status_code == 403
+    assert b"InvalidAccessKeyId" in response.content
+
+
+def test_every_auth_exempt_segment_is_a_reserved_bucket_name() -> None:
+    """Any segment auth_router skips authentication for MUST be unusable as a bucket name:
+    a bucket created under it is stamped with no owner, is invisible to its creator, and
+    permanently locks the globally-unique name (prod incident 2026-08-03). These two sets
+    live in different modules, so nothing but this test keeps them honest."""
+    assert ALL_EXEMPT_SEGMENTS <= RESERVED_BUCKET_SEGMENTS
+
+
+def test_exempt_segments_are_matched_on_the_decoded_raw_path() -> None:
+    """auth_router and input_validation must agree on where a path starts. request.url.path
+    is built with urlsplit, which truncates at '#' — `/docs%23x` reads as the exempt segment
+    `docs` through that lens while input_validation sees the bucket `docs#x`."""
+    request = MagicMock()
+    request.scope = {"raw_path": b"/docs%23x"}
+    assert first_path_segment(request) == "docs#x"
+    assert first_path_segment(request) not in ALL_EXEMPT_SEGMENTS
 
 
 @pytest.mark.asyncio
