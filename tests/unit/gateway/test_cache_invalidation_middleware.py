@@ -28,6 +28,7 @@ from httpx import ASGITransport
 from httpx import AsyncClient
 
 from gateway.middlewares.cache_invalidation import _bucket_from_path
+from gateway.middlewares.cache_invalidation import _is_successful_bucket_create
 from gateway.middlewares.cache_invalidation import _is_successful_bucket_delete
 from gateway.middlewares.cache_invalidation import cache_invalidation_middleware
 from gateway.repositories.cached_acl_repository import CachedACLRepository
@@ -92,6 +93,34 @@ class TestIsSuccessfulBucketDelete:
         )
 
 
+class TestIsSuccessfulBucketCreate:
+    def _make_request(self, method: str, query: dict[str, str] | None = None) -> Any:
+        request = MagicMock(spec=Request)
+        request.method = method
+        request.query_params = query or {}
+        return request
+
+    def test_200_put_passes(self) -> None:
+        assert _is_successful_bucket_create(self._make_request("PUT"), Response(status_code=200))
+
+    def test_delete_skipped(self) -> None:
+        assert not _is_successful_bucket_create(self._make_request("DELETE"), Response(status_code=200))
+
+    def test_409_already_exists_skipped(self) -> None:
+        assert not _is_successful_bucket_create(self._make_request("PUT"), Response(status_code=409))
+
+    def test_403_skipped(self) -> None:
+        assert not _is_successful_bucket_create(self._make_request("PUT"), Response(status_code=403))
+
+    @pytest.mark.parametrize("param", ["acl", "tagging", "lifecycle", "policy", "cors"])
+    def test_sub_resource_writes_skipped(self, param: str) -> None:
+        # These mutate bucket config, not the name→owner mapping the cache holds.
+        assert not _is_successful_bucket_create(
+            self._make_request("PUT", {param: ""}),
+            Response(status_code=200),
+        )
+
+
 def _make_app(acl_service: Any, response: Response) -> FastAPI:
     app = FastAPI()
     app.state.acl_service = acl_service
@@ -114,13 +143,15 @@ def _make_cached_acl_repo() -> Any:
 def _make_acl_service(repo: Any) -> Any:
     service = MagicMock()
     service.acl_repo = repo
+    service.invalidate_bucket_meta = AsyncMock()
     return service
 
 
 @pytest.mark.asyncio
 async def test_fires_on_delete_bucket_204() -> None:
     repo = _make_cached_acl_repo()
-    app = _make_app(_make_acl_service(repo), Response(status_code=204))
+    service = _make_acl_service(repo)
+    app = _make_app(service, Response(status_code=204))
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.delete("/alpha")
@@ -128,6 +159,108 @@ async def test_fires_on_delete_bucket_204() -> None:
     assert resp.status_code == 204
     repo.invalidate_bucket_acl.assert_awaited_once_with("alpha")
     repo.invalidate_all_bucket_objects.assert_awaited_once_with("alpha")
+    service.invalidate_bucket_meta.assert_awaited_once_with("alpha")
+
+
+@pytest.mark.asyncio
+async def test_purges_bucket_meta_even_when_repo_is_uncached() -> None:
+    """The bucket-meta entry lives on ACLService's own Redis handle, not the repo's, so it must be
+    purged independently of whether acl_repo is the cached variant."""
+    service = _make_acl_service(MagicMock())  # bare repo, NOT a CachedACLRepository
+    app = _make_app(service, Response(status_code=204))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/alpha")
+
+    assert resp.status_code == 204
+    service.invalidate_bucket_meta.assert_awaited_once_with("alpha")
+
+
+@pytest.mark.asyncio
+async def test_skips_bucket_meta_purge_on_tagging_query() -> None:
+    service = _make_acl_service(_make_cached_acl_repo())
+    app = _make_app(service, Response(status_code=204))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/alpha?tagging")
+
+    assert resp.status_code == 204
+    service.invalidate_bucket_meta.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fires_on_create_bucket_200() -> None:
+    """CreateBucket is the only moment a stale name→owner entry can do harm, and it is
+    reachable without any DeleteBucket having gone through this gateway: the read-through
+    in get_bucket_owner_and_id can re-SETEX a row it read before the delete committed, and
+    scripts/purge_buckets.py hard-DELETEs rows with no gateway in the path at all."""
+    repo = _make_cached_acl_repo()
+    service = _make_acl_service(repo)
+    app = _make_app(service, Response(status_code=200))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.put("/alpha")
+
+    assert resp.status_code == 200
+    service.invalidate_bucket_meta.assert_awaited_once_with("alpha")
+    # The repo-side ACL keys are name-keyed too, so a reclaimed name must not inherit them.
+    repo.invalidate_bucket_acl.assert_awaited_once_with("alpha")
+    repo.invalidate_all_bucket_objects.assert_awaited_once_with("alpha")
+
+
+@pytest.mark.asyncio
+async def test_skips_on_put_object() -> None:
+    """PUT /<bucket>/<key> is PutObject — no bucket identity change, and purging on every
+    object write would defeat the cache entirely."""
+    service = _make_acl_service(_make_cached_acl_repo())
+    app = _make_app(service, Response(status_code=200))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.put("/alpha/key.txt")
+
+    assert resp.status_code == 200
+    service.invalidate_bucket_meta.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skips_on_put_bucket_acl() -> None:
+    service = _make_acl_service(_make_cached_acl_repo())
+    app = _make_app(service, Response(status_code=200))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.put("/alpha?acl")
+
+    assert resp.status_code == 200
+    service.invalidate_bucket_meta.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skips_on_failed_create() -> None:
+    """BucketAlreadyExists (409) means the mapping did not change."""
+    service = _make_acl_service(_make_cached_acl_repo())
+    app = _make_app(service, Response(status_code=409))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.put("/alpha")
+
+    assert resp.status_code == 409
+    service.invalidate_bucket_meta.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_purges_the_name_the_client_actually_sent() -> None:
+    """The purge target must come from raw_path, not request.url.path — Starlette's urlsplit
+    truncates at `#`, so a name containing one would purge the key for a DIFFERENT bucket while
+    leaving the real entry hot. Purging the wrong key is a cache miss; missing the right one is
+    the authz hole this middleware exists to close."""
+    service = _make_acl_service(_make_cached_acl_repo())
+    app = _make_app(service, Response(status_code=204))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/legacy%23bucket")
+
+    assert resp.status_code == 204
+    service.invalidate_bucket_meta.assert_awaited_once_with("legacy#bucket")
 
 
 @pytest.mark.asyncio
