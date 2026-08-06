@@ -32,10 +32,21 @@ import asyncpg
 import httpx
 import redis.asyncio as async_redis
 
+from hippius_s3.cache.part_memo import PartMemo
+
 
 logger = logging.getLogger(__name__)
 
 _PEER_KEY_PREFIX = "hippius:peer:"
+
+# How long a resolved peer address for a part is reused. Which node holds a part is a per-PART
+# fact, but the read path asks per CHUNK, so without this a 64-chunk part costs 64 Postgres
+# round-trips plus 64 Redis GETs — self-defeating on a tier that exists to save ~34 ms/chunk.
+#
+# TTL'd, not permanent: the evictor deletes residency rows underneath us, so a stale answer
+# must expire. A wrong answer is cheap anyway — the peer 404s and the read falls to the pool.
+_OWNER_MEMO_TTL_SECONDS = 30.0
+_OWNER_MEMO_ENTRIES = 50_000
 
 
 def peer_key(node_name: str) -> str:
@@ -108,6 +119,13 @@ class PeerChunkFetcher:
         self._registry = registry
         self._node_name = node_name
         self._client = client
+        # Caches the resolved base URL per part, so both the residency query and the peer
+        # address lookup are paid once per part rather than once per chunk. A `None` result is
+        # cached too — "no peer has this" is just as per-part, and re-asking for every chunk
+        # of a pool-only part is the common cold-read case.
+        self._owner_url: PartMemo[tuple[str, int, int], tuple[Optional[str]]] = PartMemo(
+            _OWNER_MEMO_TTL_SECONDS, _OWNER_MEMO_ENTRIES
+        )
 
     async def _owner(self, object_id: str, object_version: int, part_number: int) -> Optional[str]:
         """A node other than this one that holds the part, per the residency table.
@@ -144,10 +162,16 @@ class PeerChunkFetcher:
         an optimisation over an authoritative pool copy, so "no peer answered" and "the peer
         errored" are the same outcome: read the pool.
         """
-        owner = await self._owner(object_id, object_version, part_number)
-        if owner is None:
-            return None
-        base = await self._registry.resolve(owner)
+        part_key = (str(object_id), int(object_version), int(part_number))
+        cached = self._owner_url.get(part_key)
+        if cached is not None:
+            base = cached[0]
+        else:
+            owner = await self._owner(object_id, object_version, part_number)
+            base = await self._registry.resolve(owner) if owner is not None else None
+            # Wrapped in a 1-tuple so a cached "no peer" (None) is distinguishable from a
+            # cache miss — otherwise every pool-only part would re-query on every chunk.
+            self._owner_url.put(part_key, (base,))
         if base is None:
             return None
         url = f"{base}/internal/parts/{object_id}/{object_version}/{part_number}/chunks/{chunk_index}"

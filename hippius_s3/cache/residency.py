@@ -17,26 +17,35 @@ from typing import Optional
 
 import asyncpg
 
+from hippius_s3.cache.part_memo import PartMemo
+
 
 logger = logging.getLogger(__name__)
 
-# Cap on the "already recorded" set. Promotion is idempotent, so overflowing the cap costs a
-# duplicate upsert, never correctness — the bound exists so a long-lived api pod serving a
+# Cap on the "already recorded" memo. Promotion is idempotent, so over-evicting the memo costs
+# a duplicate upsert, never correctness — the bound exists so a long-lived api pod serving a
 # large working set cannot grow this without limit.
 _SEEN_LIMIT = 100_000
+
+# How long a recorded part stays remembered. Bounded rather than permanent because the drain's
+# evictor can DELETE the residency row underneath us: a part promoted, evicted, then read and
+# promoted again must be re-recorded, and a permanent memo would skip it forever, leaving a
+# copy on disk that this node's evictor can never see — exactly the leak per-node residency
+# exists to prevent.
+_SEEN_TTL_SECONDS = 300.0
 
 
 class ResidencyRecorder:
     """Claims promoted parts for this node so its evictor owns them."""
 
-    def __init__(self, pool: asyncpg.Pool, node_id: str) -> None:
+    def __init__(self, pool: asyncpg.Pool, node_id: str, ttl_seconds: float = _SEEN_TTL_SECONDS) -> None:
         self._pool = pool
         self._node_id = node_id
-        self._seen: set[tuple[str, int, int]] = set()
+        self._seen: PartMemo[tuple[str, int, int], bool] = PartMemo(ttl_seconds, _SEEN_LIMIT)
 
     async def __call__(self, object_id: str, object_version: int, part_number: int, size_bytes: int) -> None:
         key = (object_id, int(object_version), int(part_number))
-        if key in self._seen:
+        if self._seen.get(key) is not None:
             return
         try:
             async with self._pool.acquire() as conn:
@@ -66,9 +75,7 @@ class ResidencyRecorder:
                 exc,
             )
             return
-        if len(self._seen) >= _SEEN_LIMIT:
-            self._seen.clear()
-        self._seen.add(key)
+        self._seen.put(key, True)
 
 
 def create_residency_recorder(pool: Optional[asyncpg.Pool], node_id: str) -> Optional[ResidencyRecorder]:

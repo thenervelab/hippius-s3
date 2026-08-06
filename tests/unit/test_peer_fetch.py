@@ -169,3 +169,39 @@ async def test_a_resolved_but_unregistered_peer_is_skipped() -> None:
 
     assert await fetcher(OBJ, 1, 3, 2) is None
     assert http.urls == [], "no address, so no request was attempted"
+
+
+@pytest.mark.asyncio
+async def test_the_owner_lookup_is_per_part_not_per_chunk() -> None:
+    """Which peer holds a part is a per-PART fact, but the read path asks per chunk.
+
+    Unmemoised, a 64-chunk part costs 64 Postgres round-trips plus 64 Redis GETs on the read
+    path — self-defeating on a tier that exists to save ~34 ms per chunk.
+    """
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
+    registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
+    pool = FakePool({"node_id": "node-b"})
+    http = FakeHttp(FakeResponse(200, b"peer-bytes"))
+    fetcher = PeerChunkFetcher(pool, registry, "node-a", http)
+
+    for chunk in range(64):
+        assert await fetcher(OBJ, 1, 3, chunk) == b"peer-bytes"
+
+    assert len(pool.conn.queries) == 1, f"64 chunks issued {len(pool.conn.queries)} residency lookups"
+    assert len(http.urls) == 64, "but every chunk is still fetched"
+
+
+@pytest.mark.asyncio
+async def test_a_different_part_is_looked_up_separately() -> None:
+    """The memo is keyed by part — parts of one object can live on different nodes."""
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
+    registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
+    pool = FakePool({"node_id": "node-b"})
+    fetcher = PeerChunkFetcher(pool, registry, "node-a", FakeHttp(FakeResponse(200, b"x")))
+
+    await fetcher(OBJ, 1, 3, 0)
+    await fetcher(OBJ, 1, 4, 0)
+
+    assert len(pool.conn.queries) == 2, "part 3 and part 4 are resolved independently"

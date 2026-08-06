@@ -6,9 +6,14 @@ from typing import Callable
 from typing import Optional
 
 from hippius_s3.cache.fs_store import FileSystemPartsStore
+from hippius_s3.cache.part_memo import PartMemo
 
 
 logger = logging.getLogger(__name__)
+
+# Meta is rewritten at most this often per part, and at most this many parts are tracked.
+_META_MEMO_TTL_SECONDS = 300.0
+_META_MEMO_ENTRIES = 50_000
 
 # Called after a chunk is promoted onto the local tier, with (object_id, version,
 # part_number, bytes). The api wires this to the drain's residency table so this node's
@@ -60,6 +65,12 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         self._promote = promote
         self._on_promote = on_promote
         self._peer_fetch = peer_fetch
+        # Promotion fires per chunk, but meta is a per-part file and writing it costs a
+        # tmp-write + file fsync + rename + dir fsync. Paying that once per chunk can exceed
+        # the pool read promotion is meant to avoid, making the first read of a large part
+        # slower. TTL'd rather than permanent so an evicted part's meta is rewritten when it
+        # is promoted again.
+        self._meta_written: PartMemo[tuple[str, int, int], bool] = PartMemo(_META_MEMO_TTL_SECONDS, _META_MEMO_ENTRIES)
 
     async def get_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
@@ -130,14 +141,17 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
             meta = await self.fallback.get_meta(object_id, object_version, part_number)
             if meta is None:
                 return
-            await self.set_meta(
-                object_id,
-                object_version,
-                part_number,
-                chunk_size=int(meta["chunk_size"]),
-                num_chunks=int(meta["num_chunks"]),
-                size_bytes=int(meta["size_bytes"]),
-            )
+            part_key = (object_id, int(object_version), int(part_number))
+            if self._meta_written.get(part_key) is None:
+                await self.set_meta(
+                    object_id,
+                    object_version,
+                    part_number,
+                    chunk_size=int(meta["chunk_size"]),
+                    num_chunks=int(meta["num_chunks"]),
+                    size_bytes=int(meta["size_bytes"]),
+                )
+                self._meta_written.put(part_key, True)
             await self.set_chunk(object_id, object_version, part_number, chunk_index, data)
             if self._on_promote is not None:
                 # Records residency so THIS node's evictor owns the copy. Without it the
