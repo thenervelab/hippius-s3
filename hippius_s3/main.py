@@ -1,6 +1,7 @@
 """Main application module for Hippius S3 service."""
 
 import logging
+import os
 import platform
 import re
 from contextlib import asynccontextmanager
@@ -31,6 +32,7 @@ from hippius_s3.api.sub_token_scopes import router as sub_token_scopes_router
 from hippius_s3.api.user import router as user_router
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
+from hippius_s3.cache.residency import create_residency_recorder
 from hippius_s3.config import Config
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
@@ -127,7 +129,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Cache repositories
         # Chunks are stored on the shared filesystem (via FileSystemPartsStore).
         # Redis is used only for pub/sub chunk-ready notifications (queues_client).
-        app.state.fs_store = create_fs_store(config)
+        # A promoted chunk lands on a node that did not ingest the part, so it must be
+        # claimed for THIS node or the drain-agent's evictor — scoped by node_id — can never
+        # reclaim it. No node identity means no recorder, which disables promotion outright.
+        app.state.residency_recorder = create_residency_recorder(app.state.postgres_pool, os.getenv("NODE_NAME", ""))
+        app.state.fs_store = create_fs_store(config, on_promote=app.state.residency_recorder)
         app.state.obj_cache = RedisObjectPartsCache(
             app.state.redis_client,
             queues_client=app.state.redis_queues_client,
