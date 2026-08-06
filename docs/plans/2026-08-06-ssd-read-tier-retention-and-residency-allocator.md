@@ -34,6 +34,23 @@ replication also needs node-local read recency, which does not exist yet — the
 `fs_cache_inventory.last_access_at` is fleet-wide, so a read on one node looks hot on all of
 them.
 
+**New internal surface: `GET /internal/parts/...`.** Threat model, so it is not rediscovered:
+
+- **AuthZ is network-level only** — the api's existing `ip_whitelist` (10.x/172.x). Any pod on
+  the cluster pod network can call it. There is no per-request authentication, and it does not
+  consult bucket ACLs or object ownership.
+- **What it discloses.** Chunks are AES-256-GCM ciphertext under a per-object-version DEK that
+  never leaves the KMS path, so the bytes are useless to a caller without the envelope; the
+  endpoint grants no plaintext access anyone lacks. It IS, however, an **existence oracle**: a
+  200 vs 404 reveals whether a given `(object_id, version, part)` is resident on that node, to
+  anyone who can already reach the pod network and guess an object UUID.
+- **Resource exposure.** It serves node-local NVMe reads and unmetered intra-cluster egress.
+  The in-flight cap (`HIPPIUS_PEER_SERVE_MAX_INFLIGHT`) bounds concurrency but there is no
+  per-caller quota, so a misbehaving in-cluster client is throttled in aggregate, not isolated.
+- **If the trust boundary changes** — a shared cluster, or workloads that are not ours on the
+  pod network — this needs real authentication (the gateway's HMAC path or mTLS), not a wider
+  IP allow-list.
+
 **What to watch during the staging soak.** `chunk_reads_by_tier_total{tier=...}` is the whole
 point: `local` should climb as retention fills each node's shard, `peer` should take most of what
 used to be `pool`, and `pool` should fall. Alongside it, `drain_ssd_cache_bytes` should rise and

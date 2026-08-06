@@ -12,6 +12,7 @@ that this node's evictor can never see.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 
 import pytest
@@ -153,3 +154,35 @@ async def test_promoting_a_part_writes_its_meta_once_not_once_per_chunk(tmp_path
         assert await dual.get_chunk(OBJ, 1, 1, index) == chunks[index]
 
     assert calls["n"] == 1, f"8 promoted chunks wrote meta {calls['n']} times"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_readers_promote_a_chunk_only_once(tmp_path) -> None:
+    """Two readers missing the same cold chunk must not both promote it.
+
+    Raised in review as merely wasteful — duplicate writes are safe, since `set_chunk` is
+    tmp+rename. It stopped being merely wasteful once the residency upsert became
+    accumulating: a duplicate promotion now DOUBLE-COUNTS the chunk's bytes, inflating the
+    figure the evictor sums against its deficit, so a pass frees less than it believes while
+    reporting success. Same failure class as recording the whole part's size per chunk.
+
+    The guard skips rather than waits: the caller already holds the bytes, so waiting on
+    another reader's write would add latency for no benefit to this request.
+    """
+    recorded: list[tuple[str, int, int, int]] = []
+    gate = asyncio.Event()
+
+    async def _record(object_id: str, version: int, part_number: int, size_bytes: int) -> None:
+        await gate.wait()
+        recorded.append((object_id, version, part_number, size_bytes))
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), promote=True, on_promote=_record)
+    await dual.fallback.set_chunk(OBJ, 1, 1, 0, b"payload")
+    await dual.fallback.set_meta(OBJ, 1, 1, chunk_size=7, num_chunks=1, size_bytes=7)
+
+    both = asyncio.gather(dual.get_chunk(OBJ, 1, 1, 0), dual.get_chunk(OBJ, 1, 1, 0))
+    await asyncio.sleep(0)
+    gate.set()
+    assert await both == [b"payload", b"payload"], "both readers still get their bytes"
+
+    assert len(recorded) == 1, f"the chunk was promoted {len(recorded)} times"

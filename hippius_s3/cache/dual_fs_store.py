@@ -62,6 +62,11 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         self._promote = promote
         self._on_promote = on_promote
         self._peer_fetch = peer_fetch
+        # Chunks whose promotion is in flight right now, so concurrent readers of the same
+        # cold chunk write it once. Holds only in-flight keys, so it drains itself and needs
+        # no bound or TTL — unlike a "already done" memo, which the out-of-process evictor
+        # could invalidate underneath us.
+        self._promoting: set[tuple[str, int, int, int]] = set()
 
     async def get_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
@@ -128,6 +133,15 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         writing it last would leave the whole part invisible until some read happened to
         promote the final chunk.
         """
+        # Skip if another reader is already promoting this exact chunk. Skipping beats
+        # waiting: this caller already holds the bytes, so blocking on someone else's write
+        # would add latency and return the same result. Duplicate promotion is not merely
+        # wasteful now that the residency upsert accumulates — it would double-count the
+        # chunk's bytes and inflate the figure the evictor sums against its deficit.
+        in_flight = (object_id, int(object_version), int(part_number), int(chunk_index))
+        if in_flight in self._promoting:
+            return
+        self._promoting.add(in_flight)
         try:
             meta = await self.fallback.get_meta(object_id, object_version, part_number)
             if meta is None:
@@ -165,6 +179,8 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
                 chunk_index,
                 exc,
             )
+        finally:
+            self._promoting.discard(in_flight)
 
     async def get_meta(self, object_id: str, object_version: int, part_number: int) -> Optional[dict]:
         result = await super().get_meta(object_id, object_version, part_number)
