@@ -358,24 +358,27 @@ impl Store {
     /// headroom rather than against it, so a disk full of warm cache does not read to the
     /// allocator as a node critically behind on draining.
     ///
-    /// Served by `cephor_replication_resident_idx`. Like
-    /// [`node_backlog_bytes`](Self::node_backlog_bytes) this joins `parts`, so a row with a
-    /// missing or NULL-sized `parts` entry contributes zero — it under-reports rather than
-    /// over-reports cache, which is the fail-safe direction here (understating evictable space
-    /// overstates urgency, never the reverse).
+    /// Served by `cephor_ssd_residency_evict_idx`, reading the denormalized `bytes` rather
+    /// than joining the ~140M-row `parts` table. A part whose size was unknown at residency
+    /// time contributes zero, which under-reports cache — the fail-safe direction, since
+    /// understating evictable space overstates drain urgency rather than hiding it.
     ///
     /// # Errors
     ///
     /// [`StoreError`] if the query fails.
     pub async fn node_cache_bytes(&self, node: &str) -> Result<u64> {
+        // Same guard as the eviction worklist, and for the same reason: `cache_bytes` means
+        // EVICTABLE bytes. A resident part that is not `replicated` — a re-driven corrupt part
+        // back in `pending`, say — is on the disk but cannot be evicted, and it is already
+        // counted by `node_backlog_bytes` as the undrained work it is. Counting it here too
+        // would double-count it AND overstate the node's ingest headroom, which understates its
+        // drain urgency to the allocator: the one direction this signal must never err in.
         let (bytes,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(p.size_bytes), 0)::bigint \
-             FROM cephor_replication_status crs \
-             JOIN parts p \
-               ON p.object_id = crs.object_id::uuid \
-              AND p.object_version = crs.version \
-              AND p.part_number = crs.part_number \
-             WHERE crs.node_id = $1 AND crs.status = 'replicated' AND crs.resident_at IS NOT NULL AND crs.evicted_at IS NULL",
+            "SELECT COALESCE(SUM(r.bytes), 0)::bigint \
+             FROM cephor_ssd_residency r \
+             JOIN cephor_replication_status s \
+               ON s.object_id = r.object_id AND s.version = r.version AND s.part_number = r.part_number \
+             WHERE r.node_id = $1 AND s.status = 'replicated'",
         )
         .bind(node)
         .fetch_one(&self.pool)
@@ -914,6 +917,10 @@ impl PartReplicationStore for Store {
         row.map(|(status,)| state_from_db(&status)).transpose()
     }
 
+    async fn mark_resident(&self, part: &PartKey, bytes: u64) -> Result<()> {
+        self.record_resident(part, bytes).await
+    }
+
     async fn mark_replicated(&self, claim: &ClaimedPart, _proof: &PartVerified) -> Result<()> {
         // Guard on `draining` AND the claim's fencing token: only the agent that still
         // holds THIS claim may commit. Zero rows means the claim was lost — either the
@@ -927,16 +934,8 @@ impl PartReplicationStore for Store {
         // corruption episode, so a part that recovered (corrupt→pending→replicated) must not
         // carry a spent budget if the same row is ever corrupted again. Harmless on the common
         // path (it is already 0).
-        // resident_at is stamped in the SAME statement as the commit. The drain no longer
-        // unlinks its SSD copy — it keeps it to serve reads — so committing 'replicated' IS
-        // the moment the part joins the read tier. Setting it here leaves no window in which
-        // a part is replicated but unaccounted, which the evictor would be blind to and the
-        // heartbeat would under-report as cache. evicted_at is cleared for the corrupt→
-        // pending→replicated re-drive path, where a previously evicted row becomes resident
-        // again and must not stay filtered out of the worklist.
         let affected = sqlx::query(
-            "UPDATE cephor_replication_status \
-             SET status = 'replicated', corrupt_attempts = 0, updated_at = now(), resident_at = now(), evicted_at = NULL \
+            "UPDATE cephor_replication_status SET status = 'replicated', corrupt_attempts = 0, updated_at = now() \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' AND claim_seq = $4",
         )
         .bind(part.object().as_str())
@@ -1128,39 +1127,34 @@ impl ResidentLog for Store {
     type Error = StoreError;
 
     async fn evictable_parts(&self, limit: u32) -> Result<Vec<ResidentPart>> {
-        // Node-scoped like `claim_part`: a part lives on exactly one node's SSD, so evicting
-        // a peer's row would mark it gone while its bytes stay on a disk this agent cannot
-        // reach. An agent with no node id (the allocator) evicts nothing.
+        // Node-scoped: residency is per (node, part), and a node can only unlink what is on
+        // its own disk. An agent with no node id (the allocator) evicts nothing.
         let Some(node) = self.node_id.as_deref() else {
             return Ok(Vec::new());
         };
-        // The `status = 'replicated'` filter is load-bearing, not redundant with resident_at.
-        // Residency and status are independent: `redrive_corrupt_parts` resets a corrupt part
-        // to `pending` for a fresh copy WITHOUT clearing resident_at (correctly — the part is
-        // still on the disk), so a re-driven part is resident-and-pending. Selecting on
-        // residency alone would offer the evictor a part whose SSD copy is once again the only
-        // durable one. The orchestrator refuses it regardless, but a worklist that never emits
-        // it is the real guard; that check is the backstop.
+        // The join to cephor_replication_status carries the status guard, and it is
+        // load-bearing rather than redundant with residency: the two are INDEPENDENT axes.
+        // `redrive_corrupt_parts` resets a corrupt part to `pending` for a fresh copy without
+        // touching its residency (correctly — the part is still on the disk), so a re-driven
+        // part is resident-and-pending, and its SSD copy is once again the only durable one.
+        // Selecting on residency alone would offer it to the evictor. The orchestrator refuses
+        // it regardless, but a worklist that never emits it is the real guard.
+        //
+        // INNER JOIN: a residency row with no replication row means the object was hard-deleted,
+        // which is the reclaimer's disposition (deleted-object orphan), not the evictor's. It is
+        // excluded here and `prune_residency` clears the row when the reclaimer unlinks the part.
         //
         // ORDER BY resident_at IS the eviction policy (FIFO, oldest-retained first); the
-        // orchestrator walks this order and never re-sorts. Reads straight off
-        // `cephor_replication_resident_idx`, whose predicate matches this WHERE exactly, so
-        // the cost is proportional to `limit` rather than to the resident set — the whole
-        // point of not using a filesystem walk here.
-        //
-        // LEFT JOIN, not JOIN: a resident row whose `parts` entry is missing must still be
-        // evictable. Under an inner join it would be invisible to every pass, pinning bytes
-        // on the SSD that nothing could ever reclaim. It reports zero bytes, so it frees no
-        // *accounted* space and the pass simply continues past it.
-        let rows = sqlx::query_as::<_, (String, i64, i64, String, Option<i64>)>(
-            "SELECT crs.object_id, crs.version, crs.part_number, crs.status, p.size_bytes \
-             FROM cephor_replication_status crs \
-             LEFT JOIN parts p \
-               ON p.object_id = crs.object_id::uuid \
-              AND p.object_version = crs.version \
-              AND p.part_number = crs.part_number \
-             WHERE crs.node_id = $1 AND crs.status = 'replicated' AND crs.resident_at IS NOT NULL AND crs.evicted_at IS NULL \
-             ORDER BY crs.resident_at \
+        // orchestrator walks this order and never re-sorts. Reads off
+        // `cephor_ssd_residency_evict_idx`, so the cost is proportional to `limit` rather than
+        // to the resident set — the whole point of not using a filesystem walk here.
+        let rows = sqlx::query_as::<_, (String, i64, i64, String, i64)>(
+            "SELECT r.object_id, r.version, r.part_number, s.status, r.bytes \
+             FROM cephor_ssd_residency r \
+             JOIN cephor_replication_status s \
+               ON s.object_id = r.object_id AND s.version = r.version AND s.part_number = r.part_number \
+             WHERE r.node_id = $1 AND s.status = 'replicated' \
+             ORDER BY r.resident_at \
              LIMIT $2",
         )
         .bind(node)
@@ -1169,7 +1163,7 @@ impl ResidentLog for Store {
         .await?;
 
         let mut out = Vec::with_capacity(rows.len());
-        for (object_id, version, part_number, status, size_bytes) in rows {
+        for (object_id, version, part_number, status, bytes) in rows {
             let part = PartRow {
                 object_id,
                 version,
@@ -1178,7 +1172,7 @@ impl ResidentLog for Store {
             .into_part()?;
             out.push(ResidentPart {
                 part,
-                bytes: u64::try_from(size_bytes.unwrap_or(0)).unwrap_or(0),
+                bytes: u64::try_from(bytes).unwrap_or(0),
                 state: state_from_db(&status)?,
             });
         }
@@ -1186,6 +1180,61 @@ impl ResidentLog for Store {
     }
 
     async fn mark_evicted(&self, parts: &[PartKey]) -> Result<()> {
+        self.drop_residency(parts).await
+    }
+}
+
+impl Store {
+    /// Records that `part` is now resident on this node's SSD, with its size for the eviction
+    /// cursor's accounting.
+    ///
+    /// Called by the drain right after it commits `replicated` (it retains its copy), and by
+    /// the api after a read-through promotion copies a part onto a node that did not ingest it.
+    /// Idempotent on re-drive: a part that goes `corrupt → pending → replicated` re-asserts
+    /// residency it never actually lost.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the write fails.
+    pub async fn record_resident(&self, part: &PartKey, bytes: u64) -> Result<()> {
+        let Some(node) = self.node_id.as_deref() else {
+            return Ok(());
+        };
+        sqlx::query(
+            "INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number, bytes) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (node_id, object_id, version, part_number) \
+             DO UPDATE SET bytes = EXCLUDED.bytes",
+        )
+        .bind(node)
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .bind(i64::try_from(bytes).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Drops this node's residency rows for `parts` — the counterpart to
+    /// [`record_resident`](Self::record_resident), called by the evictor after it unlinks.
+    ///
+    /// The reclaim worker deliberately does NOT call this, because the parts it removes never
+    /// had a residency row: residency is recorded only at the drain's commit, and everything
+    /// the reclaimer removes is either terminal (`failed`) or has no replication row at all
+    /// (a deleted-object orphan). The one loose end is a part that was resident and then had
+    /// its object hard-deleted: its replication row goes, the reclaimer frees the disk space,
+    /// and the residency row is left behind — but both `evictable_parts` and `node_cache_bytes`
+    /// INNER JOIN the replication row, so it is invisible to each and drifts no signal. It is a
+    /// dead row bounded by the hard-delete rate, not a leak of disk or of accounting.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the delete fails.
+    pub async fn drop_residency(&self, parts: &[PartKey]) -> Result<()> {
+        let Some(node) = self.node_id.as_deref() else {
+            return Ok(());
+        };
         if parts.is_empty() {
             return Ok(());
         }
@@ -1197,17 +1246,13 @@ impl ResidentLog for Store {
             versions.push(i64::from(part.version().get()));
             part_numbers.push(i64::from(part.part().get()));
         }
-        // Guarded on `status = 'replicated'`: if a row somehow left that state between the
-        // worklist read and here, stamping it evicted would be a lie about a part whose SSD
-        // copy may now be load-bearing again. The unlink already happened, so a no-op UPDATE
-        // simply leaves the row for the reconciler — the same conservative direction the rest
-        // of this table's writes take.
         sqlx::query(
-            "UPDATE cephor_replication_status SET evicted_at = now() \
-             WHERE (object_id, version, part_number) IN \
-                   (SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::bigint[])) \
-               AND status = 'replicated'",
+            "DELETE FROM cephor_ssd_residency \
+             WHERE node_id = $1 \
+               AND (object_id, version, part_number) IN \
+                   (SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]))",
         )
+        .bind(node)
         .bind(&object_ids)
         .bind(&versions)
         .bind(&part_numbers)
@@ -1878,6 +1923,7 @@ mod part_tests {
 
         store.mark_replicated(&claimed, &PartVerified::for_test()).await.unwrap();
 
+        store.record_resident(&p, 4096).await.unwrap();
         assert_eq!(store.node_cache_bytes("node-a").await.unwrap(), 4096, "the retained part is cache");
         let worklist = store.evictable_parts(10).await.unwrap();
         assert_eq!(worklist.len(), 1);
@@ -1911,11 +1957,7 @@ mod part_tests {
         let store = Store::from_pool(pool.clone()).with_node_id("node-a");
         seed_status_node(&pool, UUID_A, 1, 1, "corrupt", "node-a").await;
         seed_part_size(&pool, UUID_A, 1, 1, Some(100)).await;
-        sqlx::query("UPDATE cephor_replication_status SET resident_at = now() WHERE object_id = $1")
-            .bind(UUID_A)
-            .execute(&pool)
-            .await
-            .unwrap();
+        store.record_resident(&part(UUID_A, 1, 1), 100).await.unwrap();
 
         let redriven = store.redrive_corrupt_parts(3).await.unwrap();
         assert_eq!(redriven, 1, "the corrupt part went back to pending for a fresh copy");
@@ -1943,12 +1985,14 @@ mod part_tests {
             seed_status_node(&pool, UUID_A, 1, n, "replicated", node).await;
             seed_part_size(&pool, UUID_A, 1, n, Some(100)).await;
         }
-        // Distinct resident_at so FIFO order is unambiguous; part 2 is the OLDER one.
-        for (n, hours_ago) in [(1_i64, 1_i32), (2, 3), (3, 2)] {
+        // Residency rows on the OWNING node, with distinct resident_at so FIFO order is
+        // unambiguous; part 2 is the OLDER one. Part 3 is node-b's, so it must never appear.
+        for (n, node, hours_ago) in [(1_i64, "node-a", 1_i32), (2, "node-a", 3), (3, "node-b", 2)] {
             sqlx::query(
-                "UPDATE cephor_replication_status SET resident_at = now() - make_interval(hours => $3) \
-                 WHERE object_id = $1 AND version = 1 AND part_number = $2",
+                "INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number, bytes, resident_at) \
+                 VALUES ($1, $2, 1, $3, 100, now() - make_interval(hours => $4))",
             )
+            .bind(node)
             .bind(UUID_A)
             .bind(n)
             .bind(hours_ago)

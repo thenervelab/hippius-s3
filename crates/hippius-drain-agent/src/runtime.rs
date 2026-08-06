@@ -1624,29 +1624,14 @@ mod tests {
         );
     }
 
-    /// Creates the minimal `parts` table the eviction worklist LEFT JOINs, and marks `part`
-    /// replicated + resident — the state the drain leaves behind now that it retains its SSD
-    /// copy. Done in SQL because `PartVerified` is unforgeable outside drain-core, which is
-    /// the point of that seal; `mark_replicated`'s own residency stamping is covered by the
-    /// store tests.
-    async fn seed_resident(pool: &PgPool, part: &PartKey, size_bytes: i64) {
+    /// Marks `part` replicated and records it resident on this node — the state the drain
+    /// leaves behind now that it retains its SSD copy.
+    ///
+    /// Done in SQL because `PartVerified` is unforgeable outside drain-core, which is the point
+    /// of that seal; `mark_replicated` / `mark_resident` are covered by the store's own tests.
+    async fn seed_resident(store: &Store, pool: &PgPool, part: &PartKey, size_bytes: u64) {
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS parts (object_id uuid NOT NULL, object_version bigint NOT NULL, \
-             part_number bigint NOT NULL, size_bytes bigint, upload_id uuid)",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO parts (object_id, object_version, part_number, size_bytes) VALUES ($1::uuid, $2, $3, $4)")
-            .bind(part.object().as_str())
-            .bind(i64::from(part.version().get()))
-            .bind(i64::from(part.part().get()))
-            .bind(size_bytes)
-            .execute(pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE cephor_replication_status SET status = 'replicated', resident_at = now() \
+            "UPDATE cephor_replication_status SET status = 'replicated' \
              WHERE object_id = $1 AND version = $2 AND part_number = $3",
         )
         .bind(part.object().as_str())
@@ -1655,6 +1640,7 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+        store.record_resident(part, size_bytes).await.unwrap();
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
@@ -1670,7 +1656,7 @@ mod tests {
         let resident = part_at(5, 1);
         seed_ssd_dir(ssd_dir.path(), &resident);
         store.record_landed_part(&resident).await.unwrap();
-        seed_resident(&pool, &resident, 20).await;
+        seed_resident(&store, &pool, &resident, 20).await;
 
         let ssd = LocalSsd::new(ssd_dir.path());
         super::evict_once(
@@ -1714,14 +1700,9 @@ mod tests {
         let undrained = part_at(7, 1);
         seed_ssd_dir(ssd_dir.path(), &undrained);
         store.record_landed_part(&undrained).await.unwrap();
-        // A `parts` row and a resident marker, but the status stays `pending` — the shape the
-        // worklist must refuse. Without the table the LEFT JOIN would error, masking the test.
-        seed_resident(&pool, &undrained, 20).await;
-        sqlx::query("UPDATE cephor_replication_status SET status = 'pending' WHERE object_id = $1")
-            .bind(undrained.object().as_str())
-            .execute(&pool)
-            .await
-            .unwrap();
+        // Resident on this node, but still `pending` — the shape the worklist must refuse.
+        // This is not hypothetical: redrive_corrupt_parts produces exactly it.
+        store.record_resident(&undrained, 20).await.unwrap();
 
         let ssd = LocalSsd::new(ssd_dir.path());
         super::evict_once(

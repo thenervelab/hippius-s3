@@ -217,6 +217,17 @@ pub trait PartReplicationStore: Send + Sync {
     /// copy was verified, so this cannot be called before verification.
     fn mark_replicated(&self, part: &ClaimedPart, proof: &PartVerified) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Record that this node is KEEPING the part's SSD copy to serve reads, with its size for
+    /// the evictor's accounting.
+    ///
+    /// Called just BEFORE the commit, not after, and the order matters. The part is already on
+    /// the disk, so recording residency first means a crash between the two leaves a residency
+    /// row for a still-`draining` part — which the eviction worklist's status guard refuses,
+    /// and which the reclaimer clears if the part never commits. The reverse order could commit
+    /// a part whose residency was never recorded: a copy on the disk that no evictor can see
+    /// and no `cache_bytes` sum counts, leaking space until the node fills.
+    fn mark_resident(&self, part: &PartKey, bytes: u64) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
     /// Stamp that this part's backend `UploadChainRequest` has been published (sets
     /// `upload_enqueued_at`). Called after a successful enqueue — inline in [`drain_part`]
     /// for the common ready case, and by the agent's enqueue sweep for parts whose address
@@ -514,10 +525,13 @@ where
     ceph.finalize_part(part).await.map_err(PartDrainError::io(DrainStep::Persist))?;
     let verified = PartVerified(());
 
+    // Claim the SSD copy as read-tier cache BEFORE committing — see `mark_resident`. The size
+    // comes from the manifest already read for the completeness gate, so this costs no extra
+    // I/O and never has to join `parts` on the drain path.
+    store.mark_resident(part, meta.size_bytes).await.map_err(PartDrainError::store)?;
+
     // Commit Replicated as soon as the verified copy is durable on the pool — the Ceph
-    // commit is DECOUPLED from the address-gated backend enqueue. Only past this point does a
-    // durable, verified, committed copy exist, so removing the SSD part is safe (the backend
-    // uploader reads the chunks from the shared pool, not this SSD source).
+    // commit is DECOUPLED from the address-gated backend enqueue.
     store.mark_replicated(claim, &verified).await.map_err(PartDrainError::store)?;
 
     // Best-effort backend enqueue, decoupled from the commit. For a simple PUT or a completed
@@ -737,6 +751,8 @@ mod tests {
         ssd: HashMap<String, PartState>,
         pool: HashMap<String, PartState>,
         status: HashMap<String, ReplicationState>,
+        /// Parts claimed as read-tier cache (`mark_resident`), and the size recorded for each.
+        resident: HashMap<String, u64>,
         fault: Fault,
         corrupt_persist: bool,
         /// Specific chunk indices a persist corrupts (in addition to `corrupt_persist`),
@@ -1002,6 +1018,14 @@ mod tests {
         fn status(&self, part: &PartKey) -> impl Future<Output = Result<Option<ReplicationState>, io::Error>> + Send {
             let part = part.clone();
             async move { Ok(self.world.lock().unwrap().status.get(&key_of(&part)).copied()) }
+        }
+
+        fn mark_resident(&self, part: &PartKey, bytes: u64) -> impl Future<Output = Result<(), io::Error>> + Send {
+            let part = part.clone();
+            async move {
+                self.world.lock().unwrap().resident.insert(key_of(&part), bytes);
+                Ok(())
+            }
         }
 
         fn mark_replicated(&self, part: &ClaimedPart, _proof: &PartVerified) -> impl Future<Output = Result<(), io::Error>> + Send {

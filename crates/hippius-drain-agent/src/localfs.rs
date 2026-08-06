@@ -1136,6 +1136,12 @@ mod part_tests {
             async move { Ok(self.status.lock().unwrap().get(&key).copied()) }
         }
 
+        // Residency accounting is the Postgres store's job; this in-memory double only
+        // exercises the drain's copy/verify/commit ordering.
+        async fn mark_resident(&self, _part: &PartKey, _bytes: u64) -> Result<(), io::Error> {
+            Ok(())
+        }
+
         fn mark_replicated(&self, part: &ClaimedPart, _proof: &PartVerified) -> impl Future<Output = Result<(), io::Error>> + Send {
             let key = Self::key(part.part());
             async move {
