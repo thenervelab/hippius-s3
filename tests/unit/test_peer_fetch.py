@@ -1,0 +1,171 @@
+"""Peer discovery and per-part chunk fetching.
+
+Discovery is self-registration through Redis rather than a map of node IPs, because k8s node
+names do not resolve in cluster DNS, pod IPs change on every restart, and a `hostPort`
+address would reach the peer from the node IP (192.168.x) once SNAT'd — which the api's
+`ip_whitelist` middleware rejects, admitting only 10.x/172.x.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+from typing import Optional
+
+import pytest
+
+from hippius_s3.cache.peers import PeerChunkFetcher
+from hippius_s3.cache.peers import PeerRegistry
+from hippius_s3.cache.peers import peer_key
+
+
+OBJ = "466916c0-d61b-4518-b81b-9576b574270a"
+
+
+class FakeRedis:
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+        self.ttls: dict[str, int] = {}
+        self.fail = False
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        if self.fail:
+            raise ConnectionError("redis down")
+        self.store[key] = value
+        if ex is not None:
+            self.ttls[key] = ex
+
+    async def get(self, key: str) -> Optional[str]:
+        if self.fail:
+            raise ConnectionError("redis down")
+        return self.store.get(key)
+
+
+class FakeConn:
+    def __init__(self, row: Optional[dict[str, Any]]) -> None:
+        self._row = row
+        self.queries: list[tuple[Any, ...]] = []
+
+    async def fetchrow(self, _sql: str, *args: Any) -> Optional[dict[str, Any]]:
+        self.queries.append(args)
+        return self._row
+
+
+class FakePool:
+    def __init__(self, row: Optional[dict[str, Any]] = None) -> None:
+        self.conn = FakeConn(row)
+
+    def acquire(self) -> Any:
+        conn = self.conn
+
+        class _Ctx:
+            async def __aenter__(self) -> FakeConn:
+                return conn
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _Ctx()
+
+
+class FakeResponse:
+    def __init__(self, status_code: int, content: bytes = b"") -> None:
+        self.status_code = status_code
+        self.content = content
+
+
+class FakeHttp:
+    def __init__(self, response: FakeResponse) -> None:
+        self._response = response
+        self.urls: list[str] = []
+
+    async def get(self, url: str) -> FakeResponse:
+        self.urls.append(url)
+        return self._response
+
+
+@pytest.mark.asyncio
+async def test_registration_publishes_this_pods_address_with_a_ttl() -> None:
+    """The TTL IS the liveness signal — a pod that stops refreshing stops being a peer."""
+    redis = FakeRedis()
+    registry = PeerRegistry(redis, "k8s-v3-node2", "http://10.42.1.5:8000", 90)
+
+    await registry.register()
+
+    assert json.loads(redis.store[peer_key("k8s-v3-node2")])["url"] == "http://10.42.1.5:8000"
+    assert redis.ttls[peer_key("k8s-v3-node2")] == 90
+
+
+@pytest.mark.asyncio
+async def test_a_redis_outage_never_breaks_registration_or_lookup() -> None:
+    """Peer discovery is an optimisation; losing it costs pool reads, not requests."""
+    redis = FakeRedis()
+    redis.fail = True
+    registry = PeerRegistry(redis, "k8s-v3-node2", "http://10.42.1.5:8000", 90)
+
+    await registry.register()  # must not raise
+    assert await registry.resolve("k8s-v3-node3") is None
+
+
+@pytest.mark.asyncio
+async def test_an_unregistered_peer_resolves_to_none() -> None:
+    registry = PeerRegistry(FakeRedis(), "k8s-v3-node2", "http://10.42.1.5:8000", 90)
+    assert await registry.resolve("k8s-v3-node3") is None
+
+
+@pytest.mark.asyncio
+async def test_a_chunk_is_fetched_from_the_peer_that_holds_it() -> None:
+    redis = FakeRedis()
+    registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
+    await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
+    http = FakeHttp(FakeResponse(200, b"peer-bytes"))
+    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http)
+
+    assert await fetcher(OBJ, 1, 3, 2) == b"peer-bytes"
+    assert http.urls == [f"http://10.42.2.9:8000/internal/parts/{OBJ}/1/3/chunks/2"]
+
+
+@pytest.mark.asyncio
+async def test_the_residency_lookup_excludes_this_node() -> None:
+    """Asking ourselves is pointless — the local tier already missed on this chunk.
+
+    The exclusion lives in the query so a node that holds the part but has it evicted
+    mid-read cannot resolve to itself and burn a network round trip on its own miss.
+    """
+    pool = FakePool({"node_id": "node-b"})
+    registry = PeerRegistry(FakeRedis(), "node-a", "http://10.42.1.5:8000", 90)
+    fetcher = PeerChunkFetcher(pool, registry, "node-a", FakeHttp(FakeResponse(404)))
+
+    await fetcher(OBJ, 1, 3, 2)
+
+    assert pool.conn.queries[0] == (OBJ, 1, 3, "node-a"), "this node is bound out of the lookup"
+
+
+@pytest.mark.asyncio
+async def test_no_peer_holds_the_part_so_the_pool_is_used() -> None:
+    registry = PeerRegistry(FakeRedis(), "node-a", "http://10.42.1.5:8000", 90)
+    fetcher = PeerChunkFetcher(FakePool(None), registry, "node-a", FakeHttp(FakeResponse(200, b"x")))
+
+    assert await fetcher(OBJ, 1, 3, 2) is None
+
+
+@pytest.mark.asyncio
+async def test_a_peer_that_evicted_the_chunk_returns_none() -> None:
+    """404 is routine: the evictor unlinked it between the residency read and the fetch."""
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
+    registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
+    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", FakeHttp(FakeResponse(404)))
+
+    assert await fetcher(OBJ, 1, 3, 2) is None
+
+
+@pytest.mark.asyncio
+async def test_a_resolved_but_unregistered_peer_is_skipped() -> None:
+    """Residency says node-b holds it, but node-b's pod has not registered (or aged out)."""
+    registry = PeerRegistry(FakeRedis(), "node-a", "http://10.42.1.5:8000", 90)
+    http = FakeHttp(FakeResponse(200, b"never"))
+    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http)
+
+    assert await fetcher(OBJ, 1, 3, 2) is None
+    assert http.urls == [], "no address, so no request was attempted"

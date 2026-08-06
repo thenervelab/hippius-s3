@@ -45,3 +45,10 @@ CREATE TABLE IF NOT EXISTS cephor_ssd_residency (
 -- and this table exists partly so that mistake is not repeated on the ingest tier.
 CREATE INDEX IF NOT EXISTS cephor_ssd_residency_evict_idx
     ON cephor_ssd_residency (node_id, resident_at);
+
+-- The peer resolver's access path: "which node holds THIS part on flash". The eviction index
+-- above leads with node_id, so it cannot serve a lookup keyed on the part. This one runs on
+-- the read path when a chunk misses locally, so it has to be an index lookup rather than a
+-- scan of a table that grows to ~2M rows per node.
+CREATE INDEX IF NOT EXISTS cephor_ssd_residency_part_idx
+    ON cephor_ssd_residency (object_id, version, part_number);

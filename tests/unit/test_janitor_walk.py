@@ -76,9 +76,7 @@ async def test_shards_partition_the_tree_exactly(tmp_path: Path) -> None:
 async def test_budget_truncates_and_flags(tmp_path: Path) -> None:
     _build_tree(tmp_path, 200)
     loop = asyncio.get_running_loop()
-    got, state = await _collect(
-        tmp_path, concurrency=2, shard=0, shards=1, deadline=loop.time() - 1.0
-    )
+    got, state = await _collect(tmp_path, concurrency=2, shard=0, shards=1, deadline=loop.time() - 1.0)
     assert state.truncated is True
     assert len(got) < 200  # stopped early
 

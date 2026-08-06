@@ -370,6 +370,18 @@ class Config:
     # promoted copy is only reclaimable by a drain-agent evictor running on the same node, so
     # enabling it where no evictor runs would fill the disk with copies nothing owns.
     object_cache_promote_on_read: bool = env("HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ:false", convert=bool)
+    # Read a chunk from the peer node that holds it on flash (~6 ms + ~1 ms network) before
+    # falling through to the CephFS pool (~40 ms). Resolved per PART: only ~2% of multi-part
+    # objects have every part on one node, so there is no single node to route a request to.
+    # OFF by default; needs NODE_NAME + POD_IP so peers can find each other.
+    peer_fetch_enabled: bool = env("HIPPIUS_PEER_FETCH_ENABLED:false", convert=bool)
+    # How long a pod's published peer address stays valid. The TTL IS the liveness signal, so
+    # it must exceed the refresh interval comfortably or a live pod flickers out of the map.
+    peer_registry_ttl_seconds: int = env("HIPPIUS_PEER_REGISTRY_TTL_SECONDS:90", convert=int)
+    peer_registry_refresh_seconds: int = env("HIPPIUS_PEER_REGISTRY_REFRESH_SECONDS:30", convert=int)
+    # Bound on a peer read. A slow peer must lose to the pool quickly rather than adding its
+    # latency on top of the pool read that follows.
+    peer_fetch_timeout_seconds: float = env("HIPPIUS_PEER_FETCH_TIMEOUT_SECONDS:2.0", convert=float)
     # 24h since last WRITE — the read path no longer bumps timestamps (read
     # recency lives in fs_cache_inventory.last_access_at), so this gates on
     # time since the part landed, not since it was last streamed.

@@ -161,3 +161,94 @@ async def test_the_factory_refuses_to_promote_without_a_residency_recorder(tmp_p
 
     primary = FileSystemPartsStore(str(tmp_path / "ssd"))
     assert await primary.get_chunk(OBJ, 1, 1, 0) is None, "no recorder, so no promotion"
+
+
+@pytest.mark.asyncio
+async def test_a_peer_holding_the_part_is_tried_before_the_pool(tmp_path) -> None:
+    """Peer NVMe beats the pool: ~6 ms + ~1 ms network against ~40 ms per chunk.
+
+    Locality is resolved per PART, not per request — measured on prod 2026-08-06, only 2%
+    of multi-part objects have every part on one node, so routing a whole GET somewhere
+    would leave most parts remote anyway.
+    """
+    calls: list[tuple[str, int, int, int]] = []
+
+    async def _peer(object_id: str, version: int, part_number: int, chunk_index: int) -> bytes | None:
+        calls.append((object_id, version, part_number, chunk_index))
+        return b"from-peer"
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), peer_fetch=_peer)
+    # Present on the pool too — the peer must win, or the tier is pointless.
+    await _write_part(dual.fallback, part_number=1, chunk=b"from-pool")
+
+    assert await dual.get_chunk(OBJ, 1, 1, 0) == b"from-peer"
+    assert calls == [(OBJ, 1, 1, 0)]
+
+
+@pytest.mark.asyncio
+async def test_a_local_hit_never_asks_a_peer(tmp_path) -> None:
+    """The steady state must not pay a network round trip or a residency lookup."""
+    calls: list[object] = []
+
+    async def _peer(*args: object) -> bytes | None:
+        calls.append(args)
+        return None
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), peer_fetch=_peer)
+    await _write_part(dual, part_number=1, chunk=b"on-ssd")
+
+    assert await dual.get_chunk(OBJ, 1, 1, 0) == b"on-ssd"
+    assert calls == [], "a local hit short-circuits before the peer tier"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_peer_falls_through_to_the_pool(tmp_path) -> None:
+    """A peer is an optimisation. If it is down, slow, or lying, the pool still serves.
+
+    The pool copy is authoritative and always present for a replicated part, so no peer
+    failure may ever surface to the client.
+    """
+
+    async def _peer(*args: object) -> bytes | None:
+        raise OSError("connection refused")
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), peer_fetch=_peer)
+    await _write_part(dual.fallback, part_number=1, chunk=b"from-pool")
+
+    assert await dual.get_chunk(OBJ, 1, 1, 0) == b"from-pool"
+
+
+@pytest.mark.asyncio
+async def test_a_peer_miss_falls_through_to_the_pool(tmp_path) -> None:
+    """No peer holds it (all evicted, or none ever promoted) — the pool is the answer."""
+
+    async def _peer(*args: object) -> bytes | None:
+        return None
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), peer_fetch=_peer)
+    await _write_part(dual.fallback, part_number=1, chunk=b"from-pool")
+
+    assert await dual.get_chunk(OBJ, 1, 1, 0) == b"from-pool"
+
+
+@pytest.mark.asyncio
+async def test_read_local_chunk_never_serves_the_fallback(tmp_path) -> None:
+    """What a peer serves must come off ITS flash, never off the shared pool.
+
+    If this followed the fallback, a peer fetch would become an extra network hop in front
+    of the very pool read the tier exists to avoid — and worse, two nodes each resolving the
+    other could bounce a request between them instead of just reading the pool.
+    """
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))
+    await _write_part(dual.fallback, part_number=1, chunk=b"pool-only")
+
+    assert await dual.get_chunk(OBJ, 1, 1, 0) == b"pool-only", "the normal read path does fall back"
+    assert await dual.read_local_chunk(OBJ, 1, 1, 0) is None, "but a peer serves local flash only"
+
+
+@pytest.mark.asyncio
+async def test_read_local_chunk_serves_a_local_part(tmp_path) -> None:
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))
+    await _write_part(dual, part_number=1, chunk=b"on-ssd")
+
+    assert await dual.read_local_chunk(OBJ, 1, 1, 0) == b"on-ssd"

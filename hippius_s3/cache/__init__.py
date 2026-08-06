@@ -4,7 +4,7 @@ from .notifier import ChunkNotifier
 from .object_parts import RedisObjectPartsCache
 
 
-def create_fs_store(config: object, *, on_promote: object = None) -> FileSystemPartsStore:
+def create_fs_store(config: object, *, on_promote: object = None, peer_fetch: object = None) -> FileSystemPartsStore:
     """Build the parts store: dual-tier when a fallback pool is configured, else single.
 
     `on_promote` records a promoted chunk's residency so the local evictor owns the copy.
@@ -16,7 +16,13 @@ def create_fs_store(config: object, *, on_promote: object = None) -> FileSystemP
     cache_dir = getattr(config, "object_cache_dir", "")
     if fallback_dir:
         promote = bool(getattr(config, "object_cache_promote_on_read", False)) and on_promote is not None
-        return DualFileSystemPartsStore(cache_dir, fallback_dir, promote=promote, on_promote=on_promote)  # type: ignore[arg-type]
+        return DualFileSystemPartsStore(  # type: ignore[arg-type]
+            cache_dir,
+            fallback_dir,
+            promote=promote,
+            on_promote=on_promote,
+            peer_fetch=peer_fetch,
+        )
     return FileSystemPartsStore(cache_dir)
 
 

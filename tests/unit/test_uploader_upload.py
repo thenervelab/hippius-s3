@@ -87,9 +87,7 @@ async def test_upload_single_chunk_calls_new_api(mock_config, mock_db_pool, mock
         return_value=MockRow({"part_id": "part-uuid"}),
     )
     # First fetchval call returns chunk_id (UUID), second is insert_chunk_backend
-    mock_conn.fetch = AsyncMock(
-        return_value=[MockRow({"chunk_index": i, "id": chunk_uuid}) for i in range(64)]
-    )
+    mock_conn.fetch = AsyncMock(return_value=[MockRow({"chunk_index": i, "id": chunk_uuid}) for i in range(64)])
     mock_conn.fetchval = AsyncMock(return_value=1)
 
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
@@ -151,9 +149,7 @@ async def test_upload_stores_backend_identifier_in_chunk_backend(mock_config, mo
         return_value=MockRow({"part_id": "part-uuid"}),
     )
     # First fetchval call returns chunk_id (UUID), second is insert_chunk_backend
-    mock_conn.fetch = AsyncMock(
-        return_value=[MockRow({"chunk_index": i, "id": chunk_uuid}) for i in range(64)]
-    )
+    mock_conn.fetch = AsyncMock(return_value=[MockRow({"chunk_index": i, "id": chunk_uuid}) for i in range(64)])
     mock_conn.fetchval = AsyncMock(return_value=1)
 
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
@@ -296,9 +292,7 @@ async def test_upload_passes_extra_headers_when_bypass_billing(mock_config, mock
 
     mock_conn = AsyncMock()
     mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "part-uuid"}))
-    mock_conn.fetch = AsyncMock(
-        return_value=[MockRow({"chunk_index": i, "id": chunk_uuid}) for i in range(64)]
-    )
+    mock_conn.fetch = AsyncMock(return_value=[MockRow({"chunk_index": i, "id": chunk_uuid}) for i in range(64)])
     mock_conn.fetchval = AsyncMock(return_value=1)
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 
@@ -541,9 +535,7 @@ async def test_uploader_does_not_raise_when_meta_lands_within_deadline(mock_conf
     chunk_uuid = "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
     mock_conn = AsyncMock()
     mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "part-uuid"}))
-    mock_conn.fetch = AsyncMock(
-        return_value=[MockRow({"chunk_index": i, "id": chunk_uuid}) for i in range(64)]
-    )
+    mock_conn.fetch = AsyncMock(return_value=[MockRow({"chunk_index": i, "id": chunk_uuid}) for i in range(64)])
     mock_conn.fetchval = AsyncMock(return_value=1)
     mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
 

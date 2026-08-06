@@ -1,0 +1,6 @@
+# Local-only (untracked): remap the e2e Postgres host port off 5432 so it doesn't collide with a
+# host Postgres. Internal services still reach it as db:5432 over the docker network.
+services:
+  db:
+    ports: !override
+      - "127.0.0.1:55432:5432"

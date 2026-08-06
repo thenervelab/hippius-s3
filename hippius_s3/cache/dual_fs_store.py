@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 # evictor can reclaim the copy.
 PromotionRecorder = Callable[[str, int, int, int], Awaitable[None]]
 
+# Fetches one chunk from the peer node that currently holds it on flash, with
+# (object_id, version, part_number, chunk_index). Returns None when no peer has it.
+PeerFetcher = Callable[[str, int, int, int], Awaitable[Optional[bytes]]]
+
 
 class DualFileSystemPartsStore(FileSystemPartsStore):
     """Primary (node-local NVMe) store with the shared CephFS pool as a read fallback.
@@ -37,11 +41,13 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         *,
         promote: bool = False,
         on_promote: Optional[PromotionRecorder] = None,
+        peer_fetch: Optional[PeerFetcher] = None,
     ) -> None:
         super().__init__(primary_dir)
         self.fallback = FileSystemPartsStore(fallback_dir)
         self._promote = promote
         self._on_promote = on_promote
+        self._peer_fetch = peer_fetch
 
     async def get_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
@@ -49,10 +55,45 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         result = await super().get_chunk(object_id, object_version, part_number, chunk_index)
         if result is not None:
             return result
+
+        # Peer tier, between local flash and the pool. A part lives on whichever node
+        # ingested it (and on any node a read has promoted it to), and locality is resolved
+        # per PART: on prod 2026-08-06 only 2% of multi-part objects had every part on one
+        # node, so there is no single "right" node for a whole request to be sent to.
+        peer_bytes = await self._fetch_from_peer(object_id, object_version, part_number, chunk_index)
+        if peer_bytes is not None:
+            if self._promote:
+                await self._promote_chunk(object_id, object_version, part_number, chunk_index, peer_bytes)
+            return peer_bytes
+
         result = await self.fallback.get_chunk(object_id, object_version, part_number, chunk_index)
         if result is not None and self._promote:
             await self._promote_chunk(object_id, object_version, part_number, chunk_index, result)
         return result
+
+    async def _fetch_from_peer(
+        self, object_id: str, object_version: int, part_number: int, chunk_index: int
+    ) -> Optional[bytes]:
+        """Ask the peer holding this part on flash. Best-effort; never raises.
+
+        A peer is an optimisation over the pool, and the pool copy is authoritative and
+        always present for a replicated part. So a peer that is down, slow, mid-eviction, or
+        simply does not have the chunk must degrade to a pool read, never to a failed one.
+        """
+        if self._peer_fetch is None:
+            return None
+        try:
+            return await self._peer_fetch(object_id, object_version, part_number, chunk_index)
+        except Exception as exc:  # noqa: BLE001 - a peer must never be able to fail a read
+            logger.debug(
+                "peer fetch failed for %s v%s part %s chunk %s: %s",
+                object_id,
+                object_version,
+                part_number,
+                chunk_index,
+                exc,
+            )
+            return None
 
     async def _promote_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int, data: bytes
