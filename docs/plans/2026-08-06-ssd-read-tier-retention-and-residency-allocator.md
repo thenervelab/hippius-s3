@@ -1,7 +1,9 @@
 # Restoring the drainer SSDs as a read tier
 
-Status: Phases 1–2 implemented on `feat/ssd-read-tier-phase1-backlog-signal` (2026-08-06, not
-pushed); Phases 3–4 outstanding. Diagnosis is evidence-backed against prod.
+Status: Phases 1–3 implemented on `feat/ssd-read-tier-phase1-backlog-signal` (2026-08-06, not
+pushed). **Staging only** — `k8s/production` is untouched and carries forward in a separate PR
+after soak. Phase 4 (allocator-driven `retain_bytes`) outstanding. Diagnosis is evidence-backed
+against prod.
 
 **Implemented so far** — commits `019da038` (signal split), `c3bd1c34` (retention + evictor core),
 `32e0feda` (evictor worker + residency reporting). 443 tests green, clippy clean at `-D warnings`.
@@ -16,7 +18,14 @@ the same mount. The evictor is comfortably the more aggressive of the two, which
 invariant that keeps retention from turning into failed PUTs.
 
 **Deploy note.** Phase 2 must go out as one unit — retention without the evictor means nothing
-frees the ingest SSD. Migration 0016 is backfill-free and its index builds near-empty.
+frees the ingest SSD. Migration 0016 is backfill-free and its indexes build near-empty.
+
+**What to watch during the staging soak.** `chunk_reads_by_tier_total{tier=...}` is the whole
+point: `local` should climb as retention fills each node's shard, `peer` should take most of what
+used to be `pool`, and `pool` should fall. Alongside it, `drain_ssd_cache_bytes` should rise and
+plateau under the evictor's floor, `drain_ssd_evicted_total` should be non-zero only once a node
+approaches that floor, and `drain_ssd_evicted_bytes_total` climbing while `cache_bytes` stays
+pinned at the disk size means eviction is not keeping up.
 
 ## 1. Intended design vs. what shipped
 

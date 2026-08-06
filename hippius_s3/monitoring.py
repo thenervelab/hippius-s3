@@ -1,5 +1,6 @@
 import logging
 import os
+from typing import Literal
 from typing import Optional
 from typing import Union
 
@@ -18,6 +19,11 @@ from hippius_s3.otel_setup import build_resource
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
+
+
+# The storage tiers a chunk read can be served from, closed by construction so the `tier`
+# label cannot drift into unbounded cardinality.
+ChunkReadTier = Literal["local", "peer", "pool"]
 
 
 class MetricsCollector:
@@ -94,6 +100,16 @@ class MetricsCollector:
 
         self.cache_misses = self.meter.create_counter(
             name="cache_misses_total", description="Total cache misses", unit="1"
+        )
+
+        # Which storage tier actually served a chunk: local NVMe, a peer node's NVMe, or the
+        # CephFS pool. Without this split the SSD read tier is unmeasurable — every tier reads
+        # as "cache" — so there is no way to tell whether retention, promotion, and peer fetch
+        # are doing anything, or to catch a silent regression back to all-pool reads.
+        self.chunk_reads_by_tier = self.meter.create_counter(
+            name="chunk_reads_by_tier_total",
+            description="Chunk reads served, by storage tier (local|peer|pool)",
+            unit="1",
         )
 
         self.uploader_requests_total = self.meter.create_counter(
@@ -478,6 +494,14 @@ class MetricsCollector:
             self.cache_hits.add(1, attributes=attributes)
         else:
             self.cache_misses.add(1, attributes=attributes)
+
+    def record_chunk_read_tier(self, tier: ChunkReadTier) -> None:
+        """Count one chunk read against the tier that served it.
+
+        The `Literal` is what keeps this label bounded: three values fixed in code, so it
+        cannot become a cardinality problem the way a caller-supplied string would.
+        """
+        self.chunk_reads_by_tier.add(1, attributes={"tier": tier})
 
     def record_uploader_operation(
         self,

@@ -20,6 +20,18 @@ PromotionRecorder = Callable[[str, int, int, int], Awaitable[None]]
 PeerFetcher = Callable[[str, int, int, int], Awaitable[Optional[bytes]]]
 
 
+def _record_tier(tier: str) -> None:
+    """Count which tier served a chunk. Never let observability break a read."""
+    try:
+        from hippius_s3.monitoring import get_metrics_collector
+
+        collector = get_metrics_collector()
+        if collector is not None:
+            collector.record_chunk_read_tier(tier)
+    except Exception:  # noqa: BLE001 - a metrics failure must not fail a read
+        pass
+
+
 class DualFileSystemPartsStore(FileSystemPartsStore):
     """Primary (node-local NVMe) store with the shared CephFS pool as a read fallback.
 
@@ -54,6 +66,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
     ) -> Optional[bytes]:
         result = await super().get_chunk(object_id, object_version, part_number, chunk_index)
         if result is not None:
+            _record_tier("local")
             return result
 
         # Peer tier, between local flash and the pool. A part lives on whichever node
@@ -62,13 +75,16 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         # node, so there is no single "right" node for a whole request to be sent to.
         peer_bytes = await self._fetch_from_peer(object_id, object_version, part_number, chunk_index)
         if peer_bytes is not None:
+            _record_tier("peer")
             if self._promote:
                 await self._promote_chunk(object_id, object_version, part_number, chunk_index, peer_bytes)
             return peer_bytes
 
         result = await self.fallback.get_chunk(object_id, object_version, part_number, chunk_index)
-        if result is not None and self._promote:
-            await self._promote_chunk(object_id, object_version, part_number, chunk_index, result)
+        if result is not None:
+            _record_tier("pool")
+            if self._promote:
+                await self._promote_chunk(object_id, object_version, part_number, chunk_index, result)
         return result
 
     async def _fetch_from_peer(

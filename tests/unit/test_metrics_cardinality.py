@@ -46,6 +46,10 @@ BOUNDED_LABELS = {
     # Both are closed sets fixed in code, not caller- or object-derived.
     "reason",
     "pressure_mode",
+    # Which storage tier served a chunk read: "local" | "peer" | "pool", typed as a Literal
+    # on record_chunk_read_tier and passed only from the three fixed call sites in
+    # DualFileSystemPartsStore.get_chunk. Closed in code, never object- or caller-derived.
+    "tier",
 }
 
 
