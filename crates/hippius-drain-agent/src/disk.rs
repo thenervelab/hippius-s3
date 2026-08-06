@@ -30,30 +30,22 @@ fn used_fraction(total: u64, available: u64) -> f64 {
     fraction.clamp(0.0, 1.0)
 }
 
-/// The used bytes of a filesystem with `total_blocks`, of which `free_blocks`
-/// are free, each `block_bytes` in size.
+/// A point-in-time view of a filesystem for the heartbeat: how full it is, and how much
+/// space is free.
 ///
-/// Pure and total so the backlog edges are property-tested without a real
-/// filesystem: a `free_blocks` exceeding `total_blocks` (which some filesystems
-/// report) saturates to zero used rather than underflowing, and the
-/// blocks×size product saturates rather than overflowing.
-fn used_bytes(total_blocks: u64, free_blocks: u64, block_bytes: u64) -> u64 {
-    total_blocks.saturating_sub(free_blocks).saturating_mul(block_bytes)
-}
-
-/// A point-in-time view of a filesystem's fullness for the heartbeat: the
-/// pressure fraction (the allocator's weight) and the used bytes.
-///
-/// `used_bytes` is the drain backlog: the SSD ingest cache holds exactly the
-/// undrained chunks (a drained chunk is unlinked), so its occupied space is the
-/// work waiting to drain. This equals cephor's backlog when the SSD is a
-/// dedicated ingest volume (the `DaemonSet` deployment shape).
+/// This deliberately does NOT report occupancy as a drain backlog. It used to: the SSD held
+/// only undrained chunks (the drain unlinked each part the instant it replicated), so
+/// occupancy and backlog were the same number. Retaining replicated parts to serve reads
+/// breaks that identity — occupancy then counts warm read cache, which is not work waiting to
+/// drain. The true backlog is `Store::node_backlog_bytes`, summed from the replication rows;
+/// `free_bytes` is reported instead, as one half of the node's ingest headroom.
 #[derive(Debug, Clone, Copy)]
 pub struct DiskUsage {
-    /// How full the filesystem is (`0.0..=1.0`).
+    /// How full the filesystem is (`0.0..=1.0`). Reported for the `drain_ssd_pressure` gauge
+    /// and as the pre-residency fallback urgency for a not-yet-rolled allocator.
     pub pressure: DiskPressure,
-    /// Bytes occupied on the filesystem (the drain backlog).
-    pub used_bytes: u64,
+    /// Bytes free to an unprivileged writer — what a new PUT can claim without evicting.
+    pub free_bytes: u64,
 }
 
 /// The [`DiskUsage`] of the filesystem containing `path`, from one `statvfs`.
@@ -65,11 +57,13 @@ pub fn disk_usage(path: &Path) -> io::Result<DiskUsage> {
     let stats = statvfs(path).map_err(|errno| io::Error::from_raw_os_error(errno as i32))?;
     // `statvfs` counts are `fsblkcnt_t` / `c_ulong`, whose width varies by
     // platform (u32 on some, u64 on others) — `widen` makes the reads portable.
-    // Pressure uses `f_bavail` (free to an unprivileged process — what the drain
-    // can use); backlog uses `f_bfree` (truly occupied space).
+    // BOTH reads use `f_bavail` (free to an unprivileged process) rather than
+    // `f_bfree`: the reserved blocks a privileged writer could reach are not space
+    // the drain or an ingest PUT can actually claim, so counting them would
+    // overstate headroom.
     let pressure = DiskPressure::from_fraction(used_fraction(widen(stats.blocks()), widen(stats.blocks_available()))).map_err(io::Error::other)?;
-    let used = used_bytes(widen(stats.blocks()), widen(stats.blocks_free()), widen(stats.fragment_size()));
-    Ok(DiskUsage { pressure, used_bytes: used })
+    let free = widen(stats.blocks_available()).saturating_mul(widen(stats.fragment_size()));
+    Ok(DiskUsage { pressure, free_bytes: free })
 }
 
 /// Widens a platform-dependent-width `statvfs` count to `u64`.
@@ -80,7 +74,7 @@ fn widen(value: impl Into<u64>) -> u64 {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{disk_usage, used_bytes, used_fraction};
+    use super::{disk_usage, used_fraction};
     use proptest::prelude::*;
     use std::path::Path;
 
@@ -106,32 +100,15 @@ mod tests {
     }
 
     #[test]
-    fn used_bytes_maps_the_documented_edges() {
-        assert_eq!(used_bytes(100, 0, 4096), 100 * 4096, "no free blocks -> all used");
-        assert_eq!(used_bytes(100, 100, 4096), 0, "all free -> nothing used");
-        assert_eq!(used_bytes(100, 40, 4096), 60 * 4096, "60 of 100 blocks used");
-        assert_eq!(used_bytes(100, 200, 4096), 0, "free > total saturates to zero, not underflow");
-    }
-
-    proptest! {
-        /// For any block counts and size, the used-bytes computation never panics
-        /// (saturating arithmetic) and a fully-free disk reports zero used.
-        #[test]
-        fn used_bytes_never_panics_and_is_zero_when_all_free(total in any::<u64>(), free in any::<u64>(), block in any::<u64>()) {
-            let used = used_bytes(total, free, block);
-            if free >= total {
-                prop_assert_eq!(used, 0);
-            }
-        }
-    }
-
-    #[test]
-    fn usage_of_a_live_filesystem_reports_pressure_and_nonzero_used() {
+    fn usage_of_a_live_filesystem_reports_pressure_and_nonzero_free() {
+        // Free space (not occupancy) is what the heartbeat now reports: it is half of the
+        // node's ingest headroom, and unlike occupancy it keeps its meaning once the drain
+        // retains replicated parts on the SSD to serve reads.
         let tmp = tempfile::tempdir().unwrap();
         let usage = disk_usage(tmp.path()).unwrap();
         let fraction = usage.pressure.as_fraction();
         assert!((0.0..=1.0).contains(&fraction), "pressure is a fraction, got {fraction}");
-        assert!(usage.used_bytes > 0, "a live filesystem has occupied space");
+        assert!(usage.free_bytes > 0, "a live filesystem has free space");
     }
 
     #[test]

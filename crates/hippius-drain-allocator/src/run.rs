@@ -181,6 +181,8 @@ mod tests {
         NodeObservation {
             pressure: DiskPressure::try_from(5_000).unwrap(),
             backlog: Bytes::new(9_000_000),
+            free: Bytes::ZERO,
+            cache: Bytes::ZERO,
             max_drain_rate: ByteRate::new(5_000_000),
             observed_p99: Duration::from_millis(10),
             error_bps: 0,

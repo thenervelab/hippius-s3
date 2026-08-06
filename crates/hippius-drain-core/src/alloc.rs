@@ -17,10 +17,24 @@ use std::time::Duration;
 /// One node's self-reported state — the input to allocation for that node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeObservation {
-    /// How full the node's SSD is (drives weight and the reservation floor).
+    /// The node's drain urgency — the water-fill weight and the reservation-floor gate.
+    ///
+    /// Asymmetric by design, and only until the fleet is fully rolled: an *agent* fills this
+    /// with the raw SSD fullness it measured (a fact it can always report), while the
+    /// allocator's wire boundary ([`NodeStateJson::into_observation`]) replaces it with
+    /// [`DiskPressure::from_drain_demand`] whenever the reporting agent is new enough to send
+    /// [`free`](Self::free)/[`cache`](Self::cache). Raw fullness is the conservative fallback
+    /// for a not-yet-rolled agent, and stops being reachable once every agent reports
+    /// residency.
     pub pressure: DiskPressure,
     /// Bytes currently waiting to drain. Zero backlog means zero demand.
     pub backlog: Bytes,
+    /// Free bytes on the node's SSD.
+    pub free: Bytes,
+    /// Retained, already-`replicated` bytes held on the SSD to serve reads. Evictable on
+    /// demand, so this counts toward ingest headroom rather than against it — the distinction
+    /// that keeps a full read cache from reading as a drain emergency.
+    pub cache: Bytes,
     /// The fastest the node can push to Ceph locally (its demand cap).
     pub max_drain_rate: ByteRate,
     /// The node's observed Ceph write p99 latency (feeds the saturation signal).
@@ -344,6 +358,8 @@ mod tests {
             NodeObservation {
                 pressure: DiskPressure::try_from(pressure_bps).unwrap(),
                 backlog: Bytes::new(backlog),
+                free: Bytes::ZERO,
+                cache: Bytes::ZERO,
                 max_drain_rate: ByteRate::new(max_rate),
                 observed_p99: Duration::from_millis(10),
                 error_bps: 0,
@@ -370,6 +386,8 @@ mod tests {
             NodeObservation {
                 pressure: DiskPressure::try_from(3_000).unwrap(),
                 backlog: Bytes::new(backlog),
+                free: Bytes::ZERO,
+                cache: Bytes::ZERO,
                 max_drain_rate: ByteRate::new(1_000_000_000),
                 observed_p99: p99,
                 error_bps: 0,

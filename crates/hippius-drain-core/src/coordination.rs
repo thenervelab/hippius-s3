@@ -173,6 +173,14 @@ struct NodeStateJson {
     max_drain_rate_bps: u64,
     observed_p99_ns: u64,
     error_bps: u16,
+    /// Residency, absent from heartbeats written by a pre-retention agent. `Option` (not
+    /// `#[serde(default)]` to zero) because "not reported" and "reported as zero" must stay
+    /// distinguishable: zeroes would derive full drain pressure for any backlogged node and
+    /// hand every un-rolled node a reservation floor mid-roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_bytes: Option<u64>,
 }
 
 impl NodeStateJson {
@@ -184,14 +192,34 @@ impl NodeStateJson {
             // p99 nanos: u128 -> u64 cannot overflow for any realistic latency; clamp defensively.
             observed_p99_ns: u64::try_from(observation.observed_p99.as_nanos()).unwrap_or(u64::MAX),
             error_bps: observation.error_bps,
+            free_bytes: Some(observation.free.get()),
+            cache_bytes: Some(observation.cache.get()),
         }
     }
 
+    /// Derives drain urgency from residency when the reporting agent sent it, else falls back
+    /// to the raw fullness that agent measured.
+    ///
+    /// This is the one place the two heartbeat generations are reconciled, so the allocator
+    /// core downstream sees a single meaning for `pressure` regardless of which agents have
+    /// rolled. The fallback arm is dead once every agent reports residency and should be
+    /// deleted then, along with the `Option`s.
     fn into_observation(self) -> Result<NodeObservation> {
-        let pressure = DiskPressure::try_from(self.pressure_bps).map_err(|_| CoordError::Invalid { field: "pressure_bps" })?;
+        let reported = DiskPressure::try_from(self.pressure_bps).map_err(|_| CoordError::Invalid { field: "pressure_bps" })?;
+        let backlog = Bytes::new(self.backlog_bytes);
+        let (pressure, free, cache) = match (self.free_bytes, self.cache_bytes) {
+            (Some(free), Some(cache)) => (
+                DiskPressure::from_drain_demand(backlog, Bytes::new(free), Bytes::new(cache)),
+                Bytes::new(free),
+                Bytes::new(cache),
+            ),
+            _ => (reported, Bytes::ZERO, Bytes::ZERO),
+        };
         Ok(NodeObservation {
             pressure,
-            backlog: Bytes::new(self.backlog_bytes),
+            backlog,
+            free,
+            cache,
             max_drain_rate: ByteRate::new(self.max_drain_rate_bps),
             observed_p99: Duration::from_nanos(self.observed_p99_ns),
             error_bps: self.error_bps,
@@ -490,10 +518,48 @@ mod tests {
         NodeObservation {
             pressure: DiskPressure::try_from(5_000).unwrap(),
             backlog: Bytes::new(9_000_000),
+            free: Bytes::ZERO,
+            cache: Bytes::ZERO,
             max_drain_rate: ByteRate::new(5_000_000),
             observed_p99: Duration::from_millis(10),
             error_bps: 0,
         }
+    }
+
+    // ------------------------------------------------ heartbeat wire compatibility (Phase 1)
+
+    #[test]
+    fn a_pre_retention_heartbeat_still_parses_during_a_rolling_agent_update() {
+        // The DaemonSet rolls one node at a time, so a NEW allocator necessarily reads OLD
+        // agents' heartbeats for the duration. The old form carries no residency fields; if
+        // that failed to deserialize, `load_fleet` would drop those nodes, they would be
+        // allocated nothing, and their drain would stall mid-roll. It must parse, and it must
+        // keep reporting exactly the raw pressure it measured — today's behaviour, unchanged.
+        let old = r#"{"pressure_bps":5000,"backlog_bytes":9000000,"max_drain_rate_bps":5000000,"observed_p99_ns":10000000,"error_bps":0}"#;
+        let parsed: super::NodeStateJson = serde_json::from_str(old).expect("the pre-retention wire form must still parse");
+        let observation = parsed.into_observation().unwrap();
+        assert_eq!(
+            observation.pressure,
+            DiskPressure::try_from(5_000).unwrap(),
+            "with no residency fields the allocator falls back to the reported fullness"
+        );
+        assert_eq!(observation.backlog, Bytes::new(9_000_000));
+    }
+
+    #[test]
+    fn a_heartbeat_reporting_residency_derives_pressure_from_ingest_headroom() {
+        // The new form: a node 95% full of RETAINED, evictable read cache with no undrained
+        // work. Raw fullness says 9500 bps (critical, earns a reservation floor and a heavy
+        // water-fill weight); ingest headroom says it is perfectly caught up. The allocator
+        // must believe the latter, or growing the read tier bids for Ceph budget it does not need.
+        let new = r#"{"pressure_bps":9500,"backlog_bytes":0,"max_drain_rate_bps":5000000,"observed_p99_ns":10000000,"error_bps":0,"free_bytes":50000000,"cache_bytes":950000000}"#;
+        let parsed: super::NodeStateJson = serde_json::from_str(new).expect("the residency wire form must parse");
+        let observation = parsed.into_observation().unwrap();
+        assert_eq!(
+            observation.pressure,
+            DiskPressure::ZERO,
+            "a disk full of evictable cache with no backlog is not under drain pressure"
+        );
     }
 
     #[tokio::test]

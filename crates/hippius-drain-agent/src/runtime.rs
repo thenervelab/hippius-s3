@@ -16,7 +16,7 @@
 //! gracefully — a tick in flight finishes before the worker exits (axiom
 //! `rust_quality_129_async_graceful_shutdown`).
 
-use crate::disk::disk_usage;
+use crate::disk::{DiskUsage, disk_usage};
 use crate::localfs::{LocalFs, LocalSsd};
 use crate::readiness::ReadinessTracker;
 use crate::supervisor::{RunReport, Supervisor, WorkerName};
@@ -232,6 +232,10 @@ async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotC
         Ok(bytes) => snapshot.record_backlog(bytes),
         Err(err) => tracing::warn!(error = %err, "backlog query failed; keeping the last value"),
     }
+    // NOTE: the heartbeat reads the retained backlog back off the snapshot rather than
+    // taking it from the `Ok` arm here, so a failed query reuses the last good value
+    // instead of reporting a zero backlog — which the allocator would read as "idle" and
+    // strip of demand, stalling the very node whose DB read is struggling.
     match store.node_undrained_count(node.as_str()).await {
         Ok(count) => snapshot.record_undrained_count(count),
         Err(err) => tracing::warn!(error = %err, "undrained-count query failed; keeping the last value"),
@@ -243,6 +247,34 @@ async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotC
     match store.node_oldest_pending_age_secs(node.as_str()).await {
         Ok(secs) => snapshot.record_oldest_pending_age_secs(secs),
         Err(err) => tracing::warn!(error = %err, "oldest-pending-age query failed; keeping the last value"),
+    }
+}
+
+/// Builds this node's heartbeat observation from the disk probe and the refreshed snapshot.
+///
+/// The agent reports FACTS; the allocator derives urgency from them at its wire boundary.
+///
+/// `backlog` is the DB-sourced undrained-byte sum the snapshot carries, NOT raw SSD occupancy.
+/// Occupancy was only ever a valid proxy because the drain unlinked each part the instant it
+/// replicated. It already overcounts by the A21/orphan leak, and once replicated parts are
+/// retained to serve reads it would count the entire read cache as drain demand — handing a
+/// caught-up node a reservation floor and driving Ceph writes for work that does not exist.
+///
+/// `cache` is zero until retention ships: nothing is deliberately held on the SSD yet, so every
+/// resident byte is still backlog or debris. `pressure` carries the raw fullness, which the
+/// allocator uses only as the fallback urgency when it is too old to read the residency fields.
+///
+/// Split out from [`heartbeat_once`] so this mapping is unit-testable: the caller needs a live
+/// Coordinator (Redis) and Store (Postgres), while the mapping itself is pure.
+fn node_observation(usage: DiskUsage, snapshot: &SnapshotCell, max_drain_rate: ByteRate) -> NodeObservation {
+    NodeObservation {
+        pressure: usage.pressure,
+        backlog: Bytes::new(snapshot.backlog()),
+        free: Bytes::new(usage.free_bytes),
+        cache: Bytes::ZERO,
+        max_drain_rate,
+        observed_p99: snapshot.p99(),
+        error_bps: snapshot.load().error_bps(),
     }
 }
 
@@ -273,17 +305,7 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node
 
     record_drain_signals(store, node, snapshot).await;
 
-    // The allocator observation keeps SSD occupancy as its demand weight (a leak-inflated
-    // value is a conservative over-demand, not a safety issue; refining it is coordination
-    // work). Pressure is the allocator weight; error rate is from the drain counters; p99
-    // stays neutral until per-drain timing is wired.
-    let observation = NodeObservation {
-        pressure: usage.pressure,
-        backlog: Bytes::new(usage.used_bytes),
-        max_drain_rate,
-        observed_p99: snapshot.p99(),
-        error_bps: snapshot.load().error_bps(),
-    };
+    let observation = node_observation(usage, snapshot, max_drain_rate);
     if let Err(err) = coord.upsert_node_state(node, &observation).await {
         tracing::warn!(error = %err, "heartbeat upsert failed");
     }
@@ -790,10 +812,14 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
-    use super::{AgentRuntime, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, pull_action, record_drain_signals};
+    use super::{
+        AgentRuntime, DiskUsage, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, node_observation, pull_action,
+        record_drain_signals,
+    };
     use crate::localfs::{LocalFs, LocalSsd};
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
+    use hippius_drain_core::DiskPressure;
     use hippius_drain_core::{
         Allocation, ByteRate, Bytes, Clock, CoordError, Coordinator, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReclaimGraces,
         ReplicationState, SnapshotCell, Store, StoredAllocation, TestClock, UploadEnqueuer, Version,
@@ -898,6 +924,35 @@ mod tests {
         assert!(
             !tracker.observe(0, snapshot.undrained_count(), t0 + Duration::from_mins(2)),
             "undrained rows + no progress past the stall -> NotReady (keying on the 0-byte backlog would stay Ready)"
+        );
+    }
+
+    #[test]
+    fn the_heartbeat_reports_the_db_backlog_not_disk_occupancy() {
+        // The Phase 1 wiring, pinned. A node whose SSD is nearly full but has only 4 MiB of
+        // genuinely undrained work must bid as a 4 MiB node. Sourcing this from occupancy
+        // instead — as it did before — overstates demand by everything else on the disk: the
+        // A21/orphan leak today, and the entire retained read cache once retention ships.
+        let snapshot = SnapshotCell::new();
+        snapshot.record_backlog(4 * 1024 * 1024);
+        let usage = DiskUsage {
+            pressure: DiskPressure::try_from(9_500).unwrap(),
+            free_bytes: 100 * 1024 * 1024,
+        };
+
+        let observation = node_observation(usage, &snapshot, ByteRate::new(5_000_000));
+
+        assert_eq!(
+            observation.backlog,
+            Bytes::new(4 * 1024 * 1024),
+            "backlog is the DB sum the snapshot carries, never disk occupancy"
+        );
+        assert_eq!(observation.free, Bytes::new(100 * 1024 * 1024));
+        assert_eq!(observation.cache, Bytes::ZERO, "nothing is retained until Phase 2 ships");
+        assert_eq!(
+            observation.pressure,
+            DiskPressure::try_from(9_500).unwrap(),
+            "raw fullness rides along as the fallback urgency for a pre-residency allocator"
         );
     }
 

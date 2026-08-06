@@ -137,6 +137,39 @@ impl DiskPressure {
         let bps = (fraction * f64::from(Self::MAX_BPS)).round() as u16;
         Ok(Self(bps))
     }
+
+    /// The allocator's drain-urgency signal: undrained work as a share of the space that
+    /// work is competing for.
+    ///
+    /// Deliberately NOT raw disk fullness. Once the drain retains replicated parts on the
+    /// SSD as a read tier, occupancy stops meaning "work waiting to drain" — a node can sit
+    /// at 95% full of *evictable* cache while being perfectly caught up. Feeding that
+    /// fullness to the allocator would read as a critically-behind node, earn it the
+    /// reservation floor, and drive Ceph writes for work that does not exist.
+    ///
+    /// So urgency is measured against **ingest headroom** — `free + cache`, the space a new
+    /// PUT can claim, evicting cache as needed — giving
+    /// `backlog / (backlog + free + cache)`. Zero backlog is always zero pressure however
+    /// full the disk; pressure approaches full only when backlog dominates and there is
+    /// nothing evictable left to reclaim.
+    /// Integer arithmetic throughout (`u128` intermediates), matching the allocator core:
+    /// the result feeds water-fill weights, so a deterministic value with no NaN/ordering
+    /// hazard matters more than sub-basis-point precision.
+    #[must_use]
+    pub fn from_drain_demand(backlog: Bytes, free: Bytes, cache: Bytes) -> Self {
+        let work = u128::from(backlog.get());
+        let headroom = u128::from(free.get()).saturating_add(u128::from(cache.get()));
+        let total = work.saturating_add(headroom);
+        // A disk with nothing on it and nowhere to put anything is degenerate; with no
+        // backlog there is no drain demand either way, so both fold to zero.
+        if total == 0 {
+            return Self::ZERO;
+        }
+        // work <= total, so the quotient is in 0..=MAX_BPS and the cast cannot truncate.
+        #[expect(clippy::cast_possible_truncation, reason = "work <= total bounds the quotient to 0..=10000")]
+        let bps = (work * u128::from(Self::MAX_BPS) / total) as u16;
+        Self(bps)
+    }
 }
 
 impl TryFrom<u16> for DiskPressure {
@@ -171,6 +204,58 @@ mod tests {
         assert_eq!(DiskPressure::try_from(DiskPressure::MAX_BPS).unwrap(), DiskPressure::FULL);
         let err = DiskPressure::try_from(DiskPressure::MAX_BPS + 1).unwrap_err();
         assert!(matches!(err, Error::PressureOutOfRange { actual_bps } if actual_bps == 10_001));
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn evictable_cache_is_not_drain_pressure() {
+        // The retention invariant: a node holding 3 TB of retained read cache and NO undrained
+        // work is perfectly caught up. Every byte of that cache is reclaimable on demand, so its
+        // ingest headroom is intact — it must register zero drain urgency and never earn a
+        // reservation floor, however full `statvfs` reports the disk.
+        let pressure = DiskPressure::from_drain_demand(Bytes::new(0), Bytes::new(50 * GIB), Bytes::new(3_000 * GIB));
+        assert_eq!(pressure, DiskPressure::ZERO, "cache is evictable, so it is not drain demand");
+    }
+
+    #[test]
+    fn a_backlogged_node_with_nothing_evictable_is_full_pressure() {
+        // The other end of the scale, and the reason the reservation floor still exists: real
+        // undrained work with no free space and no cache to evict is a genuinely stuck node.
+        // It must saturate, or the floor that unblocks it never engages.
+        let pressure = DiskPressure::from_drain_demand(Bytes::new(900 * GIB), Bytes::ZERO, Bytes::ZERO);
+        assert_eq!(pressure, DiskPressure::FULL);
+    }
+
+    #[test]
+    fn retaining_more_cache_lowers_drain_pressure() {
+        // The property that makes retention safe to ship: holding the same undrained backlog
+        // while retaining MORE evictable cache must never raise the node's urgency. If this
+        // inverts, growing the read tier would bid for Ceph write budget it does not need —
+        // the 2026-07-24 pool-fill shape.
+        let backlog = Bytes::new(100 * GIB);
+        let free = Bytes::new(400 * GIB);
+        let cold = DiskPressure::from_drain_demand(backlog, free, Bytes::ZERO);
+        let warm = DiskPressure::from_drain_demand(backlog, free, Bytes::new(1_000 * GIB));
+        let hot = DiskPressure::from_drain_demand(backlog, free, Bytes::new(3_000 * GIB));
+        assert!(warm < cold, "retained cache must not raise urgency: {warm:?} vs {cold:?}");
+        assert!(hot < warm, "more retained cache must lower it further: {hot:?} vs {warm:?}");
+    }
+
+    proptest! {
+        /// For any fleet state the drain signal is a well-formed pressure and zero backlog is
+        /// always zero urgency — the invariant the allocator's weight/reservation math relies
+        /// on, probed across the whole input space rather than at three fixtures.
+        #[test]
+        fn drain_demand_is_always_in_range_and_zero_backlog_is_zero(
+            backlog in any::<u64>(), free in any::<u64>(), cache in any::<u64>()
+        ) {
+            let pressure = DiskPressure::from_drain_demand(Bytes::new(backlog), Bytes::new(free), Bytes::new(cache));
+            prop_assert!(pressure.bps() <= DiskPressure::MAX_BPS);
+            if backlog == 0 {
+                prop_assert_eq!(pressure, DiskPressure::ZERO, "no undrained work is never urgent");
+            }
+        }
     }
 
     #[test]

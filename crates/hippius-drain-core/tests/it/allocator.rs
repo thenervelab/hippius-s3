@@ -36,6 +36,8 @@ fn node(id: &str, pressure_bps: u16, backlog: u64, max_rate: u64) -> (NodeId, No
         NodeObservation {
             pressure: DiskPressure::try_from(pressure_bps).unwrap(),
             backlog: Bytes::new(backlog),
+            free: Bytes::ZERO,
+            cache: Bytes::ZERO,
             max_drain_rate: ByteRate::new(max_rate),
             observed_p99: Duration::from_millis(10),
             error_bps: 0,
