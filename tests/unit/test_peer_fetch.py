@@ -8,6 +8,7 @@ address would reach the peer from the node IP (192.168.x) once SNAT'd — which 
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 from typing import Optional
@@ -238,3 +239,70 @@ async def test_a_dead_peer_is_tried_once_not_once_per_chunk() -> None:
         assert await fetcher(OBJ, 1, 3, chunk) is None, "every chunk falls through to the pool"
 
     assert http.attempts == 1, f"a dead peer was retried {http.attempts} times"
+
+
+class BlockingHttp:
+    """A peer whose responses hang until released, so in-flight state is observable."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.started = asyncio.Event()
+        self.attempts = 0
+
+    async def get(self, url: str):  # noqa: ANN201
+        self.attempts += 1
+        self.started.set()
+        await self.release.wait()
+        return FakeResponse(200, b"peer-bytes")
+
+
+@pytest.mark.asyncio
+async def test_a_saturated_peer_is_skipped_rather_than_queued() -> None:
+    """Owl caps per-peer fanout; without one, a hot part turns one node into a hotspot.
+
+    Every other node's reads converge on whichever pod holds the popular data — the same
+    uvicorn serving that node's own ingest. The cap must SKIP to the pool rather than queue:
+    waiting behind a saturated peer would add its latency on top of the pool read that
+    follows, which is the opposite of what this tier is for.
+    """
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
+    registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
+    http = BlockingHttp()
+    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http, max_inflight=1)
+
+    first = asyncio.create_task(fetcher(OBJ, 1, 3, 0))
+    await asyncio.wait_for(http.started.wait(), timeout=1)
+
+    # The peer's one slot is taken, so this must fall through immediately.
+    assert await fetcher(OBJ, 1, 3, 1) is None, "a saturated peer is skipped, not queued"
+    assert http.attempts == 1, "and no second request was even attempted"
+
+    http.release.set()
+    assert await first == b"peer-bytes"
+
+
+@pytest.mark.asyncio
+async def test_a_busy_peer_503_falls_through_without_poisoning_the_memo() -> None:
+    """503 means "busy right now", not "gone" — unlike a connect failure.
+
+    Poisoning the memo on transient load would keep sending the whole part to the pool long
+    after the peer recovered, converting a brief spike into a sustained cold read.
+    """
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
+    registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
+
+    class Flaky:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get(self, url: str):  # noqa: ANN201
+            self.calls += 1
+            return FakeResponse(503) if self.calls == 1 else FakeResponse(200, b"peer-bytes")
+
+    http = Flaky()
+    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http)
+
+    assert await fetcher(OBJ, 1, 3, 0) is None, "shed, so this chunk reads from the pool"
+    assert await fetcher(OBJ, 1, 3, 1) == b"peer-bytes", "the peer is retried once it recovers"

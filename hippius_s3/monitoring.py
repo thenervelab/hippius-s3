@@ -25,6 +25,9 @@ tracer = trace.get_tracer(__name__)
 # label cannot drift into unbounded cardinality.
 ChunkReadTier = Literal["local", "peer", "pool"]
 
+# Which side declined a peer fetch. Closed by construction, like ChunkReadTier.
+PeerShedReason = Literal["client_cap", "server_busy"]
+
 
 class MetricsCollector:
     """OTel metrics for the API, gateway and workers.
@@ -106,6 +109,15 @@ class MetricsCollector:
         # CephFS pool. Without this split the SSD read tier is unmeasurable — every tier reads
         # as "cache" — so there is no way to tell whether retention, promotion, and peer fetch
         # are doing anything, or to catch a silent regression back to all-pool reads.
+        # Peer fetches declined, by which side declined: this pod's per-peer fanout cap, or
+        # the peer shedding to protect its own ingest. A rising rate means the read tier is
+        # falling back to the pool under load, which is the signal that fanout needs tuning.
+        self.peer_fetch_shed = self.meter.create_counter(
+            name="peer_fetch_shed_total",
+            description="Peer chunk fetches declined (client_cap|server_busy)",
+            unit="1",
+        )
+
         self.chunk_reads_by_tier = self.meter.create_counter(
             name="chunk_reads_by_tier_total",
             description="Chunk reads served, by storage tier (local|peer|pool)",
@@ -495,6 +507,10 @@ class MetricsCollector:
         else:
             self.cache_misses.add(1, attributes=attributes)
 
+    def record_peer_fetch_shed(self, reason: PeerShedReason) -> None:
+        """Count a declined peer fetch. `reason` is a Literal, so the label stays bounded."""
+        self.peer_fetch_shed.add(1, attributes={"reason": reason})
+
     def record_chunk_read_tier(self, tier: ChunkReadTier) -> None:
         """Count one chunk read against the tier that served it.
 
@@ -758,6 +774,9 @@ class NullMetricsCollector:
         pass
 
     def record_chunk_read_tier(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_peer_fetch_shed(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_cache_operation(self, *args: object, **kwargs: object) -> None:

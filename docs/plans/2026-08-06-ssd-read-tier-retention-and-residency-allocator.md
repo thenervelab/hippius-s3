@@ -19,6 +19,21 @@ invariant that keeps retention from turning into failed PUTs.
 **Deploy note.** Phase 2 must go out as one unit — retention without the evictor means nothing
 frees the ingest SSD. Migration 0016 is backfill-free and its indexes build near-empty.
 
+**Per-peer fanout (added after review).** Owl (OSDI '22) selects a peer subject to per-peer
+fanout and bandwidth constraints, and the failure that prevents is live here: a part that is
+hot and resident on one node draws every other node's fetches onto that node's `api-local` pod,
+the same uvicorn serving its own ingest. Both sides are capped — the client skips to the pool
+rather than queueing (waiting behind a saturated peer would add its latency on top of the pool
+read that follows), and the server sheds with 503, since five pods each within their own cap
+still add up at the peer. `peer_fetch_shed_total{reason=client_cap|server_busy}` reports both.
+
+Not adopted from Owl: a tracker that decides *what* each node caches. Owl moves 800 PB/day to
+millions of processes; this is five nodes and a 5.4 TB working set, so a control plane of that
+shape would be premature. The transplant is the mechanism, not the architecture. Value-aware
+replication also needs node-local read recency, which does not exist yet — the shared
+`fs_cache_inventory.last_access_at` is fleet-wide, so a read on one node looks hot on all of
+them.
+
 **What to watch during the staging soak.** `chunk_reads_by_tier_total{tier=...}` is the whole
 point: `local` should climb as retention fills each node's shard, `peer` should take most of what
 used to be `pool`, and `pool` should fall. Alongside it, `drain_ssd_cache_bytes` should rise and

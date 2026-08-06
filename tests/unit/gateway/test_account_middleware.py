@@ -1,6 +1,5 @@
 """Unit tests for account middleware bypass mode and account ID derivation."""
 
-import hashlib
 from typing import Any
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock

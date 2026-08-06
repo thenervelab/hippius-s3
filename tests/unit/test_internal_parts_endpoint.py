@@ -9,6 +9,8 @@ them instead of either just reading the pool.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport
@@ -102,3 +104,41 @@ async def test_a_store_without_a_local_read_is_a_404() -> None:
         response = await client.get(f"/internal/parts/{OBJ}/1/1/chunks/0")
 
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_the_peer_endpoint_sheds_over_its_in_flight_cap(tmp_path) -> None:
+    """Serving peers must never crowd out this node's own ingest.
+
+    This pod runs the api for its own clients too. A part that is hot and resident only here
+    would otherwise draw every other node's fetches onto the same uvicorn as its PUTs. 503 is
+    correct rather than queueing: the caller treats any non-200 as "read the pool", so
+    shedding costs it one fallback, while queueing would add this pod's saturation on top of
+    that pool read anyway.
+    """
+    store = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))
+    await _write_part(store, part_number=1, chunk=b"local-bytes")
+
+    app = _app(store)
+    app.state.peer_serve_limiter = asyncio.Semaphore(1)
+    await app.state.peer_serve_limiter.acquire()  # the one slot is already taken
+
+    async with await _client(app) as client:
+        response = await client.get(f"/internal/parts/{OBJ}/1/1/chunks/0")
+
+    assert response.status_code == 503, "shed rather than queue behind a saturated pod"
+
+
+@pytest.mark.asyncio
+async def test_the_peer_endpoint_serves_normally_under_its_cap(tmp_path) -> None:
+    store = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))
+    await _write_part(store, part_number=1, chunk=b"local-bytes")
+
+    app = _app(store)
+    app.state.peer_serve_limiter = asyncio.Semaphore(4)
+
+    async with await _client(app) as client:
+        response = await client.get(f"/internal/parts/{OBJ}/1/1/chunks/0")
+
+    assert response.status_code == 200
+    assert response.content == b"local-bytes"

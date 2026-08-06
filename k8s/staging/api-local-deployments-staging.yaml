@@ -127,6 +127,15 @@ spec:
             # is local. Requires NODE_NAME (above) to claim residency for the evictor.
             - name: HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ
               value: "true"
+            # Per-peer fanout caps. A part that is hot and resident on ONE node otherwise
+            # draws every other node's fetches onto that node's api pod — the same uvicorn
+            # serving its own ingest. The client cap bounds what one pod sends; the serve cap
+            # sheds with 503 so five pods each within their own cap still cannot crowd out
+            # that node's PUTs.
+            - name: HIPPIUS_PEER_FETCH_MAX_INFLIGHT
+              value: "8"
+            - name: HIPPIUS_PEER_SERVE_MAX_INFLIGHT
+              value: "16"
             - name: K8S_NAMESPACE
               valueFrom:
                 fieldRef:

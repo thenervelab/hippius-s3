@@ -382,6 +382,12 @@ class Config:
     # Bound on a peer read. A slow peer must lose to the pool quickly rather than adding its
     # latency on top of the pool read that follows.
     peer_fetch_timeout_seconds: float = env("HIPPIUS_PEER_FETCH_TIMEOUT_SECONDS:2.0", convert=float)
+    # Per-peer fanout: concurrent fetches this pod will have in flight to any ONE peer, and
+    # concurrent peer requests this pod will SERVE. Both are needed — the client cap bounds
+    # what one pod sends, but five pods each within their own cap still add up at the peer,
+    # so the serving side sheds with 503 to protect its own ingest.
+    peer_fetch_max_inflight: int = env("HIPPIUS_PEER_FETCH_MAX_INFLIGHT:8", convert=int)
+    peer_serve_max_inflight: int = env("HIPPIUS_PEER_SERVE_MAX_INFLIGHT:16", convert=int)
     # 24h since last WRITE — the read path no longer bumps timestamps (read
     # recency lives in fs_cache_inventory.last_access_at), so this gates on
     # time since the part landed, not since it was last streamed.

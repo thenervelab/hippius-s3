@@ -164,7 +164,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 app.state.peer_registry,
                 node_name,
                 app.state.peer_http,
+                max_inflight=config.peer_fetch_max_inflight,
             )
+            # Serving-side cap, read by the /internal/parts endpoint. Set whenever peer fetch
+            # is on, since a node that fetches from peers is also one peers fetch from.
+            app.state.peer_serve_limiter = asyncio.Semaphore(config.peer_serve_max_inflight)
             logger.info("Peer chunk fetch enabled for node %s", node_name)
 
         app.state.fs_store = create_fs_store(config, on_promote=app.state.residency_recorder, peer_fetch=peer_fetch)

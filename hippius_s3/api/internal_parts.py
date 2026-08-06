@@ -56,8 +56,21 @@ async def get_local_chunk(
     if local is None:
         return Response(status_code=404)
 
+    # Shed over the in-flight cap. This pod is also serving its own ingest and reads, so a
+    # part that is hot and resident only here would otherwise let every other node's fetches
+    # crowd out PUTs on the same uvicorn. 503 is the right answer rather than queueing: the
+    # caller treats any non-200 as "read the pool", so shedding costs it a fallback, while
+    # queueing would add this pod's saturation to the pool read that follows anyway.
+    limiter = getattr(request.app.state, "peer_serve_limiter", None)
+    if limiter is not None and limiter.locked():
+        return Response(status_code=503)
+
     try:
-        data = await local(object_id, object_version, part_number, chunk_index)
+        if limiter is None:
+            data = await local(object_id, object_version, part_number, chunk_index)
+        else:
+            async with limiter:
+                data = await local(object_id, object_version, part_number, chunk_index)
     except (OSError, ValueError) as exc:
         logger.debug(
             "local chunk read failed for %s v%s part %s chunk %s: %s",

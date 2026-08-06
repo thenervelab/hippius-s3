@@ -33,6 +33,7 @@ import httpx
 import redis.asyncio as async_redis
 
 from hippius_s3.cache.part_memo import PartMemo
+from hippius_s3.monitoring import PeerShedReason
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,27 @@ _PEER_KEY_PREFIX = "hippius:peer:"
 # must expire. A wrong answer is cheap anyway — the peer 404s and the read falls to the pool.
 _OWNER_MEMO_TTL_SECONDS = 30.0
 _OWNER_MEMO_ENTRIES = 50_000
+
+# Concurrent peer fetches this pod will have in flight to any ONE peer node.
+#
+# Owl selects a peer subject to per-peer fanout and bandwidth constraints, and the reason is
+# the failure this prevents: a part that is hot and resident on a single node draws every
+# other node's reads onto that node's api pod — the same uvicorn serving its own ingest. The
+# cap SKIPS to the pool rather than queueing, because waiting behind a saturated peer would
+# add its latency on top of the pool read that follows.
+_DEFAULT_MAX_INFLIGHT_PER_PEER = 8
+
+
+def _record_shed(reason: PeerShedReason) -> None:
+    """Count a peer fetch we declined to make (or that the peer declined). Never fatal."""
+    try:
+        from hippius_s3.monitoring import get_metrics_collector
+
+        collector = get_metrics_collector()
+        if collector is not None:
+            collector.record_peer_fetch_shed(reason)
+    except Exception:  # noqa: BLE001 - observability must not fail a read
+        pass
 
 
 def peer_key(node_name: str) -> str:
@@ -120,6 +142,7 @@ class PeerChunkFetcher:
         registry: PeerRegistry,
         node_name: str,
         client: httpx.AsyncClient,
+        max_inflight: int = _DEFAULT_MAX_INFLIGHT_PER_PEER,
     ) -> None:
         self._pool = pool
         self._registry = registry
@@ -132,6 +155,11 @@ class PeerChunkFetcher:
         self._owner_url: PartMemo[tuple[str, int, int], tuple[Optional[str]]] = PartMemo(
             _OWNER_MEMO_TTL_SECONDS, _OWNER_MEMO_ENTRIES
         )
+        self._max_inflight = max_inflight
+        # One slot pool per peer, keyed by its base URL (one URL per node). This bounds what
+        # THIS pod sends; the serving side has its own limiter, because five pods each within
+        # their own cap still add up at the peer.
+        self._inflight: dict[str, asyncio.Semaphore] = {}
 
     async def _owner(self, object_id: str, object_version: int, part_number: int) -> Optional[str]:
         """A node other than this one that holds the part, per the residency table.
@@ -180,9 +208,15 @@ class PeerChunkFetcher:
             self._owner_url.put(part_key, (base,))
         if base is None:
             return None
+        slots = self._inflight.setdefault(base, asyncio.Semaphore(self._max_inflight))
+        if slots.locked():
+            _record_shed("client_cap")
+            return None
+
         url = f"{base}/internal/parts/{object_id}/{object_version}/{part_number}/chunks/{chunk_index}"
         try:
-            response = await self._client.get(url)
+            async with slots:
+                response = await self._client.get(url)
         except (httpx.HTTPError, OSError) as exc:
             # A registered-but-unreachable peer — a drained or cordoned node whose replacement
             # has not re-registered under the same key — stays resolvable until its TTL lapses.
@@ -192,6 +226,12 @@ class PeerChunkFetcher:
             # entry expires on its own, so a peer that comes back is picked up again.
             self._owner_url.put(part_key, (None,))
             logger.debug("peer fetch to %s failed, falling through to the pool: %s", base, exc)
+            return None
+        if response.status_code == 503:
+            # The peer shed this request to protect its own ingest. Transient, so it must NOT
+            # poison the memo the way a connect failure does — that would keep the whole part
+            # on the pool long after a brief spike passed.
+            _record_shed("server_busy")
             return None
         if response.status_code != 200:
             # 404 is routine: the peer evicted the part between the residency read and now.
