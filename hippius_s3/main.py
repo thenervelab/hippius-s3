@@ -1,6 +1,8 @@
 """Main application module for Hippius S3 service."""
 
+import asyncio
 import logging
+import os
 import platform
 import re
 from contextlib import asynccontextmanager
@@ -9,6 +11,7 @@ from typing import Any
 from typing import AsyncGenerator
 
 import asyncpg
+import httpx
 import redis.asyncio as async_redis
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -18,6 +21,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from hippius_s3.api.internal_parts import router as internal_parts_router
 from hippius_s3.api.middlewares.fs_cache_pressure import fs_cache_pressure_middleware
 from hippius_s3.api.middlewares.ip_whitelist import ip_whitelist_middleware
 from hippius_s3.api.middlewares.metrics import metrics_middleware
@@ -31,6 +35,9 @@ from hippius_s3.api.sub_token_scopes import router as sub_token_scopes_router
 from hippius_s3.api.user import router as user_router
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
+from hippius_s3.cache.peers import PeerChunkFetcher
+from hippius_s3.cache.peers import PeerRegistry
+from hippius_s3.cache.residency import create_residency_recorder
 from hippius_s3.config import Config
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
@@ -127,7 +134,44 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Cache repositories
         # Chunks are stored on the shared filesystem (via FileSystemPartsStore).
         # Redis is used only for pub/sub chunk-ready notifications (queues_client).
-        app.state.fs_store = create_fs_store(config)
+        # A promoted chunk lands on a node that did not ingest the part, so it must be
+        # claimed for THIS node or the drain-agent's evictor — scoped by node_id — can never
+        # reclaim it. No node identity means no recorder, which disables promotion outright.
+        app.state.residency_recorder = create_residency_recorder(app.state.postgres_pool, os.getenv("NODE_NAME", ""))
+        # Peer tier: resolve who holds a part on flash and read it from them before the pool.
+        # Peers address each other by POD IP (not a hostPort on the node IP), which keeps the
+        # traffic on the pod network and inside the api's 10.x/172.x ip_whitelist.
+        node_name = os.getenv("NODE_NAME", "")
+        pod_ip = os.getenv("POD_IP", "")
+        app.state.peer_registry = None
+        peer_fetch = None
+        if config.peer_fetch_enabled and node_name and pod_ip:
+            app.state.peer_http = httpx.AsyncClient(timeout=config.peer_fetch_timeout_seconds)
+            app.state.peer_registry = PeerRegistry(
+                app.state.redis_client,
+                node_name,
+                f"http://{pod_ip}:8000",
+                config.peer_registry_ttl_seconds,
+            )
+            await app.state.peer_registry.register()
+            # The published address carries a TTL, so it must be refreshed for the pod's
+            # lifetime; a single registration would lapse and drop this node out of the map.
+            app.state.peer_refresh_task = asyncio.create_task(
+                app.state.peer_registry.run_refresh(config.peer_registry_refresh_seconds)
+            )
+            peer_fetch = PeerChunkFetcher(
+                app.state.postgres_pool,
+                app.state.peer_registry,
+                node_name,
+                app.state.peer_http,
+                max_inflight=config.peer_fetch_max_inflight,
+            )
+            # Serving-side cap, read by the /internal/parts endpoint. Set whenever peer fetch
+            # is on, since a node that fetches from peers is also one peers fetch from.
+            app.state.peer_serve_limiter = asyncio.Semaphore(config.peer_serve_max_inflight)
+            logger.info("Peer chunk fetch enabled for node %s", node_name)
+
+        app.state.fs_store = create_fs_store(config, on_promote=app.state.residency_recorder, peer_fetch=peer_fetch)
         app.state.obj_cache = RedisObjectPartsCache(
             app.state.redis_client,
             queues_client=app.state.redis_queues_client,
@@ -159,8 +203,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Background metrics collection started")
 
         async def collect_pool_metrics() -> None:
-            import asyncio
-
             while True:
                 await asyncio.sleep(60)
                 if hasattr(app.state, "postgres_pool") and hasattr(app.state, "metrics_collector"):
@@ -168,8 +210,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     size = pool.get_size()
                     free = pool.get_idle_size()
                     app.state.metrics_collector.update_db_pool_metrics(size, free)
-
-        import asyncio
 
         asyncio.create_task(collect_pool_metrics())
         logger.info("Pool metrics collection task started")
@@ -362,6 +402,7 @@ Disallow: /"""
     app.include_router(user_router, prefix="/user")
     app.include_router(sub_token_scopes_router, prefix="/user/sub-tokens")
     app.include_router(public_router, prefix="")
+    app.include_router(internal_parts_router, prefix="")
     app.include_router(s3_router_new, prefix="")
 
     static_dir = Path(__file__).parent / "static"

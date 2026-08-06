@@ -5,7 +5,7 @@
 //! fixture map instead of the process-global environment — which is shared
 //! mutable state that races across parallel tests.
 
-use crate::runtime::{HeartbeatConfig, RuntimeConfig};
+use crate::runtime::{EvictionPolicy, HeartbeatConfig, RuntimeConfig};
 use core::str::FromStr;
 use hippius_drain_core::{ByteRate, NodeId};
 use std::num::ParseIntError;
@@ -78,13 +78,29 @@ const DEFAULT_ORPHAN_RECLAIM_GRACE: Duration = Duration::from_hours(24);
 /// (abandoned-upload) part — and an orphan write-temp — is kept on SSD before
 /// eviction (a diagnosis / abort-settle window).
 const DEFAULT_RECLAIM_GRACE: Duration = Duration::from_hours(1);
-/// Replicated crash-orphan grace when `CEPHOR_REPLICATED_RECLAIM_GRACE_SECS` is unset: how
-/// long a `replicated` part may linger on SSD before the reclaim treats it as a drain
-/// crash-orphan (a crash between the `mark_replicated` commit and the drain's own unlink) and
-/// re-drives that unlink. The happy-path unlink runs milliseconds after the commit, so this
-/// need only clear the in-flight-unlink window; a conservative hour also absorbs reclaim-poll
-/// skew. Keyed on the row's `updated_at` (store clock), so no agent-clock dependence.
-const DEFAULT_REPLICATED_RECLAIM_GRACE: Duration = Duration::from_hours(1);
+
+/// How often the read-tier evictor probes free space when `CEPHOR_EVICT_POLL_SECS` is unset.
+/// Frequent, because with retention on this is the only worker freeing the ingest SSD and a
+/// burst of ingest can breach the floor between polls. A pass that is not armed costs one
+/// `statvfs` and no query at all, so a short poll is close to free.
+const DEFAULT_EVICT_POLL: Duration = Duration::from_secs(30);
+
+/// The evictor's own free-space floor, in permille of the ingest disk, when
+/// `CEPHOR_EVICT_RESERVE_PERMILLE` is unset. This is the FALLBACK: when the allocator is
+/// publishing a per-node reserve, that wins. Chosen to sit well clear of the api's
+/// `fs_cache_pressure` 503 threshold (80 permille free): the evictor must be reclaiming well
+/// before ingest starts refusing writes, never racing it. ~575 GB on the 3.84 TB prod `NVMe`s.
+const DEFAULT_EVICT_RESERVE_PERMILLE: u16 = 150;
+
+/// How far past the floor one armed pass frees, in permille of the disk, when
+/// `CEPHOR_EVICT_HEADROOM_PERMILLE` is unset. Without this gap the evictor re-arms on nearly
+/// every poll and pins the disk at the threshold.
+const DEFAULT_EVICT_HEADROOM_PERMILLE: u16 = 50;
+
+/// Parts considered per eviction pass when `CEPHOR_EVICT_BATCH` is unset. At a 4 MiB chunk
+/// and typical part sizes this frees tens of GB per pass — enough to close a breach in a few
+/// polls without one pass monopolising the disk.
+const DEFAULT_EVICT_BATCH: u32 = 512;
 
 /// Default path of the liveness file the runtime touches each heartbeat tick; the
 /// k8s `livenessProbe` checks its freshness. Container-local `/tmp` is always writable.
@@ -157,16 +173,22 @@ pub struct Config {
     /// How long a no-DB-backing part (its object hard-deleted) is kept on SSD before the
     /// orphan reclaim evicts it. Keyed on the part's FS `meta.json` age, so set generously.
     pub orphan_reclaim_grace: Duration,
-    /// How long a `replicated` part may linger on SSD before the reclaim re-drives the drain's
-    /// own unlink (treating it as a crash-orphan). Keyed on the row's `updated_at`, so set only
-    /// to clear the in-flight-unlink window.
-    pub replicated_reclaim_grace: Duration,
     /// Maximum parts the drain worker processes concurrently — the in-flight gate
     /// that lets the node overlap fsync latency across parts.
     pub drain_concurrency: u32,
     /// Max times an R4 `corrupt` part is re-driven before it is held and paged. Bounds the
     /// re-drive so a persistently-bad pool copy cannot loop forever.
     pub redrive_max_attempts: u32,
+    /// How often the read-tier evictor probes the ingest disk's free space.
+    pub evict_poll: Duration,
+    /// The evictor's fallback free-space floor, in permille of the ingest disk, used when the
+    /// allocator is not publishing a per-node reserve. Zero disables eviction — and with
+    /// retention on, that means nothing frees the SSD.
+    pub evict_reserve_permille: u16,
+    /// How far past the floor an armed eviction pass frees, in permille of the disk.
+    pub evict_headroom_permille: u16,
+    /// Parts considered per eviction pass.
+    pub evict_batch: u32,
     /// Path of the liveness file the runtime touches each heartbeat tick; a k8s
     /// `livenessProbe` checks its freshness to restart a wedged (not crashed) pod.
     pub liveness_file: PathBuf,
@@ -244,10 +266,15 @@ impl Config {
             reclaim_poll: self.reclaim_poll,
             reclaim_grace: self.reclaim_grace,
             orphan_reclaim_grace: self.orphan_reclaim_grace,
-            replicated_reclaim_grace: self.replicated_reclaim_grace,
             grace: self.grace,
             drain_concurrency: self.drain_concurrency,
             redrive_max_attempts: self.redrive_max_attempts,
+            evict_poll: self.evict_poll,
+            evict_policy: EvictionPolicy {
+                reserve_permille: self.evict_reserve_permille,
+                headroom_permille: self.evict_headroom_permille,
+                batch: self.evict_batch,
+            },
         }
     }
 
@@ -320,9 +347,12 @@ impl Config {
             reclaim_poll: duration_secs(&get, "CEPHOR_RECLAIM_POLL_SECS", DEFAULT_RECLAIM_POLL)?,
             reclaim_grace: duration_secs(&get, "CEPHOR_RECLAIM_GRACE_SECS", DEFAULT_RECLAIM_GRACE)?,
             orphan_reclaim_grace: duration_secs(&get, "CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", DEFAULT_ORPHAN_RECLAIM_GRACE)?,
-            replicated_reclaim_grace: duration_secs(&get, "CEPHOR_REPLICATED_RECLAIM_GRACE_SECS", DEFAULT_REPLICATED_RECLAIM_GRACE)?,
             drain_concurrency: positive_u32_or(&get, "CEPHOR_DRAIN_CONCURRENCY", DEFAULT_DRAIN_CONCURRENCY)?,
             redrive_max_attempts: positive_u32_or(&get, "CEPHOR_REDRIVE_MAX_ATTEMPTS", DEFAULT_REDRIVE_MAX_ATTEMPTS)?,
+            evict_poll: duration_secs(&get, "CEPHOR_EVICT_POLL_SECS", DEFAULT_EVICT_POLL)?,
+            evict_reserve_permille: permille_or(&get, "CEPHOR_EVICT_RESERVE_PERMILLE", DEFAULT_EVICT_RESERVE_PERMILLE)?,
+            evict_headroom_permille: permille_or(&get, "CEPHOR_EVICT_HEADROOM_PERMILLE", DEFAULT_EVICT_HEADROOM_PERMILLE)?,
+            evict_batch: positive_u32_or(&get, "CEPHOR_EVICT_BATCH", DEFAULT_EVICT_BATCH)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
             readiness_file: path_or(&get, "CEPHOR_READINESS_FILE", DEFAULT_READINESS_FILE),
         })
@@ -377,6 +407,21 @@ fn positive_u64_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, def
 /// Resolves an optional positive count variable as a `u32`. Builds on [`u64_or`]
 /// but rejects an explicit zero (a zero drain concurrency would stall the worker)
 /// and a value past `u32::MAX`, mirroring [`positive_u64_or`]'s fail-fast contract.
+/// A permille value in `0..=1000`.
+///
+/// Deliberately NOT `positive_u32_or`: zero is a meaningful value for the eviction reserve
+/// (it disables eviction, the operator kill-switch), so rejecting it would turn a supported
+/// setting into a startup failure. The upper bound is checked because a reserve above the
+/// whole disk can never be satisfied — the evictor would evict the entire cache every pass and still
+/// report `starved` forever.
+fn permille_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, default: u16) -> Result<u16, ConfigError> {
+    let value = u64_or(get, var, u64::from(default))?;
+    if value > 1_000 {
+        return Err(ConfigError::OutOfRange { var, value, limit: 1_000 });
+    }
+    Ok(u16::try_from(value).unwrap_or(1_000))
+}
+
 fn positive_u32_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, default: u32) -> Result<u32, ConfigError> {
     let value = u64_or(get, var, u64::from(default))?;
     match u32::try_from(value) {
@@ -429,7 +474,7 @@ mod tests {
     use super::{
         Config, ConfigError, DEFAULT_ALLOCATION_POLL, DEFAULT_CLAIM_LEASE, DEFAULT_DECAY_HALF_LIFE, DEFAULT_DEFER_BACKOFF_CAP,
         DEFAULT_DRAIN_CONCURRENCY, DEFAULT_DRAIN_POLL, DEFAULT_FLOOR_RATE_BPS, DEFAULT_HEARTBEAT_POLL, DEFAULT_HEARTBEAT_TTL,
-        DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_ORPHAN_RECLAIM_GRACE, DEFAULT_RECLAIM_GRACE, DEFAULT_RECLAIM_POLL, DEFAULT_REPLICATED_RECLAIM_GRACE,
+        DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_ORPHAN_RECLAIM_GRACE, DEFAULT_RECLAIM_GRACE, DEFAULT_RECLAIM_POLL,
     };
     use core::str::FromStr;
     use hippius_drain_core::{ByteRate, NodeId};
@@ -577,7 +622,6 @@ mod tests {
         assert_eq!(config.reclaim_poll, DEFAULT_RECLAIM_POLL);
         assert_eq!(config.reclaim_grace, DEFAULT_RECLAIM_GRACE);
         assert_eq!(config.orphan_reclaim_grace, DEFAULT_ORPHAN_RECLAIM_GRACE);
-        assert_eq!(config.replicated_reclaim_grace, DEFAULT_REPLICATED_RECLAIM_GRACE);
     }
 
     #[test]
@@ -586,12 +630,10 @@ mod tests {
         pairs.push(("CEPHOR_RECLAIM_POLL_SECS", "120"));
         pairs.push(("CEPHOR_RECLAIM_GRACE_SECS", "600"));
         pairs.push(("CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", "7200"));
-        pairs.push(("CEPHOR_REPLICATED_RECLAIM_GRACE_SECS", "1800"));
         let config = Config::from_lookup(lookup(&pairs)).unwrap();
         assert_eq!(config.reclaim_poll, Duration::from_mins(2));
         assert_eq!(config.reclaim_grace, Duration::from_mins(10));
         assert_eq!(config.orphan_reclaim_grace, Duration::from_hours(2));
-        assert_eq!(config.replicated_reclaim_grace, Duration::from_mins(30));
     }
 
     #[test]

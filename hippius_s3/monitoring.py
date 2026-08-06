@@ -1,5 +1,6 @@
 import logging
 import os
+from typing import Literal
 from typing import Optional
 from typing import Union
 
@@ -18,6 +19,14 @@ from hippius_s3.otel_setup import build_resource
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
+
+
+# The storage tiers a chunk read can be served from, closed by construction so the `tier`
+# label cannot drift into unbounded cardinality.
+ChunkReadTier = Literal["local", "peer", "pool"]
+
+# Which side declined a peer fetch. Closed by construction, like ChunkReadTier.
+PeerShedReason = Literal["client_cap", "server_busy"]
 
 
 class MetricsCollector:
@@ -94,6 +103,25 @@ class MetricsCollector:
 
         self.cache_misses = self.meter.create_counter(
             name="cache_misses_total", description="Total cache misses", unit="1"
+        )
+
+        # Which storage tier actually served a chunk: local NVMe, a peer node's NVMe, or the
+        # CephFS pool. Without this split the SSD read tier is unmeasurable — every tier reads
+        # as "cache" — so there is no way to tell whether retention, promotion, and peer fetch
+        # are doing anything, or to catch a silent regression back to all-pool reads.
+        # Peer fetches declined, by which side declined: this pod's per-peer fanout cap, or
+        # the peer shedding to protect its own ingest. A rising rate means the read tier is
+        # falling back to the pool under load, which is the signal that fanout needs tuning.
+        self.peer_fetch_shed = self.meter.create_counter(
+            name="peer_fetch_shed_total",
+            description="Peer chunk fetches declined (client_cap|server_busy)",
+            unit="1",
+        )
+
+        self.chunk_reads_by_tier = self.meter.create_counter(
+            name="chunk_reads_by_tier_total",
+            description="Chunk reads served, by storage tier (local|peer|pool)",
+            unit="1",
         )
 
         self.uploader_requests_total = self.meter.create_counter(
@@ -479,6 +507,18 @@ class MetricsCollector:
         else:
             self.cache_misses.add(1, attributes=attributes)
 
+    def record_peer_fetch_shed(self, reason: PeerShedReason) -> None:
+        """Count a declined peer fetch. `reason` is a Literal, so the label stays bounded."""
+        self.peer_fetch_shed.add(1, attributes={"reason": reason})
+
+    def record_chunk_read_tier(self, tier: ChunkReadTier) -> None:
+        """Count one chunk read against the tier that served it.
+
+        The `Literal` is what keeps this label bounded: three values fixed in code, so it
+        cannot become a cardinality problem the way a caller-supplied string would.
+        """
+        self.chunk_reads_by_tier.add(1, attributes={"tier": tier})
+
     def record_uploader_operation(
         self,
         success: bool,
@@ -731,6 +771,12 @@ class NullMetricsCollector:
         pass
 
     def record_fs_cache_shed(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_chunk_read_tier(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_peer_fetch_shed(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_cache_operation(self, *args: object, **kwargs: object) -> None:

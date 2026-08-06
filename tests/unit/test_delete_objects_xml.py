@@ -142,8 +142,7 @@ async def test_handler_does_not_resolve_an_entity_into_a_key(_stub_repos: None) 
     the endpoint ever drops back to a bare ET.fromstring.
     """
     body = (
-        b"<?xml version='1.0'?><!DOCTYPE d [<!ENTITY e 'victim.txt'>]>"
-        b"<Delete><Object><Key>&e;</Key></Object></Delete>"
+        b"<?xml version='1.0'?><!DOCTYPE d [<!ENTITY e 'victim.txt'>]><Delete><Object><Key>&e;</Key></Object></Delete>"
     )
     baseline = ET.fromstring(body).xpath(".//*[local-name()='Key']")[0]
     assert baseline.text == "victim.txt", "default parser no longer resolves — this test lost its teeth"

@@ -64,6 +64,17 @@ const DEFAULT_MAX_ERROR_BPS: u16 = 100;
 const DEFAULT_CRITICAL_PRESSURE_BPS: u16 = 9_000;
 /// Guaranteed per-node floor (bytes/sec) for critical-pressure nodes.
 const DEFAULT_RESERVATION_FLOOR_BPS: u64 = 1_000_000;
+
+/// The evictor's free-space floor when the drain is keeping up, in permille of disk. Must stay
+/// clear of the api's `fs_cache_pressure` 503 gate (80 permille free) so eviction is always
+/// reclaiming before ingest is refused.
+const DEFAULT_BASE_RESERVE_PERMILLE: u16 = 150;
+
+/// The floor when the drain is fully stalled. Raising it is what buys ingest runway: a
+/// throttled drain means backlog grows, and freeing cache EARLY is the only lever that keeps
+/// `fs_cache_pressure` from refusing PUTs later. Deliberately well under the whole disk — the
+/// point is headroom for incoming backlog, not an emptied cache.
+const DEFAULT_MAX_RESERVE_PERMILLE: u16 = 400;
 /// Ceph near-full watermark (basis points) when `CEPHOR_CEPH_NEARFULL_BPS` is unset.
 /// Mirrors the cluster's `nearfull_ratio` of 0.85.
 const DEFAULT_CEPH_NEARFULL_BPS: u16 = 8_500;
@@ -219,6 +230,8 @@ impl AllocatorConfig {
             max_error_bps: u16_or(&get, "CEPHOR_ALLOC_MAX_ERROR_BPS", DEFAULT_MAX_ERROR_BPS)?,
             critical_pressure: critical_pressure(&get, "CEPHOR_ALLOC_CRITICAL_PRESSURE_BPS", DEFAULT_CRITICAL_PRESSURE_BPS)?,
             reservation_floor: ByteRate::new(u64_or(&get, "CEPHOR_ALLOC_RESERVATION_FLOOR_BPS", DEFAULT_RESERVATION_FLOOR_BPS)?),
+            base_reserve_permille: permille_or(&get, "CEPHOR_ALLOC_BASE_RESERVE_PERMILLE", DEFAULT_BASE_RESERVE_PERMILLE)?,
+            max_reserve_permille: permille_or(&get, "CEPHOR_ALLOC_MAX_RESERVE_PERMILLE", DEFAULT_MAX_RESERVE_PERMILLE)?,
         };
         let ceph_ceiling = positive_u64(&get, "CEPHOR_CEPH_CEILING_BPS", DEFAULT_CEPH_CEILING_BPS)?;
         let ceph_nearfull_rate = positive_u64(&get, "CEPHOR_CEPH_NEARFULL_RATE_BPS", DEFAULT_CEPH_NEARFULL_RATE_BPS)?;
@@ -306,6 +319,18 @@ fn path_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, default: &s
 
 /// Resolves an optional integer variable, falling back to `default` when unset.
 /// A present-but-unparsable value is a loud error, not a silent fallback.
+/// A permille value in `0..=1000`.
+///
+/// Zero is meaningful here — it disables the evictor — so this cannot reuse `positive_u64`,
+/// which would turn a supported setting into a startup failure.
+fn permille_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, default: u16) -> Result<u16, ConfigError> {
+    let value = u64_or(get, var, u64::from(default))?;
+    if value > 1_000 {
+        return Err(ConfigError::OutOfRange { var, value, limit: 1_000 });
+    }
+    Ok(u16::try_from(value).unwrap_or(1_000))
+}
+
 fn u64_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, default: u64) -> Result<u64, ConfigError> {
     match get(var) {
         None => Ok(default),

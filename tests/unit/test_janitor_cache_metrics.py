@@ -66,8 +66,7 @@ def test_every_delete_path_increments_the_counter(janitor_source: str, reason: s
 def test_stale_path_counts_outside_the_abandoned_branch(janitor_source: str) -> None:
     """The bug was that only the `abandoned` sub-case counted; the plain path fell through."""
     assert janitor_source.count("_janitor_deleted_counter.add(") >= 3, (
-        "expected the counter to be incremented from the gc_age, stale_mtime and abandoned "
-        "paths"
+        "expected the counter to be incremented from the gc_age, stale_mtime and abandoned paths"
     )
 
 
@@ -130,9 +129,7 @@ def test_census_panels_say_they_can_be_stale(dashboard: dict) -> None:
 def test_ssd_backlog_is_per_node(dashboard: dict) -> None:
     """The drain is per-node; a bare max() hides which node is falling behind."""
     exprs = _exprs(_panel(dashboard, 87))
-    assert any("by (service_instance_id)" in e for e in exprs), (
-        "SSD backlog collapses every ingest node into one line"
-    )
+    assert any("by (service_instance_id)" in e for e in exprs), "SSD backlog collapses every ingest node into one line"
 
 
 def test_dashboard_is_valid_json_and_panel_ids_are_unique(dashboard: dict) -> None:

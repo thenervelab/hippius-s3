@@ -91,26 +91,31 @@ async fn main() -> Result<ExitCode, StartupError> {
         Bytes::new(config.max_drain_rate.get()),
         config.drain_concurrency,
     )));
-    let rate_control = RateControl {
-        enforcer: Arc::clone(&enforcer),
-        node: config.node_id.clone(),
-        floor: config.floor_rate,
-        half_life: config.decay_half_life,
-        poll: config.allocation_poll,
-    };
-
     let runtime = AgentRuntime::new(
         Arc::new(LocalFs::new(&config.pool_root)),
         Arc::new(LocalSsd::new(&config.ssd_root)),
         store,
         enqueuer,
         config.runtime_config(),
-    )
-    .with_coordinator(coordinator)
-    .with_heartbeat(config.heartbeat_config())
-    .with_rate_control(rate_control)
-    .with_liveness(config.liveness_file.clone())
-    .with_readiness(config.readiness_file.clone());
+    );
+
+    // Built after the runtime because the allocation pull publishes this node's eviction
+    // reserve into the runtime's snapshot, which the evictor worker reads on its own poll.
+    let rate_control = RateControl {
+        enforcer: Arc::clone(&enforcer),
+        node: config.node_id.clone(),
+        floor: config.floor_rate,
+        half_life: config.decay_half_life,
+        poll: config.allocation_poll,
+        snapshot: runtime.snapshot(),
+    };
+
+    let runtime = runtime
+        .with_coordinator(coordinator)
+        .with_heartbeat(config.heartbeat_config())
+        .with_rate_control(rate_control)
+        .with_liveness(config.liveness_file.clone())
+        .with_readiness(config.readiness_file.clone());
 
     // OTLP metrics read the runtime's live snapshot + the shared enforcer (for the breaker
     // gauge); grabbed before `run` consumes the runtime. Held until after shutdown to flush.

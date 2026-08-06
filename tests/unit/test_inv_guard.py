@@ -18,7 +18,12 @@ from inv import guards  # noqa: E402
 class FakeProbe:
     """Duck-typed ClusterProbe: canned `prom_scalar` values and `pg` rows, or None (unreachable)."""
 
-    def __init__(self, prom: dict[str, float | None] | None = None, rows: list[list[str]] | None = None, scalar: str | None = None):
+    def __init__(
+        self,
+        prom: dict[str, float | None] | None = None,
+        rows: list[list[str]] | None = None,
+        scalar: str | None = None,
+    ):
         self._prom = prom or {}
         self._rows = rows
         self._scalar = scalar
@@ -66,7 +71,10 @@ def test_g1_skip_when_prometheus_unreachable():
 
 # ----------------------------------------------------------------- G2 replication-gate coverage
 def test_g2_ok_no_underreplicated():
-    assert guards.ReplicationGateCoverage().check(FakeProbe(prom={"max(janitor_underreplicated_live_chunks)": 0.0})).status == "ok"
+    assert (
+        guards.ReplicationGateCoverage().check(FakeProbe(prom={"max(janitor_underreplicated_live_chunks)": 0.0})).status
+        == "ok"
+    )
 
 
 def test_g2_breach_underreplicated():
@@ -225,9 +233,7 @@ def test_required_guard_all_skip_is_flagged():
 
 def test_required_guard_that_asserted_once_is_not_flagged():
     # A single real evaluation (ok or breach) means the guard ran — not the silent-green case.
-    flagged = inv_guard.required_never_asserted(
-        names=["G1"], guard_asserts={"G1": 1}, guard_polls={"G1": 5}
-    )
+    flagged = inv_guard.required_never_asserted(names=["G1"], guard_asserts={"G1": 1}, guard_polls={"G1": 5})
     assert flagged == []
 
 

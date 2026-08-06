@@ -166,6 +166,8 @@ mod tests {
             max_error_bps: 100,
             critical_pressure: DiskPressure::try_from(9_000).unwrap(),
             reservation_floor: ByteRate::new(50_000),
+            base_reserve_permille: 150,
+            max_reserve_permille: 400,
         }
     }
 
@@ -181,6 +183,8 @@ mod tests {
         NodeObservation {
             pressure: DiskPressure::try_from(5_000).unwrap(),
             backlog: Bytes::new(9_000_000),
+            free: Bytes::ZERO,
+            cache: Bytes::ZERO,
             max_drain_rate: ByteRate::new(5_000_000),
             observed_p99: Duration::from_millis(10),
             error_bps: 0,
@@ -290,6 +294,7 @@ mod tests {
             std::slice::from_ref(&Allocation {
                 node: node.clone(),
                 budget: ByteRate::new(1),
+                reserve_permille: 150,
             }),
         )
         .await

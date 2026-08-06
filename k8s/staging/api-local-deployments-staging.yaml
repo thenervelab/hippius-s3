@@ -105,6 +105,37 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            # Which node this pod runs on. A promoted chunk is claimed for this node in
+            # cephor_ssd_residency so the drain-agent evictor on the SAME node can reclaim
+            # it; without an identity there is no recorder and promotion stays off.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Peers address each other by POD IP, not via a hostPort on the node IP: a
+            # host-ported request arrives SNAT'd from 192.168.x, which the api's
+            # ip_whitelist middleware rejects (it admits 10.x/172.x only).
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Read a chunk from the peer node holding it on flash (~6 ms + ~1 ms network)
+            # before falling through to the CephFS pool (~40 ms). Staging only.
+            - name: HIPPIUS_PEER_FETCH_ENABLED
+              value: "true"
+            # Warm this node's flash from whatever it had to read remotely, so a repeat read
+            # is local. Requires NODE_NAME (above) to claim residency for the evictor.
+            - name: HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ
+              value: "true"
+            # Per-peer fanout caps. A part that is hot and resident on ONE node otherwise
+            # draws every other node's fetches onto that node's api pod — the same uvicorn
+            # serving its own ingest. The client cap bounds what one pod sends; the serve cap
+            # sheds with 503 so five pods each within their own cap still cannot crowd out
+            # that node's PUTs.
+            - name: HIPPIUS_PEER_FETCH_MAX_INFLIGHT
+              value: "8"
+            - name: HIPPIUS_PEER_SERVE_MAX_INFLIGHT
+              value: "16"
             - name: K8S_NAMESPACE
               valueFrom:
                 fieldRef:

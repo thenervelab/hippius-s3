@@ -298,6 +298,22 @@ class FileSystemPartsStore:
 
         await asyncio.to_thread(_touch_all)
 
+    async def read_local_chunk(
+        self, object_id: str, object_version: int, part_number: int, chunk_index: int
+    ) -> Optional[bytes]:
+        """This store's OWN copy of a chunk, ignoring any fallback tier.
+
+        Serves the peer-fetch endpoint, where "local" is the whole point: a peer that
+        followed its fallback would put a network hop in front of the pool read the peer
+        tier exists to avoid, and two nodes resolving each other could bounce a request
+        between them rather than either just reading the pool.
+
+        Calls the base implementation explicitly rather than `self.get_chunk`, so a
+        subclass that adds fallback or peer tiers (DualFileSystemPartsStore) cannot change
+        what this returns.
+        """
+        return await FileSystemPartsStore.get_chunk(self, object_id, object_version, part_number, chunk_index)
+
     async def set_meta(
         self,
         object_id: str,

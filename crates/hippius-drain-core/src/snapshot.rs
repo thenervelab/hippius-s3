@@ -159,6 +159,16 @@ pub struct SnapshotCell {
     deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
     reclaimed: AtomicU64,
+    /// Resident parts the read-tier evictor unlinked, and the bytes they freed. Separate from
+    /// `reclaimed` (debris the reclaim worker removed) because the two answer different
+    /// questions: reclaim rising means junk is accumulating, eviction rising means the cache
+    /// is under space pressure and is giving up warm data.
+    evicted: AtomicU64,
+    evicted_bytes: AtomicU64,
+    /// Worklist entries the evictor REFUSED because they were not `replicated`. The durability
+    /// invariant, and the reason it is a counter rather than a log line: "has this ever been
+    /// non-zero" has to be answerable by an alert rule, not by grepping.
+    evict_blocked_unreplicated: AtomicU64,
     /// Aborted-reclaim counter mirroring `reclaimed`: bumped once per reclaim cycle that failed
     /// its object-backing read (`ReclaimError::Backing`). Monotonic, `Relaxed` — a stat counter
     /// with no cross-counter ordering dependency (axiom `rust_quality_92`). See
@@ -169,9 +179,22 @@ pub struct SnapshotCell {
     written_off_servable: AtomicU64,
     /// Current SSD backlog (undrained bytes) — a LEVEL, not a monotonic counter, so it
     /// has its own atomic (set, not accumulated) rather than living in [`AgentSnapshot`].
-    /// The heartbeat worker writes it (`usage.used_bytes`) each tick; the metrics layer
-    /// reads it as a gauge. Kept off the wait-free `load` path so a scrape never blocks.
+    /// The heartbeat worker writes it (from `Store::node_backlog_bytes`) each tick; the
+    /// metrics layer reads it as a gauge. Kept off the wait-free `load` path so a scrape
+    /// never blocks.
     backlog_bytes: AtomicU64,
+    /// Bytes this node holds RESIDENT on SSD to serve reads (`Store::node_cache_bytes`). A
+    /// gauge on the same tick as the backlog. Distinct from it precisely because the
+    /// allocator must not read warm cache as drain demand.
+    cache_bytes: AtomicU64,
+    /// Free bytes on the ingest SSD. The third leg of backlog/cache/free: without it a
+    /// dashboard cannot tell "cache grew" from "the disk filled".
+    free_bytes: AtomicU64,
+    /// The allocator's published free-space floor for this node, in permille of disk, plus
+    /// one so that 0 can mean "nothing published". A bare 0 would be ambiguous with a
+    /// legitimate reserve of 0 (the eviction kill-switch), and reading that as "no floor" on
+    /// a node whose allocator simply had not written yet would stop it evicting entirely.
+    allocated_reserve_permille_plus_one: AtomicU64,
     /// Count of this node's undrained replication rows (`pending` + `draining`) — a LEVEL like
     /// `backlog_bytes`, set each heartbeat from `Store::node_undrained_count`. This is the C8
     /// wedge signal, kept SEPARATE from `backlog_bytes` on purpose: the byte sum joins `parts`
@@ -247,6 +270,77 @@ impl SnapshotCell {
     /// [`AgentSnapshot::throttled`].
     pub fn record_throttled(&self, n: u64) {
         self.throttled.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Adds one eviction pass's outcome to the read-tier eviction totals.
+    pub fn record_evicted(&self, parts: u64, bytes: u64) {
+        self.evicted.fetch_add(parts, Ordering::Relaxed);
+        self.evicted_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The cumulative count of parts the evictor unlinked (`drain_ssd_evicted_total`).
+    #[must_use]
+    pub fn evicted(&self) -> u64 {
+        self.evicted.load(Ordering::Relaxed)
+    }
+
+    /// The cumulative bytes the evictor freed (`drain_ssd_evicted_bytes_total`).
+    #[must_use]
+    pub fn evicted_bytes(&self) -> u64 {
+        self.evicted_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records eviction candidates refused for not being `replicated`. Must stay at zero.
+    pub fn record_evict_blocked_unreplicated(&self, n: u64) {
+        self.evict_blocked_unreplicated.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Cumulative refused-candidate count (`drain_ssd_evict_blocked_unreplicated_total`).
+    #[must_use]
+    pub fn evict_blocked_unreplicated(&self) -> u64 {
+        self.evict_blocked_unreplicated.load(Ordering::Relaxed)
+    }
+
+    /// Records free bytes on the ingest SSD. A gauge: `store`, not add.
+    pub fn record_free_bytes(&self, bytes: u64) {
+        self.free_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The last-recorded free space (`drain_ssd_free_bytes`).
+    #[must_use]
+    pub fn free_bytes(&self) -> u64 {
+        self.free_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records the bytes currently resident on SSD as read cache. A gauge: `store`, not add.
+    pub fn record_cache_bytes(&self, bytes: u64) {
+        self.cache_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The last-recorded resident cache size (the `drain_ssd_cache_bytes` gauge).
+    #[must_use]
+    pub fn cache_bytes(&self) -> u64 {
+        self.cache_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records the allocator's published free-space floor for this node (permille of disk).
+    pub fn record_allocated_reserve_permille(&self, permille: u16) {
+        self.allocated_reserve_permille_plus_one.store(u64::from(permille) + 1, Ordering::Relaxed);
+    }
+
+    /// Clears the published floor, so the evictor falls back to its configured one. Used when
+    /// the allocation key expires or the leader predates per-node reserves.
+    pub fn clear_allocated_reserve_permille(&self) {
+        self.allocated_reserve_permille_plus_one.store(0, Ordering::Relaxed);
+    }
+
+    /// The allocator's published floor, or `None` when nothing has been published.
+    #[must_use]
+    pub fn allocated_reserve_permille(&self) -> Option<u16> {
+        match self.allocated_reserve_permille_plus_one.load(Ordering::Relaxed) {
+            0 => None,
+            raw => u16::try_from(raw - 1).ok(),
+        }
     }
 
     /// Records the current SSD backlog (undrained bytes). A gauge: `store`, not add.

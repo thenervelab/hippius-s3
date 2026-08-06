@@ -3,6 +3,7 @@
 When an object is being overwritten, the current version may have NULL kek_id/wrapped_dek
 for a brief window. The reader should fall back to the previous version rather than crash.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock
@@ -86,8 +87,15 @@ def _apply_patches(mocks: list) -> None:
 @pytest.mark.asyncio
 async def test_envelope_present_no_fallback():
     """When envelope is present, no fallback is needed."""
-    with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
-         _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6:
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+    ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
         obj_cache = FakeObjCache([True])
         db = FakeDB()
@@ -105,8 +113,15 @@ async def test_envelope_present_no_fallback():
 @pytest.mark.asyncio
 async def test_fallback_to_previous_version_on_missing_kek():
     """When kek_id is NULL on current version, falls back to previous version."""
-    with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
-         _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6:
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+    ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
 
         prev_info = _make_info(object_version=4, kek_id="kek-1", wrapped_dek=b"\x00" * 32)
@@ -126,8 +141,15 @@ async def test_fallback_to_previous_version_on_missing_kek():
 @pytest.mark.asyncio
 async def test_fallback_to_previous_version_on_missing_wrapped_dek():
     """When only wrapped_dek is NULL (kek_id present), still falls back."""
-    with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
-         _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6:
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+    ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
 
         prev_info = _make_info(object_version=9, kek_id="kek-1", wrapped_dek=b"\x00" * 32)
@@ -145,8 +167,15 @@ async def test_fallback_to_previous_version_on_missing_wrapped_dek():
 @pytest.mark.asyncio
 async def test_first_version_no_fallback_raises():
     """Version 1 with missing envelope has no previous version — must raise."""
-    with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
-         _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6:
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+    ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
 
         obj_cache = FakeObjCache([True])
@@ -162,8 +191,15 @@ async def test_first_version_no_fallback_raises():
 @pytest.mark.asyncio
 async def test_previous_version_not_found_raises():
     """If the previous version doesn't exist in DB, must raise."""
-    with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
-         _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6:
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+    ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
 
         db = FakeDB(fetchrow_returns=None)
@@ -179,8 +215,15 @@ async def test_previous_version_not_found_raises():
 @pytest.mark.asyncio
 async def test_previous_version_also_missing_envelope_raises():
     """If the previous version also has NULL envelope, must raise (no infinite recursion)."""
-    with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
-         _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6:
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+    ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
 
         # Previous version exists but also has NULL envelope
@@ -198,8 +241,15 @@ async def test_previous_version_also_missing_envelope_raises():
 @pytest.mark.asyncio
 async def test_missing_bucket_id_raises_even_with_fallback():
     """If bucket_id itself is missing, fallback shouldn't be attempted."""
-    with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
-         _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6:
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+    ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
 
         obj_cache = FakeObjCache([True])
@@ -217,8 +267,15 @@ async def test_fallback_logs_warning(caplog):
     """The fallback should log a warning for observability."""
     import logging
 
-    with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
-         _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6:
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+    ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
 
         prev_info = _make_info(object_version=99, kek_id="kek-1", wrapped_dek=b"\x00" * 32)
@@ -232,7 +289,9 @@ async def test_fallback_logs_warning(caplog):
             ctx = await build_stream_context(db, None, obj_cache, info, rng=None, address="addr1")
 
         assert ctx.object_version == 99
-        assert any("Envelope missing on v100" in rec.message and "falling back to v99" in rec.message for rec in caplog.records)
+        assert any(
+            "Envelope missing on v100" in rec.message and "falling back to v99" in rec.message for rec in caplog.records
+        )
 
 
 @pytest.mark.asyncio
@@ -240,10 +299,17 @@ async def test_cold_fallback_enqueues_download():
     """Regression (A1): a cold read of the fallback version (chunks NOT on FS) must enqueue a
     DownloadChainRequest. Previously the fallback returned a `pipeline` source without enqueuing
     anything, so the streamer hung on pub/sub until the wait timed out."""
-    with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
-         _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6, \
-         patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock) as m_enqueue, \
-         patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=[]):
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+        patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock) as m_enqueue,
+        patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=[]),
+    ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
         m3.return_value.download_coalesce_lock_ttl_seconds = 120
         m3.return_value.substrate_url = ""
@@ -271,10 +337,17 @@ async def test_cold_fallback_enqueues_download():
 @pytest.mark.asyncio
 async def test_warm_fallback_does_not_enqueue():
     """A warm fallback (chunks already on FS) must NOT enqueue — no wasted download work."""
-    with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
-         _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6, \
-         patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock) as m_enqueue, \
-         patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=[]):
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+        patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock) as m_enqueue,
+        patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=[]),
+    ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
         m3.return_value.download_coalesce_lock_ttl_seconds = 120
         m3.return_value.substrate_url = ""
@@ -298,10 +371,17 @@ async def test_cold_fallback_with_none_redis_does_not_crash():
     """A cold fallback read with redis=None (unit callers) must not crash on redis.set — the
     coalesce lock's try/except fails open (behaves as acquired), so the download is still enqueued.
     The main read path relies on this same fail-open behavior for redis=None."""
-    with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
-         _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6, \
-         patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock) as m_enqueue, \
-         patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=[]):
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+        patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock) as m_enqueue,
+        patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=[]),
+    ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
         m3.return_value.download_coalesce_lock_ttl_seconds = 120
         m3.return_value.substrate_url = ""
@@ -325,8 +405,15 @@ async def test_cold_fallback_with_none_redis_does_not_crash():
 @pytest.mark.asyncio
 async def test_fallback_queries_correct_version():
     """The fallback query uses version-1, not version-2 or some other number."""
-    with _PATCHES[0] as m0, _PATCHES[1] as m1, _PATCHES[2] as m2, _PATCHES[3] as m3, \
-         _PATCHES[4] as m4, _PATCHES[5] as m5, _PATCHES[6] as m6:
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+    ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
 
         prev_info = _make_info(object_version=41, kek_id="kek-1", wrapped_dek=b"\x00" * 32)

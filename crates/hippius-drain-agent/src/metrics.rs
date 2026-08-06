@@ -71,6 +71,67 @@ fn build_provider(service_name: &'static str) -> Option<SdkMeterProvider> {
     Some(provider)
 }
 
+/// Registers the SSD read-tier instruments: how much is resident, and how fast the evictor is
+/// giving it back.
+///
+/// Split out of [`init`] to keep it under the 100-line limit, and because these three read as
+/// one story: `cache_bytes` climbing while `evicted_total` stays flat is a node heading for
+/// `fs_cache_pressure` 503s.
+fn register_ssd_tier_instruments(meter: &opentelemetry::metrics::Meter, snapshot: &Arc<SnapshotCell>, instruments: &mut Vec<Box<dyn std::any::Any>>) {
+    // Resident read-tier size (gauge): bytes this node holds on SSD to serve reads. The
+    // counterpart to the backlog gauge, and deliberately separate from it — the allocator
+    // counts this toward ingest headroom, not against it, so conflating the two is what would
+    // make a warm cache read as a drain emergency. Also the direct answer to "is the read tier
+    // actually filling up", which was the whole point of retaining parts.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_ssd_cache_bytes")
+            .with_callback(move |observer| observer.observe(snap.cache_bytes(), &[]))
+            .build(),
+    ));
+
+    // Eviction throughput (monotonic counters): parts and bytes the read-tier evictor
+    // reclaimed. With retention on, the evictor is the ONLY worker freeing the ingest SSD, so
+    // this staying flat while cache_bytes climbs toward the disk size is the tell that ingest
+    // is heading for fs_cache_pressure 503s.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_evicted_total")
+            .with_callback(move |observer| observer.observe(snap.evicted(), &[]))
+            .build(),
+    ));
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_evicted_bytes_total")
+            .with_callback(move |observer| observer.observe(snap.evicted_bytes(), &[]))
+            .build(),
+    ));
+
+    // The eviction durability invariant, as a counter so an alert can assert it stays at zero.
+    // Non-zero means the worklist offered a part whose SSD copy may be the only durable one —
+    // refused, but the query and the invariant have diverged.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_evict_blocked_unreplicated_total")
+            .with_callback(move |observer| observer.observe(snap.evict_blocked_unreplicated(), &[]))
+            .build(),
+    ));
+
+    // Free space: the third leg of backlog/cache/free. Without it a dashboard cannot separate
+    // "the read cache grew" from "the disk is filling with backlog".
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_ssd_free_bytes")
+            .with_callback(move |observer| observer.observe(snap.free_bytes(), &[]))
+            .build(),
+    ));
+}
+
 /// Builds the meter provider and registers the agent's metrics, or returns `None` when
 /// monitoring is disabled or the exporter cannot be built. `enforcer` is `None` for an
 /// ungated drain (no breaker to observe).
@@ -102,6 +163,8 @@ pub fn init(service_name: &'static str, snapshot: &Arc<SnapshotCell>, enforcer: 
             .with_callback(move |observer| observer.observe(snap.backlog(), &[]))
             .build(),
     ));
+
+    register_ssd_tier_instruments(&meter, snapshot, &mut instruments);
 
     // Reclaim throughput: terminal SSD parts the reclaim worker unlinked (monotonic counter).
     // The SSD-ingest tier's eviction rate — distinct from the drain's CephFS throughput — so a

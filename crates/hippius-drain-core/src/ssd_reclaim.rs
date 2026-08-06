@@ -1,13 +1,22 @@
 //! The SSD-ingest reclaim backstop: clean up parts stranded on the node-local SSD that the
 //! drain pipeline structurally cannot reach.
 //!
-//! Scope is the leaks whose row `claim_part` never re-selects, so the drain never unlinks
-//! their SSD copy and it leaks with nothing else to reclaim it — three dispositions, each
-//! detailed below: aborted/abandoned uploads ([`Failed`](ReplicationState::Failed) — an MPU
-//! abort, an abandoned MPU the reaper marked terminal, or a failed single-part PUT),
-//! `replicated` crash-orphans (a crash between the `mark_replicated` commit and the drain's
-//! own unlink), and deleted-object orphans (a part whose object was hard-deleted). This
-//! worker is that missing owner.
+//! Scope is the leaks whose row `claim_part` never re-selects, so nothing else would ever
+//! remove them — two dispositions, each detailed below: aborted/abandoned uploads
+//! ([`Failed`](ReplicationState::Failed) — an MPU abort, an abandoned MPU the reaper marked
+//! terminal, or a failed single-part PUT), and deleted-object orphans (a part whose object was
+//! hard-deleted). This worker is that missing owner.
+//!
+//! It is emphatically NOT the owner of `replicated` parts. Those are RETAINED on purpose —
+//! they are the node's read tier, served from local `NVMe` at ~705 MB/s / ~6 ms per chunk
+//! against the pool's ~94 MB/s / ~40 ms — and they are reclaimed by
+//! [`evict_to_target`](crate::evict_to_target) on a free-space policy, oldest-resident first
+//! and only as much as the disk needs. This module handles DEBRIS; the evictor handles CACHE.
+//! Before retention the drain unlinked its own copy at commit, so anything `replicated` left
+//! on disk could only be a crash between the commit and that unlink, and this worker
+//! re-drove it. Retention removed that inference: a lingering `replicated` part is now the
+//! normal steady state. Sweeping it on an age gate would discard hot cache from a disk with
+//! terabytes free and quietly undo retention entirely.
 //!
 //! But `failed` is not a clean proxy for "safe to delete": the drain's corruption path
 //! (`mark_failed` on a persistent `ChunkMismatch`) can mark a part of a *servable, live*
@@ -31,31 +40,8 @@
 //! `failed`-marking sweep + the `failed` path here, NOT treated as an orphan — that
 //! avoids racing an in-progress MPU whose reserved row is also unservable.
 //!
-//! It reclaims **`replicated` crash-orphans**: on the happy path the drain unlinks its own
-//! SSD copy the instant it commits a replication. A replicated copy that lingers is a
-//! **drain crash-orphan** — a crash between the `mark_replicated` commit and the unlink —
-//! which `claim_part` never re-selects, so nothing else re-drives the unlink and it leaks
-//! (an inode/dir leak on `/s3-data`, unbounded across agent restarts). This worker re-drives
-//! it: a `replicated` part older than `replicated_grace` is unlinked, which is exactly what
-//! the happy-path unlink would have done. The safety argument is that this is strictly weaker
-//! than the happy path, not stronger: that unlink runs milliseconds after the commit, so
-//! re-driving it after a grace introduces no risk the happy path does not already accept.
-//! Note the ingest SSD IS read — it is the api-local reader's *primary* tier, with the
-//! `CephFS` pool as its read *fallback* (`DualFileSystemPartsStore`) — so a same-node GET can
-//! hit the SSD copy first. But `mark_replicated` is committed only after the pool copy is
-//! written, byte-verified, and fsynced, so deleting the SSD copy merely makes a same-node read
-//! fall through to that durable fallback (the exact behaviour the fallback tier exists for),
-//! identical to the drain's own post-commit unlink. The pool copy is thus authoritative — the
-//! `replicated` state IS the drain's own record that the `CephFS` copy exists — and, unlike a
-//! `failed` part, a `replicated` one is never a corrupt-live object's last good source (a
-//! corrupt pool copy transitions the row to `failed`/`corrupt`, out of this arm), so no
-//! servability gate is needed. The grace only avoids racing a just-committed part whose
-//! in-process unlink has not yet run; a young `replicated` part is left (`skipped_replicated`).
-//! (An in-flight MPU whose address takes longer than the grace to finalize is reclaimed while
-//! still `replicated`/un-enqueued — safe: reads are served from the pool and the janitor's
-//! replication gate holds the pool copy until the upload backends have it.) `pending`/`draining`
-//! parts are live (owned by the drain pipeline) and a no-row part whose object still exists may
-//! be mid-upload — both are left strictly alone.
+//! `pending`/`draining` parts are live (owned by the drain pipeline) and a no-row part whose
+//! object still exists may be mid-upload — both are left strictly alone.
 //!
 //! Safety: `failed` is a terminal sink (nothing returns a row to `pending` except
 //! `release_part`/`defer_part`, each guarded on `status='draining'`), so the read can
@@ -104,8 +90,8 @@ pub struct PartStatusAge {
 }
 
 /// The per-disposition grace windows [`reclaim_ssd`] gates each deletion on. Grouped into a
-/// named struct so the three same-typed `Duration`s are labelled at every call site rather
-/// than passed as three adjacent positional args (which are trivial to transpose).
+/// named struct so the two same-typed `Duration`s are labelled at every call site rather
+/// than passed as adjacent positional args (which are trivial to transpose).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReclaimGraces {
     /// How long an aged `failed` (aborted/abandoned-upload) part is kept before reclaim — a
@@ -114,10 +100,6 @@ pub struct ReclaimGraces {
     /// How long a no-DB-backing (deleted-object) orphan is kept before reclaim. Keyed on the
     /// part's FS `meta.json` age, so set generously to absorb the agent-clock dependence.
     pub orphan: Duration,
-    /// How long a `replicated` crash-orphan is kept before the reclaim re-drives the drain's
-    /// own unlink. Keyed on the store clock (`updated_at`); only clears the in-flight-unlink
-    /// window, so it can be short.
-    pub replicated: Duration,
 }
 
 /// The store seam the reclaim worker needs: read the replication state + age of a
@@ -189,17 +171,11 @@ pub struct ReclaimReport {
     /// `object_versions` row (a hard-deleted object), aged past `orphan_grace`. The
     /// deleted-object leak the `failed` path cannot reach — see the module doc.
     pub reclaimed_orphan: u64,
-    /// `replicated` crash-orphans reclaimed: the drain committed `mark_replicated` but crashed
-    /// before unlinking its SSD copy, so nothing re-drove the unlink. Reclaimed once older than
-    /// `replicated_grace` — re-driving the happy-path unlink the crash skipped. See the module
-    /// doc and [`skipped_replicated`](Self::skipped_replicated).
-    pub reclaimed_replicated: u64,
     /// Left alone because still `pending`/`draining` — owned by the drain pipeline.
     pub skipped_live: u64,
-    /// Left alone because `replicated` but still within `replicated_grace` — a just-committed
-    /// part whose happy-path unlink may not have run yet. Aged ones are reclaimed
-    /// ([`reclaimed_replicated`](Self::reclaimed_replicated)), so this counts only the
-    /// transient in-flight-unlink window, not an unreclaimable leak.
+    /// Retained `replicated` parts — the node's read tier. Not a leak and not a backlog: this
+    /// is the steady-state population on a healthy node, and it is the evictor's to reclaim,
+    /// never this worker's. Expect it to dominate the scan.
     pub skipped_replicated: u64,
     /// Left alone because the store has no replication row and the part still has a live
     /// `object_versions` row (pre-reconcile or mid-upload) — or is not yet past
@@ -227,7 +203,6 @@ impl ReclaimReport {
     pub fn categorized(&self) -> u64 {
         self.reclaimed
             .saturating_add(self.reclaimed_orphan)
-            .saturating_add(self.reclaimed_replicated)
             .saturating_add(self.skipped_live)
             .saturating_add(self.skipped_replicated)
             .saturating_add(self.skipped_absent)
@@ -373,21 +348,19 @@ where
         match status.state {
             // Live: owned by the drain pipeline.
             ReplicationState::Pending | ReplicationState::Draining => report.skipped_live += 1,
-            // Replicated: the drain unlinks its own SSD copy the instant it commits, so a
-            // lingering one is a crash-orphan (a crash between the commit and the unlink).
-            // Re-drive that unlink once past `replicated_grace` — exactly what the happy path
-            // would have done, and strictly weaker than it (see the module doc). No
-            // servability gate is needed: unlike `failed`, a `replicated` part is never a
-            // corrupt-live object's last good source. A young one is left in case its
-            // in-flight unlink has simply not run yet.
-            ReplicationState::Replicated => {
-                if status.age >= graces.replicated {
-                    remover.unlink_part(part).await.map_err(ReclaimError::Remove)?;
-                    report.reclaimed_replicated += 1;
-                } else {
-                    report.skipped_replicated += 1;
-                }
-            }
+            // Replicated: RETAINED on purpose. This is the node's read tier — a local GET
+            // serves it at ~705 MB/s / ~6 ms per chunk instead of ~94 MB/s / ~40 ms from the
+            // pool — so a lingering `replicated` part is the intended steady state, not a
+            // crash-orphan to sweep. It used to be the latter, because the drain unlinked its
+            // own copy at commit and anything left behind could only be a crash between the
+            // two; retention removed that inference entirely.
+            //
+            // Reclaiming these is now the EVICTOR's job (`crate::evict_to_target`), and the
+            // distinction is not cosmetic: the evictor deletes on a free-space policy, oldest
+            // resident first, only as much as the disk needs. An age-based sweep here would
+            // throw away hot cache on a disk with terabytes free, quietly undoing retention —
+            // which is exactly what shipping the retention change without this arm would do.
+            ReplicationState::Replicated => report.skipped_replicated += 1,
             // Failed = a broken/abandoned upload (MPU abort, abandoned MPU, or a failed
             // single-part PUT) — reclaimed once past grace — UNLESS the version is still
             // servable, in which case `failed` means "corrupt pool copy on a live object"
@@ -627,14 +600,10 @@ mod tests {
     const HOUR: Duration = Duration::from_hours(1);
     const GRACE: Duration = Duration::from_mins(30);
     const ORPHAN_GRACE: Duration = Duration::from_mins(45);
-    // Larger than the `HOUR` age the existing `replicated` fixtures use, so those parts stay
-    // within grace (`skipped_replicated`); the reclaim-when-aged cases below use ages past it.
-    const REPLICATED_GRACE: Duration = Duration::from_hours(2);
     // The default graces most tests pass; the boundary/proptest cases build their own.
     const GRACES: ReclaimGraces = ReclaimGraces {
         failed: GRACE,
         orphan: ORPHAN_GRACE,
-        replicated: REPLICATED_GRACE,
     };
 
     #[tokio::test]
@@ -650,10 +619,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_replicated_part_within_grace_is_left_for_the_drains_own_unlink() {
-        // A `replicated` part younger than `replicated_grace` may have just committed, with its
-        // happy-path unlink still in flight — leave it; the crash-orphan reclaim waits out the
-        // grace before re-driving. HOUR < REPLICATED_GRACE (2h), so this is within grace.
+    async fn a_freshly_replicated_part_is_retained() {
+        // Retention is unconditional and immediate: a part is the read tier from the moment it
+        // commits, with no window in which this worker might still take it.
         let part = part_at(UUID_A, 5, 1);
         let scan = FakeScan::of(std::slice::from_ref(&part));
         let remover = FakeRemover::default();
@@ -661,12 +629,11 @@ mod tests {
 
         let report = reclaim_ssd(&scan, &remover, &log, &FakeBacking::all_backed(), GRACES).await.unwrap();
         assert_eq!(report.skipped_replicated, 1);
-        assert_eq!(report.reclaimed_replicated, 0);
-        assert!(remover.removed().is_empty(), "a within-grace replicated part is not reclaimed");
+        assert!(remover.removed().is_empty(), "a replicated part is never reclaimed here");
     }
 
     #[tokio::test]
-    async fn an_aged_replicated_crash_orphan_is_reclaimed() {
+    async fn an_aged_replicated_part_is_retained_not_reclaimed() {
         // The leak this fix targets: the drain committed `mark_replicated` but crashed before
         // unlinking its SSD copy (agent SIGKILL on eviction/OOM/restart), so nothing re-drove
         // the unlink and the dir lingers forever. Past `replicated_grace` it is unlinked —
@@ -677,32 +644,21 @@ mod tests {
         let log = FakeLog::with(&[(&part, ReplicationState::Replicated, Duration::from_hours(3))]);
 
         let report = reclaim_ssd(&scan, &remover, &log, &FakeBacking::all_backed(), GRACES).await.unwrap();
-        assert_eq!(report.reclaimed_replicated, 1);
-        assert_eq!(report.skipped_replicated, 0);
-        assert_eq!(remover.removed(), vec![key(&part)], "the aged replicated crash-orphan was unlinked");
+        assert_eq!(report.skipped_replicated, 1, "a replicated part is the read tier, held at any age");
+        assert!(
+            remover.removed().is_empty(),
+            "the reclaimer must never evict a retained part — the evictor owns that, on a free-space policy",
+        );
     }
 
     #[tokio::test]
-    async fn a_replicated_crash_orphan_exactly_at_the_grace_boundary_is_reclaimed() {
-        // The gate is `age >= replicated_grace -> reclaim`, mirroring the failed/orphan arms,
-        // so age == grace reclaims. Pins the boundary against a future `>=` vs `>` slip.
-        let part = part_at(UUID_A, 5, 1);
-        let scan = FakeScan::of(std::slice::from_ref(&part));
-        let remover = FakeRemover::default();
-        let log = FakeLog::with(&[(&part, ReplicationState::Replicated, REPLICATED_GRACE)]);
-
-        let report = reclaim_ssd(&scan, &remover, &log, &FakeBacking::all_backed(), GRACES).await.unwrap();
-        assert_eq!(report.reclaimed_replicated, 1, "age == replicated_grace reclaims");
-        assert_eq!(report.skipped_replicated, 0);
-    }
-
-    #[tokio::test]
-    async fn an_aged_replicated_crash_orphan_is_reclaimed_even_when_servable() {
-        // Unlike `failed`, a `replicated` part is reclaimed regardless of servability — a
-        // servable object is the normal case, and its pool copy is authoritative (a corrupt
-        // pool copy would have transitioned the row to failed/corrupt, out of this arm). The
-        // servability read is for the `failed` arm only and must NOT gate this one, so it is
-        // never even consulted for a `replicated` part.
+    async fn a_replicated_part_is_retained_without_consulting_servability() {
+        // A `replicated` part is held regardless of servability — a servable object is the
+        // normal case, and its pool copy is authoritative (a corrupt pool copy would have
+        // transitioned the row to failed/corrupt, out of this arm). The servability read
+        // exists for the `failed` arm only, so it must never be consulted here: paying an
+        // object_versions round-trip for the single most common state on the disk would put
+        // a query on the steady-state path for no decision it can influence.
         let part = part_at(UUID_A, 5, 1);
         let scan = FakeScan::of(std::slice::from_ref(&part));
         let remover = FakeRemover::default();
@@ -710,8 +666,8 @@ mod tests {
         let backing = FakeBacking::servable(&[&part]);
 
         let report = reclaim_ssd(&scan, &remover, &log, &backing, GRACES).await.unwrap();
-        assert_eq!(report.reclaimed_replicated, 1, "a servable replicated part is still reclaimed");
-        assert_eq!(remover.removed(), vec![key(&part)]);
+        assert_eq!(report.skipped_replicated, 1, "a servable replicated part is retained");
+        assert!(remover.removed().is_empty());
         assert!(
             backing.servable_asked().is_empty(),
             "the servability read is never consulted for a replicated part"
@@ -808,7 +764,6 @@ mod tests {
                 scanned: 5,
                 reclaimed: 1,
                 reclaimed_orphan: 0,
-                reclaimed_replicated: 0,
                 skipped_live: 1,
                 skipped_replicated: 1,
                 skipped_absent: 1,
@@ -1192,7 +1147,7 @@ mod tests {
                 let refs: Vec<&PartKey> = unbacked_refs.iter().collect();
                 let backing = FakeBacking::unbacked(&refs);
 
-                let graces = ReclaimGraces { failed: GRACE, orphan: orphan_grace, replicated: REPLICATED_GRACE };
+                let graces = ReclaimGraces { failed: GRACE, orphan: orphan_grace };
                 let report = reclaim_ssd(&scan, &remover, &log, &backing, graces).await.unwrap();
                 expected_removed.sort();
                 proptest::prop_assert_eq!(remover.removed(), expected_removed.clone());

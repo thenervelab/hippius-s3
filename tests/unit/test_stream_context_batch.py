@@ -187,9 +187,7 @@ async def test_supplied_parts_skip_read_parts_list(
 
     from hippius_s3.services.object_reader import build_stream_context
 
-    ctx = await build_stream_context(
-        db, None, obj_cache, _make_info(), rng=None, address="addr1", parts=supplied
-    )
+    ctx = await build_stream_context(db, None, obj_cache, _make_info(), rng=None, address="addr1", parts=supplied)
 
     assert ctx.source == "cache"
     mock_read_parts.assert_not_awaited()

@@ -605,10 +605,6 @@ impl PartSource for LocalSsd {
     async fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> io::Result<String> {
         hash_file(&part_dir(&self.root, part).join(chunk_file_name(index))).await
     }
-
-    async fn remove_part(&self, part: &PartKey) -> io::Result<()> {
-        remove_part_dir(&self.root, part).await
-    }
 }
 
 impl PartPool for LocalFs {
@@ -723,9 +719,10 @@ impl PartScan for LocalSsd {
 
 impl PartRemover for LocalSsd {
     async fn unlink_part(&self, part: &PartKey) -> io::Result<()> {
-        // The reclaim worker's removal seam — the same idempotent whole-part unlink the
-        // drain's success path (`PartSource::remove_part`) uses, so a reclaim racing
-        // that unlink is harmless.
+        // The sole whole-part unlink seam, shared by the reclaim worker (debris) and the
+        // read-tier evictor (resident parts). Idempotent, so two of them racing — or a
+        // re-drive after a crash — is harmless. The drain itself no longer unlinks at all:
+        // it retains its copy to serve reads.
         remove_part_dir(&self.root, part).await
     }
 }
@@ -1139,6 +1136,12 @@ mod part_tests {
             async move { Ok(self.status.lock().unwrap().get(&key).copied()) }
         }
 
+        // Residency accounting is the Postgres store's job; this in-memory double only
+        // exercises the drain's copy/verify/commit ordering.
+        async fn mark_resident(&self, _part: &PartKey, _bytes: u64) -> Result<(), io::Error> {
+            Ok(())
+        }
+
         fn mark_replicated(&self, part: &ClaimedPart, _proof: &PartVerified) -> impl Future<Output = Result<(), io::Error>> + Send {
             let key = Self::key(part.part());
             async move {
@@ -1220,16 +1223,16 @@ mod part_tests {
     }
 
     #[tokio::test]
-    async fn source_remove_part_is_idempotent() {
+    async fn unlink_part_is_idempotent() {
         let dir = TempDir::new().unwrap();
         let part = part_key(5, 1);
         seed_ssd_part(dir.path(), &part, &[(0, b"x")]);
         let ssd = LocalSsd::new(dir.path());
 
-        ssd.remove_part(&part).await.unwrap();
+        ssd.unlink_part(&part).await.unwrap();
         assert!(!dir.path().join(part.relative_dir()).exists(), "the part dir is gone");
         // A second remove of an already-absent part is Ok (idempotent re-drive).
-        ssd.remove_part(&part).await.unwrap();
+        ssd.unlink_part(&part).await.unwrap();
     }
 
     #[tokio::test]
@@ -1345,7 +1348,7 @@ mod part_tests {
     }
 
     #[tokio::test]
-    async fn end_to_end_part_drain_copies_verifies_commits_and_unlinks() {
+    async fn end_to_end_part_drain_copies_verifies_commits_and_retains() {
         let ssd_dir = TempDir::new().unwrap();
         let pool_dir = TempDir::new().unwrap();
         let part = part_key(5, 1);
@@ -1369,7 +1372,10 @@ mod part_tests {
         );
         assert!(pool_part.join("chunk_1.bin").exists());
         assert!(pool_part.join("meta.json").exists(), "meta marker copied last");
-        assert!(!ssd_part.exists(), "SSD part unlinked only after a verified, committed copy exists");
+        assert!(
+            ssd_part.exists(),
+            "the SSD copy is retained as this node's read tier once a verified pool copy exists",
+        );
         assert_eq!(store.status_of(&part), Some(ReplicationState::Replicated));
     }
 

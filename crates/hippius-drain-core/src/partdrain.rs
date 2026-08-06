@@ -54,8 +54,6 @@ pub enum DrainStep {
     Hash,
     /// Removing a corrupt `CephFS` copy after a verify mismatch.
     Cleanup,
-    /// Unlinking the SSD copy after a durable commit.
-    Unlink,
 }
 
 impl core::fmt::Display for DrainStep {
@@ -65,7 +63,6 @@ impl core::fmt::Display for DrainStep {
             Self::Persist => "persist",
             Self::Hash => "hash",
             Self::Cleanup => "cleanup",
-            Self::Unlink => "unlink",
         })
     }
 }
@@ -171,10 +168,6 @@ pub trait PartSource: Send + Sync {
 
     /// The lowercase-hex content hash of one source chunk (to verify the copy).
     fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> impl Future<Output = std::io::Result<String>> + Send;
-
-    /// Unlink the part's whole SSD dir after a committed drain; an already-absent
-    /// dir is `Ok` (idempotent, so a re-drive after a crash still converges).
-    fn remove_part(&self, part: &PartKey) -> impl Future<Output = std::io::Result<()>> + Send;
 }
 
 /// The durable shared `CephFS` pool a part is drained *to*.
@@ -223,6 +216,17 @@ pub trait PartReplicationStore: Send + Sync {
     /// Commit the part as `Replicated`. The unforgeable `&PartVerified` proves the
     /// copy was verified, so this cannot be called before verification.
     fn mark_replicated(&self, part: &ClaimedPart, proof: &PartVerified) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Record that this node is KEEPING the part's SSD copy to serve reads, with its size for
+    /// the evictor's accounting.
+    ///
+    /// Called just BEFORE the commit, not after, and the order matters. The part is already on
+    /// the disk, so recording residency first means a crash between the two leaves a residency
+    /// row for a still-`draining` part — which the eviction worklist's status guard refuses,
+    /// and which the reclaimer clears if the part never commits. The reverse order could commit
+    /// a part whose residency was never recorded: a copy on the disk that no evictor can see
+    /// and no `cache_bytes` sum counts, leaking space until the node fills.
+    fn mark_resident(&self, part: &PartKey, bytes: u64) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Stamp that this part's backend `UploadChainRequest` has been published (sets
     /// `upload_enqueued_at`). Called after a successful enqueue — inline in [`drain_part`]
@@ -379,8 +383,7 @@ impl PartDrainError {
             // source): none is evidence of pool unhealth. Matched BEFORE the general `Io`
             // arm so an SSD-side `Io` is caught here first.
             Self::Io {
-                step: DrainStep::SsdRead | DrainStep::Unlink,
-                ..
+                step: DrainStep::SsdRead, ..
             }
             | Self::Store(_)
             | Self::IncompleteSource { .. } => false,
@@ -434,11 +437,10 @@ where
 {
     let part = claim.part();
 
-    // Idempotent fast path: a prior run already committed this part, so the pool
-    // copy is durable. The only remaining obligation is to free the SSD copy — the
-    // previous run may have crashed between commit and unlink.
+    // Idempotent fast path: a prior run already committed this part, so the pool copy is
+    // durable and there is nothing left to do. The SSD copy is deliberately left in place —
+    // it is this node's read tier, and the evictor reclaims it on a free-space policy.
     if store.status(part).await.map_err(PartDrainError::store)? == Some(ReplicationState::Replicated) {
-        ssd.remove_part(part).await.map_err(PartDrainError::io(DrainStep::Unlink))?;
         return Ok(DrainOutcome::AlreadyReplicated);
     }
 
@@ -523,10 +525,13 @@ where
     ceph.finalize_part(part).await.map_err(PartDrainError::io(DrainStep::Persist))?;
     let verified = PartVerified(());
 
+    // Claim the SSD copy as read-tier cache BEFORE committing — see `mark_resident`. The size
+    // comes from the manifest already read for the completeness gate, so this costs no extra
+    // I/O and never has to join `parts` on the drain path.
+    store.mark_resident(part, meta.size_bytes).await.map_err(PartDrainError::store)?;
+
     // Commit Replicated as soon as the verified copy is durable on the pool — the Ceph
-    // commit is DECOUPLED from the address-gated backend enqueue. Only past this point does a
-    // durable, verified, committed copy exist, so removing the SSD part is safe (the backend
-    // uploader reads the chunks from the shared pool, not this SSD source).
+    // commit is DECOUPLED from the address-gated backend enqueue.
     store.mark_replicated(claim, &verified).await.map_err(PartDrainError::store)?;
 
     // Best-effort backend enqueue, decoupled from the commit. For a simple PUT or a completed
@@ -541,7 +546,12 @@ where
         store.mark_upload_enqueued(part).await.map_err(PartDrainError::store)?;
     }
 
-    ssd.remove_part(part).await.map_err(PartDrainError::io(DrainStep::Unlink))?;
+    // The SSD copy is RETAINED, not unlinked. Draining a part means "a verified copy now
+    // exists on the pool", not "the local copy is surplus": local NVMe serves a GET at
+    // ~705 MB/s / ~6 ms per chunk against the pool's ~94 MB/s / ~40 ms, so throwing the copy
+    // away at commit was discarding the fast tier the moment it became safe to keep. Space is
+    // reclaimed by the evictor on a free-space policy instead (`crate::evict_to_target`),
+    // which is why `mark_replicated` stamps `resident_at` in the same statement as the commit.
     Ok(DrainOutcome::Replicated)
 }
 
@@ -642,7 +652,7 @@ mod tests {
         // it must NOT trip the node-global Ceph breaker. This is the `Persist`-overload bug: the
         // same steps used to be tagged `Persist` (Ceph-write), so a local SSD-read EIO wrongly
         // tripped the breaker and wedged draining of a healthy pool.
-        for step in [DrainStep::SsdRead, DrainStep::Unlink] {
+        for step in [DrainStep::SsdRead] {
             for kind in [io::ErrorKind::Other, io::ErrorKind::PermissionDenied, io::ErrorKind::TimedOut] {
                 let ssd_io = PartDrainError::Io {
                     step,
@@ -721,7 +731,6 @@ mod tests {
         PoolHash,
         Cleanup,
         Commit,
-        Unlink,
     }
 
     /// One part's contents: chunk index -> content hash, and whether meta landed.
@@ -742,6 +751,8 @@ mod tests {
         ssd: HashMap<String, PartState>,
         pool: HashMap<String, PartState>,
         status: HashMap<String, ReplicationState>,
+        /// Parts claimed as read-tier cache (`mark_resident`), and the size recorded for each.
+        resident: HashMap<String, u64>,
         fault: Fault,
         corrupt_persist: bool,
         /// Specific chunk indices a persist corrupts (in addition to `corrupt_persist`),
@@ -920,18 +931,6 @@ mod tests {
                     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no ssd chunk"))
             }
         }
-
-        fn remove_part(&self, part: &PartKey) -> impl Future<Output = io::Result<()>> + Send {
-            let part = part.clone();
-            async move {
-                let mut world = self.world.lock().unwrap();
-                if world.fault == Fault::Unlink {
-                    return Err(io::Error::other("unlink failed"));
-                }
-                world.ssd.remove(&key_of(&part));
-                Ok(())
-            }
-        }
     }
 
     impl PartPool for Fakes {
@@ -1021,6 +1020,14 @@ mod tests {
             async move { Ok(self.world.lock().unwrap().status.get(&key_of(&part)).copied()) }
         }
 
+        fn mark_resident(&self, part: &PartKey, bytes: u64) -> impl Future<Output = Result<(), io::Error>> + Send {
+            let part = part.clone();
+            async move {
+                self.world.lock().unwrap().resident.insert(key_of(&part), bytes);
+                Ok(())
+            }
+        }
+
         fn mark_replicated(&self, part: &ClaimedPart, _proof: &PartVerified) -> impl Future<Output = Result<(), io::Error>> + Send {
             let key = key_of(part.part());
             async move {
@@ -1085,7 +1092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn happy_path_copies_every_chunk_then_meta_then_commits_then_unlinks() {
+    async fn happy_path_copies_every_chunk_then_meta_then_commits_and_retains_the_ssd_copy() {
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]);
 
@@ -1097,7 +1104,10 @@ mod tests {
         assert_eq!(pooled.chunks.get(&0).map(String::as_str), Some("h0"));
         assert_eq!(pooled.chunks.get(&1).map(String::as_str), Some("h1"));
         assert!(pooled.has_meta, "meta.json written");
-        assert!(!fakes.ssd_has(&part), "SSD part unlinked only after commit");
+        assert!(
+            fakes.ssd_has(&part),
+            "the SSD copy is RETAINED to serve reads; the evictor owns it now, not the drain",
+        );
         assert_eq!(fakes.enqueued(), vec![key_of(&part)], "the backend upload was enqueued");
         assert_eq!(
             fakes.upload_stamped(),
@@ -1109,10 +1119,10 @@ mod tests {
     #[tokio::test]
     async fn a_not_ready_enqueue_still_commits_replicated_and_leaves_it_unstamped() {
         // Decoupled commit: if the backend enqueue is not ready (an in-flight MPU whose
-        // address is NULL) the drain STILL commits Replicated and unlinks the SSD copy — the
-        // part is Ceph-durable now, and the agent's enqueue sweep re-publishes the backend
-        // upload once the address lands. upload_enqueued_at stays unstamped so the sweep
-        // knows this part is still outstanding. (The old behavior deferred + re-copied here.)
+        // address is NULL) the drain STILL commits Replicated — the part is Ceph-durable now,
+        // and the agent's enqueue sweep re-publishes the backend upload once the address
+        // lands. upload_enqueued_at stays unstamped so the sweep knows this part is still
+        // outstanding. (The old behavior deferred + re-copied here.)
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).enqueue_fault();
 
@@ -1124,7 +1134,7 @@ mod tests {
             Some(ReplicationState::Replicated),
             "the Ceph commit is decoupled from the enqueue",
         );
-        assert!(!fakes.ssd_has(&part), "the SSD copy is freed (the uploader reads from the pool)");
+        assert!(fakes.ssd_has(&part), "the SSD copy is retained regardless of the enqueue outcome");
         assert!(
             fakes.upload_stamped().is_empty(),
             "a not-ready enqueue leaves upload_enqueued_at NULL for the sweep to pick up",
@@ -1136,7 +1146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_replicated_part_only_unlinks_the_ssd_copy() {
+    async fn an_already_replicated_part_is_a_noop_that_keeps_its_retained_copy() {
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0")]);
         fakes.world.lock().unwrap().status.insert(key_of(&part), ReplicationState::Replicated);
@@ -1144,7 +1154,10 @@ mod tests {
         let outcome = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
 
         assert_eq!(outcome, DrainOutcome::AlreadyReplicated);
-        assert!(!fakes.ssd_has(&part), "lingering SSD copy reclaimed");
+        assert!(
+            fakes.ssd_has(&part),
+            "a committed part's SSD copy is its read tier, not a crash-orphan to reclaim",
+        );
         assert!(fakes.pool_part(&part).is_none(), "no redundant re-copy to the pool");
     }
 
@@ -1310,7 +1323,7 @@ mod tests {
         let outcome = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
 
         assert_eq!(outcome, DrainOutcome::Replicated);
-        assert!(!fakes.ssd_has(&part));
+        assert!(fakes.ssd_has(&part), "the re-drive commits and retains, same as a clean drain");
         assert_eq!(fakes.status_of(&part), Some(ReplicationState::Replicated));
     }
 
