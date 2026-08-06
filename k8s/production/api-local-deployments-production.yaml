@@ -114,13 +114,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # Which node this pod runs on. A promoted chunk is claimed for this node in
-            # cephor_ssd_residency so the drain-agent evictor on the SAME node can reclaim
-            # it; without an identity there is no recorder and promotion stays off.
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
             - name: K8S_NAMESPACE
               valueFrom:
                 fieldRef:
