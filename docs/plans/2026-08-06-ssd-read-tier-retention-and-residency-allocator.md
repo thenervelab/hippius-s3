@@ -1,6 +1,22 @@
 # Restoring the drainer SSDs as a read tier
 
-Status: proposed (2026-08-06). Diagnosis is evidence-backed against prod; the fix is not yet implemented.
+Status: Phases 1–2 implemented on `feat/ssd-read-tier-phase1-backlog-signal` (2026-08-06, not
+pushed); Phases 3–4 outstanding. Diagnosis is evidence-backed against prod.
+
+**Implemented so far** — commits `019da038` (signal split), `c3bd1c34` (retention + evictor core),
+`32e0feda` (evictor worker + residency reporting). 443 tests green, clippy clean at `-D warnings`.
+The eviction invariant was mutation-tested and that exposed a real bug: residency and status are
+independent axes, because `redrive_corrupt_parts` resets `corrupt → pending` without clearing
+`resident_at`, so the worklist must filter on `status = 'replicated'` — selecting on residency
+alone offered the evictor parts whose SSD copy was again the only durable one.
+
+**Safety margin, verified.** The evictor's floor is 15% free (frees to 20%); the api's
+`fs_cache_pressure` 503 gate fires at `HIPPIUS_FS_CACHE_MIN_FREE_RATIO=0.08` or 10 GiB free, on
+the same mount. The evictor is comfortably the more aggressive of the two, which is the
+invariant that keeps retention from turning into failed PUTs.
+
+**Deploy note.** Phase 2 must go out as one unit — retention without the evictor means nothing
+frees the ingest SSD. Migration 0016 is backfill-free and its index builds near-empty.
 
 ## 1. Intended design vs. what shipped
 
