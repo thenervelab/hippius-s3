@@ -56,7 +56,13 @@ def peer_key(node_name: str) -> str:
 class PeerRegistry:
     """Publishes this pod's address and resolves peers' addresses."""
 
-    def __init__(self, redis_client: async_redis.Redis, node_name: str, self_url: str, ttl_seconds: int) -> None:
+    def __init__(
+        self,
+        redis_client: async_redis.Redis | async_redis.RedisCluster,
+        node_name: str,
+        self_url: str,
+        ttl_seconds: int,
+    ) -> None:
         self._redis = redis_client
         self._node_name = node_name
         self._self_url = self_url
@@ -175,7 +181,18 @@ class PeerChunkFetcher:
         if base is None:
             return None
         url = f"{base}/internal/parts/{object_id}/{object_version}/{part_number}/chunks/{chunk_index}"
-        response = await self._client.get(url)
+        try:
+            response = await self._client.get(url)
+        except (httpx.HTTPError, OSError) as exc:
+            # A registered-but-unreachable peer — a drained or cordoned node whose replacement
+            # has not re-registered under the same key — stays resolvable until its TTL lapses.
+            # Retrying it per chunk pays the full fetch timeout every time before falling
+            # through to the pool, which makes that shard read WORSE than with no peer tier at
+            # all. Poison the memo so the rest of this part goes straight to the pool; the
+            # entry expires on its own, so a peer that comes back is picked up again.
+            self._owner_url.put(part_key, (None,))
+            logger.debug("peer fetch to %s failed, falling through to the pool: %s", base, exc)
+            return None
         if response.status_code != 200:
             # 404 is routine: the peer evicted the part between the residency read and now.
             return None

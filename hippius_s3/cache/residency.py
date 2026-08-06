@@ -17,8 +17,6 @@ from typing import Optional
 
 import asyncpg
 
-from hippius_s3.cache.part_memo import PartMemo
-
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +36,11 @@ _SEEN_TTL_SECONDS = 300.0
 class ResidencyRecorder:
     """Claims promoted parts for this node so its evictor owns them."""
 
-    def __init__(self, pool: asyncpg.Pool, node_id: str, ttl_seconds: float = _SEEN_TTL_SECONDS) -> None:
+    def __init__(self, pool: asyncpg.Pool, node_id: str) -> None:
         self._pool = pool
         self._node_id = node_id
-        self._seen: PartMemo[tuple[str, int, int], bool] = PartMemo(ttl_seconds, _SEEN_LIMIT)
 
     async def __call__(self, object_id: str, object_version: int, part_number: int, size_bytes: int) -> None:
-        key = (object_id, int(object_version), int(part_number))
-        if self._seen.get(key) is not None:
-            return
         try:
             async with self._pool.acquire() as conn:
                 await conn.execute(
@@ -54,7 +48,7 @@ class ResidencyRecorder:
                     INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number, bytes)
                     VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (node_id, object_id, version, part_number)
-                    DO UPDATE SET bytes = EXCLUDED.bytes
+                    DO UPDATE SET bytes = cephor_ssd_residency.bytes + EXCLUDED.bytes
                     """,
                     self._node_id,
                     str(object_id),
@@ -75,7 +69,6 @@ class ResidencyRecorder:
                 exc,
             )
             return
-        self._seen.put(key, True)
 
 
 def create_residency_recorder(pool: Optional[asyncpg.Pool], node_id: str) -> Optional[ResidencyRecorder]:

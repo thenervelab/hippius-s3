@@ -757,6 +757,9 @@ class NullMetricsCollector:
     def record_fs_cache_shed(self, *args: object, **kwargs: object) -> None:
         pass
 
+    def record_chunk_read_tier(self, *args: object, **kwargs: object) -> None:
+        pass
+
     def record_cache_operation(self, *args: object, **kwargs: object) -> None:
         pass
 

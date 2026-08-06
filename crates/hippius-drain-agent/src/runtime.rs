@@ -1474,10 +1474,36 @@ mod tests {
         let coord = Arc::new(coord);
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::from_pool(pool));
+        let store = Arc::new(Store::from_pool(pool.clone()));
         let node = NodeId::from_str("node-hb").unwrap();
         // A distinctive capability so the asserted row is unambiguously ours.
         let rate = ByteRate::new(7_000_000);
+
+        // Seed real undrained work for this node, because the heartbeat's backlog is now the
+        // DB sum of pending/draining part bytes rather than raw SSD occupancy. This assertion
+        // used to pass by accident: `statvfs` on a tempdir reports the HOST filesystem's used
+        // bytes, so the CI runner's own disk satisfied `backlog > 0` while the node had no
+        // work at all. Seeding keeps the assertion meaningful instead of weakening it.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS parts (object_id uuid NOT NULL, object_version bigint NOT NULL, \
+             part_number bigint NOT NULL, size_bytes bigint, upload_id uuid)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id) \
+             VALUES ($1, 1, 1, 'pending', 'node-hb')",
+        )
+        .bind(UUID)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO parts (object_id, object_version, part_number, size_bytes) VALUES ($1::uuid, 1, 1, 4096)")
+            .bind(UUID)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let runtime = AgentRuntime::new(
             Arc::new(LocalFs::new(pool_dir.path())),

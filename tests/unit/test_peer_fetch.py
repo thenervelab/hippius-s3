@@ -12,6 +12,7 @@ import json
 from typing import Any
 from typing import Optional
 
+import httpx
 import pytest
 
 from hippius_s3.cache.peers import PeerChunkFetcher
@@ -205,3 +206,35 @@ async def test_a_different_part_is_looked_up_separately() -> None:
     await fetcher(OBJ, 1, 4, 0)
 
     assert len(pool.conn.queries) == 2, "part 3 and part 4 are resolved independently"
+
+
+class FailingHttp:
+    """A peer that is registered but unreachable — a cordoned or drained node."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    async def get(self, url: str):  # noqa: ANN201
+        self.attempts += 1
+        raise httpx.ConnectError("connection refused")
+
+
+@pytest.mark.asyncio
+async def test_a_dead_peer_is_tried_once_not_once_per_chunk() -> None:
+    """A registered-but-dead peer must not make reads SLOWER than having no peer tier.
+
+    Its Redis registration stays resolvable for up to the 90 s TTL if no replacement pod
+    re-registers under the same node name — a drained node, not a rolling restart. Retrying
+    it per chunk pays the full fetch timeout every time before falling through to the pool,
+    so for up to a minute and a half that node's shard reads worse than with the tier off.
+    """
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
+    registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
+    http = FailingHttp()
+    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http)
+
+    for chunk in range(32):
+        assert await fetcher(OBJ, 1, 3, chunk) is None, "every chunk falls through to the pool"
+
+    assert http.attempts == 1, f"a dead peer was retried {http.attempts} times"

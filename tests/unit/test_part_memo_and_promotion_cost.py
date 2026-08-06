@@ -12,6 +12,8 @@ that this node's evictor can never see.
 
 from __future__ import annotations
 
+import shutil
+
 import pytest
 
 from hippius_s3.cache.dual_fs_store import DualFileSystemPartsStore
@@ -69,32 +71,60 @@ def test_the_memo_is_bounded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_residency_is_re_recorded_after_the_evictor_reclaims_the_part() -> None:
-    """The leak the per-node residency table exists to prevent.
+async def test_promotion_after_eviction_restores_both_meta_and_residency(tmp_path) -> None:
+    """The cross-process leak: the evictor is a DIFFERENT process from the promoter.
 
-    Promote -> record -> evictor deletes the row -> read again -> promote again. If the
-    recorder remembers "already did this" forever, the second promotion writes nothing and
-    the copy sits on disk with no row, invisible to this node's evictor.
+    api-local holds the promotion state; drain-agent's evictor unlinks the part dir (meta
+    included) and deletes the residency row. It cannot invalidate an in-process memo, so a
+    memo that says "already did this part" survives the eviction and the next promotion
+    writes chunks with NO meta and NO residency row.
+
+    That is doubly broken: meta is the readiness gate, so the copy is unreadable; and the
+    evictor is scoped entirely to the residency table, so nothing can ever reclaim it. The
+    reclaimer is not a backstop either — this branch made it skip `replicated` parts outright.
     """
-    pool = FakePool()
-    recorder = ResidencyRecorder(pool, "node-a", ttl_seconds=0.0)
+    recorded: list[tuple[str, int, int, int]] = []
 
-    await recorder(OBJ, 1, 3, 4096)
-    await recorder(OBJ, 1, 3, 4096)
+    async def _record(object_id: str, version: int, part_number: int, size_bytes: int) -> None:
+        recorded.append((object_id, version, part_number, size_bytes))
 
-    assert len(pool.executed) == 2, "a re-promotion after eviction must re-record residency"
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), promote=True, on_promote=_record)
+    await dual.fallback.set_chunk(OBJ, 1, 1, 0, b"payload")
+    await dual.fallback.set_meta(OBJ, 1, 1, chunk_size=7, num_chunks=1, size_bytes=7)
+
+    assert await dual.get_chunk(OBJ, 1, 1, 0) == b"payload"
+    local = FileSystemPartsStore(str(tmp_path / "ssd"))
+    assert await local.get_meta(OBJ, 1, 1) is not None
+    assert len(recorded) == 1
+
+    # The evictor, out of process: unlink the whole part dir and drop the residency row.
+    shutil.rmtree(tmp_path / "ssd" / OBJ)
+    recorded.clear()
+
+    assert await dual.get_chunk(OBJ, 1, 1, 0) == b"payload"
+
+    assert await local.get_meta(OBJ, 1, 1) is not None, "meta must be rewritten or the copy is unreadable"
+    assert await local.get_chunk(OBJ, 1, 1, 0) == b"payload", "and the chunk must be readable again"
+    assert recorded, "residency must be re-recorded or nothing can ever evict this copy"
 
 
 @pytest.mark.asyncio
-async def test_residency_is_not_rewritten_for_every_chunk_of_one_part() -> None:
-    """Promotion fires per chunk; residency is a per-part fact."""
-    pool = FakePool()
-    recorder = ResidencyRecorder(pool, "node-a", ttl_seconds=300.0)
+async def test_residency_accumulates_the_bytes_actually_promoted() -> None:
+    """`bytes` must track what is ON the disk, not the part's declared total.
 
-    for _ in range(64):
+    Promotion fires per chunk, and a range GET touches only the chunks it needs — so a
+    64-chunk part can be 1/64th resident. Recording the whole-part size on the first chunk
+    inflates the number the evictor sums to decide it has freed enough, which makes a pass
+    stop early while believing it succeeded.
+    """
+    pool = FakePool()
+    recorder = ResidencyRecorder(pool, "node-a")
+
+    for _ in range(3):
         await recorder(OBJ, 1, 3, 4096)
 
-    assert len(pool.executed) == 1, f"64 chunks issued {len(pool.executed)} upserts"
+    assert len(pool.executed) == 3, "every promoted chunk is accounted, not just the first"
+    assert all(args[4] == 4096 for args in pool.executed), "each records its own chunk's bytes"
 
 
 @pytest.mark.asyncio
