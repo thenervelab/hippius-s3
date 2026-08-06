@@ -710,7 +710,7 @@ mod tests {
         // The SSD part is freed only after the verified, committed pool copy exists.
         let ssd_part = ssd_dir.path().join(part.relative_dir());
         let pool_part = pool_dir.path().join(part.relative_dir());
-        assert!(!ssd_part.exists(), "the SSD part is freed after a verified drain");
+        assert!(ssd_part.exists(), "a verified drain RETAINS the SSD part to serve reads");
         assert_eq!(
             std::fs::read(pool_part.join("chunk_0.bin")).unwrap(),
             b"hello cephor part",
@@ -763,7 +763,7 @@ mod tests {
             drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&ample), None).await.unwrap(),
             ClaimOutcome::Drained(DrainOutcome::Replicated)
         );
-        assert!(!ssd_part.exists(), "the admitted drain frees the SSD part");
+        assert!(ssd_part.exists(), "the admitted drain retains the SSD part");
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
@@ -1576,8 +1576,8 @@ mod tests {
             "the Ceph commit is decoupled from the address-gated enqueue",
         );
         assert!(
-            !ssd_dir.path().join(part.relative_dir()).exists(),
-            "the SSD copy is freed — the uploader reads the chunks from the shared pool",
+            ssd_dir.path().join(part.relative_dir()).exists(),
+            "the SSD copy is retained as the read tier; the uploader reads from the shared pool",
         );
         let worklist = store.list_replicated_unenqueued_parts(10).await.unwrap();
         assert!(

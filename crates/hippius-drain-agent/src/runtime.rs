@@ -97,10 +97,6 @@ pub struct RuntimeConfig {
     /// How long a no-DB-backing part (its object hard-deleted) is kept before the orphan
     /// reclaim unlinks it. Keyed on the part's FS `meta.json` age, so set generously.
     pub orphan_reclaim_grace: Duration,
-    /// How long a `replicated` part may linger on SSD before the reclaim re-drives the drain's
-    /// own unlink (a crash-orphan between the `mark_replicated` commit and the unlink). Keyed
-    /// on the row's `updated_at`.
-    pub replicated_reclaim_grace: Duration,
     /// How long workers get to finish an in-flight tick after cancellation
     /// before the supervisor force-aborts them.
     pub grace: Duration,
@@ -321,8 +317,10 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node
 async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, graces: ReclaimGraces) {
     match reclaim_ssd(ssd, ssd, store, store, graces).await {
         Ok(report) => {
-            // All three dispositions free SSD bytes, so the reclaimed gauge counts their sum.
-            snapshot.record_reclaimed(report.reclaimed + report.reclaimed_orphan + report.reclaimed_replicated);
+            // Both debris dispositions free SSD bytes, so the reclaimed gauge counts their sum.
+            // Retained `replicated` parts are NOT counted here — they are cache, not reclaimed
+            // debris, and the evictor reports their reclamation separately.
+            snapshot.record_reclaimed(report.reclaimed + report.reclaimed_orphan);
             if report.reclaimed > 0 {
                 // Aggregate, not per-part: an abandoned MPU reclaims many parts at once,
                 // so a per-part line would spam.
@@ -334,19 +332,13 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
                     "reclaimed no-DB-backing (deleted-object) SSD orphans"
                 );
             }
-            if report.reclaimed_replicated > 0 {
-                tracing::info!(
-                    reclaimed_replicated = report.reclaimed_replicated,
-                    "reclaimed replicated crash-orphan SSD parts — re-drove the drain's skipped unlink"
-                );
-            }
-            // Replicated parts still on SSD but within the reclaim grace: a just-committed part
-            // whose happy-path unlink may not have run yet. Transient and self-clearing — aged
-            // ones are reclaimed above — so this is DEBUG, not the old un-reclaimable-leak WARN.
+            // Retained `replicated` parts: the read tier, and on a healthy node the bulk of the
+            // scan. Expected and unremarkable, so DEBUG — the evictor, not this worker, decides
+            // when any of them go, and `drain_ssd_cache_bytes` is where their size is tracked.
             if report.skipped_replicated > 0 {
                 tracing::debug!(
-                    skipped_replicated = report.skipped_replicated,
-                    "replicated parts on SSD within grace — reclaimed once they age past it"
+                    retained = report.skipped_replicated,
+                    "replicated parts retained on SSD as the read tier (evictor-owned)"
                 );
             }
             // Parts held this cycle because their live object's pool copy is corrupt (R4): a
@@ -696,7 +688,6 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         let reclaim_graces = ReclaimGraces {
             failed: self.config.reclaim_grace,
             orphan: self.config.orphan_reclaim_grace,
-            replicated: self.config.replicated_reclaim_grace,
         };
         let redrive_max_attempts = self.config.redrive_max_attempts;
         supervisor.spawn(WorkerName::new("ssd_reclaim"), move |token| {
@@ -1077,7 +1068,6 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
-                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 redrive_max_attempts: 3,
@@ -1152,7 +1142,6 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
-                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 redrive_max_attempts: 3,
@@ -1245,7 +1234,6 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
-                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 redrive_max_attempts: 3,
@@ -1311,7 +1299,6 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
-                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 redrive_max_attempts: 3,
@@ -1360,7 +1347,6 @@ mod tests {
                 reclaim_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
-                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 redrive_max_attempts: 3,
@@ -1425,7 +1411,6 @@ mod tests {
             ReclaimGraces {
                 failed: Duration::from_secs(1),
                 orphan: Duration::from_secs(1),
-                replicated: Duration::from_hours(24),
             },
         )
         .await;
@@ -1448,11 +1433,12 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
-    async fn reclaim_once_evicts_an_aged_replicated_crash_orphan(pool: PgPool) {
-        // The ssd-leak fix end-to-end through reclaim_once against real Postgres: a `replicated`
-        // part still on SSD past the replicated grace is a drain crash-orphan (the drain committed
-        // mark_replicated but crashed before its own unlink). It is evicted, counted, and its
-        // replication row is left intact — the pool copy remains authoritative.
+    async fn reclaim_once_retains_a_replicated_part_however_aged(pool: PgPool) {
+        // End-to-end against real Postgres: a `replicated` part on SSD is the node's READ TIER,
+        // and no amount of age makes this worker take it. It used to — before retention, a
+        // lingering replicated part could only be a crash between the commit and the drain's own
+        // unlink. Now it is the steady state, and reclaiming it on age would discard hot cache
+        // from a disk with terabytes free. Only the evictor may remove it, on a free-space policy.
         let ssd_dir = tempfile::tempdir().unwrap();
         let store = Store::from_pool(pool.clone());
         let snapshot = SnapshotCell::new();
@@ -1463,7 +1449,8 @@ mod tests {
         force_terminal_2h(&pool, &orphan, "replicated").await;
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        // Short replicated grace so the 2h-aged crash-orphan is past the window.
+        // Graces short enough that any age-based arm would fire — proving retention is
+        // unconditional rather than merely not-yet-due.
         super::reclaim_once(
             &ssd,
             &store,
@@ -1471,20 +1458,18 @@ mod tests {
             ReclaimGraces {
                 failed: Duration::from_secs(1),
                 orphan: Duration::from_secs(1),
-                replicated: Duration::from_secs(1),
             },
         )
         .await;
 
         assert!(
-            !ssd_dir.path().join(orphan.relative_dir()).exists(),
-            "the aged replicated crash-orphan was evicted from the SSD",
+            ssd_dir.path().join(orphan.relative_dir()).exists(),
+            "a 2h-aged replicated part is retained, not reclaimed",
         );
-        assert_eq!(snapshot.load().reclaimed, 1, "the replicated crash-orphan counts toward reclaimed");
+        assert_eq!(snapshot.load().reclaimed, 0, "retained cache is not reclaimed debris");
         assert_eq!(
             <Store as PartReplicationStore>::status(&store, &orphan).await.unwrap(),
             Some(ReplicationState::Replicated),
-            "reclaim only unlinks the SSD copy; the replicated row is left intact",
         );
     }
 
@@ -1512,7 +1497,6 @@ mod tests {
             ReclaimGraces {
                 failed: Duration::ZERO,
                 orphan: Duration::ZERO,
-                replicated: Duration::from_hours(24),
             },
         )
         .await;
@@ -1552,7 +1536,6 @@ mod tests {
             ReclaimGraces {
                 failed: Duration::from_secs(1),
                 orphan: Duration::from_hours(1),
-                replicated: Duration::from_hours(24),
             },
         )
         .await;
@@ -1594,7 +1577,6 @@ mod tests {
             ReclaimGraces {
                 failed: Duration::from_secs(1),
                 orphan: Duration::from_secs(1),
-                replicated: Duration::from_hours(24),
             },
         )
         .await;
@@ -1632,7 +1614,6 @@ mod tests {
             ReclaimGraces {
                 failed: Duration::from_secs(1),
                 orphan: Duration::from_secs(1),
-                replicated: Duration::from_hours(24),
             },
         )
         .await;
