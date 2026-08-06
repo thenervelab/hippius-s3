@@ -6,7 +6,35 @@ from fastapi import Response
 
 from gateway.middlewares.auth_probe import is_valid_auth_probe
 from gateway.services.auth_orchestrator import authenticate_request
+from gateway.utils.paths import decoded_path
+from gateway.utils.paths import first_path_segment
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
+
+
+# Matched on the EXACT first path segment. A bare startswith() also matched bucket names like
+# /docs2, which then skipped SigV4 verification entirely and landed as anonymous-owned buckets
+# (prod incident 2026-08-03).
+#
+# Exempt at the segment itself and at any depth below it.
+EXEMPT_SEGMENTS = frozenset({"docs", "openapi.json", "robots.txt", "metrics", "health"})
+
+# Exempt only WITH a subpath (`/user/...`), which is what the frontend endpoints actually use.
+# A bare `/user` is not a route — it is bucket-shaped — and acl.py / account.py both special-case
+# `/user/` with the slash, so exempting it here would make auth_router the only layer that treats
+# it as non-S3.
+EXEMPT_SUBPATH_ONLY_SEGMENTS = frozenset({"user"})
+
+# Every segment auth_router skips authentication for must be unusable as a bucket name, or a
+# bucket created under it lands with no owner. Enforced by
+# test_every_auth_exempt_segment_is_a_reserved_bucket_name.
+ALL_EXEMPT_SEGMENTS = EXEMPT_SEGMENTS | EXEMPT_SUBPATH_ONLY_SEGMENTS
+
+
+def _is_exempt(request: Request) -> bool:
+    segment = first_path_segment(request)
+    if segment in EXEMPT_SEGMENTS:
+        return True
+    return segment in EXEMPT_SUBPATH_ONLY_SEGMENTS and "/" in decoded_path(request).strip("/")
 
 
 async def auth_router_middleware(
@@ -21,13 +49,10 @@ async def auth_router_middleware(
     ray_id = getattr(request.state, "ray_id", "no-ray-id")
     logger = get_logger_with_ray_id(__name__, ray_id)
 
-    exempt_paths = ["/docs", "/openapi.json", "/user/", "/robots.txt", "/metrics", "/health"]
-
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    path = request.url.path
-    if any(path.startswith(exempt_path) or path == exempt_path for exempt_path in exempt_paths):
+    if _is_exempt(request):
         return await call_next(request)
 
     # PURGE from the gateway → ATS bounces back here via authproxy. There is

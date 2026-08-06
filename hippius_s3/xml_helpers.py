@@ -28,3 +28,29 @@ def to_xml_bytes(
     """Convert an element tree to bytes with XML declaration."""
     result: bytes = _ET.tostring(root, encoding=encoding, xml_declaration=xml_declaration, pretty_print=pretty_print)
     return result
+
+
+def parse_untrusted_xml(data: bytes) -> Element:
+    """Parse client-supplied XML with entity expansion, DTD loading and network access off.
+
+    The single entry point for request bodies, so no endpoint has to remember the hardening
+    flags — a default parser would expand DTD-declared entities and inflate a billion-laughs
+    body in memory. Predefined entities and numeric character references (``&quot;``,
+    ``&#34;``) are still decoded, which is what lets clients whose XML encoders escape quotes
+    round-trip correctly.
+
+    Args:
+        data: Raw request body.
+
+    Returns:
+        The parsed root element.
+
+    Raises:
+        ValueError: The body is not well-formed XML.
+    """
+    # A parser instance carries mutable state, so it is built per call rather than shared.
+    parser = _ET.XMLParser(resolve_entities=False, load_dtd=False, no_network=True, huge_tree=False)
+    try:
+        return _ET.fromstring(data, parser)
+    except _ET.XMLSyntaxError as exc:
+        raise ValueError(str(exc)) from exc

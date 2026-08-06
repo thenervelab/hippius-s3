@@ -396,7 +396,7 @@ Kustomize-based. Namespaces: `hippius-s3-staging` and `hippius-s3-prod`.
 Two deploy workflows, one per environment:
 
 - [.github/workflows/staging-deploy.yaml](.github/workflows/staging-deploy.yaml) — triggers on pushes to the `staging` branch. Job: `deploy-staging`.
-- [.github/workflows/production-deploy.yaml](.github/workflows/production-deploy.yaml) — triggers on pushes to the `k8s-production` branch. Job: `deploy-production`.
+- [.github/workflows/production-deploy.yaml](.github/workflows/production-deploy.yaml) — triggers on pushes to the `main` branch. Job: `deploy-production`.
 
 Both share the same `build-base` and `build-images` jobs (duplicated, since GitHub Actions can't share jobs across workflows without `workflow_call`).
 
@@ -451,6 +451,7 @@ Response shape: `{"status":"success","data":{"resultType":"streams","result":[{"
 - **DLQ requeue**: [hippius_s3/scripts/dlq_requeue.py](hippius_s3/scripts/dlq_requeue.py).
 - **Failed pin resubmit**: [hippius_s3/scripts/resubmit_failed_pins.py](hippius_s3/scripts/resubmit_failed_pins.py).
 - **Arion identifier migration** (new): [hippius_s3/scripts/migrate_arion_identifiers.py](hippius_s3/scripts/migrate_arion_identifiers.py) + [k8s/migrate-arion-identifiers-job.yaml](k8s/migrate-arion-identifiers-job.yaml). Fixes legacy chunk_backend rows that stored `arion_hash` instead of `path_hash`.
+- **Reserved-name / ownerless bucket audit**: [hippius_s3/scripts/report_reserved_name_buckets.py](hippius_s3/scripts/report_reserved_name_buckets.py). Read-only. Run after any change to the gateway's auth-exempt paths.
 - **Clean prod DB dump for testing**: [scripts/gen_clean_dump.py](scripts/gen_clean_dump.py).
 - **MPU retry**: [scripts/retryable-mpu.py](scripts/retryable-mpu.py) with usage notes in [retryable-mpu.md](retryable-mpu.md) (if present).
 - **Dangerous scripts** (flagged for a reason):

@@ -15,10 +15,19 @@ from substrateinterface.utils.ss58 import is_valid_ss58_address
 
 from gateway.config import get_config
 from gateway.utils.errors import s3_error_response
+from gateway.utils.paths import decoded_path
+from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
 
 
 logger = logging.getLogger(__name__)
 config = get_config()
+
+
+# Moved to gateway/utils/paths.py so every middleware that keys a security decision off the
+# first path segment shares one decoder. Aliased rather than renamed: the call sites below and
+# the tests reference `_decoded_path`.
+_decoded_path = decoded_path
+
 
 # S3 bucket name validation (AWS S3 compatible)
 # Must be 3-63 characters, lowercase letters/numbers/dots/hyphens only
@@ -39,6 +48,17 @@ PROHIBITED_BUCKET_SUFFIXES = ["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table
 
 SKIP_PREFIXES = {"health", "user", "docs", "robots.txt", "openapi.json"}
 
+# Re-exported so this module keeps reading as the place bucket-name policy is enforced. The set
+# itself is defined in hippius_s3/reserved_bucket_names.py — the audit script needs it too, and a
+# second copy drifting is the exact failure this rejection exists to prevent.
+#
+# Deliberately NOT in it: `acl` (acl_router mounts /{bucket} at the ROOT — there is no /acl path)
+# and `static` (no StaticFiles mount anywhere in the gateway).
+#
+# auth_router.ALL_EXEMPT_SEGMENTS must stay a subset — enforced by
+# test_every_auth_exempt_segment_is_a_reserved_bucket_name.
+__all__ = ["RESERVED_BUCKET_SEGMENTS", "input_validation_middleware"]
+
 
 async def input_validation_middleware(
     request: Request,
@@ -46,11 +66,7 @@ async def input_validation_middleware(
 ) -> Response:
     """Validate S3 inputs for security and AWS compatibility."""
 
-    path_parts = request.url.path.strip("/").split("/")
-
-    # Skip validation for non-S3 endpoints
-    if path_parts[0] in SKIP_PREFIXES:
-        return await call_next(request)
+    path_parts = _decoded_path(request).strip("/").split("/")
 
     # Validate bucket name only on CreateBucket (PUT /{bucket} with no object key and no
     # tagging/lifecycle/policy query params). Existing buckets with non-compliant names
@@ -63,6 +79,20 @@ async def input_validation_middleware(
         and "lifecycle" not in request.query_params
         and "policy" not in request.query_params
     )
+
+    # Reserved-name rejection must run BEFORE the SKIP_PREFIXES bypass: PUT /docs is
+    # CreateBucket-shaped, and skipping it is exactly how the ownerless "docs" bucket
+    # got written.
+    if is_create_bucket and path_parts[0] in RESERVED_BUCKET_SEGMENTS:
+        return s3_error_response(
+            code="InvalidBucketName",
+            message=f"Bucket name '{path_parts[0]}' is reserved for gateway routes",
+            status_code=400,
+        )
+
+    # Skip validation for non-S3 endpoints
+    if path_parts[0] in SKIP_PREFIXES:
+        return await call_next(request)
 
     if is_create_bucket:
         bucket_name = path_parts[0]

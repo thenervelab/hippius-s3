@@ -3,7 +3,7 @@ name: production-deploy
 on:
   push:
     branches:
-      - k8s-production
+      - main
 
 permissions:
   contents: read

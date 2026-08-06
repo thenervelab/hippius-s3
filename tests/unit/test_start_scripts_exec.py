@@ -57,3 +57,34 @@ def test_graceful_shutdown_timeout_is_set(script: Path) -> None:
         f"{script.name} does not pass --timeout-graceful-shutdown, so uvicorn waits "
         f"indefinitely for in-flight requests and can be SIGKILLed mid-drain instead."
     )
+
+
+# The longest keepalive_expiry of anything that pools connections to us: the ATS edge holds
+# idle origin connections for 60s (keep_alive_no_activity_timeout_out, hippius-ats), and the
+# gateway's ForwardService httpx pool holds them for 30s.
+LONGEST_UPSTREAM_POOL_SECONDS = 60
+
+
+@pytest.mark.parametrize("script", START_SCRIPTS, ids=lambda p: p.name)
+def test_keep_alive_outlives_upstream_pools(script: Path) -> None:
+    """Whoever pools the connection must retire it first, or idle sockets become 502s.
+
+    uvicorn defaults --timeout-keep-alive to 5s. Both of our callers pool for far longer, so
+    at the default they kept dispatching onto sockets we had already closed. A request that
+    dies after its header is written is retried when it is idempotent and fails hard when it
+    is not, which is why this surfaced as PUT-only 502s at the edge and never as a failed GET.
+    """
+    body = script.read_text()
+    assert "--timeout-keep-alive" in body, (
+        f"{script.name} does not pass --timeout-keep-alive, so uvicorn falls back to 5s and "
+        f"closes idle connections long before the pools upstream of it do."
+    )
+
+    match = re.search(r"UVICORN_KEEP_ALIVE=\$\{UVICORN_KEEP_ALIVE:-(\d+)\}", body)
+    assert match, f"{script.name} does not define an overridable UVICORN_KEEP_ALIVE default"
+
+    assert int(match.group(1)) > LONGEST_UPSTREAM_POOL_SECONDS, (
+        f"{script.name} sets UVICORN_KEEP_ALIVE={match.group(1)}s, which is not above the "
+        f"{LONGEST_UPSTREAM_POOL_SECONDS}s ATS edge pool. The server must outlive every pool "
+        f"that holds connections to it."
+    )
