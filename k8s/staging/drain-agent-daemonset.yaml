@@ -143,10 +143,11 @@ spec:
             # threshold so the evictor is always reclaiming before ingest is refused.
             - name: CEPHOR_EVICT_POLL_SECS
               value: "30"
-            - name: CEPHOR_EVICT_RESERVE_PERCENT
-              value: "15"
-            - name: CEPHOR_EVICT_HEADROOM_PERCENT
-              value: "5"
+            # Fallback floor, used only until the allocator publishes a per-node reserve.
+            - name: CEPHOR_EVICT_RESERVE_PERMILLE
+              value: "150"
+            - name: CEPHOR_EVICT_HEADROOM_PERMILLE
+              value: "50"
             # Max parts drained concurrently — the in-flight gate that lets the node
             # overlap fsync latency across parts (the AIMD allocator only tunes bytes/s).
             # Safe code default (4); set here for per-node tuning.

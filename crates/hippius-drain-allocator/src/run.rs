@@ -166,6 +166,8 @@ mod tests {
             max_error_bps: 100,
             critical_pressure: DiskPressure::try_from(9_000).unwrap(),
             reservation_floor: ByteRate::new(50_000),
+            base_reserve_permille: 150,
+            max_reserve_permille: 400,
         }
     }
 
@@ -292,6 +294,7 @@ mod tests {
             std::slice::from_ref(&Allocation {
                 node: node.clone(),
                 budget: ByteRate::new(1),
+                reserve_permille: 150,
             }),
         )
         .await

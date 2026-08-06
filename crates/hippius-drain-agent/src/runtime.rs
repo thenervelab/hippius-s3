@@ -157,6 +157,11 @@ pub struct RateControl {
     pub half_life: Duration,
     /// How often to re-pull the allocation.
     pub poll: Duration,
+    /// Where the pulled per-node eviction reserve is published for the evictor to read.
+    /// Shared rather than passed directly because the two workers run on independent polls:
+    /// the allocation pull is the only thing that learns the reserve, and the evictor is the
+    /// only thing that acts on it.
+    pub snapshot: Arc<SnapshotCell>,
 }
 
 /// The drain worker's shared dependencies, bundled so the worker fn stays within
@@ -260,14 +265,17 @@ async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotC
 /// setting stays correct on nodes whose ingest disks differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvictionPolicy {
-    /// Free-space floor, as a percent of the disk. Eviction arms below this. Must sit
-    /// comfortably above the api's `fs_cache_pressure` 503 threshold (10% free): the evictor
-    /// has to be reclaiming well before ingest starts refusing writes, not racing it.
+    /// Free-space floor, in permille of the disk. Eviction arms below this. Must sit
+    /// comfortably above the api's `fs_cache_pressure` 503 threshold (80 permille free): the
+    /// evictor has to be reclaiming well before ingest starts refusing writes, not racing it.
     /// Zero disables eviction entirely — the operator kill-switch.
-    pub reserve_percent: u8,
-    /// How far past the floor to free once armed, as a percent of the disk. Without this the
+    ///
+    /// Permille, not percent, so this shares units with the allocator's per-node reserve and
+    /// the two can be swapped without a lossy conversion.
+    pub reserve_permille: u16,
+    /// How far past the floor to free once armed, in permille of the disk. Without this the
     /// evictor re-arms on nearly every cycle and pins the disk at the threshold.
-    pub headroom_percent: u8,
+    pub headroom_permille: u16,
     /// Most parts to consider in one pass, bounding both the worklist query and how long a
     /// single pass can hold the disk busy.
     pub batch: u32,
@@ -275,16 +283,22 @@ pub struct EvictionPolicy {
 
 /// Resolves a policy against a probed disk into the concrete byte target for one pass.
 ///
-/// Split out from [`evict_once`] so the percentage arithmetic — the part that silently
+/// Split out from [`evict_once`] so the permille arithmetic — the part that silently
 /// misbehaves if it rounds or overflows — is unit-testable without a disk or a database.
-fn eviction_target(usage: DiskUsage, policy: EvictionPolicy) -> EvictionTarget {
-    // u128 intermediates: total_bytes is multi-terabyte and a percent multiply would be
-    // within a factor of 100 of overflowing u64 on a large enough disk.
-    let percent_of_disk = |percent: u8| -> u64 { u64::try_from(u128::from(usage.total_bytes) * u128::from(percent) / 100).unwrap_or(u64::MAX) };
+fn eviction_target(usage: DiskUsage, policy: EvictionPolicy, allocated_reserve_permille: Option<u16>) -> EvictionTarget {
+    // u128 intermediates: total_bytes is multi-terabyte and a permille multiply would be
+    // within a factor of 1000 of overflowing u64 on a large enough disk.
+    let permille_of_disk = |permille: u16| -> u64 { u64::try_from(u128::from(usage.total_bytes) * u128::from(permille) / 1_000).unwrap_or(u64::MAX) };
+    // The allocator's reserve wins when present: it is the only component that can see WHY a
+    // node is not draining (the fleet Ceph ceiling, and this node's budget against its demand),
+    // so it can raise the floor BEFORE free space falls rather than after — which on a stalled
+    // drain is the difference between evicting early and 503ing. Absent, the node keeps its own
+    // configured floor rather than dropping to none.
+    let reserve = allocated_reserve_permille.unwrap_or(policy.reserve_permille);
     EvictionTarget {
         free: usage.free_bytes,
-        reserve: percent_of_disk(policy.reserve_percent),
-        headroom: percent_of_disk(policy.headroom_percent),
+        reserve: permille_of_disk(reserve),
+        headroom: permille_of_disk(policy.headroom_permille),
     }
 }
 
@@ -310,7 +324,9 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
         }
     };
 
-    let target = eviction_target(usage, policy);
+    // None means the allocator has not published a reserve for this node (pre-Phase-4
+    // leader, expired allocation key, or a malformed value); the static floor then applies.
+    let target = eviction_target(usage, policy, snapshot.allocated_reserve_permille());
     match evict_to_target(store, ssd, target, policy.batch).await {
         Ok(report) => {
             snapshot.record_evicted(report.evicted, report.freed_bytes);
@@ -585,6 +601,7 @@ fn pull_action(pull: &Result<Option<StoredAllocation>, CoordError>) -> PullActio
 /// `load_allocation` runs *unlocked*; only the synchronous `set_rate` takes the lock.
 async fn run_alloc(token: CancellationToken, coord: Arc<Coordinator>, rate_control: RateControl, clock: Arc<dyn Clock>) {
     let RateControl {
+        snapshot,
         enforcer,
         node,
         floor,
@@ -602,6 +619,17 @@ async fn run_alloc(token: CancellationToken, coord: Arc<Coordinator>, rate_contr
         let pull = coord.load_allocation(&node).await;
         if let Err(err) = &pull {
             tracing::warn!(error = %err, "allocation pull failed; decaying toward the floor");
+        }
+        // The eviction reserve rides along with the budget, and follows the same liveness
+        // rule: an allocation that is present carries a floor, and one that has expired takes
+        // its floor with it. Leaving a stale floor in place after the allocator went silent
+        // would have the evictor acting on a Ceph picture that may be minutes out of date.
+        match &pull {
+            Ok(Some(allocation)) => match allocation.reserve_permille {
+                Some(permille) => snapshot.record_allocated_reserve_permille(permille),
+                None => snapshot.clear_allocated_reserve_permille(),
+            },
+            Ok(None) | Err(_) => snapshot.clear_allocated_reserve_permille(),
         }
         match pull_action(&pull) {
             PullAction::Adopt(budget) => {
@@ -969,6 +997,7 @@ mod tests {
         let allocation = StoredAllocation {
             budget: ByteRate::new(500_000),
             epoch: 7,
+            reserve_permille: None,
         };
         assert_eq!(pull_action(&Ok(Some(allocation))), PullAction::Adopt(ByteRate::new(500_000)));
     }
@@ -1047,17 +1076,57 @@ mod tests {
             total_bytes: 4000 * GIB,
         };
         let policy = EvictionPolicy {
-            reserve_percent: 15,
-            headroom_percent: 5,
+            reserve_permille: 150,
+            headroom_permille: 50,
             batch: 128,
         };
 
-        let target = eviction_target(usage, policy);
+        let target = eviction_target(usage, policy, None);
 
         assert_eq!(target.free, 400 * GIB);
-        assert_eq!(target.reserve, 600 * GIB, "15% of 4000 GiB");
-        assert_eq!(target.headroom, 200 * GIB, "5% of 4000 GiB");
+        assert_eq!(target.reserve, 600 * GIB, "150 permille of 4000 GiB");
+        assert_eq!(target.headroom, 200 * GIB, "50 permille of 4000 GiB");
         assert!(target.deficit() > 0, "400 GiB free is under a 15% reserve, so eviction arms");
+    }
+
+    #[test]
+    fn an_allocator_reserve_overrides_the_static_floor() {
+        // Phase 4: the allocator raises the floor when it knows the drain is throttled — it
+        // sees the fleet Ceph ceiling and this node's budget against its demand, neither of
+        // which the evictor can observe. Reacting only once free space has already fallen is
+        // too late on a stalled drain.
+        let usage = DiskUsage {
+            pressure: DiskPressure::try_from(5_000).unwrap(),
+            free_bytes: 400 * GIB,
+            total_bytes: 4000 * GIB,
+        };
+        let policy = EvictionPolicy {
+            reserve_permille: 150,
+            headroom_permille: 50,
+            batch: 128,
+        };
+
+        let target = eviction_target(usage, policy, Some(400));
+
+        assert_eq!(target.reserve, 1600 * GIB, "40% of 4000 GiB, not the configured 15%");
+    }
+
+    #[test]
+    fn no_allocator_reserve_falls_back_to_the_static_floor() {
+        // A pre-Phase-4 leader, an expired allocation key, or a malformed value: the node
+        // keeps evicting on its own configured floor rather than dropping to no floor at all.
+        let usage = DiskUsage {
+            pressure: DiskPressure::try_from(5_000).unwrap(),
+            free_bytes: 400 * GIB,
+            total_bytes: 4000 * GIB,
+        };
+        let policy = EvictionPolicy {
+            reserve_permille: 150,
+            headroom_permille: 50,
+            batch: 128,
+        };
+
+        assert_eq!(eviction_target(usage, policy, None).reserve, 600 * GIB);
     }
 
     #[test]
@@ -1071,12 +1140,12 @@ mod tests {
             total_bytes: 4000 * GIB,
         };
         let policy = EvictionPolicy {
-            reserve_percent: 0,
-            headroom_percent: 5,
+            reserve_permille: 0,
+            headroom_permille: 50,
             batch: 128,
         };
 
-        assert_eq!(eviction_target(usage, policy).deficit(), 0, "a zero reserve never arms");
+        assert_eq!(eviction_target(usage, policy, None).deficit(), 0, "a zero reserve never arms");
     }
 
     #[test]
@@ -1211,6 +1280,7 @@ mod tests {
                 &[Allocation {
                     node: node.clone(),
                     budget: ByteRate::new(750_000),
+                    reserve_permille: 150,
                 }],
             )
             .await
@@ -1234,8 +1304,8 @@ mod tests {
                 drain_concurrency: 4,
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
-                    reserve_percent: 15,
-                    headroom_percent: 5,
+                    reserve_permille: 150,
+                    headroom_permille: 50,
                     batch: 512,
                 },
                 redrive_max_attempts: 3,
@@ -1248,6 +1318,7 @@ mod tests {
             floor: ByteRate::new(1_000),
             half_life: Duration::from_secs(30),
             poll: Duration::from_millis(20),
+            snapshot: Arc::new(SnapshotCell::new()),
         });
 
         let shutdown = CancellationToken::new();
@@ -1291,7 +1362,17 @@ mod tests {
         let floor = ByteRate::new(1_000);
 
         // alloc_ttl is 1s (above), so this budget key expires ~1s after the write.
-        coord.write_allocations(1, &[Allocation { node: node.clone(), budget }]).await.unwrap();
+        coord
+            .write_allocations(
+                1,
+                &[Allocation {
+                    node: node.clone(),
+                    budget,
+                    reserve_permille: 150,
+                }],
+            )
+            .await
+            .unwrap();
 
         let enforcer = Arc::new(Mutex::new(default_enforcer(ByteRate::new(0), Bytes::new(1 << 20), 4)));
         // Keep the concrete handle (for `advance`) and a trait-object clone (for the
@@ -1314,8 +1395,8 @@ mod tests {
                 drain_concurrency: 4,
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
-                    reserve_percent: 15,
-                    headroom_percent: 5,
+                    reserve_permille: 150,
+                    headroom_permille: 50,
                     batch: 512,
                 },
                 redrive_max_attempts: 3,
@@ -1328,6 +1409,7 @@ mod tests {
             floor,
             half_life: Duration::from_secs(1),
             poll: Duration::from_millis(10),
+            snapshot: Arc::new(SnapshotCell::new()),
         })
         .with_clock(clock_source);
 
@@ -1412,8 +1494,8 @@ mod tests {
                 drain_concurrency: 4,
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
-                    reserve_percent: 15,
-                    headroom_percent: 5,
+                    reserve_permille: 150,
+                    headroom_permille: 50,
                     batch: 512,
                 },
                 redrive_max_attempts: 3,
@@ -1483,8 +1565,8 @@ mod tests {
                 drain_concurrency: 4,
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
-                    reserve_percent: 15,
-                    headroom_percent: 5,
+                    reserve_permille: 150,
+                    headroom_permille: 50,
                     batch: 512,
                 },
                 redrive_max_attempts: 3,
@@ -1537,8 +1619,8 @@ mod tests {
                 drain_concurrency: 4,
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
-                    reserve_percent: 15,
-                    headroom_percent: 5,
+                    reserve_permille: 150,
+                    headroom_permille: 50,
                     batch: 512,
                 },
                 redrive_max_attempts: 3,
@@ -1664,8 +1746,8 @@ mod tests {
             &store,
             &snapshot,
             EvictionPolicy {
-                reserve_percent: 100,
-                headroom_percent: 0,
+                reserve_permille: 1_000,
+                headroom_permille: 0,
                 batch: 512,
             },
         )
@@ -1710,8 +1792,8 @@ mod tests {
             &store,
             &snapshot,
             EvictionPolicy {
-                reserve_percent: 100,
-                headroom_percent: 0,
+                reserve_permille: 1_000,
+                headroom_permille: 0,
                 batch: 512,
             },
         )

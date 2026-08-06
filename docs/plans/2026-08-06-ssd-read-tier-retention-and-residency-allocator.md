@@ -1,9 +1,8 @@
 # Restoring the drainer SSDs as a read tier
 
-Status: Phases 1–3 implemented on `feat/ssd-read-tier-phase1-backlog-signal` (2026-08-06, not
+Status: Phases 1–4 implemented on `feat/ssd-read-tier-phase1-backlog-signal` (2026-08-06, not
 pushed). **Staging only** — `k8s/production` is untouched and carries forward in a separate PR
-after soak. Phase 4 (allocator-driven `retain_bytes`) outstanding. Diagnosis is evidence-backed
-against prod.
+after soak. Diagnosis is evidence-backed against prod.
 
 **Implemented so far** — commits `019da038` (signal split), `c3bd1c34` (retention + evictor core),
 `32e0feda` (evictor worker + residency reporting). 443 tests green, clippy clean at `-D warnings`.
@@ -211,12 +210,29 @@ Because both land at once, attribution needs to be built in up front: the `read_
 (§8) carries a `routed | fallthrough` dimension so a routing regression and a promotion
 regression are separable in the dashboards without bisecting a deploy.
 
-### Phase 4 — allocator drives residency
+### Phase 4 — allocator drives the eviction reserve
 
-With backlog and cache separated and an evictor to actuate, extend `allocate()` from a pure
-write-budget to a write-budget + `retain_bytes` per node: high Ceph pressure → drain slower, hold
-more resident; low Ceph pressure → drain harder, and hold whatever the disk affords. This is the
-"balance drainer space against Ceph load" the design called for.
+`allocate()` now returns a per-node `reserve_permille` alongside the budget, carried in the same
+fenced write and applied by the agent's evictor in place of its static floor.
+
+**The sign is the opposite of what this section originally said.** The earlier text —
+"high Ceph pressure → hold more resident" — conflates Ceph *read* load with Ceph *write*
+pressure. Disk = backlog + cache + free. When the pool is degraded the drain writes nothing,
+backlog grows at the full ingest rate, and holding *more* cache consumes exactly the space that
+incoming backlog needs, bringing the `fs_cache_pressure` 503s forward. The correct law is:
+**drain throttled → raise the free-space floor now, buying ingest runway.**
+
+The reserve interpolates between `base_reserve_permille` (150) and `max_reserve_permille` (400)
+on the worse of two severities, because either alone starves the drain:
+
+- the fleet's Ceph ceiling (`Open` 0 / `NearFull` 500 / `Critical` 1000 permille);
+- the node's own shortfall, `(demand - budget) / demand` — the water-fill can leave one node
+  short while its peers are satisfied, and that node is the one accumulating.
+
+A caught-up node has no demand and therefore no shortfall, so it never evicts past the base.
+The agent falls back to its configured floor whenever no reserve is published (a pre-Phase-4
+leader, an expired allocation key, a malformed value), and the allocation's TTL governs both —
+a floor never outlives the budget it arrived with.
 
 ## 7. Decisions
 

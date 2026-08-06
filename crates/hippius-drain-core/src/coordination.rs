@@ -78,9 +78,11 @@ return 1
 ";
 
 /// Fenced per-node allocation write. `KEYS[1]`=the epoch counter (`cephor:epoch`);
-/// `KEYS[2..]`=the alloc keys (one per node); `ARGV[1]`=epoch, `ARGV[2]`=ttl secs,
-/// `ARGV[3..]`=the budget for each alloc key (parallel to `KEYS[2..]`). Returns 0 — writing
-/// NOTHING — if this leader is deposed, else writes every alloc key and returns 1.
+/// `KEYS[2..]`=the alloc keys (one per node); `ARGV[1]`=epoch, `ARGV[2]`=ttl secs, then the
+/// budgets for each alloc key (parallel to `KEYS[2..]`), then the reserves in the same order.
+/// Appending the reserves after the budgets — rather than interleaving — keeps the budget
+/// indexing identical to before. Returns 0 — writing NOTHING — if this leader is deposed,
+/// else writes every alloc key and returns 1.
 ///
 /// The deposed test is TWO checks, both against `epoch`:
 /// 1. **Current-era fence (R3):** the counter at `KEYS[1]` is `INCR`'d to the new era the
@@ -111,7 +113,7 @@ for i = 2, #KEYS do
   end
 end
 for i = 2, #KEYS do
-  redis.call('SET', KEYS[i], cjson.encode({budget = ARGV[1 + i], epoch = epoch}), 'EX', ttl)
+  redis.call('SET', KEYS[i], cjson.encode({budget = ARGV[1 + i], reserve = ARGV[#KEYS + i], epoch = epoch}), 'EX', ttl)
 end
 return 1
 ";
@@ -161,6 +163,9 @@ pub struct StoredAllocation {
     pub budget: ByteRate,
     /// The leader epoch that wrote it (for fencing checks).
     pub epoch: u64,
+    /// The free-space floor the evictor should hold, in permille of disk. `None` when the
+    /// writing leader predates Phase 4, in which case the agent keeps its configured floor.
+    pub reserve_permille: Option<u16>,
 }
 
 /// The wire form of a node heartbeat. Stored as JSON under each node's TTL'd key; a DTO
@@ -234,6 +239,11 @@ impl NodeStateJson {
 struct AllocJson {
     budget: String,
     epoch: u64,
+    /// Absent from allocations written by a pre-Phase-4 leader. `Option` so a rolling
+    /// allocator update degrades to the agent's configured static reserve rather than
+    /// deserializing to zero — which would read as "hold no free space at all".
+    #[serde(default)]
+    reserve: Option<String>,
 }
 
 /// Handle to the Redis-backed coordination state. Cheap to clone (the `ConnectionManager`
@@ -445,6 +455,9 @@ impl Coordinator {
             // Budget as a decimal string preserves full u64 precision past Lua's doubles.
             invocation.arg(allocation.budget.get().to_string());
         }
+        for allocation in allocations {
+            invocation.arg(allocation.reserve_permille.to_string());
+        }
         let written: i64 = invocation.invoke_async(&mut conn).await?;
         if written == 0 {
             return Err(CoordError::Fenced { epoch });
@@ -467,9 +480,13 @@ impl Coordinator {
             Some(json) => {
                 let allocation: AllocJson = serde_json::from_str(&json)?;
                 let budget = allocation.budget.parse::<u64>().map_err(|_| CoordError::Invalid { field: "budget" })?;
+                // A malformed reserve degrades to None (the agent's static floor) rather than
+                // failing the pull: losing the budget refresh would decay the whole node.
+                let reserve_permille = allocation.reserve.as_deref().and_then(|raw| raw.parse::<u16>().ok());
                 Ok(Some(StoredAllocation {
                     budget: ByteRate::new(budget),
                     epoch: allocation.epoch,
+                    reserve_permille,
                 }))
             }
         }
@@ -644,6 +661,7 @@ mod tests {
         let alloc = |budget| Allocation {
             node: node.clone(),
             budget: ByteRate::new(budget),
+            reserve_permille: 150,
         };
         // Epoch 5 writes a budget; it reads back with its epoch.
         c.write_allocations(5, std::slice::from_ref(&alloc(1_000))).await.unwrap();
@@ -682,6 +700,7 @@ mod tests {
         let alloc = |budget| Allocation {
             node: node.clone(),
             budget: ByteRate::new(budget),
+            reserve_permille: 150,
         };
 
         // A leads (epoch e) and writes a budget.
@@ -738,6 +757,7 @@ mod tests {
         let alloc = |budget| Allocation {
             node: node.clone(),
             budget: ByteRate::new(budget),
+            reserve_permille: 150,
         };
 
         // A wins a SHORT lease (epoch eA, which bumps cephor:epoch to eA) and writes a budget.

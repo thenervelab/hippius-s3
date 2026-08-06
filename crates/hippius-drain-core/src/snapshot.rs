@@ -183,6 +183,11 @@ pub struct SnapshotCell {
     /// gauge on the same tick as the backlog. Distinct from it precisely because the
     /// allocator must not read warm cache as drain demand.
     cache_bytes: AtomicU64,
+    /// The allocator's published free-space floor for this node, in permille of disk, plus
+    /// one so that 0 can mean "nothing published". A bare 0 would be ambiguous with a
+    /// legitimate reserve of 0 (the eviction kill-switch), and reading that as "no floor" on
+    /// a node whose allocator simply had not written yet would stop it evicting entirely.
+    allocated_reserve_permille_plus_one: AtomicU64,
     /// Count of this node's undrained replication rows (`pending` + `draining`) — a LEVEL like
     /// `backlog_bytes`, set each heartbeat from `Store::node_undrained_count`. This is the C8
     /// wedge signal, kept SEPARATE from `backlog_bytes` on purpose: the byte sum joins `parts`
@@ -287,6 +292,26 @@ impl SnapshotCell {
     #[must_use]
     pub fn cache_bytes(&self) -> u64 {
         self.cache_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records the allocator's published free-space floor for this node (permille of disk).
+    pub fn record_allocated_reserve_permille(&self, permille: u16) {
+        self.allocated_reserve_permille_plus_one.store(u64::from(permille) + 1, Ordering::Relaxed);
+    }
+
+    /// Clears the published floor, so the evictor falls back to its configured one. Used when
+    /// the allocation key expires or the leader predates per-node reserves.
+    pub fn clear_allocated_reserve_permille(&self) {
+        self.allocated_reserve_permille_plus_one.store(0, Ordering::Relaxed);
+    }
+
+    /// The allocator's published floor, or `None` when nothing has been published.
+    #[must_use]
+    pub fn allocated_reserve_permille(&self) -> Option<u16> {
+        match self.allocated_reserve_permille_plus_one.load(Ordering::Relaxed) {
+            0 => None,
+            raw => u16::try_from(raw - 1).ok(),
+        }
     }
 
     /// Records the current SSD backlog (undrained bytes). A gauge: `store`, not add.
