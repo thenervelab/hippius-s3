@@ -122,7 +122,7 @@ Do BOTH:
 
 1. **Durable repoint (source of truth):** change the literal in `production-deploy.yaml`
    (`redis://redis-queues:6379/0` → `redis://redis-queues-ha-master:6379/0`) and merge to
-   `k8s-production`. Prepared as a held PR (see the "cutover repoint" PR). **Merge it only AFTER
+   `main`. Prepared as a held PR (see the "cutover repoint" PR). **Merge it only AFTER
    Phase 0** (the `redis-queues-ha-master` service must exist, or that deploy breaks the queue path).
    `staging-deploy.yaml` has the analogous literal — edit it on `staging` for a staging cutover.
 2. **Immediate repoint + roll** (the live switch; the merge in step 1 recreates the secret but does

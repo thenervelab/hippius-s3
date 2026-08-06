@@ -396,7 +396,7 @@ Kustomize-based. Namespaces: `hippius-s3-staging` and `hippius-s3-prod`.
 Two deploy workflows, one per environment:
 
 - [.github/workflows/staging-deploy.yaml](.github/workflows/staging-deploy.yaml) — triggers on pushes to the `staging` branch. Job: `deploy-staging`.
-- [.github/workflows/production-deploy.yaml](.github/workflows/production-deploy.yaml) — triggers on pushes to the `k8s-production` branch. Job: `deploy-production`.
+- [.github/workflows/production-deploy.yaml](.github/workflows/production-deploy.yaml) — triggers on pushes to the `main` branch. Job: `deploy-production`.
 
 Both share the same `build-base` and `build-images` jobs (duplicated, since GitHub Actions can't share jobs across workflows without `workflow_call`).
 
