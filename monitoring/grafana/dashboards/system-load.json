@@ -21,6 +21,19 @@
   "links": [],
   "panels": [
     {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "panels": [],
+      "title": "Traffic",
+      "type": "row"
+    },
+    {
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -179,205 +192,6 @@
       "description": "Gateway request rate collapsed into HTTP status classes (2xx/3xx/4xx/5xx), one line each. Individual status codes are in \"Gateway req/s\" below; this is the at-a-glance health shape."
     },
     {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 0
-      },
-      "id": 1,
-      "panels": [],
-      "title": "Traffic",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 30,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "normal"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "reqps"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 0,
-        "y": 9
-      },
-      "id": 2,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.3.1",
-      "targets": [
-        {
-          "expr": "sum by (status_code) (rate(http_requests_total{service_namespace=\"$namespace\", handler=~\"gateway.*\"}[5m]))",
-          "legendFormat": "{{status_code}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Gateway req/s",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 30,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "normal"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "reqps"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 6,
-        "y": 9
-      },
-      "id": 3,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.3.1",
-      "targets": [
-        {
-          "expr": "sum by (status_code) (rate(http_requests_total{service_namespace=\"$namespace\", handler!~\"gateway.*\"}[5m]))",
-          "legendFormat": "{{status_code}}",
-          "refId": "A"
-        }
-      ],
-      "title": "API req/s",
-      "type": "timeseries"
-    },
-    {
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -441,8 +255,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 12,
+        "w": 12,
+        "x": 0,
         "y": 9
       },
       "id": 4,
@@ -539,8 +353,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 18,
+        "w": 12,
+        "x": 12,
         "y": 9
       },
       "id": 5,
@@ -565,105 +379,7 @@
           "refId": "A"
         }
       ],
-      "title": "S3 errors/s (4xx/5xx)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 0,
-        "y": 17
-      },
-      "id": 6,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.3.1",
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_overhead_seconds_bucket{service_namespace=\"$namespace\"}[5m])))",
-          "legendFormat": "p95",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(gateway_overhead_seconds_bucket{service_namespace=\"$namespace\"}[5m])))",
-          "legendFormat": "p50",
-          "refId": "B"
-        }
-      ],
-      "title": "Gateway overhead (excl. body)",
+      "title": "Errors/s",
       "type": "timeseries"
     },
     {
@@ -730,8 +446,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 6,
+        "w": 9,
+        "x": 0,
         "y": 17
       },
       "id": 82,
@@ -823,8 +539,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 7,
-        "x": 14,
+        "w": 9,
+        "x": 9,
         "y": 17
       },
       "id": 81,
@@ -917,8 +633,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 3,
-        "x": 21,
+        "w": 6,
+        "x": 18,
         "y": 17
       },
       "id": 83,
@@ -962,19 +678,6 @@
         "w": 24,
         "x": 0,
         "y": 25
-      },
-      "id": 80,
-      "panels": [],
-      "title": "Bandwidth",
-      "type": "row"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 26
       },
       "id": 10,
       "panels": [],
@@ -1047,7 +750,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 27
+        "y": 26
       },
       "id": 11,
       "options": {
@@ -1083,7 +786,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 35
+        "y": 34
       },
       "id": 20,
       "panels": [],
@@ -1154,9 +857,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
+        "w": 8,
         "x": 0,
-        "y": 36
+        "y": 35
       },
       "id": 21,
       "options": {
@@ -1247,9 +950,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 6,
-        "y": 36
+        "w": 8,
+        "x": 8,
+        "y": 35
       },
       "id": 22,
       "options": {
@@ -1340,9 +1043,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 12,
-        "y": 36
+        "w": 8,
+        "x": 16,
+        "y": 35
       },
       "id": 23,
       "options": {
@@ -1370,105 +1073,12 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 36
-      },
-      "id": 24,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.3.1",
-      "targets": [
-        {
-          "expr": "sum by (backend) (rate(uploader_dlq_total{service_namespace=\"$namespace\"}[5m]))",
-          "legendFormat": "{{backend}}",
-          "refId": "A"
-        }
-      ],
-      "title": "DLQ rate",
-      "type": "timeseries"
-    },
-    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 44
+        "y": 43
       },
       "id": 30,
       "panels": [],
@@ -1541,7 +1151,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 45
+        "y": 44
       },
       "id": 31,
       "options": {
@@ -1634,7 +1244,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 45
+        "y": 44
       },
       "id": 32,
       "options": {
@@ -1727,7 +1337,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 45
+        "y": 44
       },
       "id": 33,
       "options": {
@@ -1760,7 +1370,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 52
       },
       "id": 40,
       "panels": [],
@@ -1833,7 +1443,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 54
+        "y": 53
       },
       "id": 41,
       "options": {
@@ -1926,7 +1536,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 54
+        "y": 53
       },
       "id": 42,
       "options": {
@@ -1959,7 +1569,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 62
+        "y": 61
       },
       "id": 50,
       "panels": [],
@@ -2032,7 +1642,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 63
+        "y": 62
       },
       "id": 51,
       "options": {
@@ -2159,7 +1769,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 63
+        "y": 62
       },
       "id": 52,
       "options": {
@@ -2235,7 +1845,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 63
+        "y": 62
       },
       "id": 53,
       "options": {
@@ -2263,7 +1873,7 @@
       ],
       "title": "Cache disk usage (PVC quota)",
       "type": "gauge",
-      "description": "statvfs on the cache mount = the CephFS PVC QUOTA, not the backing pool. Compare with \"Ceph pool usage (data0)\" to the right \u2014 they diverge sharply when the pool fills ahead of the quota (the 2026-07-24 blind spot)."
+      "description": "statvfs on the cache mount = the CephFS PVC QUOTA, not the backing pool. The two diverge sharply when the pool fills ahead of the quota (the 2026-07-24 blind spot) \u2014 pool fullness lives on the Ceph dashboard, not here."
     },
     {
       "datasource": {
@@ -2300,8 +1910,8 @@
       "gridPos": {
         "h": 8,
         "w": 6,
-        "x": 0,
-        "y": 71
+        "x": 18,
+        "y": 62
       },
       "id": 54,
       "options": {
@@ -2324,14 +1934,113 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
-          "expr": "max(fs_store_parts_on_disk{service_namespace=\"$namespace\"})",
+          "expr": "max(max_over_time(fs_store_parts_on_disk{service_namespace=\"$namespace\"}[6h]))",
           "legendFormat": "parts",
           "refId": "A"
         }
       ],
       "title": "Cache parts on disk",
       "type": "stat",
-      "description": "Census from the last COMPLETED GC phase. If 'Janitor cycle health' shows a stuck/never-completed cycle, this is stale rather than zero."
+      "description": "Census from the last COMPLETED GC phase. The raw gauge starts at 0 on every janitor restart and stays there until the next sweep finishes, which is why this read 0 for hours at a time; max_over_time([6h]) carries the last real census across those gaps. A sustained 0 over a full 6h window means no sweep has completed \u2014 check 'Janitor cycle health'."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      },
+      "id": 65,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "expr": "max(fs_janitor_last_cycle_age_seconds{service_namespace=\"$namespace\"})",
+          "legendFormat": "since last completed cycle",
+          "refId": "A"
+        },
+        {
+          "expr": "max(fs_janitor_cycle_seconds{service_namespace=\"$namespace\"})",
+          "legendFormat": "last cycle duration",
+          "refId": "B"
+        }
+      ],
+      "title": "Janitor cycle health",
+      "type": "timeseries",
+      "description": "Seconds since the last COMPLETED janitor cycle (-1 = none since start). A line climbing without resetting means a phase is stuck and every census gauge on this dashboard is stale."
     },
     {
       "collapsed": false,
@@ -2339,7 +2048,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 71
+        "y": 78
       },
       "id": 60,
       "panels": [],
@@ -2418,7 +2127,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 72
+        "y": 79
       },
       "id": 61,
       "options": {
@@ -2605,7 +2314,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 72
+        "y": 79
       },
       "id": 62,
       "options": {
@@ -2699,7 +2408,7 @@
         "h": 8,
         "w": 4,
         "x": 16,
-        "y": 72
+        "y": 79
       },
       "id": 63,
       "options": {
@@ -2792,7 +2501,7 @@
         "h": 8,
         "w": 4,
         "x": 20,
-        "y": 72
+        "y": 79
       },
       "id": 64,
       "options": {
@@ -2833,7 +2542,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 80
+        "y": 87
       },
       "id": 70,
       "panels": [],
@@ -2912,7 +2621,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 81
+        "y": 88
       },
       "id": 71,
       "options": {
@@ -3024,7 +2733,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 81
+        "y": 88
       },
       "id": 72,
       "options": {
@@ -3091,7 +2800,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 81
+        "y": 88
       },
       "id": 73,
       "options": {
@@ -3114,13 +2823,14 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
-          "expr": "kube_deployment_status_replicas_ready{namespace=\"$namespace\"}",
+          "expr": "kube_deployment_status_replicas_ready{namespace=\"$namespace\", deployment!=\"api\"}",
           "legendFormat": "{{deployment}}",
           "refId": "A"
         }
       ],
       "title": "Ready replicas",
-      "type": "stat"
+      "type": "stat",
+      "description": "Ready replicas per Deployment. The `api` Deployment is excluded: the internal API now runs as the api-local DaemonSet, so the Deployment sits at 0 replicas and only added a permanent red 0 to this panel. DaemonSets are not covered by this metric."
     },
     {
       "collapsed": false,
@@ -3128,7 +2838,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 89
+        "y": 96
       },
       "id": 84,
       "panels": [],
@@ -3167,7 +2877,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 90
+        "y": 97
       },
       "id": 85,
       "options": {
@@ -3232,7 +2942,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 90
+        "y": 97
       },
       "id": 86,
       "options": {
@@ -3295,7 +3005,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 90
+        "y": 97
       },
       "id": 87,
       "options": {
@@ -3358,7 +3068,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 90
+        "y": 97
       },
       "id": 88,
       "options": {
@@ -3430,7 +3140,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 98
+        "y": 105
       },
       "id": 89,
       "options": {
@@ -3493,7 +3203,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 98
+        "y": 105
       },
       "id": 90,
       "options": {
@@ -3556,7 +3266,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 98
+        "y": 105
       },
       "id": 91,
       "options": {
@@ -3619,7 +3329,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 98
+        "y": 105
       },
       "id": 92,
       "options": {
@@ -3679,7 +3389,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 106
+        "y": 113
       },
       "id": 93,
       "options": {
@@ -3742,7 +3452,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 106
+        "y": 113
       },
       "id": 94,
       "options": {
@@ -3805,7 +3515,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 106
+        "y": 113
       },
       "id": 95,
       "options": {
@@ -3833,105 +3543,6 @@
       ],
       "title": "Account cacher \u2014 cycles",
       "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 4,
-        "x": 0,
-        "y": 64
-      },
-      "id": 65,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.3.1",
-      "targets": [
-        {
-          "expr": "max(fs_janitor_last_cycle_age_seconds{service_namespace=\"$namespace\"})",
-          "legendFormat": "since last completed cycle",
-          "refId": "A"
-        },
-        {
-          "expr": "max(fs_janitor_cycle_seconds{service_namespace=\"$namespace\"})",
-          "legendFormat": "last cycle duration",
-          "refId": "B"
-        }
-      ],
-      "title": "Janitor cycle health",
-      "type": "timeseries",
-      "description": "Seconds since the last COMPLETED janitor cycle (-1 = none since start). A line climbing without resetting means a phase is stuck and every census gauge on this dashboard is stale."
     }
   ],
   "preload": false,
@@ -3977,5 +3588,5 @@
   "timezone": "browser",
   "title": "Hippius S3 \u2014 System Load",
   "uid": "hippius-s3-system-load",
-  "version": 10
+  "version": 11
 }

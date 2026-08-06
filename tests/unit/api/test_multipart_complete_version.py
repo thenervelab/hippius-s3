@@ -510,6 +510,63 @@ async def test_complete_idempotent_replay_is_wellformed_and_uses_host(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_complete_success_path_location_comes_from_the_host_header(monkeypatch: Any) -> None:
+    """Pins the success half of the Location contract; the replay half is pinned above.
+
+    Both paths build the document through build_complete_result_xml now, so the two have to
+    agree. Nothing failed when they diverged: replay hardcoded http://localhost:8000 while
+    success read Host, and no test looked at either.
+
+    What this value IS in production is a separate problem, deliberately not asserted here.
+    The gateway deletes Host and X-Forwarded-Host before forwarding
+    (gateway/services/forward_service.py), so the API reads GATEWAY_BACKEND_URL's authority
+    and hands clients `http://api:8000/...` — the internal service name. Correcting that
+    needs the gateway to pass a public-host header through; this test is where the change
+    will surface.
+    """
+    _patch_common(monkeypatch)
+    completed: dict[str, Any] = {"ok": False}
+    _completing_writer(monkeypatch, completed)
+
+    db = _FakeDb(current_version=1, upload_version=1)
+    resp = await multipart.complete_multipart_upload("b", "k", "up-1", _request(), db)
+
+    assert resp.status_code == 200, bytes(resp.body)
+    root = _parse(bytes(resp.body))
+    assert _text(root, "Location") == "http://h/b/k"
+
+
+@pytest.mark.asyncio
+async def test_complete_success_and_replay_agree_on_location(monkeypatch: Any) -> None:
+    """The same upload must report the same Location whether it completes or replays.
+
+    An AWS CLI retry hits the replay path for an upload the first attempt completed, so a
+    client can legitimately see both documents for one upload. They disagreed before.
+    """
+    _patch_common(monkeypatch)
+    completed: dict[str, Any] = {"ok": False}
+    _completing_writer(monkeypatch, completed)
+
+    class _CompletedDb(_FakeDb):
+        async def fetchrow(self, query: str, *args: Any) -> Any:
+            if query == "get_multipart_upload":
+                return {"object_id": "obj-1", "is_completed": True, "current_object_version": 1}
+            if query == "get_object_by_path":
+                return {"md5_hash": "abc"}
+            return await super().fetchrow(query, *args)
+
+    success = await multipart.complete_multipart_upload(
+        "b", "k", "up-1", _request(), _FakeDb(current_version=1, upload_version=1)
+    )
+    replay = await multipart.complete_multipart_upload(
+        "b", "k", "up-1", _request(), _CompletedDb(current_version=1, upload_version=1)
+    )
+
+    assert success.status_code == 200 and replay.status_code == 200
+    assert _text(_parse(bytes(success.body)), "Location") == _text(_parse(bytes(replay.body)), "Location")
+
+
+@pytest.mark.asyncio
 async def test_complete_rejects_duplicate_part_numbers(monkeypatch: Any) -> None:
     """Duplicate part numbers are not strictly ascending => InvalidPartOrder."""
     _patch_common(monkeypatch)
