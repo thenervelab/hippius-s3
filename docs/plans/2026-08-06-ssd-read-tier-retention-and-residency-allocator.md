@@ -178,12 +178,22 @@ first-read hit on the node that already holds the shard, promotion covers everyt
 misses (a re-ingested object, a node drained for maintenance, a shard rebalanced after a node
 is added).
 
-- **Ingest-affinity routing.** Route a GET to the node named in
-  `cephor_replication_status.node_id`. Capacity-efficient — 17.5 TB of *distinct* resident data,
-  no duplication — and a first-read hit. Needs a per-node addressable endpoint and a routing hop.
-  This is the riskiest surface in the stack, so it ships behind a flag defaulting to off, with a
-  fall-through to the current round-robin `Service/api` whenever the target node is unknown,
-  unready, or the lookup fails. Routing must never be able to fail a request.
+- **Ingest-affinity locality, resolved PER PART.** Not per request — measured on prod
+  2026-08-06, only 48 of 2,214 sampled multi-part object versions (2%) have all their parts on
+  one node, while 684 (31%) span all five. Each `UploadPart` of an MPU is handled by whichever
+  `api-local` pod the round-robin `Service/api` picks, so `node_id` is a per-part fact and
+  routing a whole GET to "the object's node" would leave most parts remote anyway.
+
+  The shape that follows is a **peer-fetch tier** in the read path — local SSD → the node that
+  owns *that part* → CephFS pool — rather than a routing hop at the gateway. Same DB lookup and
+  same api→api transfer, at the granularity the data demands. It composes with promotion (a
+  peer-fetched chunk is promoted locally) and needs no gateway or Service change. Peer NVMe
+  (~6 ms + ~1 ms network) still beats the pool's ~40 ms by a wide margin.
+
+  Requires per-node addressing (`hostPort` on the `api-local` DaemonSet plus a node→IP map) and
+  an internal read-only endpoint serving a part from local SSD, behind the existing IP-whitelist
+  middleware. Ships behind a flag defaulting to off, falling through to the pool whenever the
+  peer is unknown, unready, or slow. A peer fetch must never be able to fail a read.
 - **Read-through promotion.** When an api pod reads a chunk from the CephFS fallback, it copies
   it to its own local NVMe. No routing dependency; warms on the second read on any node. Hot
   objects replicate up to 5×, which the 3× capacity headroom absorbs.
