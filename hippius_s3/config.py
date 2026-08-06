@@ -365,6 +365,11 @@ class Config:
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
     object_cache_fallback_dir: str = env("HIPPIUS_OBJECT_CACHE_FALLBACK_DIR:", convert=str)
+    # Copy a pool-served chunk onto this node's local NVMe so the next read of it comes off
+    # flash (~6 ms/chunk) instead of CephFS (~40 ms). OFF by default and deliberately so: a
+    # promoted copy is only reclaimable by a drain-agent evictor running on the same node, so
+    # enabling it where no evictor runs would fill the disk with copies nothing owns.
+    object_cache_promote_on_read: bool = env("HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ:false", convert=bool)
     # 24h since last WRITE — the read path no longer bumps timestamps (read
     # recency lives in fs_cache_inventory.last_access_at), so this gates on
     # time since the part landed, not since it was last streamed.
