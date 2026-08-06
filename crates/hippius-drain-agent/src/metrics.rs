@@ -109,6 +109,27 @@ fn register_ssd_tier_instruments(meter: &opentelemetry::metrics::Meter, snapshot
             .with_callback(move |observer| observer.observe(snap.evicted_bytes(), &[]))
             .build(),
     ));
+
+    // The eviction durability invariant, as a counter so an alert can assert it stays at zero.
+    // Non-zero means the worklist offered a part whose SSD copy may be the only durable one —
+    // refused, but the query and the invariant have diverged.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_evict_blocked_unreplicated_total")
+            .with_callback(move |observer| observer.observe(snap.evict_blocked_unreplicated(), &[]))
+            .build(),
+    ));
+
+    // Free space: the third leg of backlog/cache/free. Without it a dashboard cannot separate
+    // "the read cache grew" from "the disk is filling with backlog".
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_ssd_free_bytes")
+            .with_callback(move |observer| observer.observe(snap.free_bytes(), &[]))
+            .build(),
+    ));
 }
 
 /// Builds the meter provider and registers the agent's metrics, or returns `None` when

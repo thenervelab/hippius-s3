@@ -330,6 +330,7 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
     match evict_to_target(store, ssd, target, policy.batch).await {
         Ok(report) => {
             snapshot.record_evicted(report.evicted, report.freed_bytes);
+            snapshot.record_evict_blocked_unreplicated(report.skipped_unreplicated);
             if report.evicted > 0 {
                 tracing::info!(
                     evicted = report.evicted,
@@ -413,6 +414,7 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node
     // (blocking) statvfs probe already produced it — the metrics layer reads it wait-free
     // off the exporter thread and must never run statvfs itself.
     snapshot.record_disk_pressure(usage.pressure.bps());
+    snapshot.record_free_bytes(usage.free_bytes);
 
     record_drain_signals(store, node, snapshot).await;
 

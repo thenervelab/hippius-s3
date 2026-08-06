@@ -165,6 +165,10 @@ pub struct SnapshotCell {
     /// is under space pressure and is giving up warm data.
     evicted: AtomicU64,
     evicted_bytes: AtomicU64,
+    /// Worklist entries the evictor REFUSED because they were not `replicated`. The durability
+    /// invariant, and the reason it is a counter rather than a log line: "has this ever been
+    /// non-zero" has to be answerable by an alert rule, not by grepping.
+    evict_blocked_unreplicated: AtomicU64,
     /// Aborted-reclaim counter mirroring `reclaimed`: bumped once per reclaim cycle that failed
     /// its object-backing read (`ReclaimError::Backing`). Monotonic, `Relaxed` — a stat counter
     /// with no cross-counter ordering dependency (axiom `rust_quality_92`). See
@@ -183,6 +187,9 @@ pub struct SnapshotCell {
     /// gauge on the same tick as the backlog. Distinct from it precisely because the
     /// allocator must not read warm cache as drain demand.
     cache_bytes: AtomicU64,
+    /// Free bytes on the ingest SSD. The third leg of backlog/cache/free: without it a
+    /// dashboard cannot tell "cache grew" from "the disk filled".
+    free_bytes: AtomicU64,
     /// The allocator's published free-space floor for this node, in permille of disk, plus
     /// one so that 0 can mean "nothing published". A bare 0 would be ambiguous with a
     /// legitimate reserve of 0 (the eviction kill-switch), and reading that as "no floor" on
@@ -281,6 +288,28 @@ impl SnapshotCell {
     #[must_use]
     pub fn evicted_bytes(&self) -> u64 {
         self.evicted_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records eviction candidates refused for not being `replicated`. Must stay at zero.
+    pub fn record_evict_blocked_unreplicated(&self, n: u64) {
+        self.evict_blocked_unreplicated.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Cumulative refused-candidate count (`drain_ssd_evict_blocked_unreplicated_total`).
+    #[must_use]
+    pub fn evict_blocked_unreplicated(&self) -> u64 {
+        self.evict_blocked_unreplicated.load(Ordering::Relaxed)
+    }
+
+    /// Records free bytes on the ingest SSD. A gauge: `store`, not add.
+    pub fn record_free_bytes(&self, bytes: u64) {
+        self.free_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The last-recorded free space (`drain_ssd_free_bytes`).
+    #[must_use]
+    pub fn free_bytes(&self) -> u64 {
+        self.free_bytes.load(Ordering::Relaxed)
     }
 
     /// Records the bytes currently resident on SSD as read cache. A gauge: `store`, not add.
