@@ -148,8 +148,17 @@ spec:
               value: "300"
             - name: CEPHOR_RECLAIM_GRACE_SECS
               value: "3600"
-            - name: CEPHOR_REPLICATED_RECLAIM_GRACE_SECS
-              value: "3600"
+            # Read-tier eviction. With the drain retaining its replicated parts to serve
+            # reads, this is the ONLY thing that frees /s3-data — if it stalls, the disk
+            # fills to the api's fs_cache_pressure threshold and PUTs start 503ing.
+            # The reserve (15% of 3.84 TB, ~575 GB) sits well clear of that 10%-free
+            # threshold so the evictor is always reclaiming before ingest is refused.
+            - name: CEPHOR_EVICT_POLL_SECS
+              value: "30"
+            - name: CEPHOR_EVICT_RESERVE_PERCENT
+              value: "15"
+            - name: CEPHOR_EVICT_HEADROOM_PERCENT
+              value: "5"
             # Max parts drained concurrently — the in-flight gate that lets the node
             # overlap fsync latency across parts (the AIMD allocator only tunes bytes/s).
             # Safe code default (4); set here for per-node tuning.

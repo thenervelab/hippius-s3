@@ -5,7 +5,7 @@
 //! fixture map instead of the process-global environment — which is shared
 //! mutable state that races across parallel tests.
 
-use crate::runtime::{HeartbeatConfig, RuntimeConfig};
+use crate::runtime::{EvictionPolicy, HeartbeatConfig, RuntimeConfig};
 use core::str::FromStr;
 use hippius_drain_core::{ByteRate, NodeId};
 use std::num::ParseIntError;
@@ -78,6 +78,28 @@ const DEFAULT_ORPHAN_RECLAIM_GRACE: Duration = Duration::from_hours(24);
 /// (abandoned-upload) part — and an orphan write-temp — is kept on SSD before
 /// eviction (a diagnosis / abort-settle window).
 const DEFAULT_RECLAIM_GRACE: Duration = Duration::from_hours(1);
+
+/// How often the read-tier evictor probes free space when `CEPHOR_EVICT_POLL_SECS` is unset.
+/// Frequent, because with retention on this is the only worker freeing the ingest SSD and a
+/// burst of ingest can breach the floor between polls. A pass that is not armed costs one
+/// `statvfs` and no query at all, so a short poll is close to free.
+const DEFAULT_EVICT_POLL: Duration = Duration::from_secs(30);
+
+/// The free-space floor the evictor maintains, as a percent of the ingest disk, when
+/// `CEPHOR_EVICT_RESERVE_PERCENT` is unset. Chosen to sit well clear of the api's
+/// `fs_cache_pressure` 503 threshold (10% free): the evictor must be reclaiming well before
+/// ingest starts refusing writes, never racing it. On the 3.84 TB prod `NVMe`s this is ~575 GB.
+const DEFAULT_EVICT_RESERVE_PERCENT: u8 = 15;
+
+/// How far past the floor one armed pass frees, as a percent of the disk, when
+/// `CEPHOR_EVICT_HEADROOM_PERCENT` is unset. Without this gap the evictor re-arms on nearly
+/// every poll and pins the disk at the threshold.
+const DEFAULT_EVICT_HEADROOM_PERCENT: u8 = 5;
+
+/// Parts considered per eviction pass when `CEPHOR_EVICT_BATCH` is unset. At a 4 MiB chunk
+/// and typical part sizes this frees tens of GB per pass — enough to close a breach in a few
+/// polls without one pass monopolising the disk.
+const DEFAULT_EVICT_BATCH: u32 = 512;
 
 /// Default path of the liveness file the runtime touches each heartbeat tick; the
 /// k8s `livenessProbe` checks its freshness. Container-local `/tmp` is always writable.
@@ -156,6 +178,15 @@ pub struct Config {
     /// Max times an R4 `corrupt` part is re-driven before it is held and paged. Bounds the
     /// re-drive so a persistently-bad pool copy cannot loop forever.
     pub redrive_max_attempts: u32,
+    /// How often the read-tier evictor probes the ingest disk's free space.
+    pub evict_poll: Duration,
+    /// The free-space floor the evictor maintains, as a percent of the ingest disk. Zero
+    /// disables eviction — and with retention on, that means nothing frees the SSD.
+    pub evict_reserve_percent: u8,
+    /// How far past the floor an armed eviction pass frees, as a percent of the disk.
+    pub evict_headroom_percent: u8,
+    /// Parts considered per eviction pass.
+    pub evict_batch: u32,
     /// Path of the liveness file the runtime touches each heartbeat tick; a k8s
     /// `livenessProbe` checks its freshness to restart a wedged (not crashed) pod.
     pub liveness_file: PathBuf,
@@ -236,6 +267,12 @@ impl Config {
             grace: self.grace,
             drain_concurrency: self.drain_concurrency,
             redrive_max_attempts: self.redrive_max_attempts,
+            evict_poll: self.evict_poll,
+            evict_policy: EvictionPolicy {
+                reserve_percent: self.evict_reserve_percent,
+                headroom_percent: self.evict_headroom_percent,
+                batch: self.evict_batch,
+            },
         }
     }
 
@@ -310,6 +347,10 @@ impl Config {
             orphan_reclaim_grace: duration_secs(&get, "CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", DEFAULT_ORPHAN_RECLAIM_GRACE)?,
             drain_concurrency: positive_u32_or(&get, "CEPHOR_DRAIN_CONCURRENCY", DEFAULT_DRAIN_CONCURRENCY)?,
             redrive_max_attempts: positive_u32_or(&get, "CEPHOR_REDRIVE_MAX_ATTEMPTS", DEFAULT_REDRIVE_MAX_ATTEMPTS)?,
+            evict_poll: duration_secs(&get, "CEPHOR_EVICT_POLL_SECS", DEFAULT_EVICT_POLL)?,
+            evict_reserve_percent: percent_or(&get, "CEPHOR_EVICT_RESERVE_PERCENT", DEFAULT_EVICT_RESERVE_PERCENT)?,
+            evict_headroom_percent: percent_or(&get, "CEPHOR_EVICT_HEADROOM_PERCENT", DEFAULT_EVICT_HEADROOM_PERCENT)?,
+            evict_batch: positive_u32_or(&get, "CEPHOR_EVICT_BATCH", DEFAULT_EVICT_BATCH)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
             readiness_file: path_or(&get, "CEPHOR_READINESS_FILE", DEFAULT_READINESS_FILE),
         })
@@ -364,6 +405,21 @@ fn positive_u64_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, def
 /// Resolves an optional positive count variable as a `u32`. Builds on [`u64_or`]
 /// but rejects an explicit zero (a zero drain concurrency would stall the worker)
 /// and a value past `u32::MAX`, mirroring [`positive_u64_or`]'s fail-fast contract.
+/// A percentage in `0..=100`.
+///
+/// Deliberately NOT `positive_u32_or`: zero is a meaningful value for the eviction reserve
+/// (it disables eviction, the operator kill-switch), so rejecting it would turn a supported
+/// setting into a startup failure. The upper bound is checked because a reserve above 100%
+/// can never be satisfied — the evictor would evict the entire cache every pass and still
+/// report `starved` forever.
+fn percent_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, default: u8) -> Result<u8, ConfigError> {
+    let value = u64_or(get, var, u64::from(default))?;
+    if value > 100 {
+        return Err(ConfigError::OutOfRange { var, value, limit: 100 });
+    }
+    Ok(u8::try_from(value).unwrap_or(100))
+}
+
 fn positive_u32_or(get: &impl Fn(&str) -> Option<String>, var: &'static str, default: u32) -> Result<u32, ConfigError> {
     let value = u64_or(get, var, u64::from(default))?;
     match u32::try_from(value) {

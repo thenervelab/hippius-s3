@@ -159,6 +159,12 @@ pub struct SnapshotCell {
     deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
     reclaimed: AtomicU64,
+    /// Resident parts the read-tier evictor unlinked, and the bytes they freed. Separate from
+    /// `reclaimed` (debris the reclaim worker removed) because the two answer different
+    /// questions: reclaim rising means junk is accumulating, eviction rising means the cache
+    /// is under space pressure and is giving up warm data.
+    evicted: AtomicU64,
+    evicted_bytes: AtomicU64,
     /// Aborted-reclaim counter mirroring `reclaimed`: bumped once per reclaim cycle that failed
     /// its object-backing read (`ReclaimError::Backing`). Monotonic, `Relaxed` — a stat counter
     /// with no cross-counter ordering dependency (axiom `rust_quality_92`). See
@@ -169,9 +175,14 @@ pub struct SnapshotCell {
     written_off_servable: AtomicU64,
     /// Current SSD backlog (undrained bytes) — a LEVEL, not a monotonic counter, so it
     /// has its own atomic (set, not accumulated) rather than living in [`AgentSnapshot`].
-    /// The heartbeat worker writes it (`usage.used_bytes`) each tick; the metrics layer
-    /// reads it as a gauge. Kept off the wait-free `load` path so a scrape never blocks.
+    /// The heartbeat worker writes it (from `Store::node_backlog_bytes`) each tick; the
+    /// metrics layer reads it as a gauge. Kept off the wait-free `load` path so a scrape
+    /// never blocks.
     backlog_bytes: AtomicU64,
+    /// Bytes this node holds RESIDENT on SSD to serve reads (`Store::node_cache_bytes`). A
+    /// gauge on the same tick as the backlog. Distinct from it precisely because the
+    /// allocator must not read warm cache as drain demand.
+    cache_bytes: AtomicU64,
     /// Count of this node's undrained replication rows (`pending` + `draining`) — a LEVEL like
     /// `backlog_bytes`, set each heartbeat from `Store::node_undrained_count`. This is the C8
     /// wedge signal, kept SEPARATE from `backlog_bytes` on purpose: the byte sum joins `parts`
@@ -247,6 +258,35 @@ impl SnapshotCell {
     /// [`AgentSnapshot::throttled`].
     pub fn record_throttled(&self, n: u64) {
         self.throttled.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Adds one eviction pass's outcome to the read-tier eviction totals.
+    pub fn record_evicted(&self, parts: u64, bytes: u64) {
+        self.evicted.fetch_add(parts, Ordering::Relaxed);
+        self.evicted_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The cumulative count of parts the evictor unlinked (`drain_ssd_evicted_total`).
+    #[must_use]
+    pub fn evicted(&self) -> u64 {
+        self.evicted.load(Ordering::Relaxed)
+    }
+
+    /// The cumulative bytes the evictor freed (`drain_ssd_evicted_bytes_total`).
+    #[must_use]
+    pub fn evicted_bytes(&self) -> u64 {
+        self.evicted_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records the bytes currently resident on SSD as read cache. A gauge: `store`, not add.
+    pub fn record_cache_bytes(&self, bytes: u64) {
+        self.cache_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The last-recorded resident cache size (the `drain_ssd_cache_bytes` gauge).
+    #[must_use]
+    pub fn cache_bytes(&self) -> u64 {
+        self.cache_bytes.load(Ordering::Relaxed)
     }
 
     /// Records the current SSD backlog (undrained bytes). A gauge: `store`, not add.

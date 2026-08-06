@@ -375,7 +375,7 @@ impl Store {
                ON p.object_id = crs.object_id::uuid \
               AND p.object_version = crs.version \
               AND p.part_number = crs.part_number \
-             WHERE crs.node_id = $1 AND crs.resident_at IS NOT NULL AND crs.evicted_at IS NULL",
+             WHERE crs.node_id = $1 AND crs.status = 'replicated' AND crs.resident_at IS NOT NULL AND crs.evicted_at IS NULL",
         )
         .bind(node)
         .fetch_one(&self.pool)
@@ -1134,6 +1134,14 @@ impl ResidentLog for Store {
         let Some(node) = self.node_id.as_deref() else {
             return Ok(Vec::new());
         };
+        // The `status = 'replicated'` filter is load-bearing, not redundant with resident_at.
+        // Residency and status are independent: `redrive_corrupt_parts` resets a corrupt part
+        // to `pending` for a fresh copy WITHOUT clearing resident_at (correctly — the part is
+        // still on the disk), so a re-driven part is resident-and-pending. Selecting on
+        // residency alone would offer the evictor a part whose SSD copy is once again the only
+        // durable one. The orchestrator refuses it regardless, but a worklist that never emits
+        // it is the real guard; that check is the backstop.
+        //
         // ORDER BY resident_at IS the eviction policy (FIFO, oldest-retained first); the
         // orchestrator walks this order and never re-sorts. Reads straight off
         // `cephor_replication_resident_idx`, whose predicate matches this WHERE exactly, so
@@ -1151,7 +1159,7 @@ impl ResidentLog for Store {
                ON p.object_id = crs.object_id::uuid \
               AND p.object_version = crs.version \
               AND p.part_number = crs.part_number \
-             WHERE crs.node_id = $1 AND crs.resident_at IS NOT NULL AND crs.evicted_at IS NULL \
+             WHERE crs.node_id = $1 AND crs.status = 'replicated' AND crs.resident_at IS NOT NULL AND crs.evicted_at IS NULL \
              ORDER BY crs.resident_at \
              LIMIT $2",
         )
@@ -1890,6 +1898,37 @@ mod part_tests {
 
         assert_eq!(store.node_cache_bytes("node-a").await.unwrap(), 0, "a pre-retention row is not cache");
         assert!(store.evictable_parts(10).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test]
+    async fn a_redriven_corrupt_part_leaves_the_eviction_worklist_while_it_is_pending_again(pool: PgPool) {
+        // Residency and status are INDEPENDENT, and conflating them is a data-loss bug.
+        // `redrive_corrupt_parts` resets a corrupt part to 'pending' so the drain re-copies it,
+        // and deliberately does NOT clear resident_at — the part really is still on the disk.
+        // But while it is pending its SSD copy is once again the ONLY durable copy, so it must
+        // vanish from the worklist until the re-drive commits and makes it replicated again.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        seed_status_node(&pool, UUID_A, 1, 1, "corrupt", "node-a").await;
+        seed_part_size(&pool, UUID_A, 1, 1, Some(100)).await;
+        sqlx::query("UPDATE cephor_replication_status SET resident_at = now() WHERE object_id = $1")
+            .bind(UUID_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let redriven = store.redrive_corrupt_parts(3).await.unwrap();
+        assert_eq!(redriven, 1, "the corrupt part went back to pending for a fresh copy");
+
+        assert!(
+            store.evictable_parts(10).await.unwrap().is_empty(),
+            "a resident-but-pending part is not evictable — its SSD copy is the only durable one",
+        );
+        assert_eq!(
+            store.node_cache_bytes("node-a").await.unwrap(),
+            0,
+            "nor does it count as evictable cache toward the allocator's ingest headroom",
+        );
     }
 
     #[sqlx::test]

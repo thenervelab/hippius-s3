@@ -22,9 +22,9 @@ use crate::readiness::ReadinessTracker;
 use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
-    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, NodeId, NodeObservation,
-    PartReplicationStore, ReclaimError, ReclaimGraces, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate,
-    jittered, reclaim_ssd, reconcile_parts,
+    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, EvictionTarget, NodeId,
+    NodeObservation, PartReplicationStore, ReclaimError, ReclaimGraces, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket,
+    UploadEnqueuer, decay_rate, evict_to_target, jittered, reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -87,6 +87,10 @@ pub struct RuntimeConfig {
     pub reconcile_poll: Duration,
     /// How often the reclaim worker scans the SSD for `failed` (abandoned-upload) parts.
     pub reclaim_poll: Duration,
+    /// How often the read-tier evictor checks the ingest disk's free space.
+    pub evict_poll: Duration,
+    /// The free-space floor the evictor maintains, and how far past it to free.
+    pub evict_policy: EvictionPolicy,
     /// How often the enqueue sweep publishes the backend upload for `replicated` parts whose
     /// address was not finalized at drain time (an in-flight MPU). Short, since a completed
     /// MPU's parts should publish promptly — but off the read path, so seconds is fine.
@@ -232,6 +236,10 @@ async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotC
     // taking it from the `Ok` arm here, so a failed query reuses the last good value
     // instead of reporting a zero backlog — which the allocator would read as "idle" and
     // strip of demand, stalling the very node whose DB read is struggling.
+    match store.node_cache_bytes(node.as_str()).await {
+        Ok(bytes) => snapshot.record_cache_bytes(bytes),
+        Err(err) => tracing::warn!(error = %err, "cache-bytes query failed; keeping the last value"),
+    }
     match store.node_undrained_count(node.as_str()).await {
         Ok(count) => snapshot.record_undrained_count(count),
         Err(err) => tracing::warn!(error = %err, "undrained-count query failed; keeping the last value"),
@@ -243,6 +251,97 @@ async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotC
     match store.node_oldest_pending_age_secs(node.as_str()).await {
         Ok(secs) => snapshot.record_oldest_pending_age_secs(secs),
         Err(err) => tracing::warn!(error = %err, "oldest-pending-age query failed; keeping the last value"),
+    }
+}
+
+/// How aggressively this node keeps free space on its ingest SSD.
+///
+/// Expressed as percentages of disk size rather than absolute bytes so a single fleet-wide
+/// setting stays correct on nodes whose ingest disks differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvictionPolicy {
+    /// Free-space floor, as a percent of the disk. Eviction arms below this. Must sit
+    /// comfortably above the api's `fs_cache_pressure` 503 threshold (10% free): the evictor
+    /// has to be reclaiming well before ingest starts refusing writes, not racing it.
+    /// Zero disables eviction entirely — the operator kill-switch.
+    pub reserve_percent: u8,
+    /// How far past the floor to free once armed, as a percent of the disk. Without this the
+    /// evictor re-arms on nearly every cycle and pins the disk at the threshold.
+    pub headroom_percent: u8,
+    /// Most parts to consider in one pass, bounding both the worklist query and how long a
+    /// single pass can hold the disk busy.
+    pub batch: u32,
+}
+
+/// Resolves a policy against a probed disk into the concrete byte target for one pass.
+///
+/// Split out from [`evict_once`] so the percentage arithmetic — the part that silently
+/// misbehaves if it rounds or overflows — is unit-testable without a disk or a database.
+fn eviction_target(usage: DiskUsage, policy: EvictionPolicy) -> EvictionTarget {
+    // u128 intermediates: total_bytes is multi-terabyte and a percent multiply would be
+    // within a factor of 100 of overflowing u64 on a large enough disk.
+    let percent_of_disk = |percent: u8| -> u64 { u64::try_from(u128::from(usage.total_bytes) * u128::from(percent) / 100).unwrap_or(u64::MAX) };
+    EvictionTarget {
+        free: usage.free_bytes,
+        reserve: percent_of_disk(policy.reserve_percent),
+        headroom: percent_of_disk(policy.headroom_percent),
+    }
+}
+
+/// One eviction pass: probe the ingest disk and, if free space is under the reserve, evict
+/// oldest-resident parts until it is back over the floor.
+///
+/// With retention on, this is the ONLY thing that frees the ingest SSD, so a persistent
+/// failure here ends in `fs_cache_pressure` 503ing PUTs. Errors are logged and retried on the
+/// next poll rather than propagated (a failed pass must not kill the agent), but `starved`
+/// and `skipped_unreplicated` are surfaced loudly because neither is self-correcting.
+async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, policy: EvictionPolicy) {
+    let root = ssd.root().to_path_buf();
+    // statvfs blocks — same rule as the heartbeat probe (axiom r4r_ch10_01).
+    let usage = match tokio::task::spawn_blocking(move || disk_usage(&root)).await {
+        Ok(Ok(usage)) => usage,
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "eviction disk probe failed");
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "eviction disk probe task panicked");
+            return;
+        }
+    };
+
+    let target = eviction_target(usage, policy);
+    match evict_to_target(store, ssd, target, policy.batch).await {
+        Ok(report) => {
+            snapshot.record_evicted(report.evicted, report.freed_bytes);
+            if report.evicted > 0 {
+                tracing::info!(
+                    evicted = report.evicted,
+                    freed_bytes = report.freed_bytes,
+                    free_bytes = usage.free_bytes,
+                    "evicted resident SSD parts to restore the free-space floor"
+                );
+            }
+            // Eviction could not reach its target: the disk is filling with something it
+            // cannot reclaim (undrained backlog, reclaimer-owned debris, or a foreign writer).
+            // Left alone this ends in 503s on PUT, and no amount of retrying fixes it.
+            if report.starved {
+                tracing::error!(
+                    free_bytes = usage.free_bytes,
+                    deficit = target.deficit(),
+                    "eviction ran out of resident parts before restoring the free-space floor"
+                );
+            }
+            // The eviction invariant broke: the worklist offered a part whose only durable
+            // copy may be the SSD one. Refused, but the query and the invariant have diverged.
+            if report.skipped_unreplicated > 0 {
+                tracing::error!(
+                    skipped_unreplicated = report.skipped_unreplicated,
+                    "eviction worklist offered non-replicated parts — refused; worklist and invariant have diverged"
+                );
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "eviction pass failed; retrying next poll"),
     }
 }
 
@@ -267,7 +366,7 @@ fn node_observation(usage: DiskUsage, snapshot: &SnapshotCell, max_drain_rate: B
         pressure: usage.pressure,
         backlog: Bytes::new(snapshot.backlog()),
         free: Bytes::new(usage.free_bytes),
-        cache: Bytes::ZERO,
+        cache: Bytes::new(snapshot.cache_bytes()),
         max_drain_rate,
         observed_p99: snapshot.p99(),
         error_bps: snapshot.load().error_bps(),
@@ -703,6 +802,21 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             })
         });
 
+        // Read-tier evictor: with the drain retaining its replicated parts, this is the ONLY
+        // worker that frees the ingest SSD. It runs on its own poll (not folded into
+        // ssd_reclaim) because the two answer to different clocks — reclaim chases debris that
+        // accrues slowly, eviction chases a free-space floor that a burst of ingest can breach
+        // in minutes.
+        let (ssd, store, snapshot) = (Arc::clone(&self.ssd), Arc::clone(&self.store), Arc::clone(&self.snapshot));
+        let evict_poll = self.config.evict_poll;
+        let evict_policy = self.config.evict_policy;
+        supervisor.spawn(WorkerName::new("ssd_evict"), move |token| {
+            run_periodic(token, evict_poll, move || {
+                let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
+                async move { evict_once(&ssd, &store, &snapshot, evict_policy).await }
+            })
+        });
+
         // Enqueue-sweep worker: publish the backend upload for `replicated` parts whose
         // address was NULL at drain time (an in-flight MPU) — the decoupled counterpart to the
         // drain's inline best-effort enqueue. Uses only the Postgres store + the shared
@@ -804,16 +918,18 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
     use super::{
-        AgentRuntime, DiskUsage, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, node_observation, pull_action,
-        record_drain_signals,
+        AgentRuntime, DiskUsage, EvictionPolicy, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, eviction_target,
+        node_observation, pull_action, record_drain_signals,
     };
     use crate::localfs::{LocalFs, LocalSsd};
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
     use hippius_drain_core::DiskPressure;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
     use hippius_drain_core::{
         Allocation, ByteRate, Bytes, Clock, CoordError, Coordinator, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReclaimGraces,
-        ReplicationState, SnapshotCell, Store, StoredAllocation, TestClock, UploadEnqueuer, Version,
+        ReplicationState, ResidentLog, SnapshotCell, Store, StoredAllocation, TestClock, UploadEnqueuer, Version,
     };
 
     /// A coordinator on the test Redis under a per-test prefix, or `None` to skip the
@@ -919,6 +1035,51 @@ mod tests {
     }
 
     #[test]
+    fn the_eviction_target_is_a_percentage_of_the_disk_not_an_absolute_size() {
+        // Reserve and headroom are percentages so one setting is correct on ingest disks of
+        // different sizes: 15%/5% of a 4000 GiB disk must resolve to 600 GiB / 200 GiB, not to
+        // whatever byte count happened to suit the node it was first tuned on. They are taken
+        // against TOTAL size, not against free space — a floor measured against what is left
+        // would move every time the disk filled.
+        let usage = DiskUsage {
+            pressure: DiskPressure::try_from(9_000).unwrap(),
+            free_bytes: 400 * GIB,
+            total_bytes: 4000 * GIB,
+        };
+        let policy = EvictionPolicy {
+            reserve_percent: 15,
+            headroom_percent: 5,
+            batch: 128,
+        };
+
+        let target = eviction_target(usage, policy);
+
+        assert_eq!(target.free, 400 * GIB);
+        assert_eq!(target.reserve, 600 * GIB, "15% of 4000 GiB");
+        assert_eq!(target.headroom, 200 * GIB, "5% of 4000 GiB");
+        assert!(target.deficit() > 0, "400 GiB free is under a 15% reserve, so eviction arms");
+    }
+
+    #[test]
+    fn a_zero_reserve_policy_disables_eviction_entirely() {
+        // The operator kill-switch. With retention on, the evictor is the only thing freeing
+        // the ingest SSD, so being able to turn it off has to be a deliberate, obvious
+        // setting rather than an emergent effect of some percentage rounding to nothing.
+        let usage = DiskUsage {
+            pressure: DiskPressure::FULL,
+            free_bytes: 0,
+            total_bytes: 4000 * GIB,
+        };
+        let policy = EvictionPolicy {
+            reserve_percent: 0,
+            headroom_percent: 5,
+            batch: 128,
+        };
+
+        assert_eq!(eviction_target(usage, policy).deficit(), 0, "a zero reserve never arms");
+    }
+
+    #[test]
     fn the_heartbeat_reports_the_db_backlog_not_disk_occupancy() {
         // The Phase 1 wiring, pinned. A node whose SSD is nearly full but has only 4 MiB of
         // genuinely undrained work must bid as a 4 MiB node. Sourcing this from occupancy
@@ -929,6 +1090,7 @@ mod tests {
         let usage = DiskUsage {
             pressure: DiskPressure::try_from(9_500).unwrap(),
             free_bytes: 100 * 1024 * 1024,
+            total_bytes: 1024 * 1024 * 1024,
         };
 
         let observation = node_observation(usage, &snapshot, ByteRate::new(5_000_000));
@@ -1070,6 +1232,12 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                evict_poll: Duration::from_secs(30),
+                evict_policy: EvictionPolicy {
+                    reserve_percent: 15,
+                    headroom_percent: 5,
+                    batch: 512,
+                },
                 redrive_max_attempts: 3,
             },
         )
@@ -1144,6 +1312,12 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                evict_poll: Duration::from_secs(30),
+                evict_policy: EvictionPolicy {
+                    reserve_percent: 15,
+                    headroom_percent: 5,
+                    batch: 512,
+                },
                 redrive_max_attempts: 3,
             },
         )
@@ -1236,6 +1410,12 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                evict_poll: Duration::from_secs(30),
+                evict_policy: EvictionPolicy {
+                    reserve_percent: 15,
+                    headroom_percent: 5,
+                    batch: 512,
+                },
                 redrive_max_attempts: 3,
             },
         )
@@ -1301,6 +1481,12 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                evict_poll: Duration::from_secs(30),
+                evict_policy: EvictionPolicy {
+                    reserve_percent: 15,
+                    headroom_percent: 5,
+                    batch: 512,
+                },
                 redrive_max_attempts: 3,
             },
         );
@@ -1349,6 +1535,12 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                evict_poll: Duration::from_secs(30),
+                evict_policy: EvictionPolicy {
+                    reserve_percent: 15,
+                    headroom_percent: 5,
+                    batch: 512,
+                },
                 redrive_max_attempts: 3,
             },
         );
@@ -1430,6 +1622,125 @@ mod tests {
             Some(ReplicationState::Failed),
             "reclaim does not touch the replication row",
         );
+    }
+
+    /// Creates the minimal `parts` table the eviction worklist LEFT JOINs, and marks `part`
+    /// replicated + resident — the state the drain leaves behind now that it retains its SSD
+    /// copy. Done in SQL because `PartVerified` is unforgeable outside drain-core, which is
+    /// the point of that seal; `mark_replicated`'s own residency stamping is covered by the
+    /// store tests.
+    async fn seed_resident(pool: &PgPool, part: &PartKey, size_bytes: i64) {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS parts (object_id uuid NOT NULL, object_version bigint NOT NULL, \
+             part_number bigint NOT NULL, size_bytes bigint, upload_id uuid)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO parts (object_id, object_version, part_number, size_bytes) VALUES ($1::uuid, $2, $3, $4)")
+            .bind(part.object().as_str())
+            .bind(i64::from(part.version().get()))
+            .bind(i64::from(part.part().get()))
+            .bind(size_bytes)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE cephor_replication_status SET status = 'replicated', resident_at = now() \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn evict_once_reclaims_a_resident_part_when_the_disk_is_under_its_floor(pool: PgPool) {
+        // The whole eviction path end-to-end against real Postgres and a real directory:
+        // statvfs -> target -> worklist -> unlink -> mark evicted. A reserve of 100% is
+        // unsatisfiable by construction, so the pass is guaranteed to arm regardless of how
+        // full the test machine's disk happens to be.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let snapshot = SnapshotCell::new();
+
+        let resident = part_at(5, 1);
+        seed_ssd_dir(ssd_dir.path(), &resident);
+        store.record_landed_part(&resident).await.unwrap();
+        seed_resident(&pool, &resident, 20).await;
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        super::evict_once(
+            &ssd,
+            &store,
+            &snapshot,
+            EvictionPolicy {
+                reserve_percent: 100,
+                headroom_percent: 0,
+                batch: 512,
+            },
+        )
+        .await;
+
+        assert!(
+            !ssd_dir.path().join(resident.relative_dir()).exists(),
+            "the resident part was evicted to restore the floor",
+        );
+        assert_eq!(snapshot.evicted(), 1);
+        assert!(
+            store.evictable_parts(10).await.unwrap().is_empty(),
+            "an evicted part is marked, so the next pass does not re-offer a part that is gone",
+        );
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &resident).await.unwrap(),
+            Some(ReplicationState::Replicated),
+            "eviction drops the SSD copy only; the pool copy stays authoritative",
+        );
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn evict_once_never_touches_an_undrained_part(pool: PgPool) {
+        // The invariant that makes retention safe, proven through the real worklist rather
+        // than a fake: a `pending` part's SSD copy is the ONLY durable copy in existence.
+        // Even with an unsatisfiable reserve — maximum possible pressure to free something —
+        // it must survive, because losing it is data loss, not a cache miss.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let snapshot = SnapshotCell::new();
+
+        let undrained = part_at(7, 1);
+        seed_ssd_dir(ssd_dir.path(), &undrained);
+        store.record_landed_part(&undrained).await.unwrap();
+        // A `parts` row and a resident marker, but the status stays `pending` — the shape the
+        // worklist must refuse. Without the table the LEFT JOIN would error, masking the test.
+        seed_resident(&pool, &undrained, 20).await;
+        sqlx::query("UPDATE cephor_replication_status SET status = 'pending' WHERE object_id = $1")
+            .bind(undrained.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        super::evict_once(
+            &ssd,
+            &store,
+            &snapshot,
+            EvictionPolicy {
+                reserve_percent: 100,
+                headroom_percent: 0,
+                batch: 512,
+            },
+        )
+        .await;
+
+        assert!(
+            ssd_dir.path().join(undrained.relative_dir()).exists(),
+            "an undrained part is the only durable copy — eviction must never take it",
+        );
+        assert_eq!(snapshot.evicted(), 0);
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]

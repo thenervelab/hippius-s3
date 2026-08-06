@@ -46,6 +46,10 @@ pub struct DiskUsage {
     pub pressure: DiskPressure,
     /// Bytes free to an unprivileged writer — what a new PUT can claim without evicting.
     pub free_bytes: u64,
+    /// The filesystem's total size. The evictor's reserve and headroom are expressed as
+    /// percentages of this rather than as absolute bytes, so one setting is correct across
+    /// nodes whose ingest disks differ in size.
+    pub total_bytes: u64,
 }
 
 /// The [`DiskUsage`] of the filesystem containing `path`, from one `statvfs`.
@@ -63,7 +67,12 @@ pub fn disk_usage(path: &Path) -> io::Result<DiskUsage> {
     // overstate headroom.
     let pressure = DiskPressure::from_fraction(used_fraction(widen(stats.blocks()), widen(stats.blocks_available()))).map_err(io::Error::other)?;
     let free = widen(stats.blocks_available()).saturating_mul(widen(stats.fragment_size()));
-    Ok(DiskUsage { pressure, free_bytes: free })
+    let total = widen(stats.blocks()).saturating_mul(widen(stats.fragment_size()));
+    Ok(DiskUsage {
+        pressure,
+        free_bytes: free,
+        total_bytes: total,
+    })
 }
 
 /// Widens a platform-dependent-width `statvfs` count to `u64`.
@@ -109,6 +118,7 @@ mod tests {
         let fraction = usage.pressure.as_fraction();
         assert!((0.0..=1.0).contains(&fraction), "pressure is a fraction, got {fraction}");
         assert!(usage.free_bytes > 0, "a live filesystem has free space");
+        assert!(usage.total_bytes >= usage.free_bytes, "free space cannot exceed the disk");
     }
 
     #[test]

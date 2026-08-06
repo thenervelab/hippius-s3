@@ -42,6 +42,11 @@ SET LOCAL lock_timeout = '5s';
 -- oldest-resident first. node_id leads so the equality is an index condition; resident_at
 -- follows so the eviction cursor reads straight off the index in order.
 --
+-- `status = 'replicated'` is in the predicate because residency and status are INDEPENDENT:
+-- redrive_corrupt_parts resets a corrupt part to 'pending' for a fresh copy without clearing
+-- resident_at (correctly — the part is still on the disk). A resident-and-pending part's SSD
+-- copy is once again the only durable one, so it must never reach the evictor's worklist.
+--
 -- The partial predicate matches ZERO rows on arrival (nothing has been retained yet), so
 -- despite the 11M-row table this builds fast and near-empty — the scan is sequential but
 -- almost nothing is written. It then grows only with genuinely resident parts, bounded by
@@ -56,4 +61,4 @@ SET LOCAL lock_timeout = '5s';
 -- columns can stay — they are inert unless the drain writes them.
 CREATE INDEX IF NOT EXISTS cephor_replication_resident_idx
     ON cephor_replication_status (node_id, resident_at)
-    WHERE resident_at IS NOT NULL AND evicted_at IS NULL;
+    WHERE status = 'replicated' AND resident_at IS NOT NULL AND evicted_at IS NULL;
