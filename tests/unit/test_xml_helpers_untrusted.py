@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 import pytest
+from lxml import etree as _ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.xml_helpers import parse_untrusted_xml
 
@@ -26,14 +27,14 @@ def test_raises_valueerror_on_a_malformed_body() -> None:
         parse_untrusted_xml(b"<D><K>")
 
 
-def test_does_not_expand_internal_entities_while_parsing() -> None:
-    """Billion laughs: a default parser inflates this during the parse itself.
+def test_rejects_an_entity_amplification_payload() -> None:
+    """Billion laughs is refused, but not by anything in our code — say so.
 
-    With resolution off the reference is kept as an unexpanded child node, so the parse stays
-    cheap and ``.text`` reads as None rather than as megabytes of payload. That None is the
-    property callers depend on — reading text is how every endpoint pulls values out, and an
-    absent value is refused. Note lxml WILL still expand on demand if asked (``string(.)``),
-    so callers must not reach for that on untrusted input.
+    libxml2 (2.11+) applies its own amplification guard and rejects this payload with the
+    default parser too, so an assertion that ``parse_untrusted_xml`` raises here would pass
+    just as well with the hardening removed and prove nothing about it. Keep the case as a
+    regression test against a libxml2 downgrade or a build without the guard, and let
+    test_leaves_a_modest_entity_unresolved_in_element_text carry the flags.
     """
     bomb = (
         b"<?xml version='1.0'?><!DOCTYPE lolz ["
@@ -47,8 +48,7 @@ def test_does_not_expand_internal_entities_while_parsing() -> None:
         b"]><D><K>&lol7;</K></D>"
     )
     started = time.monotonic()
-    # libxml2's own amplification guard refuses a payload this size outright, which surfaces
-    # through the ValueError contract as a malformed body.
+    # The guard surfaces through the ValueError contract as a malformed body.
     with pytest.raises(ValueError):
         parse_untrusted_xml(bomb)
     elapsed = time.monotonic() - started
@@ -58,15 +58,21 @@ def test_does_not_expand_internal_entities_while_parsing() -> None:
 
 
 def test_leaves_a_modest_entity_unresolved_in_element_text() -> None:
-    """Below the amplification guard the body parses, and the reference is kept as an
-    unexpanded child node — so ``.text`` reads None rather than the payload. That None is the
-    property callers depend on: reading text is how endpoints pull values out, and an absent
-    value is refused. lxml will still expand on demand (``string(.)``), so callers must not
-    reach for that on untrusted input.
+    """This is the case that actually pins ``resolve_entities=False``.
+
+    A single small entity is below libxml2's amplification guard, so it is the parser flags
+    and nothing else deciding the outcome — the assertion against the default parser is what
+    makes that visible, and it is why this test fails if the hardening is ever dropped.
+
+    Kept unresolved, the reference stays an unexpanded child node and ``.text`` reads None.
+    That None is the property callers depend on: reading text is how endpoints pull values
+    out, and an absent value is refused. lxml will still expand on demand (``string(.)``), so
+    callers must not reach for that on untrusted input.
     """
     body = b"<?xml version='1.0'?><!DOCTYPE d [<!ENTITY e 'payload'>]><D><K>&e;</K></D>"
 
-    root = parse_untrusted_xml(body)
+    baseline = _ET.fromstring(body).xpath("./*[local-name()='K']")[0]
+    assert baseline.text == "payload", "default parser no longer resolves — this test lost its teeth"
 
-    key = root.xpath("./*[local-name()='K']")[0]
+    key = parse_untrusted_xml(body).xpath("./*[local-name()='K']")[0]
     assert key.text is None, "entity resolved into element text"
