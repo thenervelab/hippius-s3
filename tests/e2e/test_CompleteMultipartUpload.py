@@ -93,5 +93,12 @@ def test_multipart_upload_with_ampersand_key(
     etag_xml = completed["ETag"].strip('"')
     assert etag_xml.endswith("-2")
 
+    # Location is the one response field carrying both the key and a host, so it is where an
+    # escaping regression shows up first. Only the path is asserted: the authority is whatever
+    # Host the API saw, and the gateway strips Host before forwarding, so pinning it here would
+    # pin a deployment detail rather than the escaping this test is about.
+    assert completed["Location"].endswith(f"/{bucket}/{key}"), completed["Location"]
+    assert "localhost:8000" not in completed["Location"], "hardcoded host is back"
+
     head = boto3_client.head_object(Bucket=bucket, Key=key)
     assert head["ETag"].strip('"') == etag_xml
