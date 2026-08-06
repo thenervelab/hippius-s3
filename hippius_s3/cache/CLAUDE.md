@@ -9,8 +9,34 @@ Chunk cache. Backed by a shared filesystem volume; Redis is used only for pub/su
 | [fs_store.py](fs_store.py) | `FileSystemPartsStore` — the actual on-disk cache. Atomic writes, meta-gated reads, read-recency tracking (`note_read` → `fs_cache_inventory.last_access_at`). |
 | [object_parts.py](object_parts.py) | `RedisObjectPartsCache` — facade composing `FileSystemPartsStore` + `ChunkNotifier`. Name retained for compat; chunk I/O is FS-backed. |
 | [notifier.py](notifier.py) | `ChunkNotifier` — Redis pub/sub wrapper for chunk-ready notifications. |
-| [dual_fs_store.py](dual_fs_store.py) | `DualFileSystemPartsStore` — primary + fallback read-only store for migration. |
-| [__init__.py](__init__.py) | `create_fs_store(config)` factory — picks `DualFileSystemPartsStore` if `HIPPIUS_OBJECT_CACHE_FALLBACK_DIR` is set. |
+| [dual_fs_store.py](dual_fs_store.py) | `DualFileSystemPartsStore` — the tiered read path: node-local NVMe → peer node → CephFS pool. Optionally promotes a pool/peer-served chunk onto local flash. |
+| [peers.py](peers.py) | `PeerRegistry` (self-registration of pod IPs in Redis, TTL'd) + `PeerChunkFetcher` (resolve which node holds a part, fetch one chunk from it). |
+| [residency.py](residency.py) | `ResidencyRecorder` — claims a promoted part for this node in `cephor_ssd_residency` so this node's evictor can reclaim it. |
+| [part_memo.py](part_memo.py) | `PartMemo` — bounded, TTL'd per-part memo, so per-part facts are not recomputed per chunk. |
+| [__init__.py](__init__.py) | `create_fs_store(config, on_promote=..., peer_fetch=...)` factory — picks `DualFileSystemPartsStore` if `HIPPIUS_OBJECT_CACHE_FALLBACK_DIR` is set. |
+
+## Read tiers (`DualFileSystemPartsStore`)
+
+`get_chunk` tries three tiers in order, recording which one served the read into
+`chunk_reads_by_tier_total{tier=local|peer|pool}`:
+
+1. **local** — this node's NVMe (`HIPPIUS_OBJECT_CACHE_DIR` on an ingest node is node-local).
+2. **peer** — the node that holds the part on flash, via `GET /internal/parts/...` on its
+   `api-local` pod. Resolved per PART (not per request) from `cephor_ssd_residency`, memoised
+   in a `PartMemo`. Off unless `HIPPIUS_PEER_FETCH_ENABLED`.
+3. **pool** — the shared CephFS volume. Authoritative and always present for a replicated part,
+   so every tier above it is an optimisation and must never be able to fail a read.
+
+With `HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ`, a peer- or pool-served chunk is copied onto local
+flash and claimed in `cephor_ssd_residency` so the drain-agent's evictor owns it. Two caps bound
+peer fanout — `HIPPIUS_PEER_FETCH_MAX_INFLIGHT` per (pod, peer) on the client, and
+`HIPPIUS_PEER_SERVE_MAX_INFLIGHT` on the serving pod, which sheds with 503. Both shed to the
+pool rather than queueing.
+
+**The evictor runs in a different process** (`drain-agent`) and deletes both the part directory
+and its residency row. Nothing in this package may cache "I already recorded/wrote this" across
+that boundary — it cannot be invalidated when the row disappears. Check on-disk state instead;
+see the `_promote_chunk` in-flight guard and the note at the top of `residency.py`.
 
 ## On-disk layout
 

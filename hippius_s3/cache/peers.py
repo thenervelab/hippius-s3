@@ -209,6 +209,19 @@ class PeerChunkFetcher:
         if base is None:
             return None
         slots = self._inflight.setdefault(base, asyncio.Semaphore(self._max_inflight))
+        # Best-effort fast path, not a hard gate: a slot can free between this check and the
+        # acquire below, in which case the request proceeds rather than shedding. The cap
+        # itself is the semaphore; this only avoids QUEUEING behind a saturated peer, since
+        # waiting would stack that peer's backlog on top of the pool read that follows anyway.
+        #
+        # NOTE this cap is per (pod, peer) and the read path prefetches
+        # `HTTP_STREAM_PREFETCH_CHUNKS` chunks at a time. Chunks of ONE part all resolve to the
+        # same peer, so for a part with more chunks than `HIPPIUS_PEER_FETCH_MAX_INFLIGHT` a
+        # single reader sheds its own excess to the pool and books it as `client_cap` —
+        # contention that is not contention. Harmless (the pool is the correct fallback) but it
+        # understates the peer tier in `chunk_reads_by_tier_total`, so keep the two values in
+        # mind together when reading the soak. Most parts are a single chunk, so this only
+        # bites large multipart objects.
         if slots.locked():
             _record_shed("client_cap")
             return None

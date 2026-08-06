@@ -61,6 +61,10 @@ async def get_local_chunk(
     # crowd out PUTs on the same uvicorn. 503 is the right answer rather than queueing: the
     # caller treats any non-200 as "read the pool", so shedding costs it a fallback, while
     # queueing would add this pod's saturation to the pool read that follows anyway.
+    # Best-effort fast path, not a hard gate: a slot can free between this check and the
+    # acquire below, in which case the request proceeds instead of shedding. The semaphore is
+    # the actual cap; this check only avoids queueing, which would add this pod's saturation
+    # to the pool read the caller falls back to anyway.
     limiter = getattr(request.app.state, "peer_serve_limiter", None)
     if limiter is not None and limiter.locked():
         return Response(status_code=503)

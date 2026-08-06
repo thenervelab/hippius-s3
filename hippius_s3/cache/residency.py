@@ -5,9 +5,18 @@ evictor — which is scoped to `cephor_ssd_residency.node_id` — cannot reclaim
 this node claims it. Without that row the copy sits on the disk forever with nothing able
 to free it.
 
-Writes are deduplicated per part rather than per chunk: promotion runs once per chunk, but
-residency is a per-part fact, so a 64-chunk part would otherwise issue 64 identical upserts
-on the read path. The dedup set is bounded and self-clearing (see `_SEEN_LIMIT`).
+Writes happen once per PROMOTED CHUNK, not once per part, and each carries only the bytes
+that chunk actually wrote. A range GET promotes only the chunks it touches, so claiming the
+whole part's declared size would inflate the number the evictor sums against its deficit and
+stop an eviction pass early while it reported success.
+
+Deliberately NOT memoised on "already recorded for this part". Such a memo lives in this
+process while the evictor that DELETEs the row runs in another (drain-agent), so it cannot be
+invalidated when the row disappears underneath it — a promote → evict → promote sequence
+inside the memo window would then write chunks that no evictor can ever see. Duplicate
+promotion of the same chunk is instead prevented at source by the in-flight guard in
+`DualFileSystemPartsStore._promote_chunk`, which holds only in-flight keys and therefore
+drains itself.
 """
 
 from __future__ import annotations
@@ -19,18 +28,6 @@ import asyncpg
 
 
 logger = logging.getLogger(__name__)
-
-# Cap on the "already recorded" memo. Promotion is idempotent, so over-evicting the memo costs
-# a duplicate upsert, never correctness — the bound exists so a long-lived api pod serving a
-# large working set cannot grow this without limit.
-_SEEN_LIMIT = 100_000
-
-# How long a recorded part stays remembered. Bounded rather than permanent because the drain's
-# evictor can DELETE the residency row underneath us: a part promoted, evicted, then read and
-# promoted again must be re-recorded, and a permanent memo would skip it forever, leaving a
-# copy on disk that this node's evictor can never see — exactly the leak per-node residency
-# exists to prevent.
-_SEEN_TTL_SECONDS = 300.0
 
 
 class ResidencyRecorder:
@@ -58,9 +55,15 @@ class ResidencyRecorder:
                 )
         except (asyncpg.PostgresError, OSError) as exc:
             # Best-effort, like the promotion it accompanies: the bytes are already served and
-            # the pool copy is authoritative. A failure here leaves an unclaimed copy that the
-            # reclaimer's orphan sweep can still remove, so it degrades to wasted space rather
-            # than a failed read. Not cached as seen, so the next promotion retries.
+            # the pool copy is authoritative, so failing the read over a bookkeeping write would
+            # trade a served request for nothing.
+            #
+            # Be clear about what this costs, because an earlier version of this comment claimed
+            # the reclaimer's orphan sweep would collect the unclaimed copy and that is NOT true:
+            # `ssd_reclaim` skips `replicated` parts outright (they are the read tier now), so a
+            # replicated part on disk with no residency row has NO owner — the evictor is scoped
+            # to the residency table and cannot see it either. It leaks until some later read
+            # promotes the same chunk again and re-runs this upsert. Nothing else collects it.
             logger.debug(
                 "recording promoted residency failed for %s v%s part %s: %s",
                 object_id,

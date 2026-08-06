@@ -306,3 +306,42 @@ async def test_a_busy_peer_503_falls_through_without_poisoning_the_memo() -> Non
 
     assert await fetcher(OBJ, 1, 3, 0) is None, "shed, so this chunk reads from the pool"
     assert await fetcher(OBJ, 1, 3, 1) == b"peer-bytes", "the peer is retried once it recovers"
+
+
+@pytest.mark.asyncio
+async def test_both_shed_paths_are_recorded_with_their_reason(monkeypatch) -> None:
+    """A shed must be observable, and the two causes must stay distinguishable.
+
+    Without this, `chunk_reads_by_tier_total` shows the peer tier underperforming with no way
+    to say why. The two reasons call for opposite responses: `server_busy` is real contention
+    at the peer, while `client_cap` can simply be this reader out-pacing its own per-peer cap
+    — the read path prefetches `HTTP_STREAM_PREFETCH_CHUNKS` chunks and the chunks of one part
+    all resolve to the same peer, so a part with more chunks than `peer_fetch_max_inflight`
+    sheds its own excess. Reading the second as saturation would send someone tuning the peer
+    when the cap is what needs raising.
+    """
+    recorded: list[str] = []
+    monkeypatch.setattr("hippius_s3.cache.peers._record_shed", recorded.append)
+
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
+    registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
+
+    # Client cap: one slot, held by a request that has not come back yet.
+    blocking = BlockingHttp()
+    capped = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", blocking, max_inflight=1)
+    first = asyncio.create_task(capped(OBJ, 1, 3, 0))
+    await asyncio.wait_for(blocking.started.wait(), timeout=1)
+    assert await capped(OBJ, 1, 3, 1) is None
+    blocking.release.set()
+    await first
+
+    # Server cap: the peer sheds it back with a 503.
+    busy = PeerChunkFetcher(
+        FakePool({"node_id": "node-b"}), registry, "node-a", FakeHttp(FakeResponse(503)), max_inflight=8
+    )
+    assert await busy(OBJ, 1, 4, 0) is None
+
+    assert recorded == ["client_cap", "server_busy"], (
+        "each shed is counted once, under the reason that actually caused it"
+    )
