@@ -31,13 +31,28 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
 
     This endpoint is compatible with the S3 protocol used by MinIO and other S3 clients.
     """
+    main_account_id = request.state.account.main_account
+
+    # An empty or anonymous main_account means gateway identity stamping was
+    # bypassed (reserved-path holes). Every branch below writes on behalf of the
+    # caller — creating a bucket would insert an ownerless row that permanently
+    # locks the globally-unique name (prod incident 2026-08-03: buckets "docs"
+    # and "docs2"), and the config branches would insert junk user rows.
+    if not main_account_id or main_account_id == "anonymous":
+        return errors.s3_error_response(
+            "AccessDenied",
+            "This operation requires an authenticated account",
+            status_code=403,
+            BucketName=bucket_name,
+        )
+
     # Check if this is a request to set bucket lifecycle
     if "lifecycle" in request.query_params:
         try:
             # Get user for user-scoped bucket lookup
             _ = await db.fetchrow(
                 get_query("get_or_create_user_by_main_account"),
-                request.state.account.main_account,
+                main_account_id,
                 datetime.now(timezone.utc),
             )
 
@@ -103,7 +118,7 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
             # Get user for user-scoped bucket lookup
             _ = await db.fetchrow(
                 get_query("get_or_create_user_by_main_account"),
-                request.state.account.main_account,
+                main_account_id,
                 datetime.now(timezone.utc),
             )
 
@@ -180,15 +195,13 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
 
     # Handle standard bucket creation if not a tagging, lifecycle, or policy request
     else:
-        if is_valid_ss58_address(bucket_name):
-            main_account_id = request.state.account.main_account
-            if bucket_name != main_account_id:
-                return errors.s3_error_response(
-                    "AccessDenied",
-                    "You are not allowed to create this bucket, you can only create a bucket of your own SS58 account address",
-                    status_code=403,
-                    BucketName=bucket_name,
-                )
+        if is_valid_ss58_address(bucket_name) and bucket_name != main_account_id:
+            return errors.s3_error_response(
+                "AccessDenied",
+                "You are not allowed to create this bucket, you can only create a bucket of your own SS58 account address",
+                status_code=403,
+                BucketName=bucket_name,
+            )
         try:
             bucket_id = str(uuid.uuid4())
             created_at = datetime.now(timezone.utc)
@@ -197,7 +210,6 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
             is_public = False
 
             # Get or create user record for the main account
-            main_account_id = request.state.account.main_account
             await db.fetchrow(
                 get_query("get_or_create_user_by_main_account"),
                 main_account_id,

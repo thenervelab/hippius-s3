@@ -27,6 +27,13 @@ Operational and migration scripts. Most are invoked manually by an operator duri
 | [resubmit_failed_pins.py](resubmit_failed_pins.py) | Retry failed simple uploads by re-enqueuing pin requests. Access-key auth only (seed-phrase support removed). |
 | [recover_missing_backend.py](recover_missing_backend.py) | Restore accidentally-deleted `chunk_backend` rows from Arion by matching identifiers. |
 
+### Audits (read-only)
+
+| Script | Purpose |
+|---|---|
+| [report_reserved_name_buckets.py](report_reserved_name_buckets.py) | Lists live buckets whose name collides with a reserved gateway route segment, plus any bucket with an empty/`anonymous` owner. Exit 1 on findings, 2 on operational failure. A bucket named `user` or `health` is flagged `acl-bypass`: `acl_middleware` returns before the permission check for `/health` and `/user/*`, so objects under it have neither auth nor ACL in front of them. |
+| [report_broken_v5_rows.py](report_broken_v5_rows.py) | Counts `storage_version >= 5` rows with a missing envelope (`kek_id`/`wrapped_dek` NULL). Seq-scans — point at a replica. |
+
 ### Destructive ops (use with care)
 
 | Script | Purpose |
@@ -59,19 +66,19 @@ Long-running migrations use `/tmp/migration_progress.txt` (or similar) as a resu
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #422 | 12:57 PM | 🔵 | Migration Script Uses asyncpg Library for PostgreSQL Connections | ~394 |
+| #422 | 2:57 PM | 🔵 | Migration Script Uses asyncpg Library for PostgreSQL Connections | ~394 |
 
 ### Apr 23, 2026
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #6960 | 12:03 PM | 🔴 | Additional handlers migrated to pool-based pattern in follow-up commit | ~680 |
-| #6944 | 11:02 AM | 🔄 | Updated migrate_objects script to use pool parameter name for ObjectWriter | ~383 |
+| #6960 | 2:03 PM | 🔴 | Additional handlers migrated to pool-based pattern in follow-up commit | ~680 |
+| #6944 | 1:02 PM | 🔄 | Updated migrate_objects script to use pool parameter name for ObjectWriter | ~383 |
 
 ### Jul 1, 2026
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #9748 | 12:24 PM | ✅ | Documentation updated to remove stale RESUBMISSION_SEED_PHRASE reference | ~302 |
-| #9744 | 12:22 PM | 🔵 | Resubmit script has excessive blank line formatting noise | ~339 |
+| #9748 | 2:24 PM | ✅ | Documentation updated to remove stale RESUBMISSION_SEED_PHRASE reference | ~302 |
+| #9744 | 2:22 PM | 🔵 | Resubmit script has excessive blank line formatting noise | ~339 |
 </claude-mem-context>
