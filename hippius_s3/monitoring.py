@@ -25,17 +25,49 @@ tracer = trace.get_tracer(__name__)
 # label cannot drift into unbounded cardinality.
 ChunkReadTier = Literal["local", "peer", "pool"]
 
-# Which side declined a peer fetch. Closed by construction, like ChunkReadTier.
-PeerShedReason = Literal["client_cap", "server_busy"]
+# Why a peer fetch did not happen, or its answer was not used. Closed by construction, like
+# ChunkReadTier. The reasons demand different responses and must stay distinguishable:
+# `client_cap` and `server_busy` are capacity; `peer_miss` is the peer having evicted the chunk
+# between the residency read and the fetch, which is routine and settles on its own; and the
+# rest mean something is wrong. `bad_peer_url` is a peer registration this cluster did not
+# write, `bad_length` a peer serving bodies that are not the chunk that was asked for,
+# `unknown_size` a chunk with no recorded ciphertext size to check an answer against, and
+# `peer_error` any other non-200 — a half-rolled deploy, which is a pod to go find.
+#
+# Every one of these has to be counted, including the routine `peer_miss`. The alternative is
+# that a wholesale peer-tier failure — an eviction storm, or a bad image on every pod — shows up
+# only as a DROP in `chunk_reads_by_tier_total{tier=peer}`, and an absence is indistinguishable
+# from the tier simply being idle, so nothing can alert on it.
+PeerShedReason = Literal[
+    "client_cap",
+    "server_busy",
+    "bad_peer_url",
+    "bad_length",
+    "unknown_size",
+    "peer_miss",
+    "peer_error",
+]
 
 # Why a chunk that could have been promoted onto local flash was not. Closed by construction.
-PromotionSkipReason = Literal["disk_pressure"]
+# `residency_failed` is the fail-closed arm: the claim that makes this node's evictor the owner
+# of the copy did not land, so the copy is not made.
+PromotionSkipReason = Literal["disk_pressure", "residency_failed"]
 
 # Outcome of a read-recency stamp. Closed by construction. `failed` is separate rather than
 # uncounted because the write is best-effort and swallowed: without it, a recency path that is
 # erroring on every read is indistinguishable from one that is being fully absorbed by the
 # sampler, and both look like silence.
 ReadRecencyOutcome = Literal["written", "failed"]
+
+# Where the bytes that failed a chunk's AEAD check were found, and what came of it. Closed by
+# construction. `local` means a copy on this node's flash was removed and the read retried from
+# the next tier; `remote` means nothing local held it (a peer or the pool served it), so there
+# was nothing this node could invalidate and no retry was worth making. A sustained
+# `local`/`recovered` rate is a poisoner planting bad bytes on this node — the pool copy is fine.
+# Anything `unrecovered` survived a tier change, so it is a key or object fault, not local
+# corruption; the two must stay distinguishable or a DEK fault reads like cache poisoning.
+AeadFailureTier = Literal["local", "remote"]
+AeadFailureOutcome = Literal["recovered", "unrecovered"]
 
 
 class MetricsCollector:
@@ -118,12 +150,12 @@ class MetricsCollector:
         # CephFS pool. Without this split the SSD read tier is unmeasurable — every tier reads
         # as "cache" — so there is no way to tell whether retention, promotion, and peer fetch
         # are doing anything, or to catch a silent regression back to all-pool reads.
-        # Peer fetches declined, by which side declined: this pod's per-peer fanout cap, or
-        # the peer shedding to protect its own ingest. A rising rate means the read tier is
-        # falling back to the pool under load, which is the signal that fanout needs tuning.
+        # Every peer fetch that did not yield bytes, under the reason it did not — see
+        # PeerShedReason. This is the only POSITIVE signal the peer tier has: without it a tier
+        # that has failed wholesale reads on a dashboard exactly like a tier nobody is using.
         self.peer_fetch_shed = self.meter.create_counter(
             name="peer_fetch_shed_total",
-            description="Peer chunk fetches declined (client_cap|server_busy)",
+            description="Peer chunk fetches that yielded no bytes, by reason (see PeerShedReason)",
             unit="1",
         )
 
@@ -134,12 +166,14 @@ class MetricsCollector:
         )
 
         # Chunks served but deliberately NOT copied onto local flash. This is the promotion
-        # backpressure made visible: it must start rising BEFORE fs_cache_shed does, because
-        # promotion yielding is what keeps the disk from reaching the PUT-refusal threshold.
-        # Flat at zero while free space falls means the gate is not engaging.
+        # backpressure made visible: `disk_pressure` must start rising BEFORE fs_cache_shed does,
+        # because promotion yielding is what keeps the disk from reaching the PUT-refusal
+        # threshold. Flat at zero while free space falls means the gate is not engaging.
+        # `residency_failed` says promotion is off because the residency DB is unreachable —
+        # sustained, it means the read tier has stopped warming and only this counter says so.
         self.promotion_skipped = self.meter.create_counter(
             name="promotion_skipped_total",
-            description="Chunks not promoted to the local read tier, by reason (disk_pressure)",
+            description="Chunks not promoted to the local read tier, by reason (disk_pressure|residency_failed)",
             unit="1",
         )
 
@@ -153,6 +187,18 @@ class MetricsCollector:
         self.read_recency_writes = self.meter.create_counter(
             name="read_recency_writes_total",
             description="last_read_at stamps written to cephor_ssd_residency, by outcome (written|failed)",
+            unit="1",
+        )
+
+        # Chunks whose stored ciphertext failed to authenticate. Every one is either bad bytes in
+        # a cache or a key fault, and before this counter existed both were invisible — the only
+        # handling was a 500 mapped by class name at the edge. The tier is what makes a poisoner
+        # actionable: `local` failures are a copy this node holds and just dropped, so a sustained
+        # rate names the node being poisoned rather than the object being broken.
+        self.chunk_aead_failures = self.meter.create_counter(
+            name="chunk_aead_failures_total",
+            description="Chunk decrypts that failed authentication, by tier (local|remote) and "
+            "outcome (recovered|unrecovered)",
             unit="1",
         )
 
@@ -551,6 +597,10 @@ class MetricsCollector:
         """Count one `last_read_at` stamp attempt. `outcome` is a Literal, so bounded."""
         self.read_recency_writes.add(1, attributes={"outcome": outcome})
 
+    def record_aead_failure(self, tier: AeadFailureTier, outcome: AeadFailureOutcome) -> None:
+        """Count one chunk that failed to authenticate. Both labels are Literals, so bounded."""
+        self.chunk_aead_failures.add(1, attributes={"tier": tier, "outcome": outcome})
+
     def record_chunk_read_tier(self, tier: ChunkReadTier) -> None:
         """Count one chunk read against the tier that served it.
 
@@ -814,6 +864,9 @@ class NullMetricsCollector:
         pass
 
     def record_chunk_read_tier(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_aead_failure(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_peer_fetch_shed(self, *args: object, **kwargs: object) -> None:

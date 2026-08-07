@@ -427,6 +427,15 @@ class Config:
     # and waiting the old 2.0s meant paying 50x the fallback before then ALSO paying the
     # fallback. Generous against a ~7 ms healthy peer read.
     peer_fetch_timeout_seconds: float = env("HIPPIUS_PEER_FETCH_TIMEOUT_SECONDS:0.5", convert=float)
+    # An OVERALL bound on one peer fetch, connect included. httpx has no such thing: its
+    # `Timeout` carries connect/read/write/pool only, and `read` bounds the gap BETWEEN body
+    # pieces — so under the value above alone, a peer sending one piece every 0.4s holds the
+    # connection and a growing buffer with no limit at all.
+    # Deliberately NOT the same value: 0.5s of silence is a dead peer, but 0.5s to deliver a
+    # whole 4 MiB chunk is a peer doing its job, so reusing the loss-cut as a deadline would
+    # abort healthy large-chunk fetches. This is a backstop against a peer that never finishes,
+    # not a second loss-cut.
+    peer_fetch_deadline_seconds: float = env("HIPPIUS_PEER_FETCH_DEADLINE_SECONDS:2.0", convert=float)
     # Per-peer fanout: concurrent fetches this pod will have in flight to any ONE peer, and
     # concurrent peer requests this pod will SERVE. Both are needed — the client cap bounds
     # what one pod sends, but five pods each within their own cap still add up at the peer,

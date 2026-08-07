@@ -109,7 +109,9 @@ async def _bytes_for(conn: asyncpg.Connection, node: str, object_id: str) -> int
 async def test_a_first_promotion_inserts_the_claim(conn: asyncpg.Connection) -> None:
     """The statement has to execute at all. This is what a mock cannot tell you."""
     object_id = str(uuid.uuid4())
-    await ResidencyRecorder(_SingleConnPool(conn), NODE)(object_id, 1, 0, 4096)
+    assert await ResidencyRecorder(_SingleConnPool(conn), NODE)(object_id, 1, 0, 4096) is True, (
+        "a claim that landed must report success, or the caller cancels the promotion it allows"
+    )
 
     assert await _bytes_for(conn, NODE, object_id) == 4096, (
         "no row means the promoted copy is unowned: invisible to the node-scoped evictor and "
@@ -145,14 +147,15 @@ async def test_residency_is_per_node_so_a_peer_claim_is_a_separate_row(conn: asy
     assert await _bytes_for(conn, OTHER_NODE, object_id) == 8192
 
 
-async def test_a_failed_write_is_swallowed_and_leaves_no_row(conn: asyncpg.Connection) -> None:
-    """The swallow is deliberate — the chunk is already served — but it must not corrupt state.
+async def test_a_failed_claim_is_reported_as_false_rather_than_raising(conn: asyncpg.Connection) -> None:
+    """The swallow is deliberate — the chunk is already served — but the caller must be told.
 
-    This also pins the shape that made the original bug invisible: the caller cannot distinguish
-    a rejected statement from a successful one, which is precisely why the assertions above run
-    against a real server instead of a mock.
+    Returning `False` against a real rejection is what makes promotion fail closed: `False`
+    cancels the copy, so a residency outage stops the tier warming instead of leaking one
+    unreclaimable copy per promoted chunk. Asserted against a real server because a mock accepts
+    any statement, and a statement Postgres rejects is exactly what this has to catch.
     """
     object_id = str(uuid.uuid4())
     await conn.execute("DROP TABLE cephor_ssd_residency")
 
-    await ResidencyRecorder(_SingleConnPool(conn), NODE)(object_id, 1, 0, 4096)  # must not raise
+    assert await ResidencyRecorder(_SingleConnPool(conn), NODE)(object_id, 1, 0, 4096) is False

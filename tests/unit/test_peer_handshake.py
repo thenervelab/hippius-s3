@@ -25,6 +25,7 @@ from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
 from tests.unit.test_peer_fetch import FakePool
 from tests.unit.test_peer_fetch import FakeRedis
+from tests.unit.test_peer_fetch import residency_row
 
 
 OBJ = "466916c0-d61b-4518-b81b-9576b574270a"
@@ -46,7 +47,11 @@ async def _fetcher_against(app: FastAPI, secret: str) -> tuple[PeerChunkFetcher,
     registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
     client = AsyncClient(transport=ASGITransport(app=app))
     fetcher = PeerChunkFetcher(
-        FakePool({"node_id": "node-b"}),
+        # The resolver now returns the part's per-chunk ciphertext sizes alongside the owner, and
+        # the fetcher rejects a body that is not exactly the expected length — so this row has to
+        # declare 10 bytes to match the `b"peer-bytes"` the peer serves. A bare {"node_id": ...}
+        # resolves an owner and then fails every fetch on an unverifiable size.
+        FakePool(residency_row("node-b", chunk_size=10)),
         registry,
         "node-a",
         client,
