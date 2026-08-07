@@ -89,6 +89,16 @@ pub struct AgentSnapshot {
     pub deferred: u64,
     /// Chunks the reconciler recovered after a dropped `chunk_landed` trigger.
     pub reconciler_recovered: u64,
+    /// Parts visited by the SSD walks (reconciler + reclaimer), summed across passes.
+    ///
+    /// The signal that F1 has returned. The walks are O(everything on disk), and retention took
+    /// that from "the undrained backlog" to "this node's entire replicated shard" — 2.28 M parts
+    /// on prod — without anything reporting the change. A rate derived from this against the
+    /// poll interval is the walk's real cost per second.
+    pub scan_parts_total: u64,
+    /// How long the last SSD walk took, in milliseconds. Watched against the poll interval: a
+    /// scan that approaches its own period means the worker is walking continuously.
+    pub scan_duration_ms: u64,
     /// Parts recorded from the api's landed-part announcements — the fast discovery path.
     /// Read together with `reconciler_recovered`: this climbing while that stays near zero is
     /// what says the announcement path is carrying discovery. Both near zero means ingest
@@ -167,6 +177,8 @@ pub struct SnapshotCell {
     failed: AtomicU64,
     deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
+    scan_parts_total: AtomicU64,
+    scan_duration_ms: AtomicU64,
     landed_recorded: AtomicU64,
     landed_dropped: AtomicU64,
     reclaimed: AtomicU64,
@@ -262,6 +274,17 @@ impl SnapshotCell {
     /// Adds `n` to the reconciler-recovered total.
     pub fn record_reconciled(&self, n: u64) {
         self.reconciler_recovered.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records one SSD walk: how many parts it visited and how long it took.
+    ///
+    /// Called by every worker that walks the cache, so the counter is the fleet's total walk
+    /// cost rather than any one worker's. Both halves matter: the count says how big the tree
+    /// got, the duration says whether the walk still fits inside its own poll interval.
+    pub fn record_scan(&self, parts: u64, duration: Duration) {
+        self.scan_parts_total.fetch_add(parts, Ordering::Relaxed);
+        self.scan_duration_ms
+            .store(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// Records one landed-announcement batch: `recorded` parts written, `dropped` unparseable.
@@ -465,6 +488,8 @@ impl SnapshotCell {
             failed: self.failed.load(Ordering::Relaxed),
             deferred: self.deferred.load(Ordering::Relaxed),
             reconciler_recovered: self.reconciler_recovered.load(Ordering::Relaxed),
+            scan_parts_total: self.scan_parts_total.load(Ordering::Relaxed),
+            scan_duration_ms: self.scan_duration_ms.load(Ordering::Relaxed),
             landed_recorded: self.landed_recorded.load(Ordering::Relaxed),
             landed_dropped: self.landed_dropped.load(Ordering::Relaxed),
             reclaimed: self.reclaimed.load(Ordering::Relaxed),
@@ -625,6 +650,8 @@ mod tests {
                 failed: 1,
                 deferred: 0,
                 reconciler_recovered: 4,
+                scan_parts_total: 0,
+                scan_duration_ms: 0,
                 landed_recorded: 0,
                 landed_dropped: 0,
                 reclaimed: 6,
@@ -634,6 +661,35 @@ mod tests {
                 written_off_servable: 0,
             },
         );
+    }
+
+    #[test]
+    fn scan_parts_accumulate_across_walks_while_the_duration_is_the_latest() {
+        // Both SSD walkers record here, so the count must be a fleet total across passes — that
+        // is what a rate against the poll interval is derived from. The duration is deliberately
+        // NOT summed: it is compared against one poll interval to answer "is this worker walking
+        // continuously", and a running total could not answer that.
+        let cell = SnapshotCell::new();
+        cell.record_scan(2_000_000, Duration::from_millis(400));
+        cell.record_scan(280_000, Duration::from_millis(90));
+
+        let snap = cell.load();
+        assert_eq!(snap.scan_parts_total, 2_280_000, "walk cost accumulates");
+        assert_eq!(snap.scan_duration_ms, 90, "the duration is the most recent walk, not a sum");
+    }
+
+    #[test]
+    fn landed_records_split_recorded_from_dropped() {
+        // The pair that says which discovery path is carrying the work. `dropped` must stay at
+        // zero: nonzero means the api and the agent disagree about the message shape, so every
+        // announcement is discarded and discovery has silently reverted to the walk.
+        let cell = SnapshotCell::new();
+        cell.record_landed(7, 0);
+        cell.record_landed(3, 2);
+
+        let snap = cell.load();
+        assert_eq!(snap.landed_recorded, 10);
+        assert_eq!(snap.landed_dropped, 2);
     }
 
     #[test]
@@ -693,6 +749,8 @@ mod tests {
             failed: u64::MAX,
             deferred: 0,
             reconciler_recovered: 0,
+            scan_parts_total: 0,
+            scan_duration_ms: 0,
             landed_recorded: 0,
             landed_dropped: 0,
             reclaimed: 0,
@@ -711,6 +769,8 @@ mod tests {
             failed: 3,
             deferred: 0,
             reconciler_recovered: 0,
+            scan_parts_total: 0,
+            scan_duration_ms: 0,
             landed_recorded: 0,
             landed_dropped: 0,
             reclaimed: 0,

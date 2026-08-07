@@ -459,8 +459,13 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node
 /// is ever removed without a successful status read (fail-safe). The store is both the
 /// replication log and the object-backing log for the reclaim.
 async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, graces: ReclaimGraces) {
+    let started = Instant::now();
     match reclaim_ssd(ssd, ssd, store, store, graces).await {
         Ok(report) => {
+            // The walk's cost, from the pass that just paid it. `scanned` is every part on this
+            // node's SSD — which retention grew from the undrained backlog to the whole
+            // replicated shard, with nothing reporting the change until now.
+            snapshot.record_scan(report.scanned, started.elapsed());
             // Both debris dispositions free SSD bytes, so the reclaimed gauge counts their sum.
             // Retained `replicated` parts are NOT counted here — they are cache, not reclaimed
             // debris, and the evictor reports their reclamation separately.
@@ -889,8 +894,16 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             run_periodic(token, reconcile_poll, move || {
                 let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
                 async move {
+                    let started = Instant::now();
                     match reconcile_parts(ssd.as_ref(), store.as_ref()).await {
-                        Ok(report) => snapshot.record_reconciled(report.recovered),
+                        Ok(report) => {
+                            // The reconciler's walk is the expensive one: it runs on the
+                            // shortest poll of any worker, and `scanned` is every part on the
+                            // disk. Recording it is what makes the landed-announcement path's
+                            // benefit visible — and what would show F1 returning.
+                            snapshot.record_scan(report.scanned, started.elapsed());
+                            snapshot.record_reconciled(report.recovered);
+                        }
                         Err(err) => tracing::warn!(error = %err, "reconcile cycle failed"),
                     }
                 }

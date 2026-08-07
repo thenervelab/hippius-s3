@@ -132,8 +132,15 @@ spec:
             # mark_replicated commit and the drain's own unlink), and orphan write-temps,
             # once aged, so junk does not accumulate on the node-local disk. All have safe
             # code defaults (300s poll / 1h graces); set here for visibility + per-node tuning.
+            # The reclaim pass WALKS the whole SSD tree. That was cheap when the tree held only
+            # the undrained backlog; retention made it the node's entire replicated shard
+            # (2.28M parts on prod), so the walk is now the expensive part of this worker and
+            # its cadence is what bounds the cost. Hourly is ample: every disposition it owns is
+            # grace-gated at >= 1h (CEPHOR_RECLAIM_GRACE_SECS) or 24h
+            # (CEPHOR_ORPHAN_RECLAIM_GRACE_SECS), so nothing becomes actionable faster than this
+            # runs. Watch drain_scan_duration_ms against this interval.
             - name: CEPHOR_RECLAIM_POLL_SECS
-              value: "300"
+              value: "3600"
             - name: CEPHOR_RECLAIM_GRACE_SECS
               value: "3600"
             # Read-tier eviction. With the drain retaining its replicated parts to serve
