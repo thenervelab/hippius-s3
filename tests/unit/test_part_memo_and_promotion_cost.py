@@ -27,19 +27,25 @@ OBJ = "466916c0-d61b-4518-b81b-9576b574270a"
 
 
 class FakeConn:
-    def __init__(self, log: list[tuple[object, ...]]) -> None:
+    def __init__(self, log: list[tuple[object, ...]], sql_log: list[str]) -> None:
         self._log = log
+        self._sql_log = sql_log
 
-    async def execute(self, _sql: str, *args: object) -> None:
+    async def execute(self, sql: str, *args: object) -> None:
+        # The SQL is recorded, not discarded. It used to be (`_sql`), and that is exactly how a
+        # commit which deleted the residency UPSERT's `DO UPDATE` clause passed this suite: a
+        # mock accepts any string, so a statement Postgres would reject looked fine here.
+        self._sql_log.append(sql)
         self._log.append(args)
 
 
 class FakePool:
     def __init__(self) -> None:
         self.executed: list[tuple[object, ...]] = []
+        self.statements: list[str] = []
 
     def acquire(self):  # noqa: ANN201 - async context manager double
-        conn = FakeConn(self.executed)
+        conn = FakeConn(self.executed, self.statements)
 
         class _Ctx:
             async def __aenter__(self):  # noqa: ANN204
@@ -186,3 +192,29 @@ async def test_concurrent_readers_promote_a_chunk_only_once(tmp_path) -> None:
     assert await both == [b"payload", b"payload"], "both readers still get their bytes"
 
     assert len(recorded) == 1, f"the chunk was promoted {len(recorded)} times"
+
+
+@pytest.mark.asyncio
+async def test_the_residency_upsert_has_a_conflict_action() -> None:
+    """`ON CONFLICT` without an action is a syntax error, and the failure is invisible.
+
+    This is asserted on the SQL text rather than on behaviour because a mocked connection
+    accepts any string — which is how a commit that replaced the `DO UPDATE SET` line with a
+    comment explaining it passed the whole suite. Postgres would reject the statement, every
+    claim would fall into the best-effort `except`, and promoted chunks would land on disk with
+    no residency row: unowned by the node-scoped evictor, skipped by `ssd_reclaim` as read
+    tier, and therefore a permanent SSD leak. Reads keep succeeding the entire time.
+
+    Both halves are pinned: that a conflict action exists at all, and that it ACCUMULATES —
+    promotion learns a part one chunk at a time, so overwriting would report only the last
+    chunk's bytes to the evictor.
+    """
+    pool = FakePool()
+    await ResidencyRecorder(pool, "node-a")(OBJ, 1, 1, 4096)
+
+    sql = pool.statements[0]
+    normalised = " ".join(sql.split())
+    assert "ON CONFLICT" in normalised
+    assert "DO UPDATE SET bytes = cephor_ssd_residency.bytes + EXCLUDED.bytes" in normalised, (
+        f"the conflict action is missing or no longer accumulates: {normalised}"
+    )

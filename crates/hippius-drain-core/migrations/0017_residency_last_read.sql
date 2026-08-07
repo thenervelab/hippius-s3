@@ -22,6 +22,20 @@
 ALTER TABLE cephor_ssd_residency
     ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ;
 
+-- lock_timeout is the load-bearing line, as it is in 0013. CREATE INDEX takes SHARE, which
+-- conflicts with ROW EXCLUSIVE: with no timeout it waits out any open writer AND blocks every
+-- new writer on this table behind it — which for this table is every promotion, every drain
+-- commit, and every sampled read stamp. migrate() runs in the allocator's startup path BEFORE
+-- its liveness file is first touched, and that probe SIGKILLs at ~50-65s, so a long lock wait
+-- means CrashLoopBackOff with each restart re-queuing the lock. Fail fast, retry next start.
+--
+-- Plain build, NOT CONCURRENTLY — the same judgement 0013 recorded for a table of this
+-- cardinality: it builds in seconds and rolls back cleanly if aborted, whereas CONCURRENTLY
+-- needs `-- no-transaction`, leaves an INVALID index on failure that `IF NOT EXISTS` then
+-- silently refuses to rebuild (a dead index with no operator-visible apply job to catch it),
+-- and waits out all older snapshots twice.
+SET LOCAL lock_timeout = '5s';
+
 -- The eviction cursor's index has to match the ORDER BY expression or the planner sorts the
 -- whole resident set (~2M rows per node) on every pass — which would reintroduce, in Postgres,
 -- precisely the O(resident) cost the walk-free evictor was built to avoid.

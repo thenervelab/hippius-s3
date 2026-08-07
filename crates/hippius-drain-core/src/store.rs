@@ -1223,7 +1223,8 @@ impl Store {
         let rows = sqlx::query_as::<_, (String, i64, i64)>(
             "SELECT object_id, version, part_number \
              FROM cephor_replication_status \
-             WHERE node_id = $1 AND status = 'failed' AND updated_at < now() - make_interval(secs => $2) \
+             WHERE node_id = $1 AND status = 'failed' AND reclaimed_at IS NULL \
+               AND updated_at < now() - make_interval(secs => $2) \
              ORDER BY updated_at \
              LIMIT $3",
         )
@@ -1327,6 +1328,39 @@ impl ReclaimLog for Store {
 
     async fn reclaimable_failed_parts(&self, grace: Duration, limit: u32) -> Result<Vec<PartKey>> {
         self.reclaimable_failed_parts_impl(grace, limit).await
+    }
+
+    async fn mark_failed_reclaimed(&self, parts: &[PartKey]) -> Result<()> {
+        let Some(node) = self.node_id.as_deref() else {
+            return Ok(());
+        };
+        if parts.is_empty() {
+            return Ok(());
+        }
+        let mut object_ids: Vec<&str> = Vec::with_capacity(parts.len());
+        let mut versions: Vec<i64> = Vec::with_capacity(parts.len());
+        let mut part_numbers: Vec<i64> = Vec::with_capacity(parts.len());
+        for part in parts {
+            object_ids.push(part.object().as_str());
+            versions.push(i64::from(part.version().get()));
+            part_numbers.push(i64::from(part.part().get()));
+        }
+        // Batched: a per-part UPDATE would put a round-trip in the reclaim inner loop. Node
+        // scoped like every other write here — a peer's row names a file this agent never
+        // touched, so marking it would claim work it did not do.
+        sqlx::query(
+            "UPDATE cephor_replication_status SET reclaimed_at = now() \
+             WHERE node_id = $1 \
+               AND (object_id, version, part_number) IN \
+                   (SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]))",
+        )
+        .bind(node)
+        .bind(&object_ids)
+        .bind(&versions)
+        .bind(&part_numbers)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn part_states(&self, parts: &[PartKey]) -> Result<HashMap<PartKey, PartStatusAge>> {
@@ -3263,6 +3297,38 @@ mod failed_worklist_tests {
         assert_eq!(got, vec![part(2), part(3)], "oldest first, capped at the limit");
     }
 
+    #[sqlx::test]
+    async fn a_reclaimed_row_leaves_the_failed_worklist(pool: PgPool) {
+        // The store half of the cursor fix. Unlinking changes nothing about the row, so without
+        // the stamp this query re-offers the same page every poll — for the seven days until
+        // gc_terminal_status_rows removes it.
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        seed(&pool, 1, "failed", "node-a", 7200.0).await;
+        seed(&pool, 2, "failed", "node-a", 7200.0).await;
+
+        assert_eq!(store.reclaimable_failed_parts(Duration::from_hours(1), 10).await.unwrap().len(), 2);
+
+        <Store as ReclaimLog>::mark_failed_reclaimed(&store, &[part(1)]).await.unwrap();
+
+        let left = store.reclaimable_failed_parts(Duration::from_hours(1), 10).await.unwrap();
+        assert_eq!(left, vec![part(2)], "the marked part is gone from the worklist");
+    }
+
+    #[sqlx::test]
+    async fn marking_is_node_scoped(pool: PgPool) {
+        // A peer's row names a file this agent never touched, so marking it would claim work it
+        // did not do — and take the part off the worklist of the node that actually holds it.
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        seed(&pool, 1, "failed", "node-b", 7200.0).await;
+
+        <Store as ReclaimLog>::mark_failed_reclaimed(&store, &[part(1)]).await.unwrap();
+
+        let (marked,): (i64,) = sqlx::query_as("SELECT count(*) FROM cephor_replication_status WHERE reclaimed_at IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(marked, 0, "another node's row was marked");
+    }
     #[sqlx::test]
     async fn an_agent_with_no_node_id_reclaims_nothing(pool: PgPool) {
         // The allocator shares this Store type but holds no node identity and owns no disk.

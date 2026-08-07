@@ -127,6 +127,15 @@ pub trait ReclaimLog: Send + Sync {
     /// this query is how that warning eventually gets ignored, and the failure mode is deleting
     /// a live object's last good source. So this finds candidates; the existing seam judges them.
     fn reclaimable_failed_parts(&self, grace: Duration, limit: u32) -> impl Future<Output = Result<Vec<PartKey>, Self::Error>> + Send;
+
+    /// Stamps `reclaimed_at` so these parts leave the worklist.
+    ///
+    /// Without it the cursor never advances: unlinking a part changes nothing about its row, so
+    /// the next poll re-selects the same oldest page, re-unlinks it (idempotently, a no-op) and
+    /// re-counts it as reclaimed — productive-looking metrics over a cursor pinned in place,
+    /// with everything past the first page waiting on the hourly walk. The walk-driven path did
+    /// not need this because it is disk-keyed; a status-keyed worklist does.
+    fn mark_failed_reclaimed(&self, parts: &[PartKey]) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// The `object_versions` backing seam: answers two questions about a batch of parts, both
@@ -263,12 +272,21 @@ impl ReclaimError {
 /// back as `skipped_corrupt`, never deleted; see the module doc). A part with NO replication
 /// row is checked against [`BackingLog::unbacked_parts`]: if its object was hard-deleted (no
 /// `object_versions` row) AND it has aged past `graces.orphan`, it is a deleted-object orphan
-/// and is reclaimed too. A `replicated` part older than `graces.replicated` is a drain
-/// crash-orphan (the drain crashed between the `mark_replicated` commit and its own unlink)
-/// and is unlinked — re-driving the happy-path unlink the crash skipped. Everything else is
-/// left untouched: `pending`/`draining` are live (drain-owned), a young `replicated` part
-/// may have an in-flight unlink still pending, and a no-row part that still has a live
-/// `object_versions` row may be mid-upload — the absolute safety gate.
+/// and is reclaimed too.
+///
+/// A `replicated` part is **never** reclaimed here, at any age. That inverts what this
+/// function used to do — the drain unlinked its own copy at commit, so a lingering `replicated`
+/// part could only be a crash between the two, and it was swept after `graces.replicated`.
+/// Retention removed that inference: a retained `replicated` part is the node's read tier and
+/// the intended steady state, so it is counted as
+/// [`skipped_replicated`](ReclaimReport::skipped_replicated) and left to the evictor, which
+/// removes parts on a free-space policy rather than on age. `graces.replicated` and
+/// `CEPHOR_REPLICATED_RECLAIM_GRACE_SECS` are gone with it — the env var survives in the prod
+/// manifest only because the PRE-retention binary reads it, which is what makes an image
+/// rollback sweep the retained cache.
+///
+/// Everything else is left untouched: `pending`/`draining` are live (drain-owned), and a no-row
+/// part that still has a live `object_versions` row may be mid-upload — the absolute safety gate.
 ///
 /// The servability read ([`BackingLog::servable_parts`]) and the orphan-backing read
 /// ([`BackingLog::unbacked_parts`]) each run over a disjoint subset (aged-`failed` vs
@@ -460,6 +478,7 @@ where
     // remove nothing rather than assume "not in the set means safe to delete".
     let servable = backing.servable_parts(&candidates).await.map_err(ReclaimError::backing)?;
 
+    let mut reclaimed = Vec::with_capacity(candidates.len());
     for part in &candidates {
         if servable.contains(part) {
             report.held_servable += 1;
@@ -467,6 +486,19 @@ where
         }
         remover.unlink_part(part).await.map_err(ReclaimError::Remove)?;
         report.reclaimed += 1;
+        reclaimed.push(part.clone());
+    }
+
+    // Unlink THEN mark, the same ordering the evictor uses and for the same reason: the two
+    // crash windows are not equally bad. Unlink-then-crash leaves an unmarked row whose disk
+    // copy is gone — the next pass re-offers it, the idempotent unlink is a no-op, and it is
+    // marked then. Mark-then-crash would take a still-present part off the worklist forever,
+    // leaving debris only the hourly walk could find.
+    //
+    // Marking is what makes the cursor advance at all; without it this pass re-processes its
+    // own first page until gc_terminal_status_rows removes the rows seven days later.
+    if !reclaimed.is_empty() {
+        log.mark_failed_reclaimed(&reclaimed).await.map_err(ReclaimError::log)?;
     }
     Ok(report)
 }
@@ -659,6 +691,10 @@ mod tests {
 
     impl ReclaimLog for FakeLog {
         type Error = io::Error;
+
+        async fn mark_failed_reclaimed(&self, _parts: &[PartKey]) -> Result<(), io::Error> {
+            Ok(())
+        }
 
         /// The walk-driven tests never exercise the DB worklist — `reclaim_failed` owns that
         /// path and has its own suite in `failed_reclaim_tests`.
@@ -1263,8 +1299,11 @@ mod failed_reclaim_tests {
         PartKey::new(ObjectId::from_str(UUID).unwrap(), Version::new(1), PartNumber::new(n))
     }
 
+    /// A worklist whose cursor actually advances: `mark_failed_reclaimed` removes rows, exactly
+    /// as the store's `reclaimed_at` stamp takes them out of the query. Modelling that is the
+    /// point — a fake that kept returning the same page would hide a pass that never advances.
     struct FakeLog {
-        candidates: Vec<PartKey>,
+        candidates: Mutex<Vec<PartKey>>,
         fail: bool,
         asked: Mutex<Vec<(u64, u32)>>,
     }
@@ -1272,7 +1311,7 @@ mod failed_reclaim_tests {
     impl FakeLog {
         fn of(parts: &[PartKey]) -> Self {
             Self {
-                candidates: parts.to_vec(),
+                candidates: Mutex::new(parts.to_vec()),
                 fail: false,
                 asked: Mutex::new(Vec::new()),
             }
@@ -1286,12 +1325,18 @@ mod failed_reclaim_tests {
             Ok(HashMap::new())
         }
 
+        async fn mark_failed_reclaimed(&self, parts: &[PartKey]) -> Result<(), io::Error> {
+            let gone: Vec<PartKey> = parts.to_vec();
+            self.candidates.lock().unwrap().retain(|p| !gone.contains(p));
+            Ok(())
+        }
+
         fn reclaimable_failed_parts(&self, grace: Duration, limit: u32) -> impl Future<Output = Result<Vec<PartKey>, io::Error>> + Send {
             let outcome = if self.fail {
                 Err(io::Error::other("worklist read failed"))
             } else {
                 self.asked.lock().unwrap().push((grace.as_secs(), limit));
-                Ok(self.candidates.clone())
+                Ok(self.candidates.lock().unwrap().iter().take(limit as usize).cloned().collect())
             };
             async move { outcome }
         }
@@ -1360,6 +1405,50 @@ mod failed_reclaim_tests {
     }
 
     #[tokio::test]
+    async fn a_second_pass_does_not_re_offer_what_the_first_already_reclaimed() {
+        // THE cursor bug, and it is invisible without this test. Unlinking a part changes
+        // NOTHING about its replication row, so a status-keyed worklist re-selects the same
+        // oldest page every poll: it re-unlinks (idempotent, a no-op), re-counts the parts as
+        // reclaimed, and never reaches anything past the first page. Metrics and logs look
+        // productive the whole time.
+        //
+        // The walk-driven path did not have this bug because it is DISK-keyed — once the
+        // directory is gone the scan simply does not find it. gc_terminal_status_rows would
+        // eventually clear the rows, but at a 7-day retention, so on prod (~4.4k aged failed
+        // rows per node against a 512-row page) this was the normal case, not an edge one.
+        let log = FakeLog::of(&[part(1), part(2), part(3)]);
+        let remover = FakeRemover::default();
+
+        let first = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 2).await.unwrap();
+        assert_eq!(first.reclaimed, 2, "the first page");
+
+        let second = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 2).await.unwrap();
+
+        assert_eq!(second.candidates, 1, "the cursor advanced past the reclaimed page");
+        assert_eq!(*remover.removed.lock().unwrap(), vec![1, 2, 3], "each part is unlinked exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_part_held_as_servable_stays_on_the_worklist() {
+        // Held is not done. An R4 corrupt-live part must be re-offered on the next pass — its
+        // pool copy may be repaired by the re-drive, after which it becomes ordinary debris.
+        // Marking it alongside the reclaimed ones would strand it until the 7-day GC.
+        let log = FakeLog::of(&[part(1)]);
+        let remover = FakeRemover::default();
+
+        let first = reclaim_failed(&log, &backing(&[part(1)]), &remover, Duration::from_hours(1), 8)
+            .await
+            .unwrap();
+        assert_eq!(first.held_servable, 1);
+        assert_eq!(first.reclaimed, 0);
+
+        let second = reclaim_failed(&log, &backing(&[part(1)]), &remover, Duration::from_hours(1), 8)
+            .await
+            .unwrap();
+        assert_eq!(second.candidates, 1, "a held part is still a candidate next pass");
+        assert!(remover.removed.lock().unwrap().is_empty(), "and was never unlinked");
+    }
+    #[tokio::test]
     async fn a_servable_versions_part_is_held_not_deleted() {
         // THE guard (R4). A `failed` part whose object version is still servable is not debris:
         // the pool copy is corrupt and this SSD copy is the object's last good source. The
@@ -1413,7 +1502,7 @@ mod failed_reclaim_tests {
     #[tokio::test]
     async fn a_failing_worklist_read_removes_nothing() {
         let log = FakeLog {
-            candidates: vec![part(1)],
+            candidates: Mutex::new(vec![part(1)]),
             fail: true,
             asked: Mutex::new(Vec::new()),
         };
