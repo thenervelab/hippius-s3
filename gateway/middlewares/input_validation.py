@@ -53,7 +53,8 @@ SKIP_PREFIXES = {"health", "user", "docs", "robots.txt", "openapi.json"}
 # second copy drifting is the exact failure this rejection exists to prevent.
 #
 # Deliberately NOT in it: `acl` (acl_router mounts /{bucket} at the ROOT — there is no /acl path)
-# and `static` (no StaticFiles mount anywhere in the gateway).
+# and `static` (the gateway has no StaticFiles mount, and the api's is registered AFTER
+# s3_router_new, so the S3 catch-all shadows it rather than the reverse).
 #
 # auth_router.ALL_EXEMPT_SEGMENTS must stay a subset — enforced by
 # test_every_auth_exempt_segment_is_a_reserved_bucket_name.
