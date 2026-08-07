@@ -26,9 +26,22 @@ from typing import Optional
 import asyncpg
 
 from hippius_s3.cache.part_memo import PartMemo
+from hippius_s3.monitoring import ReadRecencyOutcome
 
 
 logger = logging.getLogger(__name__)
+
+
+def _record_write(outcome: ReadRecencyOutcome) -> None:
+    """Count a recency stamp attempt. Never let observability break a read."""
+    try:
+        from hippius_s3.monitoring import get_metrics_collector
+
+        collector = get_metrics_collector()
+        if collector is not None:
+            collector.record_read_recency_write(outcome)
+    except Exception:  # noqa: BLE001 - a metrics failure must not fail a read
+        pass
 
 
 # How long a part's recency stamp is considered fresh enough to skip re-writing. The evictor
@@ -71,7 +84,9 @@ class ReadRecencyRecorder:
                     int(object_version),
                     int(part_number),
                 )
+            _record_write("written")
         except (asyncpg.PostgresError, OSError) as exc:
+            _record_write("failed")
             # Best-effort, like every other bookkeeping write on this path. The chunk is already
             # served; losing the stamp means the part is evicted somewhat earlier than it
             # deserves, which is exactly the FIFO behaviour this replaces.

@@ -31,6 +31,12 @@ PeerShedReason = Literal["client_cap", "server_busy"]
 # Why a chunk that could have been promoted onto local flash was not. Closed by construction.
 PromotionSkipReason = Literal["disk_pressure"]
 
+# Outcome of a read-recency stamp. Closed by construction. `failed` is separate rather than
+# uncounted because the write is best-effort and swallowed: without it, a recency path that is
+# erroring on every read is indistinguishable from one that is being fully absorbed by the
+# sampler, and both look like silence.
+ReadRecencyOutcome = Literal["written", "failed"]
+
 
 class MetricsCollector:
     """OTel metrics for the API, gateway and workers.
@@ -134,6 +140,19 @@ class MetricsCollector:
         self.promotion_skipped = self.meter.create_counter(
             name="promotion_skipped_total",
             description="Chunks not promoted to the local read tier, by reason (disk_pressure)",
+            unit="1",
+        )
+
+        # Read-recency stamps actually written to cephor_ssd_residency. This is a DB UPDATE on
+        # the read path, sampled to at most one per part per window — so the rate is bounded by
+        # DISTINCT parts read per window, not by read throughput. That bound is weakest for the
+        # workload the read tier exists for: a full-shard scan (a training epoch) touches far
+        # more distinct parts than the sampler's memo holds, so the memo stops absorbing and
+        # every part read becomes one write. Counting it is what tells us whether that is
+        # happening before Postgres does.
+        self.read_recency_writes = self.meter.create_counter(
+            name="read_recency_writes_total",
+            description="last_read_at stamps written to cephor_ssd_residency, by outcome (written|failed)",
             unit="1",
         )
 
@@ -528,6 +547,10 @@ class MetricsCollector:
         """Count a chunk served without being promoted. `reason` is a Literal, so bounded."""
         self.promotion_skipped.add(1, attributes={"reason": reason})
 
+    def record_read_recency_write(self, outcome: ReadRecencyOutcome) -> None:
+        """Count one `last_read_at` stamp attempt. `outcome` is a Literal, so bounded."""
+        self.read_recency_writes.add(1, attributes={"outcome": outcome})
+
     def record_chunk_read_tier(self, tier: ChunkReadTier) -> None:
         """Count one chunk read against the tier that served it.
 
@@ -797,6 +820,9 @@ class NullMetricsCollector:
         pass
 
     def record_promotion_skipped(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_read_recency_write(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_cache_operation(self, *args: object, **kwargs: object) -> None:

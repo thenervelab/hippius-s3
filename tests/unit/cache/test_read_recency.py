@@ -141,3 +141,33 @@ async def test_only_a_local_hit_records_recency(tmp_path) -> None:
     await store.set_chunk(OBJ, 1, 1, 0, payload)
     assert await store.get_chunk(OBJ, 1, 1, 0) == payload
     assert seen == [(OBJ, 1, 1)], "a local hit must record recency"
+
+
+@pytest.mark.asyncio
+async def test_a_stamp_is_counted_so_the_write_rate_is_visible(monkeypatch) -> None:
+    """The recency write is a DB UPDATE on the read path, and it is silent by design.
+
+    It is sampled to at most one write per part per window, so the rate is bounded by DISTINCT
+    parts read per window rather than by read throughput. That bound is weakest for exactly the
+    workload this tier exists for: a full-shard scan touches far more distinct parts than the
+    sampler's memo holds, so the memo stops absorbing and every part read becomes a write.
+
+    `failed` is counted separately because the write is best-effort and swallowed — without it,
+    a recency path erroring on every read looks identical to one the sampler is fully absorbing.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr("hippius_s3.cache.read_recency._record_write", seen.append)
+
+    pool = FakePool()
+    recorder = ReadRecencyRecorder(pool, "node-a")
+
+    await recorder(OBJ, 1, 3)
+    assert seen == ["written"], "a stamp that reaches the database is counted"
+
+    # Same part inside the sampling window: absorbed by the memo, so no write and no count.
+    await recorder(OBJ, 1, 3)
+    assert seen == ["written"], "a sampled-out read costs neither a write nor a count"
+
+    failing = ReadRecencyRecorder(FakePool(fail=True), "node-a")
+    await failing(OBJ, 1, 9)
+    assert seen == ["written", "failed"], "a swallowed failure is still counted, under its own outcome"
