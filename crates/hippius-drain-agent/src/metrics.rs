@@ -7,7 +7,9 @@
 //! [`SnapshotCell`] / [`Enforcer`], so a metric scrape never measures anything itself.
 
 use hippius_drain_core::Enforcer;
+use hippius_drain_core::ScanWorker;
 use hippius_drain_core::SnapshotCell;
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::MetricExporter;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
@@ -132,6 +134,78 @@ fn register_ssd_tier_instruments(meter: &opentelemetry::metrics::Meter, snapshot
     ));
 }
 
+/// Registers how a part gets DISCOVERED: what the SSD walks cost, and how much of the work the
+/// api's announcements are taking off them.
+///
+/// Split out of [`init`] for the 100-line limit, and because the four read as one story: a
+/// healthy fleet has `landed_recorded` climbing while `reconciler_recovered` sits near zero and
+/// `scan_parts_total` grows only at the reclaimer's slow cadence. Any other shape means
+/// discovery has fallen back to walking the disk.
+fn register_discovery_instruments(
+    meter: &opentelemetry::metrics::Meter,
+    snapshot: &Arc<SnapshotCell>,
+    instruments: &mut Vec<Box<dyn std::any::Any>>,
+) {
+    // What the SSD walks actually cost. Retention grew their input from "the undrained backlog"
+    // to "this node's whole replicated shard" — 2.28 M parts measured on prod 2026-08-07 — and
+    // nothing reported that, which is how the cost stayed invisible until it was looked for.
+    //
+    // Labelled per worker rather than summed. The two walk on cadences three orders of magnitude
+    // apart, so a merged total is dominated by the reconciler's short poll — and lengthening
+    // that poll is exactly the follow-up these metrics gate, after which a sum could not say
+    // which walk any residual cost belonged to. `ScanWorker` is a closed enum, so the label
+    // cannot grow past two values.
+    let reconcile = [KeyValue::new("worker", ScanWorker::Reconcile.as_str())];
+    let reclaim = [KeyValue::new("worker", ScanWorker::Reclaim.as_str())];
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_scan_parts_total")
+            .with_callback(move |observer| {
+                let s = snap.load();
+                observer.observe(s.reconcile_scan_parts, &reconcile);
+                observer.observe(s.reclaim_scan_parts, &reclaim);
+            })
+            .build(),
+    ));
+    // Watched against each worker's OWN poll interval: a walk approaching its period means that
+    // worker never stops walking, which is the state that must not be reached again.
+    let reconcile = [KeyValue::new("worker", ScanWorker::Reconcile.as_str())];
+    let reclaim = [KeyValue::new("worker", ScanWorker::Reclaim.as_str())];
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_scan_duration_ms")
+            .with_callback(move |observer| {
+                let s = snap.load();
+                observer.observe(s.reconcile_scan_ms, &reconcile);
+                observer.observe(s.reclaim_scan_ms, &reclaim);
+            })
+            .build(),
+    ));
+
+    // Discovery path split. `landed_recorded` climbing while `reconciler_recovered` stays near
+    // zero is what says the api's announcements are carrying discovery and the reconciler's
+    // whole-disk walk is genuinely idle. Both near zero means ingest stopped — NOT that the
+    // fast path is working — which is why the pair has to be read together.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_landed_recorded_total")
+            .with_callback(move |observer| observer.observe(snap.load().landed_recorded, &[]))
+            .build(),
+    ));
+    // Must stay at zero. Nonzero means the api and this agent disagree about the message shape,
+    // so every announcement is being discarded and discovery has silently reverted to the walk.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_landed_dropped_total")
+            .with_callback(move |observer| observer.observe(snap.load().landed_dropped, &[]))
+            .build(),
+    ));
+}
+
 /// Builds the meter provider and registers the agent's metrics, or returns `None` when
 /// monitoring is disabled or the exporter cannot be built. `enforcer` is `None` for an
 /// ungated drain (no breaker to observe).
@@ -165,6 +239,8 @@ pub fn init(service_name: &'static str, snapshot: &Arc<SnapshotCell>, enforcer: 
     ));
 
     register_ssd_tier_instruments(&meter, snapshot, &mut instruments);
+
+    register_discovery_instruments(&meter, snapshot, &mut instruments);
 
     // Reclaim throughput: terminal SSD parts the reclaim worker unlinked (monotonic counter).
     // The SSD-ingest tier's eviction rate — distinct from the drain's CephFS throughput — so a

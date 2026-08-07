@@ -1,0 +1,216 @@
+"""Promotion must yield to ingest on the disk they share.
+
+Read-through promotion is the only unthrottled writer to the ingest SSD, and on an ingest node
+`HIPPIUS_OBJECT_CACHE_DIR` is the same mount as the drain agent's `CEPHOR_SSD_ROOT` — which is
+also the mount `fs_cache_pressure` measures when it decides to refuse a PUT with 503. So a
+read-heavy period could fill the disk that writes depend on, with promotion failures silently
+swallowed the whole way down.
+
+These tests pin the two halves of the fix: promotion backs off under pressure without ever
+affecting the read, and the threshold sits where eviction can actually restore it.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from hippius_s3.cache.dual_fs_store import DualFileSystemPartsStore
+from hippius_s3.fs_pressure import FreeSpaceGate
+from hippius_s3.fs_pressure import PromotionBandError
+from hippius_s3.fs_pressure import validate_promotion_band
+
+
+# The values shipped in hippius_s3/config.py, restated so this file tests the CONTRACT rather
+# than whatever the ambient environment resolves to. `.env` overrides both in local dev.
+DEFAULT_PROMOTE_MIN_FREE_RATIO = 0.175
+DEFAULT_FS_CACHE_MIN_FREE_RATIO = 0.08
+
+
+class FakeProbe:
+    """A scripted free-space reading, counting how often it was consulted."""
+
+    def __init__(self, ratio: float, raises: BaseException | None = None) -> None:
+        self.ratio = ratio
+        self.raises = raises
+        self.calls = 0
+
+    def __call__(self, _path: str) -> float:
+        self.calls += 1
+        if self.raises is not None:
+            raise self.raises
+        return self.ratio
+
+
+def gate(ratio: float, floor: float = 0.175, **kw: object) -> FreeSpaceGate:
+    probe = FakeProbe(ratio)
+    made = FreeSpaceGate("/nonexistent", floor, probe=probe, **kw)  # type: ignore[arg-type]
+    made.probe = probe  # type: ignore[attr-defined]
+    return made
+
+
+def test_the_shipped_defaults_form_a_recoverable_band() -> None:
+    """The shipped promote floor must sit inside the evictor's hysteresis band.
+
+    Asserted on the CODE DEFAULT, not on `get_config()`. An earlier version of this test read
+    the resolved config and was therefore validating whatever the developer's `.env` happened
+    to say — `.env` sets `HIPPIUS_FS_CACHE_MIN_FREE_RATIO=0.01`, so a mutation of the shipped
+    default changed nothing and the test passed regardless. A contract test must not depend on
+    ambient environment.
+    """
+    validate_promotion_band(
+        promote_min_free_ratio=DEFAULT_PROMOTE_MIN_FREE_RATIO,
+        fs_cache_min_free_ratio=DEFAULT_FS_CACHE_MIN_FREE_RATIO,
+    )
+
+
+def test_a_floor_equal_to_the_evict_target_is_rejected() -> None:
+    """The first attempt at this threshold. 0.20 IS the evictor's target, so promotion would be
+    live only in the instant a pass completes — chattering at the boundary with no hysteresis."""
+    with pytest.raises(PromotionBandError, match="below the evictor's target"):
+        validate_promotion_band(promote_min_free_ratio=0.20, fs_cache_min_free_ratio=0.08)
+
+
+def test_a_floor_above_the_evict_target_is_rejected() -> None:
+    """The second attempt, and the more dangerous one: a deadlock rather than a wobble.
+
+    Promotion stops below 0.25 and the evictor never frees past 0.20, so nothing can ever
+    restore enough for promotion to resume. Staging sits at 23% free, so this would have
+    switched the read tier off permanently the moment it deployed — silently.
+    """
+    with pytest.raises(PromotionBandError, match="can never be restored"):
+        validate_promotion_band(promote_min_free_ratio=0.25, fs_cache_min_free_ratio=0.08)
+
+
+def test_a_floor_below_the_evict_reserve_is_rejected() -> None:
+    """Promotion must yield BEFORE eviction arms, or the cheap lever is pulled second."""
+    with pytest.raises(PromotionBandError, match="above the evictor's reserve"):
+        validate_promotion_band(promote_min_free_ratio=0.10, fs_cache_min_free_ratio=0.08)
+
+
+def test_a_put_refusal_threshold_above_the_evict_reserve_is_rejected() -> None:
+    """Writes must never be refused before the evictor has had a chance to reclaim."""
+    with pytest.raises(PromotionBandError, match="below the evictor's reserve"):
+        validate_promotion_band(promote_min_free_ratio=0.175, fs_cache_min_free_ratio=0.30)
+
+
+def test_a_disk_with_room_allows_promotion() -> None:
+    assert gate(0.50).allows() is True
+
+
+def test_a_disk_under_the_floor_refuses_promotion() -> None:
+    assert gate(0.10).allows() is False
+
+
+def test_exactly_at_the_floor_refuses() -> None:
+    """The floor is a floor. Strict `>` keeps the boundary off the allowed side."""
+    assert gate(0.175).allows() is False
+
+
+def test_the_reading_is_memoised_so_a_chunk_read_is_not_a_syscall() -> None:
+    """Promotion is asked per CHUNK, so an unmemoised probe is a syscall per chunk.
+
+    64 reads inside one TTL window must cost one probe; crossing the window costs a second.
+    """
+    probe = FakeProbe(0.50)
+    g = FreeSpaceGate("/nonexistent", 0.175, ttl_seconds=5.0, probe=probe)
+
+    for _ in range(64):
+        assert g.allows(now=100.0) is True
+    assert probe.calls == 1, "one probe per TTL window"
+
+    g.allows(now=106.0)
+    assert probe.calls == 2, "the window expired, so it re-probed"
+
+
+def test_a_failing_probe_leaves_the_previous_verdict_rather_than_disabling_the_tier() -> None:
+    """Fails open. A statvfs blip must not silently switch the read tier off.
+
+    A genuinely full disk still stops the write with ENOSPC, which `_promote_chunk` already
+    swallows — so failing open costs a wasted write attempt, while failing closed would cost
+    the whole cache-warming path with nothing logging that it happened.
+    """
+    probe = FakeProbe(0.50)
+    g = FreeSpaceGate("/nonexistent", 0.175, ttl_seconds=1.0, probe=probe)
+    assert g.allows(now=0.0) is True
+
+    probe.raises = OSError("statvfs failed")
+    assert g.allows(now=10.0) is True, "kept the last good verdict"
+
+
+@pytest.mark.asyncio
+async def test_a_chunk_is_still_served_when_promotion_is_gated(tmp_path, monkeypatch) -> None:
+    """The point of the whole change: backpressure costs a cache warm, never a read.
+
+    The chunk comes back byte-identical from the pool while nothing lands on the local tier,
+    and the skip is counted so the backoff is visible before `fs_cache_shed` starts firing.
+    """
+    primary = tmp_path / "local"
+    fallback = tmp_path / "pool"
+    primary.mkdir()
+    fallback.mkdir()
+
+    payload = b"ciphertext-chunk"
+    pool = DualFileSystemPartsStore(str(primary), str(fallback))
+    await pool.fallback.set_meta(
+        "a" * 8 + "-1111-2222-3333-444444444444", 1, 1, chunk_size=16, num_chunks=1, size_bytes=16
+    )
+    await pool.fallback.set_chunk("a" * 8 + "-1111-2222-3333-444444444444", 1, 1, 0, payload)
+
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        "hippius_s3.cache.dual_fs_store._record_promotion_skipped",
+        lambda: recorded.append("disk_pressure"),
+    )
+
+    promoted: list[tuple] = []
+
+    async def on_promote(*args: object) -> None:
+        promoted.append(args)
+
+    store = DualFileSystemPartsStore(
+        str(primary),
+        str(fallback),
+        promote=True,
+        on_promote=on_promote,
+        space_gate=FreeSpaceGate("/nonexistent", 0.175, probe=FakeProbe(0.02)),
+    )
+
+    oid = "a" * 8 + "-1111-2222-3333-444444444444"
+    got = await store.get_chunk(oid, 1, 1, 0)
+
+    assert got == payload, "the read is served regardless of disk pressure"
+    assert promoted == [], "nothing was promoted onto the pressured disk"
+    assert recorded == ["disk_pressure"], "the backoff is counted"
+    assert not (primary / oid).exists(), "no local copy was written"
+
+
+@pytest.mark.asyncio
+async def test_promotion_still_happens_when_the_disk_has_room(tmp_path) -> None:
+    """The no-regression half: the gate must not quietly disable the tier it protects."""
+    primary = tmp_path / "local"
+    fallback = tmp_path / "pool"
+    primary.mkdir()
+    fallback.mkdir()
+
+    oid = "b" * 8 + "-1111-2222-3333-444444444444"
+    payload = b"ciphertext-chunk"
+    seed = DualFileSystemPartsStore(str(primary), str(fallback))
+    await seed.fallback.set_meta(oid, 1, 1, chunk_size=16, num_chunks=1, size_bytes=16)
+    await seed.fallback.set_chunk(oid, 1, 1, 0, payload)
+
+    promoted: list[tuple] = []
+
+    async def on_promote(*args: object) -> None:
+        promoted.append(args)
+
+    store = DualFileSystemPartsStore(
+        str(primary),
+        str(fallback),
+        promote=True,
+        on_promote=on_promote,
+        space_gate=FreeSpaceGate("/nonexistent", 0.175, probe=FakeProbe(0.90)),
+    )
+
+    assert await store.get_chunk(oid, 1, 1, 0) == payload
+    assert promoted, "a healthy disk still warms the local tier"
+    assert await store.read_local_chunk(oid, 1, 1, 0) == payload

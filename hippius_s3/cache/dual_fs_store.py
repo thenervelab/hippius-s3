@@ -6,6 +6,7 @@ from typing import Callable
 from typing import Optional
 
 from hippius_s3.cache.fs_store import FileSystemPartsStore
+from hippius_s3.fs_pressure import FreeSpaceGate
 from hippius_s3.monitoring import ChunkReadTier
 
 
@@ -16,6 +17,11 @@ logger = logging.getLogger(__name__)
 # part_number, bytes). The api wires this to the drain's residency table so this node's
 # evictor can reclaim the copy.
 PromotionRecorder = Callable[[str, int, int, int], Awaitable[None]]
+
+# Called after a chunk is served from THIS node's flash, with (object_id, version, part_number).
+# Feeds cephor_ssd_residency.last_read_at, which is what makes eviction recency-ordered instead
+# of FIFO. Sampled by the recorder, so it is cheap to call on every local hit.
+LocalReadRecorder = Callable[[str, int, int], Awaitable[None]]
 
 # Fetches one chunk from the peer node that currently holds it on flash, with
 # (object_id, version, part_number, chunk_index). Returns None when no peer has it.
@@ -30,6 +36,18 @@ def _record_tier(tier: ChunkReadTier) -> None:
         collector = get_metrics_collector()
         if collector is not None:
             collector.record_chunk_read_tier(tier)
+    except Exception:  # noqa: BLE001 - a metrics failure must not fail a read
+        pass
+
+
+def _record_promotion_skipped() -> None:
+    """Count a chunk served without warming local flash. Never fatal."""
+    try:
+        from hippius_s3.monitoring import get_metrics_collector
+
+        collector = get_metrics_collector()
+        if collector is not None:
+            collector.record_promotion_skipped("disk_pressure")
     except Exception:  # noqa: BLE001 - a metrics failure must not fail a read
         pass
 
@@ -56,12 +74,22 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         promote: bool = False,
         on_promote: Optional[PromotionRecorder] = None,
         peer_fetch: Optional[PeerFetcher] = None,
+        space_gate: Optional[FreeSpaceGate] = None,
+        on_local_read: Optional[LocalReadRecorder] = None,
     ) -> None:
         super().__init__(primary_dir)
         self.fallback = FileSystemPartsStore(fallback_dir)
         self._promote = promote
         self._on_promote = on_promote
         self._peer_fetch = peer_fetch
+        # Promotion yields to ingest: this is the only writer here that is pure optimisation,
+        # and it shares the mount with the PUTs that `fs_cache_pressure` refuses when the disk
+        # runs out. `None` means no gate (tests, and any deployment without a fallback tier).
+        self._space_gate = space_gate
+        # Records that a part was served locally, so the drain-agent evictor can order on USE
+        # rather than on arrival. Sampled inside the recorder — this is a dict probe on all but
+        # the first local read of a part per window.
+        self._on_local_read = on_local_read
         # Chunks whose promotion is in flight right now, so concurrent readers of the same
         # cold chunk write it once. Holds only in-flight keys, so it drains itself and needs
         # no bound or TTL — unlike a "already done" memo, which the out-of-process evictor
@@ -74,6 +102,12 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         result = await super().get_chunk(object_id, object_version, part_number, chunk_index)
         if result is not None:
             _record_tier("local")
+            # Tell the evictor this part is still in use. Without it eviction orders on when a
+            # part ARRIVED, which for a working set re-read every epoch tends to take exactly
+            # the parts about to be read again. Sampled inside the recorder, so this is a dict
+            # probe on all but the first read of a part per window.
+            if self._on_local_read is not None:
+                await self._on_local_read(object_id, int(object_version), int(part_number))
             return result
 
         # Peer tier, between local flash and the pool. A part lives on whichever node
@@ -133,6 +167,15 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         writing it last would leave the whole part invisible until some read happened to
         promote the final chunk.
         """
+        # Yield to ingest before doing any work. Promotion competes for the same mount that
+        # `fs_cache_pressure` refuses PUTs on, and it is the only writer here that is pure
+        # optimisation — a cold cache costs latency, a full disk costs writes. The gate fires
+        # above the drain evictor's floor, so promotion backs off before eviction is even
+        # armed rather than racing it.
+        if self._space_gate is not None and not self._space_gate.allows():
+            _record_promotion_skipped()
+            return
+
         # Skip if another reader is already promoting this exact chunk. Skipping beats
         # waiting: this caller already holds the bytes, so blocking on someone else's write
         # would add latency and return the same result. Duplicate promotion is not merely

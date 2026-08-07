@@ -1144,17 +1144,28 @@ impl ResidentLog for Store {
         // which is the reclaimer's disposition (deleted-object orphan), not the evictor's. It is
         // excluded here and `prune_residency` clears the row when the reclaimer unlinks the part.
         //
-        // ORDER BY resident_at IS the eviction policy (FIFO, oldest-retained first); the
-        // orchestrator walks this order and never re-sorts. Reads off
-        // `cephor_ssd_residency_evict_idx`, so the cost is proportional to `limit` rather than
-        // to the resident set — the whole point of not using a filesystem walk here.
+        // THIS ORDER BY IS THE EVICTION POLICY; the orchestrator walks it and never re-sorts.
+        //
+        // Least-recently-USED, not least-recently-admitted. `resident_at` says when a part
+        // joined the cache, which says nothing about whether anyone is still reading it — that
+        // is FIFO, and FIFO is a poor fit here: a training set re-read every epoch is maximally
+        // skewed, so evicting by arrival order tends to take exactly the parts about to be read
+        // again, each costing a peer-or-pool read plus a local write to restore.
+        //
+        // COALESCE gives the fallback for free: a part nobody has read since 0017 shipped has no
+        // recency, and using its residency time is precisely the old behaviour. No backfill, and
+        // no window where the order is undefined.
+        //
+        // Must match `cephor_ssd_residency_recency_idx` expression-for-expression, or the
+        // planner sorts the whole ~2M-row resident set on every pass — reintroducing in Postgres
+        // the O(resident) cost this evictor exists to avoid.
         let rows = sqlx::query_as::<_, (String, i64, i64, String, i64)>(
             "SELECT r.object_id, r.version, r.part_number, s.status, r.bytes \
              FROM cephor_ssd_residency r \
              JOIN cephor_replication_status s \
                ON s.object_id = r.object_id AND s.version = r.version AND s.part_number = r.part_number \
              WHERE r.node_id = $1 AND s.status = 'replicated' \
-             ORDER BY r.resident_at \
+             ORDER BY COALESCE(r.last_read_at, r.resident_at) \
              LIMIT $2",
         )
         .bind(node)
@@ -1185,6 +1196,56 @@ impl ResidentLog for Store {
 }
 
 impl Store {
+    /// This node's `failed` parts older than `grace`, oldest first, at most `limit`.
+    ///
+    /// Node-scoped: a part lives only on the SSD of the node that ingested it, so another node's
+    /// `failed` row names a file this agent cannot unlink. Without a node id (the allocator)
+    /// there is nothing to reclaim.
+    ///
+    /// **Candidates only.** Servability — "is this the last good copy of a live object?" — is
+    /// deliberately absent: [`BackingLog::servable_parts`](crate::BackingLog::servable_parts)
+    /// owns that predicate, and it already carries a MUST-stay-in-lockstep warning shared with
+    /// `janitor_part_terminally_abandoned.sql` and the A21 sweep. A third copy here is how such
+    /// a warning gets quietly broken, and the failure mode is deleting a live object's last good
+    /// source. [`reclaim_failed`](crate::reclaim_failed) applies the guard to what this returns.
+    ///
+    /// `updated_at` is the store clock, so the grace has no agent-clock dependence — the same
+    /// property the walk-driven path relied on. Oldest first so a backlog drains in age order
+    /// rather than starving its own tail.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the query fails.
+    pub async fn reclaimable_failed_parts_impl(&self, grace: Duration, limit: u32) -> Result<Vec<PartKey>> {
+        let Some(node) = self.node_id.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT object_id, version, part_number \
+             FROM cephor_replication_status \
+             WHERE node_id = $1 AND status = 'failed' AND reclaimed_at IS NULL \
+               AND updated_at < now() - make_interval(secs => $2) \
+             ORDER BY updated_at \
+             LIMIT $3",
+        )
+        .bind(node)
+        .bind(grace.as_secs_f64())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|(object_id, version, part_number)| {
+                PartRow {
+                    object_id,
+                    version,
+                    part_number,
+                }
+                .into_part()
+            })
+            .collect()
+    }
+
     /// Records that `part` is now resident on this node's SSD, with its size for the eviction
     /// cursor's accounting.
     ///
@@ -1264,6 +1325,43 @@ impl Store {
 
 impl ReclaimLog for Store {
     type Error = StoreError;
+
+    async fn reclaimable_failed_parts(&self, grace: Duration, limit: u32) -> Result<Vec<PartKey>> {
+        self.reclaimable_failed_parts_impl(grace, limit).await
+    }
+
+    async fn mark_failed_reclaimed(&self, parts: &[PartKey]) -> Result<()> {
+        let Some(node) = self.node_id.as_deref() else {
+            return Ok(());
+        };
+        if parts.is_empty() {
+            return Ok(());
+        }
+        let mut object_ids: Vec<&str> = Vec::with_capacity(parts.len());
+        let mut versions: Vec<i64> = Vec::with_capacity(parts.len());
+        let mut part_numbers: Vec<i64> = Vec::with_capacity(parts.len());
+        for part in parts {
+            object_ids.push(part.object().as_str());
+            versions.push(i64::from(part.version().get()));
+            part_numbers.push(i64::from(part.part().get()));
+        }
+        // Batched: a per-part UPDATE would put a round-trip in the reclaim inner loop. Node
+        // scoped like every other write here — a peer's row names a file this agent never
+        // touched, so marking it would claim work it did not do.
+        sqlx::query(
+            "UPDATE cephor_replication_status SET reclaimed_at = now() \
+             WHERE node_id = $1 \
+               AND (object_id, version, part_number) IN \
+                   (SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]))",
+        )
+        .bind(node)
+        .bind(&object_ids)
+        .bind(&versions)
+        .bind(&part_numbers)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 
     async fn part_states(&self, parts: &[PartKey]) -> Result<HashMap<PartKey, PartStatusAge>> {
         let mut out = HashMap::with_capacity(parts.len());
@@ -2011,6 +2109,109 @@ mod part_tests {
         let after: Vec<u32> = store.evictable_parts(10).await.unwrap().iter().map(|r| r.part.part().get()).collect();
         assert_eq!(after, vec![1], "an evicted part leaves the worklist");
         assert_eq!(store.node_cache_bytes("node-a").await.unwrap(), 100, "and stops counting as cache");
+    }
+
+    #[sqlx::test]
+    async fn eviction_orders_on_last_read_falling_back_to_residency(pool: PgPool) {
+        // The Phase H property, and it fails on FIFO. `old_but_hot` joined the cache first, so
+        // arrival order would evict it — but it is the one still being read, which for a working
+        // set re-read every epoch is exactly the part about to be needed again. Evicting it costs
+        // a peer-or-pool read plus a local write to put it straight back.
+        //
+        // `never_read` has a NULL last_read_at and must fall back to its residency time, so the
+        // pre-0017 population still orders sanely with no backfill.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        for n in 1..=3 {
+            seed_status_node(&pool, UUID_A, 1, n, "replicated", "node-a").await;
+            seed_part_size(&pool, UUID_A, 1, n, Some(100)).await;
+        }
+        // part 1: resident longest, but read most recently -> must survive
+        // part 2: resident recently, never read            -> falls back to resident_at
+        // part 3: resident a while ago, read a while ago   -> the true LRU victim
+        sqlx::query(
+            "INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number, bytes, resident_at, last_read_at) VALUES \
+             ('node-a', $1, 1, 1, 100, now() - make_interval(hours => 10), now() - make_interval(mins => 1)), \
+             ('node-a', $1, 1, 2, 100, now() - make_interval(hours => 2),  NULL), \
+             ('node-a', $1, 1, 3, 100, now() - make_interval(hours => 9),  now() - make_interval(hours => 5))",
+        )
+        .bind(UUID_A)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let order: Vec<u32> = store.evictable_parts(10).await.unwrap().iter().map(|r| r.part.part().get()).collect();
+
+        assert_eq!(
+            order,
+            vec![3, 2, 1],
+            "least-recently-USED first: the hot part resident longest must be evicted LAST"
+        );
+    }
+
+    #[sqlx::test]
+    async fn a_local_read_moves_a_part_to_the_back_of_the_eviction_queue(pool: PgPool) {
+        // The other half: serving a part from local flash has to actually change its fate, or
+        // the ordering above is decorative.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        for n in 1_u32..=2 {
+            seed_status_node(&pool, UUID_A, 1, i64::from(n), "replicated", "node-a").await;
+            seed_part_size(&pool, UUID_A, 1, i64::from(n), Some(100)).await;
+            store.record_resident(&part(UUID_A, 1, n), 100).await.unwrap();
+        }
+        // Age part 1 so it is the victim, then read it.
+        sqlx::query("UPDATE cephor_ssd_residency SET resident_at = now() - make_interval(hours => 5) WHERE part_number = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let first: Vec<u32> = store.evictable_parts(10).await.unwrap().iter().map(|r| r.part.part().get()).collect();
+        assert_eq!(first, vec![1, 2], "part 1 is the victim before it is read");
+
+        // The UPDATE the api's ReadRecencyRecorder issues. Pinned here because this ordering is
+        // the contract that recorder has to satisfy, and the consequence of getting it wrong —
+        // a hot part evicted and immediately re-fetched — is silent.
+        sqlx::query(
+            "UPDATE cephor_ssd_residency SET last_read_at = now()              WHERE node_id = $1 AND object_id = $2 AND version = 1 AND part_number = 1",
+        )
+        .bind("node-a")
+        .bind(UUID_A)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let after: Vec<u32> = store.evictable_parts(10).await.unwrap().iter().map(|r| r.part.part().get()).collect();
+        assert_eq!(after, vec![2, 1], "reading it moved it behind the untouched part");
+    }
+
+    #[sqlx::test]
+    async fn touching_a_part_this_node_does_not_hold_changes_nothing(pool: PgPool) {
+        // The read path calls this on any local hit, and a peer's row must not be reachable:
+        // recency is per (node, part), and stamping a peer's row would protect a copy on a disk
+        // this node cannot see while leaving its own unprotected.
+        create_app_schema(&pool).await;
+        seed_status_node(&pool, UUID_A, 1, 1, "replicated", "node-b").await;
+        seed_part_size(&pool, UUID_A, 1, 1, Some(100)).await;
+        sqlx::query("INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number, bytes) VALUES ('node-b', $1, 1, 1, 100)")
+            .bind(UUID_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE cephor_ssd_residency SET last_read_at = now()              WHERE node_id = $1 AND object_id = $2 AND version = 1 AND part_number = 1",
+        )
+        .bind("node-a")
+        .bind(UUID_A)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (touched,): (i64,) = sqlx::query_as("SELECT count(*) FROM cephor_ssd_residency WHERE last_read_at IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(touched, 0, "another node's residency row was stamped");
     }
 
     #[sqlx::test]
@@ -3028,5 +3229,112 @@ mod part_tests {
             None,
             "the stamped row was GC'd",
         );
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod failed_worklist_tests {
+    use super::{PartKey, Store};
+    use crate::apipart::{ObjectId, PartNumber, Version};
+    use crate::ssd_reclaim::ReclaimLog;
+    use core::str::FromStr;
+    use core::time::Duration;
+    use sqlx::postgres::PgPool;
+
+    const UUID_A: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+
+    fn part(n: u32) -> PartKey {
+        PartKey::new(ObjectId::from_str(UUID_A).unwrap(), Version::new(1), PartNumber::new(n))
+    }
+
+    /// Seeds a replication row with an explicit age, so grace boundaries are exact.
+    async fn seed(pool: &PgPool, n: i64, status: &str, node: &str, age_secs: f64) {
+        sqlx::query(
+            "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id, updated_at) \
+             VALUES ($1, 1, $2, $3, $4, now() - make_interval(secs => $5))",
+        )
+        .bind(UUID_A)
+        .bind(n)
+        .bind(status)
+        .bind(node)
+        .bind(age_secs)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn the_worklist_is_node_scoped_aged_and_failed_only(pool: PgPool) {
+        // Three independent filters, each load-bearing. Node scope: a peer's `failed` row names
+        // a file this agent cannot unlink. Grace: the diagnosis / abort-settle window. Status:
+        // everything else is either live (drain-owned), retained read tier, or the R4 corrupt
+        // hold — none of it this worker's to delete.
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        seed(&pool, 1, "failed", "node-a", 7200.0).await; // aged, ours   -> candidate
+        seed(&pool, 2, "failed", "node-a", 60.0).await; // young, ours   -> held by grace
+        seed(&pool, 3, "failed", "node-b", 7200.0).await; // aged, peer's -> not ours to touch
+        seed(&pool, 4, "replicated", "node-a", 7200.0).await; // the read tier
+        seed(&pool, 5, "pending", "node-a", 7200.0).await; // live, drain-owned
+        seed(&pool, 6, "corrupt", "node-a", 7200.0).await; // R4 hold, never reclaimed
+
+        let got = store.reclaimable_failed_parts(Duration::from_hours(1), 100).await.unwrap();
+
+        assert_eq!(got, vec![part(1)], "only this node's aged failed part is a candidate");
+    }
+
+    #[sqlx::test]
+    async fn the_worklist_is_oldest_first_and_honours_the_limit(pool: PgPool) {
+        // Oldest first so a backlog drains in age order rather than starving its own tail — the
+        // same property the eviction cursor needs, for the same reason.
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        seed(&pool, 1, "failed", "node-a", 7200.0).await;
+        seed(&pool, 2, "failed", "node-a", 90000.0).await;
+        seed(&pool, 3, "failed", "node-a", 10800.0).await;
+
+        let got = store.reclaimable_failed_parts(Duration::from_hours(1), 2).await.unwrap();
+
+        assert_eq!(got, vec![part(2), part(3)], "oldest first, capped at the limit");
+    }
+
+    #[sqlx::test]
+    async fn a_reclaimed_row_leaves_the_failed_worklist(pool: PgPool) {
+        // The store half of the cursor fix. Unlinking changes nothing about the row, so without
+        // the stamp this query re-offers the same page every poll — for the seven days until
+        // gc_terminal_status_rows removes it.
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        seed(&pool, 1, "failed", "node-a", 7200.0).await;
+        seed(&pool, 2, "failed", "node-a", 7200.0).await;
+
+        assert_eq!(store.reclaimable_failed_parts(Duration::from_hours(1), 10).await.unwrap().len(), 2);
+
+        <Store as ReclaimLog>::mark_failed_reclaimed(&store, &[part(1)]).await.unwrap();
+
+        let left = store.reclaimable_failed_parts(Duration::from_hours(1), 10).await.unwrap();
+        assert_eq!(left, vec![part(2)], "the marked part is gone from the worklist");
+    }
+
+    #[sqlx::test]
+    async fn marking_is_node_scoped(pool: PgPool) {
+        // A peer's row names a file this agent never touched, so marking it would claim work it
+        // did not do — and take the part off the worklist of the node that actually holds it.
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        seed(&pool, 1, "failed", "node-b", 7200.0).await;
+
+        <Store as ReclaimLog>::mark_failed_reclaimed(&store, &[part(1)]).await.unwrap();
+
+        let (marked,): (i64,) = sqlx::query_as("SELECT count(*) FROM cephor_replication_status WHERE reclaimed_at IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(marked, 0, "another node's row was marked");
+    }
+    #[sqlx::test]
+    async fn an_agent_with_no_node_id_reclaims_nothing(pool: PgPool) {
+        // The allocator shares this Store type but holds no node identity and owns no disk.
+        let store = Store::from_pool(pool.clone());
+        seed(&pool, 1, "failed", "node-a", 7200.0).await;
+
+        assert!(store.reclaimable_failed_parts(Duration::from_hours(1), 100).await.unwrap().is_empty());
     }
 }

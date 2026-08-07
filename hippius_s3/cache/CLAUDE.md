@@ -11,6 +11,7 @@ Chunk cache. Backed by a shared filesystem volume; Redis is used only for pub/su
 | [notifier.py](notifier.py) | `ChunkNotifier` — Redis pub/sub wrapper for chunk-ready notifications. |
 | [dual_fs_store.py](dual_fs_store.py) | `DualFileSystemPartsStore` — the tiered read path: node-local NVMe → peer node → CephFS pool. Optionally promotes a pool/peer-served chunk onto local flash. |
 | [peers.py](peers.py) | `PeerRegistry` (self-registration of pod IPs in Redis, TTL'd) + `PeerChunkFetcher` (resolve which node holds a part, fetch one chunk from it). |
+| [read_recency.py](read_recency.py) | `ReadRecencyRecorder` — stamps `cephor_ssd_residency.last_read_at` on a local hit (sampled), so the drain evictor orders on USE rather than arrival. |
 | [residency.py](residency.py) | `ResidencyRecorder` — claims a promoted part for this node in `cephor_ssd_residency` so this node's evictor can reclaim it. |
 | [part_memo.py](part_memo.py) | `PartMemo` — bounded, TTL'd per-part memo, so per-part facts are not recomputed per chunk. |
 | [__init__.py](__init__.py) | `create_fs_store(config, on_promote=..., peer_fetch=...)` factory — picks `DualFileSystemPartsStore` if `HIPPIUS_OBJECT_CACHE_FALLBACK_DIR` is set. |
@@ -32,6 +33,19 @@ flash and claimed in `cephor_ssd_residency` so the drain-agent's evictor owns it
 peer fanout — `HIPPIUS_PEER_FETCH_MAX_INFLIGHT` per (pod, peer) on the client, and
 `HIPPIUS_PEER_SERVE_MAX_INFLIGHT` on the serving pod, which sheds with 503. Both shed to the
 pool rather than queueing.
+
+**The client cap must be ≥ `HTTP_STREAM_PREFETCH_CHUNKS`.** Every chunk of one PART resolves to
+the same peer, so a lower cap makes a single reader shed its own prefetch window to the pool and
+book it as `client_cap` — contention that does not exist. `effective_max_inflight` floors it at
+the prefetch depth at wiring time, so a stale config degrades to a startup warning rather than a
+silently halved peer tier. It does **not** add peer capacity: the semaphore is shared across
+readers on the pod, so under concurrency shedding just moves to the peer's `server_busy`.
+
+Promotion is gated on free space (`HIPPIUS_PROMOTE_MIN_FREE_RATIO`, default 0.175) because it
+shares the ingest mount with PUTs — `HIPPIUS_OBJECT_CACHE_DIR` is the drain agent's
+`CEPHOR_SSD_ROOT` and the mount `fs_cache_pressure` measures. The floor must sit strictly inside
+the evictor's band, above its reserve (0.150) and below its target (0.200), or promotion either
+chatters or deadlocks permanently; `validate_promotion_band` enforces that at startup.
 
 **The evictor runs in a different process** (`drain-agent`) and deletes both the part directory
 and its residency row. Nothing in this package may cache "I already recorded/wrote this" across

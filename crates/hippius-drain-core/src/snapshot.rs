@@ -68,6 +68,29 @@ impl LatencyWindow {
     }
 }
 
+/// Which worker performed an SSD walk.
+///
+/// A closed enum, not a string: it becomes a metric label, and two values fixed in code cannot
+/// become a cardinality problem the way a caller-supplied name could.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanWorker {
+    /// The reconciler — the discovery walk, on the short poll.
+    Reconcile,
+    /// The reclaim worker — the debris walk, on the long poll.
+    Reclaim,
+}
+
+impl ScanWorker {
+    /// The metric label for this worker.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reconcile => "reconcile",
+            Self::Reclaim => "reclaim",
+        }
+    }
+}
+
 /// A point-in-time view of the agent's drain activity, for metrics.
 ///
 /// Plain monotonic counters the runtime accumulates; the observability layer
@@ -89,6 +112,34 @@ pub struct AgentSnapshot {
     pub deferred: u64,
     /// Chunks the reconciler recovered after a dropped `chunk_landed` trigger.
     pub reconciler_recovered: u64,
+    /// Parts visited by the RECONCILER's walk, summed across passes.
+    ///
+    /// The signal that F1 has returned. The walks are O(everything on disk), and retention took
+    /// that from "the undrained backlog" to "this node's entire replicated shard" — 2.28 M parts
+    /// on prod — without anything reporting the change.
+    ///
+    /// Split per worker rather than summed, because the two answer different questions and run
+    /// on cadences three orders of magnitude apart. A merged counter is readable only while the
+    /// reconciler's short poll dominates it — and lengthening that poll is precisely the
+    /// follow-up this metric exists to gate, after which a merged total could not say which
+    /// walk any residual cost belonged to.
+    pub reconcile_scan_parts: u64,
+    /// How long the reconciler's last walk took, in milliseconds. Watched against ITS poll
+    /// interval: a scan approaching its own period means the worker never stops walking.
+    pub reconcile_scan_ms: u64,
+    /// Parts visited by the RECLAIMER's walk, summed across passes.
+    pub reclaim_scan_parts: u64,
+    /// How long the reclaimer's last walk took, in milliseconds.
+    pub reclaim_scan_ms: u64,
+    /// Parts recorded from the api's landed-part announcements — the fast discovery path.
+    /// Read together with `reconciler_recovered`: this climbing while that stays near zero is
+    /// what says the announcement path is carrying discovery. Both near zero means ingest
+    /// stopped, not that the fast path is working.
+    pub landed_recorded: u64,
+    /// Announcements dropped as unparseable. Must stay at zero; nonzero means the api and the
+    /// agent disagree about the wire contract, in which case every message is being lost and
+    /// discovery has silently fallen back to the reconciler's walk.
+    pub landed_dropped: u64,
     /// `failed` (broken/abandoned-upload) SSD parts the reclaim worker unlinked — the
     /// SSD-ingest tier's eviction throughput, distinct from the drain's `CephFS` work.
     pub reclaimed: u64,
@@ -158,6 +209,12 @@ pub struct SnapshotCell {
     failed: AtomicU64,
     deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
+    reconcile_scan_parts: AtomicU64,
+    reconcile_scan_ms: AtomicU64,
+    reclaim_scan_parts: AtomicU64,
+    reclaim_scan_ms: AtomicU64,
+    landed_recorded: AtomicU64,
+    landed_dropped: AtomicU64,
     reclaimed: AtomicU64,
     /// Resident parts the read-tier evictor unlinked, and the bytes they freed. Separate from
     /// `reclaimed` (debris the reclaim worker removed) because the two answer different
@@ -251,6 +308,30 @@ impl SnapshotCell {
     /// Adds `n` to the reconciler-recovered total.
     pub fn record_reconciled(&self, n: u64) {
         self.reconciler_recovered.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records one SSD walk against the worker that performed it.
+    ///
+    /// Attributed rather than summed: the two walkers run on cadences three orders of magnitude
+    /// apart, and the point of the announcement path is to lengthen the reconciler's poll — at
+    /// which point a merged counter could no longer say which walk any residual cost was.
+    ///
+    /// Both halves matter per worker: the count says how big the tree got, the duration says
+    /// whether that worker's walk still fits inside its own poll interval.
+    pub fn record_scan(&self, worker: ScanWorker, parts: u64, duration: Duration) {
+        let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let (count, last) = match worker {
+            ScanWorker::Reconcile => (&self.reconcile_scan_parts, &self.reconcile_scan_ms),
+            ScanWorker::Reclaim => (&self.reclaim_scan_parts, &self.reclaim_scan_ms),
+        };
+        count.fetch_add(parts, Ordering::Relaxed);
+        last.store(millis, Ordering::Relaxed);
+    }
+
+    /// Records one landed-announcement batch: `recorded` parts written, `dropped` unparseable.
+    pub fn record_landed(&self, recorded: u64, dropped: u64) {
+        self.landed_recorded.fetch_add(recorded, Ordering::Relaxed);
+        self.landed_dropped.fetch_add(dropped, Ordering::Relaxed);
     }
 
     /// Adds `n` to the SSD-reclaim total (terminal parts the reclaim worker unlinked).
@@ -448,6 +529,12 @@ impl SnapshotCell {
             failed: self.failed.load(Ordering::Relaxed),
             deferred: self.deferred.load(Ordering::Relaxed),
             reconciler_recovered: self.reconciler_recovered.load(Ordering::Relaxed),
+            reconcile_scan_parts: self.reconcile_scan_parts.load(Ordering::Relaxed),
+            reconcile_scan_ms: self.reconcile_scan_ms.load(Ordering::Relaxed),
+            reclaim_scan_parts: self.reclaim_scan_parts.load(Ordering::Relaxed),
+            reclaim_scan_ms: self.reclaim_scan_ms.load(Ordering::Relaxed),
+            landed_recorded: self.landed_recorded.load(Ordering::Relaxed),
+            landed_dropped: self.landed_dropped.load(Ordering::Relaxed),
             reclaimed: self.reclaimed.load(Ordering::Relaxed),
             reclaim_backing_errors: self.reclaim_backing_errors.load(Ordering::Relaxed),
             throttled: self.throttled.load(Ordering::Relaxed),
@@ -460,7 +547,7 @@ impl SnapshotCell {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{AgentSnapshot, SnapshotCell};
+    use super::{AgentSnapshot, ScanWorker, SnapshotCell};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -606,6 +693,12 @@ mod tests {
                 failed: 1,
                 deferred: 0,
                 reconciler_recovered: 4,
+                reconcile_scan_parts: 0,
+                reconcile_scan_ms: 0,
+                reclaim_scan_parts: 0,
+                reclaim_scan_ms: 0,
+                landed_recorded: 0,
+                landed_dropped: 0,
                 reclaimed: 6,
                 reclaim_backing_errors: 0,
                 throttled: 9,
@@ -613,6 +706,40 @@ mod tests {
                 written_off_servable: 0,
             },
         );
+    }
+
+    #[test]
+    fn scan_parts_accumulate_across_walks_while_the_duration_is_the_latest() {
+        // Both SSD walkers record here, so the count must be a fleet total across passes — that
+        // is what a rate against the poll interval is derived from. The duration is deliberately
+        // NOT summed: it is compared against one poll interval to answer "is this worker walking
+        // continuously", and a running total could not answer that.
+        let cell = SnapshotCell::new();
+        cell.record_scan(ScanWorker::Reconcile, 2_000_000, Duration::from_millis(400));
+        cell.record_scan(ScanWorker::Reconcile, 280_000, Duration::from_millis(90));
+        cell.record_scan(ScanWorker::Reclaim, 5_000, Duration::from_millis(7));
+
+        let snap = cell.load();
+        assert_eq!(snap.reconcile_scan_parts, 2_280_000, "walk cost accumulates per worker");
+        assert_eq!(snap.reconcile_scan_ms, 90, "the duration is that worker's most recent walk, not a sum");
+        // Attribution is the point: the reclaimer's cheap hourly walk must not be buried in the
+        // reconciler's total, or lengthening the reconcile poll leaves the residual unexplained.
+        assert_eq!(snap.reclaim_scan_parts, 5_000);
+        assert_eq!(snap.reclaim_scan_ms, 7);
+    }
+
+    #[test]
+    fn landed_records_split_recorded_from_dropped() {
+        // The pair that says which discovery path is carrying the work. `dropped` must stay at
+        // zero: nonzero means the api and the agent disagree about the message shape, so every
+        // announcement is discarded and discovery has silently reverted to the walk.
+        let cell = SnapshotCell::new();
+        cell.record_landed(7, 0);
+        cell.record_landed(3, 2);
+
+        let snap = cell.load();
+        assert_eq!(snap.landed_recorded, 10);
+        assert_eq!(snap.landed_dropped, 2);
     }
 
     #[test]
@@ -672,6 +799,12 @@ mod tests {
             failed: u64::MAX,
             deferred: 0,
             reconciler_recovered: 0,
+            reconcile_scan_parts: 0,
+            reconcile_scan_ms: 0,
+            reclaim_scan_parts: 0,
+            reclaim_scan_ms: 0,
+            landed_recorded: 0,
+            landed_dropped: 0,
             reclaimed: 0,
             reclaim_backing_errors: 0,
             throttled: 0,
@@ -688,6 +821,12 @@ mod tests {
             failed: 3,
             deferred: 0,
             reconciler_recovered: 0,
+            reconcile_scan_parts: 0,
+            reconcile_scan_ms: 0,
+            reclaim_scan_parts: 0,
+            reclaim_scan_ms: 0,
+            landed_recorded: 0,
+            landed_dropped: 0,
             reclaimed: 0,
             reclaim_backing_errors: 0,
             throttled: 0,

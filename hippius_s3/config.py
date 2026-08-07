@@ -370,6 +370,17 @@ class Config:
     # promoted copy is only reclaimable by a drain-agent evictor running on the same node, so
     # enabling it where no evictor runs would fill the disk with copies nothing owns.
     object_cache_promote_on_read: bool = env("HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ:false", convert=bool)
+    # Free-space floor below which a read stops promoting onto local flash. Promotion is the
+    # only unthrottled writer to the ingest SSD and it shares that mount with ingest — on an
+    # ingest node HIPPIUS_OBJECT_CACHE_DIR is the drain agent's CEPHOR_SSD_ROOT — so warming
+    # the cache must yield to accepting writes.
+    #
+    # 0.175 is not arbitrary: it has to sit strictly INSIDE the drain evictor's hysteresis
+    # band, between its reserve (150 permille) and its target (reserve + headroom = 200
+    # permille). Equal to the target it chatters; above the target it deadlocks, because the
+    # evictor only frees back to its target and could never restore enough for promotion to
+    # resume. See FreeSpaceGate and test_promotion_pressure_guard.py.
+    promote_min_free_ratio: float = env("HIPPIUS_PROMOTE_MIN_FREE_RATIO:0.175", convert=float)
     # Read a chunk from the peer node that holds it on flash (~6 ms + ~1 ms network) before
     # falling through to the CephFS pool (~40 ms). Resolved per PART: only ~2% of multi-part
     # objects have every part on one node, so there is no single node to route a request to.
@@ -381,12 +392,21 @@ class Config:
     peer_registry_refresh_seconds: int = env("HIPPIUS_PEER_REGISTRY_REFRESH_SECONDS:30", convert=int)
     # Bound on a peer read. A slow peer must lose to the pool quickly rather than adding its
     # latency on top of the pool read that follows.
-    peer_fetch_timeout_seconds: float = env("HIPPIUS_PEER_FETCH_TIMEOUT_SECONDS:2.0", convert=float)
+    # The fallback costs ~40 ms (a CephFS pool read), so this is a loss-cut, not a deadline: a
+    # peer that has not answered in 0.5s is already an order of magnitude worse than giving up,
+    # and waiting the old 2.0s meant paying 50x the fallback before then ALSO paying the
+    # fallback. Generous against a ~7 ms healthy peer read.
+    peer_fetch_timeout_seconds: float = env("HIPPIUS_PEER_FETCH_TIMEOUT_SECONDS:0.5", convert=float)
     # Per-peer fanout: concurrent fetches this pod will have in flight to any ONE peer, and
     # concurrent peer requests this pod will SERVE. Both are needed — the client cap bounds
     # what one pod sends, but five pods each within their own cap still add up at the peer,
     # so the serving side sheds with 503 to protect its own ingest.
-    peer_fetch_max_inflight: int = env("HIPPIUS_PEER_FETCH_MAX_INFLIGHT:8", convert=int)
+    # Must be >= http_stream_prefetch_chunks. Every chunk of one PART resolves to the same
+    # peer, so a cap below the prefetch depth makes a single reader shed its own window to the
+    # pool and book it as `client_cap` contention that does not exist. `effective_max_inflight`
+    # enforces that floor at wiring time, so a stale value degrades to a warning, not a
+    # silently halved peer tier.
+    peer_fetch_max_inflight: int = env("HIPPIUS_PEER_FETCH_MAX_INFLIGHT:16", convert=int)
     peer_serve_max_inflight: int = env("HIPPIUS_PEER_SERVE_MAX_INFLIGHT:16", convert=int)
     # 24h since last WRITE — the read path no longer bumps timestamps (read
     # recency lives in fs_cache_inventory.last_access_at), so this gates on

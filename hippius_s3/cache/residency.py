@@ -40,6 +40,20 @@ class ResidencyRecorder:
     async def __call__(self, object_id: str, object_version: int, part_number: int, size_bytes: int) -> None:
         try:
             async with self._pool.acquire() as conn:
+                # The conflict action ACCUMULATES, where the drain's `record_resident`
+                # OVERWRITES. The two are writing different facts: the drain knows the whole
+                # part's size at commit and states it; promotion learns the part one chunk at a
+                # time and has to add. They cannot collide on a live (node, part) — the drain
+                # records only on its own commit, a locally-resident part is served locally and
+                # so is never promoted, and eviction removes the row and the directory
+                # together, resetting both writers to the same empty starting point.
+                #
+                # The action itself is load-bearing and must never be dropped: `ON CONFLICT`
+                # without one is a syntax error, every claim then fails into the except below,
+                # and promoted chunks land on disk with NO residency row — unowned by the
+                # node-scoped evictor and skipped by `ssd_reclaim` as read tier, i.e. a
+                # permanent SSD leak. That is exactly the failure this recorder exists to
+                # prevent, and it is invisible: reads still succeed.
                 await conn.execute(
                     """
                     INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number, bytes)

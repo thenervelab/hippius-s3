@@ -1,9 +1,9 @@
 # The hippius-drain agent: the per-node drain daemon.
 # One pod per ingest node, draining that node's local-SSD ingest dir to
 # the shared CephFS pool, path-preservingly per the api part layout
-# (<object_id>/v<version>/part_<n>/). The reconciler is the sole trigger — it scans the
-# SSD for complete parts (a meta.json marker) with no replication row and records them,
-# so the api needs no change.
+# (<object_id>/v<version>/part_<n>/). Parts are discovered from the api's landed-part
+# announcements (cephor:landed:<node> on the queue Redis); the reconciler's SSD scan is the
+# BACKSTOP for an announcement that was never delivered, not the primary trigger.
 #
 # == Node alignment ==
 # Selects the SAME node label `s3-prod-local-ingest=true` as the api-local
@@ -148,6 +148,15 @@ spec:
               value: "300"
             - name: CEPHOR_RECLAIM_GRACE_SECS
               value: "3600"
+            # ROLLBACK-LOAD-BEARING — do not delete as manifest hygiene.
+            # Read by the CURRENT (pre-retention) binary, which unlinks a replicated part once
+            # it ages past this grace. The retention binary ignores it: ssd_reclaim skips
+            # `replicated` outright, because those parts are the read tier and the evictor owns
+            # them instead. It looks dead the moment retention ships here — and it is exactly
+            # then that it matters most, because `kubectl rollout undo daemonset/drain-agent`
+            # restores unlink-on-commit AND needs this grace to sweep the cache the rolled-back
+            # fleet is still holding. Deleting it would leave a rolled-back node with a full
+            # disk and nothing to reclaim it.
             - name: CEPHOR_REPLICATED_RECLAIM_GRACE_SECS
               value: "3600"
             # Max parts drained concurrently — the in-flight gate that lets the node
@@ -174,17 +183,29 @@ spec:
             # AND defer_attempts), so a just-completed MPU's parts drain promptly regardless.
             - name: CEPHOR_DRAIN_POLL_SECS
               value: "1"
-            # Reconciler scan period (was the 60s code default). The reconciler is the SOLE
-            # drain trigger — a freshly-landed part is invisible until the next scan records its
-            # `pending` row — so this interval, not the 1s drain poll, is the dominant, jittery
-            # replication-sync tail (0–60s at the old default; ~30s avg). 15s cuts it to ~7.5s avg.
-            # Safe to lower: a scan is a walk of the node-local SSD ingest tree (undrained parts
-            # only — drained parts are unlinked; the Ceph pool and the 94M-row parts table are
-            # never walked) + ONE batched UNNEST status read. record_landed writes fire only for
-            # genuinely-new parts (a known part is seen as already_pending and skipped), so a
-            # faster poll adds NO extra write load — just the cheap walk + one read, jittered per
-            # node. The real fix (an api landing fast-path + mtime-incremental scan) collapses
-            # this to ~1s; 15s is the zero-code interim. See drainer-optimisations.md Tier 1.
+            # Reconciler scan period (was the 60s code default). NO LONGER the sole drain trigger:
+            # the api announces each part to cephor:landed:<node> and the agent's `landed` worker
+            # records it, so this walk is the BACKSTOP for an announcement never delivered. Until
+            # that path is proven this interval still bounds the replication-sync tail, which is
+            # why it is unchanged here.
+            # STALE PREMISE — corrected 2026-08-07. This used to read "undrained parts only —
+            # drained parts are unlinked", which is what made a 15s walk cheap. Retention (PR
+            # #398) ended that: the drain keeps its replicated copy to serve reads, so the tree
+            # is now the node's ENTIRE replicated shard — measured on prod 2026-08-07 at 2.28M
+            # parts / ~930 GB per node. At this interval that is ~2.28M stats and ~4,560 batched
+            # queries every 15 seconds, per node, to discover a handful of new parts.
+            # The Ceph pool and the 94M-row parts table are still never walked.
+            #
+            # The api landing fast-path now exists (cephor:landed:<node>, see landed.rs), so
+            # discovery no longer depends on this poll — but the poll is deliberately left at 15s
+            # until that path is proven, and demoting the reconciler to a ~10min BACKSTOP is a
+            # separate commit and separate deploy so either can be rolled back alone.
+            # Watch drain_scan_parts_total / drain_scan_duration_ms.
+            #
+            # ORDERING CONSTRAINT: this cost is only theoretical on prod today because prod is
+            # still pre-retention (the SSD holds just the undrained backlog). Retention must not
+            # reach prod before this poll is demoted, or prod starts paying the full walk 4x a
+            # minute per node on day one.
             - name: CEPHOR_RECONCILE_POLL_SECS
               value: "15"
             - name: RUST_LOG

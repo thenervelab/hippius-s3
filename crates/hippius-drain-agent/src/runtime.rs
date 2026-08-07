@@ -17,14 +17,15 @@
 //! `rust_quality_129_async_graceful_shutdown`).
 
 use crate::disk::{DiskUsage, disk_usage};
+use crate::landed::LandedQueue;
 use crate::localfs::{LocalFs, LocalSsd};
 use crate::readiness::ReadinessTracker;
 use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
-    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, EvictionTarget, NodeId,
-    NodeObservation, PartReplicationStore, ReclaimError, ReclaimGraces, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket,
-    UploadEnqueuer, decay_rate, evict_to_target, jittered, reclaim_ssd, reconcile_parts,
+    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, EvictionPass, EvictionTarget,
+    NodeId, NodeObservation, PartReplicationStore, ReclaimError, ReclaimGraces, ScanWorker, SnapshotCell, Store, StoredAllocation, SystemClock,
+    TokenBucket, UploadEnqueuer, decay_rate, evict_to_target, jittered, reclaim_failed, reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -87,6 +88,13 @@ pub struct RuntimeConfig {
     pub reconcile_poll: Duration,
     /// How often the reclaim worker scans the SSD for `failed` (abandoned-upload) parts.
     pub reclaim_poll: Duration,
+    /// How often the DB-driven `failed`-part reclaim runs. Independent of the reclaim WALK:
+    /// decoupling debris cleanup from the walk is the point, so the walk can be rare.
+    pub failed_reclaim_poll: Duration,
+    /// How often the landed-part announcement queue is drained. Short: this is the discovery
+    /// latency for a freshly-written part, the role the 15 s reconciler walk used to fill, and
+    /// an empty queue costs one `RPOP`.
+    pub landed_poll: Duration,
     /// How often the read-tier evictor checks the ingest disk's free space.
     pub evict_poll: Duration,
     /// The free-space floor the evictor maintains, and how far past it to free.
@@ -276,9 +284,13 @@ pub struct EvictionPolicy {
     /// How far past the floor to free once armed, in permille of the disk. Without this the
     /// evictor re-arms on nearly every cycle and pins the disk at the threshold.
     pub headroom_permille: u16,
-    /// Most parts to consider in one pass, bounding both the worklist query and how long a
-    /// single pass can hold the disk busy.
+    /// Rows fetched per worklist query. **Not** the pass budget — see [`EvictionPass`]. Prod's
+    /// part sizes are bimodal (measured p50 686 bytes against a 408 KB shard mean), so a part
+    /// count says almost nothing about bytes freed; the pass pages until the byte goal is met.
     pub batch: u32,
+    /// Wall-clock ceiling on one pass, so eviction cannot monopolise the disk the drain is also
+    /// writing to. Whatever is left over resumes on the next poll.
+    pub max_pass: Duration,
 }
 
 /// Resolves a policy against a probed disk into the concrete byte target for one pass.
@@ -327,7 +339,11 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
     // None means the allocator has not published a reserve for this node (pre-Phase-4
     // leader, expired allocation key, or a malformed value); the static floor then applies.
     let target = eviction_target(usage, policy, snapshot.allocated_reserve_permille());
-    match evict_to_target(store, ssd, target, policy.batch).await {
+    let pass = EvictionPass {
+        page: policy.batch,
+        max_duration: policy.max_pass,
+    };
+    match evict_to_target(store, ssd, ssd, &SystemClock, target, pass).await {
         Ok(report) => {
             snapshot.record_evicted(report.evicted, report.freed_bytes);
             snapshot.record_evict_blocked_unreplicated(report.skipped_unreplicated);
@@ -335,8 +351,21 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
                 tracing::info!(
                     evicted = report.evicted,
                     freed_bytes = report.freed_bytes,
+                    pages = report.pages,
                     free_bytes = usage.free_bytes,
                     "evicted resident SSD parts to restore the free-space floor"
+                );
+            }
+            // Ran out of the pass's wall clock with work still queued. Routine and
+            // self-correcting — the next poll resumes the cursor — so INFO. Keeping this
+            // OUT of `starved` is the point: a large deficit takes many passes by design,
+            // and reporting that as starvation is what made the ERROR meaningless.
+            if report.budget_exhausted {
+                tracing::info!(
+                    evicted = report.evicted,
+                    pages = report.pages,
+                    free_bytes = usage.free_bytes,
+                    "eviction pass hit its time budget; resuming next poll"
                 );
             }
             // Eviction could not reach its target: the disk is filling with something it
@@ -346,6 +375,7 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
                 tracing::error!(
                     free_bytes = usage.free_bytes,
                     deficit = target.deficit(),
+                    evicted = report.evicted,
                     "eviction ran out of resident parts before restoring the free-space floor"
                 );
             }
@@ -432,8 +462,13 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node
 /// is ever removed without a successful status read (fail-safe). The store is both the
 /// replication log and the object-backing log for the reclaim.
 async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, graces: ReclaimGraces) {
+    let started = Instant::now();
     match reclaim_ssd(ssd, ssd, store, store, graces).await {
         Ok(report) => {
+            // The walk's cost, from the pass that just paid it. `scanned` is every part on this
+            // node's SSD — which retention grew from the undrained backlog to the whole
+            // replicated shard, with nothing reporting the change until now.
+            snapshot.record_scan(ScanWorker::Reclaim, report.scanned, started.elapsed());
             // Both debris dispositions free SSD bytes, so the reclaimed gauge counts their sum.
             // Retained `replicated` parts are NOT counted here — they are cache, not reclaimed
             // debris, and the evictor reports their reclamation separately.
@@ -520,6 +555,95 @@ async fn redrive_corrupt_once(store: &Store, snapshot: &SnapshotCell, max_attemp
         Ok(0) => {}
         Ok(redriven) => tracing::warn!(redriven, "re-drove corrupt-live parts (corrupt pool copy; re-copying from SSD source)"),
         Err(err) => tracing::warn!(error = %err, "corrupt re-drive failed; will retry next poll"),
+    }
+}
+
+/// Aged `failed` parts adjudicated per DB-driven reclaim pass. Bounded so one pass is a small
+/// indexed query plus one batched servability read, never a sweep of a pathological backlog.
+const FAILED_RECLAIM_BATCH: u32 = 512;
+
+/// One DB-driven `failed`-reclaim pass: unlink this node's aged abandoned-upload debris.
+///
+/// The walk used to find these by scanning every part on the SSD and asking the database about
+/// each one — work proportional to the whole tree (2.28 M parts on prod after retention) to find
+/// a population that is tiny and directly queryable (22,123 `failed` rows fleet-wide). This asks
+/// for them instead, which is why the walk's cadence could drop to hourly without leaving debris
+/// on the disk for an hour.
+///
+/// Errors log and retry next poll. Every failure mode here removes NOTHING: the worklist read,
+/// the servability read, and the unlink each abort the pass rather than proceeding on a
+/// half-answered question.
+async fn failed_reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, grace: Duration) {
+    match reclaim_failed(store, store, ssd, grace, FAILED_RECLAIM_BATCH).await {
+        Ok(report) => {
+            snapshot.record_reclaimed(report.reclaimed);
+            if report.reclaimed > 0 {
+                tracing::info!(reclaimed = report.reclaimed, "reclaimed broken/abandoned-upload SSD parts");
+            }
+            // R4: the part is a live object's last good source because its pool copy is corrupt.
+            // Same signal the walk's `skipped_corrupt` carries — a standing nonzero value across
+            // cycles is the incident, not a single pass.
+            if report.held_servable > 0 {
+                tracing::warn!(
+                    held_servable = report.held_servable,
+                    "corrupt-live SSD parts held (pool copy corrupt) — last good source preserved (R4)"
+                );
+            }
+        }
+        // A backing-read abort leaves every candidate unjudged, so the pass removed nothing and
+        // this GC is DISABLED rather than merely slow — the same distinction the walk draws.
+        Err(ReclaimError::Backing(err)) => {
+            snapshot.record_reclaim_backing_error();
+            tracing::error!(error = %err, "failed-part reclaim disabled: object-backing read failed; removed nothing");
+        }
+        Err(err) => tracing::warn!(error = ?err, "failed-part reclaim pass failed; will retry next poll"),
+    }
+}
+
+/// Announcements drained per landed-queue poll. Generous: the work per message is one
+/// idempotent UPSERT, and a burst (a large multipart upload completing) should be absorbed in
+/// one tick rather than trickled at the poll rate, which is what a small batch would do.
+const LANDED_POP_BATCH: usize = 512;
+
+/// One landed-queue pass: record every part the api announced since the last tick.
+///
+/// This is the fast discovery path that replaces the reconciler's whole-disk walk. It is
+/// deliberately thin — pop, record, count — because everything that makes discovery *correct*
+/// still lives in the reconciler, which remains as the backstop for any announcement that was
+/// never delivered.
+///
+/// Failures are logged and dropped rather than retried in-tick: a Redis error leaves the
+/// entries queued for the next poll, and a `record_landed_part` error leaves the part for the
+/// reconciler. Neither can lose the part, because the disk is the source of truth in both cases.
+async fn landed_once(queue: &LandedQueue, store: &Store, snapshot: &SnapshotCell) {
+    let (parts, dropped) = match queue.pop(LANDED_POP_BATCH).await {
+        Ok(batch) => batch,
+        Err(err) => {
+            tracing::warn!(error = %err, "landed-queue read failed; entries stay queued for the next poll");
+            return;
+        }
+    };
+    if parts.is_empty() && dropped == 0 {
+        return;
+    }
+    let mut recorded = 0u64;
+    for part in &parts {
+        // Idempotent, and the same call the reconciler makes — so an announcement racing the
+        // backstop is a no-op rather than a conflict.
+        match store.record_landed_part(part).await {
+            Ok(()) => recorded += 1,
+            Err(err) => tracing::warn!(error = %err, "recording an announced part failed; the reconciler will recover it"),
+        }
+    }
+    snapshot.record_landed(recorded, dropped);
+    if dropped > 0 {
+        // The api and this agent disagree about the message shape, so EVERY announcement is
+        // being lost and discovery has silently fallen back to the reconciler's walk — the
+        // thing this path exists to avoid. Loud, because nothing else would show it.
+        tracing::error!(dropped, "landed announcements were unparseable; the api/agent wire contract has diverged");
+    }
+    if recorded > 0 {
+        tracing::debug!(recorded, "recorded announced parts");
     }
 }
 
@@ -686,6 +810,10 @@ pub struct AgentRuntime<E: UploadEnqueuer> {
     /// Opt-in readiness file the heartbeat worker touches only while the drain is progressing
     /// (C8), for the k8s `readinessProbe`. `None` writes no file.
     readiness_path: Option<Arc<PathBuf>>,
+    /// Opt-in landed-part announcement queue. `None` (tests, and any deployment whose api does
+    /// not publish yet) leaves the reconciler as the sole discovery path — i.e. today's
+    /// behaviour — so the two sides roll independently.
+    landed: Option<LandedQueue>,
 }
 
 impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
@@ -706,6 +834,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             clock: Arc::new(SystemClock),
             liveness_path: None,
             readiness_path: None,
+            landed: None,
         }
     }
 
@@ -763,6 +892,15 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         self
     }
 
+    /// Enables the landed-announcement worker, so a part the api just wrote is discovered by
+    /// one `RPOP` rather than by the reconciler's walk of the whole SSD tree. Without it the
+    /// reconciler remains the sole trigger, which is exactly the pre-announcement behaviour.
+    #[must_use]
+    pub fn with_landed_queue(mut self, queue: LandedQueue) -> Self {
+        self.landed = Some(queue);
+        self
+    }
+
     /// A handle to the runtime's live drain counters. Grab it before [`run`](Self::run)
     /// (which consumes the runtime) to read metrics while the workers publish.
     #[must_use]
@@ -801,8 +939,16 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             run_periodic(token, reconcile_poll, move || {
                 let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
                 async move {
+                    let started = Instant::now();
                     match reconcile_parts(ssd.as_ref(), store.as_ref()).await {
-                        Ok(report) => snapshot.record_reconciled(report.recovered),
+                        Ok(report) => {
+                            // The reconciler's walk is the expensive one: it runs on the
+                            // shortest poll of any worker, and `scanned` is every part on the
+                            // disk. Recording it is what makes the landed-announcement path's
+                            // benefit visible — and what would show F1 returning.
+                            snapshot.record_scan(ScanWorker::Reconcile, report.scanned, started.elapsed());
+                            snapshot.record_reconciled(report.recovered);
+                        }
                         Err(err) => tracing::warn!(error = %err, "reconcile cycle failed"),
                     }
                 }
@@ -846,6 +992,36 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
                 async move { evict_once(&ssd, &store, &snapshot, evict_policy).await }
             })
         });
+
+        // Failed-part reclaim worker: unlink aged abandoned-upload debris, found by an indexed
+        // query rather than by walking the disk. Separate from the reclaim WALK above and on its
+        // own poll deliberately — decoupling debris cleanup from the walk is what let the walk
+        // drop to hourly without leaving debris around for an hour.
+        let (ssd, store, snapshot) = (Arc::clone(&self.ssd), Arc::clone(&self.store), Arc::clone(&self.snapshot));
+        let failed_reclaim_poll = self.config.failed_reclaim_poll;
+        let failed_grace = self.config.reclaim_grace;
+        supervisor.spawn(WorkerName::new("failed_reclaim"), move |token| {
+            run_periodic(token, failed_reclaim_poll, move || {
+                let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
+                async move { failed_reclaim_once(&ssd, &store, &snapshot, failed_grace).await }
+            })
+        });
+
+        // Landed-announcement worker (opt-in): record parts the api says it just wrote, so
+        // discovery costs one RPOP instead of a walk of the node's entire replicated shard
+        // (2.28 M parts on prod). Without a queue configured the agent behaves exactly as
+        // before — the reconciler is still the sole trigger — which is what makes the api-side
+        // publish and this consumer independently deployable in either order.
+        if let Some(queue) = self.landed.as_ref() {
+            let (queue, store, snapshot) = (queue.clone(), Arc::clone(&self.store), Arc::clone(&self.snapshot));
+            let landed_poll = self.config.landed_poll;
+            supervisor.spawn(WorkerName::new("landed"), move |token| {
+                run_periodic(token, landed_poll, move || {
+                    let (queue, store, snapshot) = (queue.clone(), Arc::clone(&store), Arc::clone(&snapshot));
+                    async move { landed_once(&queue, &store, &snapshot).await }
+                })
+            });
+        }
 
         // Enqueue-sweep worker: publish the backend upload for `replicated` parts whose
         // address was NULL at drain time (an in-flight MPU) — the decoupled counterpart to the
@@ -1081,6 +1257,7 @@ mod tests {
             reserve_permille: 150,
             headroom_permille: 50,
             batch: 128,
+            max_pass: Duration::from_secs(10),
         };
 
         let target = eviction_target(usage, policy, None);
@@ -1106,6 +1283,7 @@ mod tests {
             reserve_permille: 150,
             headroom_permille: 50,
             batch: 128,
+            max_pass: Duration::from_secs(10),
         };
 
         let target = eviction_target(usage, policy, Some(400));
@@ -1126,6 +1304,7 @@ mod tests {
             reserve_permille: 150,
             headroom_permille: 50,
             batch: 128,
+            max_pass: Duration::from_secs(10),
         };
 
         assert_eq!(eviction_target(usage, policy, None).reserve, 600 * GIB);
@@ -1145,6 +1324,7 @@ mod tests {
             reserve_permille: 0,
             headroom_permille: 50,
             batch: 128,
+            max_pass: Duration::from_secs(10),
         };
 
         assert_eq!(eviction_target(usage, policy, None).deficit(), 0, "a zero reserve never arms");
@@ -1304,11 +1484,14 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
                     headroom_permille: 50,
                     batch: 512,
+                    max_pass: Duration::from_secs(10),
                 },
                 redrive_max_attempts: 3,
             },
@@ -1395,11 +1578,14 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
                     headroom_permille: 50,
                     batch: 512,
+                    max_pass: Duration::from_secs(10),
                 },
                 redrive_max_attempts: 3,
             },
@@ -1520,11 +1706,14 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
                     headroom_permille: 50,
                     batch: 512,
+                    max_pass: Duration::from_secs(10),
                 },
                 redrive_max_attempts: 3,
             },
@@ -1591,11 +1780,14 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
                     headroom_permille: 50,
                     batch: 512,
+                    max_pass: Duration::from_secs(10),
                 },
                 redrive_max_attempts: 3,
             },
@@ -1645,11 +1837,14 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
                     headroom_permille: 50,
                     batch: 512,
+                    max_pass: Duration::from_secs(10),
                 },
                 redrive_max_attempts: 3,
             },
@@ -1777,6 +1972,7 @@ mod tests {
                 reserve_permille: 1_000,
                 headroom_permille: 0,
                 batch: 512,
+                max_pass: Duration::from_secs(10),
             },
         )
         .await;
@@ -1823,6 +2019,7 @@ mod tests {
                 reserve_permille: 1_000,
                 headroom_permille: 0,
                 batch: 512,
+                max_pass: Duration::from_secs(10),
             },
         )
         .await;

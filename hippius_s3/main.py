@@ -37,12 +37,15 @@ from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
 from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
+from hippius_s3.cache.peers import effective_max_inflight
+from hippius_s3.cache.read_recency import create_read_recency_recorder
 from hippius_s3.cache.residency import create_residency_recorder
 from hippius_s3.config import Config
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
+from hippius_s3.writer.landed import initialize_landed_publisher
 
 
 logger = logging.getLogger(__name__)
@@ -164,19 +167,39 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 app.state.peer_registry,
                 node_name,
                 app.state.peer_http,
-                max_inflight=config.peer_fetch_max_inflight,
+                # Floored at the prefetch depth: chunks of one part all resolve to the same
+                # peer, so a lower cap has a single reader shedding its own window to the pool.
+                max_inflight=effective_max_inflight(
+                    config.peer_fetch_max_inflight,
+                    config.http_stream_prefetch_chunks,
+                ),
             )
             # Serving-side cap, read by the /internal/parts endpoint. Set whenever peer fetch
             # is on, since a node that fetches from peers is also one peers fetch from.
             app.state.peer_serve_limiter = asyncio.Semaphore(config.peer_serve_max_inflight)
             logger.info("Peer chunk fetch enabled for node %s", node_name)
 
-        app.state.fs_store = create_fs_store(config, on_promote=app.state.residency_recorder, peer_fetch=peer_fetch)
+        # Eviction orders on COALESCE(last_read_at, resident_at), so a locally-served part has
+        # to say so or the evictor falls back to arrival order — which for a re-read working set
+        # tends to drop exactly the parts about to be needed again.
+        app.state.read_recency_recorder = create_read_recency_recorder(app.state.postgres_pool, node_name)
+        app.state.fs_store = create_fs_store(
+            config,
+            on_promote=app.state.residency_recorder,
+            peer_fetch=peer_fetch,
+            on_local_read=app.state.read_recency_recorder,
+        )
         app.state.obj_cache = RedisObjectPartsCache(
             app.state.redis_client,
             queues_client=app.state.redis_queues_client,
             fs_store=app.state.fs_store,
         )
+        # Tell this node's drain agent about each part as it lands, so discovery costs one queue
+        # pop instead of the reconciler's walk of the node's entire replicated shard. Best-effort
+        # and node-scoped: without NODE_NAME there is no way to say whose agent should drain the
+        # part, so nothing is published and the reconciler keeps doing the job.
+        if initialize_landed_publisher(app.state.redis_queues_client, node_name) is not None:
+            logger.info("Landed-part announcements enabled for node %s", node_name)
         logger.info("Cache repositories initialized")
 
         app.state.sub_token_scope_repo = SubTokenScopeRepository(db_pool=app.state.postgres_pool)

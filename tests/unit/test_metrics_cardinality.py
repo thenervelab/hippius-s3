@@ -52,6 +52,9 @@ BOUNDED_LABELS = {
     # on record_chunk_read_tier and passed only from the three fixed call sites in
     # DualFileSystemPartsStore.get_chunk. Closed in code, never object- or caller-derived.
     "tier",
+    # Outcome of a read-recency stamp: "written" | "failed", typed as the ReadRecencyOutcome
+    # Literal and passed from exactly two call sites in ReadRecencyRecorder. Closed in code.
+    "outcome",
 }
 
 

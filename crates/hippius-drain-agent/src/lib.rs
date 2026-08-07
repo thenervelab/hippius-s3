@@ -7,6 +7,7 @@
 pub mod config;
 pub mod disk;
 pub mod enqueue;
+pub mod landed;
 pub mod localfs;
 #[cfg(feature = "otel")]
 pub mod metrics;

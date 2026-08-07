@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from hippius_s3.writer.landed import get_landed_publisher
+
 
 class WriteThroughPartsWriter:
     """Writes object parts to the filesystem cache (mandatory, fatal on failure).
@@ -57,6 +59,18 @@ class WriteThroughPartsWriter:
             num_chunks=int(num_chunks),
             size_bytes=int(plain_size),
         )
+        # Announce to this node's drain agent, strictly AFTER meta lands. Meta is the readiness
+        # gate: a part is only complete once it exists, so announcing earlier could have the
+        # drain claim a part whose chunks are still being written. It also has to be here rather
+        # than at the call sites — this is the one choke point every upload path (simple PUT,
+        # streamed PUT, MPU part, append) already funnels through, and a hook one of them
+        # forgets is a part that falls back to the disk walk with nothing saying so.
+        #
+        # Best-effort: the bytes and meta are already durable, and the agent's reconciler still
+        # discovers the part from disk if this never arrives.
+        publisher = get_landed_publisher()
+        if publisher is not None:
+            await publisher.publish(object_id, int(object_version), int(part_number))
 
     async def write_chunks(self, object_id: str, object_version: int, part_number: int, chunks: list[bytes]) -> None:
         """Write chunks to the FS cache (fatal on failure).

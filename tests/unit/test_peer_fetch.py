@@ -18,6 +18,7 @@ import pytest
 
 from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
+from hippius_s3.cache.peers import effective_max_inflight
 from hippius_s3.cache.peers import peer_key
 
 
@@ -345,3 +346,90 @@ async def test_both_shed_paths_are_recorded_with_their_reason(monkeypatch) -> No
     assert recorded == ["client_cap", "server_busy"], (
         "each shed is counted once, under the reason that actually caused it"
     )
+
+
+# ----------------------------------------------------------------- per-peer cap vs prefetch
+
+
+def test_the_cap_is_floored_at_the_prefetch_depth() -> None:
+    """A cap below the prefetch depth makes a reader compete with itself.
+
+    Every chunk of one PART resolves to the same peer, and the streamer keeps
+    HTTP_STREAM_PREFETCH_CHUNKS fetches in flight, so with the shipped 8-vs-16 pairing half of
+    every part over 32 MiB went to CephFS while the peer sat idle.
+    """
+    assert effective_max_inflight(8, 16) == 16
+
+
+def test_a_cap_already_at_or_above_the_prefetch_depth_is_left_alone() -> None:
+    """Deliberate over-provisioning is an operator decision; only the broken case is corrected."""
+    assert effective_max_inflight(32, 16) == 32
+    assert effective_max_inflight(16, 16) == 16
+
+
+@pytest.mark.asyncio
+async def test_a_single_readers_prefetch_window_never_sheds_against_an_idle_peer() -> None:
+    """THE Phase G regression test: it fails on the shipped 8-vs-16 defaults.
+
+    One reader, one part, a full prefetch window in flight, and a peer that is doing nothing
+    else. Every chunk must reach the peer. Before this fix the 9th through 16th were shed to
+    the pool and booked as `client_cap`, which reads on a dashboard as peer contention while
+    the peer is idle — and understates `chunk_reads_by_tier_total{tier=peer}` for the whole
+    soak, making "the peer tier is not helping" unfalsifiable.
+    """
+    prefetch = 16
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
+    registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
+    http = BlockingHttp()
+    fetcher = PeerChunkFetcher(
+        FakePool({"node_id": "node-b"}),
+        registry,
+        "node-a",
+        http,
+        max_inflight=effective_max_inflight(8, prefetch),
+    )
+
+    # One part, so every chunk resolves to the same peer — the case the cap used to break.
+    inflight = [asyncio.create_task(fetcher(OBJ, 1, 3, i)) for i in range(prefetch)]
+    await asyncio.sleep(0)  # let the owner lookup and the acquires run
+    await asyncio.sleep(0)
+
+    http.release.set()
+    results = await asyncio.gather(*inflight)
+
+    assert http.attempts == prefetch, f"only {http.attempts} of {prefetch} chunks reached an idle peer"
+    assert all(r == b"peer-bytes" for r in results), "every chunk came from the peer, none from the pool"
+
+
+@pytest.mark.asyncio
+async def test_the_cap_still_sheds_when_readers_genuinely_contend() -> None:
+    """The Owl property must survive the floor: real contention still skips to the pool.
+
+    Note what this does NOT claim. The semaphore is per (pod, peer) and shared across readers,
+    so raising it does not add peer capacity — under concurrency it moves shedding from
+    `client_cap` to the peer's own `server_busy`. Aggregate demand is `(pods - 1) x cap`
+    against one serve cap, oversubscribed by design, with Ceph as the intended overflow valve.
+    """
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
+    registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
+    http = BlockingHttp()
+    cap = 4
+    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http, max_inflight=cap)
+
+    saturating = [asyncio.create_task(fetcher(OBJ, 1, 3, i)) for i in range(cap)]
+    await asyncio.wait_for(http.started.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    # The cap is now taken; a further reader must skip to the pool rather than queue behind it.
+    # `wait_for` is the assertion, not a safety net: without the skip this call blocks on the
+    # semaphore until the peer replies, which is the failure mode — the reader would pay the
+    # saturated peer's full latency and THEN still read the pool. A plain await would hang the
+    # suite instead of failing it.
+    shed = await asyncio.wait_for(fetcher(OBJ, 1, 3, 99), timeout=1)
+    assert shed is None, "a saturated peer is skipped, not queued"
+    assert http.attempts == cap, "and the extra request was never even attempted"
+
+    http.release.set()
+    await asyncio.gather(*saturating)

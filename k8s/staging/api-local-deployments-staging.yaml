@@ -132,8 +132,15 @@ spec:
             # serving its own ingest. The client cap bounds what one pod sends; the serve cap
             # sheds with 503 so five pods each within their own cap still cannot crowd out
             # that node's PUTs.
+            #
+            # The client cap must be >= HTTP_STREAM_PREFETCH_CHUNKS (16). Every chunk of one
+            # PART resolves to the same peer, so at the previous value of 8 a single reader
+            # shed half its own prefetch window to CephFS while the peer sat idle — and booked
+            # it as `client_cap`, which reads as contention on the dashboard. The api floors
+            # this at the prefetch depth anyway (effective_max_inflight); set correctly here
+            # so the manifest states the intent rather than relying on the correction.
             - name: HIPPIUS_PEER_FETCH_MAX_INFLIGHT
-              value: "8"
+              value: "16"
             - name: HIPPIUS_PEER_SERVE_MAX_INFLIGHT
               value: "16"
             - name: K8S_NAMESPACE
