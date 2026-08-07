@@ -22,8 +22,8 @@ use crate::readiness::ReadinessTracker;
 use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
-    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, EvictionTarget, NodeId,
-    NodeObservation, PartReplicationStore, ReclaimError, ReclaimGraces, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket,
+    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, EvictionPass, EvictionTarget,
+    NodeId, NodeObservation, PartReplicationStore, ReclaimError, ReclaimGraces, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket,
     UploadEnqueuer, decay_rate, evict_to_target, jittered, reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
@@ -276,9 +276,13 @@ pub struct EvictionPolicy {
     /// How far past the floor to free once armed, in permille of the disk. Without this the
     /// evictor re-arms on nearly every cycle and pins the disk at the threshold.
     pub headroom_permille: u16,
-    /// Most parts to consider in one pass, bounding both the worklist query and how long a
-    /// single pass can hold the disk busy.
+    /// Rows fetched per worklist query. **Not** the pass budget — see [`EvictionPass`]. Prod's
+    /// part sizes are bimodal (measured p50 686 bytes against a 408 KB shard mean), so a part
+    /// count says almost nothing about bytes freed; the pass pages until the byte goal is met.
     pub batch: u32,
+    /// Wall-clock ceiling on one pass, so eviction cannot monopolise the disk the drain is also
+    /// writing to. Whatever is left over resumes on the next poll.
+    pub max_pass: Duration,
 }
 
 /// Resolves a policy against a probed disk into the concrete byte target for one pass.
@@ -327,7 +331,11 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
     // None means the allocator has not published a reserve for this node (pre-Phase-4
     // leader, expired allocation key, or a malformed value); the static floor then applies.
     let target = eviction_target(usage, policy, snapshot.allocated_reserve_permille());
-    match evict_to_target(store, ssd, target, policy.batch).await {
+    let pass = EvictionPass {
+        page: policy.batch,
+        max_duration: policy.max_pass,
+    };
+    match evict_to_target(store, ssd, ssd, &SystemClock, target, pass).await {
         Ok(report) => {
             snapshot.record_evicted(report.evicted, report.freed_bytes);
             snapshot.record_evict_blocked_unreplicated(report.skipped_unreplicated);
@@ -335,8 +343,21 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
                 tracing::info!(
                     evicted = report.evicted,
                     freed_bytes = report.freed_bytes,
+                    pages = report.pages,
                     free_bytes = usage.free_bytes,
                     "evicted resident SSD parts to restore the free-space floor"
+                );
+            }
+            // Ran out of the pass's wall clock with work still queued. Routine and
+            // self-correcting — the next poll resumes the cursor — so INFO. Keeping this
+            // OUT of `starved` is the point: a large deficit takes many passes by design,
+            // and reporting that as starvation is what made the ERROR meaningless.
+            if report.budget_exhausted {
+                tracing::info!(
+                    evicted = report.evicted,
+                    pages = report.pages,
+                    free_bytes = usage.free_bytes,
+                    "eviction pass hit its time budget; resuming next poll"
                 );
             }
             // Eviction could not reach its target: the disk is filling with something it
@@ -346,6 +367,7 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
                 tracing::error!(
                     free_bytes = usage.free_bytes,
                     deficit = target.deficit(),
+                    evicted = report.evicted,
                     "eviction ran out of resident parts before restoring the free-space floor"
                 );
             }
@@ -1081,6 +1103,7 @@ mod tests {
             reserve_permille: 150,
             headroom_permille: 50,
             batch: 128,
+            max_pass: Duration::from_secs(10),
         };
 
         let target = eviction_target(usage, policy, None);
@@ -1106,6 +1129,7 @@ mod tests {
             reserve_permille: 150,
             headroom_permille: 50,
             batch: 128,
+            max_pass: Duration::from_secs(10),
         };
 
         let target = eviction_target(usage, policy, Some(400));
@@ -1126,6 +1150,7 @@ mod tests {
             reserve_permille: 150,
             headroom_permille: 50,
             batch: 128,
+            max_pass: Duration::from_secs(10),
         };
 
         assert_eq!(eviction_target(usage, policy, None).reserve, 600 * GIB);
@@ -1145,6 +1170,7 @@ mod tests {
             reserve_permille: 0,
             headroom_permille: 50,
             batch: 128,
+            max_pass: Duration::from_secs(10),
         };
 
         assert_eq!(eviction_target(usage, policy, None).deficit(), 0, "a zero reserve never arms");
@@ -1309,6 +1335,7 @@ mod tests {
                     reserve_permille: 150,
                     headroom_permille: 50,
                     batch: 512,
+                    max_pass: Duration::from_secs(10),
                 },
                 redrive_max_attempts: 3,
             },
@@ -1400,6 +1427,7 @@ mod tests {
                     reserve_permille: 150,
                     headroom_permille: 50,
                     batch: 512,
+                    max_pass: Duration::from_secs(10),
                 },
                 redrive_max_attempts: 3,
             },
@@ -1525,6 +1553,7 @@ mod tests {
                     reserve_permille: 150,
                     headroom_permille: 50,
                     batch: 512,
+                    max_pass: Duration::from_secs(10),
                 },
                 redrive_max_attempts: 3,
             },
@@ -1596,6 +1625,7 @@ mod tests {
                     reserve_permille: 150,
                     headroom_permille: 50,
                     batch: 512,
+                    max_pass: Duration::from_secs(10),
                 },
                 redrive_max_attempts: 3,
             },
@@ -1650,6 +1680,7 @@ mod tests {
                     reserve_permille: 150,
                     headroom_permille: 50,
                     batch: 512,
+                    max_pass: Duration::from_secs(10),
                 },
                 redrive_max_attempts: 3,
             },
@@ -1777,6 +1808,7 @@ mod tests {
                 reserve_permille: 1_000,
                 headroom_permille: 0,
                 batch: 512,
+                max_pass: Duration::from_secs(10),
             },
         )
         .await;
@@ -1823,6 +1855,7 @@ mod tests {
                 reserve_permille: 1_000,
                 headroom_permille: 0,
                 batch: 512,
+                max_pass: Duration::from_secs(10),
             },
         )
         .await;

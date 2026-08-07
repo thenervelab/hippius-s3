@@ -12,9 +12,10 @@
 //! implement the GC-only [`CephFs`]/[`SsdCache`] `remove_object` reclaim (by
 //! `<object_id>` folder).
 
+use core::future::Future;
 use hippius_drain_core::{
-    CephFs, ChunkIndex, DiscoveredPart, FileId, META_FILE_NAME, PartKey, PartMeta, PartPool, PartRemover, PartScan, PartSource, SsdCache,
-    chunk_file_name, parse_part_dir,
+    CephFs, ChunkIndex, DiscoveredPart, FileId, FreeSpaceProbe, META_FILE_NAME, PartKey, PartMeta, PartPool, PartRemover, PartScan, PartSource,
+    SsdCache, chunk_file_name, parse_part_dir,
 };
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
@@ -724,6 +725,30 @@ impl PartRemover for LocalSsd {
         // re-drive after a crash — is harmless. The drain itself no longer unlinks at all:
         // it retains its copy to serve reads.
         remove_part_dir(&self.root, part).await
+    }
+}
+
+impl FreeSpaceProbe for LocalSsd {
+    type Error = io::Error;
+
+    /// Re-probes free space between eviction pages, so a long pass converges on the disk's
+    /// real state rather than on the single reading it started with.
+    ///
+    /// This matters more than a periodic refresh usually would: the evictor's own accounting
+    /// sums `cephor_ssd_residency.bytes`, which is denormalized at residency time and records
+    /// zero for a part whose size was unknown. A pass trusting that sum alone could believe it
+    /// had freed nothing while reclaiming real space, and page until its time budget.
+    ///
+    /// `statvfs` blocks, so it goes to the blocking pool (axiom `r4r_ch10_01`) exactly as the
+    /// heartbeat and the pass's initial probe do.
+    fn free_bytes(&self) -> impl Future<Output = io::Result<u64>> + Send {
+        let root = self.root.clone();
+        async move {
+            tokio::task::spawn_blocking(move || crate::disk::disk_usage(&root))
+                .await
+                .map_err(io::Error::other)?
+                .map(|usage| usage.free_bytes)
+        }
     }
 }
 

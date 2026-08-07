@@ -102,6 +102,14 @@ const DEFAULT_EVICT_HEADROOM_PERMILLE: u16 = 50;
 /// polls without one pass monopolising the disk.
 const DEFAULT_EVICT_BATCH: u32 = 512;
 
+/// Wall-clock ceiling on ONE eviction pass when `CEPHOR_EVICT_MAX_PASS_SECS` is unset.
+///
+/// The pass pages until its byte goal is met, so without a time bound a large deficit would hold
+/// the disk — which the drain and ingest are also writing to — for as long as it took. The
+/// remainder resumes on the next poll and is reported as `budget_exhausted`, deliberately NOT as
+/// starvation: a deficit spanning many passes is the design, not a fault.
+const DEFAULT_EVICT_MAX_PASS: Duration = Duration::from_secs(10);
+
 /// Default path of the liveness file the runtime touches each heartbeat tick; the
 /// k8s `livenessProbe` checks its freshness. Container-local `/tmp` is always writable.
 const DEFAULT_LIVENESS_FILE: &str = "/tmp/hippius-drain-agent.alive";
@@ -187,8 +195,10 @@ pub struct Config {
     pub evict_reserve_permille: u16,
     /// How far past the floor an armed eviction pass frees, in permille of the disk.
     pub evict_headroom_permille: u16,
-    /// Parts considered per eviction pass.
+    /// Rows fetched per eviction worklist query — the page size, not the pass budget.
     pub evict_batch: u32,
+    /// Wall-clock ceiling on one eviction pass; the remainder resumes on the next poll.
+    pub evict_max_pass: Duration,
     /// Path of the liveness file the runtime touches each heartbeat tick; a k8s
     /// `livenessProbe` checks its freshness to restart a wedged (not crashed) pod.
     pub liveness_file: PathBuf,
@@ -274,6 +284,7 @@ impl Config {
                 reserve_permille: self.evict_reserve_permille,
                 headroom_permille: self.evict_headroom_permille,
                 batch: self.evict_batch,
+                max_pass: self.evict_max_pass,
             },
         }
     }
@@ -353,6 +364,7 @@ impl Config {
             evict_reserve_permille: permille_or(&get, "CEPHOR_EVICT_RESERVE_PERMILLE", DEFAULT_EVICT_RESERVE_PERMILLE)?,
             evict_headroom_permille: permille_or(&get, "CEPHOR_EVICT_HEADROOM_PERMILLE", DEFAULT_EVICT_HEADROOM_PERMILLE)?,
             evict_batch: positive_u32_or(&get, "CEPHOR_EVICT_BATCH", DEFAULT_EVICT_BATCH)?,
+            evict_max_pass: duration_secs(&get, "CEPHOR_EVICT_MAX_PASS_SECS", DEFAULT_EVICT_MAX_PASS)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
             readiness_file: path_or(&get, "CEPHOR_READINESS_FILE", DEFAULT_READINESS_FILE),
         })
