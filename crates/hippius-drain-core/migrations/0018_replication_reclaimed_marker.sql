@@ -18,9 +18,6 @@
 -- only record that this part failed, and reclaiming disk is not a reason to discard the
 -- diagnosis a week early. The marker takes the row off the worklist and leaves the GC's
 -- semantics untouched.
-ALTER TABLE cephor_replication_status
-    ADD COLUMN IF NOT EXISTS reclaimed_at TIMESTAMPTZ;
-
 -- lock_timeout is the load-bearing line, exactly as in 0013. CREATE INDEX takes SHARE, which
 -- conflicts with ROW EXCLUSIVE: with no timeout it waits out any open writer AND blocks every
 -- new writer on this table behind it — claim_part, release_part, mark_replicated,
@@ -28,7 +25,15 @@ ALTER TABLE cephor_replication_status
 -- BEFORE its liveness file is first touched, and that probe SIGKILLs at ~50-65s, so a long lock
 -- wait means CrashLoopBackOff with each restart re-queuing the lock. Failing fast and retrying
 -- on the next start is strictly better.
+--
+-- Set BEFORE the ALTER, not after it. `ADD COLUMN` without a default is metadata-only and
+-- fast once it HOLDS the lock, but it still needs ACCESS EXCLUSIVE to take it, and that
+-- acquisition queues behind any open reader and then blocks every statement arriving after
+-- it. 0013 puts the guard ahead of its first DDL for this reason.
 SET LOCAL lock_timeout = '5s';
+
+ALTER TABLE cephor_replication_status
+    ADD COLUMN IF NOT EXISTS reclaimed_at TIMESTAMPTZ;
 
 -- Partial, so the index covers only the ~22k `failed` rows rather than all 11.4M. Without it the
 -- worklist query is a scan on a table the drain writes to constantly, every poll, per node.

@@ -19,9 +19,6 @@
 -- has no read recency, and treating its residency time as its last-read time is exactly the old
 -- behaviour — so the change degrades to FIFO for the existing population and becomes recency as
 -- reads land. There is no window where eviction is ordered on nothing.
-ALTER TABLE cephor_ssd_residency
-    ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ;
-
 -- lock_timeout is the load-bearing line, as it is in 0013. CREATE INDEX takes SHARE, which
 -- conflicts with ROW EXCLUSIVE: with no timeout it waits out any open writer AND blocks every
 -- new writer on this table behind it — which for this table is every promotion, every drain
@@ -35,6 +32,9 @@ ALTER TABLE cephor_ssd_residency
 -- silently refuses to rebuild (a dead index with no operator-visible apply job to catch it),
 -- and waits out all older snapshots twice.
 SET LOCAL lock_timeout = '5s';
+
+ALTER TABLE cephor_ssd_residency
+    ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ;
 
 -- The eviction cursor's index has to match the ORDER BY expression or the planner sorts the
 -- whole resident set (~2M rows per node) on every pass — which would reintroduce, in Postgres,
