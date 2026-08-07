@@ -44,6 +44,7 @@ from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
+from hippius_s3.writer.landed import initialize_landed_publisher
 
 
 logger = logging.getLogger(__name__)
@@ -183,6 +184,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             queues_client=app.state.redis_queues_client,
             fs_store=app.state.fs_store,
         )
+        # Tell this node's drain agent about each part as it lands, so discovery costs one queue
+        # pop instead of the reconciler's walk of the node's entire replicated shard. Best-effort
+        # and node-scoped: without NODE_NAME there is no way to say whose agent should drain the
+        # part, so nothing is published and the reconciler keeps doing the job.
+        if initialize_landed_publisher(app.state.redis_queues_client, node_name) is not None:
+            logger.info("Landed-part announcements enabled for node %s", node_name)
         logger.info("Cache repositories initialized")
 
         app.state.sub_token_scope_repo = SubTokenScopeRepository(db_pool=app.state.postgres_pool)

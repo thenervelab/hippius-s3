@@ -10,7 +10,8 @@ Entry point is [`ObjectWriter`](object_writer.py); the heavy lifting is in [`put
 |---|---|
 | [object_writer.py](object_writer.py) | Orchestrator. Simple PUT, MPU part upload, MPU completion, append. |
 | [chunker.py](chunker.py) | `stream_encrypt_to_chunks` — buffers plaintext, yields ciphertext one chunk at a time. |
-| [write_through_writer.py](write_through_writer.py) | `WriteThroughPartsWriter` — FS writes (fatal), Redis writes (best-effort). |
+| [write_through_writer.py](write_through_writer.py) | `WriteThroughPartsWriter` — FS writes (fatal), then the landed-part announcement (best-effort). |
+| [landed.py](landed.py) | `LandedPartPublisher` — tells this node's drain agent a part is complete, so discovery is a queue pop instead of a whole-disk walk. |
 | [cache_writer.py](cache_writer.py) | **Dead code** — `CacheWriter` not referenced anywhere. Delete candidate in [todo.md](../../todo.md). |
 | [db.py](db.py) | `upsert_object_basic`, `ensure_upload_row` — atomic DB reserves. |
 | [types.py](types.py) | Dataclasses: `PutResult`, `PartResult`, `CompleteResult`, `AppendPreconditionFailed`, etc. |
@@ -29,7 +30,7 @@ _(`queue.py` was removed: its `enqueue_upload` was the dead PUT-path upload prod
    - Producer (main coroutine, [line 338-394](object_writer.py)): drains `body_iter`, accumulates into `pt_buf`, encrypts full chunks with the **global** chunk index (AEAD AAD binds to it, so chunks MUST be encrypted in order), enqueues onto `write_queue` (maxsize 16).
    - Consumer ([line 308-333](object_writer.py)): dequeues, calls `fs_store.set_chunk` (fatal on failure), appends to `redis_chunks` for best-effort batched Redis write ([line 330-331](object_writer.py) flushes every 16).
 6. **Flush final Redis batch** ([line 285-306 `_flush_redis_batch`](object_writer.py)).
-7. **Write FS meta** via `WriteThroughPartsWriter.write_meta` ([line 420](object_writer.py)). `meta.json` is the "part is complete" signal for readers. Must land AFTER every chunk is safely on disk — otherwise readers could see a completed part with missing chunks.
+7. **Write FS meta** via `WriteThroughPartsWriter.write_meta` ([line 420](object_writer.py)). `meta.json` is the "part is complete" signal for readers. Must land AFTER every chunk is safely on disk — otherwise readers could see a completed part with missing chunks. `write_meta` then **announces the part** to this node's drain agent ([landed.py](landed.py)) — strictly after meta, since meta is what makes the part claimable. It is the one choke point every upload path funnels through, which is why the hook lives there rather than at the four call sites. Best-effort: a dropped announcement costs discovery latency, and the agent's reconciler still finds the part on disk.
 8. **Update object_versions** with final `size_bytes`, `md5_hash`, `content_type`, `metadata`, `updated_at` ([line 442](object_writer.py)). **Until this runs, the version is invisible to downloads** (the download query filters `size_bytes=0 AND md5=""` to avoid serving reserved-but-incomplete rows).
 9. **Upsert upload row + part placeholder** ([line 455-474](object_writer.py)) — links the object_version to a multipart_uploads row (used for append and MPU; simple PUT still creates one for structural consistency).
 10. **Return `PutResult`**. The endpoint does NOT enqueue the backend upload (drain-direct cutover) — it persists the version address (`set_object_version_address`); the Rust drain replicates the part to Ceph and LPUSHes the `UploadChainRequest` to `{backend}_upload_requests` itself, as the sole producer (see line 18).
