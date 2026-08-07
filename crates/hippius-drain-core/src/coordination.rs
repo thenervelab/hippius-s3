@@ -35,6 +35,17 @@ use thiserror::Error;
 /// instance. Override per test via [`Coordinator::with_prefix`] for isolation.
 const DEFAULT_PREFIX: &str = "cephor:";
 
+/// The promote-floor key, split out from the method so it can be pinned without a live Redis.
+///
+/// This string is a CROSS-LANGUAGE contract: `hippius_s3/promote_floor.py` hardcodes
+/// `"cephor:promote_floor:"` and cannot see this prefix. Drift does not fail anything — the api
+/// reads a key nobody writes, concludes "signal unavailable", and silently falls back to its
+/// static floor forever, which is exactly the mirrored-constant failure this whole change exists
+/// to remove. `promote_floor_key_is_the_literal_the_api_reads` pins the two together.
+fn promote_floor_key_for(prefix: &str, node: &NodeId) -> String {
+    format!("{prefix}promote_floor:{}", node.as_str())
+}
+
 /// Per-command response timeout (and per-attempt connection timeout) for the coordinator's
 /// Redis manager. Bounds every command so a reachable-but-blocked redis-queues (an fsync
 /// stall, a BGSAVE, a half-open TCP after a blip) surfaces as a retryable error instead of
@@ -352,7 +363,7 @@ impl Coordinator {
     }
 
     fn promote_floor_key(&self, node: &NodeId) -> String {
-        format!("{}promote_floor:{}", self.prefix, node.as_str())
+        promote_floor_key_for(&self.prefix, node)
     }
 
     /// Publishes the free-space floor below which the api must stop promoting chunks onto this
@@ -567,6 +578,8 @@ fn nonneg_u64(field: &'static str, value: i64) -> Result<u64> {
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
     use super::Coordinator;
+    use super::DEFAULT_PREFIX;
+    use super::promote_floor_key_for;
     use crate::alloc::Allocation;
     use crate::alloc::NodeObservation;
     use crate::ids::NodeId;
@@ -594,6 +607,26 @@ mod tests {
             .expect("connect to the test redis")
             .with_prefix(&format!("{}:{prefix}", std::process::id()));
         Some(coordinator)
+    }
+
+    #[test]
+    fn promote_floor_key_is_the_literal_the_api_reads() {
+        // The only test in this module that needs no Redis, because it pins a STRING rather than
+        // a round trip. Both sides of this contract are tested against the documented shape and
+        // neither is tested against the other — the api hardcodes "cephor:promote_floor:" in
+        // hippius_s3/promote_floor.py and has no way to see DEFAULT_PREFIX.
+        //
+        // A mismatch is silent by construction: the agent writes a key nobody reads, the api reads
+        // a key nobody writes and treats the absence as "signal unavailable", and promotion runs on
+        // the static floor forever while every test on both sides stays green. That is the same
+        // failure mode as the mirrored EVICT_RESERVE_RATIO constant this work replaced, so leaving
+        // it unpinned would reintroduce the bug one layer out.
+        let node = NodeId::from_str("node-7").unwrap();
+        assert_eq!(
+            promote_floor_key_for(DEFAULT_PREFIX, &node),
+            "cephor:promote_floor:node-7",
+            "must match PROMOTE_FLOOR_KEY_PREFIX in hippius_s3/promote_floor.py"
+        );
     }
 
     fn observation() -> NodeObservation {
