@@ -42,6 +42,27 @@ const DEFAULT_PREFIX: &str = "cephor:";
 /// error-retry paths only fire on an `Err`, never on a silent hang.
 pub const DEFAULT_REDIS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// TTL on each node's published promote floor. Sized to survive several missed eviction polls
+/// (30 s default) so a brief agent hiccup does not flip the api back to its static floor, while
+/// a genuinely dead agent stops steering the api's threshold within a couple of minutes.
+/// Matches `PROMOTE_FLOOR_TTL_SECONDS` in `hippius_s3/promote_floor.py`.
+pub const PROMOTE_FLOOR_TTL: Duration = Duration::from_mins(2);
+
+/// The wire form of a node's published promote floor — the free-space ratio below which the
+/// api must stop copying pool/peer-served chunks onto this node's flash.
+///
+/// The agent publishes the RESOLVED number, not the inputs it was derived from. An earlier
+/// draft published `reserve` + `headroom` and had the api compute the midpoint, which merely
+/// moves the mirror up a level: the api would then encode this crate's FORMULA, and would go
+/// silently wrong the next time the meaning of `headroom` changes. One resolved integer has no
+/// formula to drift.
+#[derive(Serialize)]
+struct PromoteFloorJson {
+    floor_permille: u16,
+    source: &'static str,
+    ts: u64,
+}
+
 /// Acquire-or-renew the singleton lease. `KEYS[1]`=lease, `KEYS[2]`=epoch counter;
 /// `ARGV[1]`=instance id, `ARGV[2]`=ttl secs. Returns the held epoch, or nil if another
 /// instance holds an unexpired lease. An absent (expired/fresh) lease bumps the epoch via
@@ -330,6 +351,41 @@ impl Coordinator {
         format!("{}alloc:{}", self.prefix, node.as_str())
     }
 
+    fn promote_floor_key(&self, node: &NodeId) -> String {
+        format!("{}promote_floor:{}", self.prefix, node.as_str())
+    }
+
+    /// Publishes the free-space floor below which the api must stop promoting chunks onto this
+    /// node's flash, under [`PROMOTE_FLOOR_TTL`].
+    ///
+    /// The evictor calls this once per pass. The TTL — not a delete — is what retires the
+    /// signal: an agent that stops publishing (crashed, rolled, or with eviction disabled)
+    /// leaves the key to lapse, and the api falls back to its own statically configured floor.
+    /// That makes the two sides independently deployable in either order, and makes an agent
+    /// outage degrade the read tier's threshold rather than freeze a stale one.
+    ///
+    /// Note `redis-queues` runs an LRU eviction policy under a memory cap. A key read every few
+    /// seconds stays hot, but an eviction under pressure is indistinguishable from a TTL lapse
+    /// on the consumer side, which is exactly why absence must mean "fall back", never "stop".
+    ///
+    /// # Errors
+    ///
+    /// [`CoordError::Serde`] if the payload cannot serialize; [`CoordError::Redis`] on a
+    /// command failure. Callers treat both as best-effort — the floor is an optimisation
+    /// signal, so a failed publish must never fail the eviction pass that produced it.
+    pub async fn publish_promote_floor(&self, node: &NodeId, floor_permille: u16) -> Result<()> {
+        let payload = serde_json::to_string(&PromoteFloorJson {
+            floor_permille,
+            source: "drain-agent",
+            ts: unix_seconds(),
+        })?;
+        let mut conn = self.conn.clone();
+        let _: () = conn
+            .set_ex(self.promote_floor_key(node), payload, PROMOTE_FLOOR_TTL.as_secs().max(1))
+            .await?;
+        Ok(())
+    }
+
     /// Acquires or renews the singleton leadership lease for `instance_id`.
     ///
     /// Returns `Some(Lease)` when this instance holds leadership after the call (a fresh
@@ -491,6 +547,15 @@ impl Coordinator {
             }
         }
     }
+}
+
+/// Wall-clock seconds since the epoch, for the `ts` a consumer uses to judge freshness. A
+/// clock before 1970 reads as 0 rather than panicking — the TTL, not this stamp, is what
+/// actually retires the key.
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// Checked `i64 -> u64` for a value Redis stored as a (non-negative) integer.

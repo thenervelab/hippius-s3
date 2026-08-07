@@ -301,16 +301,90 @@ fn eviction_target(usage: DiskUsage, policy: EvictionPolicy, allocated_reserve_p
     // u128 intermediates: total_bytes is multi-terabyte and a permille multiply would be
     // within a factor of 1000 of overflowing u64 on a large enough disk.
     let permille_of_disk = |permille: u16| -> u64 { u64::try_from(u128::from(usage.total_bytes) * u128::from(permille) / 1_000).unwrap_or(u64::MAX) };
+    let reserve = resolved_reserve_permille(policy, allocated_reserve_permille);
+    EvictionTarget {
+        free: usage.free_bytes,
+        reserve: permille_of_disk(reserve),
+        headroom: permille_of_disk(policy.headroom_permille),
+    }
+}
+
+/// The free-space floor below which the api must stop promoting chunks onto this disk, in
+/// permille — the MIDPOINT of the evictor's hysteresis band.
+///
+/// Read-through promotion (`hippius_s3/cache/dual_fs_store.py`) is the only unthrottled writer
+/// on the ingest SSD, so it has to back off before the evictor is even armed. Where inside the
+/// band it backs off is not a free choice:
+///
+/// - at or below the RESERVE, promotion is racing an armed evictor for the same bytes;
+/// - at the TARGET (`reserve + headroom`), it chatters — the evictor stops the instant it
+///   reaches the target, so promotion would be live only in the moment a pass completes;
+/// - ABOVE the target it deadlocks permanently: the evictor never frees past its target, so a
+///   floor above that point can never be restored and the read tier stops warming for good.
+///
+/// The midpoint is the only choice with a margin on both sides, and it is derived from the
+/// reserve actually in force rather than from a constant, which is the entire point: the
+/// allocator raises the reserve to 400 permille on a stalled node and the floor must ride up
+/// with it. Integer halving biases the floor toward the reserve, which is the safe direction.
+fn promote_floor_permille(reserve_permille: u16, headroom_permille: u16) -> u16 {
+    reserve_permille.saturating_add(headroom_permille / 2)
+}
+
+/// The reserve this pass will actually hold: the allocator's per-node value when it has
+/// published one, else the node's configured floor.
+///
+/// Extracted so [`eviction_target`] and [`published_promote_floor`] cannot drift — publishing a
+/// floor derived from a different reserve than the evictor is enforcing is exactly the class of
+/// bug this whole change removes.
+fn resolved_reserve_permille(policy: EvictionPolicy, allocated_reserve_permille: Option<u16>) -> u16 {
     // The allocator's reserve wins when present: it is the only component that can see WHY a
     // node is not draining (the fleet Ceph ceiling, and this node's budget against its demand),
     // so it can raise the floor BEFORE free space falls rather than after — which on a stalled
     // drain is the difference between evicting early and 503ing. Absent, the node keeps its own
     // configured floor rather than dropping to none.
-    let reserve = allocated_reserve_permille.unwrap_or(policy.reserve_permille);
-    EvictionTarget {
-        free: usage.free_bytes,
-        reserve: permille_of_disk(reserve),
-        headroom: permille_of_disk(policy.headroom_permille),
+    allocated_reserve_permille.unwrap_or(policy.reserve_permille)
+}
+
+/// The promote floor to publish for this pass, or `None` when this evictor forms no band a
+/// floor could live inside.
+///
+/// `None` covers the two degenerate policies: a zero reserve (the operator's eviction
+/// kill-switch — with retention on, NOTHING then frees the disk, so any floor we published
+/// would be a threshold no eviction can restore) and a headroom too small to leave room
+/// between the reserve and the target. Publishing nothing lets the key lapse, and the api
+/// reads an absent key as "signal unavailable" and falls back to its own static floor — which
+/// is the honest answer when there is no live control loop to track.
+fn published_promote_floor(policy: EvictionPolicy, allocated_reserve_permille: Option<u16>) -> Option<u16> {
+    let reserve = resolved_reserve_permille(policy, allocated_reserve_permille);
+    let floor = promote_floor_permille(reserve, policy.headroom_permille);
+    let target = reserve.saturating_add(policy.headroom_permille);
+    (reserve > 0 && reserve < floor && floor < target).then_some(floor)
+}
+
+/// Publishes this node's resolved promote floor so the api's read-through promotion can gate on
+/// the band the evictor is ACTUALLY holding rather than on a mirrored constant.
+///
+/// Carries the same [`NodeId`] the heartbeat is keyed by, so the api — which reads
+/// `cephor:promote_floor:{NODE_NAME}` and gets its `NODE_NAME` from the same `spec.nodeName`
+/// field — is guaranteed to read its own node's floor and not a peer's.
+#[derive(Debug, Clone)]
+struct PromoteFloorPublisher {
+    coord: Arc<Coordinator>,
+    node: NodeId,
+}
+
+impl PromoteFloorPublisher {
+    /// Best-effort publish. `None` means this evictor forms no band worth advertising, so the
+    /// key is left to lapse; an error is logged and dropped. Neither may fail the eviction pass
+    /// that produced the floor — eviction is the only thing freeing the ingest SSD, and a
+    /// missing floor merely returns the api to its static default.
+    async fn publish(&self, floor_permille: Option<u16>) {
+        let Some(floor_permille) = floor_permille else {
+            return;
+        };
+        if let Err(err) = self.coord.publish_promote_floor(&self.node, floor_permille).await {
+            tracing::warn!(error = %err, floor_permille, "publishing the promote floor failed; the api falls back to its static floor once the key lapses");
+        }
     }
 }
 
@@ -321,7 +395,7 @@ fn eviction_target(usage: DiskUsage, policy: EvictionPolicy, allocated_reserve_p
 /// failure here ends in `fs_cache_pressure` 503ing PUTs. Errors are logged and retried on the
 /// next poll rather than propagated (a failed pass must not kill the agent), but `starved`
 /// and `skipped_unreplicated` are surfaced loudly because neither is self-correcting.
-async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, policy: EvictionPolicy) {
+async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, policy: EvictionPolicy, floor: Option<&PromoteFloorPublisher>) {
     let root = ssd.root().to_path_buf();
     // statvfs blocks — same rule as the heartbeat probe (axiom r4r_ch10_01).
     let usage = match tokio::task::spawn_blocking(move || disk_usage(&root)).await {
@@ -338,7 +412,16 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
 
     // None means the allocator has not published a reserve for this node (pre-Phase-4
     // leader, expired allocation key, or a malformed value); the static floor then applies.
-    let target = eviction_target(usage, policy, snapshot.allocated_reserve_permille());
+    // Read ONCE: the target the evictor enforces and the floor the api is told to respect must
+    // come from the same reserve, and a second read of the atomic could land on a fresh
+    // allocation and publish a floor for a band this pass is not holding.
+    let allocated_reserve = snapshot.allocated_reserve_permille();
+    let target = eviction_target(usage, policy, allocated_reserve);
+    // Publish before the pass, not after: the pass can run for its whole wall-clock budget, and
+    // the floor describes the band the evictor is holding, not the outcome of any one pass.
+    if let Some(publisher) = floor {
+        publisher.publish(published_promote_floor(policy, allocated_reserve)).await;
+    }
     let pass = EvictionPass {
         page: policy.batch,
         max_duration: policy.max_pass,
@@ -986,10 +1069,22 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         let (ssd, store, snapshot) = (Arc::clone(&self.ssd), Arc::clone(&self.store), Arc::clone(&self.snapshot));
         let evict_poll = self.config.evict_poll;
         let evict_policy = self.config.evict_policy;
+        // The evictor also publishes the floor the api must stop promoting below. It needs the
+        // coordinator (for Redis) and the node identity (to key the value); both already exist
+        // for the heartbeat, so a node that reports itself to the allocator also steers the api,
+        // and one that does not (tests, drain-only e2e) leaves the api on its static floor.
+        let promote_floor = self
+            .coord
+            .as_ref()
+            .zip(self.heartbeat.as_ref())
+            .map(|(coord, heartbeat)| PromoteFloorPublisher {
+                coord: Arc::clone(coord),
+                node: heartbeat.node.clone(),
+            });
         supervisor.spawn(WorkerName::new("ssd_evict"), move |token| {
             run_periodic(token, evict_poll, move || {
-                let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
-                async move { evict_once(&ssd, &store, &snapshot, evict_policy).await }
+                let (ssd, store, snapshot, promote_floor) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot), promote_floor.clone());
+                async move { evict_once(&ssd, &store, &snapshot, evict_policy, promote_floor.as_ref()).await }
             })
         });
 
@@ -1125,7 +1220,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 mod tests {
     use super::{
         AgentRuntime, DiskUsage, EvictionPolicy, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, eviction_target,
-        node_observation, pull_action, record_drain_signals,
+        node_observation, promote_floor_permille, published_promote_floor, pull_action, record_drain_signals,
     };
     use crate::localfs::{LocalFs, LocalSsd};
     use crate::supervisor::ShutdownTrigger;
@@ -1328,6 +1423,121 @@ mod tests {
         };
 
         assert_eq!(eviction_target(usage, policy, None).deficit(), 0, "a zero reserve never arms");
+    }
+
+    /// The eviction policy the fleet ships: 15% reserve, 5% headroom.
+    fn shipped_policy() -> EvictionPolicy {
+        EvictionPolicy {
+            reserve_permille: 150,
+            headroom_permille: 50,
+            batch: 128,
+            max_pass: Duration::from_secs(10),
+        }
+    }
+
+    #[test]
+    fn the_promote_floor_is_the_midpoint_of_the_band_at_every_reserve() {
+        // The midpoint is the only point that neither chatters nor deadlocks, and it must be
+        // derived from whatever reserve is in force — not from the 150 the code was written
+        // against. At the allocator's ceiling the floor is 425 permille, which is the whole
+        // point: on a stalled node promotion stops long before the evictor is armed.
+        assert_eq!(promote_floor_permille(150, 50), 175, "the shipped band's midpoint");
+        assert_eq!(
+            promote_floor_permille(400, 50),
+            425,
+            "an allocator-raised reserve raises the floor with it"
+        );
+    }
+
+    #[test]
+    fn every_reserve_the_allocator_can_publish_yields_a_floor_strictly_inside_the_band() {
+        // THE invariant, stated in the language that owns the constants. `validate_promotion_band`
+        // asserted this once at startup against a hardcoded 150 while the allocator was free to
+        // publish anything in 150..=400 (base_reserve_permille..max_reserve_permille in
+        // hippius-drain-allocator's AllocConfig) — so it inverted for every reserve >= 175 and
+        // said nothing. Exhaustive over the shipped range rather than sampled: 251 values is
+        // cheaper than a proptest run and proves the property outright.
+        for reserve in 150_u16..=400 {
+            let floor = published_promote_floor(
+                EvictionPolicy {
+                    reserve_permille: reserve,
+                    ..shipped_policy()
+                },
+                None,
+            )
+            .expect("a live band publishes a floor");
+            assert!(
+                reserve < floor && floor < reserve + 50,
+                "reserve {reserve} must yield a floor strictly inside ({reserve}, {}), got {floor}",
+                reserve + 50
+            );
+        }
+    }
+
+    #[test]
+    fn the_published_floor_follows_the_allocated_reserve_not_the_configured_one() {
+        // The bug in one assertion: the evictor obeys the allocator's per-node reserve, so the
+        // floor the api consumes has to be resolved from the SAME value. Publishing the static
+        // one would re-create the mirror this change exists to delete.
+        assert_eq!(
+            published_promote_floor(shipped_policy(), None),
+            Some(175),
+            "no allocation: the node's own configured reserve"
+        );
+        assert_eq!(
+            published_promote_floor(shipped_policy(), Some(400)),
+            Some(425),
+            "an allocated reserve wins over the configured one, exactly as eviction_target resolves it"
+        );
+    }
+
+    #[test]
+    fn an_evictor_that_forms_no_band_publishes_nothing_and_leaves_the_api_on_its_static_floor() {
+        // A zero reserve is the operator's eviction kill-switch, and a zero headroom leaves an
+        // empty band. In both cases there is no live control loop for a floor to sit inside, so
+        // publishing a derived number would hand the api a threshold nothing can restore.
+        // Publishing NOTHING lets the key lapse, which the api reads as "signal unavailable".
+        assert_eq!(
+            published_promote_floor(
+                EvictionPolicy {
+                    reserve_permille: 0,
+                    ..shipped_policy()
+                },
+                None
+            ),
+            None,
+            "eviction disabled: nothing frees the disk, so no floor is honest"
+        );
+        assert_eq!(
+            published_promote_floor(
+                EvictionPolicy {
+                    headroom_permille: 0,
+                    ..shipped_policy()
+                },
+                None
+            ),
+            None,
+            "a zero headroom leaves no room between the reserve and the target"
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_published_floor_is_always_strictly_inside_the_band_it_was_derived_from(
+            reserve in 1_u16..=1_000,
+            headroom in 0_u16..=1_000,
+            allocated in proptest::option::of(1_u16..=1_000),
+        ) {
+            let policy = EvictionPolicy { reserve_permille: reserve, headroom_permille: headroom, ..shipped_policy() };
+            if let Some(floor) = published_promote_floor(policy, allocated) {
+                let resolved = allocated.unwrap_or(reserve);
+                proptest::prop_assert!(
+                    resolved < floor && floor < resolved + headroom,
+                    "floor {floor} escaped the band ({resolved}, {})",
+                    resolved + headroom
+                );
+            }
+        }
     }
 
     #[test]
@@ -1974,6 +2184,7 @@ mod tests {
                 batch: 512,
                 max_pass: Duration::from_secs(10),
             },
+            None,
         )
         .await;
 
@@ -2021,6 +2232,7 @@ mod tests {
                 batch: 512,
                 max_pass: Duration::from_secs(10),
             },
+            None,
         )
         .await;
 

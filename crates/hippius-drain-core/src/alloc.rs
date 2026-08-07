@@ -156,6 +156,14 @@ pub struct Allocation {
     /// not draining: it sees the fleet-wide Ceph ceiling and this node's budget against its
     /// demand. The evictor alone can only react once free space has already fallen, which on
     /// a stalled drain is too late to avoid 503s.
+    ///
+    /// **This value steers a threshold in another language.** The agent derives the api's
+    /// read-through promote floor from whatever reserve is in force
+    /// (`hippius-drain-agent`'s `published_promote_floor`) and publishes it on the queues Redis
+    /// for `hippius_s3/promote_floor.py` to consume, so raising this reserve also raises the
+    /// free-space level at which the api stops warming that node's cache — by design, since
+    /// this reserve rises precisely when the drain is in trouble. Widening the range this can
+    /// take is therefore a change to the api's read path too, not only to eviction.
     pub reserve_permille: u16,
 }
 
