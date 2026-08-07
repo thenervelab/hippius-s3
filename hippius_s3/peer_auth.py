@@ -26,6 +26,10 @@ def peer_auth_matches(presented: str | None, expected: str) -> bool:
     # here as a non-ASCII str and raises TypeError — surfacing as a 500 that confirms this route is
     # mounted, which is the existence oracle the endpoint's 404 exists to deny.
     #
-    # errors="replace" cannot raise and cannot manufacture a match: the configured secret is hex,
-    # so it contains no "?" for a replacement character to collide with.
+    # errors="replace" cannot raise, and it cannot manufacture a match either. Not because of
+    # anything about the secret's alphabet — nothing constrains it — but because the replace
+    # path is unreachable from a header at all: latin-1 maps bytes 0x00-0xFF to U+0000-U+00FF
+    # and back exactly, so anything decoded from the wire re-encodes to the identical bytes.
+    # It is here so this function's "never raises" contract also holds for a caller that hands
+    # it a str from somewhere other than a request header.
     return hmac.compare_digest(presented.encode("latin-1", errors="replace"), expected.encode("utf-8"))

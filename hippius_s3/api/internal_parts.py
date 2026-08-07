@@ -51,9 +51,9 @@ router = APIRouter()
 @router.get("/internal/parts/{object_id}/{object_version}/{part_number}/chunks/{chunk_index}")
 async def get_local_chunk(
     object_id: str,
-    object_version: int,
-    part_number: int,
-    chunk_index: int,
+    object_version: str,
+    part_number: str,
+    chunk_index: str,
     request: Request,
 ) -> Response:
     """One chunk from this node's local tier, or 404.
@@ -66,10 +66,22 @@ async def get_local_chunk(
     exists and that they named a real (object, version, part). That existence oracle is most
     of what this endpoint was worth to an attacker, so the refusal must be indistinguishable
     from a miss, and it runs before any filesystem work so the timing cannot separate them
-    either.
+    either. 404 is therefore the ONLY status this route emits short of a hit: any other one
+    answers "is this route mounted here", which is what an unmounted route denies.
     """
     expected = getattr(request.app.state, "peer_auth_secret", "")
     if not peer_auth_matches(request.headers.get(PEER_AUTH_HEADER), expected):
+        return Response(status_code=404)
+
+    # Taken as strings and parsed HERE rather than declared as `int` path params, because
+    # FastAPI validates those before the handler body runs — so a non-numeric segment answered
+    # 422 to a caller who had presented no secret at all, advertising the route just as plainly
+    # as the non-ASCII-header 500 did. Parsing after the auth check keeps every refusal a 404.
+    try:
+        version = int(object_version)
+        part = int(part_number)
+        index = int(chunk_index)
+    except ValueError:
         return Response(status_code=404)
 
     fs_store = getattr(request.app.state, "fs_store", None)
@@ -98,17 +110,17 @@ async def get_local_chunk(
 
     try:
         if limiter is None:
-            data = await local(object_id, object_version, part_number, chunk_index)
+            data = await local(object_id, version, part, index)
         else:
             async with limiter:
-                data = await local(object_id, object_version, part_number, chunk_index)
+                data = await local(object_id, version, part, index)
     except (OSError, ValueError) as exc:
         logger.debug(
             "local chunk read failed for %s v%s part %s chunk %s: %s",
             object_id,
-            object_version,
-            part_number,
-            chunk_index,
+            version,
+            part,
+            index,
             exc,
         )
         return Response(status_code=404)

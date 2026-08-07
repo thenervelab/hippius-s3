@@ -49,6 +49,45 @@ async def _client(app: FastAPI) -> AsyncClient:
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://peer")
 
 
+async def _raw_get(app: FastAPI, path: bytes, *, auth: bytes | None = None) -> int | str:
+    """Drive the ASGI app directly, so the request can carry bytes a client would not send.
+
+    httpx ASCII-encodes header values and would raise before sending, so the whole class of
+    "what does an adversarial byte do to the auth comparison" is unreachable through
+    `_client`. A test written with the client passes vacuously. Returns the status, or a
+    description of whatever escaped the app — an unhandled exception IS the failure here.
+    """
+    headers = [(b"host", b"peer")]
+    if auth is not None:
+        headers.append((PEER_AUTH_HEADER.lower().encode(), auth))
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "http_version": "1.1",
+        "path": path.decode("utf-8", "surrogateescape"),
+        "raw_path": path,
+        "root_path": "",
+        "scheme": "http",
+        "query_string": b"",
+        "headers": headers,
+        "client": ("10.42.1.5", 1234),
+        "server": ("10.42.2.9", 8000),
+    }
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    try:
+        await app(scope, receive, send)
+    except Exception as exc:  # noqa: BLE001 - an escaping exception is the thing under test
+        return f"unhandled {type(exc).__name__}: {exc}"
+    return int(sent[0]["status"])
+
+
 async def _write_part(store: object, *, part_number: int, chunk: bytes) -> None:
     await store.set_chunk(OBJ, 1, part_number, 0, chunk)  # type: ignore[attr-defined]
     await store.set_meta(OBJ, 1, part_number, chunk_size=len(chunk), num_chunks=1, size_bytes=len(chunk))  # type: ignore[attr-defined]
@@ -229,6 +268,14 @@ async def test_an_unset_secret_refuses_everyone_rather_than_disabling_the_check(
     assert [r.status_code for r in (no_header, empty_header, any_header)] == [404, 404, 404]
 
 
+# ------------------------------------------------- every refusal is the same 404, or it is an oracle
+#
+# The 404 is chosen over a 403 so a caller cannot tell "wrong secret" from "no such chunk". Any
+# OTHER status this route can be made to emit before it authenticates undoes that: it does not
+# leak which objects exist, but it does confirm the route is mounted, which is the first thing
+# an attacker needs and the thing an unmounted route denies.
+
+
 @pytest.mark.asyncio
 async def test_a_non_ascii_secret_is_refused_as_a_miss_not_a_server_error(tmp_path) -> None:
     """A refusal must stay indistinguishable from a miss even for bytes no client should send.
@@ -246,34 +293,62 @@ async def test_a_non_ascii_secret_is_refused_as_a_miss_not_a_server_error(tmp_pa
     store = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))
     await _write_part(store, part_number=1, chunk=b"local-bytes")
     app = _app_with_secret(store, SECRET)
+    path = f"/internal/parts/{OBJ}/1/1/chunks/0".encode()
 
-    path = f"/internal/parts/{OBJ}/1/1/chunks/0"
-    statuses: list[int] = []
+    assert await _raw_get(app, path, auth=b"\xff" * 8) == 404
+    # The whole latin-1 range, not just one byte, and a UTF-8 multi-byte sequence.
+    assert await _raw_get(app, path, auth=bytes(range(128, 256))) == 404
+    assert await _raw_get(app, path, auth="sécret".encode()) == 404
+    # A correct secret still works, so the encoding fix did not break the comparison itself.
+    assert await _raw_get(app, path, auth=SECRET.encode()) == 200
 
-    async def receive() -> dict:
-        return {"type": "http.request", "body": b"", "more_body": False}
 
-    async def send(message: dict) -> None:
-        if message["type"] == "http.response.start":
-            statuses.append(message["status"])
+@pytest.mark.asyncio
+async def test_a_malformed_path_is_refused_as_a_miss_not_a_validation_error(tmp_path) -> None:
+    """Unparseable path segments must 404 like everything else, not 422.
 
-    await app(
-        {
-            "type": "http",
-            "asgi": {"version": "3.0"},
-            "http_version": "1.1",
-            "method": "GET",
-            "path": path,
-            "raw_path": path.encode(),
-            "query_string": b"",
-            "root_path": "",
-            "scheme": "http",
-            "client": ("10.0.0.5", 1234),
-            "server": ("api", 8000),
-            "headers": [(b"host", b"peer"), (PEER_AUTH_HEADER.lower().encode(), b"\xff" * 8)],
-        },
-        receive,
-        send,
-    )
+    FastAPI validates `int` path params BEFORE the handler body, so declaring them as ints put
+    a 422 in front of the auth check — announcing the route to an unauthenticated caller
+    exactly as loudly as the 500 did. The segments are therefore taken as strings and parsed
+    after authenticating.
+    """
+    store = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))
+    await _write_part(store, part_number=1, chunk=b"local-bytes")
+    app = _app_with_secret(store, SECRET)
 
-    assert statuses == [404], "a non-ASCII secret must read as a miss, not a 500 that confirms the route"
+    for path in (
+        f"/internal/parts/{OBJ}/1/1/chunks/abc".encode(),
+        f"/internal/parts/{OBJ}/1/zz/chunks/0".encode(),
+        f"/internal/parts/{OBJ}/x/1/chunks/0".encode(),
+        b"/internal/parts/\xff\xff/1/1/chunks/0",
+    ):
+        assert await _raw_get(app, path, auth=b"wrong-secret") == 404, path
+        # Authenticating does not make a malformed path any more parseable.
+        assert await _raw_get(app, path, auth=SECRET.encode()) == 404, path
+
+
+@pytest.mark.asyncio
+async def test_each_segment_addresses_the_part_it_names(tmp_path) -> None:
+    """Taking the segments as strings must not stop them addressing the right chunk.
+
+    Part 1 and part 2 hold different bytes, so this catches a handler that mixed up or
+    hardcoded a segment — every other case in this file reads part 1 and would not notice.
+
+    It does NOT pin the `int()` parse itself, and cannot: `FileSystemPartsStore` coerces its
+    own arguments (`f"part_{int(part_number)}"`), so passing the raw strings through behaves
+    identically. Verified by mutation — dropping the parse keeps this green. The parse earns
+    its place by moving the failure to a 404 instead of FastAPI's 422, which is pinned by
+    test_a_malformed_path_is_refused_as_a_miss_not_a_validation_error.
+    """
+    store = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))
+    await _write_part(store, part_number=1, chunk=b"part-one")
+    await _write_part(store, part_number=2, chunk=b"part-two")
+    app = _app_with_secret(store, SECRET)
+
+    async with await _client(app) as client:
+        first = await client.get(f"/internal/parts/{OBJ}/1/1/chunks/0", headers=AUTH)
+        second = await client.get(f"/internal/parts/{OBJ}/1/2/chunks/0", headers=AUTH)
+
+    assert (first.content, second.content) == (b"part-one", b"part-two")
+
+
