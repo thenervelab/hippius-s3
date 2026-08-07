@@ -383,6 +383,7 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
                     deficit = target.deficit(),
                     evicted = report.evicted,
                     remove_failed = report.remove_failed,
+                    remove_failed_kind = ?report.remove_failed_kind,
                     "eviction ran out of resident parts before restoring the free-space floor"
                 );
             }
@@ -393,6 +394,7 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
             if report.remove_failed > 0 && !report.starved {
                 tracing::warn!(
                     remove_failed = report.remove_failed,
+                    remove_failed_kind = ?report.remove_failed_kind,
                     evicted = report.evicted,
                     "eviction skipped parts whose unlink failed; the free-space floor was still restored"
                 );
