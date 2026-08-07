@@ -189,7 +189,12 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         # optimisation — a cold cache costs latency, a full disk costs writes. The gate fires
         # above the drain evictor's floor, so promotion backs off before eviction is even
         # armed rather than racing it.
-        if self._space_gate is not None and not self._space_gate.allows():
+        # BOTH halves of this line matter and they came from different branches. `await` is
+        # load-bearing: `allows()` became async when the floor started coming from the agent's
+        # published band, and `not <coroutine>` is always False — dropping it does not fail, it
+        # silently stops the gate from ever blocking and lets promotion write unthrottled to a
+        # disk ingest is about to be refused on. The reason label is what makes a skip legible.
+        if self._space_gate is not None and not await self._space_gate.allows():
             _record_promotion_skipped("disk_pressure")
             return
 

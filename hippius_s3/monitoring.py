@@ -53,6 +53,10 @@ PeerShedReason = Literal[
 # of the copy did not land, so the copy is not made.
 PromotionSkipReason = Literal["disk_pressure", "residency_failed"]
 
+# Which way the drain agent's published promote floor differs from this process's configured
+# one. Closed by construction, like the labels above.
+PromoteFloorDivergence = Literal["stricter", "looser"]
+
 # Outcome of a read-recency stamp. Closed by construction. `failed` is separate rather than
 # uncounted because the write is best-effort and swallowed: without it, a recency path that is
 # erroring on every read is indistinguishable from one that is being fully absorbed by the
@@ -174,6 +178,16 @@ class MetricsCollector:
         self.promotion_skipped = self.meter.create_counter(
             name="promotion_skipped_total",
             description="Chunks not promoted to the local read tier, by reason (disk_pressure|residency_failed)",
+            unit="1",
+        )
+
+        # Gate decisions taken on the drain agent's published floor rather than the configured
+        # one. `stricter` rising means the allocator has raised this node's eviction reserve —
+        # the read tier is deliberately backing off a stressed disk, and that must be visible
+        # rather than looking like promotion silently stopped working.
+        self.promote_floor_divergence = self.meter.create_counter(
+            name="promote_floor_divergence_total",
+            description="Promotion gate decisions using a published floor that differs from the configured one (stricter|looser)",
             unit="1",
         )
 
@@ -593,6 +607,10 @@ class MetricsCollector:
         """Count a chunk served without being promoted. `reason` is a Literal, so bounded."""
         self.promotion_skipped.add(1, attributes={"reason": reason})
 
+    def record_promote_floor_divergence(self, direction: PromoteFloorDivergence) -> None:
+        """Count a gate decision on a published floor unequal to the configured one."""
+        self.promote_floor_divergence.add(1, attributes={"direction": direction})
+
     def record_read_recency_write(self, outcome: ReadRecencyOutcome) -> None:
         """Count one `last_read_at` stamp attempt. `outcome` is a Literal, so bounded."""
         self.read_recency_writes.add(1, attributes={"outcome": outcome})
@@ -873,6 +891,9 @@ class NullMetricsCollector:
         pass
 
     def record_promotion_skipped(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_promote_floor_divergence(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_read_recency_write(self, *args: object, **kwargs: object) -> None:
