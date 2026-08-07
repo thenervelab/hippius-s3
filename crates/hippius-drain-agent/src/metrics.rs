@@ -135,6 +135,27 @@ fn register_ssd_tier_instruments(meter: &opentelemetry::metrics::Meter, snapshot
             .build(),
     ));
 
+    // Whether this node's ingest disk is shared with a writer the drain cannot account for (1)
+    // or is its own (0). The precondition for reading ANY of the three gauges above as a
+    // statement about the drain: on a shared mount the eviction reserve, the promote floor and
+    // the api's fs_cache_pressure 503 are all responding to a co-tenant's bytes. Staging's
+    // /dev/md3 is exactly that, which is what made the free-space work unvalidatable there.
+    //
+    // Observed only once measured: a node that has never completed the check publishes NO data
+    // point rather than a `0`, because a `0` here is a verified clean bill of health and an
+    // absent series is an open question. Alert on `== 1`, and on the series' absence separately.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_ssd_shared_filesystem")
+            .with_callback(move |observer| {
+                if let Some(shared) = snap.shared_filesystem() {
+                    observer.observe(u64::from(shared), &[]);
+                }
+            })
+            .build(),
+    ));
+
     // Free space: the third leg of backlog/cache/free. Without it a dashboard cannot separate
     // "the read cache grew" from "the disk is filling with backlog".
     let snap = Arc::clone(snapshot);

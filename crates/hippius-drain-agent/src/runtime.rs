@@ -240,19 +240,36 @@ async fn run_drain<E: UploadEnqueuer>(token: CancellationToken, period: Duration
 /// contributes zero: a wedged node's byte-backlog can read 0 while undrained rows remain, which
 /// readiness would misread as idle. On a query error, KEEP the last-recorded value rather than
 /// zeroing it (a transient blip must not read as "drained"); the next tick refreshes it.
-async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotCell) {
-    match store.node_backlog_bytes(node.as_str()).await {
-        Ok(bytes) => snapshot.record_backlog(bytes),
-        Err(err) => tracing::warn!(error = %err, "backlog query failed; keeping the last value"),
-    }
+///
+/// Returns the bytes this node accounts for on its ingest disk THIS tick — its undrained backlog
+/// plus its evictable read cache, which are disjoint by construction (backlog is
+/// `pending`/`draining`, cache is `replicated`) — or `None` if either read failed, so a blind
+/// tick cannot be mistaken for a small honest total by [`check_shared_disk`].
+async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotCell) -> Option<u64> {
+    let backlog = match store.node_backlog_bytes(node.as_str()).await {
+        Ok(bytes) => {
+            snapshot.record_backlog(bytes);
+            Some(bytes)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "backlog query failed; keeping the last value");
+            None
+        }
+    };
     // NOTE: the heartbeat reads the retained backlog back off the snapshot rather than
     // taking it from the `Ok` arm here, so a failed query reuses the last good value
     // instead of reporting a zero backlog — which the allocator would read as "idle" and
     // strip of demand, stalling the very node whose DB read is struggling.
-    match store.node_cache_bytes(node.as_str()).await {
-        Ok(bytes) => snapshot.record_cache_bytes(bytes),
-        Err(err) => tracing::warn!(error = %err, "cache-bytes query failed; keeping the last value"),
-    }
+    let cache = match store.node_cache_bytes(node.as_str()).await {
+        Ok(bytes) => {
+            snapshot.record_cache_bytes(bytes);
+            Some(bytes)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "cache-bytes query failed; keeping the last value");
+            None
+        }
+    };
     match store.node_undrained_count(node.as_str()).await {
         Ok(count) => snapshot.record_undrained_count(count),
         Err(err) => tracing::warn!(error = %err, "undrained-count query failed; keeping the last value"),
@@ -265,6 +282,65 @@ async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotC
         Ok(secs) => snapshot.record_oldest_pending_age_secs(secs),
         Err(err) => tracing::warn!(error = %err, "oldest-pending-age query failed; keeping the last value"),
     }
+    backlog.zip(cache).map(|(backlog, cache)| backlog.saturating_add(cache))
+}
+
+/// The share of the ingest disk's USED bytes the agent must be able to account for before the
+/// disk reads as its own. Deliberately lax — a co-tenant has to be dominating the disk, not
+/// merely present, because prod may legitimately host small ones and the point of this check is
+/// to catch the case where the free-space gates are measuring somebody else's writes.
+const ACCOUNTED_SHARE_MIN_PERMILLE: u64 = 500;
+
+/// How much of the disk must be in use before the comparison means anything, in permille. A
+/// fresh node's cache is cold, so its accounted bytes are a rounding error next to a fixed
+/// filesystem footprint: without this floor every new node flags on its first heartbeats and the
+/// alert is trained away long before it catches a real co-tenant.
+const JUDGEABLE_USED_MIN_PERMILLE: u64 = 10;
+
+/// The two measurements behind a shared-disk report, carried back so the caller's log names both:
+/// "the gap is this wide" is actionable in a way "there is a gap" is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedDiskReport {
+    /// Bytes the agent can account for: its evictable read cache plus its undrained backlog.
+    accounted_bytes: u64,
+    /// Bytes in use on the mount, from `statvfs`.
+    used_bytes: u64,
+}
+
+/// Compares what the agent accounts for against what the disk says is used, records the verdict
+/// on `snapshot`, and returns the measurements when this tick is the TRANSITION into "shared".
+///
+/// Every free-space gate in this system — the evictor's reserve, the promote floor the api reads,
+/// its `fs_cache_pressure` 503 — treats free space as a function of what this agent stores. On a
+/// disk it does not own, all three are measuring a co-tenant's writes and nothing says so. This
+/// does not refuse to run on such a node (prod may legitimately have small co-tenants, and a
+/// guard that turns a measurement into an outage is worse than the blind spot it closes); it
+/// makes the condition alertable.
+///
+/// Returns `None` — leaving the last verdict standing — whenever the comparison cannot be made:
+/// a failed accounting read (`accounted` is `None`) or a disk too empty to judge. A guard that
+/// cannot measure must not issue a clean bill of health, so an unmeasurable tick neither reports
+/// nor clears.
+fn check_shared_disk(snapshot: &SnapshotCell, accounted: Option<u64>, usage: DiskUsage) -> Option<SharedDiskReport> {
+    let accounted_bytes = accounted?;
+    // Saturating: some filesystems report more available blocks than total (reserved blocks),
+    // and an underflow here would invent a multi-exabyte "used" that flags every node.
+    let used_bytes = usage.total_bytes.saturating_sub(usage.free_bytes);
+    // Multiply rather than divide on both comparisons: no rounding, and no divide-by-zero to
+    // special-case. The explicit zero is not redundant with the floor — it is the degenerate
+    // mount `used_fraction` already handles, where total is 0 too and every ratio comparison
+    // reads false, so without it a disk that measured as nothing would record as verified-clean.
+    if used_bytes == 0 || u128::from(used_bytes) * 1_000 < u128::from(usage.total_bytes) * u128::from(JUDGEABLE_USED_MIN_PERMILLE) {
+        return None;
+    }
+    let shared = u128::from(accounted_bytes) * 1_000 < u128::from(used_bytes) * u128::from(ACCOUNTED_SHARE_MIN_PERMILLE);
+    // Read before write: the report is the TRANSITION, not the state. The heartbeat ticks every
+    // 10s, so reporting the state would be 8,640 ERRORs a day per node — the gauge is what
+    // carries a standing condition. Clearing is not latched either: a live measurement that
+    // cannot go back to clean is one an operator can never use to confirm a fix.
+    let newly_shared = shared && snapshot.shared_filesystem() != Some(true);
+    snapshot.record_shared_filesystem(shared);
+    newly_shared.then_some(SharedDiskReport { accounted_bytes, used_bytes })
 }
 
 /// How aggressively this node keeps free space on its ingest SSD.
@@ -466,7 +542,19 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node
     snapshot.record_disk_pressure(usage.pressure.bps());
     snapshot.record_free_bytes(usage.free_bytes);
 
-    record_drain_signals(store, node, snapshot).await;
+    let accounted = record_drain_signals(store, node, snapshot).await;
+    // Both inputs are already in hand on this tick — the statvfs probe above and the accounting
+    // reads just made — so the shared-disk check costs nothing beyond the comparison, and it
+    // re-runs every heartbeat rather than once at startup: a co-tenant can arrive at any time,
+    // and a boot-time answer would be stale for the life of the pod.
+    if let Some(report) = check_shared_disk(snapshot, accounted, usage) {
+        tracing::error!(
+            accounted_bytes = report.accounted_bytes,
+            used_bytes = report.used_bytes,
+            total_bytes = usage.total_bytes,
+            "ingest disk holds far more than this agent accounts for — every free-space gate (eviction reserve, promote floor, fs_cache_pressure) is measuring a writer the drain cannot see"
+        );
+    }
 
     let observation = node_observation(usage, snapshot, max_drain_rate);
     if let Err(err) = coord.upsert_node_state(node, &observation).await {
@@ -1144,8 +1232,8 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
     use super::{
-        AgentRuntime, DiskUsage, EvictionPolicy, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, eviction_target,
-        node_observation, pull_action, record_drain_signals,
+        AgentRuntime, DiskUsage, EvictionPolicy, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, SharedDiskReport, check_shared_disk,
+        default_enforcer, eviction_target, node_observation, pull_action, record_drain_signals,
     };
     use crate::localfs::{LocalFs, LocalSsd};
     use crate::supervisor::ShutdownTrigger;
@@ -1348,6 +1436,138 @@ mod tests {
         };
 
         assert_eq!(eviction_target(usage, policy, None).deficit(), 0, "a zero reserve never arms");
+    }
+
+    /// A probed disk for the shared-filesystem tests. `pressure` is fixed because the check
+    /// reads `total_bytes`/`free_bytes` directly — it must not depend on a derived fraction.
+    fn disk(total_bytes: u64, free_bytes: u64) -> DiskUsage {
+        DiskUsage {
+            pressure: DiskPressure::try_from(5_000).unwrap(),
+            free_bytes,
+            total_bytes,
+        }
+    }
+
+    #[test]
+    fn a_disk_mostly_used_by_a_writer_the_agent_cannot_account_for_reads_as_shared() {
+        // B-5: the evictor's reserve, the api's promote floor and its fs_cache_pressure 503 all
+        // read free space as if this agent's cache were what fills the disk. On staging's shared
+        // /dev/md3 that is false, and nothing said so — which makes every free-space gate in the
+        // workstream unvalidatable on the environment validating it.
+        let snapshot = SnapshotCell::new();
+
+        let report = check_shared_disk(&snapshot, Some(100 * GIB), disk(4000 * GIB, 3000 * GIB));
+
+        assert_eq!(
+            report,
+            Some(SharedDiskReport {
+                accounted_bytes: 100 * GIB,
+                used_bytes: 1000 * GIB,
+            }),
+            "both numbers ride along so the operator sees the size of the gap, not just its existence"
+        );
+        assert_eq!(snapshot.shared_filesystem(), Some(true), "and the gauge carries it as a standing signal");
+    }
+
+    #[test]
+    fn a_disk_the_agent_accounts_for_reads_as_owned() {
+        // The prod shape: a dedicated ingest NVMe whose used bytes are this agent's parts, give
+        // or take filesystem overhead and debris. Nothing to report.
+        let snapshot = SnapshotCell::new();
+
+        let report = check_shared_disk(&snapshot, Some(900 * GIB), disk(4000 * GIB, 3000 * GIB));
+
+        assert_eq!(report, None, "90% accounted is the agent's own disk");
+        assert_eq!(snapshot.shared_filesystem(), Some(false));
+    }
+
+    #[test]
+    fn an_unreadable_accounting_moves_the_verdict_in_neither_direction() {
+        // A transient PG blip is the only source of a `None` accounting, and it must not be read
+        // as "zero bytes accounted for": that would manufacture a shared-disk alarm out of a
+        // measurement never taken. Nor may it clear a standing one. Both directions are asserted
+        // because only one of them is the obvious failure.
+        let snapshot = SnapshotCell::new();
+        let probe = disk(4000 * GIB, 3000 * GIB);
+
+        check_shared_disk(&snapshot, Some(900 * GIB), probe);
+        assert_eq!(check_shared_disk(&snapshot, None, probe), None, "a blind tick reports nothing");
+        assert_eq!(snapshot.shared_filesystem(), Some(false), "an unread accounting is not a zero accounting");
+
+        check_shared_disk(&snapshot, Some(100 * GIB), probe);
+        assert_eq!(check_shared_disk(&snapshot, None, probe), None);
+        assert_eq!(snapshot.shared_filesystem(), Some(true), "and it does not clear a live alarm either");
+    }
+
+    #[test]
+    fn an_unreadable_accounting_on_a_never_measured_node_stays_unmeasured() {
+        // The same rule from the other side: with no prior verdict, a blind tick must leave the
+        // gauge UNPUBLISHED rather than recording a false `false`.
+        let snapshot = SnapshotCell::new();
+
+        assert_eq!(check_shared_disk(&snapshot, None, disk(4000 * GIB, 3000 * GIB)), None);
+        assert_eq!(snapshot.shared_filesystem(), None, "never measured is not the same as clean");
+    }
+
+    #[test]
+    fn an_empty_or_barely_used_disk_is_not_judged() {
+        // A fresh node's cache is cold, so its accounted bytes are a rounding error next to a
+        // fixed filesystem footprint — every new node would flag on its first heartbeats and the
+        // alert would be trained away before it ever caught a real co-tenant. Under 1% of the
+        // disk there is nothing to judge, and an entirely empty one divides by nothing.
+        let snapshot = SnapshotCell::new();
+
+        assert_eq!(check_shared_disk(&snapshot, Some(0), disk(4000 * GIB, 4000 * GIB)), None, "0 used bytes");
+        assert_eq!(
+            check_shared_disk(&snapshot, Some(0), disk(4000 * GIB, 3999 * GIB)),
+            None,
+            "1 GiB used of 4000 GiB is below the judgement floor"
+        );
+        assert_eq!(snapshot.shared_filesystem(), None, "an unjudged disk publishes no verdict either way");
+    }
+
+    #[test]
+    fn a_mount_that_measures_as_nothing_is_not_judged_clean() {
+        // The degenerate zero-block mount `used_fraction` already treats as full. Every ratio
+        // comparison against it reads false, so it would otherwise sail through as "the agent
+        // accounts for all of it" — a verified-clean verdict derived from no measurement at all.
+        let snapshot = SnapshotCell::new();
+
+        assert_eq!(check_shared_disk(&snapshot, Some(0), disk(0, 0)), None);
+        assert_eq!(snapshot.shared_filesystem(), None);
+    }
+
+    #[test]
+    fn a_mount_reporting_more_free_than_total_is_not_judged() {
+        // Reserved blocks make some filesystems report `available` above the total the same
+        // statvfs call returns. Saturating the subtraction keeps that a non-judgement rather
+        // than an underflow into a multi-exabyte "used".
+        let snapshot = SnapshotCell::new();
+
+        assert_eq!(check_shared_disk(&snapshot, Some(GIB), disk(100 * GIB, 200 * GIB)), None);
+        assert_eq!(snapshot.shared_filesystem(), None);
+    }
+
+    #[test]
+    fn a_standing_shared_disk_is_reported_once_per_transition_not_once_per_tick() {
+        // The heartbeat ticks every 10s; an ERROR per tick is 8,640 lines a day per node, which
+        // is how a real signal becomes noise. The gauge is the standing signal — the log marks
+        // the edges, so a co-tenant arriving, leaving, and returning is all still visible.
+        let snapshot = SnapshotCell::new();
+        let shared = disk(4000 * GIB, 3000 * GIB);
+
+        assert!(check_shared_disk(&snapshot, Some(100 * GIB), shared).is_some(), "first sighting reports");
+        assert_eq!(
+            check_shared_disk(&snapshot, Some(100 * GIB), shared),
+            None,
+            "the same condition does not re-report"
+        );
+        assert_eq!(check_shared_disk(&snapshot, Some(900 * GIB), shared), None, "clearing is not an ERROR");
+        assert_eq!(snapshot.shared_filesystem(), Some(false));
+        assert!(
+            check_shared_disk(&snapshot, Some(100 * GIB), shared).is_some(),
+            "but a return is reported again"
+        );
     }
 
     #[test]

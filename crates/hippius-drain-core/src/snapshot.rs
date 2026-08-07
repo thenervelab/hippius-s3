@@ -276,6 +276,14 @@ pub struct SnapshotCell {
     /// a leak can fill the disk without any drain demand. bps not f64 so the gauge stays a
     /// plain atomic; the metrics layer scales it to a 0..1 fraction.
     disk_pressure_bps: AtomicU64,
+    /// Whether the ingest SSD looks like it is shared with a writer the agent cannot see, plus
+    /// one so that 0 can mean "not measured yet" — the same encoding, and for the same reason,
+    /// as `allocated_reserve_permille_plus_one`. Every free-space gate in the system (the
+    /// evictor's reserve, the api's promote floor, its `fs_cache_pressure` 503) assumes the
+    /// bytes this agent accounts for are most of what is on the disk; a bare 0 would report
+    /// that assumption as VERIFIED on a node that has never managed to check it, which is the
+    /// blind spot this flag exists to close.
+    shared_filesystem_plus_one: AtomicU64,
     /// Count of parts currently held `corrupt` on this node — a LEVEL, set each cycle by the
     /// re-drive pass from `Store::count_corrupt_parts`. A nonzero value is a live object whose
     /// pool copy is corrupt, kept alive only by its SSD source: a durability incident (R4), so
@@ -509,6 +517,24 @@ impl SnapshotCell {
         u16::try_from(self.disk_pressure_bps.load(Ordering::Relaxed).min(10_000)).unwrap_or(10_000)
     }
 
+    /// Records whether the ingest SSD appears to be shared with a writer this agent cannot
+    /// account for. A gauge: `store`, not add — and only ever written from a tick that actually
+    /// MEASURED both sides, so a tick that could not measure leaves the last verdict standing.
+    pub fn record_shared_filesystem(&self, shared: bool) {
+        self.shared_filesystem_plus_one.store(u64::from(shared) + 1, Ordering::Relaxed);
+    }
+
+    /// The last shared-disk verdict, or `None` if the check has not run successfully yet
+    /// (the `drain_ssd_shared_filesystem` gauge source). `None` is deliberately NOT `Some(false)`:
+    /// an unmeasured disk is an open question, not a clean one.
+    #[must_use]
+    pub fn shared_filesystem(&self) -> Option<bool> {
+        match self.shared_filesystem_plus_one.load(Ordering::Relaxed) {
+            0 => None,
+            raw => Some(raw > 1),
+        }
+    }
+
     /// Records the current count of parts held `corrupt` on this node. A gauge: `store`, not
     /// add. The re-drive pass writes it each cycle from `Store::count_corrupt_parts`.
     pub fn record_corrupt(&self, count: u64) {
@@ -641,6 +667,24 @@ mod tests {
             cell.corrupt_parts(),
             1,
             "corrupt parts is a level: a later record replaces, not accumulates"
+        );
+    }
+
+    #[test]
+    fn the_shared_filesystem_verdict_distinguishes_unmeasured_from_clean() {
+        // B-5: every free-space gate in the workstream assumes the agent's accounted bytes are
+        // most of what is on the disk. A two-state flag would report an agent that has never
+        // checked as "verified clean" — the exact blind spot — so the unmeasured state is a
+        // third value the metrics layer declines to publish at all.
+        let cell = SnapshotCell::new();
+        assert_eq!(cell.shared_filesystem(), None, "a fresh cell has not measured the disk");
+        cell.record_shared_filesystem(true);
+        assert_eq!(cell.shared_filesystem(), Some(true));
+        cell.record_shared_filesystem(false);
+        assert_eq!(
+            cell.shared_filesystem(),
+            Some(false),
+            "a co-tenant leaving clears the verdict: this is a live measurement, not an incident latch"
         );
     }
 
