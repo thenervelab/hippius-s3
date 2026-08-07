@@ -300,13 +300,19 @@ where
         // which at prod's 14 GB maximum part size is a lot of cache given away for nothing.
         let mut projected = target.free;
         for candidate in candidates {
-            if projected >= goal {
-                break;
-            }
-            // Defense in depth against worklist drift — see the module doc. Skipped, never
-            // deleted, however badly the pass needs the space.
+            // Defense in depth against worklist drift — see the module doc. Checked FIRST, and
+            // for every candidate on the page even after the goal is met: this is the durability
+            // invariant's detector, the page is already materialised in memory, and the check is
+            // pure comparison. Ordering it after the goal test made the counter sample only the
+            // prefix of a page the pass happened to need, so a worklist that had drifted could
+            // go unreported precisely when eviction was cheap.
             if candidate.state != ReplicationState::Replicated {
                 report.skipped_unreplicated += 1;
+                continue;
+            }
+            // Enough space already: keep scanning the page for invariant violations, but stop
+            // evicting. `continue`, not `break`, for the reason above.
+            if projected >= goal {
                 continue;
             }
             projected = projected.saturating_add(candidate.bytes);
@@ -761,6 +767,42 @@ mod tests {
 
         assert_eq!(report.evicted, 4, "4 GiB deficit closed from accounted bytes alone");
         assert!(!report.starved);
+    }
+
+    #[tokio::test]
+    async fn the_invariant_counter_sees_the_whole_page_even_after_the_goal_is_met() {
+        // `skipped_unreplicated` is the detector for worklist drift, and drift is a data-loss
+        // class bug: a query that starts offering pending/draining parts is offering the only
+        // durable copy of something. Counting only the prefix the pass happened to need meant a
+        // drifted worklist went UNREPORTED exactly when eviction was cheap — the case where the
+        // goal is met in the first couple of parts.
+        //
+        // The page is already in memory and the check is a comparison, so scanning all of it
+        // costs nothing. One part covers the whole deficit; the violations behind it must still
+        // be counted, and still must not be unlinked.
+        let mut pending = resident(9, 0);
+        pending.state = ReplicationState::Pending;
+        let mut corrupt = resident(10, 0);
+        corrupt.state = ReplicationState::Corrupt;
+        let log = FakeLog::of(&[resident(1, 100 * GIB), pending, corrupt]);
+        let remover = FakeRemover::default();
+        let probe = FakeProbe::new(300 * GIB, GIB);
+        let counting = CountingProbe {
+            probe: &probe,
+            remover: &remover,
+        };
+        let clock = TestClock::new();
+        let target = EvictionTarget {
+            free: 300 * GIB,
+            reserve: 301 * GIB,
+            headroom: GIB,
+        };
+
+        let report = evict_to_target(&log, &remover, &counting, &clock, target, pass(8)).await.unwrap();
+
+        assert_eq!(report.evicted, 1, "one part covered the deficit");
+        assert_eq!(report.skipped_unreplicated, 2, "both violations behind the goal were still detected");
+        assert_eq!(remover.removed(), vec![key(&part_at(1, 1))], "and neither was unlinked");
     }
 
     #[tokio::test]

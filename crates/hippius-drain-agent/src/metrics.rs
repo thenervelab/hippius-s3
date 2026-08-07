@@ -7,7 +7,9 @@
 //! [`SnapshotCell`] / [`Enforcer`], so a metric scrape never measures anything itself.
 
 use hippius_drain_core::Enforcer;
+use hippius_drain_core::ScanWorker;
 use hippius_drain_core::SnapshotCell;
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::MetricExporter;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
@@ -147,20 +149,38 @@ fn register_discovery_instruments(
     // What the SSD walks actually cost. Retention grew their input from "the undrained backlog"
     // to "this node's whole replicated shard" — 2.28 M parts measured on prod 2026-08-07 — and
     // nothing reported that, which is how the cost stayed invisible until it was looked for.
+    //
+    // Labelled per worker rather than summed. The two walk on cadences three orders of magnitude
+    // apart, so a merged total is dominated by the reconciler's short poll — and lengthening
+    // that poll is exactly the follow-up these metrics gate, after which a sum could not say
+    // which walk any residual cost belonged to. `ScanWorker` is a closed enum, so the label
+    // cannot grow past two values.
+    let reconcile = [KeyValue::new("worker", ScanWorker::Reconcile.as_str())];
+    let reclaim = [KeyValue::new("worker", ScanWorker::Reclaim.as_str())];
     let snap = Arc::clone(snapshot);
     instruments.push(Box::new(
         meter
             .u64_observable_counter("drain_scan_parts_total")
-            .with_callback(move |observer| observer.observe(snap.load().scan_parts_total, &[]))
+            .with_callback(move |observer| {
+                let s = snap.load();
+                observer.observe(s.reconcile_scan_parts, &reconcile);
+                observer.observe(s.reclaim_scan_parts, &reclaim);
+            })
             .build(),
     ));
-    // Watched against the poll interval: a walk approaching its own period means the worker
-    // never stops walking, which is the state that must not be reached again.
+    // Watched against each worker's OWN poll interval: a walk approaching its period means that
+    // worker never stops walking, which is the state that must not be reached again.
+    let reconcile = [KeyValue::new("worker", ScanWorker::Reconcile.as_str())];
+    let reclaim = [KeyValue::new("worker", ScanWorker::Reclaim.as_str())];
     let snap = Arc::clone(snapshot);
     instruments.push(Box::new(
         meter
             .u64_observable_gauge("drain_scan_duration_ms")
-            .with_callback(move |observer| observer.observe(snap.load().scan_duration_ms, &[]))
+            .with_callback(move |observer| {
+                let s = snap.load();
+                observer.observe(s.reconcile_scan_ms, &reconcile);
+                observer.observe(s.reclaim_scan_ms, &reclaim);
+            })
             .build(),
     ));
 

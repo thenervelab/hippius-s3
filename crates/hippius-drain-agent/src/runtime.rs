@@ -24,8 +24,8 @@ use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, EvictionPass, EvictionTarget,
-    NodeId, NodeObservation, PartReplicationStore, ReclaimError, ReclaimGraces, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket,
-    UploadEnqueuer, decay_rate, evict_to_target, jittered, reclaim_failed, reclaim_ssd, reconcile_parts,
+    NodeId, NodeObservation, PartReplicationStore, ReclaimError, ReclaimGraces, ScanWorker, SnapshotCell, Store, StoredAllocation, SystemClock,
+    TokenBucket, UploadEnqueuer, decay_rate, evict_to_target, jittered, reclaim_failed, reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -468,7 +468,7 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
             // The walk's cost, from the pass that just paid it. `scanned` is every part on this
             // node's SSD — which retention grew from the undrained backlog to the whole
             // replicated shard, with nothing reporting the change until now.
-            snapshot.record_scan(report.scanned, started.elapsed());
+            snapshot.record_scan(ScanWorker::Reclaim, report.scanned, started.elapsed());
             // Both debris dispositions free SSD bytes, so the reclaimed gauge counts their sum.
             // Retained `replicated` parts are NOT counted here — they are cache, not reclaimed
             // debris, and the evictor reports their reclamation separately.
@@ -946,7 +946,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
                             // shortest poll of any worker, and `scanned` is every part on the
                             // disk. Recording it is what makes the landed-announcement path's
                             // benefit visible — and what would show F1 returning.
-                            snapshot.record_scan(report.scanned, started.elapsed());
+                            snapshot.record_scan(ScanWorker::Reconcile, report.scanned, started.elapsed());
                             snapshot.record_reconciled(report.recovered);
                         }
                         Err(err) => tracing::warn!(error = %err, "reconcile cycle failed"),

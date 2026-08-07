@@ -42,7 +42,7 @@ pub use partdrain::{
     breaker_signal_for, drain_part,
 };
 pub use reconcile::{DiscoveredPart, PartLandingLog, PartScan, PartStatus, ReconcileError, ReconcileReport, reconcile_parts};
-pub use snapshot::{AgentSnapshot, SnapshotCell};
+pub use snapshot::{AgentSnapshot, ScanWorker, SnapshotCell};
 pub use ssd_evict::{EvictionError, EvictionPass, EvictionReport, EvictionTarget, FreeSpaceProbe, ResidentLog, ResidentPart, evict_to_target};
 pub use ssd_reclaim::{
     FailedReclaimReport, PartRemover, PartStatusAge, ReclaimError, ReclaimGraces, ReclaimLog, ReclaimReport, reclaim_failed, reclaim_ssd,
