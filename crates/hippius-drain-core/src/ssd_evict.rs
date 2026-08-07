@@ -130,10 +130,16 @@ pub struct EvictionReport {
     /// trips `evicted.is_empty()` and breaks after one page. Only the non-starved path — a pass
     /// that keeps making progress around a stuck part — could inflate.
     pub remove_failed: u64,
-    /// The errno class of the FIRST unlink failure this pass. First-wins, not last: a persistent
-    /// `PermissionDenied`/read-only-filesystem fault needs intervention and must not be masked by
-    /// a later transient `DirectoryNotEmpty` from the api renaming a promoted chunk into the
-    /// directory being removed. Carried on the report rather than logged at the failure site
+    /// The errno class of the most ACTIONABLE unlink failure this pass — not the first one seen.
+    /// `DirectoryNotEmpty` is the api winning a race to rename a promoted chunk into the directory
+    /// being removed, and it clears itself next tick; every other kind may not. So any other kind
+    /// displaces it, and otherwise the earliest is kept.
+    ///
+    /// Ranking rather than taking the first is the difference between a true statement and a
+    /// plausible one: the worklist is ordered by `COALESCE(last_read_at, resident_at)`, which is
+    /// unrelated to severity, so "first" would mean one transient race on the oldest part could
+    /// mask a read-only mount behind it and report the fault an operator can ignore.
+    /// Carried on the report rather than logged at the failure site
     /// because this crate has no logging — see the module doc — and because a separate line would
     /// not join to the structured record the agent already emits.
     pub remove_failed_kind: Option<std::io::ErrorKind>,
@@ -364,7 +370,15 @@ where
                 // advances the cursor — so on a stable oldest-first worklist one un-unlinkable
                 // part pinned the head and halted ALL eviction, with no report to carry `starved`.
                 report.remove_failed = report.remove_failed.saturating_add(1);
-                report.remove_failed_kind.get_or_insert(err.kind());
+                // Ranked by what needs a human, NOT by arrival order. `get_or_insert` here would
+                // keep whichever fault the worklist happened to order first, and the worklist is
+                // ordered by read recency — which has no relationship to severity. One transient
+                // `DirectoryNotEmpty` on the oldest part would then mask 511 EROFS behind it and
+                // report a promotion race for a read-only mount.
+                report.remove_failed_kind = match (report.remove_failed_kind, err.kind()) {
+                    (None | Some(std::io::ErrorKind::DirectoryNotEmpty), kind) => Some(kind),
+                    (existing, _) => existing,
+                };
                 failed.insert(candidate.part);
                 continue;
             }
@@ -939,16 +953,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_first_unlink_failure_kind_wins_so_a_transient_cannot_mask_a_persistent_one() {
+    async fn a_transient_unlink_failure_cannot_mask_an_actionable_one_whatever_the_worklist_order() {
         // EACCES/EROFS means the mount needs intervention; `DirectoryNotEmpty` means the api won a
         // race renaming a promoted chunk into the directory being removed, and will lose it next
-        // tick. Reporting the LAST kind would let the transient overwrite the fault an operator
-        // has to act on, so the first is kept.
+        // tick. The transient is deliberately placed FIRST in worklist order here: that is the
+        // arrangement a first-wins rule gets wrong, and worklist order is ordered by read recency,
+        // which is unrelated to severity — so the ordering that exposes the bug is the one that
+        // occurs by chance in production.
         let parts: Vec<ResidentPart> = (1..=4).map(|v| resident(v, GIB)).collect();
         let log = FakeLog::of(&parts);
         let remover = FlakyRemover::failing_with(&[
-            (part_at(1, 1), io::ErrorKind::PermissionDenied),
-            (part_at(2, 1), io::ErrorKind::DirectoryNotEmpty),
+            (part_at(1, 1), io::ErrorKind::DirectoryNotEmpty),
+            (part_at(2, 1), io::ErrorKind::PermissionDenied),
         ]);
         let probe = FakeProbe::new(300 * GIB, GIB);
         let counting = CountingProbe {
@@ -968,7 +984,7 @@ mod tests {
         assert_eq!(
             report.remove_failed_kind,
             Some(io::ErrorKind::PermissionDenied),
-            "the persistent fault survived the later transient"
+            "the actionable fault displaced the transient that preceded it"
         );
     }
 
