@@ -28,13 +28,28 @@
 //!
 //! # Policy vs. mechanism
 //!
-//! Eviction order is FIFO by `resident_at` — oldest retained first — supplied by the store's
-//! indexed cursor. That is a deliberate v1: it is O(evicted), not O(resident), so it does not
-//! repeat the janitor's walk-based eviction, which is readdir-bound at ~36 obj/s and starves
-//! its own tail. True LRU needs node-local read recency, which does not exist yet (the shared
-//! `fs_cache_inventory.last_access_at` is fleet-wide, so a read on one node would look hot on
-//! every node). The mechanism here is policy-agnostic — ordering lives entirely in the store's
-//! `ORDER BY` — so promoting FIFO to recency later changes one query, not this worker.
+//! Eviction order is least-recently-USED with FIFO as its fallback, supplied by the store's
+//! indexed cursor: `ORDER BY COALESCE(last_read_at, resident_at)`, oldest first. `resident_at`
+//! alone says when a part JOINED the cache, which says nothing about whether anyone is still
+//! reading it — that is FIFO, and FIFO is a poor fit for a working set re-read every epoch, where
+//! evicting by arrival order tends to take exactly the parts about to be read again, each costing
+//! a peer-or-pool read plus a local write to put it back.
+//!
+//! `last_read_at` (migration 0017) is stamped by `hippius_s3/cache/read_recency.py` when a node
+//! serves a part off its own flash. It lives on `cephor_ssd_residency`, which is keyed by node, so
+//! it says which node's copy was read — unlike the fleet-wide `fs_cache_inventory.last_access_at`,
+//! where a read on one node would make the part look hot on every node. It is sampled per part per
+//! window, so the read path pays a write per window rather than per chunk; a lost sample only
+//! evicts the part somewhat earlier than it deserved.
+//!
+//! COALESCE is what buys the fallback for free. A part nobody has read since 0017 shipped has no
+//! recency, so it sorts on its arrival time — which is precisely the old behaviour. No backfill,
+//! and no window in which the order is undefined.
+//!
+//! Either policy is O(evicted), not O(resident), so it does not repeat the janitor's walk-based
+//! eviction, which is readdir-bound at ~36 obj/s and starves its own tail. The mechanism here
+//! stays policy-agnostic — ordering lives entirely in the store's `ORDER BY` — so a further change
+//! of policy changes one query, not this worker.
 //!
 //! # Hysteresis
 //!
@@ -223,7 +238,7 @@ pub trait ResidentLog: Send + Sync {
     /// Store-specific failure, boxed into [`EvictionError`].
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// This node's resident parts, **oldest-resident first**, at most `limit`.
+    /// This node's resident parts, **least-recently-used first**, at most `limit`.
     ///
     /// The ordering IS the eviction policy (see the module doc); the orchestrator walks
     /// whatever order it is handed and never re-sorts.
@@ -235,11 +250,11 @@ pub trait ResidentLog: Send + Sync {
     fn mark_evicted(&self, parts: &[PartKey]) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// Frees SSD space by evicting oldest-resident parts, **paging until the byte deficit is met**.
+/// Frees SSD space by evicting least-recently-used parts, **paging until the byte deficit is met**.
 ///
 /// A no-op when free space is at or above `target.reserve` — the common case, and it costs
 /// nothing: the worklist is not even queried. Once armed, it repeatedly fetches a page of the
-/// store's oldest-first cursor, unlinks each `replicated` part, stamps them evicted, and
+/// store's coldest-first cursor, unlinks each `replicated` part, stamps them evicted, and
 /// re-probes free space before deciding whether to continue.
 ///
 /// # Why it pages rather than taking one batch
