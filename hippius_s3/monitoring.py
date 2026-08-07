@@ -27,11 +27,26 @@ ChunkReadTier = Literal["local", "peer", "pool"]
 
 # Why a peer fetch did not happen, or its answer was not used. Closed by construction, like
 # ChunkReadTier. The reasons demand different responses and must stay distinguishable:
-# `client_cap` and `server_busy` are capacity, while the other three mean something is wrong.
-# `bad_peer_url` is a peer registration this cluster did not write, `bad_length` a peer serving
-# bodies that are not the chunk that was asked for (a rolled-back or half-deployed image), and
-# `unknown_size` a chunk with no recorded ciphertext size to check an answer against.
-PeerShedReason = Literal["client_cap", "server_busy", "bad_peer_url", "bad_length", "unknown_size"]
+# `client_cap` and `server_busy` are capacity; `peer_miss` is the peer having evicted the chunk
+# between the residency read and the fetch, which is routine and settles on its own; and the
+# rest mean something is wrong. `bad_peer_url` is a peer registration this cluster did not
+# write, `bad_length` a peer serving bodies that are not the chunk that was asked for,
+# `unknown_size` a chunk with no recorded ciphertext size to check an answer against, and
+# `peer_error` any other non-200 — a half-rolled deploy, which is a pod to go find.
+#
+# Every one of these has to be counted, including the routine `peer_miss`. The alternative is
+# that a wholesale peer-tier failure — an eviction storm, or a bad image on every pod — shows up
+# only as a DROP in `chunk_reads_by_tier_total{tier=peer}`, and an absence is indistinguishable
+# from the tier simply being idle, so nothing can alert on it.
+PeerShedReason = Literal[
+    "client_cap",
+    "server_busy",
+    "bad_peer_url",
+    "bad_length",
+    "unknown_size",
+    "peer_miss",
+    "peer_error",
+]
 
 # Why a chunk that could have been promoted onto local flash was not. Closed by construction.
 # `residency_failed` is the fail-closed arm: the claim that makes this node's evictor the owner
@@ -135,12 +150,12 @@ class MetricsCollector:
         # CephFS pool. Without this split the SSD read tier is unmeasurable — every tier reads
         # as "cache" — so there is no way to tell whether retention, promotion, and peer fetch
         # are doing anything, or to catch a silent regression back to all-pool reads.
-        # Peer fetches declined, by which side declined: this pod's per-peer fanout cap, or
-        # the peer shedding to protect its own ingest. A rising rate means the read tier is
-        # falling back to the pool under load, which is the signal that fanout needs tuning.
+        # Every peer fetch that did not yield bytes, under the reason it did not — see
+        # PeerShedReason. This is the only POSITIVE signal the peer tier has: without it a tier
+        # that has failed wholesale reads on a dashboard exactly like a tier nobody is using.
         self.peer_fetch_shed = self.meter.create_counter(
             name="peer_fetch_shed_total",
-            description="Peer chunk fetches declined (client_cap|server_busy|bad_peer_url|bad_length|unknown_size)",
+            description="Peer chunk fetches that yielded no bytes, by reason (see PeerShedReason)",
             unit="1",
         )
 

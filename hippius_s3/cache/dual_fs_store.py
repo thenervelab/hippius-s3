@@ -332,12 +332,13 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
     async def chunks_exist_batch(
         self, object_id: str, object_version: int, checks: list[tuple[int, int]]
     ) -> list[bool]:
-        # The read path decides cache-vs-pipeline from this batch check, so it must see
-        # the fallback too: under drain-direct the drain unlinks the primary SSD copy
-        # after replicating to the pool (the fallback tier), and a part present only on
-        # the pool is durably available — it should read as cache, not be re-fetched
-        # through the download pipeline. Only the primary misses are re-checked, so the
-        # common all-present case stays a single primary pass.
+        # The read path decides cache-vs-pipeline from this batch check, so it must see the
+        # fallback too. A part is routinely on the pool and not here: the drain retains its
+        # copy on the INGEST node's flash, and this pod is usually not that node — and even
+        # there, the drain-agent's evictor unlinks on a free-space policy while the pool copy
+        # stays. Either way a part present only on the pool is durably available and must read
+        # as cache rather than be re-fetched through the download pipeline. Only the primary
+        # misses are re-checked, so the common all-present case stays a single primary pass.
         primary = await super().chunks_exist_batch(object_id, object_version, checks)
         missing = [check for check, present in zip(checks, primary, strict=False) if not present]
         if not missing:

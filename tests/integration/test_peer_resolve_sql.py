@@ -25,8 +25,11 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import datetime
+from datetime import timezone
 from typing import Any
 from typing import AsyncGenerator
+from typing import Optional
 
 import asyncpg
 import pytest
@@ -41,6 +44,10 @@ _DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:54
 
 NODE = "k8s-v3-node2"
 PEER = "k8s-v3-node3"
+# A second holder of the same part — what a read-through promotion leaves behind. Named so it
+# sorts BEFORE `PEER`: the residency primary key leads with node_id, so a plan that reads the
+# index would otherwise hand back the long-held copy by luck of the alphabet.
+PROMOTED_PEER = "k8s-v3-node1"
 
 
 class _SingleConnPool:
@@ -124,6 +131,27 @@ async def conn() -> AsyncGenerator[asyncpg.Connection, None]:
         await c.close()
 
 
+async def _add_residency(
+    conn: asyncpg.Connection,
+    *,
+    object_id: str,
+    node: str,
+    resident_at: Optional[datetime] = None,
+    version: int = 1,
+    part_number: int = 3,
+) -> None:
+    """One more node holding an already-seeded part, at an explicit residency time."""
+    await conn.execute(
+        "INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number, resident_at) "
+        "VALUES ($1, $2, $3, $4, COALESCE($5, now()))",
+        node,
+        object_id,
+        version,
+        part_number,
+        resident_at,
+    )
+
+
 async def _seed(
     conn: asyncpg.Connection,
     *,
@@ -133,14 +161,16 @@ async def _seed(
     status: str = "replicated",
     part_number: int = 3,
     version: int = 1,
+    resident_at: Optional[datetime] = None,
 ) -> None:
     """One replicated part, resident on `resident_on`, with `sizes` as its chunk sizes."""
-    await conn.execute(
-        "INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number) VALUES ($1, $2, $3, $4)",
-        resident_on,
-        object_id,
-        version,
-        part_number,
+    await _add_residency(
+        conn,
+        object_id=object_id,
+        node=resident_on,
+        resident_at=resident_at,
+        version=version,
+        part_number=part_number,
     )
     await conn.execute(
         "INSERT INTO cephor_replication_status (object_id, version, part_number, status) VALUES ($1, $2, $3, $4)",
@@ -236,6 +266,38 @@ async def test_a_part_with_no_recorded_chunks_resolves_to_an_owner_but_no_sizes(
 
     assert owner == PEER
     assert sizes == {}
+
+
+async def test_the_longest_resident_copy_wins_when_several_nodes_hold_the_part(
+    conn: asyncpg.Connection,
+) -> None:
+    """Read-through promotion means a part can be resident on several nodes at once.
+
+    `LIMIT 1` with nothing to order it takes whichever row the plan happens to emit first, so
+    the answer for one part is not merely arbitrary but UNSTABLE — it can change between
+    replans. The `PartMemo` pins one answer for 30 s and hides that locally, while fleet-wide
+    the peer traffic ends up distributed by the planner rather than by anything that accounts
+    for it, working against the serve-side fanout cap that is supposed to protect a peer.
+
+    Ordering on `resident_at` makes it deterministic, and picks the copy that has already
+    survived eviction passes over one a read created moments ago.
+
+    The seeding is adversarial on purpose. The promoted copy is inserted FIRST and sits on the
+    alphabetically-first node, so both orders an unordered `LIMIT 1` can fall back on — physical
+    row order, and the residency primary key, which leads with node_id — pick it. Only an
+    explicit ordering on `resident_at` returns the other one.
+    """
+    promoted_at = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    ingested_at = datetime(2026, 8, 1, 9, 0, tzinfo=timezone.utc)
+
+    object_id = str(uuid.uuid4())
+    await _seed(conn, object_id=object_id, sizes=[100], resident_on=PROMOTED_PEER, resident_at=promoted_at)
+    await _add_residency(conn, object_id=object_id, node=PEER, resident_at=ingested_at)
+
+    owner, sizes = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+
+    assert owner == PEER, "a copy promoted five days later won over the long-held one"
+    assert sizes == {0: 100}, "and the sizes still come back alongside the owner"
 
 
 async def test_another_parts_chunk_sizes_are_not_mixed_in(conn: asyncpg.Connection) -> None:

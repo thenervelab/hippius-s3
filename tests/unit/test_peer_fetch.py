@@ -146,6 +146,23 @@ class FakeHttp:
         return _StreamCtx(stream)
 
 
+class Flaky:
+    """A peer that answers `status` once and then serves the chunk normally.
+
+    This is the shape that separates a transient refusal from a memo poison: if the first
+    answer took the whole part off the peer tier, the second request never reaches here.
+    """
+
+    def __init__(self, status: int) -> None:
+        self._status = status
+        self.calls = 0
+
+    def stream(self, method: str, url: str) -> Any:
+        assert method == "GET"
+        self.calls += 1
+        return _StreamCtx(FakeStream(self._status) if self.calls == 1 else FakeStream(200, b"peer-bytes"))
+
+
 @pytest.mark.asyncio
 async def test_registration_publishes_this_pods_address_with_a_ttl() -> None:
     """The TTL IS the liveness signal — a pod that stops refreshing stops being a peer."""
@@ -373,16 +390,7 @@ async def test_a_busy_peer_503_falls_through_without_poisoning_the_memo() -> Non
     await PeerRegistry(redis, "node-b", PEER_URL, 90).register()
     registry = PeerRegistry(redis, "node-a", SELF_URL, 90)
 
-    class Flaky:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def stream(self, method: str, url: str) -> Any:
-            self.calls += 1
-            return _StreamCtx(FakeStream(503) if self.calls == 1 else FakeStream(200, b"peer-bytes"))
-
-    http = Flaky()
-    fetcher = PeerChunkFetcher(FakePool(residency_row()), registry, "node-a", http)
+    fetcher = PeerChunkFetcher(FakePool(residency_row()), registry, "node-a", Flaky(503))
 
     assert await fetcher(OBJ, 1, 3, 0) is None, "shed, so this chunk reads from the pool"
     assert await fetcher(OBJ, 1, 3, 1) == b"peer-bytes", "the peer is retried once it recovers"
@@ -692,6 +700,69 @@ async def test_a_wrong_length_is_counted_under_its_own_reason(monkeypatch) -> No
     assert await fetcher(OBJ, 1, 3, 0) is None
 
     assert recorded == ["bad_length"]
+
+
+# ------------------------------------------------- the peer's own answer, when it is not 200
+
+
+async def _registered_peer() -> PeerRegistry:
+    """A registry in which node-b is a resolvable peer of node-a."""
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", PEER_URL, 90).register()
+    return PeerRegistry(redis, "node-a", SELF_URL, 90)
+
+
+@pytest.mark.asyncio
+async def test_a_peer_404_is_counted_rather_than_leaving_only_a_gap_in_the_tier_split(monkeypatch) -> None:
+    """A 404 is routine, and counting it is what makes an eviction storm visible.
+
+    Uncounted, the whole peer tier can go away — every node evicting between the residency read
+    and the fetch — and the only trace is a DROP in `chunk_reads_by_tier_total{tier=peer}`. That
+    is a negative-space signal: it looks identical to the feature simply being idle, so nothing
+    can alert on it.
+    """
+    recorded: list[str] = []
+    monkeypatch.setattr("hippius_s3.cache.peers._record_shed", recorded.append)
+    fetcher = PeerChunkFetcher(FakePool(residency_row()), await _registered_peer(), "node-a", FakeHttp(404))
+
+    assert await fetcher(OBJ, 1, 3, 2) is None, "the chunk still falls through to the pool"
+
+    assert recorded == ["peer_miss"]
+
+
+@pytest.mark.asyncio
+async def test_a_peer_5xx_is_counted_apart_from_a_miss(monkeypatch) -> None:
+    """A broken peer and an evicting one call for opposite responses.
+
+    A rise in `peer_miss` is the eviction cursor moving faster than reads, and settles on its
+    own. A rise in `peer_error` is a peer serving errors — a half-rolled deploy — and the
+    response is to find that pod. Collapsed into one counter, the second hides inside the first,
+    which on this fleet is the routine one.
+    """
+    recorded: list[str] = []
+    monkeypatch.setattr("hippius_s3.cache.peers._record_shed", recorded.append)
+    fetcher = PeerChunkFetcher(FakePool(residency_row()), await _registered_peer(), "node-a", FakeHttp(500))
+
+    assert await fetcher(OBJ, 1, 3, 2) is None
+
+    assert recorded == ["peer_error"]
+
+
+@pytest.mark.asyncio
+async def test_neither_a_404_nor_a_5xx_poisons_the_part_memo() -> None:
+    """Only an unreachable peer earns the memo poison; an answering one is retried.
+
+    A connect failure is memoised off because retrying a dead peer costs the full deadline on
+    every chunk. Neither of these is that: the peer answered promptly. Poisoning on a 404 would
+    push a whole 64-chunk part to the pool for 30 s over one evicted chunk, and on a 5xx it
+    would outlast the bad pod's rollback.
+    """
+    for status in (404, 500):
+        http = Flaky(status)
+        fetcher = PeerChunkFetcher(FakePool(residency_row()), await _registered_peer(), "node-a", http)
+
+        assert await fetcher(OBJ, 1, 3, 0) is None, f"the {status} chunk reads from the pool"
+        assert await fetcher(OBJ, 1, 3, 1) == b"peer-bytes", f"a {status} kept the part off the peer tier"
 
 
 @pytest.mark.asyncio

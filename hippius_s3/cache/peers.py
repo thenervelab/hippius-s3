@@ -293,6 +293,15 @@ class PeerChunkFetcher:
         has it on flash right now": the ingest node may have evicted its copy, and a
         promotion may have put one somewhere else entirely.
 
+        Several nodes can hold one part once promotion has run, so the `LIMIT 1` needs an
+        ORDER BY to be a CHOICE rather than whatever the plan emits first. Unordered it is not
+        merely arbitrary but unstable across replans, and the `PartMemo` hides that locally
+        while leaving the fleet's peer traffic distributed by the planner — which is precisely
+        what the serve-side fanout cap has no way to account for. Ordering on `resident_at`
+        prefers the copy that has already survived eviction passes over one a read created
+        moments ago. The candidate set is bounded by the node count (5 in prod), so the sort
+        is free.
+
         Both facts come back together because both are per-PART while the read path asks per
         CHUNK, so the memo above amortises one round trip over the whole part. Splitting the
         sizes into a second query would put a Postgres round trip back on the per-chunk path,
@@ -313,6 +322,7 @@ class PeerChunkFetcher:
                     WHERE r.object_id = $1 AND r.version = $2 AND r.part_number = $3
                       AND r.node_id <> $4
                       AND s.status = 'replicated'
+                    ORDER BY r.resident_at
                     LIMIT 1
                 )
                 SELECT o.node_id, sizes.chunk_indexes, sizes.cipher_sizes
@@ -430,8 +440,19 @@ class PeerChunkFetcher:
                 # part on the pool long after a brief spike passed.
                 _record_shed("server_busy")
                 return None
+            if response.status_code == 404:
+                # Routine — the peer evicted the part between the residency read and now — and
+                # counted for exactly that reason. Under an eviction storm this is the entire
+                # peer tier going away, and the only other trace of it is a DROP in
+                # `chunk_reads_by_tier_total{tier=peer}`, which reads the same as a tier nobody
+                # is using. Not memo-poisoned: the peer answered, and promptly.
+                _record_shed("peer_miss")
+                return None
             if response.status_code != 200:
-                # 404 is routine: the peer evicted the part between the residency read and now.
+                # Anything else is a peer that is broken rather than busy or empty — a half-rolled
+                # deploy answering 500. Kept apart from `peer_miss` because the response differs:
+                # find the pod, rather than wait for the eviction cursor to settle.
+                _record_shed("peer_error")
                 return None
             body = bytearray()
             async for piece in response.aiter_bytes():
