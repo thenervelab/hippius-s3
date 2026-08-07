@@ -44,6 +44,7 @@ from hippius_s3.config import Config
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
+from hippius_s3.promote_floor import create_published_floor_source
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
 from hippius_s3.writer.landed import initialize_landed_publisher
 
@@ -183,11 +184,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # to say so or the evictor falls back to arrival order — which for a re-read working set
         # tends to drop exactly the parts about to be needed again.
         app.state.read_recency_recorder = create_read_recency_recorder(app.state.postgres_pool, node_name)
+        # Promotion must stay inside the band THIS node's evictor is holding, and the drain
+        # allocator moves that band at runtime — so the floor is read from the agent rather than
+        # configured here. The queues Redis is the only instance both processes share (the agent
+        # has no main-Redis URL); an unavailable key falls back to `promote_min_free_ratio`.
+        published_floor = create_published_floor_source(app.state.redis_queues_client, node_name)
         app.state.fs_store = create_fs_store(
             config,
             on_promote=app.state.residency_recorder,
             peer_fetch=peer_fetch,
             on_local_read=app.state.read_recency_recorder,
+            published_floor=published_floor.ratio if published_floor is not None else None,
         )
         app.state.obj_cache = RedisObjectPartsCache(
             app.state.redis_client,

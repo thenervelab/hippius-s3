@@ -5,13 +5,20 @@ import random
 import shutil
 import time
 from dataclasses import dataclass
+from typing import Awaitable
 from typing import Callable
+from typing import Literal
 from typing import Optional
 
 from hippius_s3.config import Config
 
 
 logger = logging.getLogger(__name__)
+
+
+# Yields the free-space floor the local evictor is actually holding, as a ratio, or `None` when
+# the signal is unavailable. See hippius_s3/promote_floor.py for the wire contract.
+PublishedFloorSource = Callable[[], Awaitable[Optional[float]]]
 
 
 @dataclass(frozen=True)
@@ -29,6 +36,22 @@ class FsCachePressure:
 _GATE_MEMO_SECONDS = 5.0
 
 
+def _record_floor_divergence(direction: Literal["stricter", "looser"]) -> None:
+    """Count a gate decision made on a published floor that differs from the configured one.
+
+    Imported lazily and never allowed to raise, matching the other promotion counters: this
+    sits on the read path and observability must not be able to fail a GET.
+    """
+    try:
+        from hippius_s3.monitoring import get_metrics_collector
+
+        collector = get_metrics_collector()
+        if collector is not None:
+            collector.record_promote_floor_divergence(direction)
+    except Exception:  # noqa: BLE001 - a metrics failure must not fail a read
+        pass
+
+
 class FreeSpaceGate:
     """Answers "is there room to promote onto this disk?", at most one probe per TTL.
 
@@ -41,13 +64,19 @@ class FreeSpaceGate:
     The threshold sits INSIDE the evictor's hysteresis band, which is the part that is easy to
     get wrong in both directions:
 
-        fs_cache_min_free 0.08  <  evict_reserve 0.15  <  promote_floor  <  evict target 0.20
+        fs_cache_min_free  <  evict_reserve  <  promote_floor  <  evict_reserve + headroom
 
     A floor equal to the evictor's target chatters — promotion is live only in the instant a
     pass completes. A floor ABOVE the target deadlocks — promotion stops and the evictor, which
     only frees back to its target, can never restore enough for it to resume. Only a floor
     strictly between the reserve and the target leaves a band where eviction restores the disk
     past the point promotion resumes.
+
+    That band is NOT fixed. The drain allocator publishes a per-node eviction reserve that
+    overrides the agent's configured one (150..400 permille, by how stalled the drain is), so a
+    constant on this side is only ever correct by accident. The agent therefore resolves the
+    floor for the reserve in force and publishes it; `floor_source` reads that number and it
+    WINS over `min_free_ratio`, which is now purely the fallback for when no floor is published.
     """
 
     def __init__(
@@ -57,31 +86,77 @@ class FreeSpaceGate:
         *,
         ttl_seconds: float = _GATE_MEMO_SECONDS,
         probe: Optional[Callable[[str], float]] = None,
+        floor_source: Optional[PublishedFloorSource] = None,
     ) -> None:
         self._path = path
         self._min_free_ratio = float(min_free_ratio)
         self._ttl = float(ttl_seconds)
         self._probe = probe or free_ratio_of
+        self._floor_source = floor_source
         self._expires_at = 0.0
         self._allowed = True
+        # The last divergent floor warned about, so a sustained divergence logs on the
+        # TRANSITION rather than every memo window (which on a stalled node would be 12 lines a
+        # minute per pod, for hours). The counter below carries the rate; the log carries the event.
+        self._warned_floor: Optional[float] = None
 
-    def allows(self, now: Optional[float] = None) -> bool:
+    async def allows(self, now: Optional[float] = None) -> bool:
         """True when the disk has room to spare for a cache copy.
 
         Fails OPEN: a probe that raises leaves the previous verdict in place (initially
         "allowed"). Promotion is best-effort in every other respect too — a `statvfs` blip must
         not silently disable the read tier, and a genuinely full disk still stops the write with
         `ENOSPC`, which `_promote_chunk` already swallows.
+
+        The published floor is resolved inside the SAME memo window as the probe, so a decision
+        asked per chunk costs at most one Redis round-trip and one `statvfs` per TTL.
         """
         stamp = now if now is not None else time.monotonic()
         if stamp < self._expires_at:
             return self._allowed
+        floor = await self._resolve_floor()
         try:
-            self._allowed = self._probe(self._path) > self._min_free_ratio
+            self._allowed = self._probe(self._path) > floor
         except OSError as exc:
             logger.debug("promotion free-space probe failed for %s: %s", self._path, exc)
         self._expires_at = stamp + self._ttl
         return self._allowed
+
+    async def _resolve_floor(self) -> float:
+        """The floor to gate on: the evictor's published one, else the static fallback.
+
+        Prefers the published value because it is the only one that tracks the reserve actually
+        in force — the allocator raises that reserve at runtime and a configured constant cannot
+        follow it. Every failure mode lands on the static floor, which is today's behaviour: an
+        unavailable signal must not disable the read tier.
+        """
+        if self._floor_source is None:
+            return self._min_free_ratio
+        try:
+            published = await self._floor_source()
+        except Exception as exc:  # noqa: BLE001 - promotion is awaited inline in a GET
+            logger.debug("published promote-floor lookup failed for %s: %s", self._path, exc)
+            return self._min_free_ratio
+        if published is None:
+            return self._min_free_ratio
+        if published == self._min_free_ratio:
+            self._warned_floor = None
+            return published
+        # Surfaced rather than merely handled: a divergence means the evictor is holding a band
+        # this process was configured for the wrong side of. At the allocator's ceiling the
+        # published floor is ~0.425, so promotion effectively stops on a stressed node — which
+        # is the intent, since warming a cache while the drain is stalled is the failure this
+        # prevents, but it must never look like the read tier quietly broke.
+        _record_floor_divergence("stricter" if published > self._min_free_ratio else "looser")
+        if published != self._warned_floor:
+            logger.warning(
+                "promote floor: using the evictor's published %.3f instead of the configured %.3f "
+                "(the allocator has moved this node's eviction reserve)",
+                published,
+                self._min_free_ratio,
+            )
+            self._warned_floor = published
+        return published
 
 
 def free_ratio_of(path: str) -> float:
@@ -90,11 +165,15 @@ def free_ratio_of(path: str) -> float:
     return float(usage.free / usage.total) if usage.total > 0 else 0.0
 
 
-# The drain agent's shipped eviction policy, as ratios. The evictor lives in Rust
-# (`crates/hippius-drain-agent/src/config.rs`: DEFAULT_EVICT_RESERVE_PERMILLE = 150,
-# DEFAULT_EVICT_HEADROOM_PERMILLE = 50) with no runtime coupling to this process, so the
-# contract is mirrored here and pinned by a test on each side. If the Rust defaults move and
-# these do not, `validate_promotion_band` stops describing the deployed system.
+# The drain agent's DEFAULT eviction policy, as ratios (`crates/hippius-drain-agent/src/config.rs`:
+# DEFAULT_EVICT_RESERVE_PERMILLE = 150, DEFAULT_EVICT_HEADROOM_PERMILLE = 50).
+#
+# These describe the band an agent holds when the allocator is publishing NO reserve for it —
+# nothing more. The live band moves with the allocator's per-node reserve, and the agent
+# publishes the resolved floor for it (see hippius_s3/promote_floor.py), so these constants no
+# longer bound the running system. They remain here because `promote_min_free_ratio` is the
+# fallback used when that signal is unavailable, and that fallback still has to be valid
+# against the defaults it will be paired with.
 EVICT_RESERVE_RATIO = 0.150
 EVICT_HEADROOM_RATIO = 0.050
 
@@ -110,7 +189,13 @@ def validate_promotion_band(
     evict_reserve_ratio: float = EVICT_RESERVE_RATIO,
     evict_headroom_ratio: float = EVICT_HEADROOM_RATIO,
 ) -> None:
-    """Raise unless the four thresholds form a loop that can actually recover.
+    """Raise unless the STATIC FALLBACK thresholds form a loop that can actually recover.
+
+    This no longer describes the live band. The drain allocator moves each node's eviction
+    reserve at runtime, so no startup check in this process can bound where the evictor will
+    be; the agent publishes the resolved floor per pass and `FreeSpaceGate` prefers it. What is
+    validated here is the floor used when that signal is UNAVAILABLE, against the agent's
+    default policy — the one configuration this side can still reason about locally.
 
     Checked against the RESOLVED config at startup, not just against code defaults, because
     every one of these is settable per-deployment and a bad combination fails silently — the

@@ -172,7 +172,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         # optimisation — a cold cache costs latency, a full disk costs writes. The gate fires
         # above the drain evictor's floor, so promotion backs off before eviction is even
         # armed rather than racing it.
-        if self._space_gate is not None and not self._space_gate.allows():
+        if self._space_gate is not None and not await self._space_gate.allows():
             _record_promotion_skipped()
             return
 
