@@ -392,7 +392,11 @@ class Config:
     peer_registry_refresh_seconds: int = env("HIPPIUS_PEER_REGISTRY_REFRESH_SECONDS:30", convert=int)
     # Bound on a peer read. A slow peer must lose to the pool quickly rather than adding its
     # latency on top of the pool read that follows.
-    peer_fetch_timeout_seconds: float = env("HIPPIUS_PEER_FETCH_TIMEOUT_SECONDS:2.0", convert=float)
+    # The fallback costs ~40 ms (a CephFS pool read), so this is a loss-cut, not a deadline: a
+    # peer that has not answered in 0.5s is already an order of magnitude worse than giving up,
+    # and waiting the old 2.0s meant paying 50x the fallback before then ALSO paying the
+    # fallback. Generous against a ~7 ms healthy peer read.
+    peer_fetch_timeout_seconds: float = env("HIPPIUS_PEER_FETCH_TIMEOUT_SECONDS:0.5", convert=float)
     # Per-peer fanout: concurrent fetches this pod will have in flight to any ONE peer, and
     # concurrent peer requests this pod will SERVE. Both are needed — the client cap bounds
     # what one pod sends, but five pods each within their own cap still add up at the peer,

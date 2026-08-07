@@ -45,7 +45,13 @@ class ResidencyRecorder:
                     INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number, bytes)
                     VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (node_id, object_id, version, part_number)
-                    DO UPDATE SET bytes = cephor_ssd_residency.bytes + EXCLUDED.bytes
+                    -- ACCUMULATES, where the drain's record_resident OVERWRITES. The two are
+                    -- writing different facts: the drain knows the whole part's size at commit
+                    -- and states it; promotion learns the part one chunk at a time and has to
+                    -- add. They cannot collide on a live (node, part) — the drain records only
+                    -- on its own commit, a locally-resident part is served locally and so is
+                    -- never promoted, and eviction removes the row and the directory together,
+                    -- which resets both writers to the same empty starting point.
                     """,
                     self._node_id,
                     str(object_id),
