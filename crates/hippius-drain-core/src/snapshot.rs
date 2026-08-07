@@ -226,6 +226,11 @@ pub struct SnapshotCell {
     /// invariant, and the reason it is a counter rather than a log line: "has this ever been
     /// non-zero" has to be answerable by an alert rule, not by grepping.
     evict_blocked_unreplicated: AtomicU64,
+    /// Candidates the evictor SKIPPED because the unlink itself failed. Not alertable on its own
+    /// — `starved` already covers a page that freed nothing — but it is what separates
+    /// starved-because-removals-are-failing (a disk, permissions, or racing-promotion fault) from
+    /// starved-because-the-cursor-is-empty (genuine backlog). The two need opposite responses.
+    evict_remove_failed: AtomicU64,
     /// Aborted-reclaim counter mirroring `reclaimed`: bumped once per reclaim cycle that failed
     /// its object-backing read (`ReclaimError::Backing`). Monotonic, `Relaxed` — a stat counter
     /// with no cross-counter ordering dependency (axiom `rust_quality_92`). See
@@ -380,6 +385,17 @@ impl SnapshotCell {
     #[must_use]
     pub fn evict_blocked_unreplicated(&self) -> u64 {
         self.evict_blocked_unreplicated.load(Ordering::Relaxed)
+    }
+
+    /// Records eviction candidates skipped because their unlink failed.
+    pub fn record_evict_remove_failed(&self, n: u64) {
+        self.evict_remove_failed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Cumulative skipped-on-unlink-failure count (`drain_ssd_evict_remove_failed_total`).
+    #[must_use]
+    pub fn evict_remove_failed(&self) -> u64 {
+        self.evict_remove_failed.load(Ordering::Relaxed)
     }
 
     /// Records free bytes on the ingest SSD. A gauge: `store`, not add.

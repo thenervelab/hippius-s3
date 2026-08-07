@@ -123,6 +123,18 @@ fn register_ssd_tier_instruments(meter: &opentelemetry::metrics::Meter, snapshot
             .build(),
     ));
 
+    // Candidates skipped because the unlink failed. Deliberately NOT its own alert: it is the
+    // discriminator to read ALONGSIDE the existing starvation alert, separating "removals are
+    // failing" from "the cursor is empty". Rising while evicted_total stays flat is the shape
+    // that used to abort every pass silently.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_evict_remove_failed_total")
+            .with_callback(move |observer| observer.observe(snap.evict_remove_failed(), &[]))
+            .build(),
+    ));
+
     // Free space: the third leg of backlog/cache/free. Without it a dashboard cannot separate
     // "the read cache grew" from "the disk is filling with backlog".
     let snap = Arc::clone(snapshot);

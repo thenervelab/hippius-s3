@@ -347,6 +347,7 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
         Ok(report) => {
             snapshot.record_evicted(report.evicted, report.freed_bytes);
             snapshot.record_evict_blocked_unreplicated(report.skipped_unreplicated);
+            snapshot.record_evict_remove_failed(report.remove_failed);
             if report.evicted > 0 {
                 tracing::info!(
                     evicted = report.evicted,
@@ -371,12 +372,29 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
             // Eviction could not reach its target: the disk is filling with something it
             // cannot reclaim (undrained backlog, reclaimer-owned debris, or a foreign writer).
             // Left alone this ends in 503s on PUT, and no amount of retrying fixes it.
+            //
+            // `remove_failed` rides along because it is the discriminator: non-zero means the
+            // removals themselves are failing (disk, permissions, or the api renaming a promoted
+            // chunk into the directory being removed), which is a different fault from an empty
+            // cursor and wants a different response.
             if report.starved {
                 tracing::error!(
                     free_bytes = usage.free_bytes,
                     deficit = target.deficit(),
                     evicted = report.evicted,
+                    remove_failed = report.remove_failed,
                     "eviction ran out of resident parts before restoring the free-space floor"
+                );
+            }
+            // Removals failed but the pass still met its target, so nothing is starving yet. Worth
+            // a line rather than only a counter: this is the early form of the fault that used to
+            // abort the whole pass, and it is cheap to catch before it becomes starvation. Guarded
+            // on `!starved` so the ERROR above stays the single report when both are true.
+            if report.remove_failed > 0 && !report.starved {
+                tracing::warn!(
+                    remove_failed = report.remove_failed,
+                    evicted = report.evicted,
+                    "eviction skipped parts whose unlink failed; the free-space floor was still restored"
                 );
             }
             // The eviction invariant broke: the worklist offered a part whose only durable
