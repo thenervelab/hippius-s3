@@ -324,12 +324,23 @@ where
         // Re-probe rather than trusting the accounted sum: `bytes` is denormalized at residency
         // time and a part whose size was unknown records zero, so accounting alone can report
         // "freed nothing" while real space was reclaimed — and would spin the loop.
-        target.free = match probe.free_bytes().await {
-            Ok(free) => free,
-            Err(_) => target.free.saturating_add(freed_this_page),
-        };
+        let probed = probe.free_bytes().await.ok();
+        target.free = probed.unwrap_or_else(|| target.free.saturating_add(freed_this_page));
 
         if target.free >= goal {
+            break;
+        }
+        // Neither signal moved: the probe is unavailable AND every part on that page was
+        // unaccounted (`bytes = 0`, which migration 0016 explicitly anticipates). Continuing
+        // would unlink a full page per iteration until the wall clock with no evidence any of
+        // it helps — deleting the read tier blind. Progress that cannot be measured is
+        // starvation, not success.
+        //
+        // Only when BOTH are true. A probe that works and reports no gain is a different
+        // situation — something else is filling the disk as fast as this frees it — and there
+        // the right answer IS to keep evicting until the time budget.
+        if probed.is_none() && freed_this_page == 0 {
+            report.starved = true;
             break;
         }
         if returned < page as usize {
@@ -750,6 +761,36 @@ mod tests {
 
         assert_eq!(report.evicted, 4, "4 GiB deficit closed from accounted bytes alone");
         assert!(!report.starved);
+    }
+
+    #[tokio::test]
+    async fn a_failing_probe_with_unaccounted_parts_must_not_evict_unbounded() {
+        // Zero-byte residency rows are anticipated by design (migration 0016: "a part whose
+        // size is unknown records 0 — it is still evictable, it just frees no accounted
+        // bytes"). Combine that with a failing statvfs and NOTHING advances: free does not
+        // move, the projection does not move, the page is full so exhaustion never fires, and
+        // parts WERE evicted so the no-progress guard never fires either. The pass then unlinks
+        // a full page per iteration until its wall clock — deleting the read tier on no
+        // evidence that it is helping.
+        let parts: Vec<ResidentPart> = (1..=200).map(|v| resident(v, 0)).collect();
+        let log = FakeLog::of(&parts);
+        let remover = FakeRemover::default();
+        let probe = FakeProbe::failing();
+        let clock = TestClock::new();
+        let target = EvictionTarget {
+            free: 100 * GIB,
+            reserve: 300 * GIB,
+            headroom: 50 * GIB,
+        };
+
+        let report = evict_to_target(&log, &remover, &probe, &clock, target, pass(8)).await.unwrap();
+
+        assert!(
+            report.evicted <= 8,
+            "no measurable progress must stop the pass after one page, evicted {}",
+            report.evicted
+        );
+        assert!(report.starved, "unmeasurable progress is starvation, not success");
     }
 
     #[test]
