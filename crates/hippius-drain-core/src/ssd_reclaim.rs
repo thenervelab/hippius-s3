@@ -116,6 +116,17 @@ pub trait ReclaimLog: Send + Sync {
     /// The replication state + age of every `parts` entry the store has a row for.
     /// A part with no row is simply absent from the map (the caller skips it).
     fn part_states(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashMap<PartKey, PartStatusAge>, Self::Error>> + Send;
+
+    /// This node's `failed` parts older than `grace`, oldest first, at most `limit`.
+    ///
+    /// **Candidates only — deliberately no servability logic here.** Whether a `failed` part is
+    /// a corrupt-live object's last good copy is decided by
+    /// [`BackingLog::servable_parts`](BackingLog::servable_parts), which already carries that
+    /// predicate under a "MUST stay in lockstep" warning shared with
+    /// `janitor_part_terminally_abandoned.sql` and the A21 sweep. Expressing it a third time in
+    /// this query is how that warning eventually gets ignored, and the failure mode is deleting
+    /// a live object's last good source. So this finds candidates; the existing seam judges them.
+    fn reclaimable_failed_parts(&self, grace: Duration, limit: u32) -> impl Future<Output = Result<Vec<PartKey>, Self::Error>> + Send;
 }
 
 /// The `object_versions` backing seam: answers two questions about a batch of parts, both
@@ -391,6 +402,75 @@ where
     Ok(report)
 }
 
+/// What one DB-driven `failed`-reclaim pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FailedReclaimReport {
+    /// Aged `failed` parts the worklist offered.
+    pub candidates: u64,
+    /// Parts unlinked — debris from an aborted or abandoned upload.
+    pub reclaimed: u64,
+    /// Parts REFUSED because their object version is still servable: the R4 corrupt-live case,
+    /// where this SSD copy is the last good source. Must never be deleted; a standing nonzero
+    /// value is the same incident signal the walk's `skipped_corrupt` carries.
+    pub held_servable: u64,
+}
+
+/// Reclaims this node's aged `failed` parts **without walking the disk**.
+///
+/// The walk found these by scanning every part on the SSD and asking the database about each.
+/// That was proportional to the whole tree — which retention grew to this node's entire
+/// replicated shard — to find a population that is tiny and directly queryable: prod carries
+/// 22,123 `failed` rows fleet-wide against 11.4 M replicated. Asking the database for them is
+/// the obvious shape; it only became worth doing once the walk stopped being cheap.
+///
+/// # The guard, and why it is not re-implemented here
+///
+/// A `failed` part whose object version is still SERVABLE is not debris — it is a live object
+/// whose pool copy is corrupt, and this SSD copy is its last good source (R4). Deleting it is
+/// data loss.
+///
+/// That judgement stays in [`BackingLog::servable_parts`], which the walk already used. Its
+/// predicate carries a "MUST stay in lockstep" warning shared with
+/// `janitor_part_terminally_abandoned.sql` and the A21 sweep, so it is already expressed twice;
+/// writing it a third time in a worklist query is how such a warning eventually gets ignored.
+/// The worklist therefore returns CANDIDATES and this function judges them with the existing,
+/// tested seam.
+///
+/// # Errors
+///
+/// - [`ReclaimError::Log`] if the worklist read fails (nothing is removed).
+/// - [`ReclaimError::Backing`] if the servability read fails — **nothing is removed**, because
+///   without it every candidate is un-adjudicated and deleting one could destroy a live
+///   object's last copy. Fail-safe, exactly as the walk's backing read is.
+/// - [`ReclaimError::Remove`] if unlinking fails.
+pub async fn reclaim_failed<L, B, R>(log: &L, backing: &B, remover: &R, grace: Duration, limit: u32) -> Result<FailedReclaimReport, ReclaimError>
+where
+    L: ReclaimLog,
+    B: BackingLog,
+    R: PartRemover,
+{
+    let mut report = FailedReclaimReport::default();
+    let candidates = log.reclaimable_failed_parts(grace, limit).await.map_err(ReclaimError::log)?;
+    if candidates.is_empty() {
+        return Ok(report);
+    }
+    report.candidates = candidates.len() as u64;
+
+    // Fail-safe: a backing read that errors leaves EVERY candidate unjudged, so the pass must
+    // remove nothing rather than assume "not in the set means safe to delete".
+    let servable = backing.servable_parts(&candidates).await.map_err(ReclaimError::backing)?;
+
+    for part in &candidates {
+        if servable.contains(part) {
+            report.held_servable += 1;
+            continue;
+        }
+        remover.unlink_part(part).await.map_err(ReclaimError::Remove)?;
+        report.reclaimed += 1;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
@@ -579,6 +659,12 @@ mod tests {
 
     impl ReclaimLog for FakeLog {
         type Error = io::Error;
+
+        /// The walk-driven tests never exercise the DB worklist — `reclaim_failed` owns that
+        /// path and has its own suite in `failed_reclaim_tests`.
+        async fn reclaimable_failed_parts(&self, _grace: Duration, _limit: u32) -> Result<Vec<PartKey>, io::Error> {
+            Ok(Vec::new())
+        }
 
         fn part_states(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashMap<PartKey, PartStatusAge>, io::Error>> + Send {
             let outcome = if self.fail {
@@ -1156,5 +1242,188 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod failed_reclaim_tests {
+    use super::{BackingLog, FailedReclaimReport, PartRemover, PartStatusAge, ReclaimError, ReclaimLog, reclaim_failed};
+    use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
+    use core::future::Future;
+    use core::str::FromStr;
+    use core::time::Duration;
+    use std::collections::{HashMap, HashSet};
+    use std::io;
+    use std::sync::Mutex;
+
+    const UUID: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+
+    fn part(n: u32) -> PartKey {
+        PartKey::new(ObjectId::from_str(UUID).unwrap(), Version::new(1), PartNumber::new(n))
+    }
+
+    struct FakeLog {
+        candidates: Vec<PartKey>,
+        fail: bool,
+        asked: Mutex<Vec<(u64, u32)>>,
+    }
+
+    impl FakeLog {
+        fn of(parts: &[PartKey]) -> Self {
+            Self {
+                candidates: parts.to_vec(),
+                fail: false,
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ReclaimLog for FakeLog {
+        type Error = io::Error;
+
+        async fn part_states(&self, _parts: &[PartKey]) -> Result<HashMap<PartKey, PartStatusAge>, io::Error> {
+            Ok(HashMap::new())
+        }
+
+        fn reclaimable_failed_parts(&self, grace: Duration, limit: u32) -> impl Future<Output = Result<Vec<PartKey>, io::Error>> + Send {
+            let outcome = if self.fail {
+                Err(io::Error::other("worklist read failed"))
+            } else {
+                self.asked.lock().unwrap().push((grace.as_secs(), limit));
+                Ok(self.candidates.clone())
+            };
+            async move { outcome }
+        }
+    }
+
+    struct FakeBacking {
+        servable: HashSet<PartKey>,
+        fail: bool,
+    }
+
+    impl BackingLog for FakeBacking {
+        type Error = io::Error;
+
+        async fn unbacked_parts(&self, _parts: &[PartKey]) -> Result<HashSet<PartKey>, io::Error> {
+            Ok(HashSet::new())
+        }
+
+        fn servable_parts(&self, _parts: &[PartKey]) -> impl Future<Output = Result<HashSet<PartKey>, io::Error>> + Send {
+            let outcome = if self.fail {
+                Err(io::Error::other("backing read failed"))
+            } else {
+                Ok(self.servable.clone())
+            };
+            async move { outcome }
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRemover {
+        removed: Mutex<Vec<u32>>,
+    }
+
+    impl PartRemover for FakeRemover {
+        fn unlink_part(&self, part: &PartKey) -> impl Future<Output = io::Result<()>> + Send {
+            self.removed.lock().unwrap().push(part.part().get());
+            async { Ok(()) }
+        }
+    }
+
+    fn backing(servable: &[PartKey]) -> FakeBacking {
+        FakeBacking {
+            servable: servable.iter().cloned().collect(),
+            fail: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn aged_failed_debris_is_reclaimed_without_a_disk_walk() {
+        // The point of the change: the worklist comes from the database, so finding a handful of
+        // failed parts no longer costs a scan proportional to the node's whole replicated shard.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::default();
+
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(
+            report,
+            FailedReclaimReport {
+                candidates: 2,
+                reclaimed: 2,
+                held_servable: 0,
+            }
+        );
+        assert_eq!(*remover.removed.lock().unwrap(), vec![1, 2]);
+        assert_eq!(*log.asked.lock().unwrap(), vec![(3600, 256)], "grace and limit reach the worklist");
+    }
+
+    #[tokio::test]
+    async fn a_servable_versions_part_is_held_not_deleted() {
+        // THE guard (R4). A `failed` part whose object version is still servable is not debris:
+        // the pool copy is corrupt and this SSD copy is the object's last good source. The
+        // judgement is delegated to BackingLog::servable_parts rather than re-expressed in the
+        // worklist query, precisely so it cannot drift from the two places that already carry it.
+        let log = FakeLog::of(&[part(1), part(2), part(3)]);
+        let remover = FakeRemover::default();
+
+        let report = reclaim_failed(&log, &backing(&[part(2)]), &remover, Duration::from_hours(1), 256)
+            .await
+            .unwrap();
+
+        assert_eq!(report.held_servable, 1);
+        assert_eq!(report.reclaimed, 2);
+        assert_eq!(*remover.removed.lock().unwrap(), vec![1, 3], "the servable part survived");
+    }
+
+    #[tokio::test]
+    async fn a_failing_backing_read_removes_nothing() {
+        // Without the servability answer every candidate is unjudged, so proceeding could delete
+        // a live object's last good copy. The pass must remove NOTHING rather than treat an
+        // unanswered question as permission.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::default();
+        let failing = FakeBacking {
+            servable: HashSet::new(),
+            fail: true,
+        };
+
+        let err = reclaim_failed(&log, &failing, &remover, Duration::from_hours(1), 256).await.unwrap_err();
+
+        assert!(matches!(err, ReclaimError::Backing(_)));
+        assert!(remover.removed.lock().unwrap().is_empty(), "nothing may be unlinked unjudged");
+    }
+
+    #[tokio::test]
+    async fn an_empty_worklist_never_asks_about_backing() {
+        // The steady state on a healthy node, and it must cost one query, not two.
+        let log = FakeLog::of(&[]);
+        let remover = FakeRemover::default();
+        let never = FakeBacking {
+            servable: HashSet::new(),
+            fail: true,
+        };
+
+        let report = reclaim_failed(&log, &never, &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(report, FailedReclaimReport::default());
+    }
+
+    #[tokio::test]
+    async fn a_failing_worklist_read_removes_nothing() {
+        let log = FakeLog {
+            candidates: vec![part(1)],
+            fail: true,
+            asked: Mutex::new(Vec::new()),
+        };
+        let remover = FakeRemover::default();
+
+        let err = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ReclaimError::Log(_)));
+        assert!(remover.removed.lock().unwrap().is_empty());
     }
 }

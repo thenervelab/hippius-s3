@@ -25,7 +25,7 @@ use crate::worker::drain_until_empty;
 use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, EvictionPass, EvictionTarget,
     NodeId, NodeObservation, PartReplicationStore, ReclaimError, ReclaimGraces, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket,
-    UploadEnqueuer, decay_rate, evict_to_target, jittered, reclaim_ssd, reconcile_parts,
+    UploadEnqueuer, decay_rate, evict_to_target, jittered, reclaim_failed, reclaim_ssd, reconcile_parts,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -88,6 +88,9 @@ pub struct RuntimeConfig {
     pub reconcile_poll: Duration,
     /// How often the reclaim worker scans the SSD for `failed` (abandoned-upload) parts.
     pub reclaim_poll: Duration,
+    /// How often the DB-driven `failed`-part reclaim runs. Independent of the reclaim WALK:
+    /// decoupling debris cleanup from the walk is the point, so the walk can be rare.
+    pub failed_reclaim_poll: Duration,
     /// How often the landed-part announcement queue is drained. Short: this is the discovery
     /// latency for a freshly-written part, the role the 15 s reconciler walk used to fill, and
     /// an empty queue costs one `RPOP`.
@@ -555,6 +558,48 @@ async fn redrive_corrupt_once(store: &Store, snapshot: &SnapshotCell, max_attemp
     }
 }
 
+/// Aged `failed` parts adjudicated per DB-driven reclaim pass. Bounded so one pass is a small
+/// indexed query plus one batched servability read, never a sweep of a pathological backlog.
+const FAILED_RECLAIM_BATCH: u32 = 512;
+
+/// One DB-driven `failed`-reclaim pass: unlink this node's aged abandoned-upload debris.
+///
+/// The walk used to find these by scanning every part on the SSD and asking the database about
+/// each one — work proportional to the whole tree (2.28 M parts on prod after retention) to find
+/// a population that is tiny and directly queryable (22,123 `failed` rows fleet-wide). This asks
+/// for them instead, which is why the walk's cadence could drop to hourly without leaving debris
+/// on the disk for an hour.
+///
+/// Errors log and retry next poll. Every failure mode here removes NOTHING: the worklist read,
+/// the servability read, and the unlink each abort the pass rather than proceeding on a
+/// half-answered question.
+async fn failed_reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, grace: Duration) {
+    match reclaim_failed(store, store, ssd, grace, FAILED_RECLAIM_BATCH).await {
+        Ok(report) => {
+            snapshot.record_reclaimed(report.reclaimed);
+            if report.reclaimed > 0 {
+                tracing::info!(reclaimed = report.reclaimed, "reclaimed broken/abandoned-upload SSD parts");
+            }
+            // R4: the part is a live object's last good source because its pool copy is corrupt.
+            // Same signal the walk's `skipped_corrupt` carries — a standing nonzero value across
+            // cycles is the incident, not a single pass.
+            if report.held_servable > 0 {
+                tracing::warn!(
+                    held_servable = report.held_servable,
+                    "corrupt-live SSD parts held (pool copy corrupt) — last good source preserved (R4)"
+                );
+            }
+        }
+        // A backing-read abort leaves every candidate unjudged, so the pass removed nothing and
+        // this GC is DISABLED rather than merely slow — the same distinction the walk draws.
+        Err(ReclaimError::Backing(err)) => {
+            snapshot.record_reclaim_backing_error();
+            tracing::error!(error = %err, "failed-part reclaim disabled: object-backing read failed; removed nothing");
+        }
+        Err(err) => tracing::warn!(error = ?err, "failed-part reclaim pass failed; will retry next poll"),
+    }
+}
+
 /// Announcements drained per landed-queue poll. Generous: the work per message is one
 /// idempotent UPSERT, and a burst (a large multipart upload completing) should be absorbed in
 /// one tick rather than trickled at the poll rate, which is what a small batch would do.
@@ -945,6 +990,20 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             run_periodic(token, evict_poll, move || {
                 let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
                 async move { evict_once(&ssd, &store, &snapshot, evict_policy).await }
+            })
+        });
+
+        // Failed-part reclaim worker: unlink aged abandoned-upload debris, found by an indexed
+        // query rather than by walking the disk. Separate from the reclaim WALK above and on its
+        // own poll deliberately — decoupling debris cleanup from the walk is what let the walk
+        // drop to hourly without leaving debris around for an hour.
+        let (ssd, store, snapshot) = (Arc::clone(&self.ssd), Arc::clone(&self.store), Arc::clone(&self.snapshot));
+        let failed_reclaim_poll = self.config.failed_reclaim_poll;
+        let failed_grace = self.config.reclaim_grace;
+        supervisor.spawn(WorkerName::new("failed_reclaim"), move |token| {
+            run_periodic(token, failed_reclaim_poll, move || {
+                let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
+                async move { failed_reclaim_once(&ssd, &store, &snapshot, failed_grace).await }
             })
         });
 
@@ -1426,6 +1485,7 @@ mod tests {
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
@@ -1519,6 +1579,7 @@ mod tests {
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
@@ -1646,6 +1707,7 @@ mod tests {
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
@@ -1719,6 +1781,7 @@ mod tests {
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
@@ -1775,6 +1838,7 @@ mod tests {
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
                 landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,

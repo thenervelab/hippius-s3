@@ -1185,6 +1185,55 @@ impl ResidentLog for Store {
 }
 
 impl Store {
+    /// This node's `failed` parts older than `grace`, oldest first, at most `limit`.
+    ///
+    /// Node-scoped: a part lives only on the SSD of the node that ingested it, so another node's
+    /// `failed` row names a file this agent cannot unlink. Without a node id (the allocator)
+    /// there is nothing to reclaim.
+    ///
+    /// **Candidates only.** Servability — "is this the last good copy of a live object?" — is
+    /// deliberately absent: [`BackingLog::servable_parts`](crate::BackingLog::servable_parts)
+    /// owns that predicate, and it already carries a MUST-stay-in-lockstep warning shared with
+    /// `janitor_part_terminally_abandoned.sql` and the A21 sweep. A third copy here is how such
+    /// a warning gets quietly broken, and the failure mode is deleting a live object's last good
+    /// source. [`reclaim_failed`](crate::reclaim_failed) applies the guard to what this returns.
+    ///
+    /// `updated_at` is the store clock, so the grace has no agent-clock dependence — the same
+    /// property the walk-driven path relied on. Oldest first so a backlog drains in age order
+    /// rather than starving its own tail.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the query fails.
+    pub async fn reclaimable_failed_parts_impl(&self, grace: Duration, limit: u32) -> Result<Vec<PartKey>> {
+        let Some(node) = self.node_id.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT object_id, version, part_number \
+             FROM cephor_replication_status \
+             WHERE node_id = $1 AND status = 'failed' AND updated_at < now() - make_interval(secs => $2) \
+             ORDER BY updated_at \
+             LIMIT $3",
+        )
+        .bind(node)
+        .bind(grace.as_secs_f64())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|(object_id, version, part_number)| {
+                PartRow {
+                    object_id,
+                    version,
+                    part_number,
+                }
+                .into_part()
+            })
+            .collect()
+    }
+
     /// Records that `part` is now resident on this node's SSD, with its size for the eviction
     /// cursor's accounting.
     ///
@@ -1264,6 +1313,10 @@ impl Store {
 
 impl ReclaimLog for Store {
     type Error = StoreError;
+
+    async fn reclaimable_failed_parts(&self, grace: Duration, limit: u32) -> Result<Vec<PartKey>> {
+        self.reclaimable_failed_parts_impl(grace, limit).await
+    }
 
     async fn part_states(&self, parts: &[PartKey]) -> Result<HashMap<PartKey, PartStatusAge>> {
         let mut out = HashMap::with_capacity(parts.len());
@@ -3028,5 +3081,80 @@ mod part_tests {
             None,
             "the stamped row was GC'd",
         );
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod failed_worklist_tests {
+    use super::{PartKey, Store};
+    use crate::apipart::{ObjectId, PartNumber, Version};
+    use crate::ssd_reclaim::ReclaimLog;
+    use core::str::FromStr;
+    use core::time::Duration;
+    use sqlx::postgres::PgPool;
+
+    const UUID_A: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+
+    fn part(n: u32) -> PartKey {
+        PartKey::new(ObjectId::from_str(UUID_A).unwrap(), Version::new(1), PartNumber::new(n))
+    }
+
+    /// Seeds a replication row with an explicit age, so grace boundaries are exact.
+    async fn seed(pool: &PgPool, n: i64, status: &str, node: &str, age_secs: f64) {
+        sqlx::query(
+            "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id, updated_at) \
+             VALUES ($1, 1, $2, $3, $4, now() - make_interval(secs => $5))",
+        )
+        .bind(UUID_A)
+        .bind(n)
+        .bind(status)
+        .bind(node)
+        .bind(age_secs)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn the_worklist_is_node_scoped_aged_and_failed_only(pool: PgPool) {
+        // Three independent filters, each load-bearing. Node scope: a peer's `failed` row names
+        // a file this agent cannot unlink. Grace: the diagnosis / abort-settle window. Status:
+        // everything else is either live (drain-owned), retained read tier, or the R4 corrupt
+        // hold — none of it this worker's to delete.
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        seed(&pool, 1, "failed", "node-a", 7200.0).await; // aged, ours   -> candidate
+        seed(&pool, 2, "failed", "node-a", 60.0).await; // young, ours   -> held by grace
+        seed(&pool, 3, "failed", "node-b", 7200.0).await; // aged, peer's -> not ours to touch
+        seed(&pool, 4, "replicated", "node-a", 7200.0).await; // the read tier
+        seed(&pool, 5, "pending", "node-a", 7200.0).await; // live, drain-owned
+        seed(&pool, 6, "corrupt", "node-a", 7200.0).await; // R4 hold, never reclaimed
+
+        let got = store.reclaimable_failed_parts(Duration::from_hours(1), 100).await.unwrap();
+
+        assert_eq!(got, vec![part(1)], "only this node's aged failed part is a candidate");
+    }
+
+    #[sqlx::test]
+    async fn the_worklist_is_oldest_first_and_honours_the_limit(pool: PgPool) {
+        // Oldest first so a backlog drains in age order rather than starving its own tail — the
+        // same property the eviction cursor needs, for the same reason.
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        seed(&pool, 1, "failed", "node-a", 7200.0).await;
+        seed(&pool, 2, "failed", "node-a", 90000.0).await;
+        seed(&pool, 3, "failed", "node-a", 10800.0).await;
+
+        let got = store.reclaimable_failed_parts(Duration::from_hours(1), 2).await.unwrap();
+
+        assert_eq!(got, vec![part(2), part(3)], "oldest first, capped at the limit");
+    }
+
+    #[sqlx::test]
+    async fn an_agent_with_no_node_id_reclaims_nothing(pool: PgPool) {
+        // The allocator shares this Store type but holds no node identity and owns no disk.
+        let store = Store::from_pool(pool.clone());
+        seed(&pool, 1, "failed", "node-a", 7200.0).await;
+
+        assert!(store.reclaimable_failed_parts(Duration::from_hours(1), 100).await.unwrap().is_empty());
     }
 }
