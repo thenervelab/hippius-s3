@@ -397,7 +397,12 @@ class Config:
     # concurrent peer requests this pod will SERVE. Both are needed — the client cap bounds
     # what one pod sends, but five pods each within their own cap still add up at the peer,
     # so the serving side sheds with 503 to protect its own ingest.
-    peer_fetch_max_inflight: int = env("HIPPIUS_PEER_FETCH_MAX_INFLIGHT:8", convert=int)
+    # Must be >= http_stream_prefetch_chunks. Every chunk of one PART resolves to the same
+    # peer, so a cap below the prefetch depth makes a single reader shed its own window to the
+    # pool and book it as `client_cap` contention that does not exist. `effective_max_inflight`
+    # enforces that floor at wiring time, so a stale value degrades to a warning, not a
+    # silently halved peer tier.
+    peer_fetch_max_inflight: int = env("HIPPIUS_PEER_FETCH_MAX_INFLIGHT:16", convert=int)
     peer_serve_max_inflight: int = env("HIPPIUS_PEER_SERVE_MAX_INFLIGHT:16", convert=int)
     # 24h since last WRITE — the read path no longer bumps timestamps (read
     # recency lives in fs_cache_inventory.last_access_at), so this gates on

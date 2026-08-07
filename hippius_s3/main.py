@@ -37,6 +37,7 @@ from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
 from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
+from hippius_s3.cache.peers import effective_max_inflight
 from hippius_s3.cache.residency import create_residency_recorder
 from hippius_s3.config import Config
 from hippius_s3.config import get_config
@@ -164,7 +165,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 app.state.peer_registry,
                 node_name,
                 app.state.peer_http,
-                max_inflight=config.peer_fetch_max_inflight,
+                # Floored at the prefetch depth: chunks of one part all resolve to the same
+                # peer, so a lower cap has a single reader shedding its own window to the pool.
+                max_inflight=effective_max_inflight(
+                    config.peer_fetch_max_inflight,
+                    config.http_stream_prefetch_chunks,
+                ),
             )
             # Serving-side cap, read by the /internal/parts endpoint. Set whenever peer fetch
             # is on, since a node that fetches from peers is also one peers fetch from.

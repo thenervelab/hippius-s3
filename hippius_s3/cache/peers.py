@@ -56,7 +56,44 @@ _OWNER_MEMO_ENTRIES = 50_000
 # other node's reads onto that node's api pod — the same uvicorn serving its own ingest. The
 # cap SKIPS to the pool rather than queueing, because waiting behind a saturated peer would
 # add its latency on top of the pool read that follows.
-_DEFAULT_MAX_INFLIGHT_PER_PEER = 8
+#
+# Must be >= HTTP_STREAM_PREFETCH_CHUNKS or a single reader sheds its own prefetch window —
+# see `effective_max_inflight`, which enforces that floor at wiring time regardless of config.
+_DEFAULT_MAX_INFLIGHT_PER_PEER = 16
+
+
+def effective_max_inflight(configured: int, prefetch_chunks: int) -> int:
+    """The per-peer cap, raised to at least the read path's prefetch depth.
+
+    Every chunk of one PART resolves to the same peer, and the streamer keeps up to
+    `HTTP_STREAM_PREFETCH_CHUNKS` chunk fetches in flight. So whenever the cap is below the
+    prefetch depth, a **single reader of a single part sheds its own excess to the pool** and
+    books it as `client_cap` — contention that does not exist. Shipped defaults were 8 against
+    a prefetch of 16, so half of every part over 32 MiB (8 chunks at 4 MiB) went to CephFS
+    while the peer sat idle.
+
+    Deriving the floor rather than validating it is deliberate: an invariant that must hold
+    between two independently-tuned knobs is one somebody eventually breaks, and the failure is
+    silent — reads still succeed, just slower and against the wrong tier. Raising is safe
+    because the *serving* side has its own cap and sheds with 503, so the peer stays protected
+    however high a client goes.
+
+    **What this does not fix.** The semaphore is per (pod, peer) and shared across every reader
+    on the pod, so under concurrent readers the cap still binds — it just moves the shedding
+    from `client_cap` to `server_busy` at the peer. Aggregate client demand is
+    `(pods - 1) x cap` against one `HIPPIUS_PEER_SERVE_MAX_INFLIGHT`, which on a 5-node fleet is
+    oversubscribed by design: Ceph is the intended overflow valve. This only removes the case
+    where a reader competes with *itself*.
+    """
+    if configured >= prefetch_chunks:
+        return configured
+    logger.warning(
+        "raising HIPPIUS_PEER_FETCH_MAX_INFLIGHT from %d to %d to match HTTP_STREAM_PREFETCH_CHUNKS: "
+        "a cap below the prefetch depth makes a single reader shed its own chunks to the pool",
+        configured,
+        prefetch_chunks,
+    )
+    return prefetch_chunks
 
 
 def _record_shed(reason: PeerShedReason) -> None:
@@ -214,14 +251,12 @@ class PeerChunkFetcher:
         # itself is the semaphore; this only avoids QUEUEING behind a saturated peer, since
         # waiting would stack that peer's backlog on top of the pool read that follows anyway.
         #
-        # NOTE this cap is per (pod, peer) and the read path prefetches
-        # `HTTP_STREAM_PREFETCH_CHUNKS` chunks at a time. Chunks of ONE part all resolve to the
-        # same peer, so for a part with more chunks than `HIPPIUS_PEER_FETCH_MAX_INFLIGHT` a
-        # single reader sheds its own excess to the pool and books it as `client_cap` —
-        # contention that is not contention. Harmless (the pool is the correct fallback) but it
-        # understates the peer tier in `chunk_reads_by_tier_total`, so keep the two values in
-        # mind together when reading the soak. Most parts are a single chunk, so this only
-        # bites large multipart objects.
+        # This cap is per (pod, peer) and SHARED across every reader on the pod, so a shed here
+        # means genuine contention — several readers converging on one peer. It used to mean
+        # something weaker as well: with the cap below `HTTP_STREAM_PREFETCH_CHUNKS`, one reader
+        # of one part shed its own prefetch window, because every chunk of a part resolves to
+        # the same peer. `effective_max_inflight` now floors the cap at the prefetch depth, so
+        # that case is gone and a `client_cap` count is trustworthy as a contention signal.
         if slots.locked():
             _record_shed("client_cap")
             return None

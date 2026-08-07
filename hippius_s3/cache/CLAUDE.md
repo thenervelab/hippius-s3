@@ -33,6 +33,19 @@ peer fanout — `HIPPIUS_PEER_FETCH_MAX_INFLIGHT` per (pod, peer) on the client,
 `HIPPIUS_PEER_SERVE_MAX_INFLIGHT` on the serving pod, which sheds with 503. Both shed to the
 pool rather than queueing.
 
+**The client cap must be ≥ `HTTP_STREAM_PREFETCH_CHUNKS`.** Every chunk of one PART resolves to
+the same peer, so a lower cap makes a single reader shed its own prefetch window to the pool and
+book it as `client_cap` — contention that does not exist. `effective_max_inflight` floors it at
+the prefetch depth at wiring time, so a stale config degrades to a startup warning rather than a
+silently halved peer tier. It does **not** add peer capacity: the semaphore is shared across
+readers on the pod, so under concurrency shedding just moves to the peer's `server_busy`.
+
+Promotion is gated on free space (`HIPPIUS_PROMOTE_MIN_FREE_RATIO`, default 0.175) because it
+shares the ingest mount with PUTs — `HIPPIUS_OBJECT_CACHE_DIR` is the drain agent's
+`CEPHOR_SSD_ROOT` and the mount `fs_cache_pressure` measures. The floor must sit strictly inside
+the evictor's band, above its reserve (0.150) and below its target (0.200), or promotion either
+chatters or deadlocks permanently; `validate_promotion_band` enforces that at startup.
+
 **The evictor runs in a different process** (`drain-agent`) and deletes both the part directory
 and its residency row. Nothing in this package may cache "I already recorded/wrote this" across
 that boundary — it cannot be invalidated when the row disappears. Check on-disk state instead;
