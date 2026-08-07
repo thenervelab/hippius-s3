@@ -21,4 +21,11 @@ def peer_auth_matches(presented: str | None, expected: str) -> bool:
     """
     if not presented or not expected:
         return False
-    return hmac.compare_digest(presented, expected)
+    # Compared as BYTES, never as str. `hmac.compare_digest` supports only ASCII when handed str,
+    # and Starlette decodes header values as latin-1, so a header carrying any byte >= 0x80 arrives
+    # here as a non-ASCII str and raises TypeError — surfacing as a 500 that confirms this route is
+    # mounted, which is the existence oracle the endpoint's 404 exists to deny.
+    #
+    # errors="replace" cannot raise and cannot manufacture a match: the configured secret is hex,
+    # so it contains no "?" for a replacement character to collide with.
+    return hmac.compare_digest(presented.encode("latin-1", errors="replace"), expected.encode("utf-8"))

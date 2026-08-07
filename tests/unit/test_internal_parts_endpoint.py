@@ -227,3 +227,53 @@ async def test_an_unset_secret_refuses_everyone_rather_than_disabling_the_check(
         any_header = await client.get(f"/internal/parts/{OBJ}/1/1/chunks/0", headers=AUTH)
 
     assert [r.status_code for r in (no_header, empty_header, any_header)] == [404, 404, 404]
+
+
+@pytest.mark.asyncio
+async def test_a_non_ascii_secret_is_refused_as_a_miss_not_a_server_error(tmp_path) -> None:
+    """A refusal must stay indistinguishable from a miss even for bytes no client should send.
+
+    `hmac.compare_digest` supports only ASCII when handed `str`, and Starlette decodes header
+    values as latin-1, so any byte >= 0x80 arrives as a non-ASCII `str` and raises TypeError.
+    That surfaces as a 500 — which tells the caller this route is mounted, defeating the exact
+    existence oracle the 404 above exists to deny, and burns an unhandled exception per request
+    on the pod that is also serving ingest.
+
+    The header is injected as RAW BYTES through the ASGI scope on purpose: httpx ascii-encodes
+    header values and raises before the request is ever sent, so the same assertion written
+    against the test client passes vacuously and proves nothing.
+    """
+    store = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))
+    await _write_part(store, part_number=1, chunk=b"local-bytes")
+    app = _app_with_secret(store, SECRET)
+
+    path = f"/internal/parts/{OBJ}/1/1/chunks/0"
+    statuses: list[int] = []
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict) -> None:
+        if message["type"] == "http.response.start":
+            statuses.append(message["status"])
+
+    await app(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "scheme": "http",
+            "client": ("10.0.0.5", 1234),
+            "server": ("api", 8000),
+            "headers": [(b"host", b"peer"), (PEER_AUTH_HEADER.lower().encode(), b"\xff" * 8)],
+        },
+        receive,
+        send,
+    )
+
+    assert statuses == [404], "a non-ASCII secret must read as a miss, not a 500 that confirms the route"
