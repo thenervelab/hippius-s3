@@ -22,10 +22,15 @@ def _parse_cidrs(value: str | None) -> tuple[IpNetwork, ...]:
     return tuple(ipaddress.ip_network(part.strip()) for part in str(value or "").split(",") if part.strip())
 
 
-# RFC1918 plus loopback. Deliberately NOT pinned to any one cluster's pod/service ranges: a CIDR
-# that does not cover the gateway 403s every forwarded request and takes the whole api down, so
-# the default has to be the safe superset and narrowing it is an opt-in per deployment.
-_DEFAULT_IP_WHITELIST_CIDRS = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1/32,::1/128"
+# Deliberately NOT pinned to any one cluster's pod/service ranges: a CIDR that does not cover the
+# gateway 403s every forwarded request and takes the whole api down, so narrowing this is an opt-in
+# per deployment rather than a default.
+#
+# 192.168.0.0/16 is RFC1918 but is deliberately absent, and should not be "restored" on the grounds
+# that it completes the set. Nothing here uses it — k8s pod networks are 10.x and docker-compose
+# bridges land in 172.16/12 — and this list is the api's authorization boundary, so an unused range
+# is boundary we are carrying for free. A deployment that genuinely needs it adds one entry.
+_DEFAULT_IP_WHITELIST_CIDRS = "10.0.0.0/8,172.16.0.0/12,127.0.0.1/32,::1/128"
 
 
 def _parse_csv_urls(value: str | None) -> list[str]:

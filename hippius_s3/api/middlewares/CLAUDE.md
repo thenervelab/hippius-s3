@@ -31,9 +31,11 @@ Threshold is configurable (see [hippius_s3/config.py](../../config.py)); today i
 
 ## [ip_whitelist.py](ip_whitelist.py) — `ip_whitelist_middleware`
 
-Defence-in-depth: the API rejects with 403 any client address outside `API_IP_WHITELIST_CIDRS` (comma-separated CIDRs, default `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1/32,::1/128` — RFC1918 plus loopback). `/health` is exempt so kubelet can probe from the node IP. Normally k8s NetworkPolicy provides the primary barrier — this is belt-and-braces for when the policy is misconfigured or the API is port-forwarded during debug.
+Defence-in-depth: the API rejects with 403 any client address outside `API_IP_WHITELIST_CIDRS` (comma-separated CIDRs, default `10.0.0.0/8,172.16.0.0/12,127.0.0.1/32,::1/128`). `/health` is exempt so kubelet can probe from the node IP. Normally k8s NetworkPolicy provides the primary barrier — this is belt-and-braces for when the policy is misconfigured or the API is port-forwarded during debug.
 
-The list is parsed into `ipaddress` network objects once, when the Config singleton is built, and an unparseable client address is a 403 rather than a 500. Narrow it to the real pod/service CIDRs per deployment if you want a tighter boundary; a value that fails to cover the gateway 403s every forwarded request and takes the API down, which is why the default is the safe superset.
+Note RFC1918's middle block is `172.16.0.0/12`, **not** all of `172/8` — `172.15.x` and `172.32.x` are public address space. `192.168.0.0/16` is RFC1918 but deliberately excluded: nothing here runs on it (pod networks are 10.x, docker-compose bridges land in 172.16/12), and this list is the API's authorization boundary, so an unused range is boundary carried for free.
+
+The list is parsed into `ipaddress` network objects once, when the Config singleton is built, and an unparseable client address is a 403 rather than a 500. IPv4-mapped IPv6 addresses are normalised first (`::ffff:10.0.0.1` → `10.0.0.1`), so a dual-stack listener does not 403 every forwarded request and take the API down. Narrow the list to the real pod/service CIDRs per deployment if you want a tighter boundary; a value that fails to cover the gateway takes the API down, which is why the default is not pinned to one cluster's ranges.
 
 ## [metrics.py](metrics.py) — `metrics_middleware`
 

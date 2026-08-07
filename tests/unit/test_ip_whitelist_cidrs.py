@@ -51,7 +51,10 @@ async def _admitted(client_ip: str | None, path: str = "/some-bucket/key") -> bo
         # 10.0.0.0/8 and its lower boundary.
         ("10.0.0.1", True),
         ("9.255.255.255", False),
-        ("192.168.1.1", True),
+        # RFC1918 but deliberately not in the default: nothing here runs on 192.168/16, and an
+        # unused range is authorization boundary carried for free. Denied on purpose, not by
+        # oversight — see _DEFAULT_IP_WHITELIST_CIDRS.
+        ("192.168.1.1", False),
         ("127.0.0.1", True),
         ("::1", True),
         # Anything unparseable must fail closed rather than raise.
@@ -61,6 +64,23 @@ async def _admitted(client_ip: str | None, path: str = "/some-bucket/key") -> bo
     ],
 )
 async def test_only_private_ranges_are_admitted(client_ip: str, expected: bool) -> None:
+    assert await _admitted(client_ip) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("client_ip", "expected"),
+    [
+        ("::ffff:10.0.0.1", True),
+        ("::ffff:127.0.0.1", True),
+        ("::ffff:172.15.255.255", False),
+        ("::ffff:203.0.113.7", False),
+    ],
+)
+async def test_ipv4_mapped_addresses_decide_the_same_as_their_ipv4_form(client_ip: str, expected: bool) -> None:
+    """A dual-stack listener reports the gateway as ::ffff:10.0.0.1. That is the same host as
+    10.0.0.1, so it has to reach the same verdict — admitting it is correctness, and the denied
+    cases prove normalising the form does not blanket-admit the mapped range."""
     assert await _admitted(client_ip) is expected
 
 

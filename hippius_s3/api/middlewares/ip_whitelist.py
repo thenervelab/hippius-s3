@@ -48,6 +48,14 @@ async def ip_whitelist_middleware(
     except ValueError:
         return _denied(f"Denied request from unparseable client IP: {client_ip!r}")
 
+    # A dual-stack listener reports the gateway as ::ffff:10.0.0.1, which matches no IPv4 network —
+    # so without this every forwarded request 403s and the api is hard-down from a listener config
+    # change whose symptom looks nothing like its cause. The mapped form is a representation of the
+    # same host, not a separate address class, so normalising it makes the check correct rather than
+    # more permissive: ::ffff:172.15.0.1 is still denied.
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+
     if not any(address in network for network in get_config().api_ip_whitelist_cidrs):
         return _denied(f"Denied request from non-internal IP: {client_ip}")
 
