@@ -89,6 +89,15 @@ pub struct AgentSnapshot {
     pub deferred: u64,
     /// Chunks the reconciler recovered after a dropped `chunk_landed` trigger.
     pub reconciler_recovered: u64,
+    /// Parts recorded from the api's landed-part announcements — the fast discovery path.
+    /// Read together with `reconciler_recovered`: this climbing while that stays near zero is
+    /// what says the announcement path is carrying discovery. Both near zero means ingest
+    /// stopped, not that the fast path is working.
+    pub landed_recorded: u64,
+    /// Announcements dropped as unparseable. Must stay at zero; nonzero means the api and the
+    /// agent disagree about the wire contract, in which case every message is being lost and
+    /// discovery has silently fallen back to the reconciler's walk.
+    pub landed_dropped: u64,
     /// `failed` (broken/abandoned-upload) SSD parts the reclaim worker unlinked — the
     /// SSD-ingest tier's eviction throughput, distinct from the drain's `CephFS` work.
     pub reclaimed: u64,
@@ -158,6 +167,8 @@ pub struct SnapshotCell {
     failed: AtomicU64,
     deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
+    landed_recorded: AtomicU64,
+    landed_dropped: AtomicU64,
     reclaimed: AtomicU64,
     /// Resident parts the read-tier evictor unlinked, and the bytes they freed. Separate from
     /// `reclaimed` (debris the reclaim worker removed) because the two answer different
@@ -251,6 +262,12 @@ impl SnapshotCell {
     /// Adds `n` to the reconciler-recovered total.
     pub fn record_reconciled(&self, n: u64) {
         self.reconciler_recovered.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records one landed-announcement batch: `recorded` parts written, `dropped` unparseable.
+    pub fn record_landed(&self, recorded: u64, dropped: u64) {
+        self.landed_recorded.fetch_add(recorded, Ordering::Relaxed);
+        self.landed_dropped.fetch_add(dropped, Ordering::Relaxed);
     }
 
     /// Adds `n` to the SSD-reclaim total (terminal parts the reclaim worker unlinked).
@@ -448,6 +465,8 @@ impl SnapshotCell {
             failed: self.failed.load(Ordering::Relaxed),
             deferred: self.deferred.load(Ordering::Relaxed),
             reconciler_recovered: self.reconciler_recovered.load(Ordering::Relaxed),
+            landed_recorded: self.landed_recorded.load(Ordering::Relaxed),
+            landed_dropped: self.landed_dropped.load(Ordering::Relaxed),
             reclaimed: self.reclaimed.load(Ordering::Relaxed),
             reclaim_backing_errors: self.reclaim_backing_errors.load(Ordering::Relaxed),
             throttled: self.throttled.load(Ordering::Relaxed),
@@ -606,6 +625,8 @@ mod tests {
                 failed: 1,
                 deferred: 0,
                 reconciler_recovered: 4,
+                landed_recorded: 0,
+                landed_dropped: 0,
                 reclaimed: 6,
                 reclaim_backing_errors: 0,
                 throttled: 9,
@@ -672,6 +693,8 @@ mod tests {
             failed: u64::MAX,
             deferred: 0,
             reconciler_recovered: 0,
+            landed_recorded: 0,
+            landed_dropped: 0,
             reclaimed: 0,
             reclaim_backing_errors: 0,
             throttled: 0,
@@ -688,6 +711,8 @@ mod tests {
             failed: 3,
             deferred: 0,
             reconciler_recovered: 0,
+            landed_recorded: 0,
+            landed_dropped: 0,
             reclaimed: 0,
             reclaim_backing_errors: 0,
             throttled: 0,

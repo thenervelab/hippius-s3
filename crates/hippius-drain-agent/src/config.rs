@@ -112,6 +112,11 @@ const DEFAULT_EVICT_BATCH: u32 = 512;
 /// starvation: a deficit spanning many passes is the design, not a fault.
 const DEFAULT_EVICT_MAX_PASS: Duration = Duration::from_secs(10);
 
+/// Landed-announcement poll when `CEPHOR_LANDED_POLL_SECS` is unset. This is the discovery
+/// latency for a freshly-written part — the job the 15 s reconciler walk used to do — so it is
+/// short. An empty queue costs one RPOP, so polling fast is close to free.
+const DEFAULT_LANDED_POLL: Duration = Duration::from_secs(1);
+
 /// Default path of the liveness file the runtime touches each heartbeat tick; the
 /// k8s `livenessProbe` checks its freshness. Container-local `/tmp` is always writable.
 const DEFAULT_LIVENESS_FILE: &str = "/tmp/hippius-drain-agent.alive";
@@ -199,6 +204,9 @@ pub struct Config {
     pub evict_headroom_permille: u16,
     /// Rows fetched per eviction worklist query — the page size, not the pass budget.
     pub evict_batch: u32,
+    /// How often the landed-part announcement queue is drained (discovery latency for a
+    /// freshly-written part).
+    pub landed_poll: Duration,
     /// Wall-clock ceiling on one eviction pass; the remainder resumes on the next poll.
     pub evict_max_pass: Duration,
     /// Path of the liveness file the runtime touches each heartbeat tick; a k8s
@@ -281,6 +289,7 @@ impl Config {
             grace: self.grace,
             drain_concurrency: self.drain_concurrency,
             redrive_max_attempts: self.redrive_max_attempts,
+            landed_poll: self.landed_poll,
             evict_poll: self.evict_poll,
             evict_policy: EvictionPolicy {
                 reserve_permille: self.evict_reserve_permille,
@@ -367,6 +376,7 @@ impl Config {
             evict_headroom_permille: permille_or(&get, "CEPHOR_EVICT_HEADROOM_PERMILLE", DEFAULT_EVICT_HEADROOM_PERMILLE)?,
             evict_batch: positive_u32_or(&get, "CEPHOR_EVICT_BATCH", DEFAULT_EVICT_BATCH)?,
             evict_max_pass: duration_secs(&get, "CEPHOR_EVICT_MAX_PASS_SECS", DEFAULT_EVICT_MAX_PASS)?,
+            landed_poll: duration_secs(&get, "CEPHOR_LANDED_POLL_SECS", DEFAULT_LANDED_POLL)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
             readiness_file: path_or(&get, "CEPHOR_READINESS_FILE", DEFAULT_READINESS_FILE),
         })

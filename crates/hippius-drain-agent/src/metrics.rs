@@ -166,6 +166,27 @@ pub fn init(service_name: &'static str, snapshot: &Arc<SnapshotCell>, enforcer: 
 
     register_ssd_tier_instruments(&meter, snapshot, &mut instruments);
 
+    // Discovery path split. `landed_recorded` climbing while `reconciler_recovered` stays near
+    // zero is what says the api's announcements are carrying discovery and the reconciler's
+    // whole-disk walk is genuinely idle. Both near zero means ingest stopped — NOT that the
+    // fast path is working — which is why the pair has to be read together.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_landed_recorded_total")
+            .with_callback(move |observer| observer.observe(snap.load().landed_recorded, &[]))
+            .build(),
+    ));
+    // Must stay at zero. Nonzero means the api and this agent disagree about the message shape,
+    // so every announcement is being discarded and discovery has silently reverted to the walk.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_landed_dropped_total")
+            .with_callback(move |observer| observer.observe(snap.load().landed_dropped, &[]))
+            .build(),
+    ));
+
     // Reclaim throughput: terminal SSD parts the reclaim worker unlinked (monotonic counter).
     // The SSD-ingest tier's eviction rate — distinct from the drain's CephFS throughput — so a
     // stalled reclaim (backlog rising while this stays flat) is visible without reading logs.

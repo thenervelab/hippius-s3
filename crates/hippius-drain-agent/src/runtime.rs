@@ -17,6 +17,7 @@
 //! `rust_quality_129_async_graceful_shutdown`).
 
 use crate::disk::{DiskUsage, disk_usage};
+use crate::landed::LandedQueue;
 use crate::localfs::{LocalFs, LocalSsd};
 use crate::readiness::ReadinessTracker;
 use crate::supervisor::{RunReport, Supervisor, WorkerName};
@@ -87,6 +88,10 @@ pub struct RuntimeConfig {
     pub reconcile_poll: Duration,
     /// How often the reclaim worker scans the SSD for `failed` (abandoned-upload) parts.
     pub reclaim_poll: Duration,
+    /// How often the landed-part announcement queue is drained. Short: this is the discovery
+    /// latency for a freshly-written part, the role the 15 s reconciler walk used to fill, and
+    /// an empty queue costs one `RPOP`.
+    pub landed_poll: Duration,
     /// How often the read-tier evictor checks the ingest disk's free space.
     pub evict_poll: Duration,
     /// The free-space floor the evictor maintains, and how far past it to free.
@@ -545,6 +550,53 @@ async fn redrive_corrupt_once(store: &Store, snapshot: &SnapshotCell, max_attemp
     }
 }
 
+/// Announcements drained per landed-queue poll. Generous: the work per message is one
+/// idempotent UPSERT, and a burst (a large multipart upload completing) should be absorbed in
+/// one tick rather than trickled at the poll rate, which is what a small batch would do.
+const LANDED_POP_BATCH: usize = 512;
+
+/// One landed-queue pass: record every part the api announced since the last tick.
+///
+/// This is the fast discovery path that replaces the reconciler's whole-disk walk. It is
+/// deliberately thin — pop, record, count — because everything that makes discovery *correct*
+/// still lives in the reconciler, which remains as the backstop for any announcement that was
+/// never delivered.
+///
+/// Failures are logged and dropped rather than retried in-tick: a Redis error leaves the
+/// entries queued for the next poll, and a `record_landed_part` error leaves the part for the
+/// reconciler. Neither can lose the part, because the disk is the source of truth in both cases.
+async fn landed_once(queue: &LandedQueue, store: &Store, snapshot: &SnapshotCell) {
+    let (parts, dropped) = match queue.pop(LANDED_POP_BATCH).await {
+        Ok(batch) => batch,
+        Err(err) => {
+            tracing::warn!(error = %err, "landed-queue read failed; entries stay queued for the next poll");
+            return;
+        }
+    };
+    if parts.is_empty() && dropped == 0 {
+        return;
+    }
+    let mut recorded = 0u64;
+    for part in &parts {
+        // Idempotent, and the same call the reconciler makes — so an announcement racing the
+        // backstop is a no-op rather than a conflict.
+        match store.record_landed_part(part).await {
+            Ok(()) => recorded += 1,
+            Err(err) => tracing::warn!(error = %err, "recording an announced part failed; the reconciler will recover it"),
+        }
+    }
+    snapshot.record_landed(recorded, dropped);
+    if dropped > 0 {
+        // The api and this agent disagree about the message shape, so EVERY announcement is
+        // being lost and discovery has silently fallen back to the reconciler's walk — the
+        // thing this path exists to avoid. Loud, because nothing else would show it.
+        tracing::error!(dropped, "landed announcements were unparseable; the api/agent wire contract has diverged");
+    }
+    if recorded > 0 {
+        tracing::debug!(recorded, "recorded announced parts");
+    }
+}
+
 /// How many replicated-but-unenqueued parts one enqueue-sweep pass publishes. Bounded so a
 /// large post-CompleteMPU burst is drained over a few passes rather than one giant query +
 /// Redis fan-out; the partial index keeps each scan cheap, and the leftover is picked up on
@@ -708,6 +760,10 @@ pub struct AgentRuntime<E: UploadEnqueuer> {
     /// Opt-in readiness file the heartbeat worker touches only while the drain is progressing
     /// (C8), for the k8s `readinessProbe`. `None` writes no file.
     readiness_path: Option<Arc<PathBuf>>,
+    /// Opt-in landed-part announcement queue. `None` (tests, and any deployment whose api does
+    /// not publish yet) leaves the reconciler as the sole discovery path — i.e. today's
+    /// behaviour — so the two sides roll independently.
+    landed: Option<LandedQueue>,
 }
 
 impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
@@ -728,6 +784,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             clock: Arc::new(SystemClock),
             liveness_path: None,
             readiness_path: None,
+            landed: None,
         }
     }
 
@@ -782,6 +839,15 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
     #[must_use]
     pub fn with_readiness(mut self, path: PathBuf) -> Self {
         self.readiness_path = Some(Arc::new(path));
+        self
+    }
+
+    /// Enables the landed-announcement worker, so a part the api just wrote is discovered by
+    /// one `RPOP` rather than by the reconciler's walk of the whole SSD tree. Without it the
+    /// reconciler remains the sole trigger, which is exactly the pre-announcement behaviour.
+    #[must_use]
+    pub fn with_landed_queue(mut self, queue: LandedQueue) -> Self {
+        self.landed = Some(queue);
         self
     }
 
@@ -868,6 +934,22 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
                 async move { evict_once(&ssd, &store, &snapshot, evict_policy).await }
             })
         });
+
+        // Landed-announcement worker (opt-in): record parts the api says it just wrote, so
+        // discovery costs one RPOP instead of a walk of the node's entire replicated shard
+        // (2.28 M parts on prod). Without a queue configured the agent behaves exactly as
+        // before — the reconciler is still the sole trigger — which is what makes the api-side
+        // publish and this consumer independently deployable in either order.
+        if let Some(queue) = self.landed.as_ref() {
+            let (queue, store, snapshot) = (queue.clone(), Arc::clone(&self.store), Arc::clone(&self.snapshot));
+            let landed_poll = self.config.landed_poll;
+            supervisor.spawn(WorkerName::new("landed"), move |token| {
+                run_periodic(token, landed_poll, move || {
+                    let (queue, store, snapshot) = (queue.clone(), Arc::clone(&store), Arc::clone(&snapshot));
+                    async move { landed_once(&queue, &store, &snapshot).await }
+                })
+            });
+        }
 
         // Enqueue-sweep worker: publish the backend upload for `replicated` parts whose
         // address was NULL at drain time (an in-flight MPU) — the decoupled counterpart to the
@@ -1330,6 +1412,7 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
@@ -1422,6 +1505,7 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
@@ -1548,6 +1632,7 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
@@ -1620,6 +1705,7 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
@@ -1675,6 +1761,7 @@ mod tests {
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
                 evict_poll: Duration::from_secs(30),
                 evict_policy: EvictionPolicy {
                     reserve_permille: 150,
