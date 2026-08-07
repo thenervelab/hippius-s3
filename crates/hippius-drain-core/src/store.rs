@@ -1144,17 +1144,28 @@ impl ResidentLog for Store {
         // which is the reclaimer's disposition (deleted-object orphan), not the evictor's. It is
         // excluded here and `prune_residency` clears the row when the reclaimer unlinks the part.
         //
-        // ORDER BY resident_at IS the eviction policy (FIFO, oldest-retained first); the
-        // orchestrator walks this order and never re-sorts. Reads off
-        // `cephor_ssd_residency_evict_idx`, so the cost is proportional to `limit` rather than
-        // to the resident set — the whole point of not using a filesystem walk here.
+        // THIS ORDER BY IS THE EVICTION POLICY; the orchestrator walks it and never re-sorts.
+        //
+        // Least-recently-USED, not least-recently-admitted. `resident_at` says when a part
+        // joined the cache, which says nothing about whether anyone is still reading it — that
+        // is FIFO, and FIFO is a poor fit here: a training set re-read every epoch is maximally
+        // skewed, so evicting by arrival order tends to take exactly the parts about to be read
+        // again, each costing a peer-or-pool read plus a local write to restore.
+        //
+        // COALESCE gives the fallback for free: a part nobody has read since 0017 shipped has no
+        // recency, and using its residency time is precisely the old behaviour. No backfill, and
+        // no window where the order is undefined.
+        //
+        // Must match `cephor_ssd_residency_recency_idx` expression-for-expression, or the
+        // planner sorts the whole ~2M-row resident set on every pass — reintroducing in Postgres
+        // the O(resident) cost this evictor exists to avoid.
         let rows = sqlx::query_as::<_, (String, i64, i64, String, i64)>(
             "SELECT r.object_id, r.version, r.part_number, s.status, r.bytes \
              FROM cephor_ssd_residency r \
              JOIN cephor_replication_status s \
                ON s.object_id = r.object_id AND s.version = r.version AND s.part_number = r.part_number \
              WHERE r.node_id = $1 AND s.status = 'replicated' \
-             ORDER BY r.resident_at \
+             ORDER BY COALESCE(r.last_read_at, r.resident_at) \
              LIMIT $2",
         )
         .bind(node)
@@ -2064,6 +2075,109 @@ mod part_tests {
         let after: Vec<u32> = store.evictable_parts(10).await.unwrap().iter().map(|r| r.part.part().get()).collect();
         assert_eq!(after, vec![1], "an evicted part leaves the worklist");
         assert_eq!(store.node_cache_bytes("node-a").await.unwrap(), 100, "and stops counting as cache");
+    }
+
+    #[sqlx::test]
+    async fn eviction_orders_on_last_read_falling_back_to_residency(pool: PgPool) {
+        // The Phase H property, and it fails on FIFO. `old_but_hot` joined the cache first, so
+        // arrival order would evict it — but it is the one still being read, which for a working
+        // set re-read every epoch is exactly the part about to be needed again. Evicting it costs
+        // a peer-or-pool read plus a local write to put it straight back.
+        //
+        // `never_read` has a NULL last_read_at and must fall back to its residency time, so the
+        // pre-0017 population still orders sanely with no backfill.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        for n in 1..=3 {
+            seed_status_node(&pool, UUID_A, 1, n, "replicated", "node-a").await;
+            seed_part_size(&pool, UUID_A, 1, n, Some(100)).await;
+        }
+        // part 1: resident longest, but read most recently -> must survive
+        // part 2: resident recently, never read            -> falls back to resident_at
+        // part 3: resident a while ago, read a while ago   -> the true LRU victim
+        sqlx::query(
+            "INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number, bytes, resident_at, last_read_at) VALUES \
+             ('node-a', $1, 1, 1, 100, now() - make_interval(hours => 10), now() - make_interval(mins => 1)), \
+             ('node-a', $1, 1, 2, 100, now() - make_interval(hours => 2),  NULL), \
+             ('node-a', $1, 1, 3, 100, now() - make_interval(hours => 9),  now() - make_interval(hours => 5))",
+        )
+        .bind(UUID_A)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let order: Vec<u32> = store.evictable_parts(10).await.unwrap().iter().map(|r| r.part.part().get()).collect();
+
+        assert_eq!(
+            order,
+            vec![3, 2, 1],
+            "least-recently-USED first: the hot part resident longest must be evicted LAST"
+        );
+    }
+
+    #[sqlx::test]
+    async fn a_local_read_moves_a_part_to_the_back_of_the_eviction_queue(pool: PgPool) {
+        // The other half: serving a part from local flash has to actually change its fate, or
+        // the ordering above is decorative.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        for n in 1_u32..=2 {
+            seed_status_node(&pool, UUID_A, 1, i64::from(n), "replicated", "node-a").await;
+            seed_part_size(&pool, UUID_A, 1, i64::from(n), Some(100)).await;
+            store.record_resident(&part(UUID_A, 1, n), 100).await.unwrap();
+        }
+        // Age part 1 so it is the victim, then read it.
+        sqlx::query("UPDATE cephor_ssd_residency SET resident_at = now() - make_interval(hours => 5) WHERE part_number = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let first: Vec<u32> = store.evictable_parts(10).await.unwrap().iter().map(|r| r.part.part().get()).collect();
+        assert_eq!(first, vec![1, 2], "part 1 is the victim before it is read");
+
+        // The UPDATE the api's ReadRecencyRecorder issues. Pinned here because this ordering is
+        // the contract that recorder has to satisfy, and the consequence of getting it wrong —
+        // a hot part evicted and immediately re-fetched — is silent.
+        sqlx::query(
+            "UPDATE cephor_ssd_residency SET last_read_at = now()              WHERE node_id = $1 AND object_id = $2 AND version = 1 AND part_number = 1",
+        )
+        .bind("node-a")
+        .bind(UUID_A)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let after: Vec<u32> = store.evictable_parts(10).await.unwrap().iter().map(|r| r.part.part().get()).collect();
+        assert_eq!(after, vec![2, 1], "reading it moved it behind the untouched part");
+    }
+
+    #[sqlx::test]
+    async fn touching_a_part_this_node_does_not_hold_changes_nothing(pool: PgPool) {
+        // The read path calls this on any local hit, and a peer's row must not be reachable:
+        // recency is per (node, part), and stamping a peer's row would protect a copy on a disk
+        // this node cannot see while leaving its own unprotected.
+        create_app_schema(&pool).await;
+        seed_status_node(&pool, UUID_A, 1, 1, "replicated", "node-b").await;
+        seed_part_size(&pool, UUID_A, 1, 1, Some(100)).await;
+        sqlx::query("INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number, bytes) VALUES ('node-b', $1, 1, 1, 100)")
+            .bind(UUID_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE cephor_ssd_residency SET last_read_at = now()              WHERE node_id = $1 AND object_id = $2 AND version = 1 AND part_number = 1",
+        )
+        .bind("node-a")
+        .bind(UUID_A)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (touched,): (i64,) = sqlx::query_as("SELECT count(*) FROM cephor_ssd_residency WHERE last_read_at IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(touched, 0, "another node's residency row was stamped");
     }
 
     #[sqlx::test]

@@ -2,6 +2,7 @@ from hippius_s3.fs_pressure import FreeSpaceGate
 from hippius_s3.fs_pressure import validate_promotion_band
 
 from .dual_fs_store import DualFileSystemPartsStore
+from .dual_fs_store import LocalReadRecorder
 from .dual_fs_store import PeerFetcher
 from .dual_fs_store import PromotionRecorder
 from .fs_store import FileSystemPartsStore
@@ -14,6 +15,7 @@ def create_fs_store(
     *,
     on_promote: PromotionRecorder | None = None,
     peer_fetch: PeerFetcher | None = None,
+    on_local_read: LocalReadRecorder | None = None,
 ) -> FileSystemPartsStore:
     """Build the parts store: dual-tier when a fallback pool is configured, else single.
 
@@ -47,6 +49,7 @@ def create_fs_store(
             on_promote=on_promote,
             peer_fetch=peer_fetch,
             space_gate=space_gate,
+            on_local_read=on_local_read,
         )
     return FileSystemPartsStore(cache_dir)
 

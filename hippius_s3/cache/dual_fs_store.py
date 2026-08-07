@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 # evictor can reclaim the copy.
 PromotionRecorder = Callable[[str, int, int, int], Awaitable[None]]
 
+# Called after a chunk is served from THIS node's flash, with (object_id, version, part_number).
+# Feeds cephor_ssd_residency.last_read_at, which is what makes eviction recency-ordered instead
+# of FIFO. Sampled by the recorder, so it is cheap to call on every local hit.
+LocalReadRecorder = Callable[[str, int, int], Awaitable[None]]
+
 # Fetches one chunk from the peer node that currently holds it on flash, with
 # (object_id, version, part_number, chunk_index). Returns None when no peer has it.
 PeerFetcher = Callable[[str, int, int, int], Awaitable[Optional[bytes]]]
@@ -70,6 +75,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         on_promote: Optional[PromotionRecorder] = None,
         peer_fetch: Optional[PeerFetcher] = None,
         space_gate: Optional[FreeSpaceGate] = None,
+        on_local_read: Optional[LocalReadRecorder] = None,
     ) -> None:
         super().__init__(primary_dir)
         self.fallback = FileSystemPartsStore(fallback_dir)
@@ -80,6 +86,10 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         # and it shares the mount with the PUTs that `fs_cache_pressure` refuses when the disk
         # runs out. `None` means no gate (tests, and any deployment without a fallback tier).
         self._space_gate = space_gate
+        # Records that a part was served locally, so the drain-agent evictor can order on USE
+        # rather than on arrival. Sampled inside the recorder — this is a dict probe on all but
+        # the first local read of a part per window.
+        self._on_local_read = on_local_read
         # Chunks whose promotion is in flight right now, so concurrent readers of the same
         # cold chunk write it once. Holds only in-flight keys, so it drains itself and needs
         # no bound or TTL — unlike a "already done" memo, which the out-of-process evictor
@@ -92,6 +102,12 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         result = await super().get_chunk(object_id, object_version, part_number, chunk_index)
         if result is not None:
             _record_tier("local")
+            # Tell the evictor this part is still in use. Without it eviction orders on when a
+            # part ARRIVED, which for a working set re-read every epoch tends to take exactly
+            # the parts about to be read again. Sampled inside the recorder, so this is a dict
+            # probe on all but the first read of a part per window.
+            if self._on_local_read is not None:
+                await self._on_local_read(object_id, int(object_version), int(part_number))
             return result
 
         # Peer tier, between local flash and the pool. A part lives on whichever node

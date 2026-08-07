@@ -11,6 +11,7 @@ Chunk cache. Backed by a shared filesystem volume; Redis is used only for pub/su
 | [notifier.py](notifier.py) | `ChunkNotifier` — Redis pub/sub wrapper for chunk-ready notifications. |
 | [dual_fs_store.py](dual_fs_store.py) | `DualFileSystemPartsStore` — the tiered read path: node-local NVMe → peer node → CephFS pool. Optionally promotes a pool/peer-served chunk onto local flash. |
 | [peers.py](peers.py) | `PeerRegistry` (self-registration of pod IPs in Redis, TTL'd) + `PeerChunkFetcher` (resolve which node holds a part, fetch one chunk from it). |
+| [read_recency.py](read_recency.py) | `ReadRecencyRecorder` — stamps `cephor_ssd_residency.last_read_at` on a local hit (sampled), so the drain evictor orders on USE rather than arrival. |
 | [residency.py](residency.py) | `ResidencyRecorder` — claims a promoted part for this node in `cephor_ssd_residency` so this node's evictor can reclaim it. |
 | [part_memo.py](part_memo.py) | `PartMemo` — bounded, TTL'd per-part memo, so per-part facts are not recomputed per chunk. |
 | [__init__.py](__init__.py) | `create_fs_store(config, on_promote=..., peer_fetch=...)` factory — picks `DualFileSystemPartsStore` if `HIPPIUS_OBJECT_CACHE_FALLBACK_DIR` is set. |

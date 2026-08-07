@@ -38,6 +38,7 @@ from hippius_s3.cache import create_fs_store
 from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
 from hippius_s3.cache.peers import effective_max_inflight
+from hippius_s3.cache.read_recency import create_read_recency_recorder
 from hippius_s3.cache.residency import create_residency_recorder
 from hippius_s3.config import Config
 from hippius_s3.config import get_config
@@ -178,7 +179,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             app.state.peer_serve_limiter = asyncio.Semaphore(config.peer_serve_max_inflight)
             logger.info("Peer chunk fetch enabled for node %s", node_name)
 
-        app.state.fs_store = create_fs_store(config, on_promote=app.state.residency_recorder, peer_fetch=peer_fetch)
+        # Eviction orders on COALESCE(last_read_at, resident_at), so a locally-served part has
+        # to say so or the evictor falls back to arrival order — which for a re-read working set
+        # tends to drop exactly the parts about to be needed again.
+        app.state.read_recency_recorder = create_read_recency_recorder(app.state.postgres_pool, node_name)
+        app.state.fs_store = create_fs_store(
+            config,
+            on_promote=app.state.residency_recorder,
+            peer_fetch=peer_fetch,
+            on_local_read=app.state.read_recency_recorder,
+        )
         app.state.obj_cache = RedisObjectPartsCache(
             app.state.redis_client,
             queues_client=app.state.redis_queues_client,
