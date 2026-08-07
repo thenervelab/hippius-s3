@@ -44,6 +44,7 @@ from hippius_s3.config import Config
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
+from hippius_s3.peer_auth import validate_peer_secret
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
 from hippius_s3.writer.landed import initialize_landed_publisher
 
@@ -337,6 +338,20 @@ def factory() -> FastAPI:
     load_dotenv()
     config = get_config()
     setup_loki_logging(config, "api")
+
+    # A malformed peer secret fails on the READ path: httpx ascii-encodes header values and raises
+    # UnicodeEncodeError, which is a ValueError, so the fetcher's `except (httpx.HTTPError, OSError)`
+    # does not absorb it into a pool fallback the way it absorbs every other peer failure. The GET
+    # fails outright, arbitrarily long after the deploy that misconfigured it.
+    #
+    # Here and not in get_config(): the api is the only process that puts this secret on a wire
+    # (PeerChunkFetcher is constructed in this module's lifespan and nowhere else — workers call
+    # create_fs_store without a peer_fetch), so validating at config load would crash the janitor,
+    # uploader and unpinner over a value they never read.
+    #
+    # After setup_loki_logging on purpose, so the traceback reaches the log store an operator
+    # actually reads rather than only container stderr.
+    validate_peer_secret(config.internal_peer_secret)
 
     from hippius_s3.sentry import init_sentry
 

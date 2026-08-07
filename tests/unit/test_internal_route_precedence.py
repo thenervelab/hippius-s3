@@ -24,6 +24,10 @@ from hippius_s3.config import reset_config
 
 OBJ = "466916c0-d61b-4518-b81b-9576b574270a"
 INTERNAL_PATH = f"/internal/parts/{OBJ}/1/1/chunks/0"
+# Must be a WELL-FORMED secret (64 hex), not a readable placeholder: `factory()` validates it at
+# boot, so a stand-in like "a-configured-secret" fails startup and every test here dies before it
+# can assert anything about route ordering.
+SECRET = "a" * 64
 
 
 def _api_app(monkeypatch, *, serve_enabled: str, secret: str) -> FastAPI:
@@ -56,7 +60,7 @@ def _matching_routes(app: FastAPI, path: str) -> list[str]:
 
 
 def test_the_internal_route_beats_the_s3_catch_all(monkeypatch) -> None:
-    app = _api_app(monkeypatch, serve_enabled="true", secret="a-configured-secret")
+    app = _api_app(monkeypatch, serve_enabled="true", secret=SECRET)
 
     matches = _matching_routes(app, INTERNAL_PATH)
 
@@ -69,13 +73,13 @@ def test_the_internal_route_beats_the_s3_catch_all(monkeypatch) -> None:
 
 def test_an_ordinary_object_key_is_not_captured_by_the_internal_route(monkeypatch) -> None:
     """The internal route must be narrow: five fixed-shape segments, not a prefix grab."""
-    app = _api_app(monkeypatch, serve_enabled="true", secret="a-configured-secret")
+    app = _api_app(monkeypatch, serve_enabled="true", secret=SECRET)
 
     assert "get_local_chunk" not in _matching_routes(app, "/my-bucket/some/key.txt")
 
 
 def test_the_route_is_absent_when_serving_is_off(monkeypatch) -> None:
-    app = _api_app(monkeypatch, serve_enabled="false", secret="a-configured-secret")
+    app = _api_app(monkeypatch, serve_enabled="false", secret=SECRET)
 
     assert all(route.name != "get_local_chunk" for route in app.routes)
 
