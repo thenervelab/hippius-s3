@@ -35,6 +35,7 @@ from hippius_s3.api.sub_token_scopes import router as sub_token_scopes_router
 from hippius_s3.api.user import router as user_router
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
+from hippius_s3.cache.peers import PEER_PORT
 from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
 from hippius_s3.cache.peers import effective_max_inflight
@@ -153,7 +154,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             app.state.peer_registry = PeerRegistry(
                 app.state.redis_client,
                 node_name,
-                f"http://{pod_ip}:8000",
+                # Built from the same constant the resolver pins addresses to, so a peer's
+                # registration and the allow-list that admits it cannot drift apart.
+                f"http://{pod_ip}:{PEER_PORT}",
                 config.peer_registry_ttl_seconds,
             )
             await app.state.peer_registry.register()
@@ -173,6 +176,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     config.peer_fetch_max_inflight,
                     config.http_stream_prefetch_chunks,
                 ),
+                # The httpx timeout above bounds each socket operation, never the whole
+                # response; this is what stops a peer that drips bytes forever.
+                deadline_seconds=config.peer_fetch_deadline_seconds,
             )
             # Serving-side cap, read by the /internal/parts endpoint. Set whenever peer fetch
             # is on, since a node that fetches from peers is also one peers fetch from.

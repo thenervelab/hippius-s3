@@ -25,8 +25,13 @@ tracer = trace.get_tracer(__name__)
 # label cannot drift into unbounded cardinality.
 ChunkReadTier = Literal["local", "peer", "pool"]
 
-# Which side declined a peer fetch. Closed by construction, like ChunkReadTier.
-PeerShedReason = Literal["client_cap", "server_busy"]
+# Why a peer fetch did not happen, or its answer was not used. Closed by construction, like
+# ChunkReadTier. The reasons demand different responses and must stay distinguishable:
+# `client_cap` and `server_busy` are capacity, while the other three mean something is wrong.
+# `bad_peer_url` is a peer registration this cluster did not write, `bad_length` a peer serving
+# bodies that are not the chunk that was asked for (a rolled-back or half-deployed image), and
+# `unknown_size` a chunk with no recorded ciphertext size to check an answer against.
+PeerShedReason = Literal["client_cap", "server_busy", "bad_peer_url", "bad_length", "unknown_size"]
 
 # Why a chunk that could have been promoted onto local flash was not. Closed by construction.
 # `residency_failed` is the fail-closed arm: the claim that makes this node's evictor the owner
@@ -125,7 +130,7 @@ class MetricsCollector:
         # falling back to the pool under load, which is the signal that fanout needs tuning.
         self.peer_fetch_shed = self.meter.create_counter(
             name="peer_fetch_shed_total",
-            description="Peer chunk fetches declined (client_cap|server_busy)",
+            description="Peer chunk fetches declined (client_cap|server_busy|bad_peer_url|bad_length|unknown_size)",
             unit="1",
         )
 
