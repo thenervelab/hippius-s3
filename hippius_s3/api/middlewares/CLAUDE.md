@@ -31,7 +31,9 @@ Threshold is configurable (see [hippius_s3/config.py](../../config.py)); today i
 
 ## [ip_whitelist.py](ip_whitelist.py) — `ip_whitelist_middleware`
 
-Defence-in-depth: if `API_IP_WHITELIST` is set (comma-separated CIDR or IPs), the API rejects anything else with 403. Normally k8s NetworkPolicy provides the primary barrier — this is belt-and-braces for when the policy is misconfigured or the API is port-forwarded during debug.
+Defence-in-depth: the API rejects with 403 any client address outside `API_IP_WHITELIST_CIDRS` (comma-separated CIDRs, default `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1/32,::1/128` — RFC1918 plus loopback). `/health` is exempt so kubelet can probe from the node IP. Normally k8s NetworkPolicy provides the primary barrier — this is belt-and-braces for when the policy is misconfigured or the API is port-forwarded during debug.
+
+The list is parsed into `ipaddress` network objects once, when the Config singleton is built, and an unparseable client address is a 403 rather than a 500. Narrow it to the real pod/service CIDRs per deployment if you want a tighter boundary; a value that fails to cover the gateway 403s every forwarded request and takes the API down, which is why the default is the safe superset.
 
 ## [metrics.py](metrics.py) — `metrics_middleware`
 

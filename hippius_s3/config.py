@@ -1,4 +1,5 @@
 import dataclasses
+import ipaddress
 import uuid
 
 import dotenv
@@ -7,6 +8,24 @@ from hippius_s3.utils import env
 
 
 dotenv.load_dotenv()
+
+IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def _parse_cidrs(value: str | None) -> tuple[IpNetwork, ...]:
+    """Parse a comma-separated CIDR list into network objects.
+
+    Parsed once, when the Config singleton is built, because ip_whitelist_middleware matches
+    against this on every request to the api. A malformed or host-bits-set entry raises here, at
+    startup, rather than being silently skipped and quietly widening the boundary.
+    """
+    return tuple(ipaddress.ip_network(part.strip()) for part in str(value or "").split(",") if part.strip())
+
+
+# RFC1918 plus loopback. Deliberately NOT pinned to any one cluster's pod/service ranges: a CIDR
+# that does not cover the gateway 403s every forwarded request and takes the whole api down, so
+# the default has to be the safe superset and narrowing it is an opt-in per deployment.
+_DEFAULT_IP_WHITELIST_CIDRS = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1/32,::1/128"
 
 
 def _parse_csv_urls(value: str | None) -> list[str]:
@@ -56,6 +75,12 @@ class Config:
     frontend_hmac_secret: str = env("FRONTEND_HMAC_SECRET")
     rate_limit_per_minute: int = env("RATE_LIMIT_PER_MINUTE", convert=int)
     max_request_size_mb: int = env("MAX_REQUEST_SIZE_MB", convert=int)
+    # The api performs no authentication of its own — it trusts the X-Hippius-* headers the gateway
+    # stamps. These CIDRs are therefore the entire boundary that makes "only the gateway reaches the
+    # api" true, so they have to mean exactly what they say.
+    api_ip_whitelist_cidrs: tuple[IpNetwork, ...] = env(
+        f"API_IP_WHITELIST_CIDRS:{_DEFAULT_IP_WHITELIST_CIDRS}", convert=_parse_cidrs
+    )
 
     # Logging
     log_level: str = env("LOG_LEVEL")
