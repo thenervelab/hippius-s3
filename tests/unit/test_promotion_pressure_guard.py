@@ -159,13 +159,14 @@ async def test_a_chunk_is_still_served_when_promotion_is_gated(tmp_path, monkeyp
     recorded: list[str] = []
     monkeypatch.setattr(
         "hippius_s3.cache.dual_fs_store._record_promotion_skipped",
-        lambda: recorded.append("disk_pressure"),
+        recorded.append,
     )
 
     promoted: list[tuple] = []
 
-    async def on_promote(*args: object) -> None:
+    async def on_promote(*args: object) -> bool:
         promoted.append(args)
+        return True
 
     store = DualFileSystemPartsStore(
         str(primary),
@@ -180,7 +181,7 @@ async def test_a_chunk_is_still_served_when_promotion_is_gated(tmp_path, monkeyp
 
     assert got == payload, "the read is served regardless of disk pressure"
     assert promoted == [], "nothing was promoted onto the pressured disk"
-    assert recorded == ["disk_pressure"], "the backoff is counted"
+    assert recorded == ["disk_pressure"], "the backoff is counted under its own reason"
     assert not (primary / oid).exists(), "no local copy was written"
 
 
@@ -200,8 +201,9 @@ async def test_promotion_still_happens_when_the_disk_has_room(tmp_path) -> None:
 
     promoted: list[tuple] = []
 
-    async def on_promote(*args: object) -> None:
+    async def on_promote(*args: object) -> bool:
         promoted.append(args)
+        return True
 
     store = DualFileSystemPartsStore(
         str(primary),

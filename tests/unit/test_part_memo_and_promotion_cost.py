@@ -92,8 +92,9 @@ async def test_promotion_after_eviction_restores_both_meta_and_residency(tmp_pat
     """
     recorded: list[tuple[str, int, int, int]] = []
 
-    async def _record(object_id: str, version: int, part_number: int, size_bytes: int) -> None:
+    async def _record(object_id: str, version: int, part_number: int, size_bytes: int) -> bool:
         recorded.append((object_id, version, part_number, size_bytes))
+        return True
 
     dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), promote=True, on_promote=_record)
     await dual.fallback.set_chunk(OBJ, 1, 1, 0, b"payload")
@@ -178,9 +179,10 @@ async def test_concurrent_readers_promote_a_chunk_only_once(tmp_path) -> None:
     recorded: list[tuple[str, int, int, int]] = []
     gate = asyncio.Event()
 
-    async def _record(object_id: str, version: int, part_number: int, size_bytes: int) -> None:
+    async def _record(object_id: str, version: int, part_number: int, size_bytes: int) -> bool:
         await gate.wait()
         recorded.append((object_id, version, part_number, size_bytes))
+        return True
 
     dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), promote=True, on_promote=_record)
     await dual.fallback.set_chunk(OBJ, 1, 1, 0, b"payload")

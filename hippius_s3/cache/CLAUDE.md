@@ -28,8 +28,14 @@ Chunk cache. Backed by a shared filesystem volume; Redis is used only for pub/su
 3. **pool** — the shared CephFS volume. Authoritative and always present for a replicated part,
    so every tier above it is an optimisation and must never be able to fail a read.
 
-With `HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ`, a peer- or pool-served chunk is copied onto local
-flash and claimed in `cephor_ssd_residency` so the drain-agent's evictor owns it. Two caps bound
+With `HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ`, a peer- or pool-served chunk is claimed in
+`cephor_ssd_residency` — so the drain-agent's evictor owns it — and only then copied onto local
+flash. **Claim first, and a failed claim cancels the copy.** An unclaimed copy has no owner in
+either process (the evictor is scoped to that table, and `ssd_reclaim` skips replicated parts as
+the read tier), so writing first would leak one unreclaimable copy per promoted chunk for the
+whole of a residency-DB outage — on the disk whose filling makes the api 503 every PUT. Failing
+closed on an optimisation costs a cache warm, counted as
+`promotion_skipped_total{reason=residency_failed}`. Two caps bound
 peer fanout — `HIPPIUS_PEER_FETCH_MAX_INFLIGHT` per (pod, peer) on the client, and
 `HIPPIUS_PEER_SERVE_MAX_INFLIGHT` on the serving pod, which sheds with 503. Both shed to the
 pool rather than queueing.

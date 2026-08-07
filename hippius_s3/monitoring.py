@@ -29,7 +29,9 @@ ChunkReadTier = Literal["local", "peer", "pool"]
 PeerShedReason = Literal["client_cap", "server_busy"]
 
 # Why a chunk that could have been promoted onto local flash was not. Closed by construction.
-PromotionSkipReason = Literal["disk_pressure"]
+# `residency_failed` is the fail-closed arm: the claim that makes this node's evictor the owner
+# of the copy did not land, so the copy is not made.
+PromotionSkipReason = Literal["disk_pressure", "residency_failed"]
 
 # Outcome of a read-recency stamp. Closed by construction. `failed` is separate rather than
 # uncounted because the write is best-effort and swallowed: without it, a recency path that is
@@ -134,12 +136,14 @@ class MetricsCollector:
         )
 
         # Chunks served but deliberately NOT copied onto local flash. This is the promotion
-        # backpressure made visible: it must start rising BEFORE fs_cache_shed does, because
-        # promotion yielding is what keeps the disk from reaching the PUT-refusal threshold.
-        # Flat at zero while free space falls means the gate is not engaging.
+        # backpressure made visible: `disk_pressure` must start rising BEFORE fs_cache_shed does,
+        # because promotion yielding is what keeps the disk from reaching the PUT-refusal
+        # threshold. Flat at zero while free space falls means the gate is not engaging.
+        # `residency_failed` says promotion is off because the residency DB is unreachable —
+        # sustained, it means the read tier has stopped warming and only this counter says so.
         self.promotion_skipped = self.meter.create_counter(
             name="promotion_skipped_total",
-            description="Chunks not promoted to the local read tier, by reason (disk_pressure)",
+            description="Chunks not promoted to the local read tier, by reason (disk_pressure|residency_failed)",
             unit="1",
         )
 
