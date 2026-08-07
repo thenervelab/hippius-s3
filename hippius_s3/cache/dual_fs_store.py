@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from pathlib import Path
 from typing import Awaitable
 from typing import Callable
 from typing import Optional
@@ -244,6 +246,77 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
             )
         finally:
             self._promoting.discard(in_flight)
+
+    async def invalidate_local_chunk(
+        self, object_id: str, object_version: int, part_number: int, chunk_index: int
+    ) -> bool:
+        """Drop THIS node's copy of a chunk whose stored ciphertext would not authenticate.
+
+        The local tier is read first, so a bad copy on this disk is a permanent, retry-immune
+        failure for that object on this node — every retry re-reads the same bytes. Unlinking it
+        makes the next read fall through to the peer or the pool, which is what turns a permanent
+        failure into a transient one. Read-through promotion is what makes bad local bytes
+        reachable in the first place, and no admission check covers torn writes or bit rot, so
+        invalidation is the arm that covers every source uniformly.
+
+        Only the PRIMARY is touched. The fallback is the authoritative copy and the fault may be
+        in the DEK rather than in the bytes, so a pool chunk failing AEAD stays a genuine error.
+        That is also why this method exists on the dual store alone: without a fallback dir the
+        single store's root IS the shared pool, and the same call would delete the last copy.
+
+        The pool-presence gate is a data-loss guard, not an optimisation. A freshly ingested part
+        lives on SSD alone until the drain replicates it, and a DEK fault fails those chunks too —
+        so an ungated unlink would destroy data over a fault that has nothing to do with the bytes.
+        The gate is exact for a second reason: pool presence is meta-gated, and the drain persists
+        the pool's meta.json LAST, after every chunk is copied and byte-verified (partdrain.rs), so
+        anything this can unlink is already past the point where a drain in flight reads the source.
+
+        Removes one chunk file, never the part: `meta.json` is the readiness gate, and a part with
+        meta and a hole is exactly the downloader's normal partial-fill state — the hole reads as a
+        miss and falls through a tier while every sibling chunk still serves off flash.
+
+        Returns whether a local copy was removed. A concurrent reader promoting the same chunk can
+        re-write it immediately afterwards; that is self-limiting (the next failed read invalidates
+        it again) and not worth serialising against the promotion path.
+        """
+        if not await self.fallback.chunk_exists(object_id, object_version, part_number, chunk_index):
+            return False
+
+        chunk_path = self._chunk_file(Path(self.part_path(object_id, object_version, part_number)), chunk_index)
+
+        def _unlink() -> bool:
+            try:
+                chunk_path.unlink()
+            except FileNotFoundError:
+                return False  # the evictor or another reader got there first — same end state
+            return True
+
+        try:
+            removed = await asyncio.to_thread(_unlink)
+        except OSError as exc:
+            # A read-only or failing mount must not replace the decrypt failure with an unrelated
+            # errno: the caller re-raises the real fault, which is what the client should see.
+            logger.error(
+                "could not invalidate a chunk that failed authentication, so it stays poisoned on "
+                "this node: %s v%s part %s chunk %s: %s",
+                object_id,
+                object_version,
+                part_number,
+                chunk_index,
+                exc,
+            )
+            return False
+
+        if removed:
+            logger.warning(
+                "invalidated a local chunk that failed authentication; the next read falls through "
+                "to the pool: %s v%s part %s chunk %s",
+                object_id,
+                object_version,
+                part_number,
+                chunk_index,
+            )
+        return removed
 
     async def get_meta(self, object_id: str, object_version: int, part_number: int) -> Optional[dict]:
         result = await super().get_meta(object_id, object_version, part_number)

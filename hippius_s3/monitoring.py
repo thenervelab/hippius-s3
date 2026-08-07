@@ -44,6 +44,16 @@ PromotionSkipReason = Literal["disk_pressure", "residency_failed"]
 # sampler, and both look like silence.
 ReadRecencyOutcome = Literal["written", "failed"]
 
+# Where the bytes that failed a chunk's AEAD check were found, and what came of it. Closed by
+# construction. `local` means a copy on this node's flash was removed and the read retried from
+# the next tier; `remote` means nothing local held it (a peer or the pool served it), so there
+# was nothing this node could invalidate and no retry was worth making. A sustained
+# `local`/`recovered` rate is a poisoner planting bad bytes on this node — the pool copy is fine.
+# Anything `unrecovered` survived a tier change, so it is a key or object fault, not local
+# corruption; the two must stay distinguishable or a DEK fault reads like cache poisoning.
+AeadFailureTier = Literal["local", "remote"]
+AeadFailureOutcome = Literal["recovered", "unrecovered"]
+
 
 class MetricsCollector:
     """OTel metrics for the API, gateway and workers.
@@ -162,6 +172,18 @@ class MetricsCollector:
         self.read_recency_writes = self.meter.create_counter(
             name="read_recency_writes_total",
             description="last_read_at stamps written to cephor_ssd_residency, by outcome (written|failed)",
+            unit="1",
+        )
+
+        # Chunks whose stored ciphertext failed to authenticate. Every one is either bad bytes in
+        # a cache or a key fault, and before this counter existed both were invisible — the only
+        # handling was a 500 mapped by class name at the edge. The tier is what makes a poisoner
+        # actionable: `local` failures are a copy this node holds and just dropped, so a sustained
+        # rate names the node being poisoned rather than the object being broken.
+        self.chunk_aead_failures = self.meter.create_counter(
+            name="chunk_aead_failures_total",
+            description="Chunk decrypts that failed authentication, by tier (local|remote) and "
+            "outcome (recovered|unrecovered)",
             unit="1",
         )
 
@@ -560,6 +582,10 @@ class MetricsCollector:
         """Count one `last_read_at` stamp attempt. `outcome` is a Literal, so bounded."""
         self.read_recency_writes.add(1, attributes={"outcome": outcome})
 
+    def record_aead_failure(self, tier: AeadFailureTier, outcome: AeadFailureOutcome) -> None:
+        """Count one chunk that failed to authenticate. Both labels are Literals, so bounded."""
+        self.chunk_aead_failures.add(1, attributes={"tier": tier, "outcome": outcome})
+
     def record_chunk_read_tier(self, tier: ChunkReadTier) -> None:
         """Count one chunk read against the tier that served it.
 
@@ -823,6 +849,9 @@ class NullMetricsCollector:
         pass
 
     def record_chunk_read_tier(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_aead_failure(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_peer_fetch_shed(self, *args: object, **kwargs: object) -> None:

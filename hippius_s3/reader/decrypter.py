@@ -2,9 +2,19 @@ from __future__ import annotations
 
 from typing import Optional
 
+from cryptography.exceptions import InvalidTag
+from nacl.exceptions import CryptoError
+
 from hippius_s3.services.crypto_pool import run_crypto
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.storage_version import require_supported_storage_version
+
+
+# The two ways stored ciphertext can turn out not to be the chunk that was asked for: the AEAD
+# tag does not authenticate (InvalidTag), or the body is too short to even hold a nonce and tag
+# (CryptoError("ciphertext_too_short") — the shape a version-skewed peer serves). Named here
+# because the decrypter is what defines "these bytes are unusable"; the streamer acts on it.
+CIPHERTEXT_UNUSABLE: tuple[type[BaseException], ...] = (InvalidTag, CryptoError)
 
 
 async def decrypt_chunk_if_needed(
