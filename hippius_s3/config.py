@@ -370,6 +370,17 @@ class Config:
     # promoted copy is only reclaimable by a drain-agent evictor running on the same node, so
     # enabling it where no evictor runs would fill the disk with copies nothing owns.
     object_cache_promote_on_read: bool = env("HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ:false", convert=bool)
+    # Free-space floor below which a read stops promoting onto local flash. Promotion is the
+    # only unthrottled writer to the ingest SSD and it shares that mount with ingest — on an
+    # ingest node HIPPIUS_OBJECT_CACHE_DIR is the drain agent's CEPHOR_SSD_ROOT — so warming
+    # the cache must yield to accepting writes.
+    #
+    # 0.175 is not arbitrary: it has to sit strictly INSIDE the drain evictor's hysteresis
+    # band, between its reserve (150 permille) and its target (reserve + headroom = 200
+    # permille). Equal to the target it chatters; above the target it deadlocks, because the
+    # evictor only frees back to its target and could never restore enough for promotion to
+    # resume. See FreeSpaceGate and test_promotion_pressure_guard.py.
+    promote_min_free_ratio: float = env("HIPPIUS_PROMOTE_MIN_FREE_RATIO:0.175", convert=float)
     # Read a chunk from the peer node that holds it on flash (~6 ms + ~1 ms network) before
     # falling through to the CephFS pool (~40 ms). Resolved per PART: only ~2% of multi-part
     # objects have every part on one node, so there is no single node to route a request to.

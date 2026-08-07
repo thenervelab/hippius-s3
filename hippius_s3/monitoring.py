@@ -28,6 +28,9 @@ ChunkReadTier = Literal["local", "peer", "pool"]
 # Which side declined a peer fetch. Closed by construction, like ChunkReadTier.
 PeerShedReason = Literal["client_cap", "server_busy"]
 
+# Why a chunk that could have been promoted onto local flash was not. Closed by construction.
+PromotionSkipReason = Literal["disk_pressure"]
+
 
 class MetricsCollector:
     """OTel metrics for the API, gateway and workers.
@@ -121,6 +124,16 @@ class MetricsCollector:
         self.chunk_reads_by_tier = self.meter.create_counter(
             name="chunk_reads_by_tier_total",
             description="Chunk reads served, by storage tier (local|peer|pool)",
+            unit="1",
+        )
+
+        # Chunks served but deliberately NOT copied onto local flash. This is the promotion
+        # backpressure made visible: it must start rising BEFORE fs_cache_shed does, because
+        # promotion yielding is what keeps the disk from reaching the PUT-refusal threshold.
+        # Flat at zero while free space falls means the gate is not engaging.
+        self.promotion_skipped = self.meter.create_counter(
+            name="promotion_skipped_total",
+            description="Chunks not promoted to the local read tier, by reason (disk_pressure)",
             unit="1",
         )
 
@@ -511,6 +524,10 @@ class MetricsCollector:
         """Count a declined peer fetch. `reason` is a Literal, so the label stays bounded."""
         self.peer_fetch_shed.add(1, attributes={"reason": reason})
 
+    def record_promotion_skipped(self, reason: PromotionSkipReason) -> None:
+        """Count a chunk served without being promoted. `reason` is a Literal, so bounded."""
+        self.promotion_skipped.add(1, attributes={"reason": reason})
+
     def record_chunk_read_tier(self, tier: ChunkReadTier) -> None:
         """Count one chunk read against the tier that served it.
 
@@ -777,6 +794,9 @@ class NullMetricsCollector:
         pass
 
     def record_peer_fetch_shed(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_promotion_skipped(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_cache_operation(self, *args: object, **kwargs: object) -> None:

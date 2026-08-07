@@ -97,9 +97,11 @@ const DEFAULT_EVICT_RESERVE_PERMILLE: u16 = 150;
 /// every poll and pins the disk at the threshold.
 const DEFAULT_EVICT_HEADROOM_PERMILLE: u16 = 50;
 
-/// Parts considered per eviction pass when `CEPHOR_EVICT_BATCH` is unset. At a 4 MiB chunk
-/// and typical part sizes this frees tens of GB per pass — enough to close a breach in a few
-/// polls without one pass monopolising the disk.
+/// Rows fetched per eviction worklist QUERY when `CEPHOR_EVICT_BATCH` is unset — the page size,
+/// **not** the pass budget. The pass keeps paging until its byte goal is met (see
+/// `DEFAULT_EVICT_MAX_PASS`), because a part count says almost nothing about bytes freed: prod
+/// part sizes are bimodal, measured 2026-08-07 at p50 686 bytes against a 408 KB shard mean, so
+/// a page walking the small-part tail frees ~350 KB against a ~175 GB deficit.
 const DEFAULT_EVICT_BATCH: u32 = 512;
 
 /// Wall-clock ceiling on ONE eviction pass when `CEPHOR_EVICT_MAX_PASS_SECS` is unset.
@@ -485,8 +487,9 @@ fn duration_secs(get: &impl Fn(&str) -> Option<String>, var: &'static str, defau
 mod tests {
     use super::{
         Config, ConfigError, DEFAULT_ALLOCATION_POLL, DEFAULT_CLAIM_LEASE, DEFAULT_DECAY_HALF_LIFE, DEFAULT_DEFER_BACKOFF_CAP,
-        DEFAULT_DRAIN_CONCURRENCY, DEFAULT_DRAIN_POLL, DEFAULT_FLOOR_RATE_BPS, DEFAULT_HEARTBEAT_POLL, DEFAULT_HEARTBEAT_TTL,
-        DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_ORPHAN_RECLAIM_GRACE, DEFAULT_RECLAIM_GRACE, DEFAULT_RECLAIM_POLL,
+        DEFAULT_DRAIN_CONCURRENCY, DEFAULT_DRAIN_POLL, DEFAULT_EVICT_HEADROOM_PERMILLE, DEFAULT_EVICT_RESERVE_PERMILLE, DEFAULT_FLOOR_RATE_BPS,
+        DEFAULT_HEARTBEAT_POLL, DEFAULT_HEARTBEAT_TTL, DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_ORPHAN_RECLAIM_GRACE, DEFAULT_RECLAIM_GRACE,
+        DEFAULT_RECLAIM_POLL,
     };
     use core::str::FromStr;
     use hippius_drain_core::{ByteRate, NodeId};
@@ -859,5 +862,30 @@ mod tests {
         pairs.push(("HIPPIUS_UPLOAD_BACKENDS", "arion"));
         let config = Config::from_lookup(lookup(&pairs)).unwrap();
         assert_eq!(config.enqueue_backends(), vec!["arion".to_owned()]);
+    }
+
+    #[test]
+    fn the_eviction_band_matches_what_the_api_assumes_when_gating_promotion() {
+        // Cross-language contract pin. The api refuses to promote onto local flash below
+        // `HIPPIUS_PROMOTE_MIN_FREE_RATIO` (0.175), and that floor is only correct if it sits
+        // strictly inside THIS evictor's band: above the reserve, below reserve + headroom.
+        //
+        // There is no runtime coupling between the two processes, so the api mirrors these
+        // numbers in `hippius_s3/fs_pressure.py` (EVICT_RESERVE_RATIO / EVICT_HEADROOM_RATIO)
+        // and each side pins its own. Moving either default without the other silently breaks
+        // the loop: a floor at or above the target can never be restored, because the evictor
+        // never frees past its target, and promotion would stop for good.
+        assert_eq!(DEFAULT_EVICT_RESERVE_PERMILLE, 150, "api mirrors this as EVICT_RESERVE_RATIO = 0.150");
+        assert_eq!(DEFAULT_EVICT_HEADROOM_PERMILLE, 50, "api mirrors this as EVICT_HEADROOM_RATIO = 0.050");
+
+        let promote_floor_permille = 175;
+        assert!(
+            DEFAULT_EVICT_RESERVE_PERMILLE < promote_floor_permille,
+            "promotion must yield before eviction arms"
+        );
+        assert!(
+            promote_floor_permille < DEFAULT_EVICT_RESERVE_PERMILLE + DEFAULT_EVICT_HEADROOM_PERMILLE,
+            "the evictor must be able to free back past the promote floor, or promotion deadlocks"
+        );
     }
 }
