@@ -550,8 +550,14 @@ where
     // exists on the pool", not "the local copy is surplus": local NVMe serves a GET at
     // ~705 MB/s / ~6 ms per chunk against the pool's ~94 MB/s / ~40 ms, so throwing the copy
     // away at commit was discarding the fast tier the moment it became safe to keep. Space is
-    // reclaimed by the evictor on a free-space policy instead (`crate::evict_to_target`),
-    // which is why `mark_replicated` stamps `resident_at` in the same statement as the commit.
+    // reclaimed by the evictor on a free-space policy instead (`crate::evict_to_target`), which is
+    // why `mark_resident` above is issued BEFORE the commit and as its OWN statement — the commit
+    // writes only `status`/`corrupt_attempts`/`updated_at` and never touches residency. The window
+    // that ordering opens, a residency row against a still-`draining` part, is invisible to the
+    // evictor: `Store::evictable_parts` joins the replication row and filters `status =
+    // 'replicated'`, so nothing can unlink a part whose only durable copy is still the SSD one.
+    // That is what makes the order a correctness property rather than a preference — see
+    // `PartReplicationStore::mark_resident` for why the reverse leaks instead.
     Ok(DrainOutcome::Replicated)
 }
 
