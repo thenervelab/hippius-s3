@@ -34,6 +34,7 @@ import redis.asyncio as async_redis
 
 from hippius_s3.cache.part_memo import PartMemo
 from hippius_s3.monitoring import PeerShedReason
+from hippius_s3.peer_auth import PEER_AUTH_HEADER
 
 
 logger = logging.getLogger(__name__)
@@ -179,12 +180,17 @@ class PeerChunkFetcher:
         registry: PeerRegistry,
         node_name: str,
         client: httpx.AsyncClient,
+        *,
+        auth_secret: str,
         max_inflight: int = _DEFAULT_MAX_INFLIGHT_PER_PEER,
     ) -> None:
         self._pool = pool
         self._registry = registry
         self._node_name = node_name
         self._client = client
+        # Required, with no default: the peer refuses a request that does not carry it, so a
+        # default would only let a caller build a fetcher that silently never fetches.
+        self._auth_secret = auth_secret
         # Caches the resolved base URL per part, so both the residency query and the peer
         # address lookup are paid once per part rather than once per chunk. A `None` result is
         # cached too — "no peer has this" is just as per-part, and re-asking for every chunk
@@ -264,7 +270,7 @@ class PeerChunkFetcher:
         url = f"{base}/internal/parts/{object_id}/{object_version}/{part_number}/chunks/{chunk_index}"
         try:
             async with slots:
-                response = await self._client.get(url)
+                response = await self._client.get(url, headers={PEER_AUTH_HEADER: self._auth_secret})
         except (httpx.HTTPError, OSError) as exc:
             # A registered-but-unreachable peer — a drained or cordoned node whose replacement
             # has not re-registered under the same key — stays resolvable until its TTL lapses.

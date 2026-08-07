@@ -173,11 +173,31 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     config.peer_fetch_max_inflight,
                     config.http_stream_prefetch_chunks,
                 ),
+                auth_secret=config.internal_peer_secret,
             )
-            # Serving-side cap, read by the /internal/parts endpoint. Set whenever peer fetch
-            # is on, since a node that fetches from peers is also one peers fetch from.
-            app.state.peer_serve_limiter = asyncio.Semaphore(config.peer_serve_max_inflight)
             logger.info("Peer chunk fetch enabled for node %s", node_name)
+            if not config.internal_peer_secret:
+                # Fetching is on but there is no secret to present, so every peer refuses with a
+                # 404 and every read falls to the pool. That degradation is invisible from the
+                # outside — reads still succeed — and shows up only as
+                # chunk_reads_by_tier_total{tier=peer} flat, so it has to announce itself. The
+                # case is reachable by deploy ordering: the image can land before the secret.
+                logger.warning(
+                    "HIPPIUS_PEER_FETCH_ENABLED is on but HIPPIUS_INTERNAL_PEER_SECRET is unset — "
+                    "peers will refuse every fetch and all reads will fall through to the pool"
+                )
+
+        # Serving-side state, read by the /internal/parts endpoint. Keyed off peer_serve_enabled
+        # and nothing else, so it is set on every path that mounts the route. It used to hang off
+        # the fetch block above on the reasoning that "a node that fetches from peers is also one
+        # peers fetch from" — true, but it is the converse that bites: the route was mounted
+        # unconditionally, so with fetching off the endpoint was live with NO cap at all
+        # (internal_parts.py reads a missing limiter as "no limit"). A cap that only exists when
+        # an unrelated flag is on is not a cap.
+        if config.peer_serve_enabled:
+            app.state.peer_auth_secret = config.internal_peer_secret
+            app.state.peer_serve_limiter = asyncio.Semaphore(config.peer_serve_max_inflight)
+            logger.info("Peer chunk serving enabled with an in-flight cap of %d", config.peer_serve_max_inflight)
 
         # Eviction orders on COALESCE(last_read_at, resident_at), so a locally-served part has
         # to say so or the evictor falls back to arrival order — which for a re-read working set
@@ -425,7 +445,14 @@ Disallow: /"""
     app.include_router(user_router, prefix="/user")
     app.include_router(sub_token_scopes_router, prefix="/user/sub-tokens")
     app.include_router(public_router, prefix="")
-    app.include_router(internal_parts_router, prefix="")
+    # Mounted only when serving is on AND a secret exists: an absent route is the only honest
+    # representation of "peer serving is off", since a mounted one is reachable from the public
+    # internet (the gateway proxies arbitrary paths and anonymous GET is a valid auth outcome).
+    # MUST stay ahead of s3_router_new — Starlette matches in registration order, and the S3
+    # catch-all /{bucket}/{key:path} would otherwise swallow this path as a GetObject on a
+    # bucket named `internal`. Pinned by tests/unit/test_internal_route_precedence.py.
+    if config.peer_serve_enabled and config.internal_peer_secret:
+        app.include_router(internal_parts_router, prefix="")
     app.include_router(s3_router_new, prefix="")
 
     static_dir = Path(__file__).parent / "static"

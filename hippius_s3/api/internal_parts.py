@@ -4,7 +4,7 @@ The peer tier of the read path (`hippius_s3/cache/peers.py`) calls this on a sib
 `api-local` pod when that node holds a part this one does not. It exists so a cache miss
 costs a peer NVMe read (~6 ms + ~1 ms network) instead of a CephFS pool read (~40 ms).
 
-Two properties keep it safe to expose:
+Two properties bound the BLAST RADIUS of what it hands over:
 
 - It reads the LOCAL tier only, never the pool and never another peer. A peer that could
   proxy onward would let a lookup race turn into a fetch loop between nodes; and serving the
@@ -13,8 +13,22 @@ Two properties keep it safe to expose:
   per-object-version DEK that never leaves the KMS path, so these bytes are useless without
   the envelope — this endpoint grants no read access the caller does not already have.
 
-It sits behind the api's `ip_whitelist` middleware (10.x/172.x pod network only), which is
-also why peers address each other by POD IP rather than through a `hostPort` on the node IP.
+Neither is an authorization argument, and the api's `ip_whitelist` middleware is not one
+either: the gateway is a pod on that same 10.x network and it proxies arbitrary paths straight
+off the internet, so "only pods can reach it" reduced to "anyone can" — a 200-vs-404 existence
+oracle and unmetered NVMe load on a pod that is also serving ingest. What actually bounds this
+route is a shared secret every peer presents (`hippius_s3/peer_auth.py`), which is sufficient
+only because the gateway strips every inbound `x-hippius-*` header before forwarding — so a
+client cannot supply the one this checks. The route is not mounted at all unless both
+`HIPPIUS_PEER_SERVE_ENABLED` and a secret are set, because an "authentication disabled" mode
+would be indistinguishable from the defect that made this paragraph necessary.
+
+The durable fix is a second uvicorn port for internal routes that the gateway has no route to,
+which would make the secret a second line rather than the only one. Not done here: it changes
+the Service and probe topology, so it is deployment work, not a code change.
+
+Peers still address each other by POD IP rather than through a `hostPort` on the node IP, so
+that the traffic stays inside the ip_whitelist as well.
 """
 
 from __future__ import annotations
@@ -24,6 +38,9 @@ import logging
 from fastapi import APIRouter
 from fastapi import Request
 from fastapi import Response
+
+from hippius_s3.peer_auth import PEER_AUTH_HEADER
+from hippius_s3.peer_auth import peer_auth_matches
 
 
 logger = logging.getLogger(__name__)
@@ -44,7 +61,17 @@ async def get_local_chunk(
     404 is the routine answer, not an error: the caller resolved this node from the residency
     table, and the evictor may have unlinked the part in between. The caller falls through to
     the pool on any non-200, so this never needs to distinguish "evicted" from "never had it".
+
+    An unauthenticated caller gets that same 404 — not a 403, which would confirm the route
+    exists and that they named a real (object, version, part). That existence oracle is most
+    of what this endpoint was worth to an attacker, so the refusal must be indistinguishable
+    from a miss, and it runs before any filesystem work so the timing cannot separate them
+    either.
     """
+    expected = getattr(request.app.state, "peer_auth_secret", "")
+    if not peer_auth_matches(request.headers.get(PEER_AUTH_HEADER), expected):
+        return Response(status_code=404)
+
     fs_store = getattr(request.app.state, "fs_store", None)
     if fs_store is None:
         return Response(status_code=404)

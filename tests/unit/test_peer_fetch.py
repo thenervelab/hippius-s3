@@ -23,6 +23,9 @@ from hippius_s3.cache.peers import peer_key
 
 
 OBJ = "466916c0-d61b-4518-b81b-9576b574270a"
+# The peer refuses a request without it, so a fetcher cannot be built without deciding one.
+# What the header carries is exercised end-to-end in test_peer_handshake.py.
+SECRET = "peer-secret"
 
 
 class FakeRedis:
@@ -82,7 +85,7 @@ class FakeHttp:
         self._response = response
         self.urls: list[str] = []
 
-    async def get(self, url: str) -> FakeResponse:
+    async def get(self, url: str, headers: dict[str, str] | None = None) -> FakeResponse:
         self.urls.append(url)
         return self._response
 
@@ -122,7 +125,7 @@ async def test_a_chunk_is_fetched_from_the_peer_that_holds_it() -> None:
     registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
     await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
     http = FakeHttp(FakeResponse(200, b"peer-bytes"))
-    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http)
+    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http, auth_secret=SECRET)
 
     assert await fetcher(OBJ, 1, 3, 2) == b"peer-bytes"
     assert http.urls == [f"http://10.42.2.9:8000/internal/parts/{OBJ}/1/3/chunks/2"]
@@ -137,7 +140,7 @@ async def test_the_residency_lookup_excludes_this_node() -> None:
     """
     pool = FakePool({"node_id": "node-b"})
     registry = PeerRegistry(FakeRedis(), "node-a", "http://10.42.1.5:8000", 90)
-    fetcher = PeerChunkFetcher(pool, registry, "node-a", FakeHttp(FakeResponse(404)))
+    fetcher = PeerChunkFetcher(pool, registry, "node-a", FakeHttp(FakeResponse(404)), auth_secret=SECRET)
 
     await fetcher(OBJ, 1, 3, 2)
 
@@ -147,7 +150,9 @@ async def test_the_residency_lookup_excludes_this_node() -> None:
 @pytest.mark.asyncio
 async def test_no_peer_holds_the_part_so_the_pool_is_used() -> None:
     registry = PeerRegistry(FakeRedis(), "node-a", "http://10.42.1.5:8000", 90)
-    fetcher = PeerChunkFetcher(FakePool(None), registry, "node-a", FakeHttp(FakeResponse(200, b"x")))
+    fetcher = PeerChunkFetcher(
+        FakePool(None), registry, "node-a", FakeHttp(FakeResponse(200, b"x")), auth_secret=SECRET
+    )
 
     assert await fetcher(OBJ, 1, 3, 2) is None
 
@@ -158,7 +163,9 @@ async def test_a_peer_that_evicted_the_chunk_returns_none() -> None:
     redis = FakeRedis()
     await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
     registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
-    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", FakeHttp(FakeResponse(404)))
+    fetcher = PeerChunkFetcher(
+        FakePool({"node_id": "node-b"}), registry, "node-a", FakeHttp(FakeResponse(404)), auth_secret=SECRET
+    )
 
     assert await fetcher(OBJ, 1, 3, 2) is None
 
@@ -168,7 +175,7 @@ async def test_a_resolved_but_unregistered_peer_is_skipped() -> None:
     """Residency says node-b holds it, but node-b's pod has not registered (or aged out)."""
     registry = PeerRegistry(FakeRedis(), "node-a", "http://10.42.1.5:8000", 90)
     http = FakeHttp(FakeResponse(200, b"never"))
-    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http)
+    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http, auth_secret=SECRET)
 
     assert await fetcher(OBJ, 1, 3, 2) is None
     assert http.urls == [], "no address, so no request was attempted"
@@ -186,7 +193,7 @@ async def test_the_owner_lookup_is_per_part_not_per_chunk() -> None:
     registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
     pool = FakePool({"node_id": "node-b"})
     http = FakeHttp(FakeResponse(200, b"peer-bytes"))
-    fetcher = PeerChunkFetcher(pool, registry, "node-a", http)
+    fetcher = PeerChunkFetcher(pool, registry, "node-a", http, auth_secret=SECRET)
 
     for chunk in range(64):
         assert await fetcher(OBJ, 1, 3, chunk) == b"peer-bytes"
@@ -202,7 +209,7 @@ async def test_a_different_part_is_looked_up_separately() -> None:
     await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
     registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
     pool = FakePool({"node_id": "node-b"})
-    fetcher = PeerChunkFetcher(pool, registry, "node-a", FakeHttp(FakeResponse(200, b"x")))
+    fetcher = PeerChunkFetcher(pool, registry, "node-a", FakeHttp(FakeResponse(200, b"x")), auth_secret=SECRET)
 
     await fetcher(OBJ, 1, 3, 0)
     await fetcher(OBJ, 1, 4, 0)
@@ -216,7 +223,7 @@ class FailingHttp:
     def __init__(self) -> None:
         self.attempts = 0
 
-    async def get(self, url: str):  # noqa: ANN201
+    async def get(self, url: str, headers: dict[str, str] | None = None):  # noqa: ANN201
         self.attempts += 1
         raise httpx.ConnectError("connection refused")
 
@@ -234,7 +241,7 @@ async def test_a_dead_peer_is_tried_once_not_once_per_chunk() -> None:
     await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
     registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
     http = FailingHttp()
-    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http)
+    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http, auth_secret=SECRET)
 
     for chunk in range(32):
         assert await fetcher(OBJ, 1, 3, chunk) is None, "every chunk falls through to the pool"
@@ -250,7 +257,7 @@ class BlockingHttp:
         self.started = asyncio.Event()
         self.attempts = 0
 
-    async def get(self, url: str):  # noqa: ANN201
+    async def get(self, url: str, headers: dict[str, str] | None = None):  # noqa: ANN201
         self.attempts += 1
         self.started.set()
         await self.release.wait()
@@ -270,7 +277,9 @@ async def test_a_saturated_peer_is_skipped_rather_than_queued() -> None:
     await PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90).register()
     registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
     http = BlockingHttp()
-    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http, max_inflight=1)
+    fetcher = PeerChunkFetcher(
+        FakePool({"node_id": "node-b"}), registry, "node-a", http, max_inflight=1, auth_secret=SECRET
+    )
 
     first = asyncio.create_task(fetcher(OBJ, 1, 3, 0))
     await asyncio.wait_for(http.started.wait(), timeout=1)
@@ -298,12 +307,12 @@ async def test_a_busy_peer_503_falls_through_without_poisoning_the_memo() -> Non
         def __init__(self) -> None:
             self.calls = 0
 
-        async def get(self, url: str):  # noqa: ANN201
+        async def get(self, url: str, headers: dict[str, str] | None = None):  # noqa: ANN201
             self.calls += 1
             return FakeResponse(503) if self.calls == 1 else FakeResponse(200, b"peer-bytes")
 
     http = Flaky()
-    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http)
+    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http, auth_secret=SECRET)
 
     assert await fetcher(OBJ, 1, 3, 0) is None, "shed, so this chunk reads from the pool"
     assert await fetcher(OBJ, 1, 3, 1) == b"peer-bytes", "the peer is retried once it recovers"
@@ -330,7 +339,9 @@ async def test_both_shed_paths_are_recorded_with_their_reason(monkeypatch) -> No
 
     # Client cap: one slot, held by a request that has not come back yet.
     blocking = BlockingHttp()
-    capped = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", blocking, max_inflight=1)
+    capped = PeerChunkFetcher(
+        FakePool({"node_id": "node-b"}), registry, "node-a", blocking, max_inflight=1, auth_secret=SECRET
+    )
     first = asyncio.create_task(capped(OBJ, 1, 3, 0))
     await asyncio.wait_for(blocking.started.wait(), timeout=1)
     assert await capped(OBJ, 1, 3, 1) is None
@@ -339,7 +350,12 @@ async def test_both_shed_paths_are_recorded_with_their_reason(monkeypatch) -> No
 
     # Server cap: the peer sheds it back with a 503.
     busy = PeerChunkFetcher(
-        FakePool({"node_id": "node-b"}), registry, "node-a", FakeHttp(FakeResponse(503)), max_inflight=8
+        FakePool({"node_id": "node-b"}),
+        registry,
+        "node-a",
+        FakeHttp(FakeResponse(503)),
+        max_inflight=8,
+        auth_secret=SECRET,
     )
     assert await busy(OBJ, 1, 4, 0) is None
 
@@ -388,6 +404,7 @@ async def test_a_single_readers_prefetch_window_never_sheds_against_an_idle_peer
         "node-a",
         http,
         max_inflight=effective_max_inflight(8, prefetch),
+        auth_secret=SECRET,
     )
 
     # One part, so every chunk resolves to the same peer — the case the cap used to break.
@@ -416,7 +433,9 @@ async def test_the_cap_still_sheds_when_readers_genuinely_contend() -> None:
     registry = PeerRegistry(redis, "node-a", "http://10.42.1.5:8000", 90)
     http = BlockingHttp()
     cap = 4
-    fetcher = PeerChunkFetcher(FakePool({"node_id": "node-b"}), registry, "node-a", http, max_inflight=cap)
+    fetcher = PeerChunkFetcher(
+        FakePool({"node_id": "node-b"}), registry, "node-a", http, max_inflight=cap, auth_secret=SECRET
+    )
 
     saturating = [asyncio.create_task(fetcher(OBJ, 1, 3, i)) for i in range(cap)]
     await asyncio.wait_for(http.started.wait(), timeout=1)

@@ -408,6 +408,23 @@ class Config:
     # silently halved peer tier.
     peer_fetch_max_inflight: int = env("HIPPIUS_PEER_FETCH_MAX_INFLIGHT:16", convert=int)
     peer_serve_max_inflight: int = env("HIPPIUS_PEER_SERVE_MAX_INFLIGHT:16", convert=int)
+    # SERVE this node's flash to peers. Deliberately its own flag rather than a rider on
+    # peer_fetch_enabled, which governs what this pod READS. Coupling them is how the serve
+    # route came to be mounted on every api pod while the flag said the feature was off — and
+    # `ip_whitelist` never bounded it, because the gateway is a pod on that same network and
+    # proxies arbitrary paths from the internet. So this flag has to gate the mount, not just
+    # the behaviour.
+    #
+    # `x.lower() == "true"` and not `convert=bool`: `bool("false")` is True, so a plain bool
+    # converter turns an explicit HIPPIUS_PEER_SERVE_ENABLED=false into "enabled" — the exact
+    # inversion this flag exists to prevent. (peer_fetch_enabled above still has that bug.)
+    peer_serve_enabled: bool = env("HIPPIUS_PEER_SERVE_ENABLED:false", convert=lambda x: x.lower() == "true")
+    # Shared secret every peer presents on /internal/parts. It is sufficient BECAUSE the gateway
+    # strips all inbound x-hippius-* headers before forwarding, so no client can supply it; the
+    # pod network on its own is not a boundary. Empty means the route is not mounted AT ALL —
+    # there must be no configuration meaning "serving, authentication off", since that state is
+    # indistinguishable from the defect. repr=False so a stray str(config) cannot leak it.
+    internal_peer_secret: str = env("HIPPIUS_INTERNAL_PEER_SECRET:", convert=str, repr=False)
     # 24h since last WRITE — the read path no longer bumps timestamps (read
     # recency lives in fs_cache_inventory.last_access_at), so this gates on
     # time since the part landed, not since it was last streamed.

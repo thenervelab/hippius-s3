@@ -90,6 +90,23 @@ async def input_validation_middleware(
             status_code=400,
         )
 
+    # `internal` is refused on EVERY method, not just the CreateBucket shape above. The api
+    # mounts /internal/parts/... ahead of its S3 catch-all, and the request that reached it was
+    # a plain GET: anonymous auth succeeds, and the ACL middleware passes through on a bucket
+    # nobody owns. So the write-shaped check above never saw it.
+    #
+    # Defence in depth, not the boundary — the api requires a shared secret on that route, and
+    # this is a blocklist, so it protects exactly the one prefix somebody thought to add and
+    # will rot the moment another internal route lands. The durable fix is a second port for
+    # internal routes with no gateway route to it; until then, anything mounted on the api app
+    # outside the S3 namespace needs a line here.
+    if path_parts[0] == "internal":
+        return s3_error_response(
+            code="InvalidBucketName",
+            message="Bucket name 'internal' is reserved for gateway routes",
+            status_code=400,
+        )
+
     # Skip validation for non-S3 endpoints
     if path_parts[0] in SKIP_PREFIXES:
         return await call_next(request)
