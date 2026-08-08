@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -336,6 +337,13 @@ class ObjectWriter:
                 logger.debug(f"PERF chunk {chunk_idx}: io={io_ms:.1f}ms (fs) size={len(ct)}")
 
         with tracer.start_as_current_span("put_simple_stream_full.encrypt_and_cache") as span:
+            # TODO(FU-6): this path orphans `consumer_task` on any exception exactly as the MPU
+            # path did — and worse, it has no exception handling at all, so a client disconnect
+            # leaks the task and its queued chunks unconditionally. Fixing it means wrapping the
+            # whole block in try/finally, which is a reindent large enough to want its own change.
+            # A simple PUT writes to a per-object-version dir rather than one two attempts share,
+            # so the cross-attempt corruption the MPU guard prevents does not arise here; what
+            # remains is the task/queue leak.
             consumer_task = asyncio.create_task(_consumer())
 
             async for piece in body_iter:
@@ -871,6 +879,24 @@ class ObjectWriter:
             )
             meta_written = True
         except Exception:
+            # Stop the consumer before unwinding. Without this it is left PENDING holding up to
+            # HIPPIUS_WRITE_QUEUE_MAXSIZE already-queued chunks, which it then writes into the
+            # SHARED part directory on later event-loop turns — after the request has already
+            # failed. A duplicate UploadPart that dies mid-stream therefore overwrote chunks of an
+            # ALREADY-ACKNOWLEDGED attempt, silently: the AAD binds (bucket, object, part, chunk)
+            # and not attempt identity, so the result decrypts cleanly as the wrong plaintext while
+            # meta and the parts row still describe the first attempt.
+            #
+            # It also leaked the task and its queue permanently: the `None` sentinel is only sent
+            # on the success path, so the consumer blocked on `write_queue.get()` forever.
+            #
+            # This BOUNDS the window rather than closing it — a chunk already inside `set_chunk`'s
+            # worker thread is past the point cancellation can reach. Closing it properly needs
+            # attempt-scoped part dirs or publish-then-rename, so that two attempts never write the
+            # same paths at all.
+            consumer_task.cancel()
+            with contextlib.suppress(BaseException):
+                await consumer_task
             if not meta_written:
                 await _cleanup_partial()
             raise
