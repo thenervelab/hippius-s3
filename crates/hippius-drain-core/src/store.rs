@@ -340,10 +340,33 @@ impl Store {
     ///
     /// [`StoreError::Database`] if the delete fails.
     pub async fn gc_terminal_status_rows(&self, retention: Duration) -> Result<u64> {
+        // The residency guard is a DURABILITY gate, not an optimisation. Both readers of
+        // `cephor_ssd_residency` in this crate — `evictable_parts` and `node_cache_bytes` — INNER
+        // JOIN this table and require `status = 'replicated'`, so deleting the row of a part that
+        // is still on disk makes that part simultaneously **unevictable and unaccounted**: the
+        // evictor's worklist can never emit it, so it occupies ingest NVMe forever, and the
+        // heartbeat stops counting its bytes, which also feeds the shared-filesystem check into
+        // reading the node as though a foreign writer owned the disk.
+        //
+        // This was unreachable before read-tier retention, and that is why the retention window
+        // above was never sized against it: the drain unlinked a replicated part's SSD copy within
+        // `CEPHOR_REPLICATED_RECLAIM_GRACE_SECS` (1h in prod), so no `replicated` row could
+        // outlive its part. Retention keeps parts resident on a free-space policy instead, which
+        // on an uncontended node is indefinite — comfortably past the 7-day default.
+        //
+        // `cephor_ssd_residency_part_idx (object_id, version, part_number)` already serves this
+        // lookup; migration 0016 added it for exactly this key shape and 0017 deliberately kept
+        // it. No new index, no migration.
         let affected = sqlx::query(
-            "DELETE FROM cephor_replication_status \
-             WHERE (status = 'failed' OR (status = 'replicated' AND upload_enqueued_at IS NOT NULL)) \
-               AND updated_at < now() - (interval '1 second' * $1)",
+            "DELETE FROM cephor_replication_status s \
+             WHERE (s.status = 'failed' OR (s.status = 'replicated' AND s.upload_enqueued_at IS NOT NULL)) \
+               AND s.updated_at < now() - (interval '1 second' * $1) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM cephor_ssd_residency r \
+                   WHERE r.object_id = s.object_id \
+                     AND r.version = s.version \
+                     AND r.part_number = s.part_number \
+               )",
         )
         .bind(retention.as_secs_f64())
         .execute(&self.pool)
@@ -1749,6 +1772,70 @@ mod part_tests {
             store.status(&pending).await.unwrap(),
             Some(ReplicationState::Pending),
             "a live pending row is never pruned"
+        );
+    }
+
+    /// The retention window was sized against the reclaim path, not against a part that outlives
+    /// it on disk. Read-tier retention made the second case real, and this pins the consequence.
+    #[sqlx::test]
+    async fn gc_spares_a_terminal_row_whose_part_is_still_resident(pool: PgPool) {
+        // Deleting the row of a still-resident part makes that part BOTH unevictable and
+        // unaccounted: `evictable_parts` and `node_cache_bytes` each INNER JOIN this table, so
+        // with no row the evictor's worklist can never emit the part — it holds ingest NVMe
+        // forever — and the heartbeat stops counting its bytes.
+        //
+        // Unreachable before retention: the drain unlinked a replicated part's SSD copy within
+        // CEPHOR_REPLICATED_RECLAIM_GRACE_SECS (1h in prod), so no `replicated` row could outlive
+        // its part. Retention holds parts on a free-space policy, which on an uncontended node is
+        // indefinite — well past the 7-day default this GC runs at.
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let resident = part(UUID_A, 6, 1); // aged + enqueued, but STILL ON DISK -> must survive
+        let evicted = part(UUID_A, 6, 2); // aged + enqueued, no residency row -> pruned as before
+
+        for p in [&resident, &evicted] {
+            store.record_landed_part(p).await.unwrap();
+            force_terminal(&pool, p, "replicated").await; // backdated 2h
+            store.mark_upload_enqueued(p).await.unwrap();
+        }
+        // Only the first is claimed on this node's SSD. The second stands in for a part the
+        // evictor already reclaimed, which is the case the GC exists to clean up after.
+        store.record_resident(&resident, 4096).await.unwrap();
+
+        let pruned = store.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap();
+
+        assert_eq!(pruned, 1, "only the part that is no longer on disk may be pruned");
+        assert!(
+            store.status(&resident).await.unwrap().is_some(),
+            "a resident part's row was pruned — the evictor can no longer see the part at all"
+        );
+        assert!(
+            store.status(&evicted).await.unwrap().is_none(),
+            "a non-resident terminal row still prunes"
+        );
+    }
+
+    /// Residency is per NODE; this GC is fleet-wide. A part resident on ANY node must survive.
+    #[sqlx::test]
+    async fn gc_spares_a_row_whose_part_is_resident_on_a_different_node(pool: PgPool) {
+        // The guard is deliberately not node-scoped. `record_resident` writes the promoting node,
+        // which for a read-through promotion is NOT the ingesting node in the replication row —
+        // so a node-scoped guard would prune the row out from under the very node holding the
+        // copy, which is the leak this fix exists to prevent.
+        let ingesting = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let promoting = Store::from_pool(pool.clone()).with_node_id("node-b");
+        let promoted = part(UUID_A, 7, 1);
+
+        ingesting.record_landed_part(&promoted).await.unwrap();
+        force_terminal(&pool, &promoted, "replicated").await;
+        ingesting.mark_upload_enqueued(&promoted).await.unwrap();
+        promoting.record_resident(&promoted, 4096).await.unwrap();
+
+        let pruned = ingesting.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap();
+
+        assert_eq!(pruned, 0);
+        assert!(
+            ingesting.status(&promoted).await.unwrap().is_some(),
+            "a promoted copy on another node was orphaned"
         );
     }
 
