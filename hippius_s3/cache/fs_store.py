@@ -301,6 +301,20 @@ class FileSystemPartsStore:
         Costs the same as `set_chunk`: one file created now, one rename later at publish,
         versus a create and an immediate rename. No extra copy of the bytes.
 
+        WHO REAPS A STAGED FILE. Naming these so no existing sweeper touches them is what keeps
+        a live 14 GB upload alive, and it means nothing reclaims them by accident either — so
+        the disposal path is explicit at every exit:
+          - Ordinary failure or cancellation: `discard_staged`, from the writer's `finally`.
+          - Publish: the rename consumes them; a stale tail from a larger earlier attempt goes
+            with the trim.
+          - SIGKILL/OOM mid-upload: neither of the above runs. The part dir has no `meta.json`,
+            so the drain's reclaim scan never discovers it, and with NEITHER a residency row nor
+            a replication row (both are written only after publish) the evictor's INNER JOIN can
+            never emit it — `remove_dir_all` is never called on it. The drain agent's
+            `sweep_orphan_tmp` is therefore the only reaper that can reach it, which is why it
+            was taught this name, on the orphan grace (24h) rather than the write-temp one.
+            `sweep_empty_shells` then collects the emptied part/version/object dirs.
+
         Raises:
             OSError: If the write fails (fatal to request)
         """
@@ -351,6 +365,14 @@ class FileSystemPartsStore:
         `meta.json` is removed before the error propagates, which is the same "un-publish"
         the append CAS loser does, and the reader/drain then treat the part as absent rather
         than decrypting a mixture that AEAD-verifies as the wrong plaintext.
+
+        The one window that survives is a process KILL inside this thread call, which would
+        leave a partly-swapped set under the previous attempt's meta. It is bounded by the call
+        itself — `num_chunks` stats, `num_chunks` renames, one dir scan and one small write,
+        with no data copied — measured at 2.7 ms for a 100 MB part and 326 ms for a 14 GB one
+        (3584 chunks). Un-publishing FIRST would make even that invisible, but a kill in the
+        new window would then lose an acknowledged, not-yet-replicated part: that trades a
+        narrow corruption window for a loss path, against the leak-beats-loss doctrine.
 
         Raises:
             FileNotFoundError: If a staged chunk is missing (a concurrent whole-part eviction

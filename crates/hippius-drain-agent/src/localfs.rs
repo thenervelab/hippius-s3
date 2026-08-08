@@ -258,14 +258,20 @@ impl LocalSsd {
         Ok(removed)
     }
 
-    /// Removes the empty `<object_id>/v<version>/` and `<object_id>/` shells a drained part
-    /// leaves behind, once untouched for `max_age`.
+    /// Removes the empty `part_<n>/`, `<object_id>/v<version>/` and `<object_id>/` shells left
+    /// behind by a drained or swept part, once untouched for `max_age`.
     ///
     /// `remove_part_dir` deletes only `part_<n>/`, so over millions of drained parts the two
     /// ancestor dirs accumulate as empty shells — an unbounded directory/inode leak on the
     /// node-local SSD (observed at 100k-338k dirs per prod node, all `<oid>/v1/` with nothing
     /// inside). The crash-orphan reclaim never sees them: it keys on `meta.json`, and a shell
     /// has none.
+    ///
+    /// The part level is swept for the same reason one level up: an `UploadPart` killed after
+    /// staging chunks but before publishing leaves a dir that NOTHING else can reach — with no
+    /// `meta.json` it is invisible to the reclaim scan, and with neither a residency nor a
+    /// replication row the evictor's `remove_dir_all` is never called on it. `sweep_orphan_tmp`
+    /// empties it; this is what then collects the shell.
     ///
     /// THE AGE GATE IS THE SAFETY PROPERTY, not the emptiness check. Pruning inline at removal
     /// time looks safe because `rmdir` refuses a non-empty dir — but `mkdir -p` is not atomic.
@@ -278,9 +284,9 @@ impl LocalSsd {
     /// mtime, so requiring the shell to have been untouched for `max_age` means no writer has
     /// created anything in it recently — closing the window rather than narrowing it.
     ///
-    /// Sweeps version dirs before object dirs, so an object emptied by its last version going
-    /// away is collected in the same pass. Returns how many shells it removed; a missing root
-    /// is an empty cache, not an error.
+    /// Sweeps innermost-first — parts, then versions, then objects — so a tree emptied from the
+    /// bottom collapses entirely in ONE pass rather than one level per poll. Returns how many
+    /// shells it removed; a missing root is an empty cache, not an error.
     ///
     /// # Errors
     ///
@@ -300,6 +306,15 @@ impl LocalSsd {
                     if !version.file_type().await?.is_dir() {
                         continue;
                     }
+                    if let Some(mut parts) = open_dir(&version.path()).await? {
+                        while let Some(part) = parts.next_entry().await? {
+                            if !part.file_type().await?.is_dir() {
+                                continue;
+                            }
+                            removed += u64::from(rmdir_if_stale_and_empty(&part.path(), max_age).await?);
+                        }
+                    }
+                    // Only after its parts, so a version emptied by its last part just now goes too.
                     removed += u64::from(rmdir_if_stale_and_empty(&version.path(), max_age).await?);
                 }
             }
@@ -910,6 +925,51 @@ mod tests {
         assert!(!version_dir.exists(), "the empty v<version> shell is swept");
         assert!(!object_dir.exists(), "the empty <object_id> shell is swept");
         assert!(root.path().exists(), "the SSD root is never removed");
+    }
+
+    #[tokio::test]
+    async fn a_killed_attempts_staged_part_is_fully_reclaimed_by_the_two_sweeps() {
+        // THE reaping story for staging. An UploadPart killed after staging chunks but before
+        // publishing leaves a dir with NO meta.json, so the reclaim scan never discovers it, and
+        // with neither a residency nor a replication row the evictor's remove_dir_all is never
+        // called on it either. These two sweeps are the ONLY thing that can reach it: the tmp
+        // sweep empties the dir, the shell sweep then collapses the whole branch.
+        let root = TempDir::new().unwrap();
+        let p = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 1);
+        let part_path = part_dir(root.path(), &p);
+        std::fs::create_dir_all(&part_path).unwrap();
+        std::fs::write(part_path.join("chunk_0.bin.staged.0123456789abcdef"), b"staged").unwrap();
+        std::fs::write(part_path.join("chunk_1.bin.staged.0123456789abcdef"), b"staged").unwrap();
+        let object_dir = part_path.parent().unwrap().parent().unwrap().to_path_buf();
+        let ssd = LocalSsd::new(root.path().to_path_buf());
+
+        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO, Duration::ZERO).await.unwrap(), 2);
+        assert_eq!(
+            ssd.sweep_empty_shells(Duration::ZERO).await.unwrap(),
+            3,
+            "part + version + object, all in one pass"
+        );
+
+        assert!(!object_dir.exists(), "nothing of the killed attempt survives");
+        assert!(root.path().exists(), "the SSD root is never removed");
+    }
+
+    #[tokio::test]
+    async fn the_sweep_spares_a_part_dir_that_still_holds_staged_chunks() {
+        // The live-upload guard at the part level: a staged set inside its own grace keeps the
+        // dir non-empty, and `rmdir` is kernel-gated on emptiness, so an in-flight UploadPart
+        // cannot have its directory pulled out from under it.
+        let root = TempDir::new().unwrap();
+        let p = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 1);
+        let part_path = part_dir(root.path(), &p);
+        std::fs::create_dir_all(&part_path).unwrap();
+        std::fs::write(part_path.join("chunk_0.bin.staged.0123456789abcdef"), b"in flight").unwrap();
+        let ssd = LocalSsd::new(root.path().to_path_buf());
+
+        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO, Duration::from_hours(24)).await.unwrap(), 0);
+        assert_eq!(ssd.sweep_empty_shells(Duration::ZERO).await.unwrap(), 0);
+
+        assert!(part_path.join("chunk_0.bin.staged.0123456789abcdef").exists());
     }
 
     #[tokio::test]

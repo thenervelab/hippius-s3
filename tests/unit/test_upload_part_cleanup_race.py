@@ -441,6 +441,43 @@ async def test_failed_attempt_leaves_no_staged_files_behind(tmp_path, monkeypatc
     assert sorted(p.name for p in part_dir.iterdir()) == ["chunk_0.bin", "chunk_1.bin", "meta.json"]
 
 
+@pytest.mark.asyncio
+async def test_a_cancelled_attempt_still_discards_its_staged_chunks(tmp_path, monkeypatch, small_chunks):
+    """Cancellation is a BaseException, so `except Exception` would skip cleanup for the very
+    case whose staged bytes most need dropping — and nothing else can reap an unpublished part
+    dir before the drain's 24h orphan sweep."""
+    object_id = str(uuid.uuid4())
+    fs_store = _WriteSignallingStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    async def stalling_body() -> AsyncIterator[bytes]:
+        fs_store.chunk_written.clear()
+        yield b"ZZZZ"
+        await fs_store.chunk_written.wait()
+        await asyncio.sleep(30)  # still streaming when the client goes away
+        yield b"YYYY"
+
+    task = asyncio.create_task(
+        writer.mpu_upload_part_stream(
+            upload_id="upload",
+            object_id=object_id,
+            object_version=1,
+            bucket_name="bucket",
+            bucket_id="bucket",
+            account_address="acct",
+            part_number=1,
+            body_iter=stalling_body(),
+        )
+    )
+    await fs_store.chunk_written.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    part_dir = Path(fs_store.part_path(object_id, 1, 1))
+    assert list(part_dir.iterdir()) == [], "a cancelled attempt leaves nothing behind"
+
+
 class _AppendFakeConn:
     """Just enough of an asyncpg connection for append_stream's two transactions."""
 

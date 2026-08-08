@@ -805,9 +805,8 @@ class ObjectWriter:
                 perf_fs_ms += io_ms
                 logger.debug(f"PERF mpu chunk {chunk_idx}: io={io_ms:.1f}ms (fs) size={len(ct)}")
 
+        consumer_task = asyncio.create_task(_consumer())
         try:
-            consumer_task = asyncio.create_task(_consumer())
-
             async for piece in body_iter:
                 if consumer_error:
                     raise consumer_error
@@ -896,26 +895,36 @@ class ObjectWriter:
                 plain_size=int(total_size),
             )
             published = True
-        except Exception:
-            # Stop the consumer before unwinding. Without this it is left PENDING holding up to
-            # HIPPIUS_WRITE_QUEUE_MAXSIZE already-queued chunks, which it then writes on later
-            # event-loop turns — after the request has already failed. It also leaked the task
-            # and its queue permanently: the `None` sentinel is only sent on the success path,
-            # so the consumer blocked on `write_queue.get()` forever.
-            #
-            # Cancellation alone never closed the corruption window — a chunk already inside the
-            # worker thread lands regardless. Staging is what closes it: those late writes go to
-            # names only this attempt uses, so discarding them is unambiguous, and a chunk of an
-            # already-acknowledged attempt is never at risk either way.
-            consumer_task.cancel()
-            with contextlib.suppress(BaseException):
-                await consumer_task
+        finally:
             if not published:
-                await self.fs_store.discard_staged(
-                    str(object_id), int(object_version), int(part_number), attempt_id=attempt_id
-                )
-                await _cleanup_partial()
-            raise
+                # Stop the consumer before unwinding. Without this it is left PENDING holding up
+                # to HIPPIUS_WRITE_QUEUE_MAXSIZE already-queued chunks, which it then writes on
+                # later event-loop turns — after the request has already failed. It also leaked
+                # the task and its queue permanently: the `None` sentinel is only sent on the
+                # success path, so the consumer blocked on `write_queue.get()` forever.
+                #
+                # Cancellation alone never closed the corruption window — a chunk already inside
+                # the worker thread lands regardless. Staging is what closes it: those late
+                # writes go to names only this attempt uses, so discarding them is unambiguous,
+                # and a chunk of an already-acknowledged attempt is never at risk either way.
+                consumer_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await consumer_task
+
+                # `finally`, not `except Exception`: a client disconnect can arrive as
+                # CancelledError, which is a BaseException, and that is exactly the case whose
+                # staged bytes most need dropping. Shielded because once a CancelledError is
+                # unwinding, every further await raises immediately — an unshielded discard
+                # would be skipped precisely when it is needed. Suppressed because cleanup must
+                # never replace the exception that is already on its way to the client.
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(
+                        self.fs_store.discard_staged(
+                            str(object_id), int(object_version), int(part_number), attempt_id=attempt_id
+                        )
+                    )
+                with contextlib.suppress(BaseException):
+                    await _cleanup_partial()
 
         perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
         md5_hash = hasher.hexdigest()
