@@ -1,4 +1,5 @@
 import dataclasses
+import ipaddress
 import uuid
 
 import dotenv
@@ -7,6 +8,29 @@ from hippius_s3.utils import env
 
 
 dotenv.load_dotenv()
+
+IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def _parse_cidrs(value: str | None) -> tuple[IpNetwork, ...]:
+    """Parse a comma-separated CIDR list into network objects.
+
+    Parsed once, when the Config singleton is built, because ip_whitelist_middleware matches
+    against this on every request to the api. A malformed or host-bits-set entry raises here, at
+    startup, rather than being silently skipped and quietly widening the boundary.
+    """
+    return tuple(ipaddress.ip_network(part.strip()) for part in str(value or "").split(",") if part.strip())
+
+
+# Deliberately NOT pinned to any one cluster's pod/service ranges: a CIDR that does not cover the
+# gateway 403s every forwarded request and takes the whole api down, so narrowing this is an opt-in
+# per deployment rather than a default.
+#
+# 192.168.0.0/16 is RFC1918 but is deliberately absent, and should not be "restored" on the grounds
+# that it completes the set. Nothing here uses it — k8s pod networks are 10.x and docker-compose
+# bridges land in 172.16/12 — and this list is the api's authorization boundary, so an unused range
+# is boundary we are carrying for free. A deployment that genuinely needs it adds one entry.
+_DEFAULT_IP_WHITELIST_CIDRS = "10.0.0.0/8,172.16.0.0/12,127.0.0.1/32,::1/128"
 
 
 def _parse_csv_urls(value: str | None) -> list[str]:
@@ -56,6 +80,12 @@ class Config:
     frontend_hmac_secret: str = env("FRONTEND_HMAC_SECRET")
     rate_limit_per_minute: int = env("RATE_LIMIT_PER_MINUTE", convert=int)
     max_request_size_mb: int = env("MAX_REQUEST_SIZE_MB", convert=int)
+    # The api performs no authentication of its own — it trusts the X-Hippius-* headers the gateway
+    # stamps. These CIDRs are therefore the entire boundary that makes "only the gateway reaches the
+    # api" true, so they have to mean exactly what they say.
+    api_ip_whitelist_cidrs: tuple[IpNetwork, ...] = env(
+        f"API_IP_WHITELIST_CIDRS:{_DEFAULT_IP_WHITELIST_CIDRS}", convert=_parse_cidrs
+    )
 
     # Logging
     log_level: str = env("LOG_LEVEL")
@@ -397,6 +427,15 @@ class Config:
     # and waiting the old 2.0s meant paying 50x the fallback before then ALSO paying the
     # fallback. Generous against a ~7 ms healthy peer read.
     peer_fetch_timeout_seconds: float = env("HIPPIUS_PEER_FETCH_TIMEOUT_SECONDS:0.5", convert=float)
+    # An OVERALL bound on one peer fetch, connect included. httpx has no such thing: its
+    # `Timeout` carries connect/read/write/pool only, and `read` bounds the gap BETWEEN body
+    # pieces — so under the value above alone, a peer sending one piece every 0.4s holds the
+    # connection and a growing buffer with no limit at all.
+    # Deliberately NOT the same value: 0.5s of silence is a dead peer, but 0.5s to deliver a
+    # whole 4 MiB chunk is a peer doing its job, so reusing the loss-cut as a deadline would
+    # abort healthy large-chunk fetches. This is a backstop against a peer that never finishes,
+    # not a second loss-cut.
+    peer_fetch_deadline_seconds: float = env("HIPPIUS_PEER_FETCH_DEADLINE_SECONDS:2.0", convert=float)
     # Per-peer fanout: concurrent fetches this pod will have in flight to any ONE peer, and
     # concurrent peer requests this pod will SERVE. Both are needed — the client cap bounds
     # what one pod sends, but five pods each within their own cap still add up at the peer,
@@ -408,6 +447,23 @@ class Config:
     # silently halved peer tier.
     peer_fetch_max_inflight: int = env("HIPPIUS_PEER_FETCH_MAX_INFLIGHT:16", convert=int)
     peer_serve_max_inflight: int = env("HIPPIUS_PEER_SERVE_MAX_INFLIGHT:16", convert=int)
+    # SERVE this node's flash to peers. Deliberately its own flag rather than a rider on
+    # peer_fetch_enabled, which governs what this pod READS. Coupling them is how the serve
+    # route came to be mounted on every api pod while the flag said the feature was off — and
+    # `ip_whitelist` never bounded it, because the gateway is a pod on that same network and
+    # proxies arbitrary paths from the internet. So this flag has to gate the mount, not just
+    # the behaviour.
+    #
+    # `x.lower() == "true"` and not `convert=bool`: `bool("false")` is True, so a plain bool
+    # converter turns an explicit HIPPIUS_PEER_SERVE_ENABLED=false into "enabled" — the exact
+    # inversion this flag exists to prevent. (peer_fetch_enabled above still has that bug.)
+    peer_serve_enabled: bool = env("HIPPIUS_PEER_SERVE_ENABLED:false", convert=lambda x: x.lower() == "true")
+    # Shared secret every peer presents on /internal/parts. It is sufficient BECAUSE the gateway
+    # strips all inbound x-hippius-* headers before forwarding, so no client can supply it; the
+    # pod network on its own is not a boundary. Empty means the route is not mounted AT ALL —
+    # there must be no configuration meaning "serving, authentication off", since that state is
+    # indistinguishable from the defect. repr=False so a stray str(config) cannot leak it.
+    internal_peer_secret: str = env("HIPPIUS_INTERNAL_PEER_SECRET:", convert=str, repr=False)
     # 24h since last WRITE — the read path no longer bumps timestamps (read
     # recency lives in fs_cache_inventory.last_access_at), so this gates on
     # time since the part landed, not since it was last streamed.

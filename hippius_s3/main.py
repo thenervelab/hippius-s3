@@ -35,6 +35,7 @@ from hippius_s3.api.sub_token_scopes import router as sub_token_scopes_router
 from hippius_s3.api.user import router as user_router
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
+from hippius_s3.cache.peers import PEER_PORT
 from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
 from hippius_s3.cache.peers import effective_max_inflight
@@ -44,6 +45,8 @@ from hippius_s3.config import Config
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
+from hippius_s3.peer_auth import validate_peer_secret
+from hippius_s3.promote_floor import create_published_floor_source
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
 from hippius_s3.writer.landed import initialize_landed_publisher
 
@@ -153,7 +156,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             app.state.peer_registry = PeerRegistry(
                 app.state.redis_client,
                 node_name,
-                f"http://{pod_ip}:8000",
+                # Built from the same constant the resolver pins addresses to, so a peer's
+                # registration and the allow-list that admits it cannot drift apart.
+                f"http://{pod_ip}:{PEER_PORT}",
                 config.peer_registry_ttl_seconds,
             )
             await app.state.peer_registry.register()
@@ -173,21 +178,50 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     config.peer_fetch_max_inflight,
                     config.http_stream_prefetch_chunks,
                 ),
+                auth_secret=config.internal_peer_secret,
+                # The httpx timeout above bounds each socket operation, never the whole
+                # response; this is what stops a peer that drips bytes forever.
+                deadline_seconds=config.peer_fetch_deadline_seconds,
             )
-            # Serving-side cap, read by the /internal/parts endpoint. Set whenever peer fetch
-            # is on, since a node that fetches from peers is also one peers fetch from.
-            app.state.peer_serve_limiter = asyncio.Semaphore(config.peer_serve_max_inflight)
             logger.info("Peer chunk fetch enabled for node %s", node_name)
+            if not config.internal_peer_secret:
+                # Fetching is on but there is no secret to present, so every peer refuses with a
+                # 404 and every read falls to the pool. That degradation is invisible from the
+                # outside — reads still succeed — and shows up only as
+                # chunk_reads_by_tier_total{tier=peer} flat, so it has to announce itself. The
+                # case is reachable by deploy ordering: the image can land before the secret.
+                logger.warning(
+                    "HIPPIUS_PEER_FETCH_ENABLED is on but HIPPIUS_INTERNAL_PEER_SECRET is unset — "
+                    "peers will refuse every fetch and all reads will fall through to the pool"
+                )
+
+        # Serving-side state, read by the /internal/parts endpoint. Keyed off peer_serve_enabled
+        # and nothing else, so it is set on every path that mounts the route. It used to hang off
+        # the fetch block above on the reasoning that "a node that fetches from peers is also one
+        # peers fetch from" — true, but it is the converse that bites: the route was mounted
+        # unconditionally, so with fetching off the endpoint was live with NO cap at all
+        # (internal_parts.py reads a missing limiter as "no limit"). A cap that only exists when
+        # an unrelated flag is on is not a cap.
+        if config.peer_serve_enabled:
+            app.state.peer_auth_secret = config.internal_peer_secret
+            app.state.peer_serve_limiter = asyncio.Semaphore(config.peer_serve_max_inflight)
+            logger.info("Peer chunk serving enabled with an in-flight cap of %d", config.peer_serve_max_inflight)
 
         # Eviction orders on COALESCE(last_read_at, resident_at), so a locally-served part has
         # to say so or the evictor falls back to arrival order — which for a re-read working set
         # tends to drop exactly the parts about to be needed again.
         app.state.read_recency_recorder = create_read_recency_recorder(app.state.postgres_pool, node_name)
+        # Promotion must stay inside the band THIS node's evictor is holding, and the drain
+        # allocator moves that band at runtime — so the floor is read from the agent rather than
+        # configured here. The queues Redis is the only instance both processes share (the agent
+        # has no main-Redis URL); an unavailable key falls back to `promote_min_free_ratio`.
+        published_floor = create_published_floor_source(app.state.redis_queues_client, node_name)
         app.state.fs_store = create_fs_store(
             config,
             on_promote=app.state.residency_recorder,
             peer_fetch=peer_fetch,
             on_local_read=app.state.read_recency_recorder,
+            published_floor=published_floor.ratio if published_floor is not None else None,
         )
         app.state.obj_cache = RedisObjectPartsCache(
             app.state.redis_client,
@@ -318,6 +352,20 @@ def factory() -> FastAPI:
     config = get_config()
     setup_loki_logging(config, "api")
 
+    # A malformed peer secret fails on the READ path: httpx ascii-encodes header values and raises
+    # UnicodeEncodeError, which is a ValueError, so the fetcher's `except (httpx.HTTPError, OSError)`
+    # does not absorb it into a pool fallback the way it absorbs every other peer failure. The GET
+    # fails outright, arbitrarily long after the deploy that misconfigured it.
+    #
+    # Here and not in get_config(): the api is the only process that puts this secret on a wire
+    # (PeerChunkFetcher is constructed in this module's lifespan and nowhere else — workers call
+    # create_fs_store without a peer_fetch), so validating at config load would crash the janitor,
+    # uploader and unpinner over a value they never read.
+    #
+    # After setup_loki_logging on purpose, so the traceback reaches the log store an operator
+    # actually reads rather than only container stderr.
+    validate_peer_secret(config.internal_peer_secret)
+
     from hippius_s3.sentry import init_sentry
 
     init_sentry("hippius-s3-api")
@@ -425,7 +473,14 @@ Disallow: /"""
     app.include_router(user_router, prefix="/user")
     app.include_router(sub_token_scopes_router, prefix="/user/sub-tokens")
     app.include_router(public_router, prefix="")
-    app.include_router(internal_parts_router, prefix="")
+    # Mounted only when serving is on AND a secret exists: an absent route is the only honest
+    # representation of "peer serving is off", since a mounted one is reachable from the public
+    # internet (the gateway proxies arbitrary paths and anonymous GET is a valid auth outcome).
+    # MUST stay ahead of s3_router_new — Starlette matches in registration order, and the S3
+    # catch-all /{bucket}/{key:path} would otherwise swallow this path as a GetObject on a
+    # bucket named `internal`. Pinned by tests/unit/test_internal_route_precedence.py.
+    if config.peer_serve_enabled and config.internal_peer_secret:
+        app.include_router(internal_parts_router, prefix="")
     app.include_router(s3_router_new, prefix="")
 
     static_dir = Path(__file__).parent / "static"

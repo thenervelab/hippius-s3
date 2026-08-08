@@ -54,7 +54,7 @@ pub use units::{ByteRate, Bytes, DiskPressure};
 pub use clock::TestClock;
 
 #[cfg(feature = "coord")]
-pub use coordination::{CoordError, Coordinator, DEFAULT_REDIS_TIMEOUT, Lease, StoredAllocation};
+pub use coordination::{CoordError, Coordinator, DEFAULT_REDIS_TIMEOUT, Lease, PROMOTE_FLOOR_TTL, StoredAllocation};
 #[cfg(feature = "pg")]
 pub use store::{MissingSourceOutcome, PendingPart, Store, StoreError, UploadContext};
 #[cfg(feature = "coord")]

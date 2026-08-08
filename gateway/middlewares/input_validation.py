@@ -53,7 +53,8 @@ SKIP_PREFIXES = {"health", "user", "docs", "robots.txt", "openapi.json"}
 # second copy drifting is the exact failure this rejection exists to prevent.
 #
 # Deliberately NOT in it: `acl` (acl_router mounts /{bucket} at the ROOT — there is no /acl path)
-# and `static` (no StaticFiles mount anywhere in the gateway).
+# and `static` (the gateway has no StaticFiles mount, and the api's is registered AFTER
+# s3_router_new, so the S3 catch-all shadows it rather than the reverse).
 #
 # auth_router.ALL_EXEMPT_SEGMENTS must stay a subset — enforced by
 # test_every_auth_exempt_segment_is_a_reserved_bucket_name.
@@ -87,6 +88,23 @@ async def input_validation_middleware(
         return s3_error_response(
             code="InvalidBucketName",
             message=f"Bucket name '{path_parts[0]}' is reserved for gateway routes",
+            status_code=400,
+        )
+
+    # `internal` is refused on EVERY method, not just the CreateBucket shape above. The api
+    # mounts /internal/parts/... ahead of its S3 catch-all, and the request that reached it was
+    # a plain GET: anonymous auth succeeds, and the ACL middleware passes through on a bucket
+    # nobody owns. So the write-shaped check above never saw it.
+    #
+    # Defence in depth, not the boundary — the api requires a shared secret on that route, and
+    # this is a blocklist, so it protects exactly the one prefix somebody thought to add and
+    # will rot the moment another internal route lands. The durable fix is a second port for
+    # internal routes with no gateway route to it; until then, anything mounted on the api app
+    # outside the S3 namespace needs a line here.
+    if path_parts[0] == "internal":
+        return s3_error_response(
+            code="InvalidBucketName",
+            message="Bucket name 'internal' is reserved for gateway routes",
             status_code=400,
         )
 

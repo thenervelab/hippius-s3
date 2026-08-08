@@ -1,4 +1,5 @@
 from hippius_s3.fs_pressure import FreeSpaceGate
+from hippius_s3.fs_pressure import PublishedFloorSource
 from hippius_s3.fs_pressure import validate_promotion_band
 
 from .dual_fs_store import DualFileSystemPartsStore
@@ -16,6 +17,7 @@ def create_fs_store(
     on_promote: PromotionRecorder | None = None,
     peer_fetch: PeerFetcher | None = None,
     on_local_read: LocalReadRecorder | None = None,
+    published_floor: PublishedFloorSource | None = None,
 ) -> FileSystemPartsStore:
     """Build the parts store: dual-tier when a fallback pool is configured, else single.
 
@@ -23,6 +25,10 @@ def create_fs_store(
     Promotion stays off unless BOTH the flag is set and a recorder is supplied — an
     unrecorded promotion is a copy no evictor can reclaim, so the two travel together
     rather than being independently switchable.
+
+    `published_floor` reads the free-space floor this node's evictor is actually holding.
+    Optional on purpose: `None` (every caller but the api — the workers do not promote) leaves
+    the gate on `promote_min_free_ratio`, which is exactly the pre-publish behaviour.
     """
     fallback_dir = getattr(config, "object_cache_fallback_dir", "")
     cache_dir = getattr(config, "object_cache_dir", "")
@@ -31,17 +37,18 @@ def create_fs_store(
         space_gate = None
         if promote:
             floor = float(getattr(config, "promote_min_free_ratio", 0.175))
-            # Fail fast on a threshold set that cannot recover. Every one of these is settable
-            # per-deployment, and a bad combination is SILENT: the read tier simply stops
-            # warming, with nothing in the logs saying why. Better a refused startup than a
-            # cache that quietly never fills.
+            # Fail fast on a FALLBACK threshold set that cannot recover. Every one of these is
+            # settable per-deployment, and a bad combination is SILENT: the read tier simply
+            # stops warming, with nothing in the logs saying why. This can only validate the
+            # fallback — the live band moves with the allocator's per-node reserve, which is why
+            # the agent publishes the resolved floor and `published_floor` takes precedence.
             validate_promotion_band(
                 promote_min_free_ratio=floor,
                 fs_cache_min_free_ratio=float(getattr(config, "fs_cache_min_free_ratio", 0.08)),
             )
             # Built whenever promotion is on: an ungated promoter is an unthrottled writer on
             # the disk ingest depends on, so the two are not independently switchable either.
-            space_gate = FreeSpaceGate(cache_dir, floor)
+            space_gate = FreeSpaceGate(cache_dir, floor, floor_source=published_floor)
         return DualFileSystemPartsStore(
             cache_dir,
             fallback_dir,
