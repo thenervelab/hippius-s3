@@ -17,6 +17,7 @@ mod ids;
 mod mgr;
 mod partdrain;
 mod reconcile;
+mod redrive;
 mod snapshot;
 mod ssd_evict;
 mod ssd_reclaim;
@@ -42,7 +43,8 @@ pub use partdrain::{
     breaker_signal_for, drain_part,
 };
 pub use reconcile::{DiscoveredPart, PartLandingLog, PartScan, PartStatus, ReconcileError, ReconcileReport, reconcile_parts};
-pub use snapshot::{AgentSnapshot, ScanWorker, SnapshotCell};
+pub use redrive::{PartDigest, RelandVerdict, observed_part_digest, part_digest, verdict_for_reland};
+pub use snapshot::{AgentSnapshot, RelandOutcome, ScanWorker, SnapshotCell};
 pub use ssd_evict::{EvictionError, EvictionPass, EvictionReport, EvictionTarget, FreeSpaceProbe, ResidentLog, ResidentPart, evict_to_target};
 pub use ssd_reclaim::{
     FailedReclaimReport, PartRemover, PartStatusAge, ReclaimError, ReclaimGraces, ReclaimLog, ReclaimReport, reclaim_failed, reclaim_ssd,
@@ -56,6 +58,6 @@ pub use clock::TestClock;
 #[cfg(feature = "coord")]
 pub use coordination::{CoordError, Coordinator, DEFAULT_REDIS_TIMEOUT, Lease, PROMOTE_FLOOR_TTL, StoredAllocation};
 #[cfg(feature = "pg")]
-pub use store::{MissingSourceOutcome, PendingPart, Store, StoreError, UploadContext};
+pub use store::{LandedOutcome, MissingSourceOutcome, PendingPart, Store, StoreError, UploadContext};
 #[cfg(feature = "coord")]
 pub use tick::{CephCeilingSource, StaticCeiling, TickConfig, TickOutcome, run_tick};

@@ -24,8 +24,9 @@ use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, EvictionPass, EvictionTarget,
-    NodeId, NodeObservation, PartReplicationStore, ReclaimError, ReclaimGraces, ScanWorker, SnapshotCell, Store, StoredAllocation, SystemClock,
-    TokenBucket, UploadEnqueuer, decay_rate, evict_to_target, jittered, reclaim_failed, reclaim_ssd, reconcile_parts,
+    NodeId, NodeObservation, PartDigest, PartKey, PartReplicationStore, ReclaimError, ReclaimGraces, RelandOutcome, ReplicationState, ScanWorker,
+    SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, evict_to_target, jittered, observed_part_digest,
+    reclaim_failed, reclaim_ssd, reconcile_parts, verdict_for_reland,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -796,17 +797,24 @@ async fn failed_reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotC
 /// one tick rather than trickled at the poll rate, which is what a small batch would do.
 const LANDED_POP_BATCH: usize = 512;
 
-/// One landed-queue pass: record every part the api announced since the last tick.
+/// One landed-queue pass: record every part the api announced since the last tick, and re-drive
+/// any part the announcement reveals was rewritten after it drained.
 ///
-/// This is the fast discovery path that replaces the reconciler's whole-disk walk. It is
-/// deliberately thin — pop, record, count — because everything that makes discovery *correct*
+/// This is the fast discovery path that replaces the reconciler's whole-disk walk. Discovery
+/// itself stays thin — pop, record, count — because everything that makes discovery *correct*
 /// still lives in the reconciler, which remains as the backstop for any announcement that was
 /// never delivered.
+///
+/// The announcement is ALSO the only observable signal that a committed part changed on disk
+/// (B-2): the api announces only from `WriteThroughPartsWriter.write_meta`, so an announcement
+/// naming an already-`replicated` part means that part was written again. Those parts are
+/// collected during the record loop and checked AFTER the discovery tally is published, so a
+/// slow content hash never delays discovery of the batch it shares a tick with.
 ///
 /// Failures are logged and dropped rather than retried in-tick: a Redis error leaves the
 /// entries queued for the next poll, and a `record_landed_part` error leaves the part for the
 /// reconciler. Neither can lose the part, because the disk is the source of truth in both cases.
-async fn landed_once(queue: &LandedQueue, store: &Store, snapshot: &SnapshotCell) {
+async fn landed_once(queue: &LandedQueue, store: &Store, ssd: &LocalSsd, snapshot: &SnapshotCell) {
     let (parts, dropped) = match queue.pop(LANDED_POP_BATCH).await {
         Ok(batch) => batch,
         Err(err) => {
@@ -818,11 +826,17 @@ async fn landed_once(queue: &LandedQueue, store: &Store, snapshot: &SnapshotCell
         return;
     }
     let mut recorded = 0u64;
+    let mut relanded: Vec<(&PartKey, Option<PartDigest>)> = Vec::new();
     for part in &parts {
         // Idempotent, and the same call the reconciler makes — so an announcement racing the
         // backstop is a no-op rather than a conflict.
         match store.record_landed_part(part).await {
-            Ok(()) => recorded += 1,
+            Ok(outcome) => {
+                recorded += 1;
+                if outcome.state == ReplicationState::Replicated {
+                    relanded.push((part, outcome.digest));
+                }
+            }
             Err(err) => tracing::warn!(error = %err, "recording an announced part failed; the reconciler will recover it"),
         }
     }
@@ -835,6 +849,55 @@ async fn landed_once(queue: &LandedQueue, store: &Store, snapshot: &SnapshotCell
     }
     if recorded > 0 {
         tracing::debug!(recorded, "recorded announced parts");
+    }
+    for (part, stored) in relanded {
+        check_reland(store, ssd, part, stored.as_ref(), snapshot).await;
+    }
+}
+
+/// Decides whether one re-landed part's pool copy is stale, and re-drives it if so.
+///
+/// Thin by construction: the policy is [`verdict_for_reland`] in `hippius-drain-core`, which is
+/// unit-tested against in-memory fakes, because everything here needs a live Postgres and a real
+/// disk and so has no local coverage. All this adds is the I/O and the disposition of each arm.
+///
+/// A read failure decides NOTHING (the part keeps its `replicated` row). That is fail-safe in
+/// the direction that matters — re-driving on a flaky disk would re-copy the shard — but it is
+/// blind, not safe: a real divergence on an unreadable part goes undetected, which is what
+/// `reland_unreadable` exists to say.
+async fn check_reland(store: &Store, ssd: &LocalSsd, part: &PartKey, stored: Option<&PartDigest>, snapshot: &SnapshotCell) {
+    let observed = match observed_part_digest(ssd, part).await {
+        Ok(digest) => digest,
+        Err(err) => {
+            snapshot.record_reland(RelandOutcome::Unreadable);
+            tracing::warn!(part = %part.relative_dir().display(), error = %err, "could not hash a re-landed part; its pool copy is unverified");
+            return;
+        }
+    };
+    let verdict = verdict_for_reland(ReplicationState::Replicated, stored, &observed);
+    if !verdict.redrives() {
+        snapshot.record_reland(RelandOutcome::Unchanged);
+        return;
+    }
+    match store.redrive_diverged_part(part, &observed).await {
+        // Zero rows means the row moved on between the read and the write (another agent
+        // re-drove it, or a reaper flipped it terminal). Not counted as a re-drive: the guard
+        // did its job, and double-counting would make the integrity signal read high.
+        Ok(false) => tracing::debug!(part = %part.relative_dir().display(), "a re-landed part was already re-driven"),
+        Ok(true) => {
+            snapshot.record_reland(RelandOutcome::Redriven);
+            // WARN, not INFO: until the re-drive completes, the pool — and every node that
+            // promoted from it — serves bytes that decrypt and AEAD-verify cleanly but are the
+            // wrong ones, since the retry preserves the DEK, the AAD and the chunk index.
+            tracing::warn!(
+                part = %part.relative_dir().display(),
+                unverifiable = stored.is_none(),
+                "a committed part was rewritten on SSD; re-driving the stale pool copy",
+            );
+        }
+        Err(err) => {
+            tracing::error!(part = %part.relative_dir().display(), error = %err, "re-driving a diverged part failed; its pool copy stays stale");
+        }
     }
 }
 
@@ -1216,12 +1279,14 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         // before — the reconciler is still the sole trigger — which is what makes the api-side
         // publish and this consumer independently deployable in either order.
         if let Some(queue) = self.landed.as_ref() {
-            let (queue, store, snapshot) = (queue.clone(), Arc::clone(&self.store), Arc::clone(&self.snapshot));
+            // The SSD handle is here for the B-2 divergence check, which re-hashes a part the
+            // announcement reveals was rewritten after it drained.
+            let (queue, store, ssd, snapshot) = (queue.clone(), Arc::clone(&self.store), Arc::clone(&self.ssd), Arc::clone(&self.snapshot));
             let landed_poll = self.config.landed_poll;
             supervisor.spawn(WorkerName::new("landed"), move |token| {
                 run_periodic(token, landed_poll, move || {
-                    let (queue, store, snapshot) = (queue.clone(), Arc::clone(&store), Arc::clone(&snapshot));
-                    async move { landed_once(&queue, &store, &snapshot).await }
+                    let (queue, store, ssd, snapshot) = (queue.clone(), Arc::clone(&store), Arc::clone(&ssd), Arc::clone(&snapshot));
+                    async move { landed_once(&queue, &store, &ssd, &snapshot).await }
                 })
             });
         }

@@ -1,0 +1,244 @@
+//! Detecting that a committed part's SSD content has CHANGED since the drain copied it,
+//! so the stale pool copy can be re-driven.
+//!
+//! # The hole this closes
+//!
+//! An S3 client may `UploadPart` the same part number twice with DIFFERENT bytes before
+//! `CompleteMultipartUpload`. That is legal S3 and is also the shape of a late retry after a
+//! perceived timeout. The retry reuses the same `object_version`, so the part key
+//! `(object_id, version, part_number)` is IDENTICAL — attempt two overwrites attempt one's
+//! SSD bytes under a row that already reads `replicated`.
+//!
+//! Nothing re-drove that row: [`crate::Store::record_landed_part`]'s conflict action only ever
+//! filled a NULL `node_id`, the reconciler tallies a `replicated` part as an orphan and leaves
+//! it alone, and the api's `wake_version_replication` only touches rows still `pending`. So the
+//! pool kept attempt one's ciphertext while the SSD held attempt two's.
+//!
+//! It is SILENT rather than a 500. The DEK is per `object_version` and the AEAD AAD binds
+//! `(bucket_id, object_id, part_number, chunk_index)` — every one of which the retry preserves
+//! — so the stale ciphertext decrypts and authenticates cleanly. A reader served from the pool
+//! gets attempt one's plaintext under attempt two's `ETag`, with no error anywhere.
+//!
+//! # Why the content hash, and why it is free
+//!
+//! The drain already streams every chunk through SHA-256 to byte-verify its pool copy
+//! ([`crate::PartPool::persist_chunk`] returns that hash). Folding those per-chunk hashes into
+//! one part digest at commit therefore costs no extra I/O — the hash the drain already computed
+//! becomes the record of WHAT it committed. A later re-landing re-derives the digest from disk
+//! and compares.
+//!
+//! The alternative (re-drive on every landed announcement, without a hash) guesses: it cannot
+//! tell a genuine rewrite from a duplicate announcement, and a wrong guess re-copies a whole
+//! part to Ceph for nothing.
+//!
+//! # Why the announcement and not the reconciler
+//!
+//! The reconciler walks every part on the disk, so it looks like the natural home. It is not:
+//! comparing content there costs a full SSD read per part, and the obvious cheap pre-filter —
+//! "has `meta.json`'s mtime moved since we committed?" — does not work, because the arion
+//! uploader calls `touch_part` on every part after a successful backend upload
+//! (`hippius_s3/workers/uploader.py` → `object_parts.expire` → `fs_store.touch_part`), which
+//! `os.utime`s every file in the part dir. The mtime therefore moves for essentially EVERY
+//! part after its drain, so an mtime pre-filter would force a re-hash of the node's entire
+//! ~930 GB shard.
+//!
+//! The landed announcement, by contrast, fires exactly when content can change and only then:
+//! `WriteThroughPartsWriter.write_meta` is the single choke point every upload path funnels
+//! through, and the download/promotion path writes meta without announcing. So an announcement
+//! naming a part that is ALREADY `replicated` is, by construction, a rewrite of a drained part
+//! — the rare event, and the only one worth paying a hash for.
+//!
+//! **The residual gap, stated plainly:** the announcement queue is at-most-once by design (a
+//! Redis restart or a trimmed queue drops messages). A dropped announcement for a re-uploaded
+//! part leaves that part in exactly today's broken state. This is a strict improvement, not a
+//! total closure; closing the rest needs a background content scrubber, which is not this.
+
+use crate::apipart::ChunkIndex;
+use crate::partdrain::PartSource;
+use crate::state::ReplicationState;
+use sha2::{Digest, Sha256};
+
+/// A part's content digest: the lowercase-hex SHA-256 of its chunk hashes in index order.
+///
+/// Compared, never interpreted — the only operation that matters is equality against the
+/// digest stored at commit. Opaque so a caller cannot confuse it with a per-chunk hash.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PartDigest(String);
+
+impl PartDigest {
+    /// The wire/storage form (lowercase hex), for the `content_sha256` column.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Re-wraps a digest read back from the store.
+    #[must_use]
+    pub fn from_stored(raw: String) -> Self {
+        Self(raw)
+    }
+}
+
+/// Folds a part's per-chunk content hashes into one digest.
+///
+/// The chunk COUNT is hashed first and every hash is length-delimited, so a truncated part
+/// cannot collide with the full one and two different chunk splits cannot alias — the digest
+/// binds the chunk set, not just its concatenated bytes. Order is the caller's: chunk hashes
+/// arrive in ascending index, matching the drain's copy loop and `list_chunks`.
+#[must_use]
+pub fn part_digest<S: AsRef<str>>(chunk_hashes: &[S]) -> PartDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hippius-drain/part-digest/v1\n");
+    hasher.update(chunk_hashes.len().to_le_bytes());
+    for hash in chunk_hashes {
+        let raw = hash.as_ref().as_bytes();
+        hasher.update(u32::try_from(raw.len()).unwrap_or(u32::MAX).to_le_bytes());
+        hasher.update(raw);
+    }
+    PartDigest(hex_lower(&hasher.finalize()))
+}
+
+/// Lowercase hex, matching the agent's chunk-hash rendering so both sides of a comparison
+/// speak one alphabet.
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+    }
+    out
+}
+
+/// What a landed announcement means for a part the store already knows about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelandVerdict {
+    /// The part has not reached `replicated`, so the drain has committed nothing that could be
+    /// stale — the ordinary path (a first landing, or a re-upload of a part still queued). The
+    /// pending drain will copy whatever is on disk when it runs.
+    NotDrained,
+    /// The part is `replicated` and its SSD content still matches what was committed. Nothing
+    /// to do; this is the common re-announcement (a duplicate message, or a backstop racing the
+    /// fast path).
+    Unchanged,
+    /// The part is `replicated` and its SSD content DIFFERS from what was committed — the pool
+    /// holds superseded bytes. Re-drive.
+    Diverged,
+    /// The part is `replicated` but was committed before content digests were recorded, so
+    /// there is nothing to compare against. Treated as [`Diverged`](Self::Diverged) by
+    /// [`Self::redrives`]: an announcement for an already-drained part is itself evidence of a
+    /// rewrite, and "unknown" must never resolve to "fine" on an integrity check. Distinguished
+    /// from `Diverged` only so the two can be counted apart.
+    Unverifiable,
+}
+
+impl RelandVerdict {
+    /// Whether this verdict must re-drive the part.
+    #[must_use]
+    pub fn redrives(self) -> bool {
+        matches!(self, Self::Diverged | Self::Unverifiable)
+    }
+}
+
+/// Decides what a landed announcement means, given the row the store returned and the digest
+/// just derived from disk.
+///
+/// Pure, so the whole policy is unit-testable and the agent's wiring is a thin caller — the
+/// shape `eviction_target` and `check_shared_disk` already use, and the one that matters here
+/// because the agent's own store tests need a live Postgres.
+///
+/// `Corrupt` deliberately reads as [`NotDrained`](RelandVerdict::NotDrained): a corrupt part is
+/// already owned by the bounded re-drive worker, and re-driving it from here would bypass the
+/// `corrupt_attempts` cap that stops an unrecoverable pool copy looping forever.
+#[must_use]
+pub fn verdict_for_reland(state: ReplicationState, stored: Option<&PartDigest>, observed: &PartDigest) -> RelandVerdict {
+    if state != ReplicationState::Replicated {
+        return RelandVerdict::NotDrained;
+    }
+    match stored {
+        None => RelandVerdict::Unverifiable,
+        Some(stored) if stored == observed => RelandVerdict::Unchanged,
+        Some(_) => RelandVerdict::Diverged,
+    }
+}
+
+/// Derives a part's digest from its SSD copy, by hashing every chunk the source lists.
+///
+/// The expensive half of the check, deliberately kept behind the state test: it reads the whole
+/// part, so it must only run for an announcement naming an already-`replicated` part. Chunk
+/// order follows [`PartSource::list_chunks`], which yields ascending indices — the same order
+/// the drain hashes in, which is what makes the two digests comparable.
+///
+/// # Errors
+///
+/// The underlying [`io::Error`](std::io::Error). A vanished part (`NotFound`) surfaces as such;
+/// the caller treats any failure as "cannot tell" and leaves the row alone, since re-driving on
+/// a read error would let a flaky disk re-copy the whole shard.
+pub async fn observed_part_digest<S: PartSource>(ssd: &S, part: &crate::apipart::PartKey) -> std::io::Result<PartDigest> {
+    let chunks: Vec<ChunkIndex> = ssd.list_chunks(part).await?;
+    let mut hashes = Vec::with_capacity(chunks.len());
+    for index in chunks {
+        hashes.push(ssd.chunk_hash(part, index).await?);
+    }
+    Ok(part_digest(&hashes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PartDigest, RelandVerdict, part_digest, verdict_for_reland};
+    use crate::state::ReplicationState;
+
+    #[test]
+    fn a_digest_is_stable_and_separates_content_order_and_count() {
+        // The four properties the comparison rests on. Stability is what makes an unchanged part
+        // read as unchanged; the other three are what stop a real change reading as unchanged.
+        assert_eq!(part_digest(&["a", "b"]), part_digest(&["a", "b"]), "same input, same digest");
+        assert_ne!(part_digest(&["a", "b"]), part_digest(&["a", "c"]), "different content");
+        assert_ne!(part_digest(&["a", "b"]), part_digest(&["b", "a"]), "different chunk order");
+        assert_ne!(part_digest(&["a", "b"]), part_digest(&["a"]), "a truncated chunk set");
+        // Length-delimiting is what buys the last one: without it "ab" + "" and "a" + "b" would
+        // hash the same byte stream and a re-chunked part could alias its predecessor.
+        assert_ne!(part_digest(&["ab", ""]), part_digest(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_digest_is_lowercase_hex_of_the_right_width() {
+        // Both sides of a comparison must render hashes the same way; the agent's chunk hashes
+        // are lowercase hex, so a digest that came back uppercase would never match.
+        let digest = part_digest(&["a"]);
+        assert_eq!(digest.as_str().len(), 64);
+        assert!(digest.as_str().chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        assert_eq!(PartDigest::from_stored(digest.as_str().to_owned()), digest, "storage round-trips");
+    }
+
+    #[test]
+    fn only_a_replicated_part_can_diverge() {
+        // A part that has not committed has nothing stale on the pool: whatever the drain
+        // eventually copies is whatever is on disk then. Corrupt is excluded for a different
+        // reason — `redrive_corrupt_parts` owns it, and its attempt cap is what stops an
+        // unrecoverable pool copy looping forever.
+        let stored = part_digest(&["old"]);
+        let observed = part_digest(&["new"]);
+        for state in [
+            ReplicationState::Pending,
+            ReplicationState::Draining,
+            ReplicationState::Failed,
+            ReplicationState::Corrupt,
+        ] {
+            let verdict = verdict_for_reland(state, Some(&stored), &observed);
+            assert_eq!(verdict, RelandVerdict::NotDrained, "{state:?} has nothing committed to re-drive");
+            assert!(!verdict.redrives());
+        }
+    }
+
+    #[test]
+    fn an_unverifiable_commit_redrives_but_is_counted_apart_from_a_proven_divergence() {
+        // The NULL policy. "Cannot compare" must not resolve to "fine" on an integrity check,
+        // so it re-drives — but it is a distinct verdict so the metrics can say how much of the
+        // re-drive volume is legacy rows rather than genuine rewrites.
+        let observed = part_digest(&["whatever"]);
+        let verdict = verdict_for_reland(ReplicationState::Replicated, None, &observed);
+        assert_eq!(verdict, RelandVerdict::Unverifiable);
+        assert!(verdict.redrives());
+        assert_ne!(verdict, RelandVerdict::Diverged);
+    }
+}

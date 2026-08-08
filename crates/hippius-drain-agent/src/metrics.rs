@@ -237,6 +237,37 @@ fn register_discovery_instruments(
             .with_callback(move |observer| observer.observe(snap.load().landed_dropped, &[]))
             .build(),
     ));
+
+    // B-2. **Alert on any increase.** A nonzero rate means a client rewrote a part AFTER it
+    // drained, so until the re-drive completes the pool — and every node that promoted from it —
+    // serves bytes that decrypt and AEAD-verify cleanly but are the superseded ones. Legal S3,
+    // and rare, but it is the only visible trace of a silent-wrong-plaintext window.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reland_redriven_total")
+            .with_callback(move |observer| observer.observe(snap.load().reland_redriven, &[]))
+            .build(),
+    ));
+    // The benign denominator: re-announcements whose content still matched. Carries no alert on
+    // its own; it is what makes the counter above readable as a rate rather than a raw count.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reland_unchanged_total")
+            .with_callback(move |observer| observer.observe(snap.load().reland_unchanged, &[]))
+            .build(),
+    ));
+    // Checks that could not run because the part would not read back off SSD. Fail-safe (nothing
+    // is re-driven) but BLIND: a genuine divergence on such a part goes undetected, so a sustained
+    // rate means the detector is partly off, not that there is nothing to detect.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reland_unreadable_total")
+            .with_callback(move |observer| observer.observe(snap.load().reland_unreadable, &[]))
+            .build(),
+    ));
 }
 
 /// Builds the meter provider and registers the agent's metrics, or returns `None` when
