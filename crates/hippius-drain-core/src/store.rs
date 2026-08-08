@@ -376,8 +376,9 @@ impl Store {
     /// headroom rather than against it, so a disk full of warm cache does not read to the
     /// allocator as a node critically behind on draining.
     ///
-    /// Served by `cephor_ssd_residency_evict_idx`, reading the denormalized `bytes` rather
-    /// than joining the ~140M-row `parts` table. A part whose size was unknown at residency
+    /// The `node_id` equality is served by the leading column of `cephor_ssd_residency_recency_idx`
+    /// (migration 0017, which DROPPED the older `cephor_ssd_residency_evict_idx`), and `bytes` is
+    /// read denormalized rather than joined off the ~140M-row `parts` table. A part whose size was unknown at residency
     /// time contributes zero, which under-reports cache — the fail-safe direction, since
     /// understating evictable space overstates drain urgency rather than hiding it.
     ///
@@ -1240,8 +1241,10 @@ impl ResidentLog for Store {
         // it regardless, but a worklist that never emits it is the real guard.
         //
         // INNER JOIN: a residency row with no replication row means the object was hard-deleted,
-        // which is the reclaimer's disposition (deleted-object orphan), not the evictor's. It is
-        // excluded here and `prune_residency` clears the row when the reclaimer unlinks the part.
+        // which is the reclaimer's disposition (deleted-object orphan), not the evictor's. Note
+        // the reclaimer unlinks the part and leaves the row — it never touches this table — so
+        // this join is not merely a filter, it is the whole reason that row is inert. See
+        // `drop_residency` for why leaving it is safe and for the assumption that makes it so.
         //
         // THIS ORDER BY IS THE EVICTION POLICY; the orchestrator walks it and never re-sorts.
         //
@@ -1401,14 +1404,38 @@ impl Store {
     /// Drops this node's residency rows for `parts` — the counterpart to
     /// [`record_resident`](Self::record_resident), called by the evictor after it unlinks.
     ///
-    /// The reclaim worker deliberately does NOT call this, because the parts it removes never
-    /// had a residency row: residency is recorded only at the drain's commit, and everything
-    /// the reclaimer removes is either terminal (`failed`) or has no replication row at all
-    /// (a deleted-object orphan). The one loose end is a part that was resident and then had
-    /// its object hard-deleted: its replication row goes, the reclaimer frees the disk space,
-    /// and the residency row is left behind — but both `evictable_parts` and `node_cache_bytes`
-    /// INNER JOIN the replication row, so it is invisible to each and drifts no signal. It is a
-    /// dead row bounded by the hard-delete rate, not a leak of disk or of accounting.
+    /// # Why the reclaim worker deliberately does NOT call this
+    ///
+    /// Not because the parts it removes never had a residency row — that argument is false twice
+    /// over. Residency is not recorded only at the drain's commit: the api records it on
+    /// read-through promotion too (see [`record_resident`](Self::record_resident)), so a part can
+    /// be resident on a node that never drained it, and `reclaim_ssd`'s walk adjudicates such a
+    /// copy against the INGESTING node's row (`part_states` has no node predicate). And a part the
+    /// drain itself made resident can still reach terminal `failed` afterwards:
+    /// [`redrive_diverged_part`](Self::redrive_diverged_part) and
+    /// [`redrive_corrupt_parts`](Self::redrive_corrupt_parts) both return a committed part to
+    /// `pending` while deliberately leaving residency alone, and the retry can then escalate via
+    /// [`defer_part_missing_source`](Self::defer_part_missing_source) or `mark_failed`. Both
+    /// reclaim dispositions — terminal `failed` and deleted-object orphan — therefore unlink parts
+    /// that leave a residency row behind.
+    ///
+    /// What makes the leftover row harmless is the STATUS FILTER, not its absence. The only two
+    /// readers of `cephor_ssd_residency` here — [`ResidentLog::evictable_parts`](crate::ResidentLog::evictable_parts)
+    /// and [`node_cache_bytes`](Self::node_cache_bytes) — INNER JOIN `cephor_replication_status`
+    /// and require `status = 'replicated'`, and every reclaim disposition is by construction the
+    /// opposite: `failed` on both `failed` paths, no replication row at all on the orphan path. So
+    /// the row is invisible to the eviction worklist and to the heartbeat's `cache_bytes`, and it
+    /// stays invisible — `failed` is terminal (every writer back to `pending` is guarded on
+    /// `draining`, `corrupt`, or `replicated`, none of which a `failed` row matches) and nothing
+    /// recreates a replication row for a part the reclaimer just unlinked. The cost is a dead row
+    /// per reclaimed resident part, bounded by the reclaim rate — not disk, and not accounting.
+    ///
+    /// **Nothing enforces that.** There is no foreign key and no cascade between the two tables;
+    /// the safety is the `status = 'replicated'` predicate, written out twice. Dropping it from
+    /// either query — or adding a third consumer that reads this table by `node_id` alone — turns
+    /// every one of those dead rows into live over-accounting, compounded by the api's
+    /// `ResidencyRecorder`, which ACCUMULATES `bytes` and so would add to a stale row rather than
+    /// replace it. Such a change must also add the `drop_residency` call this doc calls needless.
     ///
     /// # Errors
     ///
@@ -2349,7 +2376,8 @@ mod part_tests {
 
     #[sqlx::test]
     async fn the_eviction_worklist_is_oldest_first_scoped_to_this_node_and_excludes_evicted(pool: PgPool) {
-        // Three properties the evictor's correctness rests on: FIFO order (the policy),
+        // Three properties the evictor's correctness rests on: order (here the `resident_at`
+        // FALLBACK, since nothing has been read — the LRU policy itself has its own test below),
         // node-scoping (a node must never evict a peer's part — it does not even hold it),
         // and that a marked part leaves the worklist (or the next pass would re-offer it
         // forever and never make progress).
