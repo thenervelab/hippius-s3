@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 from typing import AsyncIterator
+from typing import Iterator
 from typing import Optional
 from uuid import UUID
 
@@ -47,11 +49,17 @@ class _PartPublishLocks:
 
     Publishing swaps a SET of files into place, and a set-rename has no atomic primitive; two
     attempts publishing the same part concurrently would interleave their renames into a
-    mixture belonging to neither. In prod the api is a DaemonSet — exactly one pod per ingest
-    node, writing that node's local SSD — so every api-side writer of a given part dir is a
-    coroutine in THIS process, and an in-process lock is complete mutual exclusion rather than
-    a partial one. Entries are refcounted and dropped when idle so the registry does not grow
-    by one lock per part ever uploaded.
+    mixture belonging to neither.
+
+    This is the in-process HALF of that exclusion, not the whole of it. The api runs uvicorn
+    with UVICORN_WORKERS>1 (4 in both namespaces today), so a pod is several interpreters and
+    this registry is per-worker: two attempts at one part are spread across workers by the
+    shared listening socket and would miss each other here. `_part_dir_flock` supplies the
+    cross-process half; this lock stays because it is far cheaper, and it means each worker
+    takes the syscall once per part rather than once per waiter.
+
+    Entries are refcounted and dropped when idle so the registry does not grow by one lock per
+    part ever uploaded.
     """
 
     def __init__(self) -> None:
@@ -74,6 +82,37 @@ class _PartPublishLocks:
             holders[0] -= 1
             if holders[0] == 0 and self._entries.get(key) is entry:
                 del self._entries[key]
+
+
+@contextlib.contextmanager
+def _part_dir_flock(part_dir: Path) -> "Iterator[None]":
+    """Exclude other PROCESSES from publishing this part. BLOCKING; call on the worker thread.
+
+    Locks the part DIRECTORY's own descriptor rather than a lockfile, deliberately: everything
+    that walks a part dir treats its contents as meaningful — the drain's completeness gate wants
+    exactly `chunk_<i>.bin` plus `meta.json`, the tmp sweepers match on name shape, the janitor
+    parses what it finds — so an extra entry is a way to strand a part, and there is nothing to
+    clean up afterwards or leak if a pod is killed mid-publish.
+
+    `flock` is keyed on the open file description, so two `open()` calls contend even inside one
+    process. That is what makes this testable without spawning a second interpreter, and it is
+    also why the in-process lock above is kept: without it, waiters in one worker would each burn
+    an executor thread blocking here.
+
+    `flock` on a local filesystem only. CLAUDE.md's "no flock (unreliable on CephFS)" applies to
+    the shared object_cache PVC; this path is HIPPIUS_OBJECT_CACHE_DIR, which on an ingest node is
+    the node-local SSD (/dev/md3 on staging). The lock is released by the kernel if the process
+    dies, so a killed worker cannot wedge the part.
+    """
+    fd = os.open(part_dir, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 _publish_locks = _PartPublishLocks()
@@ -397,6 +436,14 @@ class FileSystemPartsStore:
         meta_path = self._meta_file(part_dir)
 
         def _publish() -> None:
+            # The flock is taken HERE, on the worker thread, and wraps the whole swap: the
+            # pre-flight, every rename, the trim and the meta write are one critical section
+            # against other processes exactly as they already were against other coroutines.
+            # Taking it outside `to_thread` would put the blocking acquire on the event loop.
+            with _part_dir_flock(part_dir):
+                _publish_locked()
+
+        def _publish_locked() -> None:
             missing = [p.name for p in staged if not p.exists()]
             if missing:
                 raise FileNotFoundError(f"staged chunks missing at publish: {label} missing={missing}")
