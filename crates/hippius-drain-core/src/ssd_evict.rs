@@ -1,5 +1,6 @@
 //! The SSD read-tier evictor: keeps a free-space floor on the ingest `NVMe` by reclaiming the
-//! oldest RESIDENT parts — the ones the drain deliberately kept after replicating them.
+//! least-recently-used RESIDENT parts — the ones the drain deliberately kept after replicating
+//! them.
 //!
 //! This worker exists because the drain no longer unlinks on replicate. Retaining replicated
 //! parts is what makes a local GET read at ~705 MB/s off `NVMe` instead of ~94 MB/s off the
@@ -233,7 +234,7 @@ impl EvictionError {
 /// The eviction worklist seam: which resident parts to reclaim, and recording that they were.
 ///
 /// Implemented by [`crate::Store`] (under `pg`) against the
-/// `cephor_replication_resident_idx` partial index; faked in tests.
+/// `cephor_ssd_residency_recency_idx` expression index (migration 0017); faked in tests.
 pub trait ResidentLog: Send + Sync {
     /// Store-specific failure, boxed into [`EvictionError`].
     type Error: std::error::Error + Send + Sync + 'static;
@@ -244,9 +245,11 @@ pub trait ResidentLog: Send + Sync {
     /// whatever order it is handed and never re-sorts.
     fn evictable_parts(&self, limit: u32) -> impl Future<Output = Result<Vec<ResidentPart>, Self::Error>> + Send;
 
-    /// Stamps `evicted_at` on each part, so it leaves the resident set and the next pass's
-    /// worklist. Batched: a per-part UPDATE would put a round-trip in the eviction inner
-    /// loop, which runs under disk pressure.
+    /// Records that each part is no longer resident, so it leaves the next pass's worklist. In
+    /// the Postgres impl that is a DELETE of the residency row, not a tombstone stamp — the table
+    /// is meant to stay bounded by what is actually on disk (migration 0016) — and it is the ONLY
+    /// thing that advances the cursor, since the worklist query has no OFFSET. Batched: a per-part
+    /// statement would put a round-trip in the eviction inner loop, which runs under disk pressure.
     fn mark_evicted(&self, parts: &[PartKey]) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 

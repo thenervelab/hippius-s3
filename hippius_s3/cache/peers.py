@@ -383,12 +383,18 @@ class PeerChunkFetcher:
         expected = sizes.get(int(chunk_index))
         if expected is None:
             # No recorded size means no way to tell a correct body from a truncated one, and an
-            # unverified body that gets promoted onto local flash is a PERMANENT read failure
-            # for that chunk: nothing on the read path invalidates a cached chunk on AEAD
-            # failure, so it wins the local tier and fails every subsequent read until the
-            # evictor happens to unlink the part. The pool copy is authoritative, so declining
-            # costs one pool read. Counted rather than silent because it should never happen —
-            # `part_chunks` rows are written for every chunk index when the part is created.
+            # unverified body gets promoted onto local flash, where it wins the read tier.
+            # `invalidate_local_chunk` now clears such a chunk on AEAD failure, so this is no
+            # longer permanent — but it is not a substitute for the size check either. That
+            # invalidation is gated on the POOL already holding the chunk, which a peer-served
+            # part need not be (the owner is resolved from residency alone, not from
+            # `status='replicated'`); the retry after it re-enters this same peer tier and
+            # re-promotes, so a deterministically wrong peer fails the retry too; and the retry
+            # fires exactly once per request, spending a budget that exists for genuine DEK
+            # faults and reporting on `chunk_aead_failures_total`, the metric that says the keys
+            # are wrong. The pool copy is authoritative, so declining costs one pool read.
+            # Counted rather than silent because it should never happen — `part_chunks` rows are
+            # written for every chunk index when the part is created.
             _record_shed("unknown_size")
             return None
 
