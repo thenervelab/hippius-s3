@@ -1088,8 +1088,9 @@ mod part_tests {
     use core::future::Future;
     use core::str::FromStr;
     use hippius_drain_core::{
-        ChunkIndex, ClaimedPart, DrainOutcome, ObjectId, PartDrainError, PartKey, PartNumber, PartPool, PartRemover, PartReplicationStore, PartScan,
-        PartSource, PartVerified, ReplicationState, UploadEnqueuer, Version, drain_part,
+        ChunkIndex, ClaimedPart, DrainOutcome, ObjectId, PartDigest, PartDrainError, PartKey, PartNumber, PartPool, PartRemover,
+        PartReplicationStore, PartScan, PartSource, PartVerified, RelandVerdict, ReplicationState, UploadEnqueuer, Version, drain_part,
+        observed_part_digest, part_digest, verdict_for_reland,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -1137,11 +1138,18 @@ mod part_tests {
     #[derive(Default)]
     struct MemPartStore {
         status: Mutex<HashMap<String, ReplicationState>>,
+        /// The content digest each commit recorded, so a test can assert the digest the drain
+        /// derived from REAL files matches one recomputed from the same bytes (B-2).
+        committed_digest: Mutex<HashMap<String, PartDigest>>,
     }
 
     impl MemPartStore {
         fn key(part: &PartKey) -> String {
             part.relative_dir().to_string_lossy().into_owned()
+        }
+
+        fn committed_digest(&self, part: &PartKey) -> Option<PartDigest> {
+            self.committed_digest.lock().unwrap().get(&Self::key(part)).cloned()
         }
 
         fn set(&self, part: &PartKey, state: ReplicationState) {
@@ -1167,10 +1175,17 @@ mod part_tests {
             Ok(())
         }
 
-        fn mark_replicated(&self, part: &ClaimedPart, _proof: &PartVerified) -> impl Future<Output = Result<(), io::Error>> + Send {
+        fn mark_replicated(
+            &self,
+            part: &ClaimedPart,
+            _proof: &PartVerified,
+            digest: &PartDigest,
+        ) -> impl Future<Output = Result<(), io::Error>> + Send {
             let key = Self::key(part.part());
+            let digest = digest.clone();
             async move {
-                self.status.lock().unwrap().insert(key, ReplicationState::Replicated);
+                self.status.lock().unwrap().insert(key.clone(), ReplicationState::Replicated);
+                self.committed_digest.lock().unwrap().insert(key, digest);
                 Ok(())
             }
         }
@@ -1402,6 +1417,81 @@ mod part_tests {
             "the SSD copy is retained as this node's read tier once a verified pool copy exists",
         );
         assert_eq!(store.status_of(&part), Some(ReplicationState::Replicated));
+    }
+
+    #[tokio::test]
+    async fn the_digest_a_drain_commits_is_the_one_a_later_read_derives_from_the_same_files() {
+        // B-2's load-bearing assumption, checked against REAL files rather than fakes: the
+        // digest folded from the copy-time hashes inside drain_part is byte-identical to the one
+        // `observed_part_digest` derives by re-reading the same part off LocalSsd. If the two
+        // sides ever disagree — a different chunk order, a different hash rendering — every
+        // re-landing would read as diverged and the fleet would re-copy itself.
+        let ssd_dir = TempDir::new().unwrap();
+        let pool_dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        seed_ssd_part(ssd_dir.path(), &part, &[(0, b"chunk zero"), (1, b"chunk one!")]);
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let store = MemPartStore::default();
+        store.set(&part, ReplicationState::Pending);
+        drain_part(
+            &LocalFs::new(pool_dir.path()),
+            &ssd,
+            &store,
+            &NoopEnqueuer,
+            &ClaimedPart::new(part.clone(), 0),
+        )
+        .await
+        .unwrap();
+
+        let committed = store.committed_digest(&part).unwrap();
+        let observed = observed_part_digest(&ssd, &part).await.unwrap();
+        assert_eq!(committed, observed, "an untouched part re-reads to the digest it committed");
+        assert_eq!(
+            verdict_for_reland(ReplicationState::Replicated, Some(&committed), &observed),
+            RelandVerdict::Unchanged,
+        );
+        assert_eq!(
+            observed,
+            part_digest(&[sha256_hex(b"chunk zero"), sha256_hex(b"chunk one!")]),
+            "the digest is the fold of the chunks' own SHA-256s, in ascending index",
+        );
+    }
+
+    #[tokio::test]
+    async fn rewriting_a_chunk_on_disk_changes_the_digest_a_reland_derives() {
+        // The detector's other half against real files: an `UploadPart` retry replaces the
+        // chunk bytes in place, and the re-derived digest must no longer match what was
+        // committed. Same length on purpose — a size check would not catch this, which is why
+        // the divergence has to be a content hash.
+        let ssd_dir = TempDir::new().unwrap();
+        let pool_dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        seed_ssd_part(ssd_dir.path(), &part, &[(0, b"attempt one")]);
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let store = MemPartStore::default();
+        store.set(&part, ReplicationState::Pending);
+        drain_part(
+            &LocalFs::new(pool_dir.path()),
+            &ssd,
+            &store,
+            &NoopEnqueuer,
+            &ClaimedPart::new(part.clone(), 0),
+        )
+        .await
+        .unwrap();
+        let committed = store.committed_digest(&part).unwrap();
+
+        std::fs::write(ssd_dir.path().join(part.relative_dir()).join("chunk_0.bin"), b"attempt two").unwrap();
+        let observed = observed_part_digest(&ssd, &part).await.unwrap();
+
+        assert_ne!(committed, observed);
+        assert_eq!(
+            verdict_for_reland(ReplicationState::Replicated, Some(&committed), &observed),
+            RelandVerdict::Diverged,
+            "equal-length replacement bytes still diverge — only content can tell",
+        );
     }
 
     #[tokio::test]
