@@ -2285,10 +2285,21 @@ mod part_tests {
             store.evictable_parts(10).await.unwrap().is_empty(),
             "a re-driven part is unevictable while its pool copy is the stale one",
         );
+        // The residency ROW is untouched — the bytes really are still on this disk — but they stop
+        // counting as CACHE, because cache means EVICTABLE and a `pending` part is not. This is
+        // `node_cache_bytes`' documented contract, not an accident of the re-drive: it names this
+        // exact case ("a re-driven corrupt part back in `pending`") as the thing it must exclude,
+        // because counting it would double-count against `node_backlog_bytes` and overstate the
+        // node's headroom to the allocator. So assert the MOVE, which proves both halves at once.
         assert_eq!(
             store.node_cache_bytes("node-a").await.unwrap(),
+            0,
+            "a re-driven part is no longer evictable, so it is no longer cache",
+        );
+        assert_eq!(
+            store.node_backlog_bytes("node-a").await.unwrap(),
             4096,
-            "residency is untouched — the bytes really are still on this disk",
+            "and it is now undrained work — the bytes moved, they did not vanish",
         );
     }
 
