@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from hippius_s3.main import factory
 from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
+from tests.unit.routing_helpers import leaf_routes
 
 
 def _first_segment(path: str) -> str:
@@ -16,7 +17,7 @@ def _segments_shadowing_the_s3_catch_all() -> set[str]:
     than shadowing it — walking the real route list is what keeps that distinction honest.
     """
     segments: set[str] = set()
-    for route in factory().routes:
+    for route in leaf_routes(factory()):
         path = getattr(route, "path", "")
         segment = _first_segment(path)
         if not segment:

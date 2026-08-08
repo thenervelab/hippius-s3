@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from starlette.routing import Match
 
 from hippius_s3.config import reset_config
+from tests.unit.routing_helpers import leaf_routes, route_names
 
 
 OBJ = "466916c0-d61b-4518-b81b-9576b574270a"
@@ -56,7 +57,7 @@ def _matching_routes(app: FastAPI, path: str) -> list[str]:
         "headers": [],
         "query_string": b"",
     }
-    return [route.name for route in app.routes if route.matches(scope)[0] == Match.FULL]
+    return [route.name for route in leaf_routes(app) if route.matches(scope)[0] == Match.FULL]
 
 
 def test_the_internal_route_beats_the_s3_catch_all(monkeypatch) -> None:
@@ -81,7 +82,7 @@ def test_an_ordinary_object_key_is_not_captured_by_the_internal_route(monkeypatc
 def test_the_route_is_absent_when_serving_is_off(monkeypatch) -> None:
     app = _api_app(monkeypatch, serve_enabled="false", secret=SECRET)
 
-    assert all(route.name != "get_local_chunk" for route in app.routes)
+    assert "get_local_chunk" not in route_names(app)
 
 
 def test_the_route_is_absent_when_no_secret_is_configured(monkeypatch) -> None:
@@ -92,4 +93,4 @@ def test_the_route_is_absent_when_no_secret_is_configured(monkeypatch) -> None:
     """
     app = _api_app(monkeypatch, serve_enabled="true", secret="")
 
-    assert all(route.name != "get_local_chunk" for route in app.routes)
+    assert "get_local_chunk" not in route_names(app)
