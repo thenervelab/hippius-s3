@@ -14,6 +14,8 @@ already looking.
 from __future__ import annotations
 
 import pytest
+
+from tests.unit.routing_helpers import route_names
 from fastapi import FastAPI
 
 from hippius_s3.config import reset_config
@@ -122,7 +124,7 @@ def test_a_malformed_secret_fails_the_api_boot_even_with_serving_off(monkeypatch
 def test_a_valid_hex_secret_boots_with_the_route_mounted(monkeypatch) -> None:
     app = _boot(monkeypatch, GENERATED, serving="true")
 
-    assert any(route.name == "get_local_chunk" for route in app.routes)
+    assert "get_local_chunk" in route_names(app)
 
 
 @pytest.mark.parametrize("serving", ["true", "false"])
@@ -135,4 +137,4 @@ def test_an_empty_secret_boots_with_the_route_absent(monkeypatch, serving: str) 
     """
     app = _boot(monkeypatch, "", serving=serving)
 
-    assert all(route.name != "get_local_chunk" for route in app.routes)
+    assert "get_local_chunk" not in route_names(app)
