@@ -521,7 +521,10 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
         Err(err) => tracing::warn!(error = ?err, "ssd reclaim cycle failed; will retry next poll"),
     }
 
-    match ssd.sweep_orphan_tmp(graces.failed).await {
+    // Staged chunks get the orphan grace, not the failed one: they are held for the whole of a
+    // live UploadPart by design, so the millisecond-scale write-temp window would reap a running
+    // upload's own data.
+    match ssd.sweep_orphan_tmp(graces.failed, graces.orphan).await {
         Ok(0) => {}
         Ok(removed) => tracing::info!(removed, "swept orphan SSD write-temps"),
         Err(err) => tracing::warn!(error = %err, "orphan-temp sweep failed; will retry next poll"),
