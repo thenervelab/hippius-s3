@@ -208,20 +208,27 @@ impl LocalSsd {
 
     /// Removes orphaned write-temp files left on the SSD by a crashed mid-write PUT
     /// (the api's `<name>.tmp.<uuid>`) or a cancelled persist (the agent's
-    /// `.tmp-<name>`), once older than `max_age`.
+    /// `.tmp-<name>`), once older than `max_age`; and the api's staged chunks
+    /// (`chunk_<i>.bin.staged.<attempt>`) once older than `staged_max_age`.
     ///
-    /// Walks the `<object>/v<version>/part_<n>/` layout and only ever unlinks a temp
-    /// FILE — never a real `chunk_*.bin`/`meta.json`, never a directory — so it cannot
-    /// touch a complete or in-flight part; the age gate keeps a temp an active writer
-    /// is still using. Returns how many temps it removed; a missing root is an empty
-    /// cache, not an error. The companion to whole-part reclaim (`reclaim_ssd`), which
-    /// already clears temps inside a reclaimed part dir.
+    /// The two graces differ because the files differ. A write-temp exists for
+    /// milliseconds, so anything older is a crash orphan. A staged chunk is deliberately
+    /// held for the WHOLE of one `UploadPart` — that is what stops a duplicate attempt
+    /// overwriting an already-acknowledged part — so it is legitimately as old as the
+    /// upload, and a multi-GB part on a slow link outlives the write-temp grace many times
+    /// over. Reaping it on the write-temp grace would delete a live upload's data.
+    ///
+    /// Walks the `<object>/v<version>/part_<n>/` layout and only ever unlinks a temp or
+    /// staged FILE — never a real `chunk_*.bin`/`meta.json`, never a directory — so it
+    /// cannot touch a complete or in-flight part. Returns how many files it removed; a
+    /// missing root is an empty cache, not an error. The companion to whole-part reclaim
+    /// (`reclaim_ssd`), which already clears temps inside a reclaimed part dir.
     ///
     /// # Errors
     ///
     /// [`io::Error`] if walking the cache or unlinking a temp fails for a reason other
     /// than a concurrently-removed entry (which is tolerated).
-    pub async fn sweep_orphan_tmp(&self, max_age: Duration) -> io::Result<u64> {
+    pub async fn sweep_orphan_tmp(&self, max_age: Duration, staged_max_age: Duration) -> io::Result<u64> {
         let mut removed = 0;
         let Some(mut objects) = open_dir(&self.root).await? else {
             return Ok(0);
@@ -244,7 +251,7 @@ impl LocalSsd {
                     if !part.file_type().await?.is_dir() {
                         continue;
                     }
-                    removed += sweep_part_tmp(&part.path(), max_age).await?;
+                    removed += sweep_part_tmp(&part.path(), max_age, staged_max_age).await?;
                 }
             }
         }
@@ -446,6 +453,16 @@ fn is_temp_name(name: &str) -> bool {
     name.starts_with(".tmp-") || name.contains(".tmp.")
 }
 
+/// Whether a directory-entry name is one of the api's staged chunks — `chunk_<i>.bin.staged.
+/// <attempt>`, an upload attempt's private copy that becomes `chunk_<i>.bin` only when the
+/// attempt publishes the whole set. Deliberately NOT spelled with `.tmp.`, so it survives the
+/// write-temp grace for as long as an upload legitimately runs; [`sweep_part_tmp`] gives it its
+/// own, longer one. Never counted by [`parse_chunk_index`], so it is invisible to the
+/// completeness gate either way.
+fn is_staged_name(name: &str) -> bool {
+    name.starts_with("chunk_") && name.contains(".bin.staged.")
+}
+
 /// How long ago `meta` was last modified, or [`Duration::ZERO`] if its mtime is
 /// unavailable or in the future (clock skew) — the fail-safe direction (reads young,
 /// so the temp is kept rather than removed).
@@ -486,7 +503,7 @@ async fn rmdir_if_stale_and_empty(dir: &Path, max_age: Duration) -> io::Result<b
     }
 }
 
-async fn sweep_part_tmp(part_path: &Path, max_age: Duration) -> io::Result<u64> {
+async fn sweep_part_tmp(part_path: &Path, max_age: Duration, staged_max_age: Duration) -> io::Result<u64> {
     let mut removed = 0;
     let Some(mut entries) = open_dir(part_path).await? else {
         return Ok(0);
@@ -496,11 +513,15 @@ async fn sweep_part_tmp(part_path: &Path, max_age: Duration) -> io::Result<u64> 
         let Some(name) = raw.to_str() else {
             continue;
         };
-        if !is_temp_name(name) {
+        let grace = if is_temp_name(name) {
+            max_age
+        } else if is_staged_name(name) {
+            staged_max_age
+        } else {
             continue;
-        }
+        };
         let meta = entry.metadata().await?;
-        if !meta.is_file() || file_age(&meta) < max_age {
+        if !meta.is_file() || file_age(&meta) < grace {
             continue;
         }
         match fs::remove_file(entry.path()).await {
@@ -1084,7 +1105,7 @@ mod tests {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod part_tests {
-    use super::{LocalFs, LocalSsd, hex_lower};
+    use super::{LocalFs, LocalSsd, hex_lower, list_chunk_indices};
     use core::future::Future;
     use core::str::FromStr;
     use hippius_drain_core::{
@@ -1490,11 +1511,15 @@ mod part_tests {
         let ssd = LocalSsd::new(dir.path());
 
         // A long window keeps the just-written temps (younger than max_age).
-        assert_eq!(ssd.sweep_orphan_tmp(Duration::from_hours(1)).await.unwrap(), 0);
+        assert_eq!(ssd.sweep_orphan_tmp(Duration::from_hours(1), Duration::from_hours(24)).await.unwrap(), 0);
         assert!(api_tmp.exists() && agent_tmp.exists(), "fresh temps within the window are kept");
 
         // A zero window ages every temp, so both flavors are removed; real files stay.
-        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(), 2, "both temp flavors removed");
+        assert_eq!(
+            ssd.sweep_orphan_tmp(Duration::ZERO, Duration::from_hours(24)).await.unwrap(),
+            2,
+            "both temp flavors removed"
+        );
         assert!(!api_tmp.exists() && !agent_tmp.exists(), "aged temps unlinked");
         assert!(part_dir.join("chunk_0.bin").exists(), "the real chunk is untouched");
         assert!(part_dir.join("meta.json").exists(), "the meta marker is untouched");
@@ -1503,7 +1528,7 @@ mod part_tests {
     #[tokio::test]
     async fn sweep_orphan_tmp_of_a_missing_root_is_zero() {
         let ssd = LocalSsd::new("/no/such/cephor/cache/dir");
-        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(), 0);
+        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO, Duration::from_hours(24)).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1520,7 +1545,7 @@ mod part_tests {
 
         let ssd = LocalSsd::new(dir.path());
         assert_eq!(
-            ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(),
+            ssd.sweep_orphan_tmp(Duration::ZERO, Duration::from_hours(24)).await.unwrap(),
             1,
             "the temp in a no-meta dir is swept"
         );
@@ -1545,9 +1570,49 @@ mod part_tests {
 
         let ssd = LocalSsd::new(root);
         assert_eq!(
-            ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(),
+            ssd.sweep_orphan_tmp(Duration::ZERO, Duration::from_hours(24)).await.unwrap(),
             1,
             "non-dir junk is skipped and the real temp is swept",
         );
+    }
+
+    #[tokio::test]
+    async fn sweep_orphan_tmp_keeps_a_staged_chunk_past_the_write_temp_grace() {
+        // A staged chunk is held for the WHOLE of one UploadPart by design, so it is
+        // legitimately older than a write-temp ever is. Reaping it on the write-temp grace
+        // would delete a live multi-GB upload's own data; it gets its own, longer window.
+        let dir = TempDir::new().unwrap();
+        let part = part_key(9, 2);
+        let part_dir = dir.path().join(part.relative_dir());
+        std::fs::create_dir_all(&part_dir).unwrap();
+        let staged = part_dir.join("chunk_0.bin.staged.0123456789abcdef");
+        let write_tmp = part_dir.join("chunk_0.bin.tmp.deadbeefdeadbeef");
+        std::fs::write(&staged, b"in flight").unwrap();
+        std::fs::write(&write_tmp, b"partial").unwrap();
+
+        let ssd = LocalSsd::new(dir.path());
+
+        // Write temps aged out; the staged chunk is inside its own window and survives.
+        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO, Duration::from_hours(24)).await.unwrap(), 1);
+        assert!(staged.exists(), "a staged chunk outlives the write-temp grace");
+        assert!(!write_tmp.exists());
+
+        // Past its own grace it is a crash orphan (the api never published) and goes.
+        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO, Duration::ZERO).await.unwrap(), 1);
+        assert!(!staged.exists(), "an aged staged chunk is reclaimed");
+    }
+
+    #[tokio::test]
+    async fn a_staged_chunk_is_not_counted_as_a_chunk() {
+        // The completeness gate must not see staging: a part with one published chunk and one
+        // staged file is a ONE-chunk part, not a two-chunk one.
+        let dir = TempDir::new().unwrap();
+        let part = part_key(4, 6);
+        let part_dir = dir.path().join(part.relative_dir());
+        std::fs::create_dir_all(&part_dir).unwrap();
+        std::fs::write(part_dir.join("chunk_0.bin"), b"published").unwrap();
+        std::fs::write(part_dir.join("chunk_1.bin.staged.0123456789abcdef"), b"in flight").unwrap();
+
+        assert_eq!(list_chunk_indices(&part_dir).await.unwrap(), vec![ChunkIndex::new(0)]);
     }
 }

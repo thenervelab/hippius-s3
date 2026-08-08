@@ -72,6 +72,39 @@ class WriteThroughPartsWriter:
         if publisher is not None:
             await publisher.publish(object_id, int(object_version), int(part_number))
 
+    async def publish_part(
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        *,
+        attempt_id: str,
+        chunk_size: int,
+        num_chunks: int,
+        plain_size: int,
+    ) -> None:
+        """Promote one attempt's staged chunks to the part, then announce it.
+
+        `write_meta`'s counterpart for the paths that stage (see `fs_store.stage_chunk`):
+        publishing IS the meta write there, so the landed announcement has to hang off this
+        method too or an MPU part would stop reaching the drain agent directly.
+
+        Raises:
+            Exception: If the publish fails (fatal to request)
+        """
+        await self.fs_store.publish_part(
+            object_id,
+            int(object_version),
+            int(part_number),
+            attempt_id=attempt_id,
+            chunk_size=int(chunk_size),
+            num_chunks=int(num_chunks),
+            size_bytes=int(plain_size),
+        )
+        publisher = get_landed_publisher()
+        if publisher is not None:
+            await publisher.publish(object_id, int(object_version), int(part_number))
+
     async def write_chunks(self, object_id: str, object_version: int, part_number: int, chunks: list[bytes]) -> None:
         """Write chunks to the FS cache (fatal on failure).
 

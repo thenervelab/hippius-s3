@@ -17,6 +17,7 @@ import shutil
 import uuid
 from pathlib import Path
 from typing import Any
+from typing import AsyncIterator
 from typing import Optional
 from uuid import UUID
 
@@ -25,17 +26,141 @@ from hippius_s3.cache.access_tracker import get_access_tracker
 
 logger = logging.getLogger(__name__)
 
+# Marks a chunk file as belonging to ONE in-flight upload attempt and not yet published.
+#
+# The infix deliberately does NOT contain ".tmp.". Both tmp sweepers assume a write temp lives
+# for milliseconds, so anything older is a crash orphan: the drain agent reaps `*.tmp.*` on the
+# ingest SSD after CEPHOR_RECLAIM_GRACE_SECS (1h), and the janitor does the same on the shared
+# pool after TMP_FILE_MAX_AGE_SECONDS (30m). A staged chunk is held for the WHOLE of one
+# UploadPart by design, and a multi-GB part on a slow link outlives both windows — tmp-shaped
+# staging would be deleted out from under a live upload. The drain's sweep knows this name and
+# gives it the (much longer) orphan grace instead; see `is_staged_name` in localfs.rs.
+#
+# Everything else ignores these files for free: the drain's `parse_chunk_index` accepts only
+# exactly `chunk_<u32>.bin` so they never count toward its completeness gate, readers open
+# exact names, and the evictor unlinks whole part dirs.
+_STAGED_INFIX = ".staged."
+
+
+class _PartPublishLocks:
+    """Serializes publishing of one part directory within this process.
+
+    Publishing swaps a SET of files into place, and a set-rename has no atomic primitive; two
+    attempts publishing the same part concurrently would interleave their renames into a
+    mixture belonging to neither. In prod the api is a DaemonSet — exactly one pod per ingest
+    node, writing that node's local SSD — so every api-side writer of a given part dir is a
+    coroutine in THIS process, and an in-process lock is complete mutual exclusion rather than
+    a partial one. Entries are refcounted and dropped when idle so the registry does not grow
+    by one lock per part ever uploaded.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[str, tuple[asyncio.Lock, list[int]]] = {}
+
+    @contextlib.asynccontextmanager
+    async def acquire(self, key: str) -> AsyncIterator[None]:
+        entry = self._entries.get(key)
+        if entry is None:
+            entry = (asyncio.Lock(), [0])
+            self._entries[key] = entry
+        lock, holders = entry
+        # Counted BEFORE awaiting the lock, so a waiter keeps the entry alive and every
+        # contender for one path shares one lock object.
+        holders[0] += 1
+        try:
+            async with lock:
+                yield
+        finally:
+            holders[0] -= 1
+            if holders[0] == 0 and self._entries.get(key) is entry:
+                del self._entries[key]
+
+
+_publish_locks = _PartPublishLocks()
+
+
+def _trim_chunk_tail(part_dir: Path, first_index: int, label: str) -> int:
+    """Delete `chunk_<i>.bin` for i >= first_index; the publish-time exact-set trim. BLOCKING.
+
+    The drain replicates a part only when the SSD chunk set is EXACTLY {0..num_chunks-1}
+    (partdrain.rs completeness gate → IncompleteSource); a stale tail left by a LARGER earlier
+    attempt would strand the part forever — never replicated, never evicted. Never touches
+    meta.json or chunks below first_index.
+
+    Per-file failures are logged at ERROR — a surviving tail IS the stranded-part risk and
+    operators must see it — but never raised: the chunks themselves are durable on SSD and the
+    client's success must not hinge on tail cleanup. Runs BEFORE meta.json is written, so the
+    published (meta, chunk set) pair is exact from the moment it becomes visible.
+
+    Returns:
+        Number of chunk files removed.
+    """
+    removed = 0
+    try:
+        entries = list(part_dir.iterdir())
+    except FileNotFoundError:
+        return 0
+    except OSError as e:
+        # Same loudness as a per-file failure: an unscannable dir may hide a tail.
+        logger.error(
+            f"FS trim failed — could not scan part dir, a stale chunk tail may strand the "
+            f"part as IncompleteSource in the drain: {label}: {e}"
+        )
+        return 0
+    for entry in entries:
+        name = entry.name
+        if not (name.startswith("chunk_") and name.endswith(".bin")):
+            continue
+        try:
+            idx = int(name[len("chunk_") : -len(".bin")])
+        except ValueError:
+            continue  # tmp files etc. — the janitor's orphan sweep owns those
+        if idx < first_index:
+            continue
+        try:
+            entry.unlink()
+            removed += 1
+        except OSError as e:
+            logger.error(
+                f"FS trim failed — stale chunk tail survives and the part may strand as "
+                f"IncompleteSource in the drain: {label} chunk={idx}: {e}"
+            )
+    return removed
+
+
+def _write_meta_file(meta_path: Path, payload: dict[str, int]) -> None:
+    """Write meta.json atomically (unique tmp, fsync, rename). BLOCKING."""
+    tmp_path = meta_path.with_name(f"{meta_path.name}.tmp.{uuid.uuid4().hex}")
+    try:
+        with tmp_path.open("w") as f:
+            json.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp_path.replace(meta_path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+        raise
+
 
 class FileSystemPartsStore:
     """Filesystem-backed store for object parts with atomic writes.
 
     Layout: <root>/<object_id>/v<object_version>/part_<part_number>/
               chunk_<index>.bin
+              chunk_<index>.bin.staged.<attempt>  (one attempt's unpublished chunk)
               meta.json (presence indicates part is complete)
 
     All writes are atomic (unique-tmp + rename) so concurrent writers from
     different worker pods don't corrupt files. Readers check for meta.json
     existence before reading chunks.
+
+    Two write disciplines share the layout. `set_chunk` publishes a chunk immediately —
+    right for the download path, where each chunk that lands should become readable at
+    once and the only writers are workers filling identical content. `stage_chunk` +
+    `publish_part` promotes a whole attempt's set at once — required for UploadPart,
+    where two attempts of the SAME part carry DIFFERENT content and publishing chunk by
+    chunk would let one overwrite the other's already-acknowledged bytes.
     """
 
     def __init__(self, root_dir: str) -> None:
@@ -144,6 +269,166 @@ class FileSystemPartsStore:
                 f"FS write failed: object_id={object_id} v={object_version} part={part_number} chunk={chunk_index}: {e}"
             )
             raise
+
+    def _staged_chunk_file(self, part_dir: Path, chunk_index: int, attempt_id: str) -> Path:
+        """Path for a chunk that belongs to one unpublished upload attempt."""
+        if not attempt_id.isalnum():
+            # It is a path component; keep it incapable of carrying a separator even though
+            # every caller passes a uuid4 hex.
+            raise ValueError(f"Invalid attempt_id: {attempt_id!r}")
+        return part_dir / f"chunk_{int(chunk_index)}.bin{_STAGED_INFIX}{attempt_id}"
+
+    async def stage_chunk(
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        chunk_index: int,
+        data: bytes,
+        *,
+        attempt_id: str,
+    ) -> None:
+        """Write a chunk under a name private to ONE upload attempt.
+
+        The counterpart of `set_chunk` for paths where duplicate attempts share a part dir
+        (MPU UploadPart, and the append delta part that goes through it). Nothing is visible
+        at `chunk_<i>.bin` until `publish_part` renames the whole set, so an attempt that dies
+        mid-stream — or one still writing while another publishes — cannot overwrite chunks of
+        an already-acknowledged attempt. That is not reachable by cancelling the writer: a
+        chunk already inside the worker thread lands regardless, and it must land somewhere
+        harmless rather than not land.
+
+        Costs the same as `set_chunk`: one file created now, one rename later at publish,
+        versus a create and an immediate rename. No extra copy of the bytes.
+
+        Raises:
+            OSError: If the write fails (fatal to request)
+        """
+        if int(part_number) < 0 or int(chunk_index) < 0:
+            raise ValueError("part_number and chunk_index must be non-negative")
+
+        part_dir = Path(self.part_path(object_id, object_version, part_number))
+        part_dir.mkdir(parents=True, exist_ok=True)
+        staged_path = self._staged_chunk_file(part_dir, chunk_index, attempt_id)
+
+        def _write_staged() -> None:
+            with staged_path.open("wb") as f:
+                f.write(data)
+                f.flush()
+
+        try:
+            await asyncio.to_thread(_write_staged)
+        except Exception as e:
+            with contextlib.suppress(OSError):
+                staged_path.unlink(missing_ok=True)
+            logger.error(
+                f"FS staged write failed: object_id={object_id} v={object_version} "
+                f"part={part_number} chunk={chunk_index}: {e}"
+            )
+            raise
+
+    async def publish_part(
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        *,
+        attempt_id: str,
+        chunk_size: int,
+        num_chunks: int,
+        size_bytes: int,
+    ) -> None:
+        """Make one attempt's staged chunks the part, as a single operation.
+
+        Renames `chunk_<i>.bin.staged.<attempt>` onto `chunk_<i>.bin` for the whole set, drops
+        any stale tail from a larger earlier attempt (the drain replicates only an EXACT
+        {0..num_chunks-1} set), and writes `meta.json` last — all inside one thread call under
+        a per-part lock, so no other attempt in this process can interleave into it and no
+        Python-level cancellation can stop it half-way.
+
+        A set-rename has no atomic primitive, so an FS error part-way through CAN leave two
+        attempts' chunks side by side. That state is made invisible rather than served:
+        `meta.json` is removed before the error propagates, which is the same "un-publish"
+        the append CAS loser does, and the reader/drain then treat the part as absent rather
+        than decrypting a mixture that AEAD-verifies as the wrong plaintext.
+
+        Raises:
+            FileNotFoundError: If a staged chunk is missing (a concurrent whole-part eviction
+                is the realistic cause) — detected BEFORE any rename, so nothing is disturbed.
+            OSError: If a rename or the meta write fails.
+        """
+        if int(num_chunks) <= 0:
+            # Publishing an empty set would trim every chunk away and then mark the emptied
+            # dir complete. No upload path produces one (zero-length parts are rejected
+            # upstream), so treat it as a caller bug rather than an instruction.
+            raise ValueError(f"num_chunks must be positive, got {num_chunks}")
+
+        part_dir = Path(self.part_path(object_id, object_version, part_number))
+        label = f"object_id={object_id} v={object_version} part={part_number}"
+        payload = {
+            "chunk_size": int(chunk_size),
+            "num_chunks": int(num_chunks),
+            "size_bytes": int(size_bytes),
+        }
+        staged = [self._staged_chunk_file(part_dir, i, attempt_id) for i in range(int(num_chunks))]
+        targets = [self._chunk_file(part_dir, i) for i in range(int(num_chunks))]
+        meta_path = self._meta_file(part_dir)
+
+        def _publish() -> None:
+            missing = [p.name for p in staged if not p.exists()]
+            if missing:
+                raise FileNotFoundError(f"staged chunks missing at publish: {label} missing={missing}")
+            renamed = 0
+            try:
+                for src, dst in zip(staged, targets, strict=False):
+                    src.replace(dst)
+                    renamed += 1
+            except OSError:
+                if renamed:
+                    with contextlib.suppress(OSError):
+                        meta_path.unlink(missing_ok=True)
+                raise
+            _trim_chunk_tail(part_dir, int(num_chunks), label)
+            _write_meta_file(meta_path, payload)
+
+        async with _publish_locks.acquire(str(part_dir)):
+            await asyncio.to_thread(_publish)
+            await self._fsync_dir_async(part_dir)
+
+        logger.debug(f"FS: published part {label} num_chunks={num_chunks}")
+
+    async def discard_staged(self, object_id: str, object_version: int, part_number: int, *, attempt_id: str) -> int:
+        """Remove one attempt's unpublished chunk files. Returns how many went.
+
+        Safe to call on the failure path precisely because the names are private to the
+        attempt — unlike the canonical `chunk_<i>.bin` names, which duplicate attempts share
+        and which no failure path may ever delete. Best-effort: unpublished bytes leaking
+        until the part is reclaimed is a wart, failing the caller's already-failing request
+        over it is not.
+        """
+        part_dir = Path(self.part_path(object_id, object_version, part_number))
+        marker = f"{_STAGED_INFIX}{attempt_id}"
+
+        def _discard() -> int:
+            removed = 0
+            try:
+                entries = list(part_dir.iterdir())
+            except OSError:
+                return 0
+            for entry in entries:
+                if not entry.name.endswith(marker):
+                    continue
+                with contextlib.suppress(OSError):
+                    entry.unlink()
+                    removed += 1
+            return removed
+
+        removed = await asyncio.to_thread(_discard)
+        if removed:
+            logger.debug(
+                f"FS: discarded {removed} staged chunk(s): object_id={object_id} v={object_version} part={part_number}"
+            )
+        return removed
 
     async def get_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
@@ -346,7 +631,6 @@ class FileSystemPartsStore:
         part_dir.mkdir(parents=True, exist_ok=True)
 
         meta_path = self._meta_file(part_dir)
-        tmp_path = self._unique_tmp(meta_path)
 
         payload = {
             "chunk_size": int(chunk_size),
@@ -355,15 +639,7 @@ class FileSystemPartsStore:
         }
 
         try:
-            # Write to temp file and fsync file; then replace and fsync directory
-            def _write_meta() -> None:
-                with tmp_path.open("w") as f:
-                    json.dump(payload, f)
-                    f.flush()
-                    os.fsync(f.fileno())
-                tmp_path.replace(meta_path)
-
-            await asyncio.to_thread(_write_meta)
+            await asyncio.to_thread(_write_meta_file, meta_path, payload)
             # Fsync the containing directory to ensure durability of the rename
             await self._fsync_dir_async(part_dir)
 
@@ -371,73 +647,8 @@ class FileSystemPartsStore:
                 f"FS: wrote meta object_id={object_id} v={object_version} part={part_number} num_chunks={num_chunks}"
             )
         except Exception as e:
-            # Clean up temp file if it exists
-            with contextlib.suppress(OSError):
-                if tmp_path.exists():
-                    tmp_path.unlink()
             logger.error(f"FS meta write failed: object_id={object_id} v={object_version} part={part_number}: {e}")
             raise
-
-    async def trim_chunks_from(self, object_id: str, object_version: int, part_number: int, first_index: int) -> int:
-        """Delete chunk files with index >= first_index; the publish-time exact-set trim.
-
-        Called right after meta.json lands with num_chunks == first_index. The drain
-        replicates a part only when the SSD chunk set is EXACTLY {0..num_chunks-1}
-        (partdrain.rs completeness gate → IncompleteSource); a stale tail left by a
-        larger earlier attempt would strand the part forever — never replicated, never
-        evicted. Never touches meta.json or chunks below first_index.
-
-        Per-file failures are logged at ERROR — a surviving tail IS the stranded-part
-        risk and operators must see it — but never raised: the upload itself is durable
-        on SSD and the client's success must not hinge on tail cleanup.
-
-        Returns:
-            Number of chunk files removed.
-        """
-        part_dir = Path(self.part_path(object_id, object_version, part_number))
-
-        def _trim() -> int:
-            removed = 0
-            try:
-                entries = list(part_dir.iterdir())
-            except FileNotFoundError:
-                return 0
-            except OSError as e:
-                # Same loudness as a per-file failure: an unscannable dir may hide a tail.
-                logger.error(
-                    f"FS trim failed — could not scan part dir, a stale chunk tail may strand the "
-                    f"part as IncompleteSource in the drain: object_id={object_id} "
-                    f"v={object_version} part={part_number}: {e}"
-                )
-                return 0
-            for entry in entries:
-                name = entry.name
-                if not (name.startswith("chunk_") and name.endswith(".bin")):
-                    continue
-                try:
-                    idx = int(name[len("chunk_") : -len(".bin")])
-                except ValueError:
-                    continue  # tmp files etc. — the janitor's orphan sweep owns those
-                if idx < int(first_index):
-                    continue
-                try:
-                    entry.unlink()
-                    removed += 1
-                except OSError as e:
-                    logger.error(
-                        f"FS trim failed — stale chunk tail survives and the part may strand as "
-                        f"IncompleteSource in the drain: object_id={object_id} v={object_version} "
-                        f"part={part_number} chunk={idx}: {e}"
-                    )
-            return removed
-
-        removed = await asyncio.to_thread(_trim)
-        if removed:
-            logger.debug(
-                f"FS: trimmed {removed} stale chunk(s) >= {first_index}: "
-                f"object_id={object_id} v={object_version} part={part_number}"
-            )
-        return removed
 
     async def delete_meta(self, object_id: str, object_version: int, part_number: int) -> None:
         """Delete meta.json only, un-publishing a part dir while keeping its chunks.
