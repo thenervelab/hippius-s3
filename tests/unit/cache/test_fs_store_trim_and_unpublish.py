@@ -10,6 +10,7 @@ touching chunks.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -41,9 +42,7 @@ async def _stage(store: FileSystemPartsStore, object_id: str, count: int) -> Non
 
 
 async def _publish(store: FileSystemPartsStore, object_id: str, num_chunks: int) -> None:
-    await store.publish_part(
-        object_id, 1, 1, attempt_id=ATTEMPT, chunk_size=4, num_chunks=num_chunks, size_bytes=8
-    )
+    await store.publish_part(object_id, 1, 1, attempt_id=ATTEMPT, chunk_size=4, num_chunks=num_chunks, size_bytes=8)
 
 
 @pytest.mark.asyncio
@@ -81,6 +80,28 @@ async def test_publish_without_staged_chunks_raises_before_touching_the_part(sto
 
     assert (part_dir / "meta.json").exists()
     assert (part_dir / "chunk_0.bin").read_bytes() == b"chunk-0"
+
+
+@pytest.mark.asyncio
+async def test_publish_of_a_partially_staged_set_aborts_before_any_rename(store):
+    """The case the pre-flight is FOR, as distinct from the empty-set case above.
+
+    With chunk 0 staged and chunk 1 not, renaming what is there gets as far as chunk 0 and stops,
+    leaving the part holding the new attempt's chunk 0 beside the old attempt's chunk 1 — a
+    mixture that decrypts cleanly under its per-chunk AAD. Checking the whole set up front is
+    what turns that into an untouched part.
+    """
+    object_id = str(uuid.uuid4())
+    part_dir = await _seed_part(store, object_id, indices=[0, 1], with_meta=True)
+    await store.stage_chunk(object_id, 1, 1, 0, b"new-0", attempt_id=ATTEMPT)
+
+    with pytest.raises(FileNotFoundError):
+        await _publish(store, object_id, 2)
+
+    assert (part_dir / "chunk_0.bin").read_bytes() == b"chunk-0", "the stageable chunk was renamed anyway"
+    assert (part_dir / "chunk_1.bin").read_bytes() == b"chunk-1"
+    assert (part_dir / f"chunk_0.bin.staged.{ATTEMPT}").read_bytes() == b"new-0"
+    assert json.loads((part_dir / "meta.json").read_text())["num_chunks"] == 2
 
 
 @pytest.mark.asyncio
