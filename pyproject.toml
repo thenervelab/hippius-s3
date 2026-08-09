@@ -83,6 +83,11 @@ dev = [
     # in hippius_s3/queue.py claim due members via a Lua compare-and-swap.
     "fakeredis[lua]>=2.23.0",
     "respx>=0.21.0",
+    # Pinned exactly, unlike the floors above: hypothesis generates the test inputs, so its
+    # version is part of what the property tests actually assert. A minor bump can change
+    # generation and shrinking, which turns a real counterexample into an unreproducible CI
+    # failure — or hides one that a pinned version was finding.
+    "hypothesis==6.165.2",
     # Transitive via pip-audit -> cachecontrol[filecache]; floor to clear
     # GHSA-6v7p-g79w-8964 (msgpack <1.2.1). Not used by the app at runtime.
     "msgpack>=1.2.1",
