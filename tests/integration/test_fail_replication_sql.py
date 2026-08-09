@@ -7,8 +7,8 @@ carry a NULL object_version) or failing rows for the wrong version. The unit tes
 `fail_version_replication` with a fake db, so the SQL predicate itself — the
 `$2 IS NULL → all versions` branch and the `status IN (...)` gate — is only exercised here.
 
-Runs the real `get_query("fail_replication_status_for_version")` against a TEMP table
-shadowing `cephor_replication_status` for the session.
+Runs the real `get_query("fail_replication_status_for_version")` against TEMP tables
+shadowing `cephor_replication_status` and `object_versions` for the session.
 """
 
 from __future__ import annotations
@@ -43,7 +43,21 @@ async def conn() -> AsyncGenerator[asyncpg.Connection, None]:
             version    bigint,
             status     text        NOT NULL,
             claimed_at timestamptz,
-            updated_at timestamptz
+            updated_at timestamptz,
+            -- Mirrors drain migration 0012; the query's Tier-2 arm reads it, so a mirror
+            -- without it makes every case here fail on an undefined column.
+            upload_enqueued_at timestamptz
+        ) ON COMMIT PRESERVE ROWS;
+
+        -- The Tier-2 arm's EXISTS subquery reads object_versions. Shadow it empty rather than
+        -- letting the name fall through to the real table, so no row here can ever satisfy
+        -- that arm and the cases below isolate the pending/draining gate.
+        CREATE TEMP TABLE object_versions (
+            object_id      uuid   NOT NULL,
+            object_version bigint NOT NULL,
+            address        text,
+            size_bytes     bigint NOT NULL DEFAULT 0,
+            md5_hash       text
         ) ON COMMIT PRESERVE ROWS;
         """
     )
