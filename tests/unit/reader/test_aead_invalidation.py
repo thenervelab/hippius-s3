@@ -320,6 +320,105 @@ async def test_a_single_tier_deployment_never_unlinks_its_only_copy(tmp_path: Pa
     collector.record_aead_failure.assert_called_once_with("remote", "unrecovered")
 
 
+class _SuspectProbe:
+    """A replication-status double that records every consultation."""
+
+    def __init__(self, suspect: bool) -> None:
+        self.suspect = suspect
+        self.calls: list[tuple[str, int, int]] = []
+
+    async def __call__(self, object_id: str, object_version: int, part_number: int) -> bool:
+        self.calls.append((object_id, object_version, part_number))
+        return self.suspect
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefetch", [0, 4])
+async def test_a_redriven_part_fails_the_read_and_keeps_the_local_copy(tmp_path: Path, prefetch: int) -> None:
+    """The stale-pool window: a redrive flips the part back to 'pending' while the pool still
+    holds SUPERSEDED bytes that AEAD-verify under the same DEK/AAD.
+
+    The pool here holds a DIFFERENT plaintext that decrypts cleanly — exactly what a
+    superseded copy looks like — so without the status gate the retry would "succeed" with
+    silently wrong content. The read must fail with the original decrypt error instead, and
+    the local copy must survive: during a redrive it may be the only good one.
+    """
+    probe = _SuspectProbe(suspect=True)
+    dual = _dual(tmp_path, replication_suspect=probe)
+    stale = [_ct(b"superseded-bytes", part=1, index=0), _good()[1]]
+    await _write_part(dual.fallback, stale)
+    await _write_part(dual, [POISON_TAG, _good()[1]])
+
+    collector = MagicMock()
+    cache = _StoreCache(dual)
+    with patch("hippius_s3.monitoring.get_metrics_collector", return_value=collector), pytest.raises(InvalidTag):
+        await _read(cache, prefetch=prefetch)
+
+    assert _chunk_file(dual, 0).read_bytes() == POISON_TAG, "the local copy is NOT unlinked"
+    assert cache.fetches.count((1, 0)) == 1, "no retry — a retry would serve the stale pool bytes"
+    assert probe.calls == [(OBJ, 1, 1)], "the status is re-checked freshly, once, for this part"
+    collector.record_aead_failure.assert_called_once_with("remote", "unrecovered")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefetch", [0, 4])
+async def test_a_replicated_part_keeps_the_invalidate_and_retry_behaviour(tmp_path: Path, prefetch: int) -> None:
+    """status='replicated' must change nothing: the pre-announcement B-2 window behind that
+    status is closed drain-side (#403), so the read path keeps healing local corruption."""
+    probe = _SuspectProbe(suspect=False)
+    dual = _dual(tmp_path, replication_suspect=probe)
+    good = _good()
+    await _write_part(dual.fallback, good)
+    await _write_part(dual, [POISON_TAG, good[1]])
+
+    collector = MagicMock()
+    cache = _StoreCache(dual)
+    with patch("hippius_s3.monitoring.get_metrics_collector", return_value=collector):
+        out = await _read(cache, prefetch=prefetch)
+
+    assert out == b"".join(PLAINTEXT)
+    assert not _chunk_file(dual, 0).exists(), "the poisoned local copy is gone"
+    assert probe.calls == [(OBJ, 1, 1)]
+    collector.record_aead_failure.assert_called_once_with("local", "recovered")
+
+
+@pytest.mark.asyncio
+async def test_the_probe_costs_nothing_on_a_healthy_read(tmp_path: Path) -> None:
+    """The status check rides the AEAD-retry path only — the normal read never pays for it."""
+    probe = _SuspectProbe(suspect=True)
+    dual = _dual(tmp_path, replication_suspect=probe)
+    await _write_part(dual, _good())
+
+    out = await _read(_StoreCache(dual), prefetch=0)
+
+    assert out == b"".join(PLAINTEXT)
+    assert probe.calls == [], "no decrypt failure, so the status is never consulted"
+
+
+@pytest.mark.asyncio
+async def test_a_suspect_part_is_not_unlinked_even_when_the_pool_has_it(tmp_path: Path) -> None:
+    """Both gates in order: pool presence passes, the fresh status check still refuses."""
+    probe = _SuspectProbe(suspect=True)
+    dual = _dual(tmp_path, replication_suspect=probe)
+    good = _good()
+    await _write_part(dual.fallback, good)
+    await _write_part(dual, good)
+
+    assert await dual.invalidate_local_chunk(OBJ, 1, 1, 0) is False
+    assert _chunk_file(dual, 0).exists(), "the local copy survives a redrive in flight"
+
+
+@pytest.mark.asyncio
+async def test_a_missing_pool_copy_is_refused_before_the_status_is_asked(tmp_path: Path) -> None:
+    """The cheap FS gate stays first: an SSD-only part never costs a DB round trip."""
+    probe = _SuspectProbe(suspect=False)
+    dual = _dual(tmp_path, replication_suspect=probe)
+    await _write_part(dual, [_ct(PLAINTEXT[0], part=1, index=0)])
+
+    assert await dual.invalidate_local_chunk(OBJ, 1, 1, 0) is False
+    assert probe.calls == [], "no pool copy, so the status answer could not matter"
+
+
 @pytest.mark.asyncio
 async def test_a_truncated_pool_chunk_is_still_a_clean_error(tmp_path: Path) -> None:
     """A body too short to be a ciphertext raises CryptoError, not InvalidTag — same handling."""

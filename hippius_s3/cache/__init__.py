@@ -7,6 +7,7 @@ from .dual_fs_store import LocalReadRecorder
 from .dual_fs_store import PeerFetcher
 from .dual_fs_store import PromotionRecorder
 from .dual_fs_store import PromotionReleaser
+from .dual_fs_store import ReplicationSuspectFn
 from .fs_store import FileSystemPartsStore
 from .notifier import ChunkNotifier
 from .object_parts import RedisObjectPartsCache
@@ -20,6 +21,7 @@ def create_fs_store(
     peer_fetch: PeerFetcher | None = None,
     on_local_read: LocalReadRecorder | None = None,
     published_floor: PublishedFloorSource | None = None,
+    replication_suspect: ReplicationSuspectFn | None = None,
 ) -> FileSystemPartsStore:
     """Build the parts store: dual-tier when a fallback pool is configured, else single.
 
@@ -35,6 +37,10 @@ def create_fs_store(
     `published_floor` reads the free-space floor this node's evictor is actually holding.
     Optional on purpose: `None` (every caller but the api — the workers do not promote) leaves
     the gate on `promote_min_free_ratio`, which is exactly the pre-publish behaviour.
+
+    `replication_suspect` lets the AEAD-retry path refuse a pool copy a redrive has marked
+    stale. `None` (workers — they never stream, so never invalidate) keeps the pool-presence
+    gate as the invalidation's only condition.
     """
     fallback_dir = getattr(config, "object_cache_fallback_dir", "")
     cache_dir = getattr(config, "object_cache_dir", "")
@@ -64,6 +70,7 @@ def create_fs_store(
             peer_fetch=peer_fetch,
             space_gate=space_gate,
             on_local_read=on_local_read,
+            replication_suspect=replication_suspect,
         )
     return FileSystemPartsStore(cache_dir)
 

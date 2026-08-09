@@ -100,6 +100,14 @@ def _is_peer_address(url: str) -> bool:
 #
 # TTL'd, not permanent: the evictor deletes residency rows underneath us, so a stale answer
 # must expire. A wrong answer is cheap anyway — the peer 404s and the read falls to the pool.
+#
+# The memo can also outlive a redrive flipping the part's replication status back to 'pending'
+# (the resolve joins on status='replicated', but only at resolve time). Deliberately NOT
+# re-checked at fetch time and not shortened: what a peer serves is its SSD copy, which during
+# a redrive is the SOURCE the drain re-copies from — current bytes, not stale ones. The
+# stale-bytes hazard a redrive opens is the POOL tier, and the AEAD-retry path re-checks the
+# status freshly there (`ReplicationSuspectProbe`); paying a per-part Postgres round trip here
+# would guard against nothing.
 _OWNER_MEMO_TTL_SECONDS = 30.0
 _OWNER_MEMO_ENTRIES = 50_000
 

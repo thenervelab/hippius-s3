@@ -39,6 +39,11 @@ LocalReadRecorder = Callable[[str, int, int], Awaitable[None]]
 # (object_id, version, part_number, chunk_index). Returns None when no peer has it.
 PeerFetcher = Callable[[str, int, int, int], Awaitable[Optional[bytes]]]
 
+# Called with (object_id, version, part_number) on the AEAD-retry path only. True means the
+# drain currently distrusts the part's pool copy (a redrive is in flight), so the retry must
+# not be allowed to serve it. Contract: never raises; unknown degrades to False.
+ReplicationSuspectFn = Callable[[str, int, int], Awaitable[bool]]
+
 
 def _record_tier(tier: ChunkReadTier) -> None:
     """Count which tier served a chunk. Never let observability break a read."""
@@ -89,6 +94,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         peer_fetch: Optional[PeerFetcher] = None,
         space_gate: Optional[FreeSpaceGate] = None,
         on_local_read: Optional[LocalReadRecorder] = None,
+        replication_suspect: Optional[ReplicationSuspectFn] = None,
     ) -> None:
         super().__init__(primary_dir)
         self.fallback = FileSystemPartsStore(fallback_dir)
@@ -96,6 +102,10 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         self._on_promote = on_promote
         self._on_promote_release = on_promote_release
         self._peer_fetch = peer_fetch
+        # Consulted by `invalidate_local_chunk` alone, so the normal read path never pays for
+        # it. `None` (workers, tests, deployments without a drain) keeps the pool-presence gate
+        # as the only condition, which is exactly the pre-probe behaviour.
+        self._replication_suspect = replication_suspect
         # Promotion yields to ingest: this is the only writer here that is pure optimisation,
         # and it shares the mount with the PUTs that `fs_cache_pressure` refuses when the disk
         # runs out. `None` means no gate (tests, and any deployment without a fallback tier).
@@ -296,6 +306,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         The gate is exact for a second reason: pool presence is meta-gated, and the drain persists
         the pool's meta.json LAST, after every chunk is copied and byte-verified (partdrain.rs), so
         anything this can unlink is already past the point where a drain in flight reads the source.
+        A REDRIVEN part is the one case where pool presence lies — see the status check below.
 
         Removes one chunk file, never the part: `meta.json` is the readiness gate, and a part with
         meta and a hole is exactly the downloader's normal partial-fill state — the hole reads as a
@@ -306,6 +317,29 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         it again) and not worth serialising against the promotion path.
         """
         if not await self.fallback.chunk_exists(object_id, object_version, part_number, chunk_index):
+            return False
+
+        # Pool presence alone is not enough: a redrive flips the part's replication status back
+        # to 'pending' while the pool still holds SUPERSEDED bytes that AEAD-verify under the
+        # same DEK/AAD — meta-gated `chunk_exists` passes, and the retry would silently serve
+        # stale plaintext. A FRESH status check (never the peer resolver's 30s memo) is the only
+        # signal that window is open, so refuse both halves of the retry: keep the local copy —
+        # during a redrive it may be the only good one — and return False, which the streamer
+        # turns into the original decrypt failure. When the status IS 'replicated' nothing here
+        # changes; the pre-announcement B-2 window behind that status is closed by the drain's
+        # own redrive work (#403), not on the read path.
+        if self._replication_suspect is not None and await self._replication_suspect(
+            object_id, int(object_version), int(part_number)
+        ):
+            logger.warning(
+                "refusing to invalidate a chunk that failed authentication: a redrive is in "
+                "flight, so the pool copy is suspect and the local copy may be the only good "
+                "one: %s v%s part %s chunk %s",
+                object_id,
+                object_version,
+                part_number,
+                chunk_index,
+            )
             return False
 
         chunk_path = self._chunk_file(Path(self.part_path(object_id, object_version, part_number)), chunk_index)
