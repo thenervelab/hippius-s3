@@ -181,6 +181,17 @@ class MetricsCollector:
             unit="1",
         )
 
+        # A residency claim that could not be given back after its disk write failed. Each one
+        # leaves phantom bytes in cephor_ssd_residency (the claim ACCUMULATES on conflict), so a
+        # sustained rate means node_cache_bytes is inflating and the allocator is steering on a
+        # figure the disk does not hold. Reaching this at all takes a DB fault inside the same
+        # promotion whose claim just succeeded, so it should be near zero.
+        self.residency_release_failures = self.meter.create_counter(
+            name="residency_release_failures_total",
+            description="Residency claims left in place because the compensating decrement failed",
+            unit="1",
+        )
+
         # Gate decisions taken on the drain agent's published floor rather than the configured
         # one. `stricter` rising means the allocator has raised this node's eviction reserve —
         # the read tier is deliberately backing off a stressed disk, and that must be visible
@@ -611,6 +622,10 @@ class MetricsCollector:
         """Count a gate decision on a published floor unequal to the configured one."""
         self.promote_floor_divergence.add(1, attributes={"direction": direction})
 
+    def record_residency_release_failure(self) -> None:
+        """Count a claim whose compensating decrement failed, leaving phantom bytes accounted."""
+        self.residency_release_failures.add(1)
+
     def record_read_recency_write(self, outcome: ReadRecencyOutcome) -> None:
         """Count one `last_read_at` stamp attempt. `outcome` is a Literal, so bounded."""
         self.read_recency_writes.add(1, attributes={"outcome": outcome})
@@ -894,6 +909,9 @@ class NullMetricsCollector:
         pass
 
     def record_promote_floor_divergence(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_residency_release_failure(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_read_recency_write(self, *args: object, **kwargs: object) -> None:

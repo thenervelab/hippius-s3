@@ -6,6 +6,7 @@ from .dual_fs_store import DualFileSystemPartsStore
 from .dual_fs_store import LocalReadRecorder
 from .dual_fs_store import PeerFetcher
 from .dual_fs_store import PromotionRecorder
+from .dual_fs_store import PromotionReleaser
 from .fs_store import FileSystemPartsStore
 from .notifier import ChunkNotifier
 from .object_parts import RedisObjectPartsCache
@@ -15,6 +16,7 @@ def create_fs_store(
     config: object,
     *,
     on_promote: PromotionRecorder | None = None,
+    on_promote_release: PromotionReleaser | None = None,
     peer_fetch: PeerFetcher | None = None,
     on_local_read: LocalReadRecorder | None = None,
     published_floor: PublishedFloorSource | None = None,
@@ -25,6 +27,10 @@ def create_fs_store(
     Promotion stays off unless BOTH the flag is set and a recorder is supplied — an
     unrecorded promotion is a copy no evictor can reclaim, so the two travel together
     rather than being independently switchable.
+
+    `on_promote_release` is `on_promote`'s other half and must come from the same recorder:
+    the claim accumulates bytes on conflict, so a claim whose disk write then fails has to be
+    subtracted back or every retried promotion inflates the residency row again.
 
     `published_floor` reads the free-space floor this node's evictor is actually holding.
     Optional on purpose: `None` (every caller but the api — the workers do not promote) leaves
@@ -54,6 +60,7 @@ def create_fs_store(
             fallback_dir,
             promote=promote,
             on_promote=on_promote,
+            on_promote_release=on_promote_release,
             peer_fetch=peer_fetch,
             space_gate=space_gate,
             on_local_read=on_local_read,

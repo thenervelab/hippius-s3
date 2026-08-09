@@ -219,6 +219,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.fs_store = create_fs_store(
             config,
             on_promote=app.state.residency_recorder,
+            # The claim's other half, from the SAME recorder: a claim whose disk write fails
+            # must be subtracted back or the accumulating row inflates on every retry.
+            on_promote_release=(
+                app.state.residency_recorder.release if app.state.residency_recorder is not None else None
+            ),
             peer_fetch=peer_fetch,
             on_local_read=app.state.read_recency_recorder,
             published_floor=published_floor.ratio if published_floor is not None else None,

@@ -22,6 +22,14 @@ logger = logging.getLogger(__name__)
 # promotion, because a copy no evictor owns is worse than no copy at all.
 PromotionRecorder = Callable[[str, int, int, int], Awaitable[bool]]
 
+# Called when a claim landed but the copy's disk write then failed, with the same
+# (object_id, version, part_number, bytes) the claim reported, so the recorder can subtract
+# exactly what it added. Needed because the claim ACCUMULATES on conflict: without the
+# give-back, every retried promotion against a persistently failing disk adds the chunk's
+# bytes to the residency row again, unboundedly. Contract: must never raise — it runs on
+# promotion's failure path, where an exception would fail a read that already has its bytes.
+PromotionReleaser = Callable[[str, int, int, int], Awaitable[None]]
+
 # Called after a chunk is served from THIS node's flash, with (object_id, version, part_number).
 # Feeds cephor_ssd_residency.last_read_at, which is what makes eviction recency-ordered instead
 # of FIFO. Sampled by the recorder, so it is cheap to call on every local hit.
@@ -77,6 +85,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         *,
         promote: bool = False,
         on_promote: Optional[PromotionRecorder] = None,
+        on_promote_release: Optional[PromotionReleaser] = None,
         peer_fetch: Optional[PeerFetcher] = None,
         space_gate: Optional[FreeSpaceGate] = None,
         on_local_read: Optional[LocalReadRecorder] = None,
@@ -85,6 +94,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         self.fallback = FileSystemPartsStore(fallback_dir)
         self._promote = promote
         self._on_promote = on_promote
+        self._on_promote_release = on_promote_release
         self._peer_fetch = peer_fetch
         # Promotion yields to ingest: this is the only writer here that is pure optimisation,
         # and it shares the mount with the PUTs that `fs_cache_pressure` refuses when the disk
@@ -174,10 +184,14 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         skips replicated parts as the read tier — so nothing frees it until some later read
         happens to promote the same chunk again.
 
-        Claiming before writing can leave a row for bytes that never landed. That trade is cheap:
-        the evictor re-probes actual free space after each page rather than trusting the accounted
-        sum, so an over-accounted part costs one wasted candidate and self-corrects on the next
-        pass.
+        Claiming before writing means a failed write leaves a claim for bytes that never landed —
+        and the claim ACCUMULATES on conflict, so without a give-back a persistently failing disk
+        would add the same phantom bytes on every retried promotion, unboundedly. The failure path
+        therefore releases exactly the bytes it claimed. The release is itself best-effort:
+        leaving it un-issued takes a DB fault inside the very promotion whose claim just
+        succeeded, and a fault that persists fails the claims themselves — which cancels
+        promotion outright — so the residual over-count is bounded by one claim per such
+        coincidence, and the evictor re-probes actual free space rather than trusting the sum.
 
         Meta is written FIRST of the two DISK writes, matching the downloader rather than the
         uploader. Meta is the readiness gate, so writing it first makes each promoted chunk
@@ -207,6 +221,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         if in_flight in self._promoting:
             return
         self._promoting.add(in_flight)
+        claimed = False
         try:
             meta = await self.fallback.get_meta(object_id, object_version, part_number)
             if meta is None:
@@ -219,11 +234,11 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
             # total — a range GET promotes only the chunks it touches, so claiming the whole
             # part's size would inflate the number the evictor sums to decide it has freed
             # enough, stopping a pass early while it reports success.
-            if self._on_promote is not None and not await self._on_promote(
-                object_id, object_version, part_number, len(data)
-            ):
-                _record_promotion_skipped("residency_failed")
-                return
+            if self._on_promote is not None:
+                if not await self._on_promote(object_id, object_version, part_number, len(data)):
+                    _record_promotion_skipped("residency_failed")
+                    return
+                claimed = True
             # Skip the rewrite only when meta is ACTUALLY on this node's disk — never on a
             # process-local memo. The evictor runs in a different process (drain-agent) and
             # unlinks the whole part dir, meta included; it cannot invalidate a memo held
@@ -249,6 +264,12 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
                 chunk_index,
                 exc,
             )
+            # Give back the claim, or the accumulating residency row keeps the bytes forever —
+            # and gains them AGAIN on every retried promotion against the same failing disk.
+            # Everything after the claim can raise into this handler (the meta int() coercions
+            # included), so the flag, not the failing statement, decides whether to release.
+            if claimed and self._on_promote_release is not None:
+                await self._on_promote_release(object_id, object_version, part_number, len(data))
         finally:
             self._promoting.discard(in_flight)
 

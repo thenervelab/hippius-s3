@@ -16,9 +16,11 @@ optimisation: the bytes are already served and the pool copy is authoritative, s
 promotion costs a cache warm. Fail closed on the cheap side.
 
 The cost of that ordering — a claim followed by a failed write, leaving a row for bytes never
-put on disk — is small, because the evictor re-probes actual free space after each page rather
-than trusting the accounted sum. An over-accounted part costs one wasted eviction candidate and
-self-corrects on the next pass.
+put on disk — is paid back by `release`: the promoter calls it when the disk write fails, and
+it subtracts exactly what the claim added. Without it the over-count would not merely be stale,
+it would GROW: the conflict action accumulates, so every retried promotion against a
+persistently failing disk would add the same phantom bytes again, inflating node_cache_bytes
+until DiskPressure and the allocator's weights steered on a figure the disk does not hold.
 
 Writes happen once per PROMOTED CHUNK, not once per part, and each carries only the bytes
 that chunk is about to write. A range GET promotes only the chunks it touches, so claiming the
@@ -43,6 +45,18 @@ import asyncpg
 
 
 logger = logging.getLogger(__name__)
+
+
+def _record_release_failure() -> None:
+    """Count a decrement that failed. Never let observability break a read."""
+    try:
+        from hippius_s3.monitoring import get_metrics_collector
+
+        collector = get_metrics_collector()
+        if collector is not None:
+            collector.record_residency_release_failure()
+    except Exception:  # noqa: BLE001 - a metrics failure must not fail a read
+        pass
 
 
 class ResidencyRecorder:
@@ -102,6 +116,49 @@ class ResidencyRecorder:
             )
             return False
         return True
+
+    async def release(self, object_id: str, object_version: int, part_number: int, size_bytes: int) -> None:
+        """Give back a claim whose bytes never landed. Best-effort; never raises.
+
+        Mirrors `__call__`'s shape and subtracts exactly what that claim added, so a promotion
+        whose disk write fails leaves the accumulating row where it started. Floored at zero
+        rather than allowed to go negative: the evictor SUMS this column against its deficit,
+        and a negative row would corrupt that sum, while an under-count only costs one extra
+        eviction candidate. The row is deliberately not deleted at zero — if the claim created
+        it, the part dir may hold a meta.json from the failed promotion, and the zero-byte row
+        is what keeps that residue owned by the evictor.
+        """
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE cephor_ssd_residency
+                    SET bytes = GREATEST(cephor_ssd_residency.bytes - $5, 0)
+                    WHERE node_id = $1 AND object_id = $2 AND version = $3 AND part_number = $4
+                    """,
+                    self._node_id,
+                    str(object_id),
+                    int(object_version),
+                    int(part_number),
+                    int(size_bytes),
+                )
+        except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError) as exc:
+            # Never raises: this runs on promotion's failure path, where an exception would turn
+            # a read that already served its bytes into a failed one. The harm of swallowing is
+            # bounded — reaching here at all takes the DB failing INSIDE the promotion whose
+            # claim just succeeded on the same pool, and a fault that persists fails the claims
+            # themselves, which cancels promotion outright. WARNING plus a counter because each
+            # occurrence is phantom bytes the evictor will account against a disk not holding
+            # them, and nothing else in the logs would say so.
+            _record_release_failure()
+            logger.warning(
+                "releasing a residency claim failed for %s v%s part %s (%s bytes stay accounted): %s",
+                object_id,
+                object_version,
+                part_number,
+                size_bytes,
+                exc,
+            )
 
 
 def create_residency_recorder(pool: Optional[asyncpg.Pool], node_id: str) -> Optional[ResidencyRecorder]:

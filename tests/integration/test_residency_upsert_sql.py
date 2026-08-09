@@ -159,3 +159,41 @@ async def test_a_failed_claim_is_reported_as_false_rather_than_raising(conn: asy
     await conn.execute("DROP TABLE cephor_ssd_residency")
 
     assert await ResidencyRecorder(_SingleConnPool(conn), NODE)(object_id, 1, 0, 4096) is False
+
+
+async def test_a_release_returns_the_row_to_its_pre_claim_bytes(conn: asyncpg.Connection) -> None:
+    """The claim's compensation, against the real statement. A claim whose disk write failed
+    must be subtracted back or — because the conflict action ADDS — every retried promotion
+    against a failing disk grows the row's phantom bytes without bound.
+    """
+    object_id = str(uuid.uuid4())
+    recorder = ResidencyRecorder(_SingleConnPool(conn), NODE)
+    await recorder(object_id, 1, 0, 4096)
+    await recorder(object_id, 1, 0, 8192)
+
+    await recorder.release(object_id, 1, 0, 8192)
+
+    assert await _bytes_for(conn, NODE, object_id) == 4096, "the release must undo exactly the failed claim"
+
+
+async def test_a_release_floors_at_zero_rather_than_going_negative(conn: asyncpg.Connection) -> None:
+    """The evictor SUMS this column against its deficit, so a negative row corrupts the sum,
+    while an under-count only costs one extra eviction candidate."""
+    object_id = str(uuid.uuid4())
+    recorder = ResidencyRecorder(_SingleConnPool(conn), NODE)
+    await recorder(object_id, 1, 0, 100)
+
+    await recorder.release(object_id, 1, 0, 4096)
+
+    assert await _bytes_for(conn, NODE, object_id) == 0
+
+
+async def test_a_release_for_a_row_the_evictor_already_removed_is_a_no_op(conn: asyncpg.Connection) -> None:
+    """The evictor deletes rows from another process, so a release can always lose that race.
+    It must neither raise nor resurrect the row — a recreated row would claim a part dir the
+    evictor just unlinked."""
+    object_id = str(uuid.uuid4())
+
+    await ResidencyRecorder(_SingleConnPool(conn), NODE).release(object_id, 1, 0, 4096)
+
+    assert await _bytes_for(conn, NODE, object_id) is None
