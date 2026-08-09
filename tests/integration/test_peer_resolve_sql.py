@@ -76,7 +76,13 @@ class _SingleConnPool:
 
 def _fetcher(conn: asyncpg.Connection) -> PeerChunkFetcher:
     """A fetcher wired to nothing but the database — `_resolve_part` touches neither."""
-    return PeerChunkFetcher(_SingleConnPool(conn), registry=None, node_name=NODE, client=None)  # type: ignore[arg-type]
+    return PeerChunkFetcher(
+        _SingleConnPool(conn),  # type: ignore[arg-type]
+        registry=None,  # type: ignore[arg-type]
+        node_name=NODE,
+        client=None,  # type: ignore[arg-type]
+        auth_secret="unused-by-resolve",
+    )
 
 
 @pytest_asyncio.fixture
