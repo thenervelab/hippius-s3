@@ -28,12 +28,15 @@ Resumable: keyset-paginates by (deleted_at, object_id); pass the last printed cu
 --start-after-ts/--start-after-id to resume. --loop re-scans from the start after each full
 pass (continuous sweeper mode) to catch newly soft-deleted objects.
 
-ROUTING (--backends): unpins go to `<backend>_unpin_requests` for each backend in
-`config.delete_backends` unless --backends overrides it. This matters: on prod
-delete_backends is ['arion'], but the objects that block the hard-delete scan have their
-LIVE rows on **ovh** (arion is already fully unpinned). Default routing would enqueue work
-that is already done and leave them stuck forever. `ovh_unpin_requests` is consumed by the
-s3-backup `cleanup` worker, which deletes from OVH *and* marks `chunk_backend.deleted`.
+ROUTING (--backends): by default unpins fan out to `<backend>_unpin_requests` for each
+backend in `config.delete_backends`. --backends instead enqueues DIRECTLY to each named
+queue — deliberately bypassing `enqueue_unpin_request`'s allowlist intersection with
+config.delete_backends, which would otherwise drop the override (empty intersection =>
+"disallowed; not enqueuing", zero work reaches the queue). Reaching an off-allowlist
+backend is the whole point: on prod delete_backends is ['arion'], but the objects that
+block the hard-delete scan have their LIVE rows on **ovh** (arion is already fully
+unpinned). `ovh_unpin_requests` is consumed by the s3-backup `cleanup` worker, which
+deletes from OVH *and* marks `chunk_backend.deleted`.
 
   python -m hippius_s3.scripts.backfill_soft_delete_unpins --dry-run
   python -m hippius_s3.scripts.backfill_soft_delete_unpins --batch 1000 --queue-cap 50000 \
@@ -105,6 +108,17 @@ _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 _ZERO_UUID = "00000000-0000-0000-0000-000000000000"
 
 
+async def _enqueue_unpin(payload: UnpinChainRequest, backends: list[str]) -> None:
+    """Route one unpin. An explicit --backends override enqueues directly to each named
+    queue: the generic path intersects the request with config.delete_backends, which
+    would drop exactly the off-allowlist backend the operator is trying to reach."""
+    if backends:
+        for b in backends:
+            await enqueue_unpin_request(payload=payload, queue_name=f"{b}_unpin_requests")
+    else:
+        await enqueue_unpin_request(payload=payload)
+
+
 async def _wait_for_queue_room(redis_q: async_redis.Redis, queues: list[str], cap: int) -> None:
     """Block until the combined depth of `queues` is under cap (throttle)."""
     while True:
@@ -122,7 +136,9 @@ async def main_async(args: argparse.Namespace) -> int:
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
     logger.info(
         "unpin routing: %s (deprecated, reconciled in-DB: %s)",
-        f"--backends {backends}" if backends else f"config.delete_backends {config.delete_backends}",
+        f"--backends {backends} (direct to queues, allowlist bypassed)"
+        if backends
+        else f"config.delete_backends {config.delete_backends}",
         deprecated or "none",
     )
     db = await asyncpg.connect(config.database_url)
@@ -158,14 +174,16 @@ async def main_async(args: argparse.Namespace) -> int:
                     elif args.dry_run:
                         enqueued += 1
                     else:
-                        await enqueue_unpin_request(
-                            payload=UnpinChainRequest(
+                        await _enqueue_unpin(
+                            UnpinChainRequest(
                                 address=r["main_account_id"],
                                 object_id=str(oid),
                                 object_version=int(r["object_version"]),
-                                # None => fall back to config.delete_backends (the live delete path).
+                                # Provenance only when --backends routes directly; None
+                                # => the generic path falls back to config.delete_backends.
                                 delete_backends=backends or None,
-                            )
+                            ),
+                            backends,
                         )
                         enqueued += 1
                 if r["has_deprecated"]:
@@ -217,12 +235,13 @@ def main() -> None:
         "--backends",
         default="",
         help=(
-            "Comma-separated backends to route the unpins to, overriding config.delete_backends "
-            "(each becomes a `<backend>_unpin_requests` queue). REQUIRED when the blocking rows are "
-            "on a backend that delete_backends omits: on prod delete_backends is ['arion'] but the "
-            "stuck objects' live rows are on ovh, so the default routing enqueues work that is "
-            "already done and the objects stay un-hard-deletable. `ovh_unpin_requests` is consumed "
-            "by the s3-backup `cleanup` worker, which deletes from OVH AND marks chunk_backend."
+            "Comma-separated backends to route the unpins to. Each is enqueued DIRECTLY to its "
+            "`<backend>_unpin_requests` queue, bypassing the config.delete_backends allowlist "
+            "(which would intersect an off-allowlist override away). REQUIRED when the blocking "
+            "rows are on a backend that delete_backends omits: on prod delete_backends is "
+            "['arion'] but the stuck objects' live rows are on ovh, so allowlist routing could "
+            "never reach them. `ovh_unpin_requests` is consumed by the s3-backup `cleanup` "
+            "worker, which deletes from OVH AND marks chunk_backend."
         ),
     )
     ap.add_argument("--max-objects", type=int, default=0, help="Stop after scanning this many objects (0 = all)")
