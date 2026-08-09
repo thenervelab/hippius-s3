@@ -303,3 +303,73 @@ async def test_the_ledger_folds_claims_and_releases_and_never_goes_negative(
                 f"({int(row['bytes'])}) under-reports the whole node and stops an eviction pass early"
             )
             assert int(row["bytes"]) == value, f"part {part}: the fold and the real rows disagree"
+
+
+# Same shape as `_OPERATIONS`, but the axis is the NODE rather than the part: every op lands on one
+# part, which is the configuration promotion actually creates — several nodes holding the same part,
+# each one's copy owned by its own evictor.
+_NODE_OPERATIONS = st.lists(
+    st.tuples(
+        st.sampled_from(["claim", "release", "evict"]),
+        st.sampled_from([NODE, OTHER_NODE]),
+        st.sampled_from([1, 4096, 8192]),
+    ),
+    min_size=1,
+    max_size=12,
+)
+
+_SHARED_PART = 0
+
+
+@given(operations=_NODE_OPERATIONS)
+# The shapes that discriminate, pinned rather than generated: each needs the two nodes to act on the
+# same part in a specific order, which 25 examples over a 3x2x3 space will not reliably produce.
+# The first is the one a release that forgot `node_id` gets wrong; the second is the same for evict.
+@example(operations=[("claim", NODE, 4096), ("claim", OTHER_NODE, 8192), ("release", OTHER_NODE, 8192)])
+@example(operations=[("claim", NODE, 4096), ("claim", OTHER_NODE, 8192), ("evict", OTHER_NODE, 0)])
+@settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+async def test_one_nodes_claims_and_releases_never_move_another_nodes_row(
+    conn: asyncpg.Connection, operations: list[tuple[str, str, int]]
+) -> None:
+    """Per-node ownership, over interleavings rather than the two-claim example above.
+
+    `test_residency_is_per_node_so_a_peer_claim_is_a_separate_row` pins this for CLAIMS, where the
+    `ON CONFLICT` target keeps the rows apart. Nothing pinned it for the other two statements, and
+    both carry `node_id` in a WHERE clause instead — where losing it is a one-token edit that no
+    single-node test can see. Dropping `node_id` from the release's WHERE passes the entire suite.
+
+    The harm is not an arithmetic slip. Promotion is what puts one part on several nodes, and each
+    node's evictor reclaims only what its own row claims. A release that matched every node would
+    let one node's failed promotion decrement a peer's live claim, so the peer would keep the bytes
+    on disk while accounting for fewer of them — under-reporting `node_cache_bytes` for a disk that
+    is genuinely filling, on the node least able to afford it.
+    """
+    object_id = str(uuid.uuid4())
+    recorders = {node: ResidencyRecorder(_SingleConnPool(conn), node) for node in (NODE, OTHER_NODE)}
+    expected: dict[str, tuple[bool, int]] = dict.fromkeys((NODE, OTHER_NODE), (False, 0))
+
+    for kind, node, size in operations:
+        exists, value = expected[node]
+        if kind == "claim":
+            assert await recorders[node](object_id, 1, _SHARED_PART, size) is True
+            expected[node] = (True, (value if exists else 0) + size)
+        elif kind == "release":
+            await recorders[node].release(object_id, 1, _SHARED_PART, size)
+            expected[node] = (exists, max(value - size, 0) if exists else value)
+        else:
+            await _evict(conn, node, object_id, _SHARED_PART)
+            expected[node] = (False, 0)
+
+    for node in (NODE, OTHER_NODE):
+        row = await conn.fetchrow(
+            "SELECT bytes FROM cephor_ssd_residency "
+            "WHERE node_id = $1 AND object_id = $2 AND version = $3 AND part_number = $4",
+            node,
+            object_id,
+            1,
+            _SHARED_PART,
+        )
+        exists, value = expected[node]
+        assert (row is not None) is exists, f"{node}: another node's operation created or removed this row"
+        if row is not None:
+            assert int(row["bytes"]) == value, f"{node}: another node's operation moved this row's bytes"
