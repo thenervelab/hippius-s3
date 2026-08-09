@@ -520,15 +520,15 @@ fn parse_chunk_index(name: &OsStr) -> Option<ChunkIndex> {
 }
 
 /// The chunk indices present in a part dir, sorted ascending. A missing dir is an
-/// empty part (tolerated like the cache-root scan), so `drain_part` then fails at the
-/// meta copy rather than here.
+/// error (`NotFound`), never an empty part: the reland divergence check discriminates
+/// "part gone" (the evict-vs-reland Vanished alarm) from "part with zero chunks"
+/// (digest of the empty set) purely on this contract, and the old lenient mapping is
+/// how an evicted part once digested as empty, read as Diverged, and silenced that
+/// alarm. `drain_part` is unaffected: it previously hit the identical
+/// `SsdRead`/`NotFound` benign deferral one call later, at the meta read.
 async fn list_chunk_indices(dir: &Path) -> io::Result<Vec<ChunkIndex>> {
     let mut out = Vec::new();
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(dir) => dir,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(out),
-        Err(err) => return Err(err),
-    };
+    let mut entries = fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         if !entry.file_type().await?.is_file() {
             continue;
@@ -1219,6 +1219,18 @@ mod part_tests {
             let servable = false;
             async move { Ok(servable) }
         }
+    }
+
+    #[tokio::test]
+    async fn listing_an_absent_part_dir_surfaces_not_found() {
+        // The strict-listing contract the reland Vanished alarm rests on, pinned against the
+        // REAL filesystem: the old lenient `NotFound => empty listing` arm is exactly how an
+        // evicted part once digested as a valid empty set and silenced the alarm. The
+        // core-side fakes are strict, so only this test catches the arm reappearing here.
+        let dir = TempDir::new().unwrap();
+        let ssd = LocalSsd::new(dir.path());
+        let err = ssd.list_chunks(&part_key(5, 1)).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[tokio::test]

@@ -101,9 +101,11 @@ impl Drop for PermitGuard<'_> {
 async fn part_size(ssd: &LocalSsd, part: &PartKey) -> std::io::Result<u64> {
     let indices = ssd.list_chunks(part).await?;
     if indices.is_empty() {
-        // `list_chunks` maps a missing part dir to an empty listing (a scan nicety);
-        // here that would admit a vanished source at zero cost, so re-stat the meta
-        // marker to surface the missing dir as the `NotFound` it is.
+        // `list_chunks` now errs `NotFound` on a missing dir, so an empty listing means a
+        // PRESENT dir with no chunk files (a mid-write shell). The meta re-stat stays as
+        // belt-and-braces: it still refuses to admit an unaccounted source at zero cost if
+        // the strict-listing contract ever regresses, and it distinguishes a ready-but-empty
+        // part (meta present, charge 0) from a shell (meta absent, `NotFound`).
         tokio::fs::metadata(ssd.meta_source(part)?).await?;
         return Ok(0);
     }

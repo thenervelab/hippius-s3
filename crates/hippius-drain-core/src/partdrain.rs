@@ -140,6 +140,13 @@ impl PartVerified {
 /// The node-local SSD ingest cache a part is drained *from*.
 pub trait PartSource: Send + Sync {
     /// The chunk indices present in the part's SSD dir (its `chunk_<i>.bin` files).
+    ///
+    /// # Errors
+    ///
+    /// An absent part dir is `Err(NotFound)`, never an empty chunk set — the reland
+    /// divergence check tells "part gone" (the Vanished alarm) from "part with zero
+    /// chunks" (a well-defined empty digest) on exactly this contract, and a lenient
+    /// implementation silently disables that alarm.
     fn list_chunks(&self, part: &PartKey) -> impl Future<Output = std::io::Result<Vec<ChunkIndex>>> + Send;
 
     /// The on-disk path of one chunk's bytes on SSD.
