@@ -651,7 +651,7 @@ impl SnapshotCell {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{AgentSnapshot, ScanWorker, SnapshotCell};
+    use super::{AgentSnapshot, RelandOutcome, ScanWorker, SnapshotCell};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -797,6 +797,35 @@ mod tests {
         assert_eq!(snap.written_off, 2, "the total counts every write-off, servable or not");
         assert_eq!(snap.written_off_servable, 1, "only the servable write-off pages");
         assert_eq!(snap.error_bps(), 3000, "servable write-offs stay out of the Ceph failure rate");
+    }
+
+    #[test]
+    fn each_reland_outcome_moves_exactly_its_own_counter() {
+        // The four arms feed the B-2 alerting split — `reland_vanished` in particular is the
+        // "possible destruction of acknowledged bytes" alarm. A transposed match arm would
+        // silence that alarm while every behavioural test stayed green, so the mapping is
+        // pinned as a bijection: per outcome, its counter reads 1 and the other three read 0.
+        type Project = fn(&AgentSnapshot) -> [u64; 4];
+        let cases: [(RelandOutcome, Project); 4] = [
+            (RelandOutcome::Unchanged, |s| {
+                [s.reland_unchanged, s.reland_redriven, s.reland_unreadable, s.reland_vanished]
+            }),
+            (RelandOutcome::Redriven, |s| {
+                [s.reland_redriven, s.reland_unchanged, s.reland_unreadable, s.reland_vanished]
+            }),
+            (RelandOutcome::Unreadable, |s| {
+                [s.reland_unreadable, s.reland_unchanged, s.reland_redriven, s.reland_vanished]
+            }),
+            (RelandOutcome::Vanished, |s| {
+                [s.reland_vanished, s.reland_unchanged, s.reland_redriven, s.reland_unreadable]
+            }),
+        ];
+        for (outcome, project) in cases {
+            let cell = SnapshotCell::new();
+            cell.record_reland(outcome);
+            let [own, other_a, other_b, other_c] = project(&cell.load());
+            assert_eq!((own, other_a, other_b, other_c), (1, 0, 0, 0), "outcome {outcome:?}");
+        }
     }
 
     #[test]
