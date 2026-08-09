@@ -1223,16 +1223,19 @@ mod tests {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod part_tests {
-    use super::{LocalFs, LocalSsd, hex_lower, list_chunk_indices};
+    use super::{LocalFs, LocalSsd, hex_lower, is_staged_name, list_chunk_indices, parse_chunk_index};
     use core::future::Future;
     use core::str::FromStr;
     use hippius_drain_core::{
-        ChunkIndex, ClaimedPart, DrainOutcome, FailedGrace, ObjectId, OrphanGrace, PartDrainError, PartKey, PartNumber, PartPool, PartRemover,
-        PartReplicationStore, PartScan, PartSource, PartVerified, ReplicationState, UploadEnqueuer, Version, drain_part,
+        ChunkIndex, ClaimedPart, DrainOutcome, FailedGrace, META_FILE_NAME, ObjectId, OrphanGrace, PartDrainError, PartKey, PartNumber, PartPool,
+        PartRemover, PartReplicationStore, PartScan, PartSource, PartVerified, ReplicationState, UploadEnqueuer, Version, chunk_file_name,
+        drain_part, parse_part_dir,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
+    use std::ffi::OsStr;
     use std::io;
+    use std::path::Path;
     use std::sync::Mutex;
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
@@ -1781,5 +1784,54 @@ mod part_tests {
         std::fs::write(part_dir.join("chunk_1.bin.staged.0123456789abcdef"), b"in flight").unwrap();
 
         assert_eq!(list_chunk_indices(&part_dir).await.unwrap(), vec![ChunkIndex::new(0)]);
+    }
+
+    /// The on-disk layout the api and this agent each derive independently, pinned by one
+    /// fixture BOTH sides assert against: this test covers the agent's derivation and
+    /// `tests/unit/cache/test_part_layout_contract.py` covers the api's
+    /// (`fs_store.part_path` / `_chunk_file` / `_staged_chunk_file`). Same discipline as the
+    /// `UploadChainRequest` golden in `enqueue.rs`.
+    const LAYOUT_GOLDEN: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/part_layout.golden.json"));
+
+    #[test]
+    fn the_part_layout_matches_the_cross_language_golden() {
+        // WHY a golden and not a comment: the api's publish flock and this agent's
+        // `remove_part_dir_exclusive` exclude each other only because both open the SAME part
+        // directory. If either side's path derivation drifted, both locks would keep working
+        // perfectly on two different inodes — the mutual exclusion silently gone, with every
+        // other test still green. This is the test that fails instead.
+        let golden: serde_json::Value = serde_json::from_str(LAYOUT_GOLDEN).unwrap();
+        assert_eq!(golden["meta_file"].as_str().unwrap(), META_FILE_NAME);
+        let cases = golden["cases"].as_array().unwrap();
+        assert!(!cases.is_empty(), "an empty fixture would make this test vacuous");
+
+        for case in cases {
+            let u32_of = |field: &str| u32::try_from(case[field].as_u64().unwrap()).unwrap();
+            let key = PartKey::new(
+                ObjectId::from_str(case["object_id"].as_str().unwrap()).unwrap(),
+                Version::new(u32_of("object_version")),
+                PartNumber::new(u32_of("part_number")),
+            );
+            let relative_dir = case["relative_dir"].as_str().unwrap();
+            assert_eq!(key.relative_dir().to_str().unwrap(), relative_dir);
+            // The reverse direction the reconciler's disk discovery depends on.
+            assert_eq!(parse_part_dir(Path::new(relative_dir)).unwrap(), key);
+
+            let index = ChunkIndex::new(u32_of("chunk_index"));
+            let chunk = case["chunk_file"].as_str().unwrap();
+            assert_eq!(chunk_file_name(index), chunk);
+            assert_eq!(parse_chunk_index(OsStr::new(chunk)), Some(index));
+
+            // The staged name has to be recognised by the sweep and NOT by the chunk parse: the
+            // first is what keeps a live upload's staging on the 24h grace, the second is what
+            // keeps a mid-upload part from looking complete to the drain.
+            let staged = case["staged_file"].as_str().unwrap();
+            assert!(is_staged_name(staged), "the orphan sweep must recognise the api's staged name");
+            assert_eq!(
+                parse_chunk_index(OsStr::new(staged)),
+                None,
+                "a staged chunk must never count toward the completeness gate"
+            );
+        }
     }
 }
