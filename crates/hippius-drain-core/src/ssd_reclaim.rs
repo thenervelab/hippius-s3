@@ -89,17 +89,51 @@ pub struct PartStatusAge {
     pub age: Duration,
 }
 
+/// How long an aged `failed` (aborted/abandoned-upload) part is kept before reclaim — a
+/// diagnosis / abort-settle window. Keyed on the store clock (`updated_at`).
+///
+/// A newtype rather than a bare `Duration` because the grace it is NOT is minutes-scale while
+/// [`OrphanGrace`] is hours-scale, and the two are handed to the same functions. Field labels
+/// alone stopped protecting that once a callee unwrapped them back into positional args.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailedGrace(pub Duration);
+
+impl FailedGrace {
+    /// The window as a plain `Duration`, for comparison against an age.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
+/// How long a no-DB-backing (deleted-object) orphan — or an unpublished upload's staged chunk —
+/// is kept before reclaim. Keyed on the part's FS `meta.json` / file age, so set generously to
+/// absorb the agent-clock dependence and to outlive a slow multi-GB `UploadPart`.
+///
+/// See [`FailedGrace`] for why this is a newtype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanGrace(pub Duration);
+
+impl OrphanGrace {
+    /// The window as a plain `Duration`, for comparison against an age.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
 /// The per-disposition grace windows [`reclaim_ssd`] gates each deletion on. Grouped into a
-/// named struct so the two same-typed `Duration`s are labelled at every call site rather
-/// than passed as adjacent positional args (which are trivial to transpose).
+/// named struct so the two grace windows are labelled at every call site rather than passed as
+/// adjacent positional args (which are trivial to transpose), and typed as [`FailedGrace`] /
+/// [`OrphanGrace`] so a transposition anywhere downstream of the struct fails to COMPILE — the
+/// labels stopped at the struct, and the callee that unwrapped them (the agent's staged-chunk
+/// sweep) could still swap them silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReclaimGraces {
-    /// How long an aged `failed` (aborted/abandoned-upload) part is kept before reclaim — a
-    /// diagnosis / abort-settle window. Keyed on the store clock (`updated_at`).
-    pub failed: Duration,
-    /// How long a no-DB-backing (deleted-object) orphan is kept before reclaim. Keyed on the
-    /// part's FS `meta.json` age, so set generously to absorb the agent-clock dependence.
-    pub orphan: Duration,
+    /// The `failed`-part window; see [`FailedGrace`].
+    pub failed: FailedGrace,
+    /// The deleted-object-orphan window; see [`OrphanGrace`].
+    pub orphan: OrphanGrace,
 }
 
 /// The store seam the reclaim worker needs: read the replication state + age of a
@@ -346,7 +380,7 @@ where
         .filter(|discovered| {
             states
                 .get(&discovered.part)
-                .is_some_and(|status| status.state == ReplicationState::Failed && status.age >= graces.failed)
+                .is_some_and(|status| status.state == ReplicationState::Failed && status.age >= graces.failed.get())
         })
         .map(|discovered| discovered.part.clone())
         .collect();
@@ -365,7 +399,7 @@ where
         // live row is mid-upload or pre-reconcile — never touched (the absolute safety
         // gate; reserve-before-write means an absent row can only be a deleted object).
         let Some(status) = states.get(part) else {
-            if unbacked.contains(part) && discovered.age >= graces.orphan {
+            if unbacked.contains(part) && discovered.age >= graces.orphan.get() {
                 remover.unlink_part(part).await.map_err(ReclaimError::Remove)?;
                 report.reclaimed_orphan += 1;
             } else {
@@ -395,7 +429,7 @@ where
             // servable, in which case `failed` means "corrupt pool copy on a live object"
             // and this SSD part is the last good source (skipped_corrupt; never deleted).
             ReplicationState::Failed => {
-                if status.age < graces.failed {
+                if status.age < graces.failed.get() {
                     report.skipped_young += 1;
                 } else if servable.contains(part) {
                     report.skipped_corrupt += 1;
@@ -506,7 +540,9 @@ where
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{BackingLog, PartRemover, PartStatusAge, ReclaimError, ReclaimGraces, ReclaimLog, ReclaimReport, reclaim_ssd};
+    use super::{
+        BackingLog, FailedGrace, OrphanGrace, PartRemover, PartStatusAge, ReclaimError, ReclaimGraces, ReclaimLog, ReclaimReport, reclaim_ssd,
+    };
     use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
     use crate::reconcile::{DiscoveredPart, PartScan};
     use crate::state::ReplicationState;
@@ -724,8 +760,8 @@ mod tests {
     const ORPHAN_GRACE: Duration = Duration::from_mins(45);
     // The default graces most tests pass; the boundary/proptest cases build their own.
     const GRACES: ReclaimGraces = ReclaimGraces {
-        failed: GRACE,
-        orphan: ORPHAN_GRACE,
+        failed: FailedGrace(GRACE),
+        orphan: OrphanGrace(ORPHAN_GRACE),
     };
 
     #[tokio::test]
@@ -1269,7 +1305,7 @@ mod tests {
                 let refs: Vec<&PartKey> = unbacked_refs.iter().collect();
                 let backing = FakeBacking::unbacked(&refs);
 
-                let graces = ReclaimGraces { failed: GRACE, orphan: orphan_grace };
+                let graces = ReclaimGraces { failed: FailedGrace(GRACE), orphan: OrphanGrace(orphan_grace) };
                 let report = reclaim_ssd(&scan, &remover, &log, &backing, graces).await.unwrap();
                 expected_removed.sort();
                 proptest::prop_assert_eq!(remover.removed(), expected_removed.clone());

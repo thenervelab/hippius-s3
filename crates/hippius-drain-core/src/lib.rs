@@ -45,7 +45,8 @@ pub use reconcile::{DiscoveredPart, PartLandingLog, PartScan, PartStatus, Reconc
 pub use snapshot::{AgentSnapshot, ScanWorker, SnapshotCell};
 pub use ssd_evict::{EvictionError, EvictionPass, EvictionReport, EvictionTarget, FreeSpaceProbe, ResidentLog, ResidentPart, evict_to_target};
 pub use ssd_reclaim::{
-    FailedReclaimReport, PartRemover, PartStatusAge, ReclaimError, ReclaimGraces, ReclaimLog, ReclaimReport, reclaim_failed, reclaim_ssd,
+    FailedGrace, FailedReclaimReport, OrphanGrace, PartRemover, PartStatusAge, ReclaimError, ReclaimGraces, ReclaimLog, ReclaimReport,
+    reclaim_failed, reclaim_ssd,
 };
 pub use state::{CephCeiling, PressureZone, ReplicationState};
 pub use units::{ByteRate, Bytes, DiskPressure};

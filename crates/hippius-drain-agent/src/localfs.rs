@@ -14,8 +14,8 @@
 
 use core::future::Future;
 use hippius_drain_core::{
-    CephFs, ChunkIndex, DiscoveredPart, FileId, FreeSpaceProbe, META_FILE_NAME, PartKey, PartMeta, PartPool, PartRemover, PartScan, PartSource,
-    SsdCache, chunk_file_name, parse_part_dir,
+    CephFs, ChunkIndex, DiscoveredPart, FailedGrace, FileId, FreeSpaceProbe, META_FILE_NAME, OrphanGrace, PartKey, PartMeta, PartPool, PartRemover,
+    PartScan, PartSource, SsdCache, chunk_file_name, parse_part_dir,
 };
 use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
@@ -209,15 +209,17 @@ impl LocalSsd {
 
     /// Removes orphaned write-temp files left on the SSD by a crashed mid-write PUT
     /// (the api's `<name>.tmp.<uuid>`) or a cancelled persist (the agent's
-    /// `.tmp-<name>`), once older than `max_age`; and the api's staged chunks
-    /// (`chunk_<i>.bin.staged.<attempt>`) once older than `staged_max_age`.
+    /// `.tmp-<name>`), once older than `temps`; and the api's staged chunks
+    /// (`chunk_<i>.bin.staged.<attempt>`) once older than `staged`.
     ///
     /// The two graces differ because the files differ. A write-temp exists for
     /// milliseconds, so anything older is a crash orphan. A staged chunk is deliberately
     /// held for the WHOLE of one `UploadPart` — that is what stops a duplicate attempt
     /// overwriting an already-acknowledged part — so it is legitimately as old as the
     /// upload, and a multi-GB part on a slow link outlives the write-temp grace many times
-    /// over. Reaping it on the write-temp grace would delete a live upload's data.
+    /// over. Reaping it on the write-temp grace would delete a live upload's data — which
+    /// is why the two are separate TYPES: they were adjacent `Duration`s, and transposing
+    /// them was a silent one-word edit that no test could see.
     ///
     /// Walks the `<object>/v<version>/part_<n>/` layout and only ever unlinks a temp or
     /// staged FILE — never a real `chunk_*.bin`/`meta.json`, never a directory — so it
@@ -229,7 +231,7 @@ impl LocalSsd {
     ///
     /// [`io::Error`] if walking the cache or unlinking a temp fails for a reason other
     /// than a concurrently-removed entry (which is tolerated).
-    pub async fn sweep_orphan_tmp(&self, max_age: Duration, staged_max_age: Duration) -> io::Result<u64> {
+    pub async fn sweep_orphan_tmp(&self, temps: FailedGrace, staged: OrphanGrace) -> io::Result<u64> {
         let mut removed = 0;
         let Some(mut objects) = open_dir(&self.root).await? else {
             return Ok(0);
@@ -252,7 +254,7 @@ impl LocalSsd {
                     if !part.file_type().await?.is_dir() {
                         continue;
                     }
-                    removed += sweep_part_tmp(&part.path(), max_age, staged_max_age).await?;
+                    removed += sweep_part_tmp(&part.path(), temps, staged).await?;
                 }
             }
         }
@@ -560,7 +562,7 @@ async fn rmdir_if_stale_and_empty(dir: &Path, max_age: Duration) -> io::Result<b
     }
 }
 
-async fn sweep_part_tmp(part_path: &Path, max_age: Duration, staged_max_age: Duration) -> io::Result<u64> {
+async fn sweep_part_tmp(part_path: &Path, temps: FailedGrace, staged: OrphanGrace) -> io::Result<u64> {
     let mut removed = 0;
     let Some(mut entries) = open_dir(part_path).await? else {
         return Ok(0);
@@ -570,10 +572,12 @@ async fn sweep_part_tmp(part_path: &Path, max_age: Duration, staged_max_age: Dur
         let Some(name) = raw.to_str() else {
             continue;
         };
+        // Temp FIRST: a name that somehow matched both shapes is a write temp, which is the
+        // conservative read (the shorter grace is the one that cannot strand disk).
         let grace = if is_temp_name(name) {
-            max_age
+            temps.get()
         } else if is_staged_name(name) {
-            staged_max_age
+            staged.get()
         } else {
             continue;
         };
@@ -838,7 +842,7 @@ mod tests {
     use super::{LocalSsd, TEMP_NONCE, TmpGuard, hex_lower, is_temp_name, part_dir, remove_part_dir, safe_component, temp_name};
     use core::str::FromStr;
     use core::time::Duration;
-    use hippius_drain_core::{FileId, ObjectId, PartKey, PartNumber, SsdCache, Version};
+    use hippius_drain_core::{FailedGrace, FileId, ObjectId, OrphanGrace, PartKey, PartNumber, SsdCache, Version};
     use proptest::prelude::*;
     use std::io;
     use std::path::Path;
@@ -987,7 +991,12 @@ mod tests {
         let object_dir = part_path.parent().unwrap().parent().unwrap().to_path_buf();
         let ssd = LocalSsd::new(root.path().to_path_buf());
 
-        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO, Duration::ZERO).await.unwrap(), 2);
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::ZERO))
+                .await
+                .unwrap(),
+            2
+        );
         assert_eq!(
             ssd.sweep_empty_shells(Duration::ZERO).await.unwrap(),
             3,
@@ -1010,7 +1019,12 @@ mod tests {
         std::fs::write(part_path.join("chunk_0.bin.staged.0123456789abcdef"), b"in flight").unwrap();
         let ssd = LocalSsd::new(root.path().to_path_buf());
 
-        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO, Duration::from_hours(24)).await.unwrap(), 0);
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(ssd.sweep_empty_shells(Duration::ZERO).await.unwrap(), 0);
 
         assert!(part_path.join("chunk_0.bin.staged.0123456789abcdef").exists());
@@ -1213,8 +1227,8 @@ mod part_tests {
     use core::future::Future;
     use core::str::FromStr;
     use hippius_drain_core::{
-        ChunkIndex, ClaimedPart, DrainOutcome, ObjectId, PartDrainError, PartKey, PartNumber, PartPool, PartRemover, PartReplicationStore, PartScan,
-        PartSource, PartVerified, ReplicationState, UploadEnqueuer, Version, drain_part,
+        ChunkIndex, ClaimedPart, DrainOutcome, FailedGrace, ObjectId, OrphanGrace, PartDrainError, PartKey, PartNumber, PartPool, PartRemover,
+        PartReplicationStore, PartScan, PartSource, PartVerified, ReplicationState, UploadEnqueuer, Version, drain_part,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -1638,12 +1652,19 @@ mod part_tests {
         let ssd = LocalSsd::new(dir.path());
 
         // A long window keeps the just-written temps (younger than max_age).
-        assert_eq!(ssd.sweep_orphan_tmp(Duration::from_hours(1), Duration::from_hours(24)).await.unwrap(), 0);
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::from_hours(1)), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
+            0
+        );
         assert!(api_tmp.exists() && agent_tmp.exists(), "fresh temps within the window are kept");
 
         // A zero window ages every temp, so both flavors are removed; real files stay.
         assert_eq!(
-            ssd.sweep_orphan_tmp(Duration::ZERO, Duration::from_hours(24)).await.unwrap(),
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
             2,
             "both temp flavors removed"
         );
@@ -1655,7 +1676,12 @@ mod part_tests {
     #[tokio::test]
     async fn sweep_orphan_tmp_of_a_missing_root_is_zero() {
         let ssd = LocalSsd::new("/no/such/cephor/cache/dir");
-        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO, Duration::from_hours(24)).await.unwrap(), 0);
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1672,7 +1698,9 @@ mod part_tests {
 
         let ssd = LocalSsd::new(dir.path());
         assert_eq!(
-            ssd.sweep_orphan_tmp(Duration::ZERO, Duration::from_hours(24)).await.unwrap(),
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
             1,
             "the temp in a no-meta dir is swept"
         );
@@ -1697,7 +1725,9 @@ mod part_tests {
 
         let ssd = LocalSsd::new(root);
         assert_eq!(
-            ssd.sweep_orphan_tmp(Duration::ZERO, Duration::from_hours(24)).await.unwrap(),
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
             1,
             "non-dir junk is skipped and the real temp is swept",
         );
@@ -1720,12 +1750,22 @@ mod part_tests {
         let ssd = LocalSsd::new(dir.path());
 
         // Write temps aged out; the staged chunk is inside its own window and survives.
-        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO, Duration::from_hours(24)).await.unwrap(), 1);
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
+            1
+        );
         assert!(staged.exists(), "a staged chunk outlives the write-temp grace");
         assert!(!write_tmp.exists());
 
         // Past its own grace it is a crash orphan (the api never published) and goes.
-        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO, Duration::ZERO).await.unwrap(), 1);
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::ZERO))
+                .await
+                .unwrap(),
+            1
+        );
         assert!(!staged.exists(), "an aged staged chunk is reclaimed");
     }
 
