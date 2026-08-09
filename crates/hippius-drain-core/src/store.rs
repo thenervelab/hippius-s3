@@ -354,6 +354,15 @@ impl Store {
         // outlive its part. Retention keeps parts resident on a free-space policy instead, which
         // on an uncontended node is indefinite — comfortably past the 7-day default.
         //
+        // The guard covers `failed` rows too, and that is release-based, not a permanent block:
+        // `mark_failed_reclaimed` deletes the part's residency rows (all nodes) in the same
+        // statement that stamps `reclaimed_at`, so a reclaimed `failed` row GCs on schedule and
+        // the 0018-era backlog cannot regrow. A `failed` row that KEEPS residency is the
+        // held-servable case — a corrupt-live object whose SSD copy is the last good source, so
+        // the reclaimer refuses the unlink — and sparing it is the same durability argument as
+        // the `replicated` branch: the row is the record that those bytes are on a disk. That
+        // population is bounded by corruption incidents, not by the reclaim rate.
+        //
         // `cephor_ssd_residency_part_idx (object_id, version, part_number)` already serves this
         // lookup; migration 0016 added it for exactly this key shape and 0017 deliberately kept
         // it. No new index, no migration.
@@ -1325,14 +1334,18 @@ impl Store {
     /// Drops this node's residency rows for `parts` — the counterpart to
     /// [`record_resident`](Self::record_resident), called by the evictor after it unlinks.
     ///
-    /// The reclaim worker deliberately does NOT call this, because the parts it removes never
-    /// had a residency row: residency is recorded only at the drain's commit, and everything
-    /// the reclaimer removes is either terminal (`failed`) or has no replication row at all
-    /// (a deleted-object orphan). The one loose end is a part that was resident and then had
-    /// its object hard-deleted: its replication row goes, the reclaimer frees the disk space,
-    /// and the residency row is left behind — but both `evictable_parts` and `node_cache_bytes`
-    /// INNER JOIN the replication row, so it is invisible to each and drifts no signal. It is a
-    /// dead row bounded by the hard-delete rate, not a leak of disk or of accounting.
+    /// The failed-reclaim path does not call this: [`mark_failed_reclaimed`] deletes the part's
+    /// residency rows itself, part-keyed across ALL nodes, because a terminal `failed` part's
+    /// rows can never be read again and any survivor would block `gc_terminal_status_rows`'
+    /// residency guard forever. The delete HERE stays node-scoped because the evictor's premise
+    /// is the opposite: the part is live read tier (`replicated`), and a peer's promoted copy of
+    /// it is exactly what must survive this node's eviction. The remaining loose end is the
+    /// deleted-object orphan the walk reclaims — no replication row, so its leftover residency
+    /// row blocks no GC and drifts no signal (both `evictable_parts` and `node_cache_bytes`
+    /// INNER JOIN the replication row). A dead row bounded by the hard-delete rate, not a leak
+    /// of disk or of accounting.
+    ///
+    /// [`mark_failed_reclaimed`]: crate::ssd_reclaim::ReclaimLog::mark_failed_reclaimed
     ///
     /// # Errors
     ///
@@ -1393,11 +1406,37 @@ impl ReclaimLog for Store {
         // Batched: a per-part UPDATE would put a round-trip in the reclaim inner loop. Node
         // scoped like every other write here — a peer's row names a file this agent never
         // touched, so marking it would claim work it did not do.
+        //
+        // The residency DELETE rides the same statement because a marked-but-still-resident
+        // failed row is a permanent wedge: `gc_terminal_status_rows`' residency guard is
+        // part-keyed, the mark took the row off the only worklist that would retry, and
+        // `failed` is terminal — nothing would ever clear the block. Atomicity (one statement)
+        // is what rules that state out; a crash before it re-offers the part instead
+        // (`reclaimed_at` still NULL), where the idempotent unlink makes the retry safe.
+        //
+        // The delete spans ALL nodes' rows for the part, on purpose. A read-through promotion
+        // records the PROMOTING node's residency, not the ingest node's that this reclaim runs
+        // on, so a node-scoped delete would leave that row as the same permanent GC block. It
+        // is safe because reclaim only reaches here for parts adjudicated NOT servable: both
+        // residency readers (`evictable_parts`, `node_cache_bytes`) require
+        // `status = 'replicated'`, which a terminal `failed` row never regains, and an
+        // unservable version serves no GET, so promotion cannot write the row back. The
+        // promoted bytes themselves stay the peer walk's `failed`/orphan disposition, as
+        // before. Scoping through `marked` keeps the node fence: a peer's un-marked row keeps
+        // its residency rows.
         sqlx::query(
-            "UPDATE cephor_replication_status SET reclaimed_at = now() \
-             WHERE node_id = $1 \
-               AND (object_id, version, part_number) IN \
-                   (SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]))",
+            "WITH marked AS ( \
+                 UPDATE cephor_replication_status SET reclaimed_at = now() \
+                 WHERE node_id = $1 \
+                   AND (object_id, version, part_number) IN \
+                       (SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[])) \
+                 RETURNING object_id, version, part_number \
+             ) \
+             DELETE FROM cephor_ssd_residency r \
+             USING marked m \
+             WHERE r.object_id = m.object_id \
+               AND r.version = m.version \
+               AND r.part_number = m.part_number",
         )
         .bind(node)
         .bind(&object_ids)
@@ -1837,6 +1876,63 @@ mod part_tests {
             ingesting.status(&promoted).await.unwrap().is_some(),
             "a promoted copy on another node was orphaned"
         );
+    }
+
+    /// The `failed` branch of the residency guard is release-based: the reclaim's mark deletes
+    /// every node's residency rows for the part, so the guard holds only while the bytes do.
+    /// Without that release a redrive-then-fail part would wedge its row behind the guard
+    /// forever, regrowing the unbounded failed-row backlog migration 0018 cleaned up.
+    #[sqlx::test]
+    async fn a_reclaimed_failed_part_releases_its_residency_and_then_gcs(pool: PgPool) {
+        let ingesting = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let promoting = Store::from_pool(pool.clone()).with_node_id("node-b");
+        let p = part(UUID_A, 8, 1);
+
+        // Drain commit: pending -> draining -> replicated, resident on the ingest node — plus a
+        // read-through promoted copy on node-b, the row a node-scoped release would strand.
+        ingesting.record_landed_part(&p).await.unwrap();
+        let claim = ingesting.claim_part().await.unwrap().expect("the landed part is claimable");
+        ingesting.record_resident(&p, 4096).await.unwrap();
+        ingesting.mark_replicated(&claim, &PartVerified::for_test()).await.unwrap();
+        promoting.record_resident(&p, 4096).await.unwrap();
+
+        // R4 flags the pool copy corrupt; the redrive returns the part to `pending` leaving
+        // residency untouched (the SSD copy really is still there), and the retry terminally
+        // fails — the exact lifecycle that used to strand residency against a `failed` row.
+        sqlx::query("UPDATE cephor_replication_status SET status = 'corrupt' WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ingesting.redrive_corrupt_parts(3).await.unwrap(), 1);
+        let retry = ingesting.claim_part().await.unwrap().expect("the re-driven part is claimable");
+        ingesting.mark_failed(&retry, "retry exhausted").await.unwrap();
+        force_terminal(&pool, &p, "failed").await; // backdated 2h: past grace AND retention
+
+        assert_eq!(
+            ingesting.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap(),
+            0,
+            "while the residency rows stand, the aged failed row is spared"
+        );
+
+        // The reclaim: the worklist offers the part (reclaim_failed unlinks it) and the mark
+        // stamps the cursor + releases residency in one statement.
+        let candidates = ingesting.reclaimable_failed_parts_impl(Duration::from_mins(1), 10).await.unwrap();
+        assert_eq!(candidates, vec![p.clone()], "the aged failed part is offered for reclaim");
+        <Store as ReclaimLog>::mark_failed_reclaimed(&ingesting, &candidates).await.unwrap();
+
+        let (residency,): (i64,) = sqlx::query_as("SELECT count(*) FROM cephor_ssd_residency")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(residency, 0, "the mark released BOTH nodes' residency rows");
+
+        assert_eq!(
+            ingesting.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap(),
+            1,
+            "the reclaimed failed row now prunes after retention"
+        );
+        assert_eq!(ingesting.status(&p).await.unwrap(), None, "the failed row is gone");
     }
 
     async fn force_terminal(pool: &PgPool, part: &PartKey, status: &str) {
@@ -3429,8 +3525,15 @@ mod failed_worklist_tests {
     async fn marking_is_node_scoped(pool: PgPool) {
         // A peer's row names a file this agent never touched, so marking it would claim work it
         // did not do — and take the part off the worklist of the node that actually holds it.
+        // The residency release rides the mark, so it must observe the same fence: an un-marked
+        // peer row keeps its residency claims for the peer's own reclaim to release.
         let store = Store::from_pool(pool.clone()).with_node_id("node-a");
         seed(&pool, 1, "failed", "node-b", 7200.0).await;
+        sqlx::query("INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number, bytes) VALUES ('node-b', $1, 1, 1, 100)")
+            .bind(UUID_A)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         <Store as ReclaimLog>::mark_failed_reclaimed(&store, &[part(1)]).await.unwrap();
 
@@ -3439,6 +3542,11 @@ mod failed_worklist_tests {
             .await
             .unwrap();
         assert_eq!(marked, 0, "another node's row was marked");
+        let (resident,): (i64,) = sqlx::query_as("SELECT count(*) FROM cephor_ssd_residency")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(resident, 1, "an un-marked peer row lost its residency claim");
     }
     #[sqlx::test]
     async fn an_agent_with_no_node_id_reclaims_nothing(pool: PgPool) {
