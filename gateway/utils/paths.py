@@ -83,11 +83,13 @@ def forwarded_path(path: str) -> str:
       containing `.`.
     - **`.`/`..` collapse** — see `collapse_dot_segments`.
 
-    NOT modelled, because it cannot be fixed here: httpx forwards percent-escapes in that string
-    untouched and the api decodes them a *second* time, so `/%69nternal/parts/1` is put on the wire
-    verbatim and read by the api as `/internal/parts/1`. Decoding again here would decode object
-    keys twice as well, silently widening which keys `input_validation` accepts. `%` needs
-    rejecting in the first segment instead — see `test_percent_escapes_are_a_known_parity_gap`.
+    NOT modelled, deliberately: httpx forwards percent-escapes in that string untouched and the api
+    decodes them a *second* time, so `/%69nternal/parts/1` goes on the wire verbatim and is read by
+    the api as `/internal/parts/1`. Decoding again here would decode object keys twice as well,
+    turning a key sent as `a%252Fb` — rejected today for containing `%` — into the accepted key
+    `a/b`. `input_validation` therefore refuses `%` in the first segment outright, and
+    `test_percent_escapes_diverge_which_is_why_they_are_refused_instead` pins the divergence so
+    that closing it forces a look at that rule.
     """
     # Whichever delimiter comes first ends the target; everything after it, dot segments included,
     # is never forwarded. httpx sends "/" rather than an empty target.

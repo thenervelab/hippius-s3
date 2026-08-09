@@ -117,6 +117,28 @@ async def input_validation_middleware(
             status_code=400,
         )
 
+    # The api decodes the forwarded target a SECOND time, so an escape that survives the gateway's
+    # single decode disappears at the api: a client's `/%2569nternal/parts/1` is judged here as
+    # first segment `%69nternal` (not `internal`, so the denylist above passes it), httpx puts
+    # `%69nternal` on the wire untouched, and the api's uvicorn unquotes it to `internal` — this
+    # time reaching the peer-serve route, not just the S3 catch-all. `int%65rnal` does it from the
+    # middle, so no prefix or spelling check closes this; only refusing `%` outright does.
+    #
+    # Refusing it costs nothing legitimate. A bucket name is `[a-z0-9.-]` or an SS58 address, and
+    # no gateway route contains a `%` — a first segment with one could not have been created
+    # through BUCKET_NAME_PATTERN below. `%` stays allowed in an object key exactly as before
+    # (OBJECT_KEY_AVOID_CHARS rejects it there, on the key view).
+    #
+    # Modelling the double-decode inside `forwarded_path` was the alternative and is worse: it
+    # would decode object keys twice too, turning a key sent as `a%252Fb` — rejected today for
+    # containing `%` — into the accepted key `a/b`.
+    if "%" in path_parts[0]:
+        return s3_error_response(
+            code="InvalidBucketName",
+            message="Bucket name cannot contain '%'",
+            status_code=400,
+        )
+
     # Skip validation for non-S3 endpoints
     if path_parts[0] in SKIP_PREFIXES:
         return await call_next(request)

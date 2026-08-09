@@ -130,6 +130,85 @@ async def test_a_fragment_or_query_delimiter_cannot_hide_internal(method: str, d
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["GET", "HEAD", "PUT", "POST", "DELETE"])
+@pytest.mark.parametrize(
+    ("decoded", "raw"),
+    [
+        # The gateway decodes once, httpx forwards the escape verbatim, the api decodes again.
+        ("/%69nternal/parts/1", b"/%2569nternal/parts/1"),
+        # The escape can sit anywhere in the segment, so this is not a prefix problem.
+        ("/int%65rnal/parts/1", b"/int%2565rnal/parts/1"),
+        ("/interna%6C", b"/interna%256C"),
+    ],
+)
+async def test_a_doubly_encoded_first_segment_cannot_hide_internal(method: str, decoded: str, raw: bytes) -> None:
+    """The escape survives the gateway's view and vanishes at the api.
+
+    Unlike the `#`/`?` truncation above, which can only shorten a path, this one reconstructs the
+    full target: the api routes `/internal/parts/1` to the peer-serve endpoint. It is caught by
+    refusing `%` in the first segment rather than by decoding twice here — decoding twice would
+    also decode object keys twice and widen what the key check accepts.
+    """
+    response, forwarded = await _run(method, decoded, raw_path=raw)
+
+    assert response.status_code == 400
+    assert forwarded == [], "the api decodes the escape again, so it would receive `/internal/...`"
+
+
+@pytest.mark.asyncio
+async def test_percent_is_refused_in_the_first_segment_whatever_it_spells() -> None:
+    """The rejection is the class of bug, not a list of spellings.
+
+    `%69nternal`, `int%65rnal`, `%2569nternal`... enumerating them is the blocklist mistake that
+    put `internal` in a denylist in the first place. No legitimate first segment contains `%`: a
+    bucket name is `[a-z0-9.-]` or an SS58 address, and no gateway route has one.
+    """
+    response, forwarded = await _run("GET", "/my%bucket/key.txt", raw_path=b"/my%25bucket/key.txt")
+
+    assert response.status_code == 400
+    assert b"InvalidBucketName" in response.body
+    assert forwarded == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decoded", "raw"),
+    [
+        # `%` in the KEY keeps its existing treatment — the key check owns that, not the new
+        # first-segment rule, and it must still fire.
+        ("/bucket/100%.txt", b"/bucket/100%25.txt"),
+        # A percent-escape that decodes to something harmless is still refused in segment 0,
+        # while the same bytes in a key are unaffected by this rule.
+        ("/%62ucket/key.txt", b"/%2562ucket/key.txt"),
+    ],
+)
+async def test_percent_anywhere_in_a_path_is_still_refused(decoded: str, raw: bytes) -> None:
+    response, forwarded = await _run("GET", decoded, raw_path=raw)
+
+    assert response.status_code == 400
+    assert forwarded == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decoded", "raw"),
+    [
+        ("/bucket/with space.txt", b"/bucket/with%20space.txt"),
+        ("/bucket/unicode-éè.txt", b"/bucket/unicode-%C3%A9%C3%A8.txt"),
+        ("/internal-backups/some/key.txt", b"/internal-backups/some/key.txt"),
+        ("/health", b"/health"),
+    ],
+)
+async def test_ordinary_percent_encoded_requests_still_forward(decoded: str, raw: bytes) -> None:
+    """The new rule must not touch normal traffic: escapes that decode to ordinary characters
+    leave no `%` behind, so the first segment never sees one."""
+    response, forwarded = await _run("GET", decoded, raw_path=raw)
+
+    assert response.status_code == 200
+    assert len(forwarded) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_fragment_in_a_key_is_still_judged_as_a_key_not_as_a_reserved_bucket() -> None:
     """Truncating for the routing view must not cost the key view its `#`.
 

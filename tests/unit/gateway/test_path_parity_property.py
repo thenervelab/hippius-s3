@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from urllib.parse import quote
+from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -45,6 +47,17 @@ SEGMENTS = st.sampled_from(
 
 PATHS = st.lists(SEGMENTS, min_size=0, max_size=6).map(lambda parts: "/" + "/".join(parts))
 
+# The escapes that survive the gateway's single decode and are read again by the api: spellings of
+# `internal` and of `..`, plus a bare `%`. These belong only to the security property below, whose
+# oracle is httpx rather than `forwarded_path`.
+ESCAPED_SEGMENTS = st.sampled_from(
+    ["%69nternal", "int%65rnal", "interna%6C", "%2e%2e", "%2E%2E", "%2e", "%", "%25", "%23internal"]
+)
+
+ESCAPED_PATHS = st.lists(st.one_of(SEGMENTS, ESCAPED_SEGMENTS), min_size=0, max_size=5).map(
+    lambda parts: "/" + "/".join(parts)
+)
+
 
 @settings(max_examples=200, deadline=None)
 @given(path=PATHS)
@@ -53,6 +66,12 @@ def test_forwarded_path_matches_httpx_for_generated_paths(path: str) -> None:
 
 
 def _run_middleware(path: str) -> tuple[Response, list[Request]]:
+    """Drive the middleware over the scope uvicorn would build for a client sending `path` encoded.
+
+    `path` is the DECODED scope path, so `raw_path` is it re-quoted: `quote` escapes `%`, `#` and
+    `?`, which is exactly what a client must send for those characters to survive as literals, and
+    `decoded_path` unquotes it back to `path`.
+    """
     forwarded: list[Request] = []
 
     async def call_next(request: Request) -> Response:
@@ -63,10 +82,7 @@ def _run_middleware(path: str) -> tuple[Response, list[Request]]:
         "type": "http",
         "method": "GET",
         "path": path,
-        # No `%` in the generated pool, so unquoting this is the identity and `decoded_path`
-        # returns exactly `path` — the same scope uvicorn would build for these characters sent
-        # percent-encoded.
-        "raw_path": path.encode(),
+        "raw_path": quote(path, safe="/").encode(),
         "root_path": "",
         "headers": [],
         "query_string": b"",
@@ -75,18 +91,29 @@ def _run_middleware(path: str) -> tuple[Response, list[Request]]:
     return response, forwarded
 
 
-# The generated paths deliberately include `#`/`?`, and constructing a Request is cheap but not
-# free; function-scoped fixtures are what the health check guards against and none are used here.
+def _api_first_segment(path: str) -> str:
+    """The first segment the api will route on, derived WITHOUT the code under test.
+
+    httpx decides the request target and the api's uvicorn unquotes it, so `httpx.URL(...).path`
+    put through one more unquote is the api's own `scope["path"]`. Using this rather than
+    `forwarded_path` as the precondition is what keeps the property honest: a bug in
+    `forwarded_path` cannot make the precondition stop holding and quietly excuse the middleware.
+    """
+    return unquote(httpx.URL(f"http://api{path}").path).strip("/").split("/")[0]
+
+
+# Constructing a Request is cheap but not free; the health check being suppressed is about
+# function-scoped fixtures, of which this uses none.
 @settings(max_examples=200, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
-@given(path=PATHS)
+@given(path=ESCAPED_PATHS)
 def test_no_generated_path_reaches_the_api_as_internal(path: str) -> None:
     """The guarantee, not the mechanism: if the api would route it to `internal`, we rejected it.
 
-    Parity is only how this is achieved. Stating the security claim directly means a future change
-    that stops using `forwarded_path` in the middleware — or adds a third rewrite httpx performs —
-    fails here even if the parity property is still satisfied.
+    Parity is only one way this is achieved — dot segments and `#`/`?` are modelled in
+    `forwarded_path`, while the percent double-decode is refused outright instead. Stating the claim
+    over the api's own view covers both, and covers a third rewrite nobody has thought of yet.
     """
-    if forwarded_path(path).strip("/").split("/")[0] != "internal":
+    if _api_first_segment(path) != "internal":
         return
 
     response, forwarded = _run_middleware(path)
@@ -95,14 +122,36 @@ def test_no_generated_path_reaches_the_api_as_internal(path: str) -> None:
     assert forwarded == []
 
 
-@pytest.mark.parametrize("path", ["/internal#x/parts/1", "/anybucket/../internal/parts/1"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/internal#x/parts/1",
+        "/internal?x/parts/1",
+        "/anybucket/../internal/parts/1",
+        "/%69nternal/parts/1",
+        "/int%65rnal/parts/1",
+    ],
+)
 def test_the_property_above_is_not_vacuous(path: str) -> None:
-    """Both bypass shapes really are in the generated space, and really are rejected.
+    """Every bypass shape in the generated space really does trip the precondition.
 
-    A property whose precondition never holds passes trivially. These are the two shapes the
-    generator can produce that must trip it.
+    A property whose precondition never holds passes trivially, and this one is a live risk: the
+    precondition went silently vacuous for the `#` shapes when `forwarded_path` was the oracle and
+    had no truncation. One entry per rewrite the api performs.
     """
-    assert forwarded_path(path).strip("/").split("/")[0] == "internal"
+    assert _api_first_segment(path) == "internal"
     response, forwarded = _run_middleware(path)
     assert response.status_code == 400
     assert forwarded == []
+
+
+@pytest.mark.parametrize("path", ["/%2e%2e/internal/parts/1", "/%2E%2E/internal/parts/1"])
+def test_encoded_dot_segments_do_not_reach_internal_at_all(path: str) -> None:
+    """A near-miss that looks like a bypass and is not — worth pinning so nobody "fixes" it.
+
+    httpx removes dot segments from the still-ENCODED path, so `%2e%2e` is not a dot segment to it
+    and survives; the api then decodes it to a literal `..` and never collapses (neither uvicorn nor
+    Starlette does). So the api routes on `/../internal/parts/1`, which matches no internal route.
+    The traversal only works with LITERAL dots, which `forwarded_path` collapses.
+    """
+    assert _api_first_segment(path) == ".."
