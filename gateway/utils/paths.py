@@ -32,3 +32,34 @@ def decoded_path(request: Request) -> str:
 def first_path_segment(request: Request) -> str:
     """The first path segment, decoded. `""` for `/`."""
     return decoded_path(request).strip("/").split("/", 1)[0]
+
+
+def collapse_dot_segments(path: str) -> str:
+    """The path exactly as the api will receive it: `.` and `..` segments collapsed.
+
+    The api never sees the path a client sent. `ForwardService` hands `scope["path"]` to httpx,
+    and httpx removes dot segments (RFC 3986 §5.2.4) before the request leaves the gateway — so
+    `/anybucket/../internal/parts/...` arrives at the api as `/internal/parts/...`. A security
+    check keyed off "the first path segment" of the UNcollapsed path therefore judges a different
+    request than the one it lets through. Any such check must run on this function's output.
+
+    Deliberately a segment-for-segment mirror of `httpx._urlparse.normalize_path` (0.28.x) rather
+    than `posixpath.normpath`, whose extra rewrites (`//` collapse, trailing-slash drops) would
+    make this diverge from what the forwarder actually sends;
+    `test_collapse_matches_what_httpx_forwards` pins the parity against the installed httpx.
+    """
+    if "." not in path:
+        return path
+    output: list[str] = []
+    for segment in path.split("/"):
+        if segment == ".":
+            continue
+        if segment == "..":
+            # `output != [""]` keeps the leading slash: "/.." must collapse to "/", not "".
+            if output and output != [""]:
+                output.pop()
+            continue
+        output.append(segment)
+    # httpx never sends an empty request target: a path that collapses to nothing ("/..",
+    # "/a/..") goes out as "/", so it must be judged as "/" here too.
+    return "/".join(output) or "/"

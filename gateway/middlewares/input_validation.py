@@ -15,6 +15,7 @@ from substrateinterface.utils.ss58 import is_valid_ss58_address
 
 from gateway.config import get_config
 from gateway.utils.errors import s3_error_response
+from gateway.utils.paths import collapse_dot_segments
 from gateway.utils.paths import decoded_path
 from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
 
@@ -67,7 +68,13 @@ async def input_validation_middleware(
 ) -> Response:
     """Validate S3 inputs for security and AWS compatibility."""
 
-    path_parts = _decoded_path(request).strip("/").split("/")
+    # Validate the path the api will SEE, not the one the client sent. httpx collapses dot
+    # segments when the forwarder builds the outgoing URL, so `/anybucket/../internal/...`
+    # reaches the api as `/internal/...` — checked uncollapsed, its first segment is a bucket
+    # name and every check below judges the wrong request. Collapsing is identity for any path
+    # without `.`/`..` segments, and for paths with them it matches what forwarding already
+    # does, so no key that survives the proxy is judged differently.
+    path_parts = collapse_dot_segments(_decoded_path(request)).strip("/").split("/")
 
     # Validate bucket name only on CreateBucket (PUT /{bucket} with no object key and no
     # tagging/lifecycle/policy query params). Existing buckets with non-compliant names
