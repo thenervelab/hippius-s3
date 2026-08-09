@@ -137,6 +137,57 @@ def test_two_concurrent_attempts_at_one_part_settle_on_exactly_one_of_them(
     assert int(part["Size"]) == len(body), "the recorded part size disagrees with the bytes served"
 
 
+def test_a_republished_part_survives_a_read_that_must_come_from_the_backend(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    """The republished bytes must be what REPLICATES, not just what the SSD cache serves.
+
+    Every assertion above is satisfied by the ingest cache alone: the part dir holds the winning
+    attempt and the reads never leave the node. But the part is also copied to the pool and uploaded
+    to the backend, and those copies are taken from the part dir at whatever moment the drain and the
+    uploader get to it — which is not ordered against the republish. If either captured the first
+    attempt, the object reads correctly until its cache entry is evicted and then silently serves
+    the OLD bytes, months later, with a matching ETag.
+
+    So this waits for the backend registration and then clears the cache, which forces the GET down
+    the pipeline path and makes the backend copy the thing under test.
+    """
+    from .support.cache import clear_object_cache
+    from .support.cache import get_object_id_and_version
+    from .support.cache import wait_for_all_backends_ready
+
+    bucket = unique_bucket_name("mpu-republish-backend")
+    cleanup_buckets(bucket)
+    boto3_client.create_bucket(Bucket=bucket)
+    key = "republished-then-evicted.bin"
+    upload_id = _start_mpu(boto3_client, bucket, key)
+
+    boto3_client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=1, Body=FIRST)
+    second = boto3_client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=1, Body=SECOND)
+    boto3_client.complete_multipart_upload(
+        Bucket=bucket,
+        Key=key,
+        UploadId=upload_id,
+        MultipartUpload={"Parts": [{"ETag": second["ETag"], "PartNumber": 1}]},
+    )
+
+    assert wait_for_all_backends_ready(bucket, key, min_count=1, timeout_seconds=60.0), (
+        "the republished part never registered on the backend"
+    )
+    object_id, _version = get_object_id_and_version(bucket, key)
+    clear_object_cache(object_id)
+
+    got = boto3_client.get_object(Bucket=bucket, Key=key)
+    body = got["Body"].read()
+
+    assert len(body) == len(SECOND), "the backend copy is a different length than the republished part"
+    assert body == SECOND, "the backend holds the FIRST attempt's bytes — a republish that never replicated"
+    assert _md5(body) == _md5(SECOND)
+
+
 def test_a_republished_part_reads_correctly_alongside_an_untouched_sibling(
     docker_services: Any,
     boto3_client: Any,
