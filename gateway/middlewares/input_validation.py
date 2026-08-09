@@ -17,6 +17,7 @@ from gateway.config import get_config
 from gateway.utils.errors import s3_error_response
 from gateway.utils.paths import collapse_dot_segments
 from gateway.utils.paths import decoded_path
+from gateway.utils.paths import forwarded_path
 from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
 
 
@@ -68,13 +69,14 @@ async def input_validation_middleware(
 ) -> Response:
     """Validate S3 inputs for security and AWS compatibility."""
 
-    # Validate the path the api will SEE, not the one the client sent. httpx collapses dot
-    # segments when the forwarder builds the outgoing URL, so `/anybucket/../internal/...`
-    # reaches the api as `/internal/...` — checked uncollapsed, its first segment is a bucket
-    # name and every check below judges the wrong request. Collapsing is identity for any path
-    # without `.`/`..` segments, and for paths with them it matches what forwarding already
-    # does, so no key that survives the proxy is judged differently.
-    path_parts = collapse_dot_segments(_decoded_path(request)).strip("/").split("/")
+    decoded = _decoded_path(request)
+
+    # ROUTING view: the path the api will SEE. httpx both collapses dot segments and truncates at
+    # `#`/`?` when the forwarder builds the outgoing URL, so `/anybucket/../internal/...` and
+    # `/internal%23x/parts/1` both reach the api as an `internal` first segment while their
+    # as-sent first segment is an innocuous bucket name. Every bucket-name and reserved-name
+    # decision below keys off the first segment, so all of them must use this.
+    path_parts = forwarded_path(decoded).strip("/").split("/")
 
     # Validate bucket name only on CreateBucket (PUT /{bucket} with no object key and no
     # tagging/lifecycle/policy query params). Existing buckets with non-compliant names
@@ -181,9 +183,15 @@ async def input_validation_middleware(
                         status_code=400,
                     )
 
+    # KEY view: deliberately NOT `path_parts`. Truncation at `#` is the data loss this check
+    # exists to prevent — `report%23v1.txt` and `report%23v2.txt` both forward as `report`, so one
+    # silently overwrites the other. Judging the truncated key would see no `#` and wave both
+    # through. Dot segments still collapse, because that rewrite decides the key that lands.
+    key_parts = collapse_dot_segments(decoded).strip("/").split("/")
+
     # Validate object key if present
-    if len(path_parts) >= 2:
-        object_key = "/".join(path_parts[1:])
+    if len(key_parts) >= 2:
+        object_key = "/".join(key_parts[1:])
 
         # Length check (max bytes for UTF-8)
         key_bytes = len(object_key.encode("utf-8"))

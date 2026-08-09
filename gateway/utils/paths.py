@@ -35,18 +35,20 @@ def first_path_segment(request: Request) -> str:
 
 
 def collapse_dot_segments(path: str) -> str:
-    """The path exactly as the api will receive it: `.` and `..` segments collapsed.
+    """`.` and `..` segments removed, exactly as httpx removes them (RFC 3986 §5.2.4).
 
-    The api never sees the path a client sent. `ForwardService` hands `scope["path"]` to httpx,
-    and httpx removes dot segments (RFC 3986 §5.2.4) before the request leaves the gateway — so
-    `/anybucket/../internal/parts/...` arrives at the api as `/internal/parts/...`. A security
-    check keyed off "the first path segment" of the UNcollapsed path therefore judges a different
-    request than the one it lets through. Any such check must run on this function's output.
+    `ForwardService` hands a URL string built from `scope["path"]` to httpx, and httpx collapses
+    dot segments before the request leaves the gateway — so `/anybucket/../internal/parts/...`
+    arrives at the api as `/internal/parts/...`, and `/bucket/a/../b.txt` is stored as `b.txt`.
 
     Deliberately a segment-for-segment mirror of `httpx._urlparse.normalize_path` (0.28.x) rather
     than `posixpath.normpath`, whose extra rewrites (`//` collapse, trailing-slash drops) would
     make this diverge from what the forwarder actually sends;
     `test_collapse_matches_what_httpx_forwards` pins the parity against the installed httpx.
+
+    This is the *destination* view — what a surviving request will be stored as. For the view a
+    routing or security check needs, use `forwarded_path`: httpx also truncates the request target
+    at `#`/`?`, and a check that ignores that judges a longer path than the api will route on.
     """
     if "." not in path:
         return path
@@ -63,3 +65,33 @@ def collapse_dot_segments(path: str) -> str:
     # httpx never sends an empty request target: a path that collapses to nothing ("/..",
     # "/a/..") goes out as "/", so it must be judged as "/" here too.
     return "/".join(output) or "/"
+
+
+def forwarded_path(path: str) -> str:
+    """The path exactly as the api will receive it: truncated at `#`/`?`, then dot-collapsed.
+
+    Every routing or security decision keyed off "the first path segment" must run on this, not on
+    the path as sent. `ForwardService` interpolates `scope["path"]` into a URL *string*
+    (`f"{backend_url}{path}"`) and httpx re-parses it, so httpx rewrites it twice:
+
+    - **`#`/`?` truncate the request target.** `scope["path"]` is already percent-decoded, so a
+      client's `%23`/`%3F` is a literal `#`/`?` in that string and httpx reads it as the
+      fragment/query delimiter. `/internal%23x/parts/1` has first segment `internal#x`, which is
+      not `internal`, so it passed the denylist in `input_validation` — and reached the api as
+      `GET /internal`, its S3 catch-all on the reserved bucket name `internal`. Truncation has
+      nothing to do with dot segments, so it must be applied to every path, not only ones
+      containing `.`.
+    - **`.`/`..` collapse** — see `collapse_dot_segments`.
+
+    NOT modelled, because it cannot be fixed here: httpx forwards percent-escapes in that string
+    untouched and the api decodes them a *second* time, so `/%69nternal/parts/1` is put on the wire
+    verbatim and read by the api as `/internal/parts/1`. Decoding again here would decode object
+    keys twice as well, silently widening which keys `input_validation` accepts. `%` needs
+    rejecting in the first segment instead — see `test_percent_escapes_are_a_known_parity_gap`.
+    """
+    # Whichever delimiter comes first ends the target; everything after it, dot segments included,
+    # is never forwarded. httpx sends "/" rather than an empty target.
+    delimiters = [index for index in (path.find("#"), path.find("?")) if index >= 0]
+    if delimiters:
+        path = path[: min(delimiters)] or "/"
+    return collapse_dot_segments(path)

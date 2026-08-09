@@ -103,6 +103,51 @@ async def test_percent_encoded_dot_segments_are_collapsed_before_the_check() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["GET", "HEAD", "PUT", "POST", "DELETE"])
+@pytest.mark.parametrize(
+    ("decoded", "raw"),
+    [
+        ("/internal#x/parts/1", b"/internal%23x/parts/1"),
+        ("/internal?x/parts/1", b"/internal%3Fx/parts/1"),
+        ("/internal#", b"/internal%23"),
+        ("/internal?", b"/internal%3F"),
+        ("/x/../internal#y", b"/x/%2E%2E/internal%23y"),
+    ],
+)
+async def test_a_fragment_or_query_delimiter_cannot_hide_internal(method: str, decoded: str, raw: bytes) -> None:
+    """`%23`/`%3F` in the first segment truncate the path httpx forwards, not the one checked.
+
+    uvicorn decodes them into a literal `#`/`?` in `scope["path"]`, `ForwardService` interpolates
+    that into a URL string, and httpx then reads it as the fragment/query delimiter — so the
+    request target it writes is `/internal`. Judged as sent, the first segment is `internal#x`,
+    which is not `internal` and sailed straight through the denylist. Every method, because the
+    shape that reached the api was a plain GET.
+    """
+    response, forwarded = await _run(method, decoded, raw_path=raw)
+
+    assert response.status_code == 400
+    assert forwarded == [], "httpx truncates at the delimiter, so the api would receive `/internal`"
+
+
+@pytest.mark.asyncio
+async def test_a_fragment_in_a_key_is_still_judged_as_a_key_not_as_a_reserved_bucket() -> None:
+    """Truncating for the routing view must not cost the key view its `#`.
+
+    `/internal-backups/report#v1.txt` forwards as `/internal-backups/report` — a legitimate bucket,
+    so the denylist must not claim it — while the `#` still has to be rejected as a discouraged key
+    character, because the truncation IS the silent overwrite that guard exists to prevent.
+    """
+    response, forwarded = await _run(
+        "GET", "/internal-backups/report#v1.txt", raw_path=b"/internal-backups/report%23v1.txt"
+    )
+
+    assert response.status_code == 400
+    assert forwarded == []
+    assert b"InvalidArgument" in response.body, "must fail as a bad key, not as a reserved bucket name"
+    assert b"InvalidBucketName" not in response.body
+
+
+@pytest.mark.asyncio
 async def test_a_key_with_dot_segments_that_stays_inside_its_bucket_still_forwards() -> None:
     """Collapsing must not reject more than forwarding already rewrites. `/bucket/a/../b.txt`
     reaches the api as `/bucket/b.txt` today; the gateway's only change is to validate that
