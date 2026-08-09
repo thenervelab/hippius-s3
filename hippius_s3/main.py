@@ -39,7 +39,7 @@ from hippius_s3.cache.peers import PEER_PORT
 from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
 from hippius_s3.cache.peers import effective_max_inflight
-from hippius_s3.cache.read_recency import create_read_recency_recorder
+from hippius_s3.cache.read_recency import initialize_read_recency_recorder
 from hippius_s3.cache.residency import create_residency_recorder
 from hippius_s3.config import Config
 from hippius_s3.config import get_config
@@ -209,8 +209,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         # Eviction orders on COALESCE(last_read_at, resident_at), so a locally-served part has
         # to say so or the evictor falls back to arrival order — which for a re-read working set
-        # tends to drop exactly the parts about to be needed again.
-        app.state.read_recency_recorder = create_read_recency_recorder(app.state.postgres_pool, node_name)
+        # tends to drop exactly the parts about to be needed again. Installed as a module
+        # singleton (not merely app state) because the WRITE path stamps through it too:
+        # `write_meta` marks a just-(re)written part hot so a rewrite of a replicated part
+        # cannot rank as the evictor's coldest candidate while its landed announcement is still
+        # in flight to the drain agent.
+        app.state.read_recency_recorder = initialize_read_recency_recorder(app.state.postgres_pool, node_name)
         # Promotion must stay inside the band THIS node's evictor is holding, and the drain
         # allocator moves that band at runtime — so the floor is read from the agent rather than
         # configured here. The queues Redis is the only instance both processes share (the agent

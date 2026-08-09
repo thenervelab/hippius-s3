@@ -69,7 +69,7 @@ impl LatencyWindow {
 }
 
 /// What one B-2 divergence check concluded about a re-landed part. Exactly one counter moves
-/// per checked part, so the three sum to the number of announcements that named an already-
+/// per checked part, so the variants sum to the number of announcements that named an already-
 /// `replicated` part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelandOutcome {
@@ -79,6 +79,13 @@ pub enum RelandOutcome {
     Redriven,
     /// The part could not be read off SSD, so nothing was decided. Fail-safe but blind.
     Unreadable,
+    /// The part's SSD directory was GONE at check time (`NotFound`) — the lost-race signature,
+    /// distinct from [`Unreadable`](Self::Unreadable)'s flaky-disk shape. An announcement fires
+    /// only when a part was just written, so its files being absent moments later means
+    /// something unlinked them in between — the evictor or the reclaimer. If the rewrite had
+    /// diverged, its only copy is destroyed and the pool permanently serves the superseded
+    /// bytes; nothing after this point can tell, which is why the variant exists.
+    Vanished,
 }
 
 /// Which worker performed an SSD walk.
@@ -168,6 +175,13 @@ pub struct AgentSnapshot {
     /// (nothing is re-driven), but it means the check did NOT happen, so a genuine divergence
     /// on such a part stays undetected. Should be ~zero; a rise points at local-disk trouble.
     pub reland_unreadable: u64,
+    /// Divergence checks that found the part's SSD directory ABSENT (`NotFound`) — the
+    /// lost-race signature, split out of `reland_unreadable` because the responses differ
+    /// completely. An announced part was just written, so its files vanishing before the check
+    /// means the evictor or reclaimer unlinked it in between; if that rewrite had diverged, the
+    /// client's acknowledged bytes are destroyed and the pool serves the superseded ones with
+    /// no error anywhere. **Nonzero is a possible-data-loss event**, not disk trouble.
+    pub reland_vanished: u64,
     /// `failed` (broken/abandoned-upload) SSD parts the reclaim worker unlinked — the
     /// SSD-ingest tier's eviction throughput, distinct from the drain's `CephFS` work.
     pub reclaimed: u64,
@@ -246,6 +260,7 @@ pub struct SnapshotCell {
     reland_unchanged: AtomicU64,
     reland_redriven: AtomicU64,
     reland_unreadable: AtomicU64,
+    reland_vanished: AtomicU64,
     reclaimed: AtomicU64,
     /// Resident parts the read-tier evictor unlinked, and the bytes they freed. Separate from
     /// `reclaimed` (debris the reclaim worker removed) because the two answer different
@@ -378,13 +393,14 @@ impl SnapshotCell {
         self.landed_dropped.fetch_add(dropped, Ordering::Relaxed);
     }
 
-    /// Records the outcome of one re-landing divergence check (B-2): exactly one of the three
+    /// Records the outcome of one re-landing divergence check (B-2): exactly one of the
     /// counters moves per checked part.
     pub fn record_reland(&self, outcome: RelandOutcome) {
         let counter = match outcome {
             RelandOutcome::Unchanged => &self.reland_unchanged,
             RelandOutcome::Redriven => &self.reland_redriven,
             RelandOutcome::Unreadable => &self.reland_unreadable,
+            RelandOutcome::Vanished => &self.reland_vanished,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -622,6 +638,7 @@ impl SnapshotCell {
             reland_unchanged: self.reland_unchanged.load(Ordering::Relaxed),
             reland_redriven: self.reland_redriven.load(Ordering::Relaxed),
             reland_unreadable: self.reland_unreadable.load(Ordering::Relaxed),
+            reland_vanished: self.reland_vanished.load(Ordering::Relaxed),
             reclaimed: self.reclaimed.load(Ordering::Relaxed),
             reclaim_backing_errors: self.reclaim_backing_errors.load(Ordering::Relaxed),
             throttled: self.throttled.load(Ordering::Relaxed),
@@ -807,6 +824,7 @@ mod tests {
                 reland_unchanged: 0,
                 reland_redriven: 0,
                 reland_unreadable: 0,
+                reland_vanished: 0,
                 reclaimed: 6,
                 reclaim_backing_errors: 0,
                 throttled: 9,
@@ -916,6 +934,7 @@ mod tests {
             reland_unchanged: 0,
             reland_redriven: 0,
             reland_unreadable: 0,
+            reland_vanished: 0,
             reclaimed: 0,
             reclaim_backing_errors: 0,
             throttled: 0,
@@ -941,6 +960,7 @@ mod tests {
             reland_unchanged: 0,
             reland_redriven: 0,
             reland_unreadable: 0,
+            reland_vanished: 0,
             reclaimed: 0,
             reclaim_backing_errors: 0,
             throttled: 0,

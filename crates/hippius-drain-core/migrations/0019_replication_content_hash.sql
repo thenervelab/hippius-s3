@@ -48,3 +48,25 @@ SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE cephor_replication_status
     ADD COLUMN IF NOT EXISTS content_sha256 TEXT;
+
+-- relanded_at:
+--   when an announcement last named this part while it ALREADY read 'replicated' — i.e. the
+--   moment the agent learned the part may have been rewritten on SSD after its commit. Stamped
+--   by record_landed_part's conflict path (only when the prior status is 'replicated'), read by
+--   evictable_parts, which excludes rows re-landed within a grace window.
+--
+--   WHY THE EVICTOR MUST SEE THIS. A rewrite of a committed part touches nothing the eviction
+--   worklist sorts or gates on: the row still reads 'replicated', and the residency row's
+--   recency is whatever it was before the rewrite — so the part whose SSD copy is the ONLY copy
+--   of the client's new bytes ranks as maximally COLD. If the evictor unlinks it before the
+--   re-landing digest check runs, the check reads NotFound, nothing is re-driven, and the pool
+--   permanently serves the superseded bytes — silent data loss, the exact class B-2 closes.
+--   Gating eviction on a fresh relanded_at makes the check-pending window a hard exclusion
+--   rather than a ranking accident.
+--
+--   NULL -> the part has never been re-announced after a commit (the overwhelmingly common
+--           case); the gate does not apply. No backfill for the same reason as content_sha256.
+--   Never cleared: the gate is time-bounded by the grace window in evictable_parts, so an
+--   expired stamp is inert, and keeping it records when the last re-landing was seen.
+ALTER TABLE cephor_replication_status
+    ADD COLUMN IF NOT EXISTS relanded_at TIMESTAMPTZ;

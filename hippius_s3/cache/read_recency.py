@@ -108,3 +108,24 @@ def create_read_recency_recorder(pool: Optional[asyncpg.Pool], node_id: str) -> 
     if pool is None or not node_id:
         return None
     return ReadRecencyRecorder(pool, node_id)
+
+
+_recorder: Optional[ReadRecencyRecorder] = None
+
+
+def initialize_read_recency_recorder(pool: Optional[asyncpg.Pool], node_id: str) -> Optional[ReadRecencyRecorder]:
+    """Installs the process-wide recorder (the module-singleton pattern `landed.py` uses).
+
+    The singleton exists for the WRITE path: `WriteThroughPartsWriter.write_meta` stamps recency
+    on a just-(re)written part so a rewrite of an already-replicated part is LRU-hottest — not
+    coldest — while its announcement is still in flight to the drain agent (the evict-vs-reland
+    race; see `crates/hippius-drain-core/src/redrive.rs`). The read path keeps taking the same
+    instance by reference, so both paths share one sampling memo.
+    """
+    global _recorder
+    _recorder = create_read_recency_recorder(pool, node_id)
+    return _recorder
+
+
+def get_read_recency_recorder() -> Optional[ReadRecencyRecorder]:
+    return _recorder

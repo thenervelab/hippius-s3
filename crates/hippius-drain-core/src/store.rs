@@ -190,6 +190,18 @@ const DEFAULT_DEFER_BACKOFF: Duration = Duration::from_secs(5);
 /// address finally landing. Override via [`Store::with_defer_backoff_cap`].
 const DEFAULT_DEFER_BACKOFF_CAP: Duration = Duration::from_mins(10);
 
+/// How long a re-landed `replicated` part stays off the eviction worklist, measured from the
+/// `relanded_at` stamp [`Store::record_landed_part`] writes when an announcement names a part
+/// that already committed — the B-2 rewrite signal.
+///
+/// The gate must outlive the whole record→check→disposition path in one landed tick: the
+/// divergence check re-reads and hashes the entire part off SSD, and a tick checks up to the
+/// pop batch (512) of re-landed parts sequentially. Ten minutes covers that with a wide margin
+/// while bounding the failure mode of a crash between record and check: such a part is merely
+/// unevictable for ten minutes, and only re-announced parts (rare by construction) are ever
+/// gated at all, so the space this can withhold from an armed evictor is negligible.
+const RELAND_EVICTION_GRACE: Duration = Duration::from_mins(10);
+
 /// What [`Store::defer_part_missing_source`] did to the row — decided atomically
 /// inside the guarded UPDATE, so no concurrent claim can interleave between the
 /// deferral and the terminal escalation.
@@ -617,11 +629,23 @@ impl Store {
         // guarded conflict action returns NOTHING when its WHERE fails, i.e. in exactly the
         // already-known case the divergence check needs to see. The cost is a row rewrite on
         // the conflict path only; the common announcement is a fresh part, hence a plain INSERT.
+        //
+        // relanded_at is stamped IN THE SAME STATEMENT as the prior-state read, and only when
+        // that prior state is 'replicated' — the B-2 rewrite signal. It is what takes the part
+        // off the eviction worklist (see `evictable_parts`) for the window between this record
+        // and the divergence check's disposition: a rewritten committed part otherwise ranks as
+        // maximally COLD (nothing on the rewrite path touches the residency recency the evictor
+        // sorts on), so the evictor could unlink the ONLY copy of the new bytes before the
+        // check hashes them — after which nothing re-drives and the pool serves stale bytes
+        // forever. One statement, not a follow-up UPDATE, so there is no interleaving in which
+        // the outcome reports Replicated while the eviction gate is not yet armed.
         let row = sqlx::query_as::<_, (String, Option<String>)>(
             "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id) \
              VALUES ($1, $2, $3, 'pending', $4) \
              ON CONFLICT (object_id, version, part_number) \
-             DO UPDATE SET node_id = COALESCE(cephor_replication_status.node_id, EXCLUDED.node_id) \
+             DO UPDATE SET node_id = COALESCE(cephor_replication_status.node_id, EXCLUDED.node_id), \
+                           relanded_at = CASE WHEN cephor_replication_status.status = 'replicated' \
+                                              THEN now() ELSE cephor_replication_status.relanded_at END \
              RETURNING status, content_sha256",
         )
         .bind(part.object().as_str())
@@ -1261,17 +1285,29 @@ impl ResidentLog for Store {
         // Must match `cephor_ssd_residency_recency_idx` expression-for-expression, or the
         // planner sorts the whole ~2M-row resident set on every pass — reintroducing in Postgres
         // the O(resident) cost this evictor exists to avoid.
+        //
+        // The relanded_at guard is the B-2 eviction gate. A committed part that was rewritten on
+        // SSD still reads 'replicated' and its residency recency predates the rewrite, so it
+        // ranks as maximally COLD here while its SSD copy is the ONLY copy of the client's new
+        // bytes — the pool holds the superseded ones. Excluding rows re-landed within the grace
+        // keeps the evictor off the part until the divergence check has disposed of it: a
+        // Diverged verdict flips it to 'pending' (the status join then excludes it), and an
+        // Unchanged verdict means the pool copy matches, at which point eviction is safe again
+        // the moment the grace lapses. Filtered per joined row, like the status guard, so it
+        // costs nothing on the recency index scan.
         let rows = sqlx::query_as::<_, (String, i64, i64, String, i64)>(
             "SELECT r.object_id, r.version, r.part_number, s.status, r.bytes \
              FROM cephor_ssd_residency r \
              JOIN cephor_replication_status s \
                ON s.object_id = r.object_id AND s.version = r.version AND s.part_number = r.part_number \
              WHERE r.node_id = $1 AND s.status = 'replicated' \
+               AND (s.relanded_at IS NULL OR s.relanded_at < now() - ($3 * interval '1 second')) \
              ORDER BY COALESCE(r.last_read_at, r.resident_at) \
              LIMIT $2",
         )
         .bind(node)
         .bind(i64::from(limit))
+        .bind(RELAND_EVICTION_GRACE.as_secs_f64())
         .fetch_all(&self.pool)
         .await?;
 
@@ -2284,6 +2320,72 @@ mod part_tests {
         assert_eq!(store.record_landed_part(&p).await.unwrap().digest, None, "a legacy row has no digest");
         assert!(store.redrive_diverged_part(&p, &test_digest()).await.unwrap());
         assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Pending));
+    }
+
+    #[sqlx::test]
+    async fn a_relanding_of_a_committed_part_gates_it_off_the_eviction_worklist(pool: PgPool) {
+        // The evict-vs-reland race at the store layer. A rewritten committed part still reads
+        // 'replicated' and its residency recency predates the rewrite, so without this gate the
+        // LRU worklist ranks the ONLY copy of the client's new bytes as its coldest candidate —
+        // and an eviction before the divergence check destroys those bytes while the pool keeps
+        // the superseded ones, permanently and silently. The re-landing record must therefore
+        // arm the gate in the SAME statement that reports the prior state.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let p = part(UUID_A, 5, 1);
+        seed_part_size(&pool, UUID_A, 5, 1, Some(4096)).await;
+        store.record_landed_part(&p).await.unwrap();
+        let claimed = store.claim_part().await.unwrap().unwrap();
+        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        store.record_resident(&p, 4096).await.unwrap();
+        assert_eq!(
+            store.evictable_parts(10).await.unwrap().len(),
+            1,
+            "the pre-commit record left the gate unarmed: committed and resident is evictable",
+        );
+
+        let outcome = store.record_landed_part(&p).await.unwrap();
+
+        assert_eq!(
+            outcome.state,
+            ReplicationState::Replicated,
+            "the re-landing sees the committed prior state"
+        );
+        assert!(
+            store.evictable_parts(10).await.unwrap().is_empty(),
+            "a re-landed committed part is off the worklist while its divergence check is pending",
+        );
+        // The gate is time-bounded, not permanent: a crash between the record and the check
+        // must cost ten minutes of one part's evictability, never pin cache forever.
+        sqlx::query("UPDATE cephor_replication_status SET relanded_at = now() - interval '11 minutes' WHERE object_id = $1")
+            .bind(UUID_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.evictable_parts(10).await.unwrap().len(),
+            1,
+            "an expired gate releases the part back to the worklist",
+        );
+    }
+
+    #[sqlx::test]
+    async fn a_relanding_of_an_uncommitted_part_leaves_the_eviction_gate_unarmed(pool: PgPool) {
+        // Announcements for still-pending parts are the COMMON conflict (an MPU part announced,
+        // then re-announced before its drain). They have no committed pool copy that could go
+        // stale, so stamping them would gate parts the divergence check will never look at.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        store.record_landed_part(&p).await.unwrap();
+
+        let (unarmed,): (bool,) = sqlx::query_as("SELECT relanded_at IS NULL FROM cephor_replication_status WHERE object_id = $1")
+            .bind(UUID_A)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(unarmed, "a pending part's re-announcement must not arm the eviction gate");
     }
 
     #[sqlx::test]

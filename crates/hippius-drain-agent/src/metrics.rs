@@ -268,6 +268,18 @@ fn register_discovery_instruments(
             .with_callback(move |observer| observer.observe(snap.load().reland_unreadable, &[]))
             .build(),
     ));
+    // Checks that found the part's SSD directory ABSENT — the evict-vs-reland lost-race
+    // signature, split out of `unreadable` because the responses differ completely. **Alert on
+    // any increase**: an announced part was just written, so its files vanishing before the
+    // check means an eviction/reclaim unlinked the only copy of a possible rewrite, and the
+    // pool may now permanently serve the superseded bytes with no error anywhere else.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reland_vanished_total")
+            .with_callback(move |observer| observer.observe(snap.load().reland_vanished, &[]))
+            .build(),
+    ));
 }
 
 /// Builds the meter provider and registers the agent's metrics, or returns `None` when

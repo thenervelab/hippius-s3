@@ -26,7 +26,7 @@ use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, EvictionPass, EvictionTarget,
     NodeId, NodeObservation, PartDigest, PartKey, PartReplicationStore, ReclaimError, ReclaimGraces, RelandOutcome, ReplicationState, ScanWorker,
     SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, evict_to_target, jittered, observed_part_digest,
-    reclaim_failed, reclaim_ssd, reconcile_parts, verdict_for_reland,
+    reclaim_failed, reclaim_ssd, reconcile_parts, reland_read_outcome, verdict_for_reland,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -864,13 +864,30 @@ async fn landed_once(queue: &LandedQueue, store: &Store, ssd: &LocalSsd, snapsho
 /// A read failure decides NOTHING (the part keeps its `replicated` row). That is fail-safe in
 /// the direction that matters — re-driving on a flaky disk would re-copy the shard — but it is
 /// blind, not safe: a real divergence on an unreadable part goes undetected, which is what
-/// `reland_unreadable` exists to say.
+/// `reland_unreadable` exists to say. `NotFound` is split out of that lump
+/// ([`reland_read_outcome`]): an announced part was just written, so its directory being absent
+/// at check time means an eviction/reclaim unlinked it in between — and if the rewrite had
+/// diverged, the client's acknowledged bytes are destroyed while the pool serves the superseded
+/// ones. That is a possible-data-loss signature, logged at ERROR, not a disk warning.
 async fn check_reland(store: &Store, ssd: &LocalSsd, part: &PartKey, stored: Option<&PartDigest>, snapshot: &SnapshotCell) {
     let observed = match observed_part_digest(ssd, part).await {
         Ok(digest) => digest,
         Err(err) => {
-            snapshot.record_reland(RelandOutcome::Unreadable);
-            tracing::warn!(part = %part.relative_dir().display(), error = %err, "could not hash a re-landed part; its pool copy is unverified");
+            let outcome = reland_read_outcome(err.kind());
+            snapshot.record_reland(outcome);
+            match outcome {
+                RelandOutcome::Vanished => tracing::error!(
+                    part = %part.relative_dir().display(),
+                    error = %err,
+                    unverifiable = stored.is_none(),
+                    "a re-landed part's SSD copy is GONE before its divergence check — if the rewrite diverged, the pool now permanently serves superseded bytes"
+                ),
+                RelandOutcome::Unchanged | RelandOutcome::Redriven | RelandOutcome::Unreadable => tracing::warn!(
+                    part = %part.relative_dir().display(),
+                    error = %err,
+                    "could not hash a re-landed part; its pool copy is unverified"
+                ),
+            }
             return;
         }
     };
