@@ -263,11 +263,33 @@ mod tests {
     use crate::apipart::{ChunkIndex, ObjectId, PartKey, PartMeta, PartNumber, Version};
     use crate::partdrain::PartSource;
     use crate::state::ReplicationState;
+    use proptest::prelude::*;
     use std::future::Future;
     use std::io;
     use std::io::ErrorKind;
     use std::path::PathBuf;
     use std::str::FromStr;
+
+    proptest! {
+        /// The two collision classes the divergence check depends on, over random hash sets:
+        /// a permuted chunk order and a truncated chunk set must never alias the original —
+        /// otherwise a real rewrite could read as Unchanged and the pool would keep stale bytes.
+        #[test]
+        fn a_digest_never_survives_permutation_or_truncation(
+            hashes in prop::collection::vec("[0-9a-f]{64}", 2..8),
+            a in 0usize..8,
+            b in 0usize..8,
+        ) {
+            let full = part_digest(&hashes);
+            prop_assert_ne!(&full, &part_digest(&hashes[..hashes.len() - 1]), "truncation must not alias");
+            let (a, b) = (a % hashes.len(), b % hashes.len());
+            if hashes[a] != hashes[b] {
+                let mut permuted = hashes.clone();
+                permuted.swap(a, b);
+                prop_assert_ne!(&full, &part_digest(&permuted), "reordering must not alias");
+            }
+        }
+    }
 
     /// A source that mirrors `LocalSsd`'s REAL absence semantics — an absent part lists as
     /// EMPTY (not `NotFound`), and only `part_meta` reports the absence. The `partdrain` fakes

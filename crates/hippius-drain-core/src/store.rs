@@ -2343,6 +2343,86 @@ mod part_tests {
     }
 
     #[sqlx::test]
+    async fn the_worklist_admits_exactly_replicated_rows_past_the_reland_grace(pool: PgPool) {
+        // The eviction worklist's admission predicate over its FULL domain — every status
+        // crossed with every reland-gate state — exhaustively, because a finite domain makes
+        // exhaustion stronger than sampling. Admission must be exactly
+        // {replicated} × {never re-landed, grace lapsed}: every other status means the SSD
+        // copy is (or may again become) the only durable one, and an in-grace re-land is the
+        // B-2 window where an eviction destroys the client's new bytes.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let statuses = ["pending", "draining", "replicated", "failed", "corrupt"];
+        // 0 = never re-landed, 1 = re-landed now (in grace), 2 = re-landed 11 min ago (lapsed).
+        let relands = [0i32, 1, 2];
+        let mut expected = Vec::new();
+        let mut number = 0i64;
+        for status in statuses {
+            for reland in relands {
+                number += 1;
+                let p = part(UUID_A, 7, u32::try_from(number).unwrap());
+                store.record_landed_part(&p).await.unwrap();
+                store.record_resident(&p, 4096).await.unwrap();
+                sqlx::query(
+                    "UPDATE cephor_replication_status \
+                     SET status = $1, \
+                         relanded_at = CASE $4::int WHEN 0 THEN NULL WHEN 1 THEN now() \
+                                       ELSE now() - interval '11 minutes' END \
+                     WHERE object_id = $2 AND version = 7 AND part_number = $3",
+                )
+                .bind(status)
+                .bind(UUID_A)
+                .bind(number)
+                .bind(reland)
+                .execute(&pool)
+                .await
+                .unwrap();
+                let in_grace = reland == 1;
+                if status == "replicated" && !in_grace {
+                    expected.push(number);
+                }
+            }
+        }
+        let mut admitted: Vec<i64> = store
+            .evictable_parts(50)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| i64::from(r.part.part().get()))
+            .collect();
+        admitted.sort_unstable();
+        assert_eq!(admitted, expected, "admission must be exactly replicated × out-of-grace");
+    }
+
+    #[sqlx::test]
+    async fn a_relanding_conflict_never_touches_updated_at(pool: PgPool) {
+        // `updated_at` drives the GC retention window, the failed-reclaim grace and
+        // `oldest_pending_age`. The conflict SET deliberately updates only `node_id` and
+        // `relanded_at`; a future `updated_at = now()` added there would keep a repeatedly
+        // announced terminal part young forever — never aging into GC or reclaim — with
+        // nothing else failing. Pinned here because it is the single most plausible edit
+        // to that statement.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        sqlx::query("UPDATE cephor_replication_status SET updated_at = now() - interval '3 days' WHERE object_id = $1")
+            .bind(UUID_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        store.record_landed_part(&p).await.unwrap();
+
+        let (aged,): (bool,) = sqlx::query_as("SELECT updated_at < now() - interval '2 days' FROM cephor_replication_status WHERE object_id = $1")
+            .bind(UUID_A)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(aged, "the conflict path must leave updated_at alone");
+    }
+
+    #[sqlx::test]
     async fn a_relanding_of_an_uncommitted_part_leaves_the_eviction_gate_unarmed(pool: PgPool) {
         // Announcements for still-pending parts are the COMMON conflict (an MPU part announced,
         // then re-announced before its drain). They have no committed pool copy that could go
