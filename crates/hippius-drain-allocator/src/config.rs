@@ -246,6 +246,17 @@ impl AllocatorConfig {
                 limit: max_total,
             });
         }
+        // The starting estimate lives in the same band as the estimate itself: above
+        // `max_total` the first ticks would allocate a rate the AIMD is not allowed to
+        // hold, and the back-off only walks it down geometrically.
+        let initial_total = positive_u64(&get, "CEPHOR_ALLOC_INITIAL_TOTAL_BPS", min_total)?;
+        if initial_total > max_total {
+            return Err(ConfigError::OutOfRange {
+                var: "CEPHOR_ALLOC_INITIAL_TOTAL_BPS",
+                value: initial_total,
+                limit: max_total,
+            });
+        }
         let alloc = AllocConfig {
             min_total: ByteRate::new(min_total),
             max_total: ByteRate::new(max_total),
@@ -279,7 +290,7 @@ impl AllocatorConfig {
             ceph_ceiling: ByteRate::new(ceph_ceiling),
             // The first tick starts from the AIMD floor unless overridden, so a
             // fresh leader ramps up from a safe rate rather than a guess.
-            initial_total: ByteRate::new(u64_or(&get, "CEPHOR_ALLOC_INITIAL_TOTAL_BPS", min_total)?),
+            initial_total: ByteRate::new(initial_total),
             alloc,
             ceph_mgr_metrics_url: optional(&get, "CEPHOR_CEPH_MGR_METRICS_URL"),
             ceph_thresholds: ceph_thresholds(&get)?,
@@ -589,6 +600,54 @@ mod tests {
                 limit: 1_000_000_000,
             }
         ));
+    }
+
+    #[test]
+    fn an_initial_total_above_the_max_total_is_out_of_range() {
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_ALLOC_MAX_TOTAL_BPS", "1000000000"));
+        pairs.push(("CEPHOR_ALLOC_INITIAL_TOTAL_BPS", "2000000000"));
+        let err = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::OutOfRange {
+                var: "CEPHOR_ALLOC_INITIAL_TOTAL_BPS",
+                value: 2_000_000_000,
+                limit: 1_000_000_000,
+            }
+        ));
+    }
+
+    #[test]
+    fn a_zero_initial_total_is_rejected() {
+        // A zero start allocates nothing on the first tick and only reaches a useful
+        // rate additively, so a fat-fingered zero must fail startup like any other rate.
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_ALLOC_INITIAL_TOTAL_BPS", "0"));
+        let err = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::NonPositive {
+                var: "CEPHOR_ALLOC_INITIAL_TOTAL_BPS"
+            }
+        ));
+    }
+
+    #[test]
+    fn the_alloc_tuning_vars_are_read_from_the_environment() {
+        // The four AIMD knobs deployed together, asserted together: each is otherwise
+        // silently defaulted, so a variable-name typo in the k8s manifest is
+        // indistinguishable from "the operator did not set it".
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_ALLOC_MIN_TOTAL_BPS", "250000000"));
+        pairs.push(("CEPHOR_ALLOC_INITIAL_TOTAL_BPS", "500000000"));
+        pairs.push(("CEPHOR_ALLOC_DECREASE_PERMILLE", "950"));
+        pairs.push(("CEPHOR_ALLOC_ADDITIVE_INCREASE_BPS", "50000000"));
+        let config = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(config.alloc.min_total, ByteRate::new(250_000_000));
+        assert_eq!(config.initial_total, ByteRate::new(500_000_000));
+        assert_eq!(config.alloc.decrease_permille, 950);
+        assert_eq!(config.alloc.additive_increase, ByteRate::new(50_000_000));
     }
 
     #[test]
