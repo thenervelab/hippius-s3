@@ -23,7 +23,13 @@ from hippius_s3.services.crypto_service import AESGCMChunkedAdapterV2
 
 
 KEY = b"\x11" * 32
-CHUNK = dict(bucket_id="bucket-1", object_id="object-1", part_number=1, chunk_index=0, upload_id="upload-1")
+CHUNK = {
+    "bucket_id": "bucket-1",
+    "object_id": "object-1",
+    "part_number": 1,
+    "chunk_index": 0,
+    "upload_id": "upload-1",
+}
 # The adapters are instantiated DIRECTLY rather than resolved through `CryptoService.get_adapter`.
 # Only the v2 suite is in the registry, and `get_adapter` falls back to the default for an
 # unrecognised id — so parametrising over suite strings would silently exercise v2 twice and report
@@ -66,7 +72,7 @@ def test_the_keystream_does_not_repeat_across_two_encryptions_of_one_chunk(adapt
 
     body_one = first[adapter.NONCE_SIZE : -adapter.TAG_SIZE]  # type: ignore[attr-defined]
     body_two = second[adapter.NONCE_SIZE : -adapter.TAG_SIZE]  # type: ignore[attr-defined]
-    recovered = bytes(a ^ b ^ c for a, b, c in zip(body_one, body_two, one))
+    recovered = bytes(a ^ b ^ c for a, b, c in zip(body_one, body_two, one, strict=True))
 
     assert recovered != two, "one plaintext was recoverable from the other — the keystream repeated"
 
