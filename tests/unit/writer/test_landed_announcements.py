@@ -161,6 +161,72 @@ async def test_write_meta_works_with_no_publisher_installed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_publish_part_announces_strictly_after_the_store_publish() -> None:
+    """The SECOND choke point, and the one with no `set_meta` call to hang an announcement on.
+
+    MPU parts and append deltas stage their chunks, so for them the meta write happens INSIDE
+    `fs_store.publish_part`. An announcement missing here does not error anywhere: those parts
+    just stop reaching the agent directly and wait for the reconciler's disk walk.
+    """
+    order: list[str] = []
+
+    class RecordingStore:
+        async def publish_part(self, *_a, **_kw) -> None:
+            order.append("publish")
+
+    class RecordingPublisher:
+        async def publish(self, *_a) -> None:
+            order.append("announce")
+
+    landed._publisher = RecordingPublisher()
+    writer = WriteThroughPartsWriter(RecordingStore(), None, ttl_seconds=60)
+
+    await writer.publish_part(OBJ, 1, 1, attempt_id="0123456789abcdef", chunk_size=4, num_chunks=1, plain_size=4)
+
+    assert order == ["publish", "announce"], "the announcement must follow the promotion"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_publish_announces_nothing() -> None:
+    """Announcing a part whose promotion raised would have the agent claim a part that is not
+    published — its meta belongs to whatever attempt was there before, if any."""
+    announced: list[tuple] = []
+
+    class FailingStore:
+        async def publish_part(self, *_a, **_kw) -> None:
+            raise OSError("rename failed mid-swap")
+
+    class RecordingPublisher:
+        async def publish(self, *args) -> None:
+            announced.append(args)
+
+    landed._publisher = RecordingPublisher()
+    writer = WriteThroughPartsWriter(FailingStore(), None, ttl_seconds=60)
+
+    with pytest.raises(OSError):
+        await writer.publish_part(OBJ, 1, 1, attempt_id="0123456789abcdef", chunk_size=4, num_chunks=1, plain_size=4)
+
+    assert announced == []
+
+
+@pytest.mark.asyncio
+async def test_publish_part_works_with_no_publisher_installed() -> None:
+    """Same as `write_meta`: workers, scripts and tests never initialize the singleton."""
+    calls: list[str] = []
+
+    class RecordingStore:
+        async def publish_part(self, *_a, **_kw) -> None:
+            calls.append("publish")
+
+    landed._publisher = None
+    await WriteThroughPartsWriter(RecordingStore(), None, ttl_seconds=60).publish_part(
+        OBJ, 1, 1, attempt_id="0123456789abcdef", chunk_size=4, num_chunks=1, plain_size=4
+    )
+
+    assert calls == ["publish"]
+
+
+@pytest.mark.asyncio
 async def test_a_failing_announcement_does_not_fail_the_write(monkeypatch) -> None:
     """End to end through the writer: a dead redis-queues costs a fast discovery path, not a PUT."""
 
