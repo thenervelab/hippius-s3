@@ -42,11 +42,15 @@
 //! part after its drain, so an mtime pre-filter would force a re-hash of the node's entire
 //! ~930 GB shard.
 //!
-//! The landed announcement, by contrast, fires exactly when content can change and only then:
-//! `WriteThroughPartsWriter.write_meta` is the single choke point every upload path funnels
-//! through, and the download/promotion path writes meta without announcing. So an announcement
-//! naming a part that is ALREADY `replicated` is, by construction, a rewrite of a drained part
-//! — the rare event, and the only one worth paying a hash for.
+//! The landed announcement, by contrast, fires exactly when content can change and only then.
+//! `WriteThroughPartsWriter` announces from BOTH of its meta choke points and nowhere else:
+//! `write_meta` (simple PUT, streamed PUT) and `publish_part` (MPU parts and append deltas,
+//! whose meta lands inside the staged publish). Between them every upload path is covered, and
+//! the download/promotion path writes meta without announcing. So an announcement naming a part
+//! that is ALREADY `replicated` is, by construction, a rewrite of a drained part — the rare
+//! event, and the only one worth paying a hash for. Both paths publish to the same landed queue
+//! through the same publisher, so the re-drive covers a republished MPU part exactly as it
+//! covers a rewritten simple PUT.
 //!
 //! # The eviction race, and the gate that closes it
 //!

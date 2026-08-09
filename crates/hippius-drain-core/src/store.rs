@@ -222,10 +222,11 @@ pub enum MissingSourceOutcome {
 /// What [`Store::record_landed_part`] found for the part BEFORE it recorded the landing.
 ///
 /// A freshly-recorded part reports `Pending` with no digest. The case that matters is
-/// `Replicated`: the api announces a part only from `WriteThroughPartsWriter.write_meta`, the
-/// single choke point every upload path funnels through, so an announcement for an already-
-/// committed part means that part was WRITTEN AGAIN — the B-2 divergence shape. The digest is
-/// what tells a genuine rewrite from a duplicate announcement; see [`crate::verdict_for_reland`].
+/// `Replicated`: the api announces a part only from `WriteThroughPartsWriter`'s two meta choke
+/// points — `write_meta` and `publish_part` (the staged-publish path MPU parts and appends take)
+/// — which between them cover every upload path, so an announcement for an already-committed
+/// part means that part was WRITTEN AGAIN: the B-2 divergence shape. The digest is what tells a
+/// genuine rewrite from a duplicate announcement; see [`crate::verdict_for_reland`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LandedOutcome {
     /// The part's replication state before this landing was recorded. The upsert never touches
