@@ -229,6 +229,9 @@ def factory() -> FastAPI:
     # so gateway_overhead_ms spans the whole chain and every inner middleware logs a real ray_id
     # (GW-2). Kept inside CORS so CORS still wraps error responses, including the ray_id header.
     app.middleware("http")(ray_id_middleware)
+    # TODO: normalize scope["path"] to gateway.utils.paths.routing_path here, once, so no
+    # downstream layer can judge a different path than the api receives — see todo.md
+    # "Path normalization: one view, set once".
     # Outermost: CORS must wrap everything so error responses get CORS headers
     app.middleware("http")(cors_middleware)
 

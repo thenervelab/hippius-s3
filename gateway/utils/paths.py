@@ -29,9 +29,27 @@ def decoded_path(request: Request) -> str:
     return unquote(raw.decode("utf-8", "surrogateescape"))
 
 
+def routing_path(request: Request) -> str:
+    """The request path as the api will receive it. The only view a security check may judge.
+
+    `decoded_path` for the characters the client actually sent, then `forwarded_path` for the two
+    rewrites httpx performs on the way out. Every layer that decides "is this path exempt from
+    auth", "which bucket is this", or "is this a reserved name" has to agree with the api about
+    where the path starts, and the api's answer is the one that matters — it is what actually
+    routes. Layers disagreeing on that is how `/docs/../anybucket/key` skipped authentication
+    while being served from `anybucket`.
+    """
+    return forwarded_path(decoded_path(request))
+
+
 def first_path_segment(request: Request) -> str:
-    """The first path segment, decoded. `""` for `/`."""
-    return decoded_path(request).strip("/").split("/", 1)[0]
+    """The first segment of `routing_path`. `""` for `/`.
+
+    Deliberately the routing view and not the path as sent: a helper that answered "the first
+    segment the client typed" is the wrong question for every caller it has ever had, and having it
+    available under a plausible name is how the bypass gets rebuilt.
+    """
+    return routing_path(request).strip("/").split("/", 1)[0]
 
 
 def collapse_dot_segments(path: str) -> str:
