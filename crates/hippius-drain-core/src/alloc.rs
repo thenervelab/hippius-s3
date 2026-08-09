@@ -369,12 +369,16 @@ fn next_capacity(fleet: &FleetView, ceiling: CephCeiling, prev: BudgetController
     let back_off = latency_saturated || !matches!(ceiling, CephCeiling::Open(_));
 
     let prev_total = prev.total.get();
-    let new_total = if back_off {
-        let decreased = u64::try_from(u128::from(prev_total) * u128::from(config.decrease_permille) / 1000).unwrap_or(prev_total);
-        decreased.max(config.min_total.get())
+    let evolved = if back_off {
+        u64::try_from(u128::from(prev_total) * u128::from(config.decrease_permille) / 1000).unwrap_or(prev_total)
     } else {
-        prev_total.saturating_add(config.additive_increase.get()).min(config.max_total.get())
+        prev_total.saturating_add(config.additive_increase.get())
     };
+    // Both arms land in the same band. Clamping only the arm that moves toward each
+    // bound leaves a carried estimate that started outside the band stuck there: a
+    // `prev` above `max_total` (an operator lowering the ceiling between ticks) would
+    // back off only geometrically instead of being capped on the first tick.
+    let new_total = evolved.max(config.min_total.get()).min(config.max_total.get());
 
     let capacity = new_total.min(ceiling.budget().get());
     (BudgetController::new(ByteRate::new(new_total)), ByteRate::new(capacity))
@@ -594,6 +598,50 @@ mod tests {
             plan.controller.total().get() >= min_total.get(),
             "the carried AIMD estimate keeps its floor so the fleet resumes promptly when the ceiling reopens",
         );
+    }
+
+    #[test]
+    fn the_first_tick_starts_from_initial_total_not_the_floor() {
+        // A fresh leader carries `initial_total` into its first tick, so a deployment that
+        // starts high (500 MB/s over a 250 MB/s floor) must ramp from there. Reading the
+        // start as "the floor" would cost the whole ramp — at 50 MB/s per tick, ~5 ticks —
+        // every time leadership moves.
+        let cfg = AllocConfig {
+            min_total: ByteRate::new(250_000_000),
+            additive_increase: ByteRate::new(50_000_000),
+            ..config()
+        };
+        let fleet = fleet_of(&[node("a", 5_000, 10_000_000_000, 1_000_000_000)]);
+        let plan = allocate(
+            &fleet,
+            CephCeiling::Open(ByteRate::new(1_000_000_000)),
+            BudgetController::new(ByteRate::new(500_000_000)),
+            &cfg,
+        );
+        assert_eq!(
+            plan.controller.total().get(),
+            550_000_000,
+            "a healthy first tick increases the initial estimate, it does not snap to the floor",
+        );
+    }
+
+    #[test]
+    fn a_critical_ceiling_zeroes_capacity_even_with_a_floor_far_above_it() {
+        // The floor bounds the ESTIMATE, never the distributed capacity: a pool that
+        // accepts no writes must hand out nothing however high the AIMD floor is tuned.
+        // The estimate still keeps its floor so the fleet resumes at rate — not from
+        // scratch — the moment the ceiling reopens.
+        let min_total = ByteRate::new(250_000_000);
+        let cfg = AllocConfig { min_total, ..config() };
+        let fleet = fleet_of(&[
+            node("a", 9_500, 10_000_000_000, 1_000_000_000),
+            node("b", 9_500, 10_000_000_000, 1_000_000_000),
+        ]);
+        let plan = allocate(&fleet, CephCeiling::Critical, BudgetController::new(ByteRate::new(1_000_000_000)), &cfg);
+        for allocation in &plan.allocations {
+            assert_eq!(allocation.budget.get(), 0, "node {} must get nothing", allocation.node);
+        }
+        assert!(plan.controller.total().get() >= min_total.get(), "the carried estimate keeps its floor");
     }
 
     #[test]
@@ -844,6 +892,91 @@ mod tests {
             // No node is rationed above its reservation floor.
             for alloc in &plan.allocations {
                 prop_assert!(alloc.budget.get() <= 50_000, "rationing must not exceed the reservation floor");
+            }
+        }
+
+        /// The carried estimate never leaves `[min_total, max_total]`, on either arm.
+        ///
+        /// The back-off arm clamped only the floor, so an estimate that entered the tick
+        /// above `max_total` stayed above it and decayed geometrically instead of being
+        /// capped at once.
+        #[test]
+        fn the_carried_estimate_always_stays_within_its_bounds(
+            prev in 1u64..u64::MAX,
+            specs in prop::collection::vec((0u64..20_000_000, 0u16..=10_000), 1..6),
+            p99_ms in 0u64..5_000,
+            band in 0u8..3,
+        ) {
+            let cfg = config();
+            let nodes: Vec<_> = specs.iter().enumerate()
+                .map(|(i, &(backlog, pressure))| {
+                    let (id, mut obs) = node(&format!("n{i}"), pressure, backlog, 5_000_000);
+                    obs.observed_p99 = Duration::from_millis(p99_ms);
+                    (id, obs)
+                }).collect();
+            let ceiling = match band {
+                0 => CephCeiling::Open(ByteRate::new(1_000_000_000)),
+                1 => CephCeiling::NearFull(ByteRate::new(10_000_000)),
+                _ => CephCeiling::Critical,
+            };
+            let plan = allocate(&fleet_of(&nodes), ceiling, BudgetController::new(ByteRate::new(prev)), &cfg);
+            let total = plan.controller.total().get();
+            prop_assert!(total >= cfg.min_total.get(), "estimate {total} below the floor {}", cfg.min_total.get());
+            prop_assert!(total <= cfg.max_total.get(), "estimate {total} above the ceiling {}", cfg.max_total.get());
+        }
+
+        /// The ceiling bounds the distributed total whatever the AIMD floor is tuned to.
+        ///
+        /// Generalizes the 2026-07-24 regression above (which pins one floor/rate pair) over
+        /// arbitrary floors and bands: the floor is a property of the ESTIMATE, and must never
+        /// leak into the capacity a near-full or critical pool allows.
+        #[test]
+        fn a_ceiling_always_bounds_the_distributed_total_whatever_the_floor(
+            floor in 1u64..=1_000_000_000,
+            prev in 1u64..2_000_000_000,
+            rate in 1u64..1_000_000_000,
+            backlogs in prop::collection::vec(0u64..20_000_000_000, 1..6),
+            band in 0u8..3,
+        ) {
+            let cfg = AllocConfig { min_total: ByteRate::new(floor), max_total: ByteRate::new(1_000_000_000), ..config() };
+            let nodes: Vec<_> = backlogs.iter().enumerate()
+                .map(|(i, &backlog)| node(&format!("n{i}"), 5_000, backlog, 1_000_000_000)).collect();
+            let ceiling = match band {
+                0 => CephCeiling::Open(ByteRate::new(rate)),
+                1 => CephCeiling::NearFull(ByteRate::new(rate)),
+                _ => CephCeiling::Critical,
+            };
+            let plan = allocate(&fleet_of(&nodes), ceiling, BudgetController::new(ByteRate::new(prev)), &cfg);
+            let distributed: u64 = plan.allocations.iter().map(|a| a.budget.get()).sum();
+            prop_assert!(
+                distributed <= ceiling.budget().get(),
+                "distributed {distributed} exceeds the ceiling {} (floor {floor})", ceiling.budget().get(),
+            );
+        }
+
+        /// A fleet saturated on every tick converges to exactly `min_total` and stays there.
+        ///
+        /// Documents the absorbing state: multiplicative decrease has no lower stop but the
+        /// floor, so a permanently-saturated fleet ends up writing `min_total` forever. That
+        /// makes the floor the operating rate under sustained saturation — the reason it is
+        /// tuned above the drain's collapse threshold rather than left at a safe-looking
+        /// small value.
+        #[test]
+        fn a_fleet_saturated_on_every_tick_converges_to_the_floor_and_stays(
+            prev in 1u64..1_000_000_000,
+        ) {
+            let cfg = AllocConfig { min_total: ByteRate::new(50_000_000), ..config() };
+            let fleet = fleet_of(&[node_p99("a", Duration::from_secs(30), 10_000_000_000)]);
+            let mut controller = BudgetController::new(ByteRate::new(prev));
+            let mut totals = Vec::new();
+            for _ in 0..50 {
+                controller = allocate(&fleet, CephCeiling::Open(ByteRate::new(1_000_000_000)), controller, &cfg).controller;
+                totals.push(controller.total().get());
+            }
+            // 20% off per tick closes a <=20x gap to the floor in ~14 ticks, so the tail of a
+            // 50-tick run must be pinned — not merely trending down.
+            for total in &totals[40..] {
+                prop_assert_eq!(*total, cfg.min_total.get(), "saturated ticks must settle at the floor exactly");
             }
         }
 
