@@ -386,9 +386,12 @@ class PeerChunkFetcher:
             # unverified body gets promoted onto local flash, where it wins the read tier.
             # `invalidate_local_chunk` now clears such a chunk on AEAD failure, so this is no
             # longer permanent — but it is not a substitute for the size check either. That
-            # invalidation is gated on the POOL already holding the chunk, which a peer-served
-            # part need not be (the owner is resolved from residency alone, not from
-            # `status='replicated'`); the retry after it re-enters this same peer tier and
+            # invalidation is gated on the POOL holding the chunk, and `_resolve_part` checks the
+            # `status='replicated'` guarantee behind that only ONCE, at resolve time: the memo
+            # then holds the owner for its TTL while a redrive (`redrive_diverged_part`,
+            # `redrive_corrupt_parts`) can flip the part back to `pending` without touching
+            # residency, so by the time a promoted body fails AEAD the pool copy may be stale or
+            # mid-rewrite; the retry after it re-enters this same peer tier and
             # re-promotes, so a deterministically wrong peer fails the retry too; and the retry
             # fires exactly once per request, spending a budget that exists for genuine DEK
             # faults and reporting on `chunk_aead_failures_total`, the metric that says the keys
