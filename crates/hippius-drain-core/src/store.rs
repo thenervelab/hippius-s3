@@ -2005,6 +2005,48 @@ mod part_tests {
         );
     }
 
+    /// `corrupt` is the one terminal-looking status whose SSD copy is the LAST GOOD SOURCE.
+    #[sqlx::test]
+    async fn a_corrupt_row_is_never_gcd(pool: PgPool) {
+        // R4 holds a part `corrupt` when a LIVE object's pool copy fails verification, so the
+        // bytes on SSD are the only intact source and the row is the record that they exist and
+        // that a bounded re-drive still owes work on them. Deleting it loses both: the re-drive
+        // worker's worklist is `status = 'corrupt'`, and the reconciler would then re-record the
+        // part `pending` from SSD, bypassing the attempt cap it was held at.
+        //
+        // The residency guard cannot be what protects this arm — the reclaimer's refusal to
+        // unlink is a filesystem decision, and a corrupt part need carry no residency row at all
+        // (nothing writes one outside drain commit and read-through promotion). So the status
+        // list must exclude `corrupt` on its own, which is what this pins.
+        let store = Store::from_pool(pool.clone());
+        let held = part(UUID_A, 9, 1);
+        let control = part(UUID_A, 9, 2);
+        seed_status_node(&pool, UUID_A, 9, 1, "corrupt", "node-a").await;
+        seed_status_node(&pool, UUID_A, 9, 2, "failed", "node-a").await;
+        force_terminal(&pool, &held, "corrupt").await; // backdated 2h; re-asserts the same status
+        force_terminal(&pool, &control, "failed").await;
+
+        let (residency,): (i64,) = sqlx::query_as("SELECT count(*) FROM cephor_ssd_residency")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(residency, 0, "no residency: the corrupt row must be spared by the STATUS list alone");
+
+        // The aged `failed` control is what makes the survival assertion mean something: a GC
+        // that matched nothing at all — a broken age gate, say — would otherwise pass vacuously.
+        assert_eq!(
+            store.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap(),
+            1,
+            "the sweep did not reap the aged failed control, so it proves nothing about corrupt",
+        );
+        assert_eq!(
+            store.status(&held).await.unwrap(),
+            Some(ReplicationState::Corrupt),
+            "an aged corrupt row was GC'd — the re-drive lost the record of the only intact copy",
+        );
+        assert_eq!(store.status(&control).await.unwrap(), None, "the aged failed control was reaped");
+    }
+
     async fn force_terminal(pool: &PgPool, part: &PartKey, status: &str) {
         sqlx::query(
             "UPDATE cephor_replication_status SET status = $4, updated_at = now() - interval '2 hours' \
