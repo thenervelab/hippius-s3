@@ -16,6 +16,8 @@ These tests pin the property rather than the implementation: they say nonces mus
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from hippius_s3.services.crypto_service import AESGCMChunkedAdapter
@@ -99,3 +101,41 @@ def test_a_wrong_key_still_fails_to_authenticate(adapter: AESGCMChunkedAdapter) 
 
     with pytest.raises(InvalidTag):
         adapter.decrypt_chunk(blob, key=b"\x99" * 32, **CHUNK)
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS, ids=["v2-default", "v1-deprecated"])
+def test_no_two_encryptions_share_a_nonce_across_the_whole_input_space(adapter: AESGCMChunkedAdapter) -> None:
+    """The property behind the two example tests above: uniqueness holds for ANY inputs.
+
+    What this adds over them, measured rather than assumed: every example encrypts two DIFFERENT
+    plaintexts, so a nonce derived from the plaintext satisfies all of them — verified, all four
+    stay green under that mutation — while still colliding whenever a client re-uploads the same
+    bytes, which is the commonest retry of all. Only a grid that repeats plaintexts sees it. The
+    grid also varies key and chunk identity, so uniqueness is asserted across the whole space
+    rather than at one point in it.
+
+    Deliberately a seeded grid rather than `hypothesis`: that dependency arrives on the SSD
+    read-tier branch, and declaring it here too would put both branches' `uv.lock` in conflict
+    for no extra coverage. Worth converting to a real property test once the two have merged.
+    """
+    rng = random.Random(20260809)  # noqa: S311 - test-input generation, not cryptographic
+    keys = [bytes([b]) * 32 for b in (0x11, 0x22, 0x33)]
+    identities = [
+        {"bucket_id": f"bucket-{b}", "object_id": f"object-{o}", "part_number": p, "chunk_index": c, "upload_id": "u"}
+        for b in (1, 2)
+        for o in (1, 2)
+        for p in (1, 7)
+        for c in (0, 5)
+    ]
+
+    seen: dict[bytes, str] = {}
+    for key in keys:
+        for identity in identities:
+            for repeat in range(3):
+                plaintext = bytes(rng.getrandbits(8) for _ in range(rng.choice((1, 16, 64))))
+                nonce = _nonce(adapter.encrypt_chunk(plaintext, key=key, **identity), adapter)
+                where = f"key={key[0]:#x} identity={identity} repeat={repeat}"
+
+                assert len(nonce) == adapter.NONCE_SIZE, f"wrong nonce width at {where}"  # type: ignore[attr-defined]
+                assert nonce not in seen, f"nonce reused: {where} collides with {seen[nonce]}"
+                seen[nonce] = where
