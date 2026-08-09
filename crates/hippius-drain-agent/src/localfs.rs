@@ -1223,7 +1223,7 @@ mod tests {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod part_tests {
-    use super::{LocalFs, LocalSsd, hex_lower, is_staged_name, list_chunk_indices, parse_chunk_index};
+    use super::{LocalFs, LocalSsd, hex_lower, is_staged_name, is_temp_name, list_chunk_indices, parse_chunk_index, temp_name};
     use core::future::Future;
     use core::str::FromStr;
     use hippius_drain_core::{
@@ -1833,5 +1833,42 @@ mod part_tests {
                 "a staged chunk must never count toward the completeness gate"
             );
         }
+    }
+
+    #[test]
+    fn the_apis_meta_json_deserializes_into_the_meta_this_crate_reads() {
+        // `MetaJson` has no serde default and no rename, so a key the api renamed is InvalidData on
+        // every part this node tries to drain — the node stops replicating, rather than one part
+        // failing. The keys were coupled by a doc comment alone; the fixture is now the coupling.
+        let golden: serde_json::Value = serde_json::from_str(LAYOUT_GOLDEN).unwrap();
+        let payload = &golden["meta_payload"];
+
+        let parsed: super::MetaJson = serde_json::from_value(payload.clone()).unwrap();
+
+        assert_eq!(parsed.chunk_size, payload["chunk_size"].as_u64().unwrap());
+        assert_eq!(u64::from(parsed.num_chunks), payload["num_chunks"].as_u64().unwrap());
+        assert_eq!(parsed.size_bytes, payload["size_bytes"].as_u64().unwrap());
+    }
+
+    #[test]
+    fn the_apis_write_temps_are_recognised_as_temps_and_nothing_else() {
+        // The other half of the retention split. Staged chunks must NOT be tmp-shaped (asserted
+        // above and on the api side); a half-written chunk or meta from a killed api worker MUST
+        // be, because this sweep is its only reaper. Both directions are one rename apart.
+        let golden: serde_json::Value = serde_json::from_str(LAYOUT_GOLDEN).unwrap();
+        let temps = &golden["write_temp"];
+
+        for field in ["api_chunk_example", "api_meta_example"] {
+            let name = temps[field].as_str().unwrap();
+            assert!(is_temp_name(name), "the api's write temp must be swept: {name}");
+            assert!(!is_staged_name(name), "a write temp must not get the staged grace: {name}");
+            assert_eq!(parse_chunk_index(OsStr::new(name)), None, "a write temp must not be counted: {name}");
+        }
+
+        let prefix = temps["agent_prefix"].as_str().unwrap();
+        assert!(
+            temp_name("chunk_0.bin").starts_with(prefix),
+            "this crate's own temp prefix drifted from the golden"
+        );
     }
 }

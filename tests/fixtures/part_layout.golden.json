@@ -2,6 +2,17 @@
   "description": "The on-disk part layout, derived independently by the api (hippius_s3/cache/fs_store.py) and the drain agent (crates/hippius-drain-core PartKey::relative_dir + chunk_file_name). Both sides assert against this file, so a change on either side that the other does not follow fails a test instead of silently decoupling them. The layout is load-bearing beyond mere path agreement: publish_part's flock and the drain's remove_part_dir_exclusive only exclude each other because both open the SAME part directory, and a staged chunk stays invisible to the drain's completeness gate only because its name is not exactly chunk_<u32>.bin.",
   "meta_file": "meta.json",
   "staged_infix": ".staged.",
+  "meta_payload": {
+    "chunk_size": 4194304,
+    "num_chunks": 2,
+    "size_bytes": 8388608
+  },
+  "write_temp": {
+    "api_infix": ".tmp.",
+    "agent_prefix": ".tmp-",
+    "api_chunk_example": "chunk_0.bin.tmp.deadbeefdeadbeefdeadbeefdeadbeef",
+    "api_meta_example": "meta.json.tmp.deadbeefdeadbeefdeadbeefdeadbeef"
+  },
   "cases": [
     {
       "object_id": "466916c0-d61b-4518-b81b-9576b574270a",

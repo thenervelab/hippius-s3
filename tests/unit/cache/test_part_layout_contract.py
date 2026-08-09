@@ -22,6 +22,7 @@ side fails one of the two tests. Same discipline as
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,55 @@ def test_a_staged_name_is_the_chunk_name_plus_the_infix_and_attempt(store, tmp_p
         assert staged == f"{chunk}{_golden()['staged_infix']}{case['attempt_id']}"
         assert staged.startswith(f"{chunk}.")
         assert staged != chunk
+
+
+@pytest.mark.asyncio
+async def test_meta_json_carries_exactly_the_keys_the_drain_deserializes(store) -> None:
+    """`meta.json`'s KEYS are a contract, not just its filename.
+
+    The agent's `MetaJson` has no serde default and no rename, so a key the api renamed becomes
+    `InvalidData` on every part that node tries to drain — the whole node stops replicating rather
+    than one part failing. Pinned as the exact set, since an extra key is as breaking as a missing
+    one would be if `MetaJson` ever gained `deny_unknown_fields`.
+    """
+    golden = _golden()
+    object_id = "466916c0-d61b-4518-b81b-9576b574270a"
+    expected = golden["meta_payload"]
+    await store.set_meta(
+        object_id,
+        1,
+        1,
+        chunk_size=expected["chunk_size"],
+        num_chunks=expected["num_chunks"],
+        size_bytes=expected["size_bytes"],
+    )
+
+    written = json.loads((Path(store.part_path(object_id, 1, 1)) / golden["meta_file"]).read_text())
+
+    assert written == expected
+
+
+def test_the_api_write_temp_is_shaped_so_the_agent_sweeps_it(store, tmp_path) -> None:
+    """The other half of the retention contract: the api's write temps MUST be tmp-shaped.
+
+    Staged chunks are deliberately not (see below), but a half-written chunk or meta from a killed
+    api worker has nothing else to reclaim it — the drain's sweep is the only reaper, and it matches
+    on `.tmp.`. If the api's temp suffix drifted, those files would accumulate on the ingest SSD
+    with no reaper and no error. The uuid4 tail cannot be pinned, so the infix is, plus the tail's
+    alphabet: a tail that grew a separator could turn a temp into something else's name.
+    """
+    golden = _golden()
+    infix = golden["write_temp"]["api_infix"]
+    part_dir = Path(store.part_path("466916c0-d61b-4518-b81b-9576b574270a", 1, 1))
+
+    for target in (store._chunk_file(part_dir, 0), store._meta_file(part_dir)):
+        generated = store._unique_tmp(target).name
+        prefix = f"{target.name}{infix}"
+        assert generated.startswith(prefix), generated
+        assert re.fullmatch(r"[0-9a-f]+", generated.removeprefix(prefix)), generated
+
+    assert golden["write_temp"]["api_chunk_example"].startswith(f"chunk_0.bin{infix}")
+    assert golden["write_temp"]["api_meta_example"].startswith(f"{golden['meta_file']}{infix}")
 
 
 def test_the_staged_infix_is_not_tmp_shaped() -> None:
