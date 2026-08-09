@@ -17,6 +17,7 @@ use hippius_drain_core::{
     CephFs, ChunkIndex, DiscoveredPart, FileId, FreeSpaceProbe, META_FILE_NAME, PartKey, PartMeta, PartPool, PartRemover, PartScan, PartSource,
     SsdCache, chunk_file_name, parse_part_dir,
 };
+use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::hash::BuildHasher;
@@ -438,8 +439,8 @@ async fn copy_into(dir: &Path, name: &str, source: &Path, sync_dir: bool) -> io:
 }
 
 /// Remove a part's whole directory; an already-absent dir is `Ok` (idempotent, so a
-/// re-drive after a crash still converges). Shared by the SSD-source unlink and the
-/// pool corrupt-copy cleanup.
+/// re-drive after a crash still converges). Used by the pool corrupt-copy cleanup;
+/// the SSD-source unlink goes through [`remove_part_dir_exclusive`] instead.
 ///
 /// Removes ONLY the part dir. The now-empty `v<version>/`/`<object_id>/` parents are left
 /// for [`LocalSsd::sweep_empty_shells`], deliberately — see that method for why pruning them
@@ -450,6 +451,47 @@ async fn remove_part_dir(root: &Path, part: &PartKey) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+/// [`remove_part_dir`], but contending on the api's part-publish advisory lock first.
+///
+/// The api's `fs_store.publish_part` renames an attempt's staged chunk set onto the canonical
+/// `chunk_<i>.bin` names while holding `flock(part_dir_fd, LOCK_EX)` (`_part_dir_flock` in
+/// `hippius_s3/cache/fs_store.py`). `remove_dir_all` deletes by directory listing, so racing
+/// that swap unguarded can unlink freshly-acknowledged chunks — the part looked evictable
+/// because the PREVIOUS attempt's content had replicated (the B-2 key reuse). Taking the same
+/// lock — same `flock(2)` call, same dir inode — makes the two mutually exclusive.
+///
+/// Non-blocking, deliberately: a held lock means a publish is mid-swap and the part must NOT
+/// be removed now. `EWOULDBLOCK` is surfaced as an ordinary removal failure (raw errno kept
+/// for the caller's classification); the part stays and a later pass retries. The lock is
+/// held across the whole `remove_dir_all`: a publisher arriving mid-removal blocks in its own
+/// `flock` and then fails its renames with `ENOENT` — a visible 500 the client retries, never
+/// a silently half-deleted publish.
+async fn remove_part_dir_exclusive(root: &Path, part: &PartKey) -> io::Result<()> {
+    let dir = part_dir(root, part);
+    // `flock` + `remove_dir_all` both block; one hop to the blocking pool covers the pair.
+    tokio::task::spawn_blocking(move || {
+        let file = match std::fs::File::open(&dir) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let lock = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => lock,
+            Err((_, errno)) => return Err(io::Error::from(errno)),
+        };
+        let removed = match std::fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        };
+        // The kernel drops the lock with the fd; the dir inode it locked is already unlinked.
+        drop(lock);
+        removed
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// Opens `dir` for reading, mapping a vanished dir (a concurrent reclaim removed it)
@@ -759,8 +801,10 @@ impl PartRemover for LocalSsd {
         // The sole whole-part unlink seam, shared by the reclaim worker (debris) and the
         // read-tier evictor (resident parts). Idempotent, so two of them racing — or a
         // re-drive after a crash — is harmless. The drain itself no longer unlinks at all:
-        // it retains its copy to serve reads.
-        remove_part_dir(&self.root, part).await
+        // it retains its copy to serve reads. Exclusive against the api's part-publish
+        // flock — see [`remove_part_dir_exclusive`] — so an eviction can never interleave
+        // with a publish's renames into the same dir.
+        remove_part_dir_exclusive(&self.root, part).await
     }
 }
 
@@ -1339,6 +1383,29 @@ mod part_tests {
         assert!(!dir.path().join(part.relative_dir()).exists(), "the part dir is gone");
         // A second remove of an already-absent part is Ok (idempotent re-drive).
         ssd.unlink_part(&part).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unlink_part_skips_while_a_publisher_holds_the_part_dir_flock() {
+        let dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        seed_ssd_part(dir.path(), &part, &[(0, b"x")]);
+        let ssd = LocalSsd::new(dir.path());
+
+        // Simulate the api's `_part_dir_flock`: an exclusive flock on the part dir's own fd.
+        // `flock` contends per open file description, so one process is enough to exercise it.
+        let part_dir = dir.path().join(part.relative_dir());
+        let publisher = nix::fcntl::Flock::lock(std::fs::File::open(&part_dir).unwrap(), nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, errno)| errno)
+            .unwrap();
+
+        let err = ssd.unlink_part(&part).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "a busy lock is a skip, not a removal");
+        assert!(part_dir.join("chunk_0.bin").exists(), "the publisher's chunks survive");
+
+        drop(publisher);
+        ssd.unlink_part(&part).await.unwrap();
+        assert!(!part_dir.exists(), "with the lock released the part is removable");
     }
 
     #[tokio::test]
