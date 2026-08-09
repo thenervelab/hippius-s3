@@ -1495,6 +1495,25 @@ mod part_tests {
     }
 
     #[tokio::test]
+    async fn a_removed_part_dir_reads_as_not_found_at_digest_time() {
+        // The evict-vs-reland lost race against the real FS. `list_chunk_indices` maps a
+        // missing dir to an EMPTY listing for the drain's sake, which would fold to a valid
+        // empty-set digest, read as Diverged, and spuriously re-drive a servable row — while
+        // the Vanished alarm built for this exact loss stayed silent. The meta probe inside
+        // `observed_part_digest` is what turns the absence back into `NotFound`.
+        let ssd_dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        seed_ssd_part(ssd_dir.path(), &part, &[(0, b"chunk zero")]);
+        let ssd = LocalSsd::new(ssd_dir.path());
+        observed_part_digest(&ssd, &part).await.unwrap();
+
+        std::fs::remove_dir_all(ssd_dir.path().join(part.relative_dir())).unwrap();
+
+        let err = observed_part_digest(&ssd, &part).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
     async fn end_to_end_drain_of_a_part_whose_meta_overdeclares_defers_and_keeps_the_ssd_copy() {
         // WI-1 against the real FS: meta claims 2 chunks but only chunk 0 is on disk (a
         // chunk removed after meta landed). The drain must defer with the SSD copy intact

@@ -219,23 +219,172 @@ pub fn reland_read_outcome(kind: std::io::ErrorKind) -> RelandOutcome {
 ///
 /// # Errors
 ///
-/// The underlying [`io::Error`](std::io::Error). A vanished part (`NotFound`) surfaces as such;
-/// the caller treats any failure as "cannot tell" and leaves the row alone, since re-driving on
-/// a read error would let a flaky disk re-copy the whole shard.
+/// The underlying [`io::Error`](std::io::Error). `NotFound` is reserved for a part that is
+/// GONE — the vanished (lost-race) signature — and is verified against the part's meta rather
+/// than trusted from a chunk read: `LocalSsd` reports a missing part dir as an empty listing
+/// (drain tolerance), and a single chunk can vanish under a part that still stands (a
+/// concurrent republish trimming its tail). Both would otherwise misclassify — the first as a
+/// spurious divergence, the second as a false Vanished on the loudest alarm. Every other
+/// failure is "cannot tell": the caller leaves the row alone, since re-driving on a read error
+/// would let a flaky disk re-copy the whole shard.
 pub async fn observed_part_digest<S: PartSource>(ssd: &S, part: &crate::apipart::PartKey) -> std::io::Result<PartDigest> {
     let chunks: Vec<ChunkIndex> = ssd.list_chunks(part).await?;
+    if chunks.is_empty() {
+        // Meta is the part's readiness signal, so a part that ever landed had one: NotFound
+        // here means the whole part is gone. Any other failure propagates as "cannot tell",
+        // and a present meta over zero chunks falls through to the empty-set digest.
+        ssd.part_meta(part).await?;
+    }
     let mut hashes = Vec::with_capacity(chunks.len());
     for index in chunks {
-        hashes.push(ssd.chunk_hash(part, index).await?);
+        match ssd.chunk_hash(part, index).await {
+            Ok(hash) => hashes.push(hash),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return match ssd.part_meta(part).await {
+                    Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound => Err(err),
+                    // The part still stands, so this is a mid-fold trim, not the lost race —
+                    // keep it off NotFound so the next announcement re-checks quietly.
+                    _ => Err(std::io::Error::other(format!(
+                        "chunk {} vanished mid-digest while its part remains",
+                        index.get()
+                    ))),
+                };
+            }
+            Err(err) => return Err(err),
+        }
     }
     Ok(part_digest(&hashes))
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{PartDigest, RelandOutcome, RelandVerdict, part_digest, reland_read_outcome, verdict_for_reland};
+    use super::{PartDigest, RelandOutcome, RelandVerdict, observed_part_digest, part_digest, reland_read_outcome, verdict_for_reland};
+    use crate::apipart::{ChunkIndex, ObjectId, PartKey, PartMeta, PartNumber, Version};
+    use crate::partdrain::PartSource;
     use crate::state::ReplicationState;
+    use std::future::Future;
+    use std::io;
     use std::io::ErrorKind;
+    use std::path::PathBuf;
+    use std::str::FromStr;
+
+    /// A source that mirrors `LocalSsd`'s REAL absence semantics — an absent part lists as
+    /// EMPTY (not `NotFound`), and only `part_meta` reports the absence. The `partdrain` fakes
+    /// follow the trait's documented contract instead, which is exactly why they could not
+    /// catch an implementation that trusted the listing alone.
+    /// Chunk index → hash; a `None` hash is a chunk that vanished between the listing and
+    /// its read.
+    type FakeChunks = Vec<(u32, Option<&'static str>)>;
+
+    struct SsdLike {
+        /// `None` = the whole part dir is gone.
+        part: Option<FakeChunks>,
+    }
+
+    impl PartSource for SsdLike {
+        fn list_chunks(&self, _part: &PartKey) -> impl Future<Output = io::Result<Vec<ChunkIndex>>> + Send {
+            let indices = self
+                .part
+                .as_ref()
+                .map(|chunks| chunks.iter().map(|&(i, _)| ChunkIndex::new(i)).collect())
+                .unwrap_or_default();
+            async move { Ok(indices) }
+        }
+
+        fn chunk_source(&self, part: &PartKey, index: ChunkIndex) -> io::Result<PathBuf> {
+            Ok(part.relative_dir().join(format!("chunk_{}.bin", index.get())))
+        }
+
+        fn meta_source(&self, part: &PartKey) -> io::Result<PathBuf> {
+            Ok(part.relative_dir().join("meta.json"))
+        }
+
+        fn part_meta(&self, _part: &PartKey) -> impl Future<Output = io::Result<PartMeta>> + Send {
+            let present = self.part.as_ref().map(Vec::len);
+            async move {
+                let num_chunks = present.ok_or_else(|| io::Error::new(ErrorKind::NotFound, "no part"))?;
+                Ok(PartMeta {
+                    chunk_size: 4,
+                    num_chunks: u32::try_from(num_chunks).unwrap_or(u32::MAX),
+                    size_bytes: 4,
+                })
+            }
+        }
+
+        fn chunk_hash(&self, _part: &PartKey, index: ChunkIndex) -> impl Future<Output = io::Result<String>> + Send {
+            let hash = self
+                .part
+                .as_ref()
+                .and_then(|chunks| chunks.iter().find(|&&(i, _)| i == index.get()))
+                .and_then(|&(_, hash)| hash);
+            async move { hash.map(str::to_owned).ok_or_else(|| io::Error::new(ErrorKind::NotFound, "chunk gone")) }
+        }
+    }
+
+    fn key() -> PartKey {
+        PartKey::new(
+            ObjectId::from_str("6f2e8f64-9c9b-4d7a-8b0a-0f3f4c1d2e3a").unwrap(),
+            Version::new(5),
+            PartNumber::new(1),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_absent_part_reads_as_not_found_not_as_an_empty_digest() {
+        // The lost-race regression: an evicted (absent) part must be the Vanished signature,
+        // never a well-formed empty digest that reads as Diverged and spuriously re-drives a
+        // servable row toward `failed` — silencing the alarm built for exactly this loss.
+        let err = observed_part_digest(&SsdLike { part: None }, &key()).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(reland_read_outcome(err.kind()), RelandOutcome::Vanished);
+    }
+
+    #[tokio::test]
+    async fn a_chunkless_part_that_still_stands_folds_to_the_empty_digest() {
+        let observed = observed_part_digest(&SsdLike { part: Some(vec![]) }, &key()).await.unwrap();
+        assert_eq!(observed, part_digest::<&str>(&[]));
+    }
+
+    #[tokio::test]
+    async fn a_chunk_vanishing_under_a_standing_part_is_not_the_vanished_signature() {
+        // A concurrent republish trims tail chunks between the listing and the fold. The part
+        // is being rewritten, not destroyed — reporting NotFound would fire the data-loss
+        // alarm for a routine rewrite, so the error must land in the quiet Unreadable arm.
+        let source = SsdLike {
+            part: Some(vec![(0, Some("aa")), (1, None)]),
+        };
+        let err = observed_part_digest(&source, &key()).await.unwrap_err();
+        assert_ne!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(reland_read_outcome(err.kind()), RelandOutcome::Unreadable);
+    }
+
+    #[tokio::test]
+    async fn a_chunk_vanishing_with_its_whole_part_is_the_vanished_signature() {
+        // The whole-part loss caught mid-fold rather than at the listing: the listing saw the
+        // chunk, the read misses it, and the meta probe confirms the part itself is gone.
+        struct GoneMidFold;
+        impl PartSource for GoneMidFold {
+            async fn list_chunks(&self, _part: &PartKey) -> io::Result<Vec<ChunkIndex>> {
+                Ok(vec![ChunkIndex::new(0)])
+            }
+            fn chunk_source(&self, part: &PartKey, index: ChunkIndex) -> io::Result<PathBuf> {
+                Ok(part.relative_dir().join(format!("chunk_{}.bin", index.get())))
+            }
+            fn meta_source(&self, part: &PartKey) -> io::Result<PathBuf> {
+                Ok(part.relative_dir().join("meta.json"))
+            }
+            async fn part_meta(&self, _part: &PartKey) -> io::Result<PartMeta> {
+                Err(io::Error::new(ErrorKind::NotFound, "no part"))
+            }
+            async fn chunk_hash(&self, _part: &PartKey, _index: ChunkIndex) -> io::Result<String> {
+                Err(io::Error::new(ErrorKind::NotFound, "chunk gone"))
+            }
+        }
+        let err = observed_part_digest(&GoneMidFold, &key()).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(reland_read_outcome(err.kind()), RelandOutcome::Vanished);
+    }
 
     #[test]
     fn a_digest_is_stable_and_separates_content_order_and_count() {
