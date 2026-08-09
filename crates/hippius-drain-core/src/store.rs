@@ -1935,6 +1935,76 @@ mod part_tests {
         assert_eq!(ingesting.status(&p).await.unwrap(), None, "the failed row is gone");
     }
 
+    /// The resurrection loop, pinned end to end across the GC and the reconciler.
+    #[sqlx::test]
+    async fn a_retained_replicated_part_whose_row_was_gcd_is_not_resurrected(pool: PgPool) {
+        // Retention keeps a `replicated` part on SSD as the read tier far past this GC's 7-day
+        // default, and the reconciler — the sole drain trigger — re-records any scanned part the
+        // store has no row for. So without the residency guard the two compose into a loop: the
+        // GC prunes the row, the next scan reads `None`, `record_landed` returns the part to
+        // `pending`, and because partdrain's idempotent fast path is `status == Replicated` it
+        // misses — the part is re-copied to the pool AND the commit LPUSHes a second
+        // UploadChainRequest, re-publishing a part uploaded a week earlier. The row's absence is
+        // read as "never drained", so on a node holding ~930 GB every retained part re-drains on
+        // a rolling 7-day cycle. The guard is what keeps "no row" meaning what the reconciler
+        // assumes it means.
+        use crate::reconcile::{DiscoveredPart, PartScan, reconcile_parts};
+        use core::future::Future;
+
+        // Stands in for the SSD walk. It yields the part on every pass, which is the point:
+        // under retention a scanned part is no longer evidence that a drain is outstanding.
+        struct OnePart(DiscoveredPart);
+        impl PartScan for OnePart {
+            fn scan_parts(&self) -> impl Future<Output = std::io::Result<Vec<DiscoveredPart>>> + Send {
+                let parts = vec![self.0.clone()];
+                async move { Ok(parts) }
+            }
+        }
+
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let retained = part(UUID_A, 9, 1);
+
+        // A fully completed drain: committed to the pool, backend upload published, and STILL
+        // resident — retention, not the 1h reclaim grace, now owns when the SSD copy goes away.
+        store.record_landed_part(&retained).await.unwrap();
+        let claim = store.claim_part().await.unwrap().expect("the landed part is claimable");
+        store.record_resident(&retained, 4096).await.unwrap();
+        store.mark_replicated(&claim, &PartVerified::for_test()).await.unwrap();
+        force_terminal(&pool, &retained, "replicated").await; // backdated 2h: aged past retention
+        store.mark_upload_enqueued(&retained).await.unwrap(); // leaves updated_at aged
+
+        assert_eq!(
+            store.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap(),
+            0,
+            "the aged row of a still-resident part was pruned, arming the resurrection",
+        );
+
+        let report = reconcile_parts(
+            &OnePart(DiscoveredPart {
+                part: retained.clone(),
+                age: Duration::ZERO,
+            }),
+            &store,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.recovered, 0, "the reconciler re-recorded a part that was already drained");
+        assert_eq!(
+            report.replicated_orphan, 1,
+            "the retained part was not recognised as drained-but-resident",
+        );
+        assert_eq!(
+            store.status(&retained).await.unwrap(),
+            Some(ReplicationState::Replicated),
+            "the part was returned to pending — it will be re-copied and its upload re-published",
+        );
+        assert!(
+            store.claim_part().await.unwrap().is_none(),
+            "the drained part is claimable again, so a duplicate UploadChainRequest is inevitable",
+        );
+    }
+
     async fn force_terminal(pool: &PgPool, part: &PartKey, status: &str) {
         sqlx::query(
             "UPDATE cephor_replication_status SET status = $4, updated_at = now() - interval '2 hours' \
