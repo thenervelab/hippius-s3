@@ -141,8 +141,9 @@ Anchors to touch: [gateway/services/forward_service.py](gateway/services/forward
 **Status (2026-07-17)**: fixed. The second write is gone — `put_simple_stream_full` and
 `mpu_upload_part_stream` write each chunk exactly once (guarded by
 `tests/unit/test_put_simple_stream_full.py`), and `RedisObjectPartsCache.set_chunks` had zero
-production callers and has been deleted. `WriteThroughPartsWriter.write_chunks` writes via
-`fs_store.set_chunk` only.
+production callers and has been deleted. `WriteThroughPartsWriter.write_chunks` was deleted with
+the last non-streaming write path; the streaming consumers call `fs_store.set_chunk` /
+`stage_chunk` directly.
 
 **Follow-up (minor cleanup)**: `WriteThroughPartsWriter.__init__` still accepts a `redis_cache`
 param that is stored but never read (`hippius_s3/writer/write_through_writer.py:17-26`). Drop it and
@@ -151,7 +152,7 @@ consider renaming the class to `FSPartsWriter`.
 
 ### P1 — Accepted SSD leak from the UploadPart cleanup-race fix (unbounded until ov-row cleanup lands)
 
-**Context**: branch `fix/upload-part-cleanup-race` stopped failure-path cleanups from deleting shared FS part data — a duplicate UploadPart's loser used to destroy the winner's *published* chunks (drain then wrote the part off as unrecoverable). The fix deletes nothing on failure and enforces the exact chunk set at publish time instead ([hippius_s3/writer/object_writer.py:893](hippius_s3/writer/object_writer.py), [hippius_s3/cache/fs_store.py:359 `trim_chunks_from`](hippius_s3/cache/fs_store.py)).
+**Context**: branch `fix/upload-part-cleanup-race` stopped failure-path cleanups from deleting shared FS part data — a duplicate UploadPart's loser used to destroy the winner's *published* chunks (drain then wrote the part off as unrecoverable). The fix deletes nothing on failure and enforces the exact chunk set at publish time instead — `fs_store.publish_part` promotes the attempt's staged set and runs `_trim_chunk_tail` before writing meta ([hippius_s3/cache/fs_store.py:383](hippius_s3/cache/fs_store.py); the standalone `trim_chunks_from` was folded into it).
 
 **The accepted cost** — two leak shapes now accumulate on SSD:
 
