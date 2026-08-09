@@ -16,9 +16,10 @@ These tests pin the property rather than the implementation: they say nonces mus
 
 from __future__ import annotations
 
-import random
-
 import pytest
+from hypothesis import given
+from hypothesis import settings
+from hypothesis import strategies as st
 
 from hippius_s3.services.crypto_service import AESGCMChunkedAdapter
 from hippius_s3.services.crypto_service import AESGCMChunkedAdapterV2
@@ -103,39 +104,85 @@ def test_a_wrong_key_still_fails_to_authenticate(adapter: AESGCMChunkedAdapter) 
         adapter.decrypt_chunk(blob, key=b"\x99" * 32, **CHUNK)
 
 
-@pytest.mark.parametrize("adapter", ADAPTERS, ids=["v2-default", "v1-deprecated"])
-def test_no_two_encryptions_share_a_nonce_across_the_whole_input_space(adapter: AESGCMChunkedAdapter) -> None:
-    """The property behind the two example tests above: uniqueness holds for ANY inputs.
+@st.composite
+def _identities(draw: st.DrawFn) -> dict[str, object]:
+    """A chunk identity: everything the old derivation hashed, and nothing else.
 
-    What this adds over them, measured rather than assumed: every example encrypts two DIFFERENT
-    plaintexts, so a nonce derived from the plaintext satisfies all of them — verified, all four
-    stay green under that mutation — while still colliding whenever a client re-uploads the same
-    bytes, which is the commonest retry of all. Only a grid that repeats plaintexts sees it. The
-    grid also varies key and chunk identity, so uniqueness is asserted across the whole space
-    rather than at one point in it.
-
-    Deliberately a seeded grid rather than `hypothesis`: that dependency arrives on the SSD
-    read-tier branch, and declaring it here too would put both branches' `uv.lock` in conflict
-    for no extra coverage. Worth converting to a real property test once the two have merged.
+    `part_number` and `chunk_index` span the full `struct.pack("<II")` range the AAD builder packs
+    them into, so the boundaries are part of what is asserted rather than left to a fixed grid's
+    choice of 1 and 7. The string fields are unrestricted text because bucket and object ids reach
+    this adapter as UTF-8 of arbitrary content.
     """
-    rng = random.Random(20260809)  # noqa: S311 - test-input generation, not cryptographic
-    keys = [bytes([b]) * 32 for b in (0x11, 0x22, 0x33)]
-    identities = [
-        {"bucket_id": f"bucket-{b}", "object_id": f"object-{o}", "part_number": p, "chunk_index": c, "upload_id": "u"}
-        for b in (1, 2)
-        for o in (1, 2)
-        for p in (1, 7)
-        for c in (0, 5)
-    ]
+    return {
+        "bucket_id": draw(st.text(max_size=24)),
+        "object_id": draw(st.text(max_size=24)),
+        "part_number": draw(st.integers(min_value=0, max_value=2**32 - 1)),
+        "chunk_index": draw(st.integers(min_value=0, max_value=2**32 - 1)),
+        "upload_id": draw(st.text(max_size=24)),
+    }
 
-    seen: dict[bytes, str] = {}
-    for key in keys:
-        for identity in identities:
-            for repeat in range(3):
-                plaintext = bytes(rng.getrandbits(8) for _ in range(rng.choice((1, 16, 64))))
-                nonce = _nonce(adapter.encrypt_chunk(plaintext, key=key, **identity), adapter)
-                where = f"key={key[0]:#x} identity={identity} repeat={repeat}"
 
-                assert len(nonce) == adapter.NONCE_SIZE, f"wrong nonce width at {where}"  # type: ignore[attr-defined]
-                assert nonce not in seen, f"nonce reused: {where} collides with {seen[nonce]}"
-                seen[nonce] = where
+# 32-byte AES-256 keys, and plaintexts including the empty one — a zero-length chunk is reachable
+# and is the shortest input whose nonce still has to be unique.
+_KEYS = st.binary(min_size=32, max_size=32)
+_PLAINTEXTS = st.binary(max_size=256)
+
+# Real AES-GCM per encryption and up to 5 per example, so a few hundred examples is a few thousand
+# encryptions — enough to cover the space densely while the unit suite stays fast.
+_PROPERTY = settings(max_examples=300, deadline=None)
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS, ids=["v2-default", "v1-deprecated"])
+@_PROPERTY
+@given(plaintext=_PLAINTEXTS, key=_KEYS, identity=_identities(), repeats=st.integers(min_value=2, max_value=5))
+def test_encrypting_identical_inputs_never_repeats_a_nonce(
+    adapter: AESGCMChunkedAdapter,
+    plaintext: bytes,
+    key: bytes,
+    identity: dict[str, object],
+    repeats: int,
+) -> None:
+    """The property the two example tests above are instances of, stated over the whole input space.
+
+    The inputs are held IDENTICAL across the repeats, and that is the entire point. A derived nonce
+    is by definition a pure function of whatever it is derived from, so equal inputs must give it
+    equal outputs — which makes this the exact falsifier for "derived from anything at all",
+    including inputs nobody thought to vary.
+
+    That distinction is not theoretical. Every example test in this file encrypts two DIFFERENT
+    plaintexts, so a nonce derived from the PLAINTEXT satisfies all of them — measured, they stay
+    green under that mutation — while still colliding whenever a client re-uploads the same bytes,
+    which is the commonest retry there is. Only repeating the inputs exactly can see it.
+
+    The width is asserted here too because `decrypt_chunk` slices the nonce off by
+    `NONCE_SIZE`: a nonce of the wrong length is not a weak nonce, it is a corrupt frame.
+    """
+    nonces = [_nonce(adapter.encrypt_chunk(plaintext, key=key, **identity), adapter) for _ in range(repeats)]  # type: ignore[arg-type]
+
+    for nonce in nonces:
+        assert len(nonce) == adapter.NONCE_SIZE, f"nonce is {len(nonce)} bytes, not {adapter.NONCE_SIZE}"  # type: ignore[attr-defined]
+    assert len(set(nonces)) == repeats, (
+        f"{repeats} encryptions of identical inputs produced {len(set(nonces))} distinct nonces — "
+        "the nonce is a function of its inputs, so an UploadPart retry reuses it"
+    )
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS, ids=["v2-default", "v1-deprecated"])
+@_PROPERTY
+@given(plaintext=_PLAINTEXTS, key=_KEYS, identity=_identities())
+def test_every_generated_chunk_still_round_trips(
+    adapter: AESGCMChunkedAdapter,
+    plaintext: bytes,
+    key: bytes,
+    identity: dict[str, object],
+) -> None:
+    """Uniqueness must not have been bought by breaking correctness.
+
+    Randomising the nonce is only safe because it travels in the ciphertext and `decrypt_chunk`
+    reads it from there instead of re-deriving it. This is that claim over the same generated space
+    as the property above, so no input shape can satisfy uniqueness while failing to decrypt — the
+    empty plaintext and the `2**32 - 1` identity boundaries included.
+    """
+    blob = adapter.encrypt_chunk(plaintext, key=key, **identity)  # type: ignore[arg-type]
+
+    assert adapter.decrypt_chunk(blob, key=key, **identity) == plaintext  # type: ignore[arg-type]
