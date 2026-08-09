@@ -85,11 +85,14 @@ class ReadRecencyRecorder:
                     int(part_number),
                 )
             _record_write("written")
-        except (asyncpg.PostgresError, OSError) as exc:
+        except Exception as exc:  # noqa: BLE001 - a bookkeeping stamp must never fail its caller
             _record_write("failed")
             # Best-effort, like every other bookkeeping write on this path. The chunk is already
             # served; losing the stamp means the part is evicted somewhat earlier than it
-            # deserves, which is exactly the FIFO behaviour this replaces.
+            # deserves, which is exactly the FIFO behaviour this replaces. Deliberately broader
+            # than (PostgresError, OSError): asyncpg.InterfaceError — a closing/uninitialised
+            # pool — is NEITHER, and since write_meta awaits this recorder bare, letting it
+            # escape would fail the client PUT and skip the landed announcement below it.
             logger.debug(
                 "recording read recency failed for %s v%s part %s: %s",
                 object_id,

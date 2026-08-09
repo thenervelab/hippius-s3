@@ -177,6 +177,43 @@ async def test_a_failing_announcement_does_not_fail_the_write(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_a_failing_recency_stamp_does_not_fail_the_write() -> None:
+    """The stamp's other never-fail half, through the REAL recorder.
+
+    asyncpg.InterfaceError (a closing/uninitialised pool) is neither PostgresError nor
+    OSError, so a narrowly-guarded recorder would let it escape write_meta — failing the
+    client PUT and, worse, skipping the announcement below it, the very signal the B-2
+    re-drive depends on. The write must complete and the announcement must still fire.
+    """
+    import asyncpg
+
+    from hippius_s3.cache.read_recency import ReadRecencyRecorder
+
+    order: list[str] = []
+
+    class RecordingStore:
+        async def set_meta(self, *_a, **_kw) -> None:
+            order.append("meta")
+
+    class ClosingPool:
+        def acquire(self) -> None:
+            raise asyncpg.InterfaceError("pool is closing")
+
+    class RecordingPublisher:
+        async def publish(self, *_a) -> None:
+            order.append("announce")
+
+    read_recency._recorder = ReadRecencyRecorder(ClosingPool(), "node-a")
+    landed._publisher = RecordingPublisher()
+
+    await WriteThroughPartsWriter(RecordingStore(), None, ttl_seconds=60).write_meta(
+        OBJ, 1, 1, chunk_size=4, num_chunks=1, plain_size=4
+    )
+
+    assert order == ["meta", "announce"]
+
+
+@pytest.mark.asyncio
 async def test_write_meta_stamps_recency_before_the_announcement() -> None:
     """The evict-vs-reland shield's ordering half.
 
