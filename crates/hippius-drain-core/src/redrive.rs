@@ -48,6 +48,32 @@
 //! naming a part that is ALREADY `replicated` is, by construction, a rewrite of a drained part
 //! — the rare event, and the only one worth paying a hash for.
 //!
+//! # The eviction race, and the gate that closes it
+//!
+//! Between the rewrite and [`redrive_diverged_part`](crate::Store::redrive_diverged_part)'s
+//! commit, the rewritten part's SSD copy is the ONLY copy of the client's new bytes — yet its
+//! row still reads `replicated` and nothing on the rewrite path touches the residency recency
+//! the LRU evictor sorts on, so the part ranks as maximally COLD. An evictor unlink inside that
+//! window destroys the new bytes; the digest check then reads `NotFound`, nothing is re-driven,
+//! and the pool permanently serves the superseded plaintext. Three defenses, outermost first:
+//!
+//! - the api stamps the part's residency recency at the same choke point that announces
+//!   (`WriteThroughPartsWriter.write_meta`), so the part is LRU-hottest for the whole
+//!   announcement latency (best-effort, ordering only — a pass that must walk the entire
+//!   cursor ignores rank);
+//! - [`record_landed_part`](crate::Store::record_landed_part) stamps `relanded_at` when the
+//!   announced part already reads `replicated`, and the eviction worklist EXCLUDES rows
+//!   re-landed within a grace window — a hard gate from the record to well past the check;
+//! - a `NotFound` at digest time is classified [`RelandOutcome::Vanished`] by
+//!   [`reland_read_outcome`] rather than lumped into `Unreadable`, so the lost-race signature
+//!   — possible destruction of acknowledged bytes — is loud and counted apart from a flaky
+//!   disk.
+//!
+//! What remains open: an eviction pass that fetched its worklist page BEFORE the stamps and
+//! unlinks after (bounded by one page's processing time), and a rewrite whose announcement is
+//! delayed past the recency stamp's protection while the evictor is walking its whole cursor.
+//! Both end in `Vanished`, which is the alarm for exactly that.
+//!
 //! **The residual gap, stated plainly:** the announcement queue is at-most-once by design (a
 //! Redis restart or a trimmed queue drops messages). A dropped announcement for a re-uploaded
 //! part leaves that part in exactly today's broken state. This is a strict improvement, not a
@@ -55,6 +81,7 @@
 
 use crate::apipart::ChunkIndex;
 use crate::partdrain::PartSource;
+use crate::snapshot::RelandOutcome;
 use crate::state::ReplicationState;
 use sha2::{Digest, Sha256};
 
@@ -161,6 +188,28 @@ pub fn verdict_for_reland(state: ReplicationState, stored: Option<&PartDigest>, 
     }
 }
 
+/// Classifies a failed digest read into the reland outcome it should count as.
+///
+/// `NotFound` is not disk trouble: an announcement fires only when a part was just written, so
+/// its directory being absent moments later means something unlinked it in between — the
+/// evictor or the reclaimer racing the check. If the rewrite had diverged, its only copy is
+/// gone and the pool permanently serves the superseded bytes, so this maps to
+/// [`RelandOutcome::Vanished`] — the possible-data-loss signature — while every other error
+/// keeps the flaky-disk reading, [`RelandOutcome::Unreadable`]. Neither re-drives: a re-drive
+/// without readable source bytes could only flip a servable row toward `failed`.
+///
+/// Pure, like [`verdict_for_reland`], so the split is pinned by unit tests rather than living
+/// in the agent's log statements.
+#[must_use]
+pub fn reland_read_outcome(kind: std::io::ErrorKind) -> RelandOutcome {
+    // ErrorKind is #[non_exhaustive]; everything that is not the vanished signature is, by
+    // definition here, an unreadable part.
+    match kind {
+        std::io::ErrorKind::NotFound => RelandOutcome::Vanished,
+        _ => RelandOutcome::Unreadable,
+    }
+}
+
 /// Derives a part's digest from its SSD copy, by hashing every chunk the source lists.
 ///
 /// The expensive half of the check, deliberately kept behind the state test: it reads the whole
@@ -184,8 +233,9 @@ pub async fn observed_part_digest<S: PartSource>(ssd: &S, part: &crate::apipart:
 
 #[cfg(test)]
 mod tests {
-    use super::{PartDigest, RelandVerdict, part_digest, verdict_for_reland};
+    use super::{PartDigest, RelandOutcome, RelandVerdict, part_digest, reland_read_outcome, verdict_for_reland};
     use crate::state::ReplicationState;
+    use std::io::ErrorKind;
 
     #[test]
     fn a_digest_is_stable_and_separates_content_order_and_count() {
@@ -240,5 +290,30 @@ mod tests {
         assert_eq!(verdict, RelandVerdict::Unverifiable);
         assert!(verdict.redrives());
         assert_ne!(verdict, RelandVerdict::Diverged);
+    }
+
+    #[test]
+    fn a_vanished_part_is_the_lost_race_signature_not_a_flaky_disk() {
+        // The discriminator this exists for. An announced part was JUST written, so NotFound at
+        // digest time means something unlinked it between the rewrite and the check — the
+        // evict-vs-reland race, whose worst case is destruction of the client's acknowledged
+        // bytes with the pool left serving the superseded ones. Lumping it into Unreadable hid
+        // that signature behind "local-disk trouble", which has the opposite operator response.
+        assert_eq!(reland_read_outcome(ErrorKind::NotFound), RelandOutcome::Vanished);
+    }
+
+    #[test]
+    fn every_other_read_failure_stays_the_flaky_disk_reading() {
+        // The pre-existing fail-safe: a disk that cannot be read decides nothing, and re-driving
+        // on it would re-copy the shard. Only the absent-directory signature is pulled out.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::TimedOut,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::InvalidData,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(reland_read_outcome(kind), RelandOutcome::Unreadable, "{kind:?}");
+        }
     }
 }
