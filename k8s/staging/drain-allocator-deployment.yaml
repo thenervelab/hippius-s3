@@ -110,6 +110,9 @@ spec:
             # is the actual pool protection, and the janitor's pool-gated eviction has
             # outpaced a 50 MB/s drain all day. Must stay <= CEPHOR_CEPH_CEILING_BPS
             # (config-enforced) and should move WITH the ceph watermarks if retuned.
+            # This is ALSO the rate the fleet decays to while the mgr scrape is failing:
+            # a blind probe cannot tell an open pool from a full one, so raising this
+            # loosens the blind fail-safe as well as the known-near-full cap.
             - name: CEPHOR_CEPH_NEARFULL_RATE_BPS
               value: "50000000"
           resources:

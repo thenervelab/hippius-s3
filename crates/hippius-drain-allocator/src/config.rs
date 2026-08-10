@@ -209,6 +209,31 @@ impl AllocatorConfig {
         StaticCeiling(CephCeiling::Open(self.ceph_ceiling))
     }
 
+    /// The settings the live Ceph-mgr probe scrapes `url` with.
+    ///
+    /// The blind-decay floor is the near-full rate, *not* `alloc.min_total`: while the
+    /// probe cannot read the mgr it cannot tell an open pool from a full one, so the
+    /// rate the fleet keeps must be no looser than the one a KNOWN near-full pool
+    /// carries. `min_total` is an operator latency knob tuned to keep the drain out of
+    /// its collapse threshold and may sit far above any safe blind rate — and the
+    /// 2026-07-24 incident shape (a renamed/missing target pool) reaches exactly this
+    /// path, because a pool the scrape does not mention is a parse failure and so a
+    /// decay. Sharing one variable for both made a floor raise silently loosen the
+    /// fail-safe.
+    #[cfg(feature = "http")]
+    #[must_use]
+    pub fn probe_settings(&self, url: String) -> crate::probe::ProbeSettings {
+        crate::probe::ProbeSettings {
+            url,
+            ceiling_rate: self.ceph_ceiling,
+            nearfull_rate: self.ceph_nearfull_rate,
+            floor: self.ceph_nearfull_rate,
+            thresholds: self.ceph_thresholds,
+            timeout: self.ceph_probe_timeout,
+            pools: self.ceph_pools.clone(),
+        }
+    }
+
     /// Parsing core: resolves each key through `get`. Separated from
     /// [`from_env`](Self::from_env) so tests drive it with a fixture map.
     fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
@@ -218,6 +243,17 @@ impl AllocatorConfig {
             return Err(ConfigError::OutOfRange {
                 var: "CEPHOR_ALLOC_MIN_TOTAL_BPS",
                 value: min_total,
+                limit: max_total,
+            });
+        }
+        // The starting estimate lives in the same band as the estimate itself: above
+        // `max_total` the first ticks would allocate a rate the AIMD is not allowed to
+        // hold, and the back-off only walks it down geometrically.
+        let initial_total = positive_u64(&get, "CEPHOR_ALLOC_INITIAL_TOTAL_BPS", min_total)?;
+        if initial_total > max_total {
+            return Err(ConfigError::OutOfRange {
+                var: "CEPHOR_ALLOC_INITIAL_TOTAL_BPS",
+                value: initial_total,
                 limit: max_total,
             });
         }
@@ -254,7 +290,7 @@ impl AllocatorConfig {
             ceph_ceiling: ByteRate::new(ceph_ceiling),
             // The first tick starts from the AIMD floor unless overridden, so a
             // fresh leader ramps up from a safe rate rather than a guess.
-            initial_total: ByteRate::new(u64_or(&get, "CEPHOR_ALLOC_INITIAL_TOTAL_BPS", min_total)?),
+            initial_total: ByteRate::new(initial_total),
             alloc,
             ceph_mgr_metrics_url: optional(&get, "CEPHOR_CEPH_MGR_METRICS_URL"),
             ceph_thresholds: ceph_thresholds(&get)?,
@@ -396,6 +432,8 @@ mod tests {
         AllocatorConfig, ConfigError, DEFAULT_ALLOCATION_TTL, DEFAULT_CRITICAL_PRESSURE_BPS, DEFAULT_DECREASE_PERMILLE, DEFAULT_MAX_TOTAL_BPS,
         DEFAULT_MIN_TOTAL_BPS, DEFAULT_STATUS_RETENTION, DEFAULT_TICK,
     };
+    #[cfg(feature = "http")]
+    use hippius_drain_core::decay;
     use hippius_drain_core::{ByteRate, CephCeiling, DiskPressure};
 
     /// A `get` closure backed by an owned fixture list (no process env touched).
@@ -565,6 +603,54 @@ mod tests {
     }
 
     #[test]
+    fn an_initial_total_above_the_max_total_is_out_of_range() {
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_ALLOC_MAX_TOTAL_BPS", "1000000000"));
+        pairs.push(("CEPHOR_ALLOC_INITIAL_TOTAL_BPS", "2000000000"));
+        let err = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::OutOfRange {
+                var: "CEPHOR_ALLOC_INITIAL_TOTAL_BPS",
+                value: 2_000_000_000,
+                limit: 1_000_000_000,
+            }
+        ));
+    }
+
+    #[test]
+    fn a_zero_initial_total_is_rejected() {
+        // A zero start allocates nothing on the first tick and only reaches a useful
+        // rate additively, so a fat-fingered zero must fail startup like any other rate.
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_ALLOC_INITIAL_TOTAL_BPS", "0"));
+        let err = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::NonPositive {
+                var: "CEPHOR_ALLOC_INITIAL_TOTAL_BPS"
+            }
+        ));
+    }
+
+    #[test]
+    fn the_alloc_tuning_vars_are_read_from_the_environment() {
+        // The four AIMD knobs deployed together, asserted together: each is otherwise
+        // silently defaulted, so a variable-name typo in the k8s manifest is
+        // indistinguishable from "the operator did not set it".
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_ALLOC_MIN_TOTAL_BPS", "250000000"));
+        pairs.push(("CEPHOR_ALLOC_INITIAL_TOTAL_BPS", "500000000"));
+        pairs.push(("CEPHOR_ALLOC_DECREASE_PERMILLE", "950"));
+        pairs.push(("CEPHOR_ALLOC_ADDITIVE_INCREASE_BPS", "50000000"));
+        let config = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap();
+        assert_eq!(config.alloc.min_total, ByteRate::new(250_000_000));
+        assert_eq!(config.initial_total, ByteRate::new(500_000_000));
+        assert_eq!(config.alloc.decrease_permille, 950);
+        assert_eq!(config.alloc.additive_increase, ByteRate::new(50_000_000));
+    }
+
+    #[test]
     fn a_non_numeric_tick_is_invalid() {
         let mut pairs = required_only();
         pairs.push(("CEPHOR_ALLOCATOR_TICK_SECS", "soon"));
@@ -642,6 +728,27 @@ mod tests {
                 limit: 1_000_000_000,
             }
         ));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn the_blind_probe_floor_is_never_looser_than_the_nearfull_rate() {
+        // A blind probe cannot tell an open pool from a full one, so the rate it bottoms
+        // out at must be the rate a KNOWN near-full pool carries — whatever the AIMD
+        // floor happens to be tuned to. While the two shared
+        // CEPHOR_ALLOC_MIN_TOTAL_BPS, prod's 250 MB/s latency floor let the fleet keep
+        // writing 5x the near-full rate for as long as the mgr stayed unreachable.
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_ALLOC_MIN_TOTAL_BPS", "250000000"));
+        pairs.push(("CEPHOR_CEPH_NEARFULL_RATE_BPS", "50000000"));
+        let config = AllocatorConfig::from_lookup(lookup(&pairs)).unwrap();
+        let settings = config.probe_settings("http://rook-ceph-mgr.rook-ceph.svc:9283/metrics".to_owned());
+        assert_eq!(settings.floor, config.ceph_nearfull_rate, "the decay floor tracks the near-full rate");
+        assert_eq!(
+            decay(CephCeiling::Open(ByteRate::new(1_000_000_000)), u32::MAX, settings.floor),
+            CephCeiling::Open(ByteRate::new(50_000_000)),
+            "an indefinitely blind probe bottoms out at the near-full rate, not the AIMD floor",
+        );
     }
 
     #[test]
