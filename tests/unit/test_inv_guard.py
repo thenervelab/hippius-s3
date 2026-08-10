@@ -115,8 +115,11 @@ def test_g4_skip_when_pg_unreachable():
 
 
 # ----------------------------------------------------------------- G6 terminal monotonicity
-def _crs_rows(status_by_part: dict[int, str]) -> list[list[str]]:
-    return [["obj-a", "1", str(pn), st] for pn, st in status_by_part.items()]
+def _crs_rows(status_by_part: dict[int, str], recently_relanded: bool = False) -> list[list[str]]:
+    """G6's sampled row shape. The 5th column is the SQL-evaluated reland-recency boolean, rendered
+    by `psql -tA` as 't'/'f' — 'f' also stands in for a NULL `relanded_at` (never re-landed)."""
+    relanded = "t" if recently_relanded else "f"
+    return [["obj-a", "1", str(pn), st, relanded] for pn, st in status_by_part.items()]
 
 
 def test_g6_seeds_then_ok_on_forward_progress():
@@ -130,7 +133,7 @@ def test_g6_seeds_then_ok_on_forward_progress():
 def test_g6_breach_on_terminal_regression():
     g = guards.TerminalMonotonicity()
     g.check(FakeProbe(rows=_crs_rows({0: "replicated"})))  # seed a terminal row
-    # replicated -> pending is a terminal-state regression
+    # replicated -> pending with no reland stamp is a terminal-state regression
     r = g.check(FakeProbe(rows=_crs_rows({0: "pending"})))
     assert r.status == "breach" and "regression" in r.detail
 
@@ -144,6 +147,96 @@ def test_g6_breach_on_failed_leaving_terminal():
 
 def test_g6_skip_when_pg_unreachable():
     assert guards.TerminalMonotonicity().check(FakeProbe(rows=None)).status == "skip"
+
+
+def test_g6_ok_on_b2_redrive_after_recent_reland():
+    # The B-2 content-change re-drive: record_landed_part stamps relanded_at BEFORE
+    # redrive_diverged_part flips the row, so the pending sample always carries a fresh stamp.
+    g = guards.TerminalMonotonicity()
+    g.check(FakeProbe(rows=_crs_rows({0: "replicated"})))
+    r = g.check(FakeProbe(rows=_crs_rows({0: "pending"}, recently_relanded=True)))
+    assert r.status == "ok", "a re-drive downstream of a fresh re-landing is legitimate"
+
+
+def test_g6_breach_on_replicated_to_pending_with_stale_reland():
+    # relanded_at older than the recency window (or NULL) means no re-drive caused this exit — the
+    # silent-data-loss shape the guard exists for. The SQL predicate renders both cases as 'f'.
+    g = guards.TerminalMonotonicity()
+    g.check(FakeProbe(rows=_crs_rows({0: "replicated"}, recently_relanded=True)))
+    r = g.check(FakeProbe(rows=_crs_rows({0: "pending"}, recently_relanded=False)))
+    assert r.status == "breach", "the carve-out reads the CURRENT sample's recency, not the previous one"
+
+
+def test_g6_breach_on_replicated_to_failed_despite_recent_reland():
+    # The carve-out is scoped to the one transition the re-drive makes; a fresh stamp does not
+    # license any other terminal exit.
+    g = guards.TerminalMonotonicity()
+    g.check(FakeProbe(rows=_crs_rows({0: "replicated"}, recently_relanded=True)))
+    r = g.check(FakeProbe(rows=_crs_rows({0: "failed"}, recently_relanded=True)))
+    assert r.status == "breach"
+
+
+def test_g6_skip_when_sample_rows_are_short():
+    # If the sample query loses the reland column, every row is unreadable — that must read as skip,
+    # not as an `ok` over zero tracked rows.
+    g = guards.TerminalMonotonicity()
+    r = g.check(FakeProbe(rows=[["obj-a", "1", "0", "replicated"]]))
+    assert r.status == "skip" and "columns" in r.detail
+
+
+def test_g6_ok_on_corrupt_to_pending():
+    # R4's bounded re-drive worker: `corrupt` is not in _TERMINAL, so leaving it needs no carve-out.
+    g = guards.TerminalMonotonicity()
+    g.check(FakeProbe(rows=_crs_rows({0: "corrupt"})))
+    assert g.check(FakeProbe(rows=_crs_rows({0: "pending"}))).status == "ok"
+
+
+class NoRelandColumnProbe:
+    """A cluster predating the B-2 migration: any query naming `relanded_at` fails (psql error ->
+    None), the plain 4-column sample answers."""
+
+    def __init__(self, status: str):
+        self._status = status
+        self.reland_queries = 0
+
+    def pg(self, sql: str) -> list[list[str]] | None:
+        if "relanded_at" in sql:
+            self.reland_queries += 1
+            return None
+        return [["obj-a", "1", "0", self._status]]
+
+    def pg_scalar(self, sql: str) -> str | None:
+        return None
+
+    def prom_scalar(self, promql: str) -> float | None:
+        return None
+
+
+def test_g6_falls_back_to_strict_when_reland_column_absent():
+    # No relanded_at means no re-drive can have happened, so every terminal exit still breaches —
+    # and the guard must keep asserting rather than reading `postgres unreachable` all run.
+    g = guards.TerminalMonotonicity()
+    assert g.check(NoRelandColumnProbe("replicated")).status == "ok"
+    r = g.check(NoRelandColumnProbe("pending"))
+    assert r.status == "breach"
+
+
+def test_g6_stops_probing_the_absent_column_after_the_first_fallback():
+    g = guards.TerminalMonotonicity()
+    probe = NoRelandColumnProbe("replicated")
+    for _ in range(3):
+        g.check(probe)
+    assert probe.reland_queries == 1, "the absent-column verdict must latch, not re-probe every poll"
+
+
+def test_g6_unreachable_pg_does_not_latch_the_fallback():
+    # Both queries failing is the genuinely-unreachable case; the recency sample must resume once pg
+    # is back, or a transient outage would permanently downgrade the guard and re-arm the false breach.
+    g = guards.TerminalMonotonicity()
+    assert g.check(FakeProbe(rows=None)).status == "skip"
+    g.check(FakeProbe(rows=_crs_rows({0: "replicated"})))
+    r = g.check(FakeProbe(rows=_crs_rows({0: "pending"}, recently_relanded=True)))
+    assert r.status == "ok"
 
 
 # ----------------------------------------------------------------- G9 aged-pending-orphan backlog
