@@ -1249,10 +1249,32 @@ impl Store {
     /// Records that `part` is now resident on this node's SSD, with its size for the eviction
     /// cursor's accounting.
     ///
-    /// Called by the drain right after it commits `replicated` (it retains its copy), and by
-    /// the api after a read-through promotion copies a part onto a node that did not ingest it.
-    /// Idempotent on re-drive: a part that goes `corrupt → pending → replicated` re-asserts
-    /// residency it never actually lost.
+    /// Called by the drain just BEFORE it commits `replicated` (it retains its copy — see
+    /// [`PartReplicationStore::mark_resident`](crate::PartReplicationStore::mark_resident) for why
+    /// that order and not the reverse), and by the api after a read-through promotion copies a
+    /// part onto a node that did not ingest it. Idempotent on re-drive: a part that goes
+    /// `corrupt → pending → replicated` re-asserts residency it never actually lost.
+    ///
+    /// # A second process writes this row, with the opposite conflict action
+    ///
+    /// `ResidencyRecorder` in `hippius_s3/cache/residency.py` upserts the same primary key with
+    /// `DO UPDATE SET bytes = cephor_ssd_residency.bytes + EXCLUDED.bytes` — it ACCUMULATES, where
+    /// this OVERWRITES. Neither is wrong on its own: the drain knows the whole part's size at
+    /// commit and states it, while promotion learns the part one chunk at a time and has to add.
+    ///
+    /// They do not collide on a live (node, part) because the drain records only on its own
+    /// commit; a part resident on this node is served from this node and therefore never promoted
+    /// here; and eviction DELETEs the row and unlinks the directory together, resetting both
+    /// writers to the same empty starting point.
+    ///
+    /// **Nothing enforces that.** No constraint, no trigger, no shared code path holds the two
+    /// semantics apart — it is an argument about who writes when, and it is only as true as the
+    /// read path. The shape that breaks it is a PARTIALLY promoted part: locality is decided per
+    /// CHUNK (a range GET promotes only the chunks it touches) while residency is keyed per PART,
+    /// so a node can hold some chunks of a part and still miss the rest. If that node later
+    /// drain-commits the same part, one writer's figure replaces or is added to the other's. The
+    /// damage is a wrong `bytes`, which is what the evictor sums against its deficit — so the
+    /// symptom is a pass that stops short or walks too far, reporting success either way.
     ///
     /// # Errors
     ///
@@ -2009,9 +2031,11 @@ mod part_tests {
     #[sqlx::test]
     async fn committing_a_replication_marks_the_part_resident_on_the_ssd(pool: PgPool) {
         // The drain now KEEPS its SSD copy after replicating, so the commit is exactly when a
-        // part joins the read tier. Stamping resident_at inside that same UPDATE means there
-        // is no window where a part is replicated but unaccounted — a window in which the
-        // evictor could not see it and the heartbeat would under-report cache_bytes.
+        // part joins the read tier. Residency is a SEPARATE statement from the commit — the
+        // commit writes only `status`/`corrupt_attempts`/`updated_at` — so what this asserts is
+        // the pair's end state: committed AND accounted, i.e. on the evictor's worklist and in
+        // the heartbeat's cache_bytes. `drain_part` is what orders the two, and it records
+        // residency FIRST so no crash can leave a committed part unaccounted.
         create_app_schema(&pool).await;
         let store = Store::from_pool(pool.clone()).with_node_id("node-a");
         let p = part(UUID_A, 5, 1);

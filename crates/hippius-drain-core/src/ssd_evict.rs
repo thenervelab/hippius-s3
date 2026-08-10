@@ -28,13 +28,28 @@
 //!
 //! # Policy vs. mechanism
 //!
-//! Eviction order is FIFO by `resident_at` — oldest retained first — supplied by the store's
-//! indexed cursor. That is a deliberate v1: it is O(evicted), not O(resident), so it does not
-//! repeat the janitor's walk-based eviction, which is readdir-bound at ~36 obj/s and starves
-//! its own tail. True LRU needs node-local read recency, which does not exist yet (the shared
-//! `fs_cache_inventory.last_access_at` is fleet-wide, so a read on one node would look hot on
-//! every node). The mechanism here is policy-agnostic — ordering lives entirely in the store's
-//! `ORDER BY` — so promoting FIFO to recency later changes one query, not this worker.
+//! Eviction order is least-recently-USED with FIFO as its fallback, supplied by the store's
+//! indexed cursor: `ORDER BY COALESCE(last_read_at, resident_at)`, oldest first. `resident_at`
+//! alone says when a part JOINED the cache, which says nothing about whether anyone is still
+//! reading it — that is FIFO, and FIFO is a poor fit for a working set re-read every epoch, where
+//! evicting by arrival order tends to take exactly the parts about to be read again, each costing
+//! a peer-or-pool read plus a local write to put it back.
+//!
+//! `last_read_at` (migration 0017) is stamped by `hippius_s3/cache/read_recency.py` when a node
+//! serves a part off its own flash. It lives on `cephor_ssd_residency`, which is keyed by node, so
+//! it says which node's copy was read — unlike the fleet-wide `fs_cache_inventory.last_access_at`,
+//! where a read on one node would make the part look hot on every node. It is sampled per part per
+//! window, so the read path pays a write per window rather than per chunk; a lost sample only
+//! evicts the part somewhat earlier than it deserved.
+//!
+//! COALESCE is what buys the fallback for free. A part nobody has read since 0017 shipped has no
+//! recency, so it sorts on its arrival time — which is precisely the old behaviour. No backfill,
+//! and no window in which the order is undefined.
+//!
+//! Either policy is O(evicted), not O(resident), so it does not repeat the janitor's walk-based
+//! eviction, which is readdir-bound at ~36 obj/s and starves its own tail. The mechanism here
+//! stays policy-agnostic — ordering lives entirely in the store's `ORDER BY` — so a further change
+//! of policy changes one query, not this worker.
 //!
 //! # Hysteresis
 //!
@@ -52,6 +67,7 @@ use crate::clock::Clock;
 use crate::ssd_reclaim::PartRemover;
 use crate::state::ReplicationState;
 use core::future::Future;
+use std::collections::HashSet;
 use thiserror::Error;
 
 /// One resident part as the eviction worklist reports it.
@@ -113,6 +129,35 @@ pub struct EvictionReport {
     /// see the module doc. A non-zero value means the worklist query no longer agrees with
     /// the eviction invariant, and is alert-worthy, not log-worthy.
     pub skipped_unreplicated: u64,
+    /// DISTINCT parts whose unlink failed and were skipped — counted once per part per pass, not
+    /// once per attempt. Not itself alertable (the existing `starved` covers "a whole page
+    /// failed"), but it is the DISCRIMINATOR between starved-because-unlink-is-failing (a disk or
+    /// permissions fault, or a promotion racing the removal) and
+    /// starved-because-the-cursor-is-exhausted (genuine backlog). Those two have completely
+    /// different operator responses and were previously indistinguishable, because the pass
+    /// aborted before producing a report at all.
+    ///
+    /// Distinctness is what makes it readable, and it is not free: the worklist has no cursor, so
+    /// an unmarked part is re-served on every later page and a naive count would tally attempts —
+    /// leaving `remove_failed = 6000` ambiguous between 6000 bad parts and one bad inode seen 6000
+    /// times, which is exactly the discrimination the field exists for. Note the asymmetry this
+    /// corrects: on the `starved` path the count was already right, because a wholly-failing page
+    /// trips `evicted.is_empty()` and breaks after one page. Only the non-starved path — a pass
+    /// that keeps making progress around a stuck part — could inflate.
+    pub remove_failed: u64,
+    /// The errno class of the most ACTIONABLE unlink failure this pass — not the first one seen.
+    /// `DirectoryNotEmpty` is the api winning a race to rename a promoted chunk into the directory
+    /// being removed, and it clears itself next tick; every other kind may not. So any other kind
+    /// displaces it, and otherwise the earliest is kept.
+    ///
+    /// Ranking rather than taking the first is the difference between a true statement and a
+    /// plausible one: the worklist is ordered by `COALESCE(last_read_at, resident_at)`, which is
+    /// unrelated to severity, so "first" would mean one transient race on the oldest part could
+    /// mask a read-only mount behind it and report the fault an operator can ignore.
+    /// Carried on the report rather than logged at the failure site
+    /// because this crate has no logging — see the module doc — and because a separate line would
+    /// not join to the structured record the agent already emits.
+    pub remove_failed_kind: Option<std::io::ErrorKind>,
     /// True only when the pass ran out of EVICTABLE PARTS before reaching its deficit — the
     /// disk is filling with something eviction cannot reclaim (backlog, debris, or a foreign
     /// writer). Not self-correcting, so it is the alertable condition.
@@ -171,9 +216,6 @@ pub enum EvictionError {
     /// would hand back a part that no longer exists.
     #[error("recording an eviction failed")]
     Mark(#[source] Box<dyn std::error::Error + Send + Sync>),
-    /// Unlinking an evicted part's directory failed.
-    #[error("unlinking an evicted part from the SSD cache failed")]
-    Remove(#[source] std::io::Error),
 }
 
 impl EvictionError {
@@ -196,7 +238,7 @@ pub trait ResidentLog: Send + Sync {
     /// Store-specific failure, boxed into [`EvictionError`].
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// This node's resident parts, **oldest-resident first**, at most `limit`.
+    /// This node's resident parts, **least-recently-used first**, at most `limit`.
     ///
     /// The ordering IS the eviction policy (see the module doc); the orchestrator walks
     /// whatever order it is handed and never re-sorts.
@@ -208,11 +250,11 @@ pub trait ResidentLog: Send + Sync {
     fn mark_evicted(&self, parts: &[PartKey]) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// Frees SSD space by evicting oldest-resident parts, **paging until the byte deficit is met**.
+/// Frees SSD space by evicting least-recently-used parts, **paging until the byte deficit is met**.
 ///
 /// A no-op when free space is at or above `target.reserve` — the common case, and it costs
 /// nothing: the worklist is not even queried. Once armed, it repeatedly fetches a page of the
-/// store's oldest-first cursor, unlinks each `replicated` part, stamps them evicted, and
+/// store's coldest-first cursor, unlinks each `replicated` part, stamps them evicted, and
 /// re-probes free space before deciding whether to continue.
 ///
 /// # Why it pages rather than taking one batch
@@ -233,8 +275,9 @@ pub trait ResidentLog: Send + Sync {
 /// - **Time budget** — sets [`budget_exhausted`](EvictionReport::budget_exhausted). Work
 ///   remains and the next tick resumes it. Routine.
 ///
-/// A full page that yields no eviction at all (every entry refused by the invariant) also stops
-/// the pass as starved, because continuing would re-fetch the same rows forever.
+/// A full page that yields no eviction at all (every entry refused by the invariant, or
+/// unlinkable) also stops the pass as starved, because continuing would re-fetch the same rows
+/// forever — nothing was marked, and the worklist has no cursor of its own.
 ///
 /// # Order of operations
 ///
@@ -249,10 +292,17 @@ pub trait ResidentLog: Send + Sync {
 /// by the accounted bytes it freed. Losing the probe should cost accuracy, not the eviction that
 /// is keeping ingest alive.
 ///
+/// A failing UNLINK is likewise not fatal, and for a sharper reason: aborting the pass returned
+/// before `mark_evicted`, which is the only thing that advances the cursor. Since the worklist is
+/// oldest-first and stable, a part that persistently refuses to be unlinked — EIO, EACCES, EROFS,
+/// or an `ENOTEMPTY` from the api renaming a promoted chunk into the directory being removed —
+/// pinned the head and every later pass died on the same row having freed nothing. The candidate
+/// is counted in [`remove_failed`](EvictionReport::remove_failed) and skipped; a page on which
+/// EVERY candidate fails still terminates the pass via the existing `starved` guard.
+///
 /// # Errors
 ///
 /// - [`EvictionError::Log`] if reading the worklist fails (nothing is removed).
-/// - [`EvictionError::Remove`] if unlinking fails.
 /// - [`EvictionError::Mark`] if recording the evictions fails after unlinking.
 pub async fn evict_to_target<L, R, P>(
     log: &L,
@@ -281,6 +331,10 @@ where
     let started = clock.now();
     // A zero page would query forever without making progress; treat it as one row.
     let page = pass.page.max(1);
+    // Pass-scoped, deliberately not persisted: a part that failed on EIO may well succeed on the
+    // next tick (a racing promotion finishes, a mount comes back), so forgetting between passes is
+    // the retry. Bounded by the parts one pass can touch.
+    let mut failed: HashSet<PartKey> = HashSet::new();
 
     loop {
         if clock.now().duration_since(started) >= pass.max_duration {
@@ -315,8 +369,37 @@ where
             if projected >= goal {
                 continue;
             }
+            // Already refused earlier in THIS pass, so do not attempt it again. The worklist has
+            // no OFFSET and no keyset cursor — paging works purely because `mark_evicted` DELETEs
+            // the residency row — so a candidate that was skipped rather than marked is re-served
+            // at the head of every later page. Re-attempting it would burn a syscall per page and,
+            // worse, count it per page: `remove_failed` would tally ATTEMPTS, and 6000 could mean
+            // either 6000 bad parts or one bad inode seen 6000 times. The counter exists to tell
+            // those apart, so it must count distinct parts.
+            if failed.contains(&candidate.part) {
+                continue;
+            }
+            if let Err(err) = remover.unlink_part(&candidate.part).await {
+                // Counted and skipped rather than propagated. Returning here landed BEFORE
+                // `mark_evicted`, and `mark_evicted` -> `drop_residency` is the only thing that
+                // advances the cursor — so on a stable oldest-first worklist one un-unlinkable
+                // part pinned the head and halted ALL eviction, with no report to carry `starved`.
+                report.remove_failed = report.remove_failed.saturating_add(1);
+                // Ranked by what needs a human, NOT by arrival order. `get_or_insert` here would
+                // keep whichever fault the worklist happened to order first, and the worklist is
+                // ordered by read recency — which has no relationship to severity. One transient
+                // `DirectoryNotEmpty` on the oldest part would then mask 511 EROFS behind it and
+                // report a promotion race for a read-only mount.
+                report.remove_failed_kind = match (report.remove_failed_kind, err.kind()) {
+                    (None | Some(std::io::ErrorKind::DirectoryNotEmpty), kind) => Some(kind),
+                    (existing, _) => existing,
+                };
+                failed.insert(candidate.part);
+                continue;
+            }
+            // Credited only now: a part that was not removed must not count toward the
+            // within-page early stop.
             projected = projected.saturating_add(candidate.bytes);
-            remover.unlink_part(&candidate.part).await.map_err(EvictionError::Remove)?;
             report.evicted += 1;
             freed_this_page = freed_this_page.saturating_add(candidate.bytes);
             evicted.push(candidate.part);
@@ -480,6 +563,59 @@ mod tests {
         fn unlink_part(&self, part: &PartKey) -> impl Future<Output = io::Result<()>> + Send {
             self.removed.lock().unwrap().push(key(part));
             async { Ok(()) }
+        }
+    }
+
+    /// A remover that refuses a fixed set of parts with a per-part errno, standing in for the
+    /// errors `unlink_part` does NOT map to `Ok` — EIO, EACCES, EROFS, and the `ENOTEMPTY` the api
+    /// can produce by renaming a promoted chunk into the very directory being removed.
+    ///
+    /// It OWNS a [`FakeRemover`] because [`CountingProbe`] takes `&FakeRemover` to drive free
+    /// space from what was actually unlinked; the success path delegates to it rather than
+    /// re-recording by hand, so this fake cannot diverge if `FakeRemover` ever gains behaviour.
+    ///
+    /// `refused` records every REJECTED attempt, which is what makes "the pass stopped retrying a
+    /// known-bad part" observable — a counter alone cannot tell a skipped attempt from an absent
+    /// one.
+    struct FlakyRemover {
+        inner: FakeRemover,
+        fails: Vec<(String, io::ErrorKind)>,
+        refused: Mutex<Vec<String>>,
+    }
+
+    impl FlakyRemover {
+        /// Refuses each part with EACCES — a persistent, intervention-needing fault.
+        fn failing_on(parts: &[PartKey]) -> Self {
+            let kinds: Vec<(PartKey, io::ErrorKind)> = parts.iter().map(|p| (p.clone(), io::ErrorKind::PermissionDenied)).collect();
+            Self::failing_with(&kinds)
+        }
+
+        fn failing_with(parts: &[(PartKey, io::ErrorKind)]) -> Self {
+            Self {
+                inner: FakeRemover::default(),
+                fails: parts.iter().map(|(part, kind)| (key(part), *kind)).collect(),
+                refused: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn removed(&self) -> Vec<String> {
+            self.inner.removed()
+        }
+
+        fn refused(&self) -> Vec<String> {
+            self.refused.lock().unwrap().clone()
+        }
+    }
+
+    impl PartRemover for FlakyRemover {
+        async fn unlink_part(&self, part: &PartKey) -> io::Result<()> {
+            let name = key(part);
+            let refusal = self.fails.iter().find(|(failing, _)| *failing == name).map(|(_, kind)| *kind);
+            if let Some(kind) = refusal {
+                self.refused.lock().unwrap().push(name);
+                return Err(io::Error::from(kind));
+            }
+            self.inner.unlink_part(part).await
         }
     }
 
@@ -660,6 +796,239 @@ mod tests {
         let removed = remover.removed();
         assert!(!removed.contains(&key(&part_at(3, 1))), "the pending part was unlinked");
         assert!(!removed.contains(&key(&part_at(4, 1))), "the corrupt part was unlinked");
+    }
+
+    #[tokio::test]
+    async fn a_candidate_whose_unlink_fails_does_not_stop_the_rest_of_the_page() {
+        // One un-unlinkable part used to abort the whole pass, and the abort landed BEFORE
+        // `mark_evicted` — so the parts already unlinked on that page were never recorded either.
+        // The marked count is therefore the assertion that matters: `mark_evicted` is the only
+        // thing that advances the cursor, and a pass that unlinks without marking has freed disk
+        // the worklist will keep offering back.
+        let parts: Vec<ResidentPart> = (1..=5).map(|v| resident(v, GIB)).collect();
+        let log = FakeLog::of(&parts);
+        let remover = FlakyRemover::failing_on(&[part_at(3, 1)]);
+        let probe = FakeProbe::new(300 * GIB, GIB);
+        let counting = CountingProbe {
+            probe: &probe,
+            remover: &remover.inner,
+        };
+        let clock = TestClock::new();
+        let target = EvictionTarget {
+            free: 300 * GIB,
+            reserve: 305 * GIB,
+            headroom: 0,
+        };
+
+        let report = evict_to_target(&log, &remover, &counting, &clock, target, pass(8)).await.unwrap();
+
+        assert_eq!(report.evicted, 4, "the other four candidates were still evicted");
+        assert_eq!(report.remove_failed, 1, "the refusal is counted, not propagated");
+        assert_eq!(log.marked().len(), 4, "the cursor advanced past every part that was actually unlinked");
+        assert!(
+            !remover.removed().contains(&key(&part_at(3, 1))),
+            "the refused part was reported as removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_persistently_failing_head_does_not_starve_later_passes() {
+        // The operational regression. The worklist is ordered oldest-first and stable, so a part
+        // that fails to unlink stays at the head; propagating that failure meant every subsequent
+        // pass died on the same row having freed nothing, indefinitely and silently — the report
+        // that carries `starved` was never produced, so neither eviction alert could fire.
+        let parts: Vec<ResidentPart> = (1..=10).map(|v| resident(v, GIB)).collect();
+        let log = FakeLog::of(&parts);
+        let head = part_at(1, 1);
+        let target = EvictionTarget {
+            free: 300 * GIB,
+            reserve: 303 * GIB,
+            headroom: 0,
+        };
+        let clock = TestClock::new();
+
+        let mut evicted_per_pass = Vec::new();
+        for _ in 0..2 {
+            // A fresh remover and probe per pass: the disk refills between polls, and the
+            // accounting must not carry over. The log does NOT reset — the failing head is still
+            // at the front of the cursor, which is the whole point.
+            let remover = FlakyRemover::failing_on(core::slice::from_ref(&head));
+            let probe = FakeProbe::new(300 * GIB, GIB);
+            let counting = CountingProbe {
+                probe: &probe,
+                remover: &remover.inner,
+            };
+            let report = evict_to_target(&log, &remover, &counting, &clock, target, pass(4)).await.unwrap();
+            assert_eq!(report.remove_failed, 1, "the head refused on every pass");
+            assert!(!report.starved, "the pass reached its floor around the stuck head");
+            evicted_per_pass.push(report.evicted);
+        }
+
+        assert!(
+            evicted_per_pass.iter().all(|&n| n > 0),
+            "a pass freed nothing behind the stuck head: {evicted_per_pass:?}"
+        );
+        assert!(
+            !log.marked().contains(&key(&head)),
+            "the head was never unlinked, so it must stay resident"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_unlink_does_not_credit_its_bytes_to_the_early_stop() {
+        // `projected` is the within-page early stop. Crediting a candidate's bytes before its
+        // unlink lets a part that was never removed satisfy the goal, so the page stops one part
+        // short of the deficit it actually owes. Free space is re-probed afterwards, so it
+        // self-corrects — by spending a whole extra page under exactly the disk pressure that
+        // makes pages expensive. Four candidates cover a three-part deficit only if the credit
+        // follows the unlink.
+        let parts: Vec<ResidentPart> = (1..=4).map(|v| resident(v, GIB)).collect();
+        let log = FakeLog::of(&parts);
+        let remover = FlakyRemover::failing_on(&[part_at(1, 1)]);
+        let probe = FakeProbe::new(300 * GIB, GIB);
+        let counting = CountingProbe {
+            probe: &probe,
+            remover: &remover.inner,
+        };
+        let clock = TestClock::new();
+        let target = EvictionTarget {
+            free: 300 * GIB,
+            reserve: 303 * GIB,
+            headroom: 0,
+        };
+
+        let report = evict_to_target(&log, &remover, &counting, &clock, target, pass(4)).await.unwrap();
+
+        assert_eq!(report.evicted, 3, "the deficit was covered by real unlinks, not by a phantom credit");
+        assert_eq!(report.pages, 1, "one page sufficed; a phantom credit would have needed a second");
+        assert_eq!(report.remove_failed, 1, "and the refusal was counted exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_stuck_part_is_counted_once_per_pass_however_many_pages_re_serve_it() {
+        // The worklist has no OFFSET and no keyset cursor: paging works only because
+        // `mark_evicted` DELETEs the residency row, so a part that was skipped rather than marked
+        // comes back at the head of EVERY later page. Counting each re-serve would make
+        // `remove_failed` a tally of attempts — at a 512 page and a 30 s poll, one permanently
+        // EIO inode climbs unboundedly and reads exactly like a mount-wide fault. The count must
+        // be of DISTINCT parts, and the pass must stop re-attempting what it already knows is bad.
+        let parts: Vec<ResidentPart> = (1..=12).map(|v| resident(v, GIB)).collect();
+        let log = FakeLog::of(&parts);
+        let head = part_at(1, 1);
+        let remover = FlakyRemover::failing_on(core::slice::from_ref(&head));
+        let probe = FakeProbe::new(300 * GIB, GIB);
+        let counting = CountingProbe {
+            probe: &probe,
+            remover: &remover.inner,
+        };
+        let clock = TestClock::new();
+        let target = EvictionTarget {
+            free: 300 * GIB,
+            reserve: 308 * GIB,
+            headroom: 0,
+        };
+
+        let report = evict_to_target(&log, &remover, &counting, &clock, target, pass(4)).await.unwrap();
+
+        assert!(report.pages >= 2, "the deficit needed several pages: {} pages", report.pages);
+        assert!(
+            log.served().iter().filter(|s| **s == key(&head)).count() >= 2,
+            "the stuck head was re-served"
+        );
+        assert_eq!(report.remove_failed, 1, "counted once for one distinct part, not once per page");
+        assert_eq!(remover.refused(), vec![key(&head)], "and it was only ATTEMPTED once");
+        assert_eq!(report.evicted, 8, "the deficit was still closed around it");
+    }
+
+    #[tokio::test]
+    async fn a_page_on_which_every_unlink_fails_stops_the_pass_as_starved() {
+        // The termination guarantee under the skip-and-continue policy. Skipped parts never enter
+        // `evicted`, so a wholly-failing page still trips the pre-existing `evicted.is_empty()`
+        // guard — which is what keeps "do not propagate" from becoming "spin until the wall
+        // clock re-fetching rows nothing will ever mark".
+        let parts: Vec<ResidentPart> = (1..=4).map(|v| resident(v, GIB)).collect();
+        let all: Vec<PartKey> = (1..=4).map(|v| part_at(v, 1)).collect();
+        let log = FakeLog::of(&parts);
+        let remover = FlakyRemover::failing_on(&all);
+        let probe = FakeProbe::new(100 * GIB, 0);
+        let clock = TestClock::new();
+        let target = EvictionTarget {
+            free: 100 * GIB,
+            reserve: 300 * GIB,
+            headroom: 50 * GIB,
+        };
+
+        let report = evict_to_target(&log, &remover, &probe, &clock, target, pass(4)).await.unwrap();
+
+        assert_eq!(report.pages, 1, "stopped after the first wholly-failing page");
+        assert_eq!(report.evicted, 0);
+        assert_eq!(report.remove_failed, 4, "every candidate counted exactly once");
+        assert!(report.starved, "nothing could be freed, and that is not self-correcting");
+        assert!(!report.budget_exhausted, "this is exhaustion, not a time budget");
+    }
+
+    #[tokio::test]
+    async fn a_transient_unlink_failure_cannot_mask_an_actionable_one_whatever_the_worklist_order() {
+        // EACCES/EROFS means the mount needs intervention; `DirectoryNotEmpty` means the api won a
+        // race renaming a promoted chunk into the directory being removed, and will lose it next
+        // tick. The transient is deliberately placed FIRST in worklist order here: that is the
+        // arrangement a first-wins rule gets wrong, and worklist order is ordered by read recency,
+        // which is unrelated to severity — so the ordering that exposes the bug is the one that
+        // occurs by chance in production.
+        let parts: Vec<ResidentPart> = (1..=4).map(|v| resident(v, GIB)).collect();
+        let log = FakeLog::of(&parts);
+        let remover = FlakyRemover::failing_with(&[
+            (part_at(1, 1), io::ErrorKind::DirectoryNotEmpty),
+            (part_at(2, 1), io::ErrorKind::PermissionDenied),
+        ]);
+        let probe = FakeProbe::new(300 * GIB, GIB);
+        let counting = CountingProbe {
+            probe: &probe,
+            remover: &remover.inner,
+        };
+        let clock = TestClock::new();
+        let target = EvictionTarget {
+            free: 300 * GIB,
+            reserve: 304 * GIB,
+            headroom: 0,
+        };
+
+        let report = evict_to_target(&log, &remover, &counting, &clock, target, pass(4)).await.unwrap();
+
+        assert_eq!(report.remove_failed, 2, "both refusals counted");
+        assert_eq!(
+            report.remove_failed_kind,
+            Some(io::ErrorKind::PermissionDenied),
+            "the actionable fault displaced the transient that preceded it"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_failed_is_zero_when_every_unlink_succeeds() {
+        // A counter that always fires is the same as no counter: `remove_failed` is what tells an
+        // operator whether `starved` means "the disk is refusing removals" or "the cursor is
+        // genuinely empty", and it can only do that if the healthy path leaves it at zero.
+        let parts: Vec<ResidentPart> = (1..=6).map(|v| resident(v, GIB)).collect();
+        let log = FakeLog::of(&parts);
+        let remover = FakeRemover::default();
+        let probe = FakeProbe::new(300 * GIB, GIB);
+        let counting = CountingProbe {
+            probe: &probe,
+            remover: &remover,
+        };
+        let clock = TestClock::new();
+        let target = EvictionTarget {
+            free: 300 * GIB,
+            reserve: 303 * GIB,
+            headroom: 0,
+        };
+
+        let report = evict_to_target(&log, &remover, &counting, &clock, target, pass(4)).await.unwrap();
+
+        assert_eq!(report.evicted, 3);
+        assert_eq!(report.remove_failed, 0, "nothing refused, so nothing counted");
+        assert_eq!(report.remove_failed_kind, None, "and no fault class to report");
+        assert_eq!(remover.removed(), log.marked(), "every unlinked part is recorded evicted");
     }
 
     #[tokio::test]
