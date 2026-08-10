@@ -26,6 +26,9 @@ _EXPECTED_COLUMNS = {
         "object_version": ("bigint", "NO"),
         "part_number": ("bigint", "NO"),
         "cached_at": ("timestamp with time zone", "NO"),
+        # Added by 20260725120000_fs_cache_inventory_last_access.sql; nullable because rows
+        # predating the read-recency tracker have never been read through it.
+        "last_access_at": ("timestamp with time zone", "YES"),
     },
     "janitor_state": {
         "key": ("text", "NO"),

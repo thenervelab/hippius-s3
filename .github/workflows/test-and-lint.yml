@@ -115,7 +115,33 @@ jobs:
   unit-integration:
     name: Unit & Integration Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    services:
+      # Without this, every real-Postgres test in tests/integration self-skipped: the pg_conn
+      # fixture skips when nothing is reachable, and each test_*_sql.py that opens its own
+      # asyncpg connection skips on the resulting OSError. The whole SQL tier reported green
+      # while executing nothing.
+      #
+      # postgres:17 matches the `rust` job below rather than prod's PG 15, so both jobs
+      # exercise one server version; none of these tests depend on version-specific behavior.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          # The database name is load-bearing: tests/integration/conftest.py loads
+          # .env.test-local with override=True, so the tests connect to
+          # postgres:postgres@localhost:5432/hippius regardless of what this job exports.
+          POSTGRES_DB: hippius
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 12
+    env:
+      # Exported for the migration step, which reads DATABASE_URL directly. The tests
+      # themselves get the identical DSN from .env.test-local (see POSTGRES_DB above).
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/hippius?sslmode=disable
     steps:
       - uses: actions/checkout@v4
 
@@ -136,10 +162,34 @@ jobs:
       # The retry-mover tests spawn a throwaway redis-server because fakeredis cannot run Lua,
       # and they self-skip when the binary is absent. The runner image does not ship it, so
       # without this the atomic-claim regression guard silently never executes in CI.
-      - name: Install redis-server
+      # psql applies the drain crate's migrations below.
+      - name: Install redis-server and postgresql-client
         run: |
           sudo apt-get update
-          sudo apt-get install -y redis-server
+          sudo apt-get install -y redis-server postgresql-client
+
+      # hippius_s3.scripts.migrate shells out to dbmate, which the runner image does not ship
+      # (the app image installs it in the Dockerfile).
+      - name: Install dbmate 2.35.0
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/dbmate" \
+            https://github.com/amacneil/dbmate/releases/download/v2.35.0/dbmate-linux-amd64
+          chmod +x "$RUNNER_TEMP/dbmate"
+          sudo mv "$RUNNER_TEMP/dbmate" /usr/local/bin/dbmate
+
+      # Two independent migration systems own this one database, and the SQL tier needs both:
+      # dbmate owns the app schema (hippius_s3/sql/migrations), while the drain crate owns the
+      # cephor_* tables. In prod the drain's own sqlx applies the latter, so nothing else here
+      # would create them. A reachable-but-unmigrated Postgres is worse than none at all — the
+      # skip guards pass and every query then fails on a missing relation.
+      - name: Apply database migrations
+        run: |
+          source .venv/bin/activate
+          python -m hippius_s3.scripts.migrate
+          for migration in crates/hippius-drain-core/migrations/*.sql; do
+            echo "applying $migration"
+            psql -v ON_ERROR_STOP=1 --single-transaction -q "$DATABASE_URL" -f "$migration"
+          done
 
       - name: Run unit tests
         run: |

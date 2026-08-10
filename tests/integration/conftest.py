@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import os
 import secrets
@@ -8,6 +9,7 @@ from typing import AsyncGenerator
 from typing import Callable
 from typing import Generator
 from typing import Iterator
+from typing import NoReturn
 
 import asyncpg
 import boto3
@@ -27,6 +29,49 @@ dotenv.load_dotenv(_project_root / ".env.defaults", override=True)
 dotenv.load_dotenv(_project_root / ".env.test-local", override=True)
 os.environ["HIPPIUS_BYPASS_CREDIT_CHECK"] = "true"
 os.environ["ENABLE_BANHAMMER"] = "false"
+
+# One table per migration system, so "reachable but unmigrated" is caught as loudly as
+# "unreachable": `objects` comes from dbmate, `cephor_replication_status` from the drain's own
+# sqlx migrations, which in prod only the drain applies and which CI has to apply itself.
+_REQUIRED_TABLES = ("objects", "cephor_replication_status")
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """In CI, prove Postgres is usable BEFORE any test can quietly skip past it.
+
+    Every SQL test in this directory skips when its connection fails, and a skip is not a
+    failure — which is how this whole tier reported green while executing nothing before the
+    postgres service was added. Fixing the workflow does not fix that property: the day the
+    service fails to start, or a migration step is dropped, the tier silently returns to
+    green-by-skip and nobody is told.
+
+    Asserting it once here, rather than converting thirteen individual skip sites, keeps the
+    per-test behaviour right on a laptop (skip, with a hint) while making the CI regression
+    impossible to miss. A reachable-but-unmigrated database is checked too, because it passes
+    every one of those skip guards and then fails each test on a missing relation, which reads
+    as thirteen unrelated bugs rather than one absent migration step.
+    """
+    if not os.environ.get("CI"):
+        return
+
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        pytest.exit("CI is set but DATABASE_URL is not: the integration tier would skip silently", returncode=1)
+
+    async def _check() -> list[str]:
+        conn = await asyncpg.connect(dsn=dsn)
+        try:
+            return [t for t in _REQUIRED_TABLES if not await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", t)]
+        finally:
+            await conn.close()
+
+    try:
+        missing = asyncio.run(_check())
+    except (OSError, asyncpg.PostgresError) as exc:
+        pytest.exit(f"CI is set but Postgres is unreachable on DATABASE_URL: {exc}", returncode=1)
+
+    if missing:
+        pytest.exit(f"CI is set but Postgres is not migrated: missing table(s) {missing}", returncode=1)
 
 
 @pytest.fixture(autouse=True)
@@ -410,16 +455,30 @@ async def gateway_client_no_auth(gateway_app_no_auth: Any) -> AsyncGenerator[Asy
         yield client
 
 
+def _no_postgres(reason: str) -> NoReturn:
+    """Skip locally, FAIL in CI.
+
+    Skipping is right on a laptop with no database running. In CI it is how this whole tier
+    reported green while executing nothing: every SQL test skipped on an unreachable DSN, and a
+    skip is not a failure, so the job passed. That is the state this workflow change exists to
+    end — and it would come back silently the first time the postgres service failed to start,
+    which is precisely when someone needs to be told.
+    """
+    if os.environ.get("CI"):
+        pytest.fail(f"{reason} (CI is set, so this is a failure rather than a skip)")
+    pytest.skip(reason)
+
+
 @pytest_asyncio.fixture
 async def pg_conn() -> AsyncGenerator[asyncpg.Connection, None]:
-    """A live Postgres connection on DATABASE_URL; skips the test if none is reachable."""
+    """A live Postgres connection on DATABASE_URL; skips the test if none is reachable (fails in CI)."""
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
-        pytest.skip("DATABASE_URL not set; skipping live-schema check")
+        _no_postgres("DATABASE_URL not set; skipping live-schema check")
     try:
         conn = await asyncpg.connect(dsn=dsn)
     except (OSError, asyncpg.PostgresError) as exc:
-        pytest.skip(f"Postgres unreachable on DATABASE_URL: {exc}")
+        _no_postgres(f"Postgres unreachable on DATABASE_URL: {exc}")
     try:
         yield conn
     finally:
