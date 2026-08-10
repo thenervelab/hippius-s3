@@ -161,7 +161,12 @@ async def test_a_failed_claim_is_reported_as_false_rather_than_raising(conn: asy
     any statement, and a statement Postgres rejects is exactly what this has to catch.
     """
     object_id = str(uuid.uuid4())
-    await conn.execute("DROP TABLE cephor_ssd_residency")
+    # Break the TEMP table rather than DROP it. Dropping removes the shadow, so on a database
+    # where the drain's migrations have run — which is now every CI run — the statement resolves
+    # against the REAL `cephor_ssd_residency` and succeeds, and this test both stops testing
+    # anything and writes a row into a shared table. Dropping the column the INSERT names keeps
+    # the shadow in place while making the statement fail, which is the condition under test.
+    await conn.execute("ALTER TABLE cephor_ssd_residency DROP COLUMN bytes")
 
     assert await ResidencyRecorder(_SingleConnPool(conn), NODE)(object_id, 1, 0, 4096) is False
 
