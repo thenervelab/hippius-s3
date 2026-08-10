@@ -452,13 +452,21 @@ class FileSystemPartsStore:
                 for src, dst in zip(staged, targets, strict=False):
                     src.replace(dst)
                     renamed += 1
+                # Inside the same guard as the renames, not after it. meta.json is the readiness
+                # gate, so the window this un-publish exists to close does not end at the last
+                # rename — it ends when the NEW meta lands. An OSError from the trim or the meta
+                # write left the PREVIOUS attempt's meta.json standing over a chunk set that is
+                # now this attempt's and a different length: the part still reads as published,
+                # with a wrong declared size and holes, and the drain's completeness gate strands
+                # it as IncompleteSource. ENOSPC is the obvious way in, and a disk that retention
+                # deliberately runs at 15-20% free is where it happens.
+                _trim_chunk_tail(part_dir, int(num_chunks), label)
+                _write_meta_file(meta_path, payload)
             except OSError:
                 if renamed:
                     with contextlib.suppress(OSError):
                         meta_path.unlink(missing_ok=True)
                 raise
-            _trim_chunk_tail(part_dir, int(num_chunks), label)
-            _write_meta_file(meta_path, payload)
 
         async with _publish_locks.acquire(str(part_dir)):
             await asyncio.to_thread(_publish)

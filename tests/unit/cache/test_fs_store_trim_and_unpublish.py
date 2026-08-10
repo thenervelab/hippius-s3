@@ -161,3 +161,57 @@ async def test_delete_meta_idempotent_on_missing(store):
     await store.delete_meta(object_id, 1, 1)  # no dir at all — must not raise
     await _seed_part(store, object_id, indices=[0], with_meta=False)
     await store.delete_meta(object_id, 1, 1)  # dir without meta — must not raise
+
+
+@pytest.mark.asyncio
+async def test_a_failed_meta_write_unpublishes_rather_than_leaving_a_holed_part(store, monkeypatch):
+    """The un-publish window ends when the NEW meta lands, not at the last rename.
+
+    meta.json is the readiness gate. If the meta write fails after the renames — ENOSPC is the
+    way in, and a disk retention deliberately runs at 15-20% free is where it happens — the
+    PREVIOUS attempt's meta.json is left standing over a chunk set that is now this attempt's and
+    a different length. The part still reads as published, with a wrong declared size and holes,
+    and the drain's completeness gate then strands it as IncompleteSource: never replicated,
+    never evicted. Un-publishing instead makes it invisible, which is recoverable.
+    """
+    object_id = str(uuid.uuid4())
+    part_dir = await _seed_part(store, object_id, indices=[0, 1, 2], with_meta=True)
+    before = json.loads((part_dir / "meta.json").read_text())
+    assert int(before["num_chunks"]) == 3
+
+    await _stage(store, object_id, 1)
+
+    from hippius_s3.cache import fs_store as fs_store_mod
+
+    def _enospc(*_a, **_kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(fs_store_mod, "_write_meta_file", _enospc)
+
+    with pytest.raises(OSError):
+        await _publish(store, object_id, 1)
+
+    assert not (part_dir / "meta.json").exists(), (
+        "the previous attempt's meta survived over the new chunk set: the part reads as published "
+        "with a wrong num_chunks and holes"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_trim_also_unpublishes(store, monkeypatch):
+    """Same window, one step earlier — the trim runs between the renames and the meta write."""
+    object_id = str(uuid.uuid4())
+    part_dir = await _seed_part(store, object_id, indices=[0, 1, 2], with_meta=True)
+    await _stage(store, object_id, 1)
+
+    from hippius_s3.cache import fs_store as fs_store_mod
+
+    def _boom(*_a, **_kw):
+        raise OSError(5, "I/O error")
+
+    monkeypatch.setattr(fs_store_mod, "_trim_chunk_tail", _boom)
+
+    with pytest.raises(OSError):
+        await _publish(store, object_id, 1)
+
+    assert not (part_dir / "meta.json").exists()

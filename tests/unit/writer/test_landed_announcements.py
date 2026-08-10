@@ -408,3 +408,58 @@ async def test_a_failed_publish_stamps_no_recency() -> None:
         )
 
     assert stamped == []
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_redis_does_not_hang_the_put() -> None:
+    """The swallow below catches a redis-queues that ERRORS. It does nothing for a slow one.
+
+    This await is on the client PUT path and the api's queues client is built with no
+    socket_timeout, so without a bound a slow redis-queues stalls every PUT — the shape of a real
+    prod incident, where a 1.29M-entry list on this same instance surfaced as GET IncompleteRead.
+    """
+    import asyncio as _asyncio
+
+    class HangingPipe:
+        def lpush(self, *_a: object) -> None:
+            return None
+
+        def ltrim(self, *_a: object) -> None:
+            return None
+
+        async def execute(self) -> None:
+            await _asyncio.sleep(30)
+
+    class HangingRedis:
+        def pipeline(self) -> HangingPipe:
+            return HangingPipe()
+
+    publisher = landed.LandedPartPublisher(HangingRedis(), "node-a")
+
+    started = _asyncio.get_running_loop().time()
+    await _asyncio.wait_for(publisher.publish(OBJ, 1, 1), timeout=5)
+    elapsed = _asyncio.get_running_loop().time() - started
+
+    assert elapsed < 3, f"publish waited {elapsed:.1f}s on a hanging redis; it must give up quickly"
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_announcement_still_never_reaches_the_caller() -> None:
+    """Timing out is the same contract as erroring: the bytes are durable, the walk still finds it."""
+    import asyncio as _asyncio
+
+    class HangingPipe:
+        def lpush(self, *_a: object) -> None:
+            return None
+
+        def ltrim(self, *_a: object) -> None:
+            return None
+
+        async def execute(self) -> None:
+            await _asyncio.sleep(30)
+
+    class HangingRedis:
+        def pipeline(self) -> HangingPipe:
+            return HangingPipe()
+
+    await landed.LandedPartPublisher(HangingRedis(), "node-a").publish(OBJ, 1, 1)

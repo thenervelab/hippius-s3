@@ -88,8 +88,21 @@ spec:
             - -c
             - |
               until pg_isready -h postgres-nvme-rw -p 5432; do echo "waiting for postgres"; sleep 3; done
-              until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "SELECT to_regclass('public.cephor_replication_status') IS NOT NULL")" = "t" ]; do
-                echo "waiting for the cephor schema (allocator migration)"; sleep 3
+              # Gate on the columns THIS binary needs, not on the table existing. The table has
+              # been there since migration 0005, so the old check passed instantly and guarded
+              # nothing — while `record_landed_part` (the only record path, so the landed queue
+              # AND the reconciler backstop fail together) needs 0019's content_sha256 and
+              # relanded_at, `mark_replicated` needs content_sha256, and the evictor's worklist
+              # needs 0016's cephor_ssd_residency. Started against a pre-migration schema the
+              # agent cannot commit or record ANY part while the api keeps accepting PUTs onto
+              # the same SSD, and it does not self-heal until the allocator's migration lands.
+              until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "
+                SELECT to_regclass('public.cephor_ssd_residency') IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name = 'cephor_replication_status'
+                                 AND column_name IN ('content_sha256', 'relanded_at', 'reclaimed_at')
+                               HAVING count(*) = 3)")" = "t" ]; do
+                echo "waiting for the cephor schema (allocator migrations 0016-0019)"; sleep 3
               done
           env:
             - name: CEPHOR_DATABASE_URL
@@ -142,10 +155,21 @@ spec:
             # SSD-ingest reclaim worker: clean up broken/abandoned uploads (failed parts
             # the drain skips forever), replicated crash-orphans (a crash between the
             # mark_replicated commit and the drain's own unlink), and orphan write-temps,
-            # once aged, so junk does not accumulate on the node-local disk. All have safe
-            # code defaults (300s poll / 1h graces); set here for visibility + per-node tuning.
+            # once aged, so junk does not accumulate on the node-local disk.
+            #
+            # 3600, not the 300s code default, for the SAME reason the reconcile poll above is
+            # 600: this worker still runs the full SSD tree walk (`reclaim_ssd` ->
+            # `scanner.scan_parts()`), and retention grew that tree from the undrained backlog to
+            # this node's ENTIRE replicated shard — the 2.28M parts / ~930 GB measured on prod
+            # 2026-08-07. At 300s that is 12 walks/hour per node, on the same NVMe serving ingest
+            # and reads, i.e. twice the frequency of the reconcile walk this release just demoted
+            # 40x for being too expensive. `ssd_reclaim.rs` already reasons about an hourly walk.
+            #
+            # Nothing is delayed by the change: every disposition this worker owns is grace-gated
+            # at >= 1h (CEPHOR_RECLAIM_GRACE_SECS below), so no part becomes actionable faster
+            # than hourly and a 300s poll can only re-ask the same question twelve times.
             - name: CEPHOR_RECLAIM_POLL_SECS
-              value: "300"
+              value: "3600"
             - name: CEPHOR_RECLAIM_GRACE_SECS
               value: "3600"
             # ROLLBACK-LOAD-BEARING — do not delete as manifest hygiene.

@@ -23,6 +23,7 @@ scripts, tests — get `None` and publishing is a no-op.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -34,6 +35,11 @@ logger = logging.getLogger(__name__)
 
 # Must match `landed_queue_key` in crates/hippius-drain-agent/src/landed.rs.
 _LANDED_QUEUE_PREFIX = "cephor:landed:"
+
+# Bounds the one await this puts on the client PUT path. Generous next to a healthy LPUSH
+# (sub-millisecond) and short next to a client timeout: the announcement is an optimisation
+# over the reconcile walk, so waiting on it is never worth a slow PUT.
+_PUBLISH_TIMEOUT_SECONDS = 1.0
 
 # Cap on a node's queue. The agent normally drains this within a poll, so depth is near zero;
 # the bound only matters when the agent is down. Past it the OLDEST announcements are dropped,
@@ -75,7 +81,14 @@ class LandedPartPublisher:
             pipe = self._redis.pipeline()
             pipe.lpush(self._key, payload)
             pipe.ltrim(self._key, 0, self._max_depth - 1)
-            await pipe.execute()
+            # Bounded, because this await is on the CLIENT PUT PATH and the api's queues client is
+            # built with no socket_timeout — so `except` below catches a redis-queues that ERRORS
+            # and does nothing at all for one that merely goes SLOW. That is not hypothetical on
+            # this queue: a 1.29M-entry list once made redis-queues slow enough to surface as
+            # prod GET IncompleteRead. `promote_floor` bounds its own queues read for exactly this
+            # reason; the write path is the one that needed it more. On timeout the part is
+            # already durable and the agent's reconcile walk still finds it.
+            await asyncio.wait_for(pipe.execute(), timeout=_PUBLISH_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001 - the part is already durable; the backstop covers this
             logger.debug(
                 "announcing landed part %s v%s part %s failed: %s", object_id, object_version, part_number, exc

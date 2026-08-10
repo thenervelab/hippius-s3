@@ -784,6 +784,20 @@ async fn failed_reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotC
                     "corrupt-live SSD parts held (pool copy corrupt) — last good source preserved (R4)"
                 );
             }
+            // A skipped removal is no longer fatal to the pass, so it has to be visible here or
+            // it is invisible everywhere. The shape that needs a human is `remove_failed` at or
+            // near `candidates` with `reclaimed` flat across cycles: the worklist has no offset,
+            // so the same page is being re-offered and this node's failed debris — which the
+            // residency guard also keeps un-GC-able — is not being reclaimed at all.
+            if report.remove_failed > 0 {
+                tracing::warn!(
+                    remove_failed = report.remove_failed,
+                    candidates = report.candidates,
+                    reclaimed = report.reclaimed,
+                    kind = ?report.remove_failed_kind,
+                    "failed-part reclaim skipped un-removable parts; cursor is pinned if this persists with reclaimed=0"
+                );
+            }
         }
         // A backing-read abort leaves every candidate unjudged, so the pass removed nothing and
         // this GC is DISABLED rather than merely slow — the same distinction the walk draws.
