@@ -69,8 +69,10 @@ async def _decrypt_reloading_once(
     except CIPHERTEXT_UNUSABLE:
         if not await invalidate_fn(item):
             # Nothing local held these bytes (a peer or the pool served them, or this deployment
-            # has no lower tier). Re-fetching would return the same bytes, and the pool copy is
-            # authoritative — a fault there is a real error, not something to retry away.
+            # has no lower tier) — re-fetching would return the same bytes, and the pool copy is
+            # authoritative, so a fault there is a real error. The store also answers False when
+            # a redrive has marked the pool copy suspect: the retry would read superseded bytes
+            # that still authenticate, so failing here is the only safe outcome.
             _record_aead_failure("remote", "unrecovered")
             raise
         logger.warning(

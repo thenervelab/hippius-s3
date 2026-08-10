@@ -100,6 +100,14 @@ def _is_peer_address(url: str) -> bool:
 #
 # TTL'd, not permanent: the evictor deletes residency rows underneath us, so a stale answer
 # must expire. A wrong answer is cheap anyway — the peer 404s and the read falls to the pool.
+#
+# The memo can also outlive a redrive flipping the part's replication status back to 'pending'
+# (the resolve joins on status='replicated', but only at resolve time). Deliberately NOT
+# re-checked at fetch time and not shortened: what a peer serves is its SSD copy, which during
+# a redrive is the SOURCE the drain re-copies from — current bytes, not stale ones. The
+# stale-bytes hazard a redrive opens is the POOL tier, and the AEAD-retry path re-checks the
+# status freshly there (`ReplicationSuspectProbe`); paying a per-part Postgres round trip here
+# would guard against nothing.
 _OWNER_MEMO_TTL_SECONDS = 30.0
 _OWNER_MEMO_ENTRIES = 50_000
 
@@ -383,12 +391,21 @@ class PeerChunkFetcher:
         expected = sizes.get(int(chunk_index))
         if expected is None:
             # No recorded size means no way to tell a correct body from a truncated one, and an
-            # unverified body that gets promoted onto local flash is a PERMANENT read failure
-            # for that chunk: nothing on the read path invalidates a cached chunk on AEAD
-            # failure, so it wins the local tier and fails every subsequent read until the
-            # evictor happens to unlink the part. The pool copy is authoritative, so declining
-            # costs one pool read. Counted rather than silent because it should never happen —
-            # `part_chunks` rows are written for every chunk index when the part is created.
+            # unverified body gets promoted onto local flash, where it wins the read tier.
+            # `invalidate_local_chunk` now clears such a chunk on AEAD failure, so this is no
+            # longer permanent — but it is not a substitute for the size check either. That
+            # invalidation is gated on the POOL holding the chunk, and `_resolve_part` checks the
+            # `status='replicated'` guarantee behind that only ONCE, at resolve time: the memo
+            # then holds the owner for its TTL while a redrive (`redrive_diverged_part`,
+            # `redrive_corrupt_parts`) can flip the part back to `pending` without touching
+            # residency, so by the time a promoted body fails AEAD the pool copy may be stale or
+            # mid-rewrite; the retry after it re-enters this same peer tier and
+            # re-promotes, so a deterministically wrong peer fails the retry too; and the retry
+            # fires exactly once per request, spending a budget that exists for genuine DEK
+            # faults and reporting on `chunk_aead_failures_total`, the metric that says the keys
+            # are wrong. The pool copy is authoritative, so declining costs one pool read.
+            # Counted rather than silent because it should never happen — `part_chunks` rows are
+            # written for every chunk index when the part is created.
             _record_shed("unknown_size")
             return None
 

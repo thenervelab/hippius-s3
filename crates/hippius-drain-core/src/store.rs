@@ -17,6 +17,7 @@ use crate::ids::FileId;
 use crate::partdrain::{ClaimedPart, PartReplicationStore, PartVerified};
 use crate::reconcile::PartLandingLog;
 use crate::reconcile::PartStatus;
+use crate::redrive::PartDigest;
 use crate::ssd_evict::{ResidentLog, ResidentPart};
 use crate::ssd_reclaim::{BackingLog, PartStatusAge, ReclaimLog};
 use crate::state::ReplicationState;
@@ -189,6 +190,18 @@ const DEFAULT_DEFER_BACKOFF: Duration = Duration::from_secs(5);
 /// address finally landing. Override via [`Store::with_defer_backoff_cap`].
 const DEFAULT_DEFER_BACKOFF_CAP: Duration = Duration::from_mins(10);
 
+/// How long a re-landed `replicated` part stays off the eviction worklist, measured from the
+/// `relanded_at` stamp [`Store::record_landed_part`] writes when an announcement names a part
+/// that already committed — the B-2 rewrite signal.
+///
+/// The gate must outlive the whole record→check→disposition path in one landed tick: the
+/// divergence check re-reads and hashes the entire part off SSD, and a tick checks up to the
+/// pop batch (512) of re-landed parts sequentially. Ten minutes covers that with a wide margin
+/// while bounding the failure mode of a crash between record and check: such a part is merely
+/// unevictable for ten minutes, and only re-announced parts (rare by construction) are ever
+/// gated at all, so the space this can withhold from an armed evictor is negligible.
+const RELAND_EVICTION_GRACE: Duration = Duration::from_mins(10);
+
 /// What [`Store::defer_part_missing_source`] did to the row — decided atomically
 /// inside the guarded UPDATE, so no concurrent claim can interleave between the
 /// deferral and the terminal escalation.
@@ -204,6 +217,24 @@ pub enum MissingSourceOutcome {
     /// transition (e.g. a lease-expiry re-claim) — so nothing changed. A no-op
     /// defer cannot escalate.
     Superseded,
+}
+
+/// What [`Store::record_landed_part`] found for the part BEFORE it recorded the landing.
+///
+/// A freshly-recorded part reports `Pending` with no digest. The case that matters is
+/// `Replicated`: the api announces a part only from `WriteThroughPartsWriter`'s two meta choke
+/// points — `write_meta` and `publish_part` (the staged-publish path MPU parts and appends take)
+/// — which between them cover every upload path, so an announcement for an already-committed
+/// part means that part was WRITTEN AGAIN: the B-2 divergence shape. The digest is what tells a
+/// genuine rewrite from a duplicate announcement; see [`crate::verdict_for_reland`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandedOutcome {
+    /// The part's replication state before this landing was recorded. The upsert never touches
+    /// `status`, so this is the prior state.
+    pub state: ReplicationState,
+    /// The content digest recorded at the part's last commit, if it has one. `None` for a part
+    /// that has never committed, and for one committed before `content_sha256` shipped.
+    pub digest: Option<PartDigest>,
 }
 
 /// Splices the shared exponential-backoff expression between two SQL literal halves,
@@ -390,8 +421,9 @@ impl Store {
     /// headroom rather than against it, so a disk full of warm cache does not read to the
     /// allocator as a node critically behind on draining.
     ///
-    /// Served by `cephor_ssd_residency_evict_idx`, reading the denormalized `bytes` rather
-    /// than joining the ~140M-row `parts` table. A part whose size was unknown at residency
+    /// The `node_id` equality is served by the leading column of `cephor_ssd_residency_recency_idx`
+    /// (migration 0017, which DROPPED the older `cephor_ssd_residency_evict_idx`), and `bytes` is
+    /// read denormalized rather than joined off the ~140M-row `parts` table. A part whose size was unknown at residency
     /// time contributes zero, which under-reports cache — the fail-safe direction, since
     /// understating evictable space overstates drain urgency rather than hiding it.
     ///
@@ -606,31 +638,115 @@ impl Store {
         Ok(row.is_some_and(|(done,)| done))
     }
 
-    /// Records that a part has landed on SSD and awaits drain (the reconciler-only
-    /// landed signal). Idempotent: a repeat for the same `(object_id, version,
-    /// part_number)` is a no-op, so the reconciler's backstop scan can call it safely.
+    /// Records that a part has landed on SSD and awaits drain. Idempotent: a repeat for the
+    /// same `(object_id, version, part_number)` never changes `status`, so the reconciler's
+    /// backstop scan and the announcement fast path can both call it freely.
+    ///
+    /// Returns what the row looked like BEFORE this call, because a landed announcement naming
+    /// an already-`replicated` part is the one observable signal that a committed part was
+    /// rewritten (B-2) — see [`crate::verdict_for_reland`]. The status is untouched by the
+    /// upsert, so the returned state is the prior state.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`].
-    pub async fn record_landed_part(&self, part: &PartKey) -> Result<()> {
+    /// [`StoreError::Database`]; [`StoreError::Invalid`] if the stored status is unknown.
+    pub async fn record_landed_part(&self, part: &PartKey) -> Result<LandedOutcome> {
         // Stamp the recording node so `claim_part` only drains parts whose data is on
         // this node's SSD. The UPSERT self-heals legacy rows: a row first written
         // without a node (or by an older agent) is adopted by whichever node still
         // holds the part locally and re-records it; a row already owned is left alone.
-        sqlx::query(
+        //
+        // COALESCE, not a `WHERE node_id IS NULL` conflict guard: it expresses the identical
+        // adoption rule (keep the existing owner if there is one) while letting DO UPDATE
+        // always fire, which is what makes RETURNING report on a conflicting row at all. A
+        // guarded conflict action returns NOTHING when its WHERE fails, i.e. in exactly the
+        // already-known case the divergence check needs to see. The cost is a row rewrite on
+        // the conflict path only; the common announcement is a fresh part, hence a plain INSERT.
+        //
+        // relanded_at is stamped IN THE SAME STATEMENT as the prior-state read, and only when
+        // that prior state is 'replicated' — the B-2 rewrite signal. It is what takes the part
+        // off the eviction worklist (see `evictable_parts`) for the window between this record
+        // and the divergence check's disposition: a rewritten committed part otherwise ranks as
+        // maximally COLD (nothing on the rewrite path touches the residency recency the evictor
+        // sorts on), so the evictor could unlink the ONLY copy of the new bytes before the
+        // check hashes them — after which nothing re-drives and the pool serves stale bytes
+        // forever. One statement, not a follow-up UPDATE, so there is no interleaving in which
+        // the outcome reports Replicated while the eviction gate is not yet armed.
+        let row = sqlx::query_as::<_, (String, Option<String>)>(
             "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id) \
              VALUES ($1, $2, $3, 'pending', $4) \
              ON CONFLICT (object_id, version, part_number) \
-             DO UPDATE SET node_id = EXCLUDED.node_id WHERE cephor_replication_status.node_id IS NULL",
+             DO UPDATE SET node_id = COALESCE(cephor_replication_status.node_id, EXCLUDED.node_id), \
+                           relanded_at = CASE WHEN cephor_replication_status.status = 'replicated' \
+                                              THEN now() ELSE cephor_replication_status.relanded_at END \
+             RETURNING status, content_sha256",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
         .bind(self.node_id.as_deref())
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(())
+        let (status, digest) = row;
+        Ok(LandedOutcome {
+            state: state_from_db(&status)?,
+            digest: digest.map(PartDigest::from_stored),
+        })
+    }
+
+    /// Returns a `replicated` part to `pending` because its SSD content no longer matches the
+    /// digest recorded at commit — the pool holds superseded bytes (B-2). Returns whether a row
+    /// was actually re-driven.
+    ///
+    /// # Why this is the safe direction, always
+    ///
+    /// `replicated → pending` can only make a part LESS evictable. `ResidentLog::evictable_parts`
+    /// joins the replication row and filters `status = 'replicated'`, so the instant this commits
+    /// the part leaves the eviction worklist — and it leaves it while its pool copy is the stale
+    /// one, i.e. exactly while the SSD copy is again the only good one. There is no interleaving
+    /// in which this widens what the evictor may unlink, which is why residency is deliberately
+    /// left alone (the part is still on the disk; `redrive_corrupt_parts` reasons identically).
+    ///
+    /// `upload_enqueued_at` is cleared too: the backend already shipped the superseded bytes, so
+    /// the part must go back on the enqueue sweep's worklist. (Whether the backend then ACCEPTS
+    /// the re-upload is the uploader's business — it dedups on `chunk_backend`, so a stale
+    /// backend copy may survive this. That is a separate seam, not one the drain can close.)
+    ///
+    /// `defer_attempts` is deliberately NOT reset, matching [`release_part`](Self::release_part):
+    /// a re-uploaded MPU part is precisely the address-still-NULL case, so zeroing the escalation
+    /// on every retry would re-arm the head-of-line starvation the exponential backoff exists to
+    /// prevent.
+    ///
+    /// The `content_sha256 IS DISTINCT FROM` guard carries both the idempotency and the NULL
+    /// policy in one operator: a second call for the same rewrite finds `status <> 'replicated'`
+    /// and no-ops, and a NULL digest (committed before this shipped) is DISTINCT FROM any
+    /// observed value, so an unverifiable part re-drives rather than being assumed intact.
+    ///
+    /// `observed` is COMPARED, never stored. Only a commit may write `content_sha256`, because
+    /// only a commit knows what actually reached the pool — the caller hashed the disk at some
+    /// earlier instant, and a client mid-retry may already have replaced those bytes again.
+    /// Stamping the read value here would record a digest for content the pool never received.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    pub async fn redrive_diverged_part(&self, part: &PartKey, observed: &PartDigest) -> Result<bool> {
+        let affected = sqlx::query(
+            "UPDATE cephor_replication_status \
+             SET status = 'pending', claimed_at = NULL, deferred_until = NULL, \
+                 upload_enqueued_at = NULL, updated_at = now() \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND node_id = $4 \
+               AND status = 'replicated' AND content_sha256 IS DISTINCT FROM $5",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .bind(self.node_id.as_deref())
+        .bind(observed.as_str())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected > 0)
     }
 
     /// Claims one pending part for draining, transitioning it `pending → draining`
@@ -953,7 +1069,7 @@ impl PartReplicationStore for Store {
         self.record_resident(part, bytes).await
     }
 
-    async fn mark_replicated(&self, claim: &ClaimedPart, _proof: &PartVerified) -> Result<()> {
+    async fn mark_replicated(&self, claim: &ClaimedPart, _proof: &PartVerified, digest: &PartDigest) -> Result<()> {
         // Guard on `draining` AND the claim's fencing token: only the agent that still
         // holds THIS claim may commit. Zero rows means the claim was lost — either the
         // row left `draining`, or it was re-claimed (a new claim_seq) after the lease,
@@ -966,14 +1082,20 @@ impl PartReplicationStore for Store {
         // corruption episode, so a part that recovered (corrupt→pending→replicated) must not
         // carry a spent budget if the same row is ever corrupted again. Harmless on the common
         // path (it is already 0).
+        // content_sha256 is written HERE, not by a follow-up statement: a part that reads
+        // `replicated` with a missing digest is unverifiable, and the re-landing check treats
+        // unverifiable as diverged — so a two-statement commit would leave a crash window whose
+        // recovery is a needless full re-copy of the part (B-2).
         let affected = sqlx::query(
-            "UPDATE cephor_replication_status SET status = 'replicated', corrupt_attempts = 0, updated_at = now() \
+            "UPDATE cephor_replication_status \
+             SET status = 'replicated', corrupt_attempts = 0, content_sha256 = $5, updated_at = now() \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' AND claim_seq = $4",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
         .bind(claim.claim_seq())
+        .bind(digest.as_str())
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -1148,7 +1270,10 @@ impl PartLandingLog for Store {
     }
 
     async fn record_landed(&self, part: &PartKey) -> Result<()> {
-        Store::record_landed_part(self, part).await
+        // The reconciler only records parts it found with no row or an adoptable one, so the
+        // prior-state report has nothing to tell it — the divergence check belongs to the
+        // announcement path, which is the only one that observes a rewrite (see LandedOutcome).
+        Store::record_landed_part(self, part).await.map(|_| ())
     }
 }
 
@@ -1173,8 +1298,10 @@ impl ResidentLog for Store {
         // it regardless, but a worklist that never emits it is the real guard.
         //
         // INNER JOIN: a residency row with no replication row means the object was hard-deleted,
-        // which is the reclaimer's disposition (deleted-object orphan), not the evictor's. It is
-        // excluded here and `prune_residency` clears the row when the reclaimer unlinks the part.
+        // which is the reclaimer's disposition (deleted-object orphan), not the evictor's. Note
+        // the reclaimer unlinks the part and leaves the row — it never touches this table — so
+        // this join is not merely a filter, it is the whole reason that row is inert. See
+        // `drop_residency` for why leaving it is safe and for the assumption that makes it so.
         //
         // THIS ORDER BY IS THE EVICTION POLICY; the orchestrator walks it and never re-sorts.
         //
@@ -1191,17 +1318,29 @@ impl ResidentLog for Store {
         // Must match `cephor_ssd_residency_recency_idx` expression-for-expression, or the
         // planner sorts the whole ~2M-row resident set on every pass — reintroducing in Postgres
         // the O(resident) cost this evictor exists to avoid.
+        //
+        // The relanded_at guard is the B-2 eviction gate. A committed part that was rewritten on
+        // SSD still reads 'replicated' and its residency recency predates the rewrite, so it
+        // ranks as maximally COLD here while its SSD copy is the ONLY copy of the client's new
+        // bytes — the pool holds the superseded ones. Excluding rows re-landed within the grace
+        // keeps the evictor off the part until the divergence check has disposed of it: a
+        // Diverged verdict flips it to 'pending' (the status join then excludes it), and an
+        // Unchanged verdict means the pool copy matches, at which point eviction is safe again
+        // the moment the grace lapses. Filtered per joined row, like the status guard, so it
+        // costs nothing on the recency index scan.
         let rows = sqlx::query_as::<_, (String, i64, i64, String, i64)>(
             "SELECT r.object_id, r.version, r.part_number, s.status, r.bytes \
              FROM cephor_ssd_residency r \
              JOIN cephor_replication_status s \
                ON s.object_id = r.object_id AND s.version = r.version AND s.part_number = r.part_number \
              WHERE r.node_id = $1 AND s.status = 'replicated' \
+               AND (s.relanded_at IS NULL OR s.relanded_at < now() - ($3 * interval '1 second')) \
              ORDER BY COALESCE(r.last_read_at, r.resident_at) \
              LIMIT $2",
         )
         .bind(node)
         .bind(i64::from(limit))
+        .bind(RELAND_EVICTION_GRACE.as_secs_f64())
         .fetch_all(&self.pool)
         .await?;
 
@@ -1344,6 +1483,14 @@ impl Store {
     /// row blocks no GC and drifts no signal (both `evictable_parts` and `node_cache_bytes`
     /// INNER JOIN the replication row). A dead row bounded by the hard-delete rate, not a leak
     /// of disk or of accounting.
+    ///
+    /// **Nothing enforces that.** There is no foreign key and no cascade between the two tables;
+    /// what keeps the orphan-path row harmless is the `status = 'replicated'` predicate, written
+    /// out twice. Dropping it from either query — or adding a third consumer that reads this
+    /// table by `node_id` alone — turns those dead rows into live over-accounting, compounded by
+    /// the api's `ResidencyRecorder`, which ACCUMULATES `bytes` and so would add to a stale row
+    /// rather than replace it. Such a change must also add a `drop_residency` call on the orphan
+    /// path this doc calls needless.
     ///
     /// [`mark_failed_reclaimed`]: crate::ssd_reclaim::ReclaimLog::mark_failed_reclaimed
     ///
@@ -1738,6 +1885,7 @@ mod part_tests {
     use super::{MissingSourceOutcome, Store, StoreError};
     use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
     use crate::partdrain::{ClaimedPart, PartReplicationStore, PartVerified};
+    use crate::redrive::PartDigest;
     use crate::ssd_reclaim::ReclaimLog;
     use crate::state::ReplicationState;
     use core::str::FromStr;
@@ -1747,6 +1895,11 @@ mod part_tests {
 
     const UUID_A: &str = "466916c0-d61b-4518-b81b-9576b574270a";
     const UUID_B: &str = "00000000-0000-4000-8000-000000000000";
+
+    /// A stand-in content digest for commits whose test is not about divergence detection.
+    fn test_digest() -> PartDigest {
+        crate::redrive::part_digest(&["chunk-0-hash"])
+    }
 
     fn part(uuid: &str, version: u32, number: u32) -> PartKey {
         PartKey::new(ObjectId::from_str(uuid).unwrap(), Version::new(version), PartNumber::new(number))
@@ -1893,7 +2046,10 @@ mod part_tests {
         ingesting.record_landed_part(&p).await.unwrap();
         let claim = ingesting.claim_part().await.unwrap().expect("the landed part is claimable");
         ingesting.record_resident(&p, 4096).await.unwrap();
-        ingesting.mark_replicated(&claim, &PartVerified::for_test()).await.unwrap();
+        ingesting
+            .mark_replicated(&claim, &PartVerified::for_test(), &test_digest())
+            .await
+            .unwrap();
         promoting.record_resident(&p, 4096).await.unwrap();
 
         // R4 flags the pool copy corrupt; the redrive returns the part to `pending` leaving
@@ -1969,7 +2125,7 @@ mod part_tests {
         store.record_landed_part(&retained).await.unwrap();
         let claim = store.claim_part().await.unwrap().expect("the landed part is claimable");
         store.record_resident(&retained, 4096).await.unwrap();
-        store.mark_replicated(&claim, &PartVerified::for_test()).await.unwrap();
+        store.mark_replicated(&claim, &PartVerified::for_test(), &test_digest()).await.unwrap();
         force_terminal(&pool, &retained, "replicated").await; // backdated 2h: aged past retention
         store.mark_upload_enqueued(&retained).await.unwrap(); // leaves updated_at aged
 
@@ -2338,7 +2494,7 @@ mod part_tests {
         store.record_landed_part(&p).await.unwrap();
         let claimed = store.claim_part().await.unwrap().unwrap();
 
-        store.mark_replicated(&claimed, &PartVerified::for_test()).await.unwrap();
+        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
 
         store.record_resident(&p, 4096).await.unwrap();
         assert_eq!(store.node_cache_bytes("node-a").await.unwrap(), 4096, "the retained part is cache");
@@ -2361,6 +2517,299 @@ mod part_tests {
 
         assert_eq!(store.node_cache_bytes("node-a").await.unwrap(), 0, "a pre-retention row is not cache");
         assert!(store.evictable_parts(10).await.unwrap().is_empty());
+    }
+
+    // ------------------------------------------------------------- B-2 re-landing divergence
+
+    #[sqlx::test]
+    async fn recording_a_landing_reports_the_prior_state_and_the_digest_committed_for_it(pool: PgPool) {
+        // The announcement path's whole input. A first landing has nothing to report; a landing
+        // for a committed part must hand back the state AND the digest, or the divergence check
+        // has to make a second round trip on the hot discovery path to learn them.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let p = part(UUID_A, 5, 1);
+
+        let first = store.record_landed_part(&p).await.unwrap();
+        assert_eq!(first.state, ReplicationState::Pending, "a fresh part records as pending");
+        assert_eq!(first.digest, None, "nothing has been committed for it yet");
+
+        let claimed = store.claim_part().await.unwrap().unwrap();
+        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+
+        let second = store.record_landed_part(&p).await.unwrap();
+        assert_eq!(second.state, ReplicationState::Replicated, "the upsert never touches status");
+        assert_eq!(second.digest, Some(test_digest()), "the commit's digest comes back for comparison");
+    }
+
+    #[sqlx::test]
+    async fn a_relanding_whose_content_matches_the_commit_does_not_redrive(pool: PgPool) {
+        // The common path. A duplicate announcement, or the reconciler backstop racing the fast
+        // path, must leave a committed part alone — re-driving on every re-announcement would
+        // re-copy the node's whole shard to Ceph for nothing.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        let claimed = store.claim_part().await.unwrap().unwrap();
+        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+
+        assert!(!store.redrive_diverged_part(&p, &test_digest()).await.unwrap());
+        assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Replicated));
+    }
+
+    #[sqlx::test]
+    async fn a_relanding_with_changed_content_redrives_and_reopens_the_backend_enqueue(pool: PgPool) {
+        // B-2 at the store layer. The part must go back to `pending` so the drain re-copies it,
+        // AND `upload_enqueued_at` must clear: the backend already shipped the superseded bytes,
+        // so the enqueue sweep has to publish this part again.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        let claimed = store.claim_part().await.unwrap().unwrap();
+        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        store.mark_upload_enqueued(&p).await.unwrap();
+
+        let rewritten = crate::redrive::part_digest(&["different-chunk-0-hash"]);
+        assert!(store.redrive_diverged_part(&p, &rewritten).await.unwrap());
+
+        assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Pending));
+        assert_eq!(
+            store.list_replicated_unenqueued_parts(10).await.unwrap(),
+            Vec::new(),
+            "a pending part is off the enqueue worklist until it re-commits",
+        );
+        let (cleared,): (bool,) = sqlx::query_as("SELECT upload_enqueued_at IS NULL FROM cephor_replication_status WHERE object_id = $1")
+            .bind(UUID_A)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(cleared, "the stale backend publish was cleared for a re-publish");
+        assert!(store.claim_part().await.unwrap().is_some(), "and the part is immediately re-claimable");
+    }
+
+    #[sqlx::test]
+    async fn a_relanded_part_committed_without_a_digest_redrives_rather_than_being_assumed_intact(pool: PgPool) {
+        // The NULL policy, which the `IS DISTINCT FROM` guard carries. Rows committed before
+        // content_sha256 shipped cannot be compared; "unknown" must not resolve to "fine" on an
+        // integrity check. This costs nothing at deploy because it is only evaluated when an
+        // announcement names an already-`replicated` part — a rewrite, by construction.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        seed_status_node(&pool, UUID_A, 1, 1, "replicated", "node-a").await;
+        let p = part(UUID_A, 1, 1);
+
+        assert_eq!(store.record_landed_part(&p).await.unwrap().digest, None, "a legacy row has no digest");
+        assert!(store.redrive_diverged_part(&p, &test_digest()).await.unwrap());
+        assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Pending));
+    }
+
+    #[sqlx::test]
+    async fn a_relanding_of_a_committed_part_gates_it_off_the_eviction_worklist(pool: PgPool) {
+        // The evict-vs-reland race at the store layer. A rewritten committed part still reads
+        // 'replicated' and its residency recency predates the rewrite, so without this gate the
+        // LRU worklist ranks the ONLY copy of the client's new bytes as its coldest candidate —
+        // and an eviction before the divergence check destroys those bytes while the pool keeps
+        // the superseded ones, permanently and silently. The re-landing record must therefore
+        // arm the gate in the SAME statement that reports the prior state.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let p = part(UUID_A, 5, 1);
+        seed_part_size(&pool, UUID_A, 5, 1, Some(4096)).await;
+        store.record_landed_part(&p).await.unwrap();
+        let claimed = store.claim_part().await.unwrap().unwrap();
+        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        store.record_resident(&p, 4096).await.unwrap();
+        assert_eq!(
+            store.evictable_parts(10).await.unwrap().len(),
+            1,
+            "the pre-commit record left the gate unarmed: committed and resident is evictable",
+        );
+
+        let outcome = store.record_landed_part(&p).await.unwrap();
+
+        assert_eq!(
+            outcome.state,
+            ReplicationState::Replicated,
+            "the re-landing sees the committed prior state"
+        );
+        assert!(
+            store.evictable_parts(10).await.unwrap().is_empty(),
+            "a re-landed committed part is off the worklist while its divergence check is pending",
+        );
+        // The gate is time-bounded, not permanent: a crash between the record and the check
+        // must cost ten minutes of one part's evictability, never pin cache forever.
+        sqlx::query("UPDATE cephor_replication_status SET relanded_at = now() - interval '11 minutes' WHERE object_id = $1")
+            .bind(UUID_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.evictable_parts(10).await.unwrap().len(),
+            1,
+            "an expired gate releases the part back to the worklist",
+        );
+    }
+
+    #[sqlx::test]
+    async fn the_worklist_admits_exactly_replicated_rows_past_the_reland_grace(pool: PgPool) {
+        // The eviction worklist's admission predicate over its FULL domain — every status
+        // crossed with every reland-gate state — exhaustively, because a finite domain makes
+        // exhaustion stronger than sampling. Admission must be exactly
+        // {replicated} × {never re-landed, grace lapsed}: every other status means the SSD
+        // copy is (or may again become) the only durable one, and an in-grace re-land is the
+        // B-2 window where an eviction destroys the client's new bytes.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let statuses = ["pending", "draining", "replicated", "failed", "corrupt"];
+        // 0 = never re-landed, 1 = re-landed now (in grace), 2 = re-landed 11 min ago (lapsed).
+        let relands = [0i32, 1, 2];
+        let mut expected = Vec::new();
+        let mut number = 0i64;
+        for status in statuses {
+            for reland in relands {
+                number += 1;
+                let p = part(UUID_A, 7, u32::try_from(number).unwrap());
+                store.record_landed_part(&p).await.unwrap();
+                store.record_resident(&p, 4096).await.unwrap();
+                sqlx::query(
+                    "UPDATE cephor_replication_status \
+                     SET status = $1, \
+                         relanded_at = CASE $4::int WHEN 0 THEN NULL WHEN 1 THEN now() \
+                                       ELSE now() - interval '11 minutes' END \
+                     WHERE object_id = $2 AND version = 7 AND part_number = $3",
+                )
+                .bind(status)
+                .bind(UUID_A)
+                .bind(number)
+                .bind(reland)
+                .execute(&pool)
+                .await
+                .unwrap();
+                let in_grace = reland == 1;
+                if status == "replicated" && !in_grace {
+                    expected.push(number);
+                }
+            }
+        }
+        let mut admitted: Vec<i64> = store
+            .evictable_parts(50)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| i64::from(r.part.part().get()))
+            .collect();
+        admitted.sort_unstable();
+        assert_eq!(admitted, expected, "admission must be exactly replicated × out-of-grace");
+    }
+
+    #[sqlx::test]
+    async fn a_relanding_conflict_never_touches_updated_at(pool: PgPool) {
+        // `updated_at` drives the GC retention window, the failed-reclaim grace and
+        // `oldest_pending_age`. The conflict SET deliberately updates only `node_id` and
+        // `relanded_at`; a future `updated_at = now()` added there would keep a repeatedly
+        // announced terminal part young forever — never aging into GC or reclaim — with
+        // nothing else failing. Pinned here because it is the single most plausible edit
+        // to that statement.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        sqlx::query("UPDATE cephor_replication_status SET updated_at = now() - interval '3 days' WHERE object_id = $1")
+            .bind(UUID_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        store.record_landed_part(&p).await.unwrap();
+
+        let (aged,): (bool,) = sqlx::query_as("SELECT updated_at < now() - interval '2 days' FROM cephor_replication_status WHERE object_id = $1")
+            .bind(UUID_A)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(aged, "the conflict path must leave updated_at alone");
+    }
+
+    #[sqlx::test]
+    async fn a_relanding_of_an_uncommitted_part_leaves_the_eviction_gate_unarmed(pool: PgPool) {
+        // Announcements for still-pending parts are the COMMON conflict (an MPU part announced,
+        // then re-announced before its drain). They have no committed pool copy that could go
+        // stale, so stamping them would gate parts the divergence check will never look at.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let p = part(UUID_A, 5, 1);
+        store.record_landed_part(&p).await.unwrap();
+        store.record_landed_part(&p).await.unwrap();
+
+        let (unarmed,): (bool,) = sqlx::query_as("SELECT relanded_at IS NULL FROM cephor_replication_status WHERE object_id = $1")
+            .bind(UUID_A)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(unarmed, "a pending part's re-announcement must not arm the eviction gate");
+    }
+
+    #[sqlx::test]
+    async fn a_diverged_redrive_takes_the_part_off_the_eviction_worklist(pool: PgPool) {
+        // The constraint that must never be weakened: the evictor may not unlink a part whose
+        // only good copy is the SSD one. A diverged part is exactly that — its pool copy holds
+        // superseded bytes — so the `replicated → pending` reset has to remove it from the
+        // worklist, which `evictable_parts`' status join does. Residency is deliberately left
+        // in place (the part IS still on the disk), same as the corrupt re-drive.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let p = part(UUID_A, 5, 1);
+        seed_part_size(&pool, UUID_A, 5, 1, Some(4096)).await;
+        store.record_landed_part(&p).await.unwrap();
+        let claimed = store.claim_part().await.unwrap().unwrap();
+        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        store.record_resident(&p, 4096).await.unwrap();
+        assert_eq!(store.evictable_parts(10).await.unwrap().len(), 1, "committed and resident is evictable");
+
+        store
+            .redrive_diverged_part(&p, &crate::redrive::part_digest(&["rewritten"]))
+            .await
+            .unwrap();
+
+        assert!(
+            store.evictable_parts(10).await.unwrap().is_empty(),
+            "a re-driven part is unevictable while its pool copy is the stale one",
+        );
+        // The residency ROW is untouched — the bytes really are still on this disk — but they stop
+        // counting as CACHE, because cache means EVICTABLE and a `pending` part is not. This is
+        // `node_cache_bytes`' documented contract, not an accident of the re-drive: it names this
+        // exact case ("a re-driven corrupt part back in `pending`") as the thing it must exclude,
+        // because counting it would double-count against `node_backlog_bytes` and overstate the
+        // node's headroom to the allocator. So assert the MOVE, which proves both halves at once.
+        assert_eq!(
+            store.node_cache_bytes("node-a").await.unwrap(),
+            0,
+            "a re-driven part is no longer evictable, so it is no longer cache",
+        );
+        assert_eq!(
+            store.node_backlog_bytes("node-a").await.unwrap(),
+            4096,
+            "and it is now undrained work — the bytes moved, they did not vanish",
+        );
+    }
+
+    #[sqlx::test]
+    async fn a_redrive_is_scoped_to_the_node_that_holds_the_part(pool: PgPool) {
+        // A part lives only on the SSD of the node that ingested it. A peer that somehow saw the
+        // announcement must not reset a row naming a disk it cannot read — the part would go
+        // `pending` on a node whose claim_part can never pick it up, stalling it indefinitely.
+        create_app_schema(&pool).await;
+        seed_status_node(&pool, UUID_A, 1, 1, "replicated", "node-a").await;
+        let other = Store::from_pool(pool.clone()).with_node_id("node-b");
+
+        assert!(!other.redrive_diverged_part(&part(UUID_A, 1, 1), &test_digest()).await.unwrap());
+        assert_eq!(
+            other.status(&part(UUID_A, 1, 1)).await.unwrap(),
+            Some(ReplicationState::Replicated),
+            "another node's committed part is not this node's to re-drive",
+        );
     }
 
     #[sqlx::test]
@@ -2392,7 +2841,8 @@ mod part_tests {
 
     #[sqlx::test]
     async fn the_eviction_worklist_is_oldest_first_scoped_to_this_node_and_excludes_evicted(pool: PgPool) {
-        // Three properties the evictor's correctness rests on: FIFO order (the policy),
+        // Three properties the evictor's correctness rests on: order (here the `resident_at`
+        // FALLBACK, since nothing has been read — the LRU policy itself has its own test below),
         // node-scoping (a node must never evict a peer's part — it does not even hold it),
         // and that a marked part leaves the worklist (or the next pass would re-offer it
         // forever and never make progress).
@@ -2815,7 +3265,7 @@ mod part_tests {
         let p = part(UUID_A, 5, 1);
         store.record_landed_part(&p).await.unwrap();
         let claimed = store.claim_part().await.unwrap().unwrap();
-        store.mark_replicated(&claimed, &PartVerified::for_test()).await.unwrap();
+        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
         assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Replicated));
     }
 
@@ -2828,7 +3278,10 @@ mod part_tests {
         // row is still 'pending', so the 'draining' guard matches no row (the token
         // value is irrelevant here — the status guard already rejects it).
         let unclaimed = ClaimedPart::new(p.clone(), 0);
-        let err = store.mark_replicated(&unclaimed, &PartVerified::for_test()).await.unwrap_err();
+        let err = store
+            .mark_replicated(&unclaimed, &PartVerified::for_test(), &test_digest())
+            .await
+            .unwrap_err();
         let expected = p.relative_dir().to_string_lossy().into_owned();
         assert!(
             matches!(err, StoreError::PartClaimLost { ref part } if part.as_ref() == expected),
@@ -2896,7 +3349,10 @@ mod part_tests {
         let second = store.claim_part().await.unwrap().expect("the stale claim is re-won past the lease");
         assert_ne!(first.claim_seq(), second.claim_seq(), "the re-claim gets a fresh fencing token");
 
-        let err = store.mark_replicated(&first, &PartVerified::for_test()).await.unwrap_err();
+        let err = store
+            .mark_replicated(&first, &PartVerified::for_test(), &test_digest())
+            .await
+            .unwrap_err();
         let expected = p.relative_dir().to_string_lossy().into_owned();
         assert!(
             matches!(err, StoreError::PartClaimLost { ref part } if part.as_ref() == expected),
@@ -2907,7 +3363,7 @@ mod part_tests {
             Some(ReplicationState::Draining),
             "the fenced commit leaves the live claim's draining row untouched",
         );
-        store.mark_replicated(&second, &PartVerified::for_test()).await.unwrap();
+        store.mark_replicated(&second, &PartVerified::for_test(), &test_digest()).await.unwrap();
         assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Replicated));
     }
 
@@ -3500,7 +3956,7 @@ mod part_tests {
         store.record_landed_part(&part).await.unwrap();
         let claim = store.claim_part().await.unwrap().expect("claims the seeded pending part");
         assert_eq!(claim.part(), &part);
-        store.mark_replicated(&claim, &PartVerified::for_test()).await.unwrap();
+        store.mark_replicated(&claim, &PartVerified::for_test(), &test_digest()).await.unwrap();
         part
     }
 

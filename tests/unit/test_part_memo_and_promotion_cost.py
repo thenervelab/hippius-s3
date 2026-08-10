@@ -220,3 +220,21 @@ async def test_the_residency_upsert_has_a_conflict_action() -> None:
     assert "DO UPDATE SET bytes = cephor_ssd_residency.bytes + EXCLUDED.bytes" in normalised, (
         f"the conflict action is missing or no longer accumulates: {normalised}"
     )
+
+
+@pytest.mark.asyncio
+async def test_the_release_statement_subtracts_the_claimed_bytes_with_a_zero_floor() -> None:
+    """Pinned as text for the same reason as the UPSERT above: `release` swallows every DB
+    failure by design, so a statement Postgres rejects passes a mocked suite while the phantom
+    bytes it exists to remove keep accumulating. The zero floor matters too — the evictor SUMS
+    this column against its deficit, and a negative row corrupts that sum, while an under-count
+    only costs one extra eviction candidate.
+    """
+    pool = FakePool()
+    await ResidencyRecorder(pool, "node-a").release(OBJ, 1, 1, 4096)
+
+    normalised = " ".join(pool.statements[0].split())
+    assert "GREATEST(cephor_ssd_residency.bytes - $5, 0)" in normalised, (
+        f"the release no longer subtracts, or lost its floor: {normalised}"
+    )
+    assert pool.executed[0] == ("node-a", OBJ, 1, 1, 4096), "the release must target exactly the claimed key"

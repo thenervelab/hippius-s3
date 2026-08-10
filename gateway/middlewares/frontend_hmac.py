@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from starlette import status
 
 from gateway.config import get_config
+from gateway.utils.paths import routing_path
 
 
 config = get_config()
@@ -32,7 +33,16 @@ async def verify_frontend_hmac_middleware(
     Expects an X-HMAC-Signature header containing the HMAC signature of the request.
     The signature is calculated as HMAC-SHA256(secret, method + path + query_string).
     """
-    if not request.url.path.startswith("/user/"):
+    # Gated on the path the api will RECEIVE. Judged as sent, `/x/../user/foo` does not start with
+    # `/user/`, so HMAC was skipped — and the api was still handed `/user/foo`. acl.py and
+    # account.py skip their own checks for `/user/` on that same view, so this is the only layer
+    # left in front of the frontend endpoints and it has to agree with them.
+    #
+    # The SIGNED message below deliberately stays `request.url.path`: it must remain byte-identical
+    # to what the frontend signs. The two are equal for every real `/user/...` request (no dot
+    # segments, no literal `#`), and for a crafted one they differ, which fails the comparison —
+    # the safe direction.
+    if not routing_path(request).startswith("/user/"):
         return await call_next(request)
 
     if request.method == "OPTIONS":

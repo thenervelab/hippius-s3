@@ -19,8 +19,12 @@ jobs:
       cancel-in-progress: false
 
     steps:
+      # Scheduled runs read this file from the default branch (staging), so without an
+      # explicit ref they would smoke-test prod using staging's unreleased test code.
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5

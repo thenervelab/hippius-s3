@@ -13,6 +13,7 @@ from gateway.services.sub_token_scope import evaluate as evaluate_sub_token_scop
 from gateway.services.sub_token_scope import permission_allows
 from gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
 from gateway.utils.errors import s3_error_response
+from gateway.utils.paths import routing_path
 from hippius_s3.models.acl import Permission
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
@@ -113,7 +114,11 @@ async def acl_middleware(
     ray_id = getattr(request.state, "ray_id", "no-ray-id")
     logger = get_logger_with_ray_id(__name__, ray_id)
 
-    path = request.url.path
+    # The bucket and key the api will ACT on. `request.url.path` is the wrong lens twice over: it is
+    # uncollapsed, so `/docs/../anybucket/key` made this evaluate permissions for the bucket `docs`
+    # (ownerless in prod) while the api served `anybucket`; and it is fragment-truncated, so it
+    # disagrees with the key `input_validation` judged.
+    path = routing_path(request)
 
     if path == "/health" or path.startswith("/user/"):
         return await call_next(request)
