@@ -35,10 +35,19 @@ async def test_offloaded_encrypt_matches_inline(size: int) -> None:
     adapter = CryptoService.get_adapter(SUITE)
     buf = bytes((i * 7 + 3) & 0xFF for i in range(size))
 
-    inline = adapter.encrypt_chunk(buf, **_enc_kwargs(0))
     offloaded = await run_crypto(adapter.encrypt_chunk, buf, **_enc_kwargs(0))
 
-    assert offloaded == inline, "offloaded encrypt must be byte-identical to inline"
+    # Byte-equality against an inline encrypt is NOT the assertion, even though it reads like the
+    # obvious one. Nonces are random per call — deliberately, because deriving them from the
+    # chunk's identity made an UploadPart retry reuse a nonce under the same DEK — so two
+    # encryptions of one input differ, and a test demanding otherwise would be pinning the bug.
+    #
+    # What the offload has to preserve is that the ciphertext is the plaintext: same length, and
+    # it round-trips. A thread-pool hop that corrupted or truncated the buffer fails both.
+    assert len(offloaded) == size + adapter.overhead_per_chunk
+    assert adapter.decrypt_chunk(offloaded, **_enc_kwargs(0)) == buf, (
+        "offloaded encrypt must round-trip to the original plaintext"
+    )
 
 
 @pytest.mark.asyncio

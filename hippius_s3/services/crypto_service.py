@@ -12,8 +12,7 @@ or implement AAD via explicit MAC computation.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
+import os
 import struct
 from abc import ABC
 from abc import abstractmethod
@@ -104,26 +103,6 @@ class AESGCMChunkedAdapter(CryptoAdapter):
         parts.append(struct.pack("<II", int(part_number), int(chunk_index)))
         return b"".join(parts)
 
-    def _derive_nonce(
-        self,
-        key: bytes,
-        bucket_id: str,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-        upload_id: str,
-    ) -> bytes:
-        """Derive a deterministic nonce to avoid reliance on RNG quality at extreme scale."""
-        info = (
-            f"hippius-aesgcm-nonce:"
-            f"bucket={bucket_id}:"
-            f"object={object_id}:"
-            f"upload={upload_id}:"
-            f"part={int(part_number)}:"
-            f"chunk={int(chunk_index)}"
-        ).encode("utf-8")
-        return hmac.new(key, info, hashlib.sha256).digest()[: self.NONCE_SIZE]
-
     def encrypt_chunk(
         self,
         plaintext: bytes,
@@ -136,7 +115,22 @@ class AESGCMChunkedAdapter(CryptoAdapter):
         upload_id: str,
     ) -> bytes:
         aad = self._build_aad(bucket_id, object_id, int(part_number), int(chunk_index), upload_id)
-        nonce = self._derive_nonce(key, bucket_id, object_id, int(part_number), int(chunk_index), upload_id)
+        # RANDOM, never derived from the chunk's identity. The nonce used to be
+        # HMAC(DEK, bucket|object|part|chunk), and every one of those inputs is stable across an
+        # `UploadPart` retry — as is the DEK, which is per object-version. So a client re-uploading
+        # a part with different bytes encrypted different plaintext under the SAME key and nonce,
+        # which is the one thing AES-GCM must never do: the keystream repeats, the XOR of the two
+        # plaintexts leaks, and the GHASH subkey becomes recoverable. The trigger was an ordinary
+        # retry, not an attack.
+        #
+        # The RNG-quality worry the derivation was written for does not apply here, because the DEK
+        # is per object-version: encryptions under one key are bounded by that object's chunk count
+        # (~2^20 for a 5 TB object), far inside NIST SP 800-38D's 2^32 limit for random 96-bit IVs.
+        #
+        # Safe to change with no migration and no suite bump: the nonce travels in the ciphertext
+        # and `decrypt_chunk` reads it from there rather than re-deriving, so objects written either
+        # side of this change decrypt through the identical path.
+        nonce = os.urandom(self.NONCE_SIZE)
         ct = AESGCM(key).encrypt(nonce, plaintext, aad)
         return nonce + ct
 
@@ -180,24 +174,6 @@ class AESGCMChunkedAdapterV2(AESGCMChunkedAdapter):
             parts.append(s_bytes)
         parts.append(struct.pack("<II", int(part_number), int(chunk_index)))
         return b"".join(parts)
-
-    def _derive_nonce(
-        self,
-        key: bytes,
-        bucket_id: str,
-        object_id: str,
-        part_number: int,
-        chunk_index: int,
-        upload_id: str,
-    ) -> bytes:
-        info = (
-            f"hippius-aesgcm-nonce-v2:"
-            f"bucket={bucket_id}:"
-            f"object={object_id}:"
-            f"part={int(part_number)}:"
-            f"chunk={int(chunk_index)}"
-        ).encode("utf-8")
-        return hmac.new(key, info, hashlib.sha256).digest()[: self.NONCE_SIZE]
 
 
 class CryptoService:

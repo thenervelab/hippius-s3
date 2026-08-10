@@ -2,11 +2,18 @@
 
 Clients hedge UploadPart with concurrent duplicate PUTs of the same
 (object, version, part_number); all attempts share ONE part dir on the SSD.
-Chunk writes are atomic tmp+rename and byte-identical across duplicates
-(deterministic AES-GCM nonces), so concurrent writers are harmless — but a
-loser that fails/cancels AFTER another attempt published (meta.json + parts
-row + 200 to the client) must NOT delete the shared part dir: that destroys
-acknowledged data.
+Chunk writes are atomic tmp+rename, so a concurrent writer cannot produce a
+torn file — but a loser that fails/cancels AFTER another attempt published
+(meta.json + parts row + 200 to the client) must NOT delete the shared part
+dir, and must not overwrite it either: both destroy acknowledged data.
+
+Duplicates are NOT byte-identical. Nonces are random per chunk as of the
+change this file ships with, so B's encryption of even the SAME plaintext
+differs from A's on disk; and the AAD binds (bucket, object, part, chunk)
+rather than attempt identity, so B's bytes still decrypt cleanly inside A's
+part. The loser therefore writes DISTINCT plaintext (`LOSER_BODY`): it makes
+a surviving loser chunk unambiguous rather than something the reader has to
+argue is or is not a re-encryption of the same content.
 
 These tests publish a part as attempt A, then drive attempt B through each
 failure path and assert A's published data survives B's cleanup.
@@ -14,6 +21,7 @@ failure path and assert A's published data survives B's cleanup.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,6 +37,9 @@ from hippius_s3.writer.types import AppendPreconditionFailed
 
 
 PART_BODY = b"abcdefgh"  # 2 chunks at chunk_size=4
+# One chunk, and deliberately NOT a prefix of PART_BODY: a loser chunk that survived
+# on disk has to be distinguishable from the winner's by plaintext alone.
+LOSER_BODY = b"ZZZZ"
 
 
 class DummyRedis:
@@ -111,7 +122,7 @@ async def test_mpu_duplicate_failure_after_publish_preserves_part(tmp_path, monk
     assert set(published) == {"chunk_0.bin", "chunk_1.bin"}
 
     async def dying_body() -> AsyncIterator[bytes]:
-        yield PART_BODY[:4]
+        yield LOSER_BODY
         raise ConnectionError("client disconnected mid-stream")
 
     with pytest.raises(ConnectionError):
@@ -135,6 +146,89 @@ async def test_mpu_duplicate_failure_after_publish_preserves_part(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_mpu_duplicate_cancellation_after_publish_preserves_part(tmp_path, monkeypatch, small_chunks):
+    """The same guarantee when the loser is CANCELLED rather than raising a plain exception.
+
+    This is the case that actually happens in production. A client that disconnects mid-body has
+    its request task cancelled, and `asyncio.CancelledError` derives from `BaseException`, so an
+    `except Exception` handler does not run at all — the consumer is left pending holding queued
+    chunks it then writes into the SHARED part dir on a later event-loop turn, overwriting an
+    attempt that already returned 200.
+
+    Distinct from the sibling test above by the exception TYPE alone, which is the whole point:
+    that one passes against an `except Exception` handler and this one does not.
+    """
+    object_id = str(uuid.uuid4())
+    fs_store = FileSystemPartsStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    await _publish_attempt_a(writer, object_id=object_id, object_version=1, part_number=1, upload_id="upload")
+    published = _read_chunks(fs_store, object_id, 1, 1)
+
+    async def cancelled_body() -> AsyncIterator[bytes]:
+        yield LOSER_BODY
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await writer.mpu_upload_part_stream(
+            upload_id="upload",
+            object_id=object_id,
+            object_version=1,
+            bucket_name="bucket",
+            bucket_id="bucket",
+            account_address="acct",
+            part_number=1,
+            body_iter=cancelled_body(),
+        )
+
+    # Give any consumer the handler failed to cancel the event-loop turns it would need to
+    # drain its queue onto disk. Without the fix this is where the overwrite lands.
+    await asyncio.sleep(0.05)
+
+    meta = await fs_store.get_meta(object_id, 1, 1)
+    assert meta is not None, "published meta.json was destroyed by the cancelled loser"
+    assert int(meta["num_chunks"]) == 2
+    assert _read_chunks(fs_store, object_id, 1, 1) == published, (
+        "a cancelled attempt's queued chunks were written into the published part dir"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_attempt_leaves_no_pending_consumer(tmp_path, monkeypatch, small_chunks):
+    """The leak half: cancellation must not strand the consumer task holding its queue.
+
+    The `None` sentinel that retires the consumer is only sent on the success path, so a handler
+    that never runs leaves the task blocked on `write_queue.get()` for the life of the process —
+    once per cancelled UploadPart, which is once per client disconnect.
+    """
+    object_id = str(uuid.uuid4())
+    fs_store = FileSystemPartsStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    before = {t for t in asyncio.all_tasks()}
+
+    async def cancelled_body() -> AsyncIterator[bytes]:
+        yield LOSER_BODY
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await writer.mpu_upload_part_stream(
+            upload_id="upload",
+            object_id=object_id,
+            object_version=1,
+            bucket_name="bucket",
+            bucket_id="bucket",
+            account_address="acct",
+            part_number=1,
+            body_iter=cancelled_body(),
+        )
+
+    await asyncio.sleep(0.05)
+    leaked = [t for t in asyncio.all_tasks() if t not in before and not t.done()]
+    assert not leaked, f"cancelled UploadPart stranded {len(leaked)} pending task(s): {leaked}"
+
+
+@pytest.mark.asyncio
 async def test_failed_attempt_preserves_unpublished_chunks(tmp_path, monkeypatch, small_chunks):
     """B fails while A is mid-write (A's chunks on disk, meta NOT yet written): A's chunks survive.
 
@@ -152,7 +246,7 @@ async def test_failed_attempt_preserves_unpublished_chunks(tmp_path, monkeypatch
     assert not (part_dir / "meta.json").exists()
 
     async def dying_body() -> AsyncIterator[bytes]:
-        yield PART_BODY[:4]
+        yield LOSER_BODY
         raise ConnectionError("client disconnected mid-stream")
 
     with pytest.raises(ConnectionError):
