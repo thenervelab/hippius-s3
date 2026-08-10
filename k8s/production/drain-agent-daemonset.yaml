@@ -183,31 +183,30 @@ spec:
             # AND defer_attempts), so a just-completed MPU's parts drain promptly regardless.
             - name: CEPHOR_DRAIN_POLL_SECS
               value: "1"
-            # Reconciler scan period (was the 60s code default). NO LONGER the sole drain trigger:
-            # the api announces each part to cephor:landed:<node> and the agent's `landed` worker
-            # records it, so this walk is the BACKSTOP for an announcement never delivered. Until
-            # that path is proven this interval still bounds the replication-sync tail, which is
-            # why it is unchanged here.
-            # STALE PREMISE — corrected 2026-08-07. This used to read "undrained parts only —
-            # drained parts are unlinked", which is what made a 15s walk cheap. Retention (PR
-            # #398) ended that: the drain keeps its replicated copy to serve reads, so the tree
-            # is now the node's ENTIRE replicated shard — measured on prod 2026-08-07 at 2.28M
-            # parts / ~930 GB per node. At this interval that is ~2.28M stats and ~4,560 batched
-            # queries every 15 seconds, per node, to discover a handful of new parts.
-            # The Ceph pool and the 94M-row parts table are still never walked.
+            # Reconciler scan period — the BACKSTOP for a lost landed announcement, not the
+            # drain trigger. Primary discovery is the api's cephor:landed:<node> announcement,
+            # drained every 1s (landed.rs); this walk only recovers a part whose announcement
+            # was never delivered, so its interval bounds nothing but that recovery lag. An
+            # unrecovered part waits safely on SSD in the meantime: with no DB row the evictor
+            # never selects it, and the orphan reclaim grace is 24h.
             #
-            # The api landing fast-path now exists (cephor:landed:<node>, see landed.rs), so
-            # discovery no longer depends on this poll — but the poll is deliberately left at 15s
-            # until that path is proven, and demoting the reconciler to a ~10min BACKSTOP is a
-            # separate commit and separate deploy so either can be rolled back alone.
-            # Watch drain_scan_parts_total / drain_scan_duration_ms.
+            # 600 (was 15): retention (PR #398) turns the walked tree from the small undrained
+            # backlog into the node's ENTIRE replicated shard — measured 2026-08-07 at 2.28M
+            # parts / ~930 GB per node, i.e. ~2.28M stats + ~4,560 batched status queries per
+            # cycle. At 15s that walk would run 4x a minute per node from the moment retention
+            # lands; at 600s it runs 6x an hour (a 40x reduction) while a dropped announcement
+            # still recovers within the ~10min backstop the 2026-08-07 note planned. 600s also
+            # matches the code's own backstop scale (CEPHOR_DEFER_BACKOFF_CAP defaults to 600s)
+            # and is 10x the 60s code default set back when this walk was the sole — and cheap —
+            # trigger. Watch drain_scan_parts_total / drain_scan_duration_ms.
             #
-            # ORDERING CONSTRAINT: this cost is only theoretical on prod today because prod is
-            # still pre-retention (the SSD holds just the undrained backlog). Retention must not
-            # reach prod before this poll is demoted, or prod starts paying the full walk 4x a
-            # minute per node on day one.
+            # ORDERING CONSTRAINT (closed): PR #400's review gated promoting retention to prod
+            # on this demotion landing first. Done here, on the staging branch, ahead of the
+            # retention stack's promotion — so it rides the same staging->main train as
+            # retention and prod can never receive retention without it. Staging deliberately
+            # keeps 15s (see k8s/staging/drain-agent-daemonset.yaml for why).
             - name: CEPHOR_RECONCILE_POLL_SECS
-              value: "15"
+              value: "600"
             - name: RUST_LOG
               value: "info"
             # OTLP metrics -> otel-collector -> Prometheus -> Grafana (feature `otel`, on by

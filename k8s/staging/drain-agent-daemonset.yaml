@@ -179,29 +179,21 @@ spec:
             # AND defer_attempts), so a just-completed MPU's parts drain promptly regardless.
             - name: CEPHOR_DRAIN_POLL_SECS
               value: "1"
-            # Reconciler scan period (was the 60s code default). NO LONGER the sole drain trigger:
-            # the api announces each part to cephor:landed:<node> and the agent's `landed` worker
-            # records it, so this walk is the BACKSTOP for an announcement never delivered. Until
-            # that path is proven this interval still bounds the replication-sync tail, which is
-            # why it is unchanged here.
-            # STALE PREMISE — corrected 2026-08-07. This used to read "undrained parts only —
-            # drained parts are unlinked", which is what made a 15s walk cheap. Retention (PR
-            # #398) ended that: the drain keeps its replicated copy to serve reads, so the tree
-            # is now the node's ENTIRE replicated shard — measured on prod 2026-08-07 at 2.28M
-            # parts / ~930 GB per node. At this interval that is ~2.28M stats and ~4,560 batched
-            # queries every 15 seconds, per node, to discover a handful of new parts.
-            # The Ceph pool and the 94M-row parts table are still never walked.
+            # Reconciler scan period — the BACKSTOP for a lost landed announcement, not the
+            # drain trigger. Primary discovery is the api's cephor:landed:<node> announcement,
+            # drained every 1s (landed.rs); this walk only recovers a part whose announcement
+            # was never delivered.
             #
-            # The api landing fast-path now exists (cephor:landed:<node>, see landed.rs), so
-            # discovery no longer depends on this poll — but the poll is deliberately left at 15s
-            # until that path is proven, and demoting the reconciler to a ~10min BACKSTOP is a
-            # separate commit and separate deploy so either can be rolled back alone.
-            # Watch drain_scan_parts_total / drain_scan_duration_ms.
-            #
-            # ORDERING CONSTRAINT: this cost is only theoretical on prod today because prod is
-            # still pre-retention (the SSD holds just the undrained backlog). Retention must not
-            # reach prod before this poll is demoted, or prod starts paying the full walk 4x a
-            # minute per node on day one.
+            # Staging DELIBERATELY stays at 15s where production runs 600s. Retention is
+            # already live here, but the walked shard is just the two staging ingest nodes'
+            # staging-only cache (the disjoint local_ingest_staging dir on node2/node3) —
+            # nowhere near prod's 2.28M-part / ~930 GB shards, so the fast walk stays cheap.
+            # And staging is where the announcement fast-path is being proven: a 15s cycle
+            # surfaces a dropped announcement (a nonzero `recovered` tally, see
+            # drain_scan_parts_total) within seconds instead of hiding it for ten minutes,
+            # and keeps the replication-lag tail tight while that path is validated. Demote
+            # this toward prod's 600s only once staging's cache grows enough for
+            # drain_scan_duration_ms to matter.
             - name: CEPHOR_RECONCILE_POLL_SECS
               value: "15"
             - name: RUST_LOG
