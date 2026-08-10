@@ -7,11 +7,7 @@ from hippius_s3.writer.write_through_writer import WriteThroughPartsWriter
 
 class RecordingFS:
     def __init__(self) -> None:
-        self.chunk_calls: list[tuple[int, int]] = []
         self.meta_calls: list[int] = []
-
-    async def set_chunk(self, object_id: Any, ov: int, pn: int, idx: int, data: bytes) -> None:
-        self.chunk_calls.append((int(pn), int(idx)))
 
     async def set_meta(self, object_id: Any, ov: int, pn: int, **kwargs: Any) -> None:
         self.meta_calls.append(int(pn))
@@ -28,14 +24,6 @@ class ExplodingCache:
 
 
 OBJ = "11111111-2222-3333-4444-555555555555"
-
-
-@pytest.mark.asyncio
-async def test_write_chunks_only_touches_fs() -> None:
-    fs = RecordingFS()
-    writer = WriteThroughPartsWriter(fs, ExplodingCache(), ttl_seconds=60)
-    await writer.write_chunks(OBJ, 1, 1, [b"a", b"b", b"c"])
-    assert fs.chunk_calls == [(1, 0), (1, 1), (1, 2)]
 
 
 @pytest.mark.asyncio

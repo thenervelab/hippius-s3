@@ -31,6 +31,15 @@ services:
       # then unlinks the SSD copy. Reads fall back to the pool for drained parts.
       - HIPPIUS_OBJECT_CACHE_DIR=/var/lib/hippius/local_object_cache
       - HIPPIUS_OBJECT_CACHE_FALLBACK_DIR=/var/lib/hippius/object_cache
+      # MUST equal drain-agent's CEPHOR_NODE_ID: both sides build the queue name as
+      # `cephor:landed:{node}`, so a mismatch announces onto a queue nothing drains.
+      # Without it `initialize_landed_publisher` returns None and the api announces
+      # NOTHING, which silently removes the only path that detects a re-landed part:
+      # `record_landed_part` never runs, so neither does the divergence check or the
+      # re-drive. The reconciler is not a fallback here — it tallies an already
+      # `replicated` row as a `replicated_orphan` and leaves it, which is exactly why
+      # the B-2 detection hangs off the announcement rather than the walk.
+      - NODE_NAME=e2e-node
     depends_on:
       db:
         condition: service_healthy

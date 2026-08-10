@@ -90,8 +90,15 @@ see the `_promote_chunk` in-flight guard and the note at the top of `residency.p
             ├── chunk_1.bin
             ├── ...
             ├── meta.json              # Presence = "part is known" signal
-            └── *.tmp.<uuid4>          # In-flight atomic write; janitor cleans if >1h old
+            ├── *.tmp.<uuid4>          # In-flight atomic write; janitor cleans if >1h old
+            └── chunk_<i>.bin.staged.<attempt>   # UploadPart attempt's private copy, pre-publish
 ```
+
+A staged chunk lives for the WHOLE UploadPart (a multi-GB part on a slow link can hold one for
+hours) and is renamed onto `chunk_<i>.bin` only when `publish_part` promotes the attempt's full
+set. Deliberately NOT `.tmp.`-shaped: the write-temp sweepers assume temps live for milliseconds
+and would delete it mid-upload. A SIGKILL'd attempt's leftovers are swept by the drain agent's
+orphan sweep at its 24h grace; readers and the drain's completeness gate never count staged names.
 
 - Every file is written atomically: unique tmp name → `os.replace` ([fs_store.py:92, 123-131](fs_store.py)). Two workers writing the same chunk path each use their own tmp — last rename wins, content is deterministic, no corruption.
 - **`meta.json` is the readiness gate**: `get_chunk` returns None unless `meta.json` exists AND the specific chunk file exists ([fs_store.py:168-173](fs_store.py)). `chunks_exist_batch` same.

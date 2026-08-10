@@ -163,6 +163,72 @@ async def test_write_meta_works_with_no_publisher_installed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_publish_part_announces_strictly_after_the_store_publish() -> None:
+    """The SECOND choke point, and the one with no `set_meta` call to hang an announcement on.
+
+    MPU parts and append deltas stage their chunks, so for them the meta write happens INSIDE
+    `fs_store.publish_part`. An announcement missing here does not error anywhere: those parts
+    just stop reaching the agent directly and wait for the reconciler's disk walk.
+    """
+    order: list[str] = []
+
+    class RecordingStore:
+        async def publish_part(self, *_a, **_kw) -> None:
+            order.append("publish")
+
+    class RecordingPublisher:
+        async def publish(self, *_a) -> None:
+            order.append("announce")
+
+    landed._publisher = RecordingPublisher()
+    writer = WriteThroughPartsWriter(RecordingStore(), None, ttl_seconds=60)
+
+    await writer.publish_part(OBJ, 1, 1, attempt_id="0123456789abcdef", chunk_size=4, num_chunks=1, plain_size=4)
+
+    assert order == ["publish", "announce"], "the announcement must follow the promotion"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_publish_announces_nothing() -> None:
+    """Announcing a part whose promotion raised would have the agent claim a part that is not
+    published — its meta belongs to whatever attempt was there before, if any."""
+    announced: list[tuple] = []
+
+    class FailingStore:
+        async def publish_part(self, *_a, **_kw) -> None:
+            raise OSError("rename failed mid-swap")
+
+    class RecordingPublisher:
+        async def publish(self, *args) -> None:
+            announced.append(args)
+
+    landed._publisher = RecordingPublisher()
+    writer = WriteThroughPartsWriter(FailingStore(), None, ttl_seconds=60)
+
+    with pytest.raises(OSError):
+        await writer.publish_part(OBJ, 1, 1, attempt_id="0123456789abcdef", chunk_size=4, num_chunks=1, plain_size=4)
+
+    assert announced == []
+
+
+@pytest.mark.asyncio
+async def test_publish_part_works_with_no_publisher_installed() -> None:
+    """Same as `write_meta`: workers, scripts and tests never initialize the singleton."""
+    calls: list[str] = []
+
+    class RecordingStore:
+        async def publish_part(self, *_a, **_kw) -> None:
+            calls.append("publish")
+
+    landed._publisher = None
+    await WriteThroughPartsWriter(RecordingStore(), None, ttl_seconds=60).publish_part(
+        OBJ, 1, 1, attempt_id="0123456789abcdef", chunk_size=4, num_chunks=1, plain_size=4
+    )
+
+    assert calls == ["publish"]
+
+
+@pytest.mark.asyncio
 async def test_a_failing_announcement_does_not_fail_the_write(monkeypatch) -> None:
     """End to end through the writer: a dead redis-queues costs a fast discovery path, not a PUT."""
 
@@ -263,3 +329,82 @@ async def test_write_meta_works_with_no_recency_recorder_installed() -> None:
     )
 
     assert calls == ["meta"]
+
+
+@pytest.mark.asyncio
+async def test_publish_part_stamps_recency_before_the_announcement() -> None:
+    """The staging path needs the same shield, and needs it MORE than write_meta does.
+
+    `write_meta` covers the simple-PUT path, where a rewrite lands in a per-object-version dir
+    and the evict-vs-reland race does not arise. The staging path here is MPU parts and append
+    deltas — a re-uploaded MPU part is exactly the B-2 shape the shield exists for, so a stamp
+    on write_meta alone protects the case that cannot happen and leaves the one that does
+    uncovered.
+    """
+    order: list[str] = []
+
+    class RecordingStore:
+        async def publish_part(self, *_a, **_kw) -> None:
+            order.append("publish")
+
+    class RecordingRecorder:
+        async def __call__(self, *_a) -> None:
+            order.append("stamp")
+
+    class RecordingPublisher:
+        async def publish(self, *_a) -> None:
+            order.append("announce")
+
+    read_recency._recorder = RecordingRecorder()
+    landed._publisher = RecordingPublisher()
+
+    await WriteThroughPartsWriter(RecordingStore(), None, ttl_seconds=60).publish_part(
+        OBJ, 1, 1, attempt_id="attemptaa", chunk_size=4, num_chunks=1, plain_size=4
+    )
+
+    assert order == ["publish", "stamp", "announce"]
+
+
+@pytest.mark.asyncio
+async def test_publish_part_works_with_no_recency_recorder_installed() -> None:
+    """Same degradation as write_meta: no recorder outside the api, and that must not fail a PUT."""
+    calls: list[str] = []
+
+    class RecordingStore:
+        async def publish_part(self, *_a, **_kw) -> None:
+            calls.append("publish")
+
+    read_recency._recorder = None
+    landed._publisher = None
+    await WriteThroughPartsWriter(RecordingStore(), None, ttl_seconds=60).publish_part(
+        OBJ, 1, 1, attempt_id="attemptaa", chunk_size=4, num_chunks=1, plain_size=4
+    )
+    assert calls == ["publish"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_publish_stamps_no_recency() -> None:
+    """A publish that raised produced no new bytes, so there is nothing to keep hot.
+
+    Stamping anyway would mark a part the evictor may legitimately want as freshly-read, on the
+    strength of a write that did not happen.
+    """
+    stamped: list[str] = []
+
+    class FailingStore:
+        async def publish_part(self, *_a, **_kw) -> None:
+            raise FileNotFoundError("staged set vanished")
+
+    class RecordingRecorder:
+        async def __call__(self, *_a) -> None:
+            stamped.append("stamp")
+
+    read_recency._recorder = RecordingRecorder()
+    landed._publisher = None
+
+    with pytest.raises(FileNotFoundError):
+        await WriteThroughPartsWriter(FailingStore(), None, ttl_seconds=60).publish_part(
+            OBJ, 1, 1, attempt_id="attemptaa", chunk_size=4, num_chunks=1, plain_size=4
+        )
+
+    assert stamped == []

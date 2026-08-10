@@ -14,9 +14,10 @@
 
 use core::future::Future;
 use hippius_drain_core::{
-    CephFs, ChunkIndex, DiscoveredPart, FileId, FreeSpaceProbe, META_FILE_NAME, PartKey, PartMeta, PartPool, PartRemover, PartScan, PartSource,
-    SsdCache, chunk_file_name, parse_part_dir,
+    CephFs, ChunkIndex, DiscoveredPart, FailedGrace, FileId, FreeSpaceProbe, META_FILE_NAME, OrphanGrace, PartKey, PartMeta, PartPool, PartRemover,
+    PartScan, PartSource, SsdCache, chunk_file_name, parse_part_dir,
 };
+use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::hash::BuildHasher;
@@ -208,20 +209,29 @@ impl LocalSsd {
 
     /// Removes orphaned write-temp files left on the SSD by a crashed mid-write PUT
     /// (the api's `<name>.tmp.<uuid>`) or a cancelled persist (the agent's
-    /// `.tmp-<name>`), once older than `max_age`.
+    /// `.tmp-<name>`), once older than `temps`; and the api's staged chunks
+    /// (`chunk_<i>.bin.staged.<attempt>`) once older than `staged`.
     ///
-    /// Walks the `<object>/v<version>/part_<n>/` layout and only ever unlinks a temp
-    /// FILE — never a real `chunk_*.bin`/`meta.json`, never a directory — so it cannot
-    /// touch a complete or in-flight part; the age gate keeps a temp an active writer
-    /// is still using. Returns how many temps it removed; a missing root is an empty
-    /// cache, not an error. The companion to whole-part reclaim (`reclaim_ssd`), which
-    /// already clears temps inside a reclaimed part dir.
+    /// The two graces differ because the files differ. A write-temp exists for
+    /// milliseconds, so anything older is a crash orphan. A staged chunk is deliberately
+    /// held for the WHOLE of one `UploadPart` — that is what stops a duplicate attempt
+    /// overwriting an already-acknowledged part — so it is legitimately as old as the
+    /// upload, and a multi-GB part on a slow link outlives the write-temp grace many times
+    /// over. Reaping it on the write-temp grace would delete a live upload's data — which
+    /// is why the two are separate TYPES: they were adjacent `Duration`s, and transposing
+    /// them was a silent one-word edit that no test could see.
+    ///
+    /// Walks the `<object>/v<version>/part_<n>/` layout and only ever unlinks a temp or
+    /// staged FILE — never a real `chunk_*.bin`/`meta.json`, never a directory — so it
+    /// cannot touch a complete or in-flight part. Returns how many files it removed; a
+    /// missing root is an empty cache, not an error. The companion to whole-part reclaim
+    /// (`reclaim_ssd`), which already clears temps inside a reclaimed part dir.
     ///
     /// # Errors
     ///
     /// [`io::Error`] if walking the cache or unlinking a temp fails for a reason other
     /// than a concurrently-removed entry (which is tolerated).
-    pub async fn sweep_orphan_tmp(&self, max_age: Duration) -> io::Result<u64> {
+    pub async fn sweep_orphan_tmp(&self, temps: FailedGrace, staged: OrphanGrace) -> io::Result<u64> {
         let mut removed = 0;
         let Some(mut objects) = open_dir(&self.root).await? else {
             return Ok(0);
@@ -244,21 +254,27 @@ impl LocalSsd {
                     if !part.file_type().await?.is_dir() {
                         continue;
                     }
-                    removed += sweep_part_tmp(&part.path(), max_age).await?;
+                    removed += sweep_part_tmp(&part.path(), temps, staged).await?;
                 }
             }
         }
         Ok(removed)
     }
 
-    /// Removes the empty `<object_id>/v<version>/` and `<object_id>/` shells a drained part
-    /// leaves behind, once untouched for `max_age`.
+    /// Removes the empty `part_<n>/`, `<object_id>/v<version>/` and `<object_id>/` shells left
+    /// behind by a drained or swept part, once untouched for `max_age`.
     ///
     /// `remove_part_dir` deletes only `part_<n>/`, so over millions of drained parts the two
     /// ancestor dirs accumulate as empty shells — an unbounded directory/inode leak on the
     /// node-local SSD (observed at 100k-338k dirs per prod node, all `<oid>/v1/` with nothing
     /// inside). The crash-orphan reclaim never sees them: it keys on `meta.json`, and a shell
     /// has none.
+    ///
+    /// The part level is swept for the same reason one level up: an `UploadPart` killed after
+    /// staging chunks but before publishing leaves a dir that NOTHING else can reach — with no
+    /// `meta.json` it is invisible to the reclaim scan, and with neither a residency nor a
+    /// replication row the evictor's `remove_dir_all` is never called on it. `sweep_orphan_tmp`
+    /// empties it; this is what then collects the shell.
     ///
     /// THE AGE GATE IS THE SAFETY PROPERTY, not the emptiness check. Pruning inline at removal
     /// time looks safe because `rmdir` refuses a non-empty dir — but `mkdir -p` is not atomic.
@@ -271,9 +287,9 @@ impl LocalSsd {
     /// mtime, so requiring the shell to have been untouched for `max_age` means no writer has
     /// created anything in it recently — closing the window rather than narrowing it.
     ///
-    /// Sweeps version dirs before object dirs, so an object emptied by its last version going
-    /// away is collected in the same pass. Returns how many shells it removed; a missing root
-    /// is an empty cache, not an error.
+    /// Sweeps innermost-first — parts, then versions, then objects — so a tree emptied from the
+    /// bottom collapses entirely in ONE pass rather than one level per poll. Returns how many
+    /// shells it removed; a missing root is an empty cache, not an error.
     ///
     /// # Errors
     ///
@@ -293,6 +309,15 @@ impl LocalSsd {
                     if !version.file_type().await?.is_dir() {
                         continue;
                     }
+                    if let Some(mut parts) = open_dir(&version.path()).await? {
+                        while let Some(part) = parts.next_entry().await? {
+                            if !part.file_type().await?.is_dir() {
+                                continue;
+                            }
+                            removed += u64::from(rmdir_if_stale_and_empty(&part.path(), max_age).await?);
+                        }
+                    }
+                    // Only after its parts, so a version emptied by its last part just now goes too.
                     removed += u64::from(rmdir_if_stale_and_empty(&version.path(), max_age).await?);
                 }
             }
@@ -416,8 +441,8 @@ async fn copy_into(dir: &Path, name: &str, source: &Path, sync_dir: bool) -> io:
 }
 
 /// Remove a part's whole directory; an already-absent dir is `Ok` (idempotent, so a
-/// re-drive after a crash still converges). Shared by the SSD-source unlink and the
-/// pool corrupt-copy cleanup.
+/// re-drive after a crash still converges). Used by the pool corrupt-copy cleanup;
+/// the SSD-source unlink goes through [`remove_part_dir_exclusive`] instead.
 ///
 /// Removes ONLY the part dir. The now-empty `v<version>/`/`<object_id>/` parents are left
 /// for [`LocalSsd::sweep_empty_shells`], deliberately — see that method for why pruning them
@@ -428,6 +453,47 @@ async fn remove_part_dir(root: &Path, part: &PartKey) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+/// [`remove_part_dir`], but contending on the api's part-publish advisory lock first.
+///
+/// The api's `fs_store.publish_part` renames an attempt's staged chunk set onto the canonical
+/// `chunk_<i>.bin` names while holding `flock(part_dir_fd, LOCK_EX)` (`_part_dir_flock` in
+/// `hippius_s3/cache/fs_store.py`). `remove_dir_all` deletes by directory listing, so racing
+/// that swap unguarded can unlink freshly-acknowledged chunks — the part looked evictable
+/// because the PREVIOUS attempt's content had replicated (the B-2 key reuse). Taking the same
+/// lock — same `flock(2)` call, same dir inode — makes the two mutually exclusive.
+///
+/// Non-blocking, deliberately: a held lock means a publish is mid-swap and the part must NOT
+/// be removed now. `EWOULDBLOCK` is surfaced as an ordinary removal failure (raw errno kept
+/// for the caller's classification); the part stays and a later pass retries. The lock is
+/// held across the whole `remove_dir_all`: a publisher arriving mid-removal blocks in its own
+/// `flock` and then fails its renames with `ENOENT` — a visible 500 the client retries, never
+/// a silently half-deleted publish.
+async fn remove_part_dir_exclusive(root: &Path, part: &PartKey) -> io::Result<()> {
+    let dir = part_dir(root, part);
+    // `flock` + `remove_dir_all` both block; one hop to the blocking pool covers the pair.
+    tokio::task::spawn_blocking(move || {
+        let file = match std::fs::File::open(&dir) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let lock = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => lock,
+            Err((_, errno)) => return Err(io::Error::from(errno)),
+        };
+        let removed = match std::fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        };
+        // The kernel drops the lock with the fd; the dir inode it locked is already unlinked.
+        drop(lock);
+        removed
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// Opens `dir` for reading, mapping a vanished dir (a concurrent reclaim removed it)
@@ -444,6 +510,16 @@ async fn open_dir(dir: &Path) -> io::Result<Option<fs::ReadDir>> {
 /// api's `<name>.tmp.<uuid>`. A real `chunk_<i>.bin`/`meta.json` matches neither.
 fn is_temp_name(name: &str) -> bool {
     name.starts_with(".tmp-") || name.contains(".tmp.")
+}
+
+/// Whether a directory-entry name is one of the api's staged chunks — `chunk_<i>.bin.staged.
+/// <attempt>`, an upload attempt's private copy that becomes `chunk_<i>.bin` only when the
+/// attempt publishes the whole set. Deliberately NOT spelled with `.tmp.`, so it survives the
+/// write-temp grace for as long as an upload legitimately runs; [`sweep_part_tmp`] gives it its
+/// own, longer one. Never counted by [`parse_chunk_index`], so it is invisible to the
+/// completeness gate either way.
+fn is_staged_name(name: &str) -> bool {
+    name.starts_with("chunk_") && name.contains(".bin.staged.")
 }
 
 /// How long ago `meta` was last modified, or [`Duration::ZERO`] if its mtime is
@@ -486,7 +562,7 @@ async fn rmdir_if_stale_and_empty(dir: &Path, max_age: Duration) -> io::Result<b
     }
 }
 
-async fn sweep_part_tmp(part_path: &Path, max_age: Duration) -> io::Result<u64> {
+async fn sweep_part_tmp(part_path: &Path, temps: FailedGrace, staged: OrphanGrace) -> io::Result<u64> {
     let mut removed = 0;
     let Some(mut entries) = open_dir(part_path).await? else {
         return Ok(0);
@@ -496,11 +572,17 @@ async fn sweep_part_tmp(part_path: &Path, max_age: Duration) -> io::Result<u64> 
         let Some(name) = raw.to_str() else {
             continue;
         };
-        if !is_temp_name(name) {
+        // Temp FIRST: a name that somehow matched both shapes is a write temp, which is the
+        // conservative read (the shorter grace is the one that cannot strand disk).
+        let grace = if is_temp_name(name) {
+            temps.get()
+        } else if is_staged_name(name) {
+            staged.get()
+        } else {
             continue;
-        }
+        };
         let meta = entry.metadata().await?;
-        if !meta.is_file() || file_age(&meta) < max_age {
+        if !meta.is_file() || file_age(&meta) < grace {
             continue;
         }
         match fs::remove_file(entry.path()).await {
@@ -723,8 +805,10 @@ impl PartRemover for LocalSsd {
         // The sole whole-part unlink seam, shared by the reclaim worker (debris) and the
         // read-tier evictor (resident parts). Idempotent, so two of them racing — or a
         // re-drive after a crash — is harmless. The drain itself no longer unlinks at all:
-        // it retains its copy to serve reads.
-        remove_part_dir(&self.root, part).await
+        // it retains its copy to serve reads. Exclusive against the api's part-publish
+        // flock — see [`remove_part_dir_exclusive`] — so an eviction can never interleave
+        // with a publish's renames into the same dir.
+        remove_part_dir_exclusive(&self.root, part).await
     }
 }
 
@@ -758,7 +842,7 @@ mod tests {
     use super::{LocalSsd, TEMP_NONCE, TmpGuard, hex_lower, is_temp_name, part_dir, remove_part_dir, safe_component, temp_name};
     use core::str::FromStr;
     use core::time::Duration;
-    use hippius_drain_core::{FileId, ObjectId, PartKey, PartNumber, SsdCache, Version};
+    use hippius_drain_core::{FailedGrace, FileId, ObjectId, OrphanGrace, PartKey, PartNumber, SsdCache, Version};
     use proptest::prelude::*;
     use std::io;
     use std::path::Path;
@@ -889,6 +973,61 @@ mod tests {
         assert!(!version_dir.exists(), "the empty v<version> shell is swept");
         assert!(!object_dir.exists(), "the empty <object_id> shell is swept");
         assert!(root.path().exists(), "the SSD root is never removed");
+    }
+
+    #[tokio::test]
+    async fn a_killed_attempts_staged_part_is_fully_reclaimed_by_the_two_sweeps() {
+        // THE reaping story for staging. An UploadPart killed after staging chunks but before
+        // publishing leaves a dir with NO meta.json, so the reclaim scan never discovers it, and
+        // with neither a residency nor a replication row the evictor's remove_dir_all is never
+        // called on it either. These two sweeps are the ONLY thing that can reach it: the tmp
+        // sweep empties the dir, the shell sweep then collapses the whole branch.
+        let root = TempDir::new().unwrap();
+        let p = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 1);
+        let part_path = part_dir(root.path(), &p);
+        std::fs::create_dir_all(&part_path).unwrap();
+        std::fs::write(part_path.join("chunk_0.bin.staged.0123456789abcdef"), b"staged").unwrap();
+        std::fs::write(part_path.join("chunk_1.bin.staged.0123456789abcdef"), b"staged").unwrap();
+        let object_dir = part_path.parent().unwrap().parent().unwrap().to_path_buf();
+        let ssd = LocalSsd::new(root.path().to_path_buf());
+
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::ZERO))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            ssd.sweep_empty_shells(Duration::ZERO).await.unwrap(),
+            3,
+            "part + version + object, all in one pass"
+        );
+
+        assert!(!object_dir.exists(), "nothing of the killed attempt survives");
+        assert!(root.path().exists(), "the SSD root is never removed");
+    }
+
+    #[tokio::test]
+    async fn the_sweep_spares_a_part_dir_that_still_holds_staged_chunks() {
+        // The live-upload guard at the part level: a staged set inside its own grace keeps the
+        // dir non-empty, and `rmdir` is kernel-gated on emptiness, so an in-flight UploadPart
+        // cannot have its directory pulled out from under it.
+        let root = TempDir::new().unwrap();
+        let p = part("466916c0-d61b-4518-b81b-9576b574270a", 1, 1);
+        let part_path = part_dir(root.path(), &p);
+        std::fs::create_dir_all(&part_path).unwrap();
+        std::fs::write(part_path.join("chunk_0.bin.staged.0123456789abcdef"), b"in flight").unwrap();
+        let ssd = LocalSsd::new(root.path().to_path_buf());
+
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(ssd.sweep_empty_shells(Duration::ZERO).await.unwrap(), 0);
+
+        assert!(part_path.join("chunk_0.bin.staged.0123456789abcdef").exists());
     }
 
     #[tokio::test]
@@ -1084,17 +1223,19 @@ mod tests {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod part_tests {
-    use super::{LocalFs, LocalSsd, hex_lower};
+    use super::{LocalFs, LocalSsd, hex_lower, is_staged_name, is_temp_name, list_chunk_indices, parse_chunk_index, temp_name};
     use core::future::Future;
     use core::str::FromStr;
     use hippius_drain_core::{
-        ChunkIndex, ClaimedPart, DrainOutcome, ObjectId, PartDigest, PartDrainError, PartKey, PartNumber, PartPool, PartRemover,
-        PartReplicationStore, PartScan, PartSource, PartVerified, RelandVerdict, ReplicationState, UploadEnqueuer, Version, drain_part,
-        observed_part_digest, part_digest, verdict_for_reland,
+        ChunkIndex, ClaimedPart, DrainOutcome, FailedGrace, META_FILE_NAME, ObjectId, OrphanGrace, PartDigest, PartDrainError, PartKey, PartNumber,
+        PartPool, PartRemover, PartReplicationStore, PartScan, PartSource, PartVerified, RelandVerdict, ReplicationState, UploadEnqueuer, Version,
+        chunk_file_name, drain_part, observed_part_digest, parse_part_dir, part_digest, verdict_for_reland,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
+    use std::ffi::OsStr;
     use std::io;
+    use std::path::Path;
     use std::sync::Mutex;
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
@@ -1285,6 +1426,29 @@ mod part_tests {
         assert!(!dir.path().join(part.relative_dir()).exists(), "the part dir is gone");
         // A second remove of an already-absent part is Ok (idempotent re-drive).
         ssd.unlink_part(&part).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unlink_part_skips_while_a_publisher_holds_the_part_dir_flock() {
+        let dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        seed_ssd_part(dir.path(), &part, &[(0, b"x")]);
+        let ssd = LocalSsd::new(dir.path());
+
+        // Simulate the api's `_part_dir_flock`: an exclusive flock on the part dir's own fd.
+        // `flock` contends per open file description, so one process is enough to exercise it.
+        let part_dir = dir.path().join(part.relative_dir());
+        let publisher = nix::fcntl::Flock::lock(std::fs::File::open(&part_dir).unwrap(), nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, errno)| errno)
+            .unwrap();
+
+        let err = ssd.unlink_part(&part).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "a busy lock is a skip, not a removal");
+        assert!(part_dir.join("chunk_0.bin").exists(), "the publisher's chunks survive");
+
+        drop(publisher);
+        ssd.unlink_part(&part).await.unwrap();
+        assert!(!part_dir.exists(), "with the lock released the part is removable");
     }
 
     #[tokio::test]
@@ -1611,11 +1775,22 @@ mod part_tests {
         let ssd = LocalSsd::new(dir.path());
 
         // A long window keeps the just-written temps (younger than max_age).
-        assert_eq!(ssd.sweep_orphan_tmp(Duration::from_hours(1)).await.unwrap(), 0);
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::from_hours(1)), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
+            0
+        );
         assert!(api_tmp.exists() && agent_tmp.exists(), "fresh temps within the window are kept");
 
         // A zero window ages every temp, so both flavors are removed; real files stay.
-        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(), 2, "both temp flavors removed");
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
+            2,
+            "both temp flavors removed"
+        );
         assert!(!api_tmp.exists() && !agent_tmp.exists(), "aged temps unlinked");
         assert!(part_dir.join("chunk_0.bin").exists(), "the real chunk is untouched");
         assert!(part_dir.join("meta.json").exists(), "the meta marker is untouched");
@@ -1624,7 +1799,12 @@ mod part_tests {
     #[tokio::test]
     async fn sweep_orphan_tmp_of_a_missing_root_is_zero() {
         let ssd = LocalSsd::new("/no/such/cephor/cache/dir");
-        assert_eq!(ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(), 0);
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1641,7 +1821,9 @@ mod part_tests {
 
         let ssd = LocalSsd::new(dir.path());
         assert_eq!(
-            ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(),
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
             1,
             "the temp in a no-meta dir is swept"
         );
@@ -1666,9 +1848,147 @@ mod part_tests {
 
         let ssd = LocalSsd::new(root);
         assert_eq!(
-            ssd.sweep_orphan_tmp(Duration::ZERO).await.unwrap(),
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
             1,
             "non-dir junk is skipped and the real temp is swept",
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_orphan_tmp_keeps_a_staged_chunk_past_the_write_temp_grace() {
+        // A staged chunk is held for the WHOLE of one UploadPart by design, so it is
+        // legitimately older than a write-temp ever is. Reaping it on the write-temp grace
+        // would delete a live multi-GB upload's own data; it gets its own, longer window.
+        let dir = TempDir::new().unwrap();
+        let part = part_key(9, 2);
+        let part_dir = dir.path().join(part.relative_dir());
+        std::fs::create_dir_all(&part_dir).unwrap();
+        let staged = part_dir.join("chunk_0.bin.staged.0123456789abcdef");
+        let write_tmp = part_dir.join("chunk_0.bin.tmp.deadbeefdeadbeef");
+        std::fs::write(&staged, b"in flight").unwrap();
+        std::fs::write(&write_tmp, b"partial").unwrap();
+
+        let ssd = LocalSsd::new(dir.path());
+
+        // Write temps aged out; the staged chunk is inside its own window and survives.
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::from_hours(24)))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(staged.exists(), "a staged chunk outlives the write-temp grace");
+        assert!(!write_tmp.exists());
+
+        // Past its own grace it is a crash orphan (the api never published) and goes.
+        assert_eq!(
+            ssd.sweep_orphan_tmp(FailedGrace(Duration::ZERO), OrphanGrace(Duration::ZERO))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!staged.exists(), "an aged staged chunk is reclaimed");
+    }
+
+    #[tokio::test]
+    async fn a_staged_chunk_is_not_counted_as_a_chunk() {
+        // The completeness gate must not see staging: a part with one published chunk and one
+        // staged file is a ONE-chunk part, not a two-chunk one.
+        let dir = TempDir::new().unwrap();
+        let part = part_key(4, 6);
+        let part_dir = dir.path().join(part.relative_dir());
+        std::fs::create_dir_all(&part_dir).unwrap();
+        std::fs::write(part_dir.join("chunk_0.bin"), b"published").unwrap();
+        std::fs::write(part_dir.join("chunk_1.bin.staged.0123456789abcdef"), b"in flight").unwrap();
+
+        assert_eq!(list_chunk_indices(&part_dir).await.unwrap(), vec![ChunkIndex::new(0)]);
+    }
+
+    /// The on-disk layout the api and this agent each derive independently, pinned by one
+    /// fixture BOTH sides assert against: this test covers the agent's derivation and
+    /// `tests/unit/cache/test_part_layout_contract.py` covers the api's
+    /// (`fs_store.part_path` / `_chunk_file` / `_staged_chunk_file`). Same discipline as the
+    /// `UploadChainRequest` golden in `enqueue.rs`.
+    const LAYOUT_GOLDEN: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/part_layout.golden.json"));
+
+    #[test]
+    fn the_part_layout_matches_the_cross_language_golden() {
+        // WHY a golden and not a comment: the api's publish flock and this agent's
+        // `remove_part_dir_exclusive` exclude each other only because both open the SAME part
+        // directory. If either side's path derivation drifted, both locks would keep working
+        // perfectly on two different inodes — the mutual exclusion silently gone, with every
+        // other test still green. This is the test that fails instead.
+        let golden: serde_json::Value = serde_json::from_str(LAYOUT_GOLDEN).unwrap();
+        assert_eq!(golden["meta_file"].as_str().unwrap(), META_FILE_NAME);
+        let cases = golden["cases"].as_array().unwrap();
+        assert!(!cases.is_empty(), "an empty fixture would make this test vacuous");
+
+        for case in cases {
+            let u32_of = |field: &str| u32::try_from(case[field].as_u64().unwrap()).unwrap();
+            let key = PartKey::new(
+                ObjectId::from_str(case["object_id"].as_str().unwrap()).unwrap(),
+                Version::new(u32_of("object_version")),
+                PartNumber::new(u32_of("part_number")),
+            );
+            let relative_dir = case["relative_dir"].as_str().unwrap();
+            assert_eq!(key.relative_dir().to_str().unwrap(), relative_dir);
+            // The reverse direction the reconciler's disk discovery depends on.
+            assert_eq!(parse_part_dir(Path::new(relative_dir)).unwrap(), key);
+
+            let index = ChunkIndex::new(u32_of("chunk_index"));
+            let chunk = case["chunk_file"].as_str().unwrap();
+            assert_eq!(chunk_file_name(index), chunk);
+            assert_eq!(parse_chunk_index(OsStr::new(chunk)), Some(index));
+
+            // The staged name has to be recognised by the sweep and NOT by the chunk parse: the
+            // first is what keeps a live upload's staging on the 24h grace, the second is what
+            // keeps a mid-upload part from looking complete to the drain.
+            let staged = case["staged_file"].as_str().unwrap();
+            assert!(is_staged_name(staged), "the orphan sweep must recognise the api's staged name");
+            assert_eq!(
+                parse_chunk_index(OsStr::new(staged)),
+                None,
+                "a staged chunk must never count toward the completeness gate"
+            );
+        }
+    }
+
+    #[test]
+    fn the_apis_meta_json_deserializes_into_the_meta_this_crate_reads() {
+        // `MetaJson` has no serde default and no rename, so a key the api renamed is InvalidData on
+        // every part this node tries to drain — the node stops replicating, rather than one part
+        // failing. The keys were coupled by a doc comment alone; the fixture is now the coupling.
+        let golden: serde_json::Value = serde_json::from_str(LAYOUT_GOLDEN).unwrap();
+        let payload = &golden["meta_payload"];
+
+        let parsed: super::MetaJson = serde_json::from_value(payload.clone()).unwrap();
+
+        assert_eq!(parsed.chunk_size, payload["chunk_size"].as_u64().unwrap());
+        assert_eq!(u64::from(parsed.num_chunks), payload["num_chunks"].as_u64().unwrap());
+        assert_eq!(parsed.size_bytes, payload["size_bytes"].as_u64().unwrap());
+    }
+
+    #[test]
+    fn the_apis_write_temps_are_recognised_as_temps_and_nothing_else() {
+        // The other half of the retention split. Staged chunks must NOT be tmp-shaped (asserted
+        // above and on the api side); a half-written chunk or meta from a killed api worker MUST
+        // be, because this sweep is its only reaper. Both directions are one rename apart.
+        let golden: serde_json::Value = serde_json::from_str(LAYOUT_GOLDEN).unwrap();
+        let temps = &golden["write_temp"];
+
+        for field in ["api_chunk_example", "api_meta_example"] {
+            let name = temps[field].as_str().unwrap();
+            assert!(is_temp_name(name), "the api's write temp must be swept: {name}");
+            assert!(!is_staged_name(name), "a write temp must not get the staged grace: {name}");
+            assert_eq!(parse_chunk_index(OsStr::new(name)), None, "a write temp must not be counted: {name}");
+        }
+
+        let prefix = temps["agent_prefix"].as_str().unwrap();
+        assert!(
+            temp_name("chunk_0.bin").starts_with(prefix),
+            "this crate's own temp prefix drifted from the golden"
         );
     }
 }

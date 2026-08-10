@@ -47,7 +47,8 @@ pub use redrive::{PartDigest, RelandVerdict, observed_part_digest, part_digest, 
 pub use snapshot::{AgentSnapshot, RelandOutcome, ScanWorker, SnapshotCell};
 pub use ssd_evict::{EvictionError, EvictionPass, EvictionReport, EvictionTarget, FreeSpaceProbe, ResidentLog, ResidentPart, evict_to_target};
 pub use ssd_reclaim::{
-    FailedReclaimReport, PartRemover, PartStatusAge, ReclaimError, ReclaimGraces, ReclaimLog, ReclaimReport, reclaim_failed, reclaim_ssd,
+    FailedGrace, FailedReclaimReport, OrphanGrace, PartRemover, PartStatusAge, ReclaimError, ReclaimGraces, ReclaimLog, ReclaimReport,
+    reclaim_failed, reclaim_ssd,
 };
 pub use state::{CephCeiling, PressureZone, ReplicationState};
 pub use units::{ByteRate, Bytes, DiskPressure};

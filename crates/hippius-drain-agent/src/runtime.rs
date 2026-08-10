@@ -24,9 +24,9 @@ use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, EvictionPass, EvictionTarget,
-    NodeId, NodeObservation, PartDigest, PartKey, PartReplicationStore, ReclaimError, ReclaimGraces, RelandOutcome, ReplicationState, ScanWorker,
-    SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, evict_to_target, jittered, observed_part_digest,
-    reclaim_failed, reclaim_ssd, reconcile_parts, reland_read_outcome, verdict_for_reland,
+    FailedGrace, NodeId, NodeObservation, OrphanGrace, PartDigest, PartKey, PartReplicationStore, ReclaimError, ReclaimGraces, RelandOutcome,
+    ReplicationState, ScanWorker, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, evict_to_target,
+    jittered, observed_part_digest, reclaim_failed, reclaim_ssd, reconcile_parts, reland_read_outcome, verdict_for_reland,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -713,7 +713,10 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
         Err(err) => tracing::warn!(error = ?err, "ssd reclaim cycle failed; will retry next poll"),
     }
 
-    match ssd.sweep_orphan_tmp(graces.failed).await {
+    // Staged chunks get the orphan grace, not the failed one: they are held for the whole of a
+    // live UploadPart by design, so the millisecond-scale write-temp window would reap a running
+    // upload's own data.
+    match ssd.sweep_orphan_tmp(graces.failed, graces.orphan).await {
         Ok(0) => {}
         Ok(removed) => tracing::info!(removed, "swept orphan SSD write-temps"),
         Err(err) => tracing::warn!(error = %err, "orphan-temp sweep failed; will retry next poll"),
@@ -722,7 +725,7 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
     // Reuses the failed-part grace as the "untouched for long enough" gate: both answer the
     // same question — has anything written here recently — and a second knob for the same
     // property is a knob that gets set inconsistently.
-    match ssd.sweep_empty_shells(graces.failed).await {
+    match ssd.sweep_empty_shells(graces.failed.get()).await {
         Ok(0) => {}
         Ok(removed) => tracing::info!(removed, "swept empty SSD object/version shells"),
         Err(err) => tracing::warn!(error = %err, "empty-shell sweep failed; will retry next poll"),
@@ -1232,8 +1235,8 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         let (ssd, store, snapshot) = (Arc::clone(&self.ssd), Arc::clone(&self.store), Arc::clone(&self.snapshot));
         let reclaim_poll = self.config.reclaim_poll;
         let reclaim_graces = ReclaimGraces {
-            failed: self.config.reclaim_grace,
-            orphan: self.config.orphan_reclaim_grace,
+            failed: FailedGrace(self.config.reclaim_grace),
+            orphan: OrphanGrace(self.config.orphan_reclaim_grace),
         };
         let redrive_max_attempts = self.config.redrive_max_attempts;
         supervisor.spawn(WorkerName::new("ssd_reclaim"), move |token| {
@@ -1419,8 +1422,9 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
     use hippius_drain_core::{
-        Allocation, ByteRate, Bytes, Clock, CoordError, Coordinator, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReclaimGraces,
-        ReplicationState, ResidentLog, SnapshotCell, Store, StoredAllocation, TestClock, UploadEnqueuer, Version,
+        Allocation, ByteRate, Bytes, Clock, CoordError, Coordinator, FailedGrace, NodeId, ObjectId, OrphanGrace, PartKey, PartNumber,
+        PartReplicationStore, ReclaimGraces, ReplicationState, ResidentLog, SnapshotCell, Store, StoredAllocation, TestClock, UploadEnqueuer,
+        Version,
     };
 
     /// A coordinator on the test Redis under a per-test prefix, or `None` to skip the
@@ -2438,8 +2442,8 @@ mod tests {
             &store,
             &snapshot,
             ReclaimGraces {
-                failed: Duration::from_secs(1),
-                orphan: Duration::from_secs(1),
+                failed: FailedGrace(Duration::from_secs(1)),
+                orphan: OrphanGrace(Duration::from_secs(1)),
             },
         )
         .await;
@@ -2589,8 +2593,8 @@ mod tests {
             &store,
             &snapshot,
             ReclaimGraces {
-                failed: Duration::from_secs(1),
-                orphan: Duration::from_secs(1),
+                failed: FailedGrace(Duration::from_secs(1)),
+                orphan: OrphanGrace(Duration::from_secs(1)),
             },
         )
         .await;
@@ -2620,21 +2624,30 @@ mod tests {
         std::fs::create_dir_all(&part_dir).unwrap();
         let orphan = part_dir.join("chunk_0.bin.tmp.0badf00d0badf00d");
         std::fs::write(&orphan, b"half-written").unwrap();
+        // A live UploadPart's staged chunk, in the same dir. It is what makes the two graces
+        // DISTINGUISHABLE here: with both set to ZERO this test passed whichever way round
+        // reclaim_once handed them to the sweep, so a transposition that reaps a running
+        // multi-GB upload at the (minutes-scale) failed grace was invisible. The types now
+        // reject a swap at compile time; this keeps the wiring pinned if they ever go away.
+        let staged = part_dir.join("chunk_0.bin.staged.0123456789abcdef");
+        std::fs::write(&staged, b"in flight").unwrap();
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        // Zero grace so the just-written temp is past the (no-)window.
+        // Zero FAILED grace so the just-written temp is past its (no-)window; a long ORPHAN
+        // grace so the staged chunk is inside its own.
         super::reclaim_once(
             &ssd,
             &store,
             &snapshot,
             ReclaimGraces {
-                failed: Duration::ZERO,
-                orphan: Duration::ZERO,
+                failed: FailedGrace(Duration::ZERO),
+                orphan: OrphanGrace(Duration::from_hours(24)),
             },
         )
         .await;
 
         assert!(!orphan.exists(), "reclaim_once swept the orphan temp");
+        assert!(staged.exists(), "a live upload's staged chunk is NOT on the write-temp grace");
         assert_eq!(snapshot.load().reclaimed, 0, "no failed part -> nothing reclaimed, only the temp swept");
     }
 
@@ -2667,8 +2680,8 @@ mod tests {
             &store,
             &snapshot,
             ReclaimGraces {
-                failed: Duration::from_secs(1),
-                orphan: Duration::from_hours(1),
+                failed: FailedGrace(Duration::from_secs(1)),
+                orphan: OrphanGrace(Duration::from_hours(1)),
             },
         )
         .await;
@@ -2708,8 +2721,8 @@ mod tests {
             &store,
             &snapshot,
             ReclaimGraces {
-                failed: Duration::from_secs(1),
-                orphan: Duration::from_secs(1),
+                failed: FailedGrace(Duration::from_secs(1)),
+                orphan: OrphanGrace(Duration::from_secs(1)),
             },
         )
         .await;
@@ -2745,8 +2758,8 @@ mod tests {
             &store,
             &snapshot,
             ReclaimGraces {
-                failed: Duration::from_secs(1),
-                orphan: Duration::from_secs(1),
+                failed: FailedGrace(Duration::from_secs(1)),
+                orphan: OrphanGrace(Duration::from_secs(1)),
             },
         )
         .await;
