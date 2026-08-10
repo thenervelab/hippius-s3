@@ -123,6 +123,14 @@ spec:
             # before falling through to the CephFS pool (~40 ms). Staging only.
             - name: HIPPIUS_PEER_FETCH_ENABLED
               value: "true"
+            # The other half of the tier: without this the route is not mounted, every peer
+            # fetch 404s, and the tier is dark while FETCH_ENABLED above still says it is on.
+            # It is a separate flag on purpose (see config.py) — fetch governs what this pod
+            # reads, serve what it hands out — so enabling one does not enable the other.
+            # Mounting is gated on this AND a non-empty HIPPIUS_INTERNAL_PEER_SECRET, which
+            # arrives from the hippius-s3-secrets envFrom above.
+            - name: HIPPIUS_PEER_SERVE_ENABLED
+              value: "true"
             # Warm this node's flash from whatever it had to read remotely, so a repeat read
             # is local. Requires NODE_NAME (above) to claim residency for the evictor.
             - name: HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ
