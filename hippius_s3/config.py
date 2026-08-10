@@ -399,7 +399,9 @@ class Config:
     # flash (~6 ms/chunk) instead of CephFS (~40 ms). OFF by default and deliberately so: a
     # promoted copy is only reclaimable by a drain-agent evictor running on the same node, so
     # enabling it where no evictor runs would fill the disk with copies nothing owns.
-    object_cache_promote_on_read: bool = env("HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ:false", convert=bool)
+    object_cache_promote_on_read: bool = env(
+        "HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ:false", convert=lambda x: x.lower() == "true"
+    )
     # Free-space floor below which a read stops promoting onto local flash. Promotion is the
     # only unthrottled writer to the ingest SSD and it shares that mount with ingest — on an
     # ingest node HIPPIUS_OBJECT_CACHE_DIR is the drain agent's CEPHOR_SSD_ROOT — so warming
@@ -415,7 +417,7 @@ class Config:
     # falling through to the CephFS pool (~40 ms). Resolved per PART: only ~2% of multi-part
     # objects have every part on one node, so there is no single node to route a request to.
     # OFF by default; needs NODE_NAME + POD_IP so peers can find each other.
-    peer_fetch_enabled: bool = env("HIPPIUS_PEER_FETCH_ENABLED:false", convert=bool)
+    peer_fetch_enabled: bool = env("HIPPIUS_PEER_FETCH_ENABLED:false", convert=lambda x: x.lower() == "true")
     # How long a pod's published peer address stays valid. The TTL IS the liveness signal, so
     # it must exceed the refresh interval comfortably or a live pod flickers out of the map.
     peer_registry_ttl_seconds: int = env("HIPPIUS_PEER_REGISTRY_TTL_SECONDS:90", convert=int)
@@ -454,9 +456,9 @@ class Config:
     # proxies arbitrary paths from the internet. So this flag has to gate the mount, not just
     # the behaviour.
     #
-    # `x.lower() == "true"` and not `convert=bool`: `bool("false")` is True, so a plain bool
-    # converter turns an explicit HIPPIUS_PEER_SERVE_ENABLED=false into "enabled" — the exact
-    # inversion this flag exists to prevent. (peer_fetch_enabled above still has that bug.)
+    # `x.lower() == "true"` and not `convert=bool`: `bool("false")` is True — and `env` runs
+    # the converter on the ":false" default too, so `convert=bool` makes the flag DEFAULT-ON
+    # and impossible to turn off. The exact inversion this flag exists to prevent.
     peer_serve_enabled: bool = env("HIPPIUS_PEER_SERVE_ENABLED:false", convert=lambda x: x.lower() == "true")
     # Shared secret every peer presents on /internal/parts. It is sufficient BECAUSE the gateway
     # strips all inbound x-hippius-* headers before forwarding, so no client can supply it; the

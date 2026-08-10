@@ -46,13 +46,31 @@ Opportunity: for large sequential GETs, enabling prefetch=4 or so would overlap 
 
 ## `decrypt_chunk_if_needed`
 
-[decrypter.py:9](decrypter.py). Single function, delegates to `CryptoService.decrypt_chunk` ([../services/crypto_service.py](../services/crypto_service.py)). Handles:
+[decrypter.py:20](decrypter.py). Single function, delegates to `CryptoService.decrypt_chunk` ([../services/crypto_service.py](../services/crypto_service.py)) on the crypto pool (RD-2). Handles:
 
 - Storage version check.
 - AAD reconstruction: `hippius-dek:{bucket_id}:{object_id}:{object_version}` plus chunk context.
-- AES-256-GCM decryption with authentication tag check. Failure raises (no silent bypass).
+- AES-256-GCM decryption with authentication tag check.
 
-`maybe_slice(pt, slice_start, slice_end_excl)` ([decrypter.py:40](decrypter.py)) trims plaintext for Range requests.
+An authentication failure is **not** a plain raise any more. The decrypter defines
+`CIPHERTEXT_UNUSABLE` ([decrypter.py:17](decrypter.py)) — `InvalidTag`, plus the
+`CryptoError("ciphertext_too_short")` a version-skewed peer serves — and the streamer's
+`_decrypt_reloading_once` ([streamer.py:45](streamer.py)) acts on it: drop THIS node's copy via
+`DualFileSystemPartsStore.invalidate_local_chunk`, re-fetch from the next tier, and decrypt again
+**exactly once** — then raise if it still fails. Never a silent bypass: every path out of a failed
+decrypt either yields authenticated plaintext or raises, counted as
+`chunk_aead_failures_total{tier=local|remote, outcome=recovered|unrecovered}`.
+
+Two gates bound the retry. The invalidation only happens when the **pool holds the chunk** — a
+freshly ingested part lives on SSD alone until the drain replicates it, and a DEK fault fails those
+chunks too, so an ungated unlink would turn a key error into data loss. And the retry is
+straight-line, not a loop: a DEK-level fault fails every chunk, and with promotion on, a looping
+retry would re-warm the copy it just dropped and never run out of things to invalidate. When
+nothing local held the bytes (peer/pool served them, or no lower tier exists), the failure raises
+immediately — re-fetching would return the same bytes, and a pool fault is a genuine error. Full
+rationale: [../cache/CLAUDE.md](../cache/CLAUDE.md) "Invalidating a chunk that fails AEAD".
+
+`maybe_slice(pt, slice_start, slice_end_excl)` ([decrypter.py:55](decrypter.py)) trims plaintext for Range requests.
 
 ## `wait_for_chunk`
 

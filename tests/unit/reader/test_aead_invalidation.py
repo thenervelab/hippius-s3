@@ -18,9 +18,14 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from cryptography.exceptions import InvalidTag
+from hypothesis import HealthCheck
+from hypothesis import given
+from hypothesis import settings
+from hypothesis import strategies as st
 from nacl.exceptions import CryptoError
 
 from hippius_s3.cache.dual_fs_store import DualFileSystemPartsStore
@@ -63,15 +68,17 @@ def _ct(plaintext: bytes, *, part: int, index: int) -> bytes:
     )
 
 
-def _good() -> list[bytes]:
-    return [_ct(pt, part=1, index=i) for i, pt in enumerate(PLAINTEXT)]
+def _plaintext(index: int) -> bytes:
+    # Distinct per chunk, so a chunk served for the wrong index cannot decrypt to the right body.
+    return PLAINTEXT[index] if index < len(PLAINTEXT) else f"chunk-{index}-body".encode()
 
 
-def _plan() -> list[ChunkPlanItem]:
-    return [
-        ChunkPlanItem(part_number=1, chunk_index=0),
-        ChunkPlanItem(part_number=1, chunk_index=1),
-    ]
+def _good(n: int = len(PLAINTEXT)) -> list[bytes]:
+    return [_ct(_plaintext(i), part=1, index=i) for i in range(n)]
+
+
+def _plan(n: int = len(PLAINTEXT)) -> list[ChunkPlanItem]:
+    return [ChunkPlanItem(part_number=1, chunk_index=i) for i in range(n)]
 
 
 async def _write_part(store: FileSystemPartsStore, chunks: list[bytes], *, part: int = 1) -> None:
@@ -126,12 +133,12 @@ class _StoreCache:
         return data
 
 
-async def _read(cache: _StoreCache, *, prefetch: int, key: bytes = KEY) -> bytes:
+async def _read(cache: _StoreCache, *, prefetch: int, key: bytes = KEY, n: int = len(PLAINTEXT)) -> bytes:
     gen = streamer.stream_plan(
         obj_cache=cache,
         object_id=OBJ,
         object_version=1,
-        plan=_plan(),
+        plan=_plan(n),
         storage_version=5,
         key_bytes=key,
         suite_id=SUITE,
@@ -320,6 +327,105 @@ async def test_a_single_tier_deployment_never_unlinks_its_only_copy(tmp_path: Pa
     collector.record_aead_failure.assert_called_once_with("remote", "unrecovered")
 
 
+class _SuspectProbe:
+    """A replication-status double that records every consultation."""
+
+    def __init__(self, suspect: bool) -> None:
+        self.suspect = suspect
+        self.calls: list[tuple[str, int, int]] = []
+
+    async def __call__(self, object_id: str, object_version: int, part_number: int) -> bool:
+        self.calls.append((object_id, object_version, part_number))
+        return self.suspect
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefetch", [0, 4])
+async def test_a_redriven_part_fails_the_read_and_keeps_the_local_copy(tmp_path: Path, prefetch: int) -> None:
+    """The stale-pool window: a redrive flips the part back to 'pending' while the pool still
+    holds SUPERSEDED bytes that AEAD-verify under the same DEK/AAD.
+
+    The pool here holds a DIFFERENT plaintext that decrypts cleanly — exactly what a
+    superseded copy looks like — so without the status gate the retry would "succeed" with
+    silently wrong content. The read must fail with the original decrypt error instead, and
+    the local copy must survive: during a redrive it may be the only good one.
+    """
+    probe = _SuspectProbe(suspect=True)
+    dual = _dual(tmp_path, replication_suspect=probe)
+    stale = [_ct(b"superseded-bytes", part=1, index=0), _good()[1]]
+    await _write_part(dual.fallback, stale)
+    await _write_part(dual, [POISON_TAG, _good()[1]])
+
+    collector = MagicMock()
+    cache = _StoreCache(dual)
+    with patch("hippius_s3.monitoring.get_metrics_collector", return_value=collector), pytest.raises(InvalidTag):
+        await _read(cache, prefetch=prefetch)
+
+    assert _chunk_file(dual, 0).read_bytes() == POISON_TAG, "the local copy is NOT unlinked"
+    assert cache.fetches.count((1, 0)) == 1, "no retry — a retry would serve the stale pool bytes"
+    assert probe.calls == [(OBJ, 1, 1)], "the status is re-checked freshly, once, for this part"
+    collector.record_aead_failure.assert_called_once_with("remote", "unrecovered")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefetch", [0, 4])
+async def test_a_replicated_part_keeps_the_invalidate_and_retry_behaviour(tmp_path: Path, prefetch: int) -> None:
+    """status='replicated' must change nothing: the pre-announcement B-2 window behind that
+    status is closed drain-side (#403), so the read path keeps healing local corruption."""
+    probe = _SuspectProbe(suspect=False)
+    dual = _dual(tmp_path, replication_suspect=probe)
+    good = _good()
+    await _write_part(dual.fallback, good)
+    await _write_part(dual, [POISON_TAG, good[1]])
+
+    collector = MagicMock()
+    cache = _StoreCache(dual)
+    with patch("hippius_s3.monitoring.get_metrics_collector", return_value=collector):
+        out = await _read(cache, prefetch=prefetch)
+
+    assert out == b"".join(PLAINTEXT)
+    assert not _chunk_file(dual, 0).exists(), "the poisoned local copy is gone"
+    assert probe.calls == [(OBJ, 1, 1)]
+    collector.record_aead_failure.assert_called_once_with("local", "recovered")
+
+
+@pytest.mark.asyncio
+async def test_the_probe_costs_nothing_on_a_healthy_read(tmp_path: Path) -> None:
+    """The status check rides the AEAD-retry path only — the normal read never pays for it."""
+    probe = _SuspectProbe(suspect=True)
+    dual = _dual(tmp_path, replication_suspect=probe)
+    await _write_part(dual, _good())
+
+    out = await _read(_StoreCache(dual), prefetch=0)
+
+    assert out == b"".join(PLAINTEXT)
+    assert probe.calls == [], "no decrypt failure, so the status is never consulted"
+
+
+@pytest.mark.asyncio
+async def test_a_suspect_part_is_not_unlinked_even_when_the_pool_has_it(tmp_path: Path) -> None:
+    """Both gates in order: pool presence passes, the fresh status check still refuses."""
+    probe = _SuspectProbe(suspect=True)
+    dual = _dual(tmp_path, replication_suspect=probe)
+    good = _good()
+    await _write_part(dual.fallback, good)
+    await _write_part(dual, good)
+
+    assert await dual.invalidate_local_chunk(OBJ, 1, 1, 0) is False
+    assert _chunk_file(dual, 0).exists(), "the local copy survives a redrive in flight"
+
+
+@pytest.mark.asyncio
+async def test_a_missing_pool_copy_is_refused_before_the_status_is_asked(tmp_path: Path) -> None:
+    """The cheap FS gate stays first: an SSD-only part never costs a DB round trip."""
+    probe = _SuspectProbe(suspect=False)
+    dual = _dual(tmp_path, replication_suspect=probe)
+    await _write_part(dual, [_ct(PLAINTEXT[0], part=1, index=0)])
+
+    assert await dual.invalidate_local_chunk(OBJ, 1, 1, 0) is False
+    assert probe.calls == [], "no pool copy, so the status answer could not matter"
+
+
 @pytest.mark.asyncio
 async def test_a_truncated_pool_chunk_is_still_a_clean_error(tmp_path: Path) -> None:
     """A body too short to be a ciphertext raises CryptoError, not InvalidTag — same handling."""
@@ -331,3 +437,128 @@ async def test_a_truncated_pool_chunk_is_still_a_clean_error(tmp_path: Path) -> 
         await _read(_StoreCache(dual), prefetch=0)
 
     collector.record_aead_failure.assert_called_once_with("remote", "unrecovered")
+
+
+class _InvalidationSpy:
+    """Counts what a request asked to drop, and what it actually dropped.
+
+    The per-chunk bound is enforced by `_StoreCache.RUNAWAY_AFTER`; this is the per-REQUEST
+    side of it, which no fetch count can see: a plan can recover chunk after chunk, and the
+    number of unlinks it accumulates while doing so is the size of the hole it leaves in the
+    read tier.
+    """
+
+    def __init__(self, dual: DualFileSystemPartsStore) -> None:
+        self._real = dual.invalidate_local_chunk
+        self.probes: list[tuple[int, int]] = []
+        self.unlinked: list[tuple[int, int]] = []
+
+    async def __call__(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bool:
+        key = (int(part_number), int(chunk_index))
+        self.probes.append(key)
+        removed = bool(await self._real(object_id, object_version, part_number, chunk_index))
+        if removed:
+            self.unlinked.append(key)
+        return removed
+
+
+@st.composite
+def _poisoned_plans(draw: st.DrawFn) -> tuple[int, frozenset[int]]:
+    """A plan length and the chunk indices whose LOCAL copy is unreadable."""
+    length = draw(st.integers(min_value=1, max_value=8))
+    return length, draw(st.frozensets(st.integers(min_value=0, max_value=length - 1), max_size=length))
+
+
+# Bounded because each example does real AES-GCM over a real store on a real filesystem; the
+# input space (length x poison set x prefetch x promote x poison shape) is small enough that a
+# couple of hundred examples cover it densely.
+_PROPERTY = settings(
+    max_examples=200,
+    deadline=None,
+    # tmp_path and the wait-path monkeypatch are function-scoped and shared across examples. Both
+    # are safe here: every example builds its store under a fresh subdirectory of tmp_path, and
+    # the patch sets one module attribute to the same value every time.
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+
+
+@pytest.mark.asyncio
+@_PROPERTY
+@given(
+    shape=_poisoned_plans(),
+    prefetch=st.sampled_from([0, 4]),
+    promote=st.booleans(),
+    poison=st.sampled_from([POISON_TAG, POISON_SHORT]),
+)
+async def test_a_recovering_request_heals_one_chunk_at_a_time_and_never_wipes_the_tier(
+    tmp_path: Path, shape: tuple[int, frozenset[int]], prefetch: int, promote: bool, poison: bytes
+) -> None:
+    """The per-request bound, for any number of poisoned chunks anywhere in the plan.
+
+    The existing bound tests each pin ONE failing chunk, which cannot distinguish "invalidates
+    once per corrupt chunk" from "invalidates once per chunk". That difference is the whole
+    blast radius: a request that heals as it goes must remove exactly the copies that failed,
+    so the hole it leaves in the read tier is the size of the corruption and not the size of
+    the read. A range GET over a large object is thousands of chunks.
+    """
+    length, poisoned = shape
+    dual = _dual(tmp_path / uuid4().hex, promote=promote, on_promote=_claims_residency if promote else None)
+    good = _good(length)
+    await _write_part(dual.fallback, good)
+    await _write_part(dual, [poison if i in poisoned else c for i, c in enumerate(good)])
+
+    spy = _InvalidationSpy(dual)
+    dual.invalidate_local_chunk = spy  # type: ignore[method-assign]
+    collector = MagicMock()
+    cache = _StoreCache(dual)
+    with patch("hippius_s3.monitoring.get_metrics_collector", return_value=collector):
+        out = await _read(cache, prefetch=prefetch, n=length)
+
+    assert out == b"".join(_plaintext(i) for i in range(length)), "every chunk was served, in order"
+    assert len(spy.unlinked) <= len(poisoned), "a request never drops more copies than it found corrupt"
+    assert len(cache.fetches) <= 2 * length, "at most one retry per chunk across the whole request"
+    # Exact, not just bounded: the counts above are len(poisoned) and length + len(poisoned), so a
+    # mutation that invalidates a healthy chunk shows up even when the bound still happens to hold.
+    assert spy.unlinked == sorted((1, i) for i in poisoned)
+    assert len(cache.fetches) == length + len(poisoned)
+    assert collector.record_aead_failure.call_count == len(poisoned)
+
+
+@pytest.mark.asyncio
+@_PROPERTY
+@given(
+    shape=st.integers(min_value=1, max_value=8).flatmap(
+        lambda n: st.tuples(st.just(n), st.integers(min_value=0, max_value=n - 1))
+    ),
+    prefetch=st.sampled_from([0, 4]),
+    promote=st.booleans(),
+)
+async def test_an_unrecoverable_chunk_ends_the_request_after_exactly_one_invalidation(
+    tmp_path: Path, shape: tuple[int, int], prefetch: int, promote: bool
+) -> None:
+    """The other half of the bound: a chunk no tier can serve stops the stream, it does not skip on.
+
+    Both copies of chunk `failing` are unreadable, so the retry fails too. Whatever the plan
+    length and wherever the bad chunk sits, the request must invalidate once and end — this is
+    the arm that would spin if the straight-line retry ever became a loop, because with
+    promotion on the retry re-warms local flash from the pool and so always has something left
+    to invalidate.
+    """
+    length, failing = shape
+    dual = _dual(tmp_path / uuid4().hex, promote=promote, on_promote=_claims_residency if promote else None)
+    poisoned = [POISON_TAG if i == failing else c for i, c in enumerate(_good(length))]
+    await _write_part(dual.fallback, poisoned)
+    await _write_part(dual, poisoned)
+
+    spy = _InvalidationSpy(dual)
+    dual.invalidate_local_chunk = spy  # type: ignore[method-assign]
+    collector = MagicMock()
+    cache = _StoreCache(dual)
+    with patch("hippius_s3.monitoring.get_metrics_collector", return_value=collector), pytest.raises(InvalidTag):
+        await _read(cache, prefetch=prefetch, n=length)
+
+    assert spy.unlinked == [(1, failing)], "one unlink for the one chunk that failed, then the stream ends"
+    assert len(cache.fetches) <= 2 * length, "the in-flight prefetch window, plus the single retry"
+    assert cache.fetches.count((1, failing)) == 2, "the original fetch plus exactly one retry — never a loop"
+    assert collector.record_aead_failure.call_count == 1
+    collector.record_aead_failure.assert_called_once_with("local", "unrecovered")
