@@ -235,10 +235,12 @@ pub trait PartReplicationStore: Send + Sync {
     ///
     /// Called just BEFORE the commit, not after, and the order matters. The part is already on
     /// the disk, so recording residency first means a crash between the two leaves a residency
-    /// row for a still-`draining` part — which the eviction worklist's status guard refuses,
-    /// and which the reclaimer clears if the part never commits. The reverse order could commit
-    /// a part whose residency was never recorded: a copy on the disk that no evictor can see
-    /// and no `cache_bytes` sum counts, leaking space until the node fills.
+    /// row for a still-`draining` part — which the eviction worklist's status guard refuses, and
+    /// which the next successful commit simply overwrites. (Nothing DELETES it if the part never
+    /// commits: the reclaimer touches only the disk, never `cephor_ssd_residency` — see
+    /// `Store::drop_residency` for why that dead row is inert.) The reverse order could commit a
+    /// part whose residency was never recorded: a copy on the disk that no evictor can see and no
+    /// `cache_bytes` sum counts, leaking space until the node fills.
     fn mark_resident(&self, part: &PartKey, bytes: u64) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Stamp that this part's backend `UploadChainRequest` has been published (sets

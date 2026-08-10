@@ -1,5 +1,6 @@
 //! The SSD read-tier evictor: keeps a free-space floor on the ingest `NVMe` by reclaiming the
-//! oldest RESIDENT parts — the ones the drain deliberately kept after replicating them.
+//! least-recently-used RESIDENT parts — the ones the drain deliberately kept after replicating
+//! them.
 //!
 //! This worker exists because the drain no longer unlinks on replicate. Retaining replicated
 //! parts is what makes a local GET read at ~705 MB/s off `NVMe` instead of ~94 MB/s off the
@@ -233,7 +234,7 @@ impl EvictionError {
 /// The eviction worklist seam: which resident parts to reclaim, and recording that they were.
 ///
 /// Implemented by [`crate::Store`] (under `pg`) against the
-/// `cephor_replication_resident_idx` partial index; faked in tests.
+/// `cephor_ssd_residency_recency_idx` expression index (migration 0017); faked in tests.
 pub trait ResidentLog: Send + Sync {
     /// Store-specific failure, boxed into [`EvictionError`].
     type Error: std::error::Error + Send + Sync + 'static;
@@ -244,9 +245,11 @@ pub trait ResidentLog: Send + Sync {
     /// whatever order it is handed and never re-sorts.
     fn evictable_parts(&self, limit: u32) -> impl Future<Output = Result<Vec<ResidentPart>, Self::Error>> + Send;
 
-    /// Stamps `evicted_at` on each part, so it leaves the resident set and the next pass's
-    /// worklist. Batched: a per-part UPDATE would put a round-trip in the eviction inner
-    /// loop, which runs under disk pressure.
+    /// Records that each part is no longer resident, so it leaves the next pass's worklist. In
+    /// the Postgres impl that is a DELETE of the residency row, not a tombstone stamp — the table
+    /// is meant to stay bounded by what is actually on disk (migration 0016) — and it is the ONLY
+    /// thing that advances the cursor, since the worklist query has no OFFSET. Batched: a per-part
+    /// statement would put a round-trip in the eviction inner loop, which runs under disk pressure.
     fn mark_evicted(&self, parts: &[PartKey]) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
@@ -293,10 +296,12 @@ pub trait ResidentLog: Send + Sync {
 /// is keeping ingest alive.
 ///
 /// A failing UNLINK is likewise not fatal, and for a sharper reason: aborting the pass returned
-/// before `mark_evicted`, which is the only thing that advances the cursor. Since the worklist is
-/// oldest-first and stable, a part that persistently refuses to be unlinked — EIO, EACCES, EROFS,
-/// or an `ENOTEMPTY` from the api renaming a promoted chunk into the directory being removed —
-/// pinned the head and every later pass died on the same row having freed nothing. The candidate
+/// before `mark_evicted`, which is the only thing that advances the cursor. The worklist is
+/// coldest-first by `COALESCE(last_read_at, resident_at)`, and a part nobody reads keeps its
+/// rank — the pinning holds under any stable order, LRU or the old FIFO alike. A part that
+/// persistently refuses to be unlinked — EIO, EACCES, EROFS, or an `ENOTEMPTY` from the api
+/// renaming a promoted chunk into the directory being removed — pinned the head and every later
+/// pass died on the same row having freed nothing. The candidate
 /// is counted in [`remove_failed`](EvictionReport::remove_failed) and skipped; a page on which
 /// EVERY candidate fails still terminates the pass via the existing `starved` guard.
 ///
@@ -382,8 +387,9 @@ where
             if let Err(err) = remover.unlink_part(&candidate.part).await {
                 // Counted and skipped rather than propagated. Returning here landed BEFORE
                 // `mark_evicted`, and `mark_evicted` -> `drop_residency` is the only thing that
-                // advances the cursor — so on a stable oldest-first worklist one un-unlinkable
-                // part pinned the head and halted ALL eviction, with no report to carry `starved`.
+                // advances the cursor — the worklist is coldest-first by read recency and an
+                // unread part keeps its rank, so one un-unlinkable part pinned the head and
+                // halted ALL eviction, with no report to carry `starved`.
                 report.remove_failed = report.remove_failed.saturating_add(1);
                 // Ranked by what needs a human, NOT by arrival order. `get_or_insert` here would
                 // keep whichever fault the worklist happened to order first, and the worklist is
@@ -833,7 +839,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_persistently_failing_head_does_not_starve_later_passes() {
-        // The operational regression. The worklist is ordered oldest-first and stable, so a part
+        // The operational regression. The worklist is ordered coldest-first by
+        // COALESCE(last_read_at, resident_at), and a part nobody reads keeps its rank — so a part
         // that fails to unlink stays at the head; propagating that failure meant every subsequent
         // pass died on the same row having freed nothing, indefinitely and silently — the report
         // that carries `starved` was never produced, so neither eviction alert could fire.

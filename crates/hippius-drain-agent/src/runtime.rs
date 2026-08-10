@@ -466,7 +466,7 @@ impl PromoteFloorPublisher {
 }
 
 /// One eviction pass: probe the ingest disk and, if free space is under the reserve, evict
-/// oldest-resident parts until it is back over the floor.
+/// least-recently-used resident parts until it is back over the floor.
 ///
 /// With retention on, this is the ONLY thing that frees the ingest SSD, so a persistent
 /// failure here ends in `fs_cache_pressure` 503ing PUTs. Errors are logged and retried on the
