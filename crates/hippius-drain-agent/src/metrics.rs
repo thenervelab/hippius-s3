@@ -123,6 +123,39 @@ fn register_ssd_tier_instruments(meter: &opentelemetry::metrics::Meter, snapshot
             .build(),
     ));
 
+    // Candidates skipped because the unlink failed. Deliberately NOT its own alert: it is the
+    // discriminator to read ALONGSIDE the existing starvation alert, separating "removals are
+    // failing" from "the cursor is empty". Rising while evicted_total stays flat is the shape
+    // that used to abort every pass silently.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_evict_remove_failed_total")
+            .with_callback(move |observer| observer.observe(snap.evict_remove_failed(), &[]))
+            .build(),
+    ));
+
+    // Whether this node's ingest disk is shared with a writer the drain cannot account for (1)
+    // or is its own (0). The precondition for reading ANY of the three gauges above as a
+    // statement about the drain: on a shared mount the eviction reserve, the promote floor and
+    // the api's fs_cache_pressure 503 are all responding to a co-tenant's bytes. Staging's
+    // /dev/md3 is exactly that, which is what made the free-space work unvalidatable there.
+    //
+    // Observed only once measured: a node that has never completed the check publishes NO data
+    // point rather than a `0`, because a `0` here is a verified clean bill of health and an
+    // absent series is an open question. Alert on `== 1`, and on the series' absence separately.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_ssd_shared_filesystem")
+            .with_callback(move |observer| {
+                if let Some(shared) = snap.shared_filesystem() {
+                    observer.observe(u64::from(shared), &[]);
+                }
+            })
+            .build(),
+    ));
+
     // Free space: the third leg of backlog/cache/free. Without it a dashboard cannot separate
     // "the read cache grew" from "the disk is filling with backlog".
     let snap = Arc::clone(snapshot);
@@ -202,6 +235,49 @@ fn register_discovery_instruments(
         meter
             .u64_observable_counter("drain_landed_dropped_total")
             .with_callback(move |observer| observer.observe(snap.load().landed_dropped, &[]))
+            .build(),
+    ));
+
+    // B-2. **Alert on any increase.** A nonzero rate means a client rewrote a part AFTER it
+    // drained, so until the re-drive completes the pool — and every node that promoted from it —
+    // serves bytes that decrypt and AEAD-verify cleanly but are the superseded ones. Legal S3,
+    // and rare, but it is the only visible trace of a silent-wrong-plaintext window.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reland_redriven_total")
+            .with_callback(move |observer| observer.observe(snap.load().reland_redriven, &[]))
+            .build(),
+    ));
+    // The benign denominator: re-announcements whose content still matched. Carries no alert on
+    // its own; it is what makes the counter above readable as a rate rather than a raw count.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reland_unchanged_total")
+            .with_callback(move |observer| observer.observe(snap.load().reland_unchanged, &[]))
+            .build(),
+    ));
+    // Checks that could not run because the part would not read back off SSD. Fail-safe (nothing
+    // is re-driven) but BLIND: a genuine divergence on such a part goes undetected, so a sustained
+    // rate means the detector is partly off, not that there is nothing to detect.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reland_unreadable_total")
+            .with_callback(move |observer| observer.observe(snap.load().reland_unreadable, &[]))
+            .build(),
+    ));
+    // Checks that found the part's SSD directory ABSENT — the evict-vs-reland lost-race
+    // signature, split out of `unreadable` because the responses differ completely. **Alert on
+    // any increase**: an announced part was just written, so its files vanishing before the
+    // check means an eviction/reclaim unlinked the only copy of a possible rewrite, and the
+    // pool may now permanently serve the superseded bytes with no error anywhere else.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reland_vanished_total")
+            .with_callback(move |observer| observer.observe(snap.load().reland_vanished, &[]))
             .build(),
     ));
 }

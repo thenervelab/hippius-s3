@@ -68,6 +68,26 @@ impl LatencyWindow {
     }
 }
 
+/// What one B-2 divergence check concluded about a re-landed part. Exactly one counter moves
+/// per checked part, so the variants sum to the number of announcements that named an already-
+/// `replicated` part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelandOutcome {
+    /// The SSD content still matched the digest recorded at commit.
+    Unchanged,
+    /// The content had changed (or could not be verified), so the part went back to `pending`.
+    Redriven,
+    /// The part could not be read off SSD, so nothing was decided. Fail-safe but blind.
+    Unreadable,
+    /// The part's SSD directory was GONE at check time (`NotFound`) — the lost-race signature,
+    /// distinct from [`Unreadable`](Self::Unreadable)'s flaky-disk shape. An announcement fires
+    /// only when a part was just written, so its files being absent moments later means
+    /// something unlinked them in between — the evictor or the reclaimer. If the rewrite had
+    /// diverged, its only copy is destroyed and the pool permanently serves the superseded
+    /// bytes; nothing after this point can tell, which is why the variant exists.
+    Vanished,
+}
+
 /// Which worker performed an SSD walk.
 ///
 /// A closed enum, not a string: it becomes a metric label, and two values fixed in code cannot
@@ -140,6 +160,28 @@ pub struct AgentSnapshot {
     /// agent disagree about the wire contract, in which case every message is being lost and
     /// discovery has silently fallen back to the reconciler's walk.
     pub landed_dropped: u64,
+    /// Announcements naming an already-`replicated` part whose SSD content still matched the
+    /// digest recorded at commit — a duplicate announcement, or a backstop racing the fast
+    /// path. Benign; counted so `reland_redriven` can be read as a rate against it.
+    pub reland_unchanged: u64,
+    /// Committed parts returned to `pending` because their SSD content no longer matched what
+    /// the drain copied (B-2). **Nonzero is a real integrity event, not routine work**: an
+    /// object was rewritten after its part drained, so until the re-drive completes the pool —
+    /// and anything promoted from it — holds superseded bytes that AEAD-verify cleanly. Expect
+    /// zero; a sustained rate means a client is re-uploading parts, which is legal S3 but
+    /// worth knowing about.
+    pub reland_redriven: u64,
+    /// Divergence checks abandoned because the part could not be read back off SSD. Fail-safe
+    /// (nothing is re-driven), but it means the check did NOT happen, so a genuine divergence
+    /// on such a part stays undetected. Should be ~zero; a rise points at local-disk trouble.
+    pub reland_unreadable: u64,
+    /// Divergence checks that found the part's SSD directory ABSENT (`NotFound`) — the
+    /// lost-race signature, split out of `reland_unreadable` because the responses differ
+    /// completely. An announced part was just written, so its files vanishing before the check
+    /// means the evictor or reclaimer unlinked it in between; if that rewrite had diverged, the
+    /// client's acknowledged bytes are destroyed and the pool serves the superseded ones with
+    /// no error anywhere. **Nonzero is a possible-data-loss event**, not disk trouble.
+    pub reland_vanished: u64,
     /// `failed` (broken/abandoned-upload) SSD parts the reclaim worker unlinked — the
     /// SSD-ingest tier's eviction throughput, distinct from the drain's `CephFS` work.
     pub reclaimed: u64,
@@ -215,6 +257,10 @@ pub struct SnapshotCell {
     reclaim_scan_ms: AtomicU64,
     landed_recorded: AtomicU64,
     landed_dropped: AtomicU64,
+    reland_unchanged: AtomicU64,
+    reland_redriven: AtomicU64,
+    reland_unreadable: AtomicU64,
+    reland_vanished: AtomicU64,
     reclaimed: AtomicU64,
     /// Resident parts the read-tier evictor unlinked, and the bytes they freed. Separate from
     /// `reclaimed` (debris the reclaim worker removed) because the two answer different
@@ -226,6 +272,11 @@ pub struct SnapshotCell {
     /// invariant, and the reason it is a counter rather than a log line: "has this ever been
     /// non-zero" has to be answerable by an alert rule, not by grepping.
     evict_blocked_unreplicated: AtomicU64,
+    /// Candidates the evictor SKIPPED because the unlink itself failed. Not alertable on its own
+    /// — `starved` already covers a page that freed nothing — but it is what separates
+    /// starved-because-removals-are-failing (a disk, permissions, or racing-promotion fault) from
+    /// starved-because-the-cursor-is-empty (genuine backlog). The two need opposite responses.
+    evict_remove_failed: AtomicU64,
     /// Aborted-reclaim counter mirroring `reclaimed`: bumped once per reclaim cycle that failed
     /// its object-backing read (`ReclaimError::Backing`). Monotonic, `Relaxed` — a stat counter
     /// with no cross-counter ordering dependency (axiom `rust_quality_92`). See
@@ -271,6 +322,14 @@ pub struct SnapshotCell {
     /// a leak can fill the disk without any drain demand. bps not f64 so the gauge stays a
     /// plain atomic; the metrics layer scales it to a 0..1 fraction.
     disk_pressure_bps: AtomicU64,
+    /// Whether the ingest SSD looks like it is shared with a writer the agent cannot see, plus
+    /// one so that 0 can mean "not measured yet" — the same encoding, and for the same reason,
+    /// as `allocated_reserve_permille_plus_one`. Every free-space gate in the system (the
+    /// evictor's reserve, the api's promote floor, its `fs_cache_pressure` 503) assumes the
+    /// bytes this agent accounts for are most of what is on the disk; a bare 0 would report
+    /// that assumption as VERIFIED on a node that has never managed to check it, which is the
+    /// blind spot this flag exists to close.
+    shared_filesystem_plus_one: AtomicU64,
     /// Count of parts currently held `corrupt` on this node — a LEVEL, set each cycle by the
     /// re-drive pass from `Store::count_corrupt_parts`. A nonzero value is a live object whose
     /// pool copy is corrupt, kept alive only by its SSD source: a durability incident (R4), so
@@ -334,6 +393,18 @@ impl SnapshotCell {
         self.landed_dropped.fetch_add(dropped, Ordering::Relaxed);
     }
 
+    /// Records the outcome of one re-landing divergence check (B-2): exactly one of the
+    /// counters moves per checked part.
+    pub fn record_reland(&self, outcome: RelandOutcome) {
+        let counter = match outcome {
+            RelandOutcome::Unchanged => &self.reland_unchanged,
+            RelandOutcome::Redriven => &self.reland_redriven,
+            RelandOutcome::Unreadable => &self.reland_unreadable,
+            RelandOutcome::Vanished => &self.reland_vanished,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Adds `n` to the SSD-reclaim total (terminal parts the reclaim worker unlinked).
     pub fn record_reclaimed(&self, n: u64) {
         self.reclaimed.fetch_add(n, Ordering::Relaxed);
@@ -380,6 +451,17 @@ impl SnapshotCell {
     #[must_use]
     pub fn evict_blocked_unreplicated(&self) -> u64 {
         self.evict_blocked_unreplicated.load(Ordering::Relaxed)
+    }
+
+    /// Records eviction candidates skipped because their unlink failed.
+    pub fn record_evict_remove_failed(&self, n: u64) {
+        self.evict_remove_failed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Cumulative skipped-on-unlink-failure count (`drain_ssd_evict_remove_failed_total`).
+    #[must_use]
+    pub fn evict_remove_failed(&self) -> u64 {
+        self.evict_remove_failed.load(Ordering::Relaxed)
     }
 
     /// Records free bytes on the ingest SSD. A gauge: `store`, not add.
@@ -493,6 +575,24 @@ impl SnapshotCell {
         u16::try_from(self.disk_pressure_bps.load(Ordering::Relaxed).min(10_000)).unwrap_or(10_000)
     }
 
+    /// Records whether the ingest SSD appears to be shared with a writer this agent cannot
+    /// account for. A gauge: `store`, not add — and only ever written from a tick that actually
+    /// MEASURED both sides, so a tick that could not measure leaves the last verdict standing.
+    pub fn record_shared_filesystem(&self, shared: bool) {
+        self.shared_filesystem_plus_one.store(u64::from(shared) + 1, Ordering::Relaxed);
+    }
+
+    /// The last shared-disk verdict, or `None` if the check has not run successfully yet
+    /// (the `drain_ssd_shared_filesystem` gauge source). `None` is deliberately NOT `Some(false)`:
+    /// an unmeasured disk is an open question, not a clean one.
+    #[must_use]
+    pub fn shared_filesystem(&self) -> Option<bool> {
+        match self.shared_filesystem_plus_one.load(Ordering::Relaxed) {
+            0 => None,
+            raw => Some(raw > 1),
+        }
+    }
+
     /// Records the current count of parts held `corrupt` on this node. A gauge: `store`, not
     /// add. The re-drive pass writes it each cycle from `Store::count_corrupt_parts`.
     pub fn record_corrupt(&self, count: u64) {
@@ -535,6 +635,10 @@ impl SnapshotCell {
             reclaim_scan_ms: self.reclaim_scan_ms.load(Ordering::Relaxed),
             landed_recorded: self.landed_recorded.load(Ordering::Relaxed),
             landed_dropped: self.landed_dropped.load(Ordering::Relaxed),
+            reland_unchanged: self.reland_unchanged.load(Ordering::Relaxed),
+            reland_redriven: self.reland_redriven.load(Ordering::Relaxed),
+            reland_unreadable: self.reland_unreadable.load(Ordering::Relaxed),
+            reland_vanished: self.reland_vanished.load(Ordering::Relaxed),
             reclaimed: self.reclaimed.load(Ordering::Relaxed),
             reclaim_backing_errors: self.reclaim_backing_errors.load(Ordering::Relaxed),
             throttled: self.throttled.load(Ordering::Relaxed),
@@ -547,7 +651,7 @@ impl SnapshotCell {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{AgentSnapshot, ScanWorker, SnapshotCell};
+    use super::{AgentSnapshot, RelandOutcome, ScanWorker, SnapshotCell};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -629,6 +733,24 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_filesystem_verdict_distinguishes_unmeasured_from_clean() {
+        // B-5: every free-space gate in the workstream assumes the agent's accounted bytes are
+        // most of what is on the disk. A two-state flag would report an agent that has never
+        // checked as "verified clean" — the exact blind spot — so the unmeasured state is a
+        // third value the metrics layer declines to publish at all.
+        let cell = SnapshotCell::new();
+        assert_eq!(cell.shared_filesystem(), None, "a fresh cell has not measured the disk");
+        cell.record_shared_filesystem(true);
+        assert_eq!(cell.shared_filesystem(), Some(true));
+        cell.record_shared_filesystem(false);
+        assert_eq!(
+            cell.shared_filesystem(),
+            Some(false),
+            "a co-tenant leaving clears the verdict: this is a live measurement, not an incident latch"
+        );
+    }
+
+    #[test]
     fn oldest_pending_age_is_a_settable_gauge_not_a_counter() {
         // Task F starvation signal: the age of this node's oldest `pending` row, a LEVEL
         // set each heartbeat from Store::node_oldest_pending_age_secs — so a later record
@@ -678,6 +800,35 @@ mod tests {
     }
 
     #[test]
+    fn each_reland_outcome_moves_exactly_its_own_counter() {
+        // The four arms feed the B-2 alerting split — `reland_vanished` in particular is the
+        // "possible destruction of acknowledged bytes" alarm. A transposed match arm would
+        // silence that alarm while every behavioural test stayed green, so the mapping is
+        // pinned as a bijection: per outcome, its counter reads 1 and the other three read 0.
+        type Project = fn(&AgentSnapshot) -> [u64; 4];
+        let cases: [(RelandOutcome, Project); 4] = [
+            (RelandOutcome::Unchanged, |s| {
+                [s.reland_unchanged, s.reland_redriven, s.reland_unreadable, s.reland_vanished]
+            }),
+            (RelandOutcome::Redriven, |s| {
+                [s.reland_redriven, s.reland_unchanged, s.reland_unreadable, s.reland_vanished]
+            }),
+            (RelandOutcome::Unreadable, |s| {
+                [s.reland_unreadable, s.reland_unchanged, s.reland_redriven, s.reland_vanished]
+            }),
+            (RelandOutcome::Vanished, |s| {
+                [s.reland_vanished, s.reland_unchanged, s.reland_redriven, s.reland_unreadable]
+            }),
+        ];
+        for (outcome, project) in cases {
+            let cell = SnapshotCell::new();
+            cell.record_reland(outcome);
+            let [own, other_a, other_b, other_c] = project(&cell.load());
+            assert_eq!((own, other_a, other_b, other_c), (1, 0, 0, 0), "outcome {outcome:?}");
+        }
+    }
+
+    #[test]
     fn records_accumulate_per_counter() {
         let cell = SnapshotCell::new();
         cell.record_drained(3);
@@ -699,6 +850,10 @@ mod tests {
                 reclaim_scan_ms: 0,
                 landed_recorded: 0,
                 landed_dropped: 0,
+                reland_unchanged: 0,
+                reland_redriven: 0,
+                reland_unreadable: 0,
+                reland_vanished: 0,
                 reclaimed: 6,
                 reclaim_backing_errors: 0,
                 throttled: 9,
@@ -805,6 +960,10 @@ mod tests {
             reclaim_scan_ms: 0,
             landed_recorded: 0,
             landed_dropped: 0,
+            reland_unchanged: 0,
+            reland_redriven: 0,
+            reland_unreadable: 0,
+            reland_vanished: 0,
             reclaimed: 0,
             reclaim_backing_errors: 0,
             throttled: 0,
@@ -827,6 +986,10 @@ mod tests {
             reclaim_scan_ms: 0,
             landed_recorded: 0,
             landed_dropped: 0,
+            reland_unchanged: 0,
+            reland_redriven: 0,
+            reland_unreadable: 0,
+            reland_vanished: 0,
             reclaimed: 0,
             reclaim_backing_errors: 0,
             throttled: 0,

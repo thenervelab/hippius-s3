@@ -15,7 +15,9 @@ from substrateinterface.utils.ss58 import is_valid_ss58_address
 
 from gateway.config import get_config
 from gateway.utils.errors import s3_error_response
+from gateway.utils.paths import collapse_dot_segments
 from gateway.utils.paths import decoded_path
+from gateway.utils.paths import forwarded_path
 from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
 
 
@@ -53,7 +55,8 @@ SKIP_PREFIXES = {"health", "user", "docs", "robots.txt", "openapi.json"}
 # second copy drifting is the exact failure this rejection exists to prevent.
 #
 # Deliberately NOT in it: `acl` (acl_router mounts /{bucket} at the ROOT — there is no /acl path)
-# and `static` (no StaticFiles mount anywhere in the gateway).
+# and `static` (the gateway has no StaticFiles mount, and the api's is registered AFTER
+# s3_router_new, so the S3 catch-all shadows it rather than the reverse).
 #
 # auth_router.ALL_EXEMPT_SEGMENTS must stay a subset — enforced by
 # test_every_auth_exempt_segment_is_a_reserved_bucket_name.
@@ -66,7 +69,14 @@ async def input_validation_middleware(
 ) -> Response:
     """Validate S3 inputs for security and AWS compatibility."""
 
-    path_parts = _decoded_path(request).strip("/").split("/")
+    decoded = _decoded_path(request)
+
+    # ROUTING view: the path the api will SEE. httpx both collapses dot segments and truncates at
+    # `#`/`?` when the forwarder builds the outgoing URL, so `/anybucket/../internal/...` and
+    # `/internal%23x/parts/1` both reach the api as an `internal` first segment while their
+    # as-sent first segment is an innocuous bucket name. Every bucket-name and reserved-name
+    # decision below keys off the first segment, so all of them must use this.
+    path_parts = forwarded_path(decoded).strip("/").split("/")
 
     # Validate bucket name only on CreateBucket (PUT /{bucket} with no object key and no
     # tagging/lifecycle/policy query params). Existing buckets with non-compliant names
@@ -87,6 +97,45 @@ async def input_validation_middleware(
         return s3_error_response(
             code="InvalidBucketName",
             message=f"Bucket name '{path_parts[0]}' is reserved for gateway routes",
+            status_code=400,
+        )
+
+    # `internal` is refused on EVERY method, not just the CreateBucket shape above. The api
+    # mounts /internal/parts/... ahead of its S3 catch-all, and the request that reached it was
+    # a plain GET: anonymous auth succeeds, and the ACL middleware passes through on a bucket
+    # nobody owns. So the write-shaped check above never saw it.
+    #
+    # Defence in depth, not the boundary — the api requires a shared secret on that route, and
+    # this is a blocklist, so it protects exactly the one prefix somebody thought to add and
+    # will rot the moment another internal route lands. The durable fix is a second port for
+    # internal routes with no gateway route to it; until then, anything mounted on the api app
+    # outside the S3 namespace needs a line here.
+    if path_parts[0] == "internal":
+        return s3_error_response(
+            code="InvalidBucketName",
+            message="Bucket name 'internal' is reserved for gateway routes",
+            status_code=400,
+        )
+
+    # The api decodes the forwarded target a SECOND time, so an escape that survives the gateway's
+    # single decode disappears at the api: a client's `/%2569nternal/parts/1` is judged here as
+    # first segment `%69nternal` (not `internal`, so the denylist above passes it), httpx puts
+    # `%69nternal` on the wire untouched, and the api's uvicorn unquotes it to `internal` — this
+    # time reaching the peer-serve route, not just the S3 catch-all. `int%65rnal` does it from the
+    # middle, so no prefix or spelling check closes this; only refusing `%` outright does.
+    #
+    # Refusing it costs nothing legitimate. A bucket name is `[a-z0-9.-]` or an SS58 address, and
+    # no gateway route contains a `%` — a first segment with one could not have been created
+    # through BUCKET_NAME_PATTERN below. `%` stays allowed in an object key exactly as before
+    # (OBJECT_KEY_AVOID_CHARS rejects it there, on the key view).
+    #
+    # Modelling the double-decode inside `forwarded_path` was the alternative and is worse: it
+    # would decode object keys twice too, turning a key sent as `a%252Fb` — rejected today for
+    # containing `%` — into the accepted key `a/b`.
+    if "%" in path_parts[0]:
+        return s3_error_response(
+            code="InvalidBucketName",
+            message="Bucket name cannot contain '%'",
             status_code=400,
         )
 
@@ -156,9 +205,15 @@ async def input_validation_middleware(
                         status_code=400,
                     )
 
+    # KEY view: deliberately NOT `path_parts`. Truncation at `#` is the data loss this check
+    # exists to prevent — `report%23v1.txt` and `report%23v2.txt` both forward as `report`, so one
+    # silently overwrites the other. Judging the truncated key would see no `#` and wave both
+    # through. Dot segments still collapse, because that rewrite decides the key that lands.
+    key_parts = collapse_dot_segments(decoded).strip("/").split("/")
+
     # Validate object key if present
-    if len(path_parts) >= 2:
-        object_key = "/".join(path_parts[1:])
+    if len(key_parts) >= 2:
+        object_key = "/".join(key_parts[1:])
 
         # Length check (max bytes for UTF-8)
         key_bytes = len(object_key.encode("utf-8"))

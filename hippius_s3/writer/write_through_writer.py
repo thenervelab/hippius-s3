@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from hippius_s3.cache.read_recency import get_read_recency_recorder
 from hippius_s3.writer.landed import get_landed_publisher
 
 
@@ -59,6 +60,17 @@ class WriteThroughPartsWriter:
             num_chunks=int(num_chunks),
             size_bytes=int(plain_size),
         )
+        # Stamp the part's residency recency BEFORE announcing. A rewrite of an
+        # already-replicated part touches nothing the drain evictor sorts on, so the only copy
+        # of the new bytes would rank as the LRU's COLDEST candidate for the whole window until
+        # the agent pops the announcement and runs its divergence check — an eviction in that
+        # window destroys the rewrite and leaves the pool serving the superseded bytes forever.
+        # Stamping first means that by the time the agent can even see the announcement, the
+        # part is the hottest thing on the disk. A first-time part has no residency row and the
+        # stamp is a no-op; best-effort, like the announcement below.
+        recorder = get_read_recency_recorder()
+        if recorder is not None:
+            await recorder(object_id, int(object_version), int(part_number))
         # Announce to this node's drain agent, strictly AFTER meta lands. Meta is the readiness
         # gate: a part is only complete once it exists, so announcing earlier could have the
         # drain claim a part whose chunks are still being written. It also has to be here rather

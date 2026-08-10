@@ -888,15 +888,13 @@ mod tests {
 
     #[test]
     fn the_eviction_band_matches_what_the_api_assumes_when_gating_promotion() {
-        // Cross-language contract pin. The api refuses to promote onto local flash below
-        // `HIPPIUS_PROMOTE_MIN_FREE_RATIO` (0.175), and that floor is only correct if it sits
-        // strictly inside THIS evictor's band: above the reserve, below reserve + headroom.
-        //
-        // There is no runtime coupling between the two processes, so the api mirrors these
-        // numbers in `hippius_s3/fs_pressure.py` (EVICT_RESERVE_RATIO / EVICT_HEADROOM_RATIO)
-        // and each side pins its own. Moving either default without the other silently breaks
-        // the loop: a floor at or above the target can never be restored, because the evictor
-        // never frees past its target, and promotion would stop for good.
+        // Cross-language contract pin for the api's STATIC FALLBACK floor only. The live floor
+        // is now published per pass (`cephor:promote_floor:{node}`, see
+        // `runtime::published_promote_floor`), because the allocator can override the reserve
+        // at runtime and a mirrored constant cannot follow it. What is still mirrored is the
+        // number the api uses when that key is ABSENT: `HIPPIUS_PROMOTE_MIN_FREE_RATIO` (0.175),
+        // which is only correct against THESE defaults — above the reserve, below reserve +
+        // headroom. Moving either default without the other breaks the fallback silently.
         assert_eq!(DEFAULT_EVICT_RESERVE_PERMILLE, 150, "api mirrors this as EVICT_RESERVE_RATIO = 0.150");
         assert_eq!(DEFAULT_EVICT_HEADROOM_PERMILLE, 50, "api mirrors this as EVICT_HEADROOM_RATIO = 0.050");
 

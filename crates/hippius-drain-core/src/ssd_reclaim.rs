@@ -10,7 +10,7 @@
 //! It is emphatically NOT the owner of `replicated` parts. Those are RETAINED on purpose —
 //! they are the node's read tier, served from local `NVMe` at ~705 MB/s / ~6 ms per chunk
 //! against the pool's ~94 MB/s / ~40 ms — and they are reclaimed by
-//! [`evict_to_target`](crate::evict_to_target) on a free-space policy, oldest-resident first
+//! [`evict_to_target`](crate::evict_to_target) on a free-space policy, least-recently-used first
 //! and only as much as the disk needs. This module handles DEBRIS; the evictor handles CACHE.
 //! Before retention the drain unlinked its own copy at commit, so anything `replicated` left
 //! on disk could only be a crash between the commit and that unlink, and this worker
@@ -128,13 +128,15 @@ pub trait ReclaimLog: Send + Sync {
     /// a live object's last good source. So this finds candidates; the existing seam judges them.
     fn reclaimable_failed_parts(&self, grace: Duration, limit: u32) -> impl Future<Output = Result<Vec<PartKey>, Self::Error>> + Send;
 
-    /// Stamps `reclaimed_at` so these parts leave the worklist.
+    /// Stamps `reclaimed_at` so these parts leave the worklist, and releases whatever residency
+    /// claims the parts still carry (the caller just unlinked the bytes, so a surviving claim
+    /// would block the terminal-row GC forever).
     ///
-    /// Without it the cursor never advances: unlinking a part changes nothing about its row, so
-    /// the next poll re-selects the same oldest page, re-unlinks it (idempotently, a no-op) and
-    /// re-counts it as reclaimed — productive-looking metrics over a cursor pinned in place,
-    /// with everything past the first page waiting on the hourly walk. The walk-driven path did
-    /// not need this because it is disk-keyed; a status-keyed worklist does.
+    /// Without the stamp the cursor never advances: unlinking a part changes nothing about its
+    /// row, so the next poll re-selects the same oldest page, re-unlinks it (idempotently, a
+    /// no-op) and re-counts it as reclaimed — productive-looking metrics over a cursor pinned in
+    /// place, with everything past the first page waiting on the hourly walk. The walk-driven
+    /// path did not need this because it is disk-keyed; a status-keyed worklist does.
     fn mark_failed_reclaimed(&self, parts: &[PartKey]) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
@@ -385,8 +387,8 @@ where
             // two; retention removed that inference entirely.
             //
             // Reclaiming these is now the EVICTOR's job (`crate::evict_to_target`), and the
-            // distinction is not cosmetic: the evictor deletes on a free-space policy, oldest
-            // resident first, only as much as the disk needs. An age-based sweep here would
+            // distinction is not cosmetic: the evictor deletes on a free-space policy,
+            // least-recently-USED first, only as much as the disk needs. An age-based sweep here would
             // throw away hot cache on a disk with terabytes free, quietly undoing retention —
             // which is exactly what shipping the retention change without this arm would do.
             ReplicationState::Replicated => report.skipped_replicated += 1,

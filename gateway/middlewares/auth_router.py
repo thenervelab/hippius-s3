@@ -6,8 +6,7 @@ from fastapi import Response
 
 from gateway.middlewares.auth_probe import is_valid_auth_probe
 from gateway.services.auth_orchestrator import authenticate_request
-from gateway.utils.paths import decoded_path
-from gateway.utils.paths import first_path_segment
+from gateway.utils.paths import routing_path
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
 
@@ -31,10 +30,16 @@ ALL_EXEMPT_SEGMENTS = EXEMPT_SEGMENTS | EXEMPT_SUBPATH_ONLY_SEGMENTS
 
 
 def _is_exempt(request: Request) -> bool:
-    segment = first_path_segment(request)
+    # Judged on the path the api will RECEIVE (`routing_path`), not the one the client sent. httpx
+    # collapses dot segments on the way out, so `/docs/../anybucket/key` reads as the exempt segment
+    # `docs` when judged as sent — skipping authentication entirely and processing the request as
+    # anonymous — while the api is handed `/anybucket/key`. The subpath test uses the same view, so
+    # `/user#/x` cannot borrow a subpath that is never forwarded either.
+    path = routing_path(request)
+    segment = path.strip("/").split("/", 1)[0]
     if segment in EXEMPT_SEGMENTS:
         return True
-    return segment in EXEMPT_SUBPATH_ONLY_SEGMENTS and "/" in decoded_path(request).strip("/")
+    return segment in EXEMPT_SUBPATH_ONLY_SEGMENTS and "/" in path.strip("/")
 
 
 async def auth_router_middleware(

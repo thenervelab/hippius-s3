@@ -13,6 +13,7 @@ from starlette import status
 from gateway.config import get_config
 from gateway.services.account_service import fetch_account_by_main_address
 from gateway.utils.errors import s3_error_response
+from gateway.utils.paths import routing_path
 from hippius_s3.models.account import HippiusAccount
 from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.services.arion_service import CanUploadResponse
@@ -186,7 +187,9 @@ async def account_middleware(
     ray_id = getattr(request.state, "ray_id", "no-ray-id")
     logger = get_logger_with_ray_id(__name__, ray_id)
 
-    path = request.url.path
+    # The routing view, for the same reason as acl.py: judged as sent, `/docs/../anybucket/key`
+    # matched the `/docs/` skip below and took an S3 write past the credit gate.
+    path = routing_path(request)
 
     # Test bypass: short-circuit credit and substrate/redis access entirely
     if config.bypass_credit_check:
