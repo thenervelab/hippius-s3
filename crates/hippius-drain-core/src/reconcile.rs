@@ -36,9 +36,16 @@ pub struct ReconcileReport {
     /// Already draining: a live claim in flight, or a stale orphan that
     /// `claim_part` re-claims once its claim outlives the lease (the H1 path).
     pub in_flight: u64,
-    /// Already replicated, yet still on SSD — debris from a crash between commit
-    /// and unlink. Counted for visibility; the actual sweep is the SSD-lifecycle
-    /// work (deferred), not the reconciler's job here.
+    /// Already replicated and still on SSD — since retention, the normal resting state of every
+    /// drained part (the read tier), not debris. Counted for visibility; the evictor owns the
+    /// disposal.
+    ///
+    /// The reconciler deliberately does NOT compare content here. Detecting a part rewritten
+    /// after its commit (B-2) needs a full SSD read per part, and there is no cheap pre-filter:
+    /// the arion uploader `touch_part`s every part after a successful backend upload, so
+    /// `meta.json`'s mtime moves for essentially all of them. That check therefore lives on the
+    /// landed-announcement path, which fires only when content can actually change — see
+    /// [`crate::verdict_for_reland`].
     pub replicated_orphan: u64,
     /// Marked failed (e.g. a byte mismatch); the SSD copy is kept for diagnosis, so
     /// the reconciler leaves it alone.

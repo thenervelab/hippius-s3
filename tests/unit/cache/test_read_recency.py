@@ -102,6 +102,20 @@ async def test_a_db_outage_never_reaches_the_read() -> None:
     await ReadRecencyRecorder(FakePool(fail=True), "node-a")(OBJ, 1, 1)
 
 
+@pytest.mark.asyncio
+async def test_a_closing_pool_never_reaches_the_caller() -> None:
+    """asyncpg.InterfaceError is neither PostgresError nor OSError, and a closing or
+    uninitialised pool raises exactly it at acquire time. write_meta awaits this recorder
+    bare, so an escape here fails the client PUT and skips the landed announcement — the
+    regression this test pins closed."""
+
+    class ClosingPool:
+        def acquire(self) -> FakeConn:
+            raise asyncpg.InterfaceError("pool is closing")
+
+    await ReadRecencyRecorder(ClosingPool(), "node-a")(OBJ, 1, 1)
+
+
 def test_no_node_identity_means_no_recorder() -> None:
     """Without a node there is no way to say whose copy was read, and the evictor is
     node-scoped — a stamp would either miss or land on another node's row."""

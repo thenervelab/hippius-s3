@@ -27,6 +27,7 @@
 
 use crate::apipart::{ChunkIndex, PartKey, PartMeta};
 use crate::enforce::BreakerSignal;
+use crate::redrive::{PartDigest, part_digest};
 use crate::state::ReplicationState;
 use core::future::Future;
 use std::path::{Path, PathBuf};
@@ -139,6 +140,13 @@ impl PartVerified {
 /// The node-local SSD ingest cache a part is drained *from*.
 pub trait PartSource: Send + Sync {
     /// The chunk indices present in the part's SSD dir (its `chunk_<i>.bin` files).
+    ///
+    /// # Errors
+    ///
+    /// An absent part dir is `Err(NotFound)`, never an empty chunk set — the reland
+    /// divergence check tells "part gone" (the Vanished alarm) from "part with zero
+    /// chunks" (a well-defined empty digest) on exactly this contract, and a lenient
+    /// implementation silently disables that alarm.
     fn list_chunks(&self, part: &PartKey) -> impl Future<Output = std::io::Result<Vec<ChunkIndex>>> + Send;
 
     /// The on-disk path of one chunk's bytes on SSD.
@@ -215,7 +223,12 @@ pub trait PartReplicationStore: Send + Sync {
 
     /// Commit the part as `Replicated`. The unforgeable `&PartVerified` proves the
     /// copy was verified, so this cannot be called before verification.
-    fn mark_replicated(&self, part: &ClaimedPart, proof: &PartVerified) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ///
+    /// `digest` records WHAT was committed — the fold of the per-chunk hashes the verify loop
+    /// already produced. It is written by the same statement as the status, not a follow-up,
+    /// so there is no window in which a part reads `replicated` with a stale or absent digest
+    /// (which [`crate::verdict_for_reland`] would then have to treat as unverifiable).
+    fn mark_replicated(&self, part: &ClaimedPart, proof: &PartVerified, digest: &PartDigest) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Record that this node is KEEPING the part's SSD copy to serve reads, with its size for
     /// the evictor's accounting.
@@ -470,10 +483,15 @@ where
     // CHUNK_COPY_ATTEMPTS times before terminally failing; a re-persist is idempotent (a
     // fresh tmp + atomic rename). An exhausted retry marks the part Failed, drops the
     // partial pool copy, and leaves the SSD source intact — never commit it.
+    // The verified hash of each chunk, in the order copied, folded into the part's content
+    // digest at commit. Free: `persist_chunk` already returns the hash of the bytes it streamed
+    // off SSD, so recording WHAT was committed costs one Vec and no extra read (B-2).
+    let mut committed_hashes: Vec<String> = Vec::with_capacity(chunks.len());
     for index in &chunks {
         let index = *index;
         let source = ssd.chunk_source(part, index).map_err(PartDrainError::io(DrainStep::SsdRead))?;
         let mut mismatch: Option<(String, String)> = None;
+        let mut verified_hash: Option<String> = None;
         for _ in 0..CHUNK_COPY_ATTEMPTS {
             let copy_hash = ceph
                 .persist_chunk(&source, part, index)
@@ -482,6 +500,7 @@ where
             let pool_hash = ceph.chunk_hash(part, index).await.map_err(PartDrainError::io(DrainStep::Hash))?;
             if pool_hash == copy_hash {
                 mismatch = None;
+                verified_hash = Some(copy_hash);
                 break;
             }
             mismatch = Some((copy_hash, pool_hash));
@@ -511,6 +530,10 @@ where
                 pool_hash: pool_hash.into_boxed_str(),
             });
         }
+        // Unreachable unless the retry loop exits without either outcome, which the two arms
+        // above make impossible; pushing the empty string rather than unwrapping keeps the
+        // drain panic-free at the cost of a digest that simply will not match a later read.
+        committed_hashes.push(verified_hash.unwrap_or_default());
     }
 
     // Persist meta LAST — only now, with every chunk durably copied and byte-verified,
@@ -531,8 +554,12 @@ where
     store.mark_resident(part, meta.size_bytes).await.map_err(PartDrainError::store)?;
 
     // Commit Replicated as soon as the verified copy is durable on the pool — the Ceph
-    // commit is DECOUPLED from the address-gated backend enqueue.
-    store.mark_replicated(claim, &verified).await.map_err(PartDrainError::store)?;
+    // commit is DECOUPLED from the address-gated backend enqueue. The digest of what was
+    // copied goes in the SAME statement, so no committed part is ever unverifiable (B-2).
+    store
+        .mark_replicated(claim, &verified, &part_digest(&committed_hashes))
+        .await
+        .map_err(PartDrainError::store)?;
 
     // Best-effort backend enqueue, decoupled from the commit. For a simple PUT or a completed
     // MPU the address is ready, so this publishes the UploadChainRequest and stamps
@@ -570,6 +597,7 @@ mod tests {
     };
     use crate::apipart::{ChunkIndex, ObjectId, PartKey, PartMeta, PartNumber, Version};
     use crate::enforce::BreakerSignal;
+    use crate::redrive::{PartDigest, RelandVerdict, observed_part_digest, verdict_for_reland};
     use crate::state::ReplicationState;
     use core::future::Future;
     use core::str::FromStr;
@@ -778,6 +806,9 @@ mod tests {
         /// When set, `is_version_servable` returns true, so a persistent mismatch marks the
         /// part `Corrupt` (R4) instead of `Failed`. Default false = the abandoned-upload shape.
         servable: bool,
+        /// The content digest recorded by each commit — the store column `content_sha256`,
+        /// which a later re-landing compares against to detect a rewritten part (B-2).
+        committed_digest: HashMap<String, PartDigest>,
     }
 
     /// One struct implementing all three part contracts.
@@ -879,6 +910,42 @@ mod tests {
 
         fn pool_part(&self, part: &PartKey) -> Option<PartState> {
             self.world.lock().unwrap().pool.get(&key_of(part)).cloned()
+        }
+
+        /// The digest recorded by the last commit (the `content_sha256` column).
+        fn committed_digest(&self, part: &PartKey) -> Option<PartDigest> {
+            self.world.lock().unwrap().committed_digest.get(&key_of(part)).cloned()
+        }
+
+        /// Replaces the part's SSD chunk contents — an `UploadPart` retry landing DIFFERENT
+        /// bytes under the same `(object, version, part)` key, which is legal S3 before
+        /// `CompleteMultipartUpload`.
+        fn reupload_ssd(&self, part: &PartKey, chunk_hashes: &[(u32, &str)]) {
+            let mut state = PartState::default();
+            for &(index, hash) in chunk_hashes {
+                state.chunks.insert(index, hash.to_owned());
+            }
+            state.has_meta = true;
+            self.world.lock().unwrap().ssd.insert(key_of(part), state);
+        }
+
+        /// Forget the recorded digest, modelling a row committed before `content_sha256`
+        /// existed (the legacy-backfill case).
+        fn forget_committed_digest(&self, part: &PartKey) {
+            self.world.lock().unwrap().committed_digest.remove(&key_of(part));
+        }
+
+        /// The landed-announcement handler, modelling `Store::redrive_diverged_part`'s guarded
+        /// UPDATE: derive the digest from disk, ask the pure policy, and on a re-drive verdict
+        /// return the row to `pending`. Returns the verdict so a test can assert on it.
+        async fn handle_reland(&self, part: &PartKey) -> RelandVerdict {
+            let state = self.status_of(part).expect("the announcement names a known part");
+            let observed = observed_part_digest(self, part).await.expect("the SSD part is readable");
+            let verdict = verdict_for_reland(state, self.committed_digest(part).as_ref(), &observed);
+            if verdict.redrives() {
+                self.world.lock().unwrap().status.insert(key_of(part), ReplicationState::Pending);
+            }
+            verdict
         }
     }
 
@@ -1034,14 +1101,21 @@ mod tests {
             }
         }
 
-        fn mark_replicated(&self, part: &ClaimedPart, _proof: &PartVerified) -> impl Future<Output = Result<(), io::Error>> + Send {
+        fn mark_replicated(
+            &self,
+            part: &ClaimedPart,
+            _proof: &PartVerified,
+            digest: &PartDigest,
+        ) -> impl Future<Output = Result<(), io::Error>> + Send {
             let key = key_of(part.part());
+            let digest = digest.clone();
             async move {
                 let mut world = self.world.lock().unwrap();
                 if world.fault == Fault::Commit {
                     return Err(io::Error::other("commit failed"));
                 }
-                world.status.insert(key, ReplicationState::Replicated);
+                world.status.insert(key.clone(), ReplicationState::Replicated);
+                world.committed_digest.insert(key, digest);
                 Ok(())
             }
         }
@@ -1119,6 +1193,133 @@ mod tests {
             fakes.upload_stamped(),
             vec![key_of(&part)],
             "a successful inline enqueue stamps upload_enqueued_at",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replicated_part_whose_ssd_content_is_replaced_is_redriven_and_the_pool_gets_the_new_bytes() {
+        // B-2, the regression this whole module exists for. An `UploadPart` retry may land
+        // DIFFERENT bytes under the same (object, version, part) key before Complete. Attempt
+        // one drains to `replicated`; attempt two overwrites the SSD. Nothing used to re-drive
+        // the row, so the pool kept attempt one's ciphertext — which AEAD-verifies cleanly
+        // under the unchanged DEK/AAD, making it silent wrong plaintext rather than an error.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "attempt1-c0"), (1, "attempt1-c1")]);
+        drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Replicated));
+
+        fakes.reupload_ssd(&part, &[(0, "attempt2-c0"), (1, "attempt2-c1")]);
+        let verdict = fakes.handle_reland(&part).await;
+
+        assert_eq!(verdict, RelandVerdict::Diverged, "a rewritten part's digest no longer matches");
+        assert_eq!(
+            fakes.status_of(&part),
+            Some(ReplicationState::Pending),
+            "a diverged part returns to the drainable set",
+        );
+
+        drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        let pooled = fakes.pool_part(&part).expect("the re-drive re-copied the part");
+        assert_eq!(
+            pooled.chunks.get(&0).map(String::as_str),
+            Some("attempt2-c0"),
+            "the pool must hold the SECOND attempt's bytes, not the first's",
+        );
+        assert_eq!(pooled.chunks.get(&1).map(String::as_str), Some("attempt2-c1"));
+    }
+
+    #[tokio::test]
+    async fn a_replicated_part_whose_content_is_unchanged_is_not_redriven() {
+        // The common path, and the one that would be catastrophic to get wrong: a duplicate
+        // announcement, or the reconciler backstop racing the fast path, must not re-copy the
+        // node's whole shard to Ceph. The digest is what distinguishes "announced again" from
+        // "written again"; without it the only options are re-drive everything or nothing.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]);
+        drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+
+        let verdict = fakes.handle_reland(&part).await;
+
+        assert_eq!(verdict, RelandVerdict::Unchanged);
+        assert_eq!(
+            fakes.status_of(&part),
+            Some(ReplicationState::Replicated),
+            "an unchanged part stays committed — no re-copy, no eviction churn",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replicated_part_with_no_recorded_digest_is_redriven_rather_than_assumed_intact() {
+        // Decision on NULL: a part committed before content digests shipped cannot be compared.
+        // "Unknown" must not resolve to "fine" on an integrity check, so a re-landing of such a
+        // part re-drives. It costs nothing at deploy because it is only ever evaluated when an
+        // announcement arrives for an already-`replicated` part — a rewrite, by construction.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0")]);
+        drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        fakes.forget_committed_digest(&part);
+
+        let verdict = fakes.handle_reland(&part).await;
+
+        assert_eq!(verdict, RelandVerdict::Unverifiable, "counted apart from a proven divergence");
+        assert!(verdict.redrives(), "an unverifiable committed part re-drives, fail-safe");
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Pending));
+    }
+
+    #[tokio::test]
+    async fn a_redrive_is_idempotent_and_does_not_loop_on_a_repeatedly_announced_part() {
+        // A re-drive must not spin. The second announcement for the SAME rewrite finds the row
+        // already `pending` (not `replicated`), so it is a no-op; and once the re-drive commits,
+        // the freshly-recorded digest matches the disk, so further announcements read Unchanged.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "v1")]);
+        drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        fakes.reupload_ssd(&part, &[(0, "v2")]);
+
+        assert_eq!(fakes.handle_reland(&part).await, RelandVerdict::Diverged);
+        assert_eq!(
+            fakes.handle_reland(&part).await,
+            RelandVerdict::NotDrained,
+            "a duplicate announcement for an already re-driven part changes nothing",
+        );
+
+        drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        assert_eq!(
+            fakes.handle_reland(&part).await,
+            RelandVerdict::Unchanged,
+            "once re-drained, the recorded digest matches the disk again — the loop terminates",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_part_is_left_to_the_bounded_redrive_worker() {
+        // A `corrupt` part is already owned by `redrive_corrupt_parts`, which caps attempts so
+        // an unrecoverable pool copy cannot loop forever. Re-driving it from the announcement
+        // path would bypass that cap — the same reason the reconciler refuses to re-record it.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0")]);
+        fakes.world.lock().unwrap().status.insert(key_of(&part), ReplicationState::Corrupt);
+
+        assert_eq!(fakes.handle_reland(&part).await, RelandVerdict::NotDrained);
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Corrupt));
+    }
+
+    #[tokio::test]
+    async fn the_committed_digest_binds_the_chunk_set_not_just_the_bytes() {
+        // A truncated part must not share a digest with the full one. The fold hashes the chunk
+        // COUNT and length-delimits each hash, so dropping a trailing chunk changes the digest
+        // even though every remaining chunk hash is identical.
+        let part = part();
+        let full = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]);
+        drain_part(&full, &full, &full, &full, &claim(&part)).await.unwrap();
+
+        let truncated = Fakes::seeded(&part, &[(0, "h0")]);
+        drain_part(&truncated, &truncated, &truncated, &truncated, &claim(&part)).await.unwrap();
+
+        assert_ne!(
+            full.committed_digest(&part),
+            truncated.committed_digest(&part),
+            "a truncated chunk set must not alias the full one",
         );
     }
 
