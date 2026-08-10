@@ -37,9 +37,15 @@ _decoded_path = decoded_path
 BUCKET_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9\.\-]*[a-z0-9]$")
 IP_ADDRESS_PATTERN = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
 
-# Object key characters to avoid (non-printable ASCII and problematic chars)
+# Object key characters to avoid (non-printable ASCII and problematic chars).
+#
+# `#` and `?` are here for the same concrete reason rather than as style: `ForwardService`
+# interpolates the decoded path into a URL *string*, which httpx then re-parses, and both are
+# delimiters there. A key sent as `report%3Fv1.txt` arrives at the api as `report` — so
+# `report%3Fv1.txt` and `report%3Fv2.txt` are two distinct keys that both answer 200 and land on
+# one object. `#` was already covered; `?` behaves identically and was not.
 OBJECT_KEY_AVOID_CHARS = (
-    ["\\", "{", "}", "^", "%", "`", "[", "]", '"', "<", ">", "~", "#", "|"]
+    ["\\", "{", "}", "^", "%", "`", "[", "]", '"', "<", ">", "~", "#", "?", "|"]
     + [chr(i) for i in range(0, 32)]
     + [chr(127)]
 )
@@ -77,6 +83,31 @@ async def input_validation_middleware(
     # as-sent first segment is an innocuous bucket name. Every bucket-name and reserved-name
     # decision below keys off the first segment, so all of them must use this.
     path_parts = forwarded_path(decoded).strip("/").split("/")
+
+    # A literal `?` or `#` in the DECODED path means the client percent-encoded one, because
+    # uvicorn has already split the real query off at the first raw `?`. Both are delimiters to
+    # the URL string `ForwardService` builds, so httpx re-reads them: the path the api routes on
+    # is truncated there, and everything after a `?` becomes a QUERY on the forwarded request.
+    #
+    # That second half is the reason this check is here rather than only on the key. The gateway's
+    # own `request.query_params` comes from `scope["query_string"]` and stays empty, so a
+    # subresource smuggled this way is invisible to every layer that keys off the query — which
+    # includes `acl.py`'s CreateBucket shape (`len(query_params) == 0`) and `get_required_permission`,
+    # both of which then judge a different operation from the one the api performs.
+    #
+    # Refusing the whole class up front is much cheaper to reason about than teaching each of
+    # those layers to model the rewrite, and it costs nothing legitimate: no gateway route and no
+    # creatable bucket name contains either character, and an object key that does is already
+    # silently truncated today (see OBJECT_KEY_AVOID_CHARS) rather than stored intact — so this
+    # turns a quiet overwrite into a 400.
+    for delimiter in ("?", "#"):
+        if delimiter in decoded:
+            logger.warning("Request path rejected at gateway: contains %r", delimiter)
+            return s3_error_response(
+                code="InvalidURI",
+                message=f"Request path contains an invalid character: {delimiter!r}",
+                status_code=400,
+            )
 
     # Validate bucket name only on CreateBucket (PUT /{bucket} with no object key and no
     # tagging/lifecycle/policy query params). Existing buckets with non-compliant names

@@ -213,8 +213,15 @@ async def test_a_fragment_in_a_key_is_still_judged_as_a_key_not_as_a_reserved_bu
     """Truncating for the routing view must not cost the key view its `#`.
 
     `/internal-backups/report#v1.txt` forwards as `/internal-backups/report` — a legitimate bucket,
-    so the denylist must not claim it — while the `#` still has to be rejected as a discouraged key
-    character, because the truncation IS the silent overwrite that guard exists to prevent.
+    so the denylist must not claim it — while the `#` still has to be rejected, because the
+    truncation IS the silent overwrite that guard exists to prevent.
+
+    The refusal now comes from the path-level delimiter check rather than the per-key character
+    list, so the code is `InvalidURI` instead of `InvalidArgument`. That check runs earlier
+    because it also has to cover paths with no key segment at all, and paths that take the
+    SKIP_PREFIXES bypass before the key view is ever built. What this test exists to pin is
+    unchanged and still asserted below: the request is refused, nothing is forwarded, and the
+    bucket is NOT misjudged as a reserved name.
     """
     response, forwarded = await _run(
         "GET", "/internal-backups/report#v1.txt", raw_path=b"/internal-backups/report%23v1.txt"
@@ -222,7 +229,7 @@ async def test_a_fragment_in_a_key_is_still_judged_as_a_key_not_as_a_reserved_bu
 
     assert response.status_code == 400
     assert forwarded == []
-    assert b"InvalidArgument" in response.body, "must fail as a bad key, not as a reserved bucket name"
+    assert b"InvalidURI" in response.body, "must fail on the character, not as a reserved bucket name"
     assert b"InvalidBucketName" not in response.body
 
 

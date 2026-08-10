@@ -1,0 +1,118 @@
+"""A percent-encoded `?` or `#` in the path is refused rather than reinterpreted downstream.
+
+`ForwardService` interpolates the decoded path into a URL *string*, which httpx re-parses. Both
+characters are delimiters there, so a client that percent-encodes one controls where the api
+thinks the path ends — and, for `?`, hands the forwarded request a query string that the gateway
+itself never saw, because `request.query_params` is built from `scope["query_string"]`.
+
+Layers that key off the query then judge a different operation from the one the api performs:
+`acl.py`'s CreateBucket shape is `len(query_params) == 0`, and `get_required_permission` maps
+subresources like `acl`/`tagging` to WRITE_ACP/READ_ACP. Refusing the character up front is
+cheaper than teaching each layer to model the rewrite.
+
+Nothing legitimate is lost: uvicorn has already split the real query at the first raw `?`, so a
+literal one in `scope["path"]` can only have arrived percent-encoded, and such a key is silently
+truncated today rather than stored intact.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from fastapi import FastAPI
+from fastapi import Request
+from fastapi import Response
+from httpx import ASGITransport
+from httpx import AsyncClient
+
+from gateway.middlewares.input_validation import input_validation_middleware
+
+
+def _app() -> tuple[FastAPI, list[str]]:
+    """A gateway stand-in that records whatever gets past validation."""
+    reached: list[str] = []
+    app = FastAPI()
+    app.middleware("http")(input_validation_middleware)
+
+    @app.api_route("/{full_path:path}", methods=["GET", "PUT", "HEAD", "DELETE"])
+    async def catch_all(full_path: str, request: Request) -> Response:  # pragma: no cover - trivial
+        reached.append(request.scope["path"])
+        return Response(status_code=200)
+
+    return app, reached
+
+
+async def _send(method: str, raw_path: str) -> tuple[int, list[str]]:
+    app, reached = _app()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://gw") as client:
+        resp = await client.request(method, raw_path)
+    return resp.status_code, reached
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/victimbucket%3Fpolicy",
+        "/victimbucket%3Ftagging",
+        "/victimbucket%3Facl",
+        "/bucket/key%3Facl",
+    ],
+)
+async def test_an_encoded_question_mark_is_refused(path: str) -> None:
+    """Each of these would otherwise reach the api carrying a subresource query the gateway never saw."""
+    status, reached = await _send("PUT", path)
+
+    assert status == 400, f"{path} was accepted"
+    assert reached == [], f"{path} reached the backend"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/victimbucket%23x", "/bucket/report%23v1.txt"])
+async def test_an_encoded_hash_is_refused(path: str) -> None:
+    """`#` truncates identically; it was already covered for keys, now uniformly."""
+    status, reached = await _send("PUT", path)
+
+    assert status == 400
+    assert reached == []
+
+
+@pytest.mark.asyncio
+async def test_two_keys_differing_only_after_the_delimiter_cannot_collide() -> None:
+    """The data-loss shape: both forward as key `report`, so one silently overwrites the other."""
+    first, reached_first = await _send("PUT", "/bucket/report%3Fv1.txt")
+    second, reached_second = await _send("PUT", "/bucket/report%3Fv2.txt")
+
+    assert (first, second) == (400, 400)
+    assert reached_first == [] and reached_second == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/bucket",
+        "/bucket/key.txt",
+        "/bucket/nested/key.txt",
+        "/bucket/key%20with%20spaces.txt",
+        "/bucket/key-with-dashes_and_underscores.txt",
+        "/health",
+    ],
+)
+async def test_ordinary_paths_are_untouched(path: str) -> None:
+    """The refusal must not widen: normal keys, encoded spaces and gateway routes all pass."""
+    status, reached = await _send("GET", path)
+
+    assert status == 200, f"{path} was rejected"
+    assert reached, f"{path} did not reach the backend"
+
+
+@pytest.mark.asyncio
+async def test_a_real_query_string_is_still_fine() -> None:
+    """A genuine `?` is split off by the server into scope['query_string'] and never seen here."""
+    status, reached = await _send("PUT", "/bucket?tagging")
+
+    assert status == 200
+    assert reached == ["/bucket"]
