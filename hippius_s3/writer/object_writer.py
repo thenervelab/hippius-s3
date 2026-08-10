@@ -878,7 +878,15 @@ class ObjectWriter:
                 plain_size=int(total_size),
             )
             meta_written = True
-        except Exception:
+        except BaseException:
+            # BaseException, not Exception: `asyncio.CancelledError` derives from BaseException on
+            # 3.8+, and cancellation is the DOMINANT way this block is left — a client that
+            # disconnects mid-body has its request task cancelled, which is precisely the
+            # "duplicate UploadPart dies mid-stream" shape described below. Catching only
+            # Exception left that case running the exact unwind this handler exists to prevent.
+            # The other BaseExceptions (KeyboardInterrupt, SystemExit) want this cleanup too, and
+            # the bare `raise` at the end preserves them unchanged.
+            #
             # Stop the consumer before unwinding. Without this it is left PENDING holding up to
             # HIPPIUS_WRITE_QUEUE_MAXSIZE already-queued chunks, which it then writes into the
             # SHARED part directory on later event-loop turns — after the request has already
