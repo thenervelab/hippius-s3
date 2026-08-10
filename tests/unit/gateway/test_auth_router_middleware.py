@@ -118,13 +118,43 @@ def test_every_auth_exempt_segment_is_a_reserved_bucket_name() -> None:
     assert ALL_EXEMPT_SEGMENTS <= RESERVED_BUCKET_SEGMENTS
 
 
-def test_exempt_segments_are_matched_on_the_decoded_raw_path() -> None:
-    """auth_router and input_validation must agree on where a path starts. request.url.path
-    is built with urlsplit, which truncates at '#' — `/docs%23x` reads as the exempt segment
-    `docs` through that lens while input_validation sees the bucket `docs#x`."""
+@pytest.mark.parametrize(
+    ("raw_path", "api_segment"),
+    [
+        # httpx truncates the forwarded target at the `#`, so the api routes on `/docs` — and
+        # judging this as the bucket `docs#x` (which is what reading the raw path gave) meant
+        # auth_router and the api disagreed about which request was being let through.
+        (b"/docs%23x", "docs"),
+        # The traversal, both spellings: exempt as sent, an ordinary S3 request as forwarded.
+        (b"/docs/%2E%2E/anybucket/key.txt", "anybucket"),
+        (b"/docs/../anybucket/key.txt", "anybucket"),
+        # Prefix is not segment: the `docs2` hole.
+        (b"/docs2", "docs2"),
+    ],
+)
+def test_exempt_segments_are_matched_on_the_path_the_api_will_receive(raw_path: bytes, api_segment: str) -> None:
+    """auth_router, input_validation and the api must agree on where a path starts.
+
+    They now agree on the api's own answer rather than on a shared-but-arbitrary lens: whatever
+    httpx forwards is what actually routes, so it is the only view that cannot be wrong. Neither
+    `request.url.path` (truncates at `#`) nor the raw decoded path (keeps dot segments httpx
+    removes) is that view.
+    """
     request = MagicMock()
-    request.scope = {"raw_path": b"/docs%23x"}
-    assert first_path_segment(request) == "docs#x"
+    request.scope = {"raw_path": raw_path}
+
+    assert first_path_segment(request) == api_segment
+
+
+def test_a_traversal_out_of_an_exempt_route_is_not_exempt() -> None:
+    """The consequence of the above, stated on the exempt set itself.
+
+    `/docs/../anybucket/key.txt` is served from `anybucket`; treating it as the `docs` route skipped
+    authentication and processed it as anonymous.
+    """
+    request = MagicMock()
+    request.scope = {"raw_path": b"/docs/%2E%2E/anybucket/key.txt"}
+
     assert first_path_segment(request) not in ALL_EXEMPT_SEGMENTS
 
 

@@ -232,6 +232,36 @@ Two concurrent PUTs to the same (bucket, key) today both fetch the existing obje
 
 **Proposed**: always pass `uuid.uuid4()` as the candidate, let the DB override on conflict. Removes the read-before-write and simplifies the endpoint. Low risk.
 
+### P1 — Path normalization: one view, set once
+
+**Seam**: [gateway/main.py:231](gateway/main.py) (the `# TODO:` line next to `ray_id_middleware`, second-outermost).
+
+The gateway judges paths in two views and the api receives a third-party rewrite of one of them. `ForwardService` interpolates the decoded `scope["path"]` into a URL *string* ([forward_service.py:135](gateway/services/forward_service.py)) and hands it to httpx, which then **collapses `.`/`..`** and **truncates at the first `#`/`?`** before the request goes out; the api's uvicorn then **decodes percent-escapes a second time**. So "the path" is ambiguous at every layer, and each layer that picks the wrong view is deciding about a request that is never sent.
+
+This has now failed three separate times, each fixed in isolation:
+
+1. **2026-08-03 (prod)** — `auth_router` matched exempt paths with `startswith()`, so bucket `docs2` skipped authentication entirely and landed as an anonymous-owned bucket.
+2. **PR #401** — `/anybucket/../internal/parts/...` passed `input_validation`'s first-segment denylist and reached the api as `/internal/parts/...`, because the denylist judged the uncollapsed path. Fixed by introducing `forwarded_path`.
+3. **PR #401 (later)** — `/internal%23x/parts/1` and `/internal%3Fx/parts/1` passed the same denylist and arrived as `GET /internal`, because `forwarded_path` modelled only dot segments and not the `#`/`?` truncation. Fixed by truncating. Separately, `auth_router`/`acl`/`account`/`frontend_hmac` were still judging the uncollapsed path — a candidate auth bypass (`GET /docs/../anybucket/key` skipped auth AND had ACL evaluated against the ownerless `docs` bucket).
+
+Each fix was correct and each left the *class* open, because the invariant lives in no single place: it is re-asserted by every caller that remembers to ask the right question. `gateway/utils/paths.py::routing_path` is now the one right answer, but nothing forces a new middleware to use it — and a plausible-sounding alternative (`request.url.path`) is one attribute access away.
+
+**Proposed**: rewrite `scope["path"]` to `routing_path(request)` once, in a middleware at the seam above, and let every downstream layer read `request.url.path` freely — because it would then already BE the forwarded view. `ForwardService` keeps interpolating `scope["path"]`, which is now idempotent under httpx's rewrites (dot segments already collapsed, nothing after a `#`/`?` left to truncate), so the gateway and the api agree by construction rather than by discipline.
+
+Deliberately not done as part of #401: it changes the path every middleware sees, so it needs its own PR with e2e coverage of the exempt routes, the `/user/` HMAC arm, presigned-URL canonicalization (**note**: `sigv4.py` must keep signing over `raw_path` — the client signed what it sent, not what we forward), and the ATS cache-key/purge paths.
+
+**Still judging `request.url.path` today** (each is the same class; none is known-exploitable, listed so the sweep is mechanical rather than archaeological):
+
+| File | Decision | Consequence of the wrong view |
+|---|---|---|
+| [cache_control.py:64](gateway/middlewares/cache_control.py) | ATS cache key (bucket/key) | Cache key disagrees with the object served — stale or cross-key hits |
+| [ats_purge.py:31](gateway/middlewares/ats_purge.py) | Which key to invalidate on write | A write invalidates the wrong key; readers keep the stale copy |
+| [rate_limit.py:66-70](gateway/middlewares/rate_limit.py) | `skip_paths`, `/user/` skip | Rate limiting dodgeable via `/health/../bucket/key` |
+| [read_only.py:21](gateway/middlewares/read_only.py) | `ALWAYS_ALLOWED_PATHS` | Exact-match only, so it fails safe — writes stay blocked |
+| [audit_log.py:19](gateway/middlewares/audit_log.py), [tracing.py:22](gateway/middlewares/tracing.py) | Log/span attributes | Observability only: audit lines name a path the api never saw |
+
+**Also worth one query before the next release**: the new `%`-in-first-segment rejection ([input_validation.py](gateway/middlewares/input_validation.py)) makes any pre-existing bucket whose name contains `%` unreachable. Such a name cannot be created through the gateway (`BUCKET_NAME_PATTERN` refuses it), but confirm none exists: `SELECT bucket_name FROM buckets WHERE bucket_name LIKE '%\%%' ESCAPE '\';`
+
 ### P2 — Rate limiting and banhammer disabled at gateway
 
 **File**: [gateway/main.py:94](gateway/main.py) logs `"Rate limiting and banhammer disabled"`. The middleware modules exist ([gateway/middlewares/rate_limit.py](gateway/middlewares/rate_limit.py), [gateway/middlewares/banhammer.py](gateway/middlewares/banhammer.py)) but are not registered in the middleware chain. Reasons unknown from code alone — maybe performance, maybe maturity.

@@ -28,8 +28,14 @@ Chunk cache. Backed by a shared filesystem volume; Redis is used only for pub/su
 3. **pool** — the shared CephFS volume. Authoritative and always present for a replicated part,
    so every tier above it is an optimisation and must never be able to fail a read.
 
-With `HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ`, a peer- or pool-served chunk is copied onto local
-flash and claimed in `cephor_ssd_residency` so the drain-agent's evictor owns it. Two caps bound
+With `HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ`, a peer- or pool-served chunk is claimed in
+`cephor_ssd_residency` — so the drain-agent's evictor owns it — and only then copied onto local
+flash. **Claim first, and a failed claim cancels the copy.** An unclaimed copy has no owner in
+either process (the evictor is scoped to that table, and `ssd_reclaim` skips replicated parts as
+the read tier), so writing first would leak one unreclaimable copy per promoted chunk for the
+whole of a residency-DB outage — on the disk whose filling makes the api 503 every PUT. Failing
+closed on an optimisation costs a cache warm, counted as
+`promotion_skipped_total{reason=residency_failed}`. Two caps bound
 peer fanout — `HIPPIUS_PEER_FETCH_MAX_INFLIGHT` per (pod, peer) on the client, and
 `HIPPIUS_PEER_SERVE_MAX_INFLIGHT` on the serving pod, which sheds with 503. Both shed to the
 pool rather than queueing.
@@ -46,6 +52,27 @@ shares the ingest mount with PUTs — `HIPPIUS_OBJECT_CACHE_DIR` is the drain ag
 `CEPHOR_SSD_ROOT` and the mount `fs_cache_pressure` measures. The floor must sit strictly inside
 the evictor's band, above its reserve (0.150) and below its target (0.200), or promotion either
 chatters or deadlocks permanently; `validate_promotion_band` enforces that at startup.
+
+## Invalidating a chunk that fails AEAD
+
+Promotion copies peer/pool bytes onto local flash, and the local tier is read FIRST — so a bad
+copy (a version-skewed peer, a torn write, bit rot) would be a permanent, retry-immune read
+failure for that object on that node until the evictor happened to reclaim the part.
+`invalidate_local_chunk` is what makes it transient: `stream_plan` calls it when a chunk's
+plaintext fails to authenticate, then re-fetches and decrypts **exactly once**, counted as
+`chunk_aead_failures_total{tier,outcome}`.
+
+Three things about it are load-bearing. It removes one chunk file, never the part or `meta.json` —
+a part with meta and a hole is the downloader's normal partial-fill state, so the hole falls
+through a tier while its siblings still serve. It is gated on the pool holding the chunk, because
+a freshly ingested part is on SSD alone until the drain replicates it and a DEK fault fails those
+chunks too; without the gate a key error would become data loss. And it lives on
+`DualFileSystemPartsStore` alone — with no fallback dir the single store's root IS the pool, so
+the same call there would delete the authoritative copy.
+
+The retry being straight-line rather than a loop is the other half. A DEK fault fails every chunk
+of every object, and with promotion on a looping retry re-warms the copy it just dropped, so it
+would never run out of things to invalidate.
 
 **The evictor runs in a different process** (`drain-agent`) and deletes both the part directory
 and its residency row. Nothing in this package may cache "I already recorded/wrote this" across

@@ -602,15 +602,15 @@ fn parse_chunk_index(name: &OsStr) -> Option<ChunkIndex> {
 }
 
 /// The chunk indices present in a part dir, sorted ascending. A missing dir is an
-/// empty part (tolerated like the cache-root scan), so `drain_part` then fails at the
-/// meta copy rather than here.
+/// error (`NotFound`), never an empty part: the reland divergence check discriminates
+/// "part gone" (the evict-vs-reland Vanished alarm) from "part with zero chunks"
+/// (digest of the empty set) purely on this contract, and the old lenient mapping is
+/// how an evicted part once digested as empty, read as Diverged, and silenced that
+/// alarm. `drain_part` is unaffected: it previously hit the identical
+/// `SsdRead`/`NotFound` benign deferral one call later, at the meta read.
 async fn list_chunk_indices(dir: &Path) -> io::Result<Vec<ChunkIndex>> {
     let mut out = Vec::new();
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(dir) => dir,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(out),
-        Err(err) => return Err(err),
-    };
+    let mut entries = fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         if !entry.file_type().await?.is_file() {
             continue;
@@ -1227,9 +1227,9 @@ mod part_tests {
     use core::future::Future;
     use core::str::FromStr;
     use hippius_drain_core::{
-        ChunkIndex, ClaimedPart, DrainOutcome, FailedGrace, META_FILE_NAME, ObjectId, OrphanGrace, PartDrainError, PartKey, PartNumber, PartPool,
-        PartRemover, PartReplicationStore, PartScan, PartSource, PartVerified, ReplicationState, UploadEnqueuer, Version, chunk_file_name,
-        drain_part, parse_part_dir,
+        ChunkIndex, ClaimedPart, DrainOutcome, FailedGrace, META_FILE_NAME, ObjectId, OrphanGrace, PartDigest, PartDrainError, PartKey, PartNumber,
+        PartPool, PartRemover, PartReplicationStore, PartScan, PartSource, PartVerified, RelandVerdict, ReplicationState, UploadEnqueuer, Version,
+        chunk_file_name, drain_part, observed_part_digest, parse_part_dir, part_digest, verdict_for_reland,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -1279,11 +1279,18 @@ mod part_tests {
     #[derive(Default)]
     struct MemPartStore {
         status: Mutex<HashMap<String, ReplicationState>>,
+        /// The content digest each commit recorded, so a test can assert the digest the drain
+        /// derived from REAL files matches one recomputed from the same bytes (B-2).
+        committed_digest: Mutex<HashMap<String, PartDigest>>,
     }
 
     impl MemPartStore {
         fn key(part: &PartKey) -> String {
             part.relative_dir().to_string_lossy().into_owned()
+        }
+
+        fn committed_digest(&self, part: &PartKey) -> Option<PartDigest> {
+            self.committed_digest.lock().unwrap().get(&Self::key(part)).cloned()
         }
 
         fn set(&self, part: &PartKey, state: ReplicationState) {
@@ -1309,10 +1316,17 @@ mod part_tests {
             Ok(())
         }
 
-        fn mark_replicated(&self, part: &ClaimedPart, _proof: &PartVerified) -> impl Future<Output = Result<(), io::Error>> + Send {
+        fn mark_replicated(
+            &self,
+            part: &ClaimedPart,
+            _proof: &PartVerified,
+            digest: &PartDigest,
+        ) -> impl Future<Output = Result<(), io::Error>> + Send {
             let key = Self::key(part.part());
+            let digest = digest.clone();
             async move {
-                self.status.lock().unwrap().insert(key, ReplicationState::Replicated);
+                self.status.lock().unwrap().insert(key.clone(), ReplicationState::Replicated);
+                self.committed_digest.lock().unwrap().insert(key, digest);
                 Ok(())
             }
         }
@@ -1346,6 +1360,18 @@ mod part_tests {
             let servable = false;
             async move { Ok(servable) }
         }
+    }
+
+    #[tokio::test]
+    async fn listing_an_absent_part_dir_surfaces_not_found() {
+        // The strict-listing contract the reland Vanished alarm rests on, pinned against the
+        // REAL filesystem: the old lenient `NotFound => empty listing` arm is exactly how an
+        // evicted part once digested as a valid empty set and silenced the alarm. The
+        // core-side fakes are strict, so only this test catches the arm reappearing here.
+        let dir = TempDir::new().unwrap();
+        let ssd = LocalSsd::new(dir.path());
+        let err = ssd.list_chunks(&part_key(5, 1)).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[tokio::test]
@@ -1567,6 +1593,100 @@ mod part_tests {
             "the SSD copy is retained as this node's read tier once a verified pool copy exists",
         );
         assert_eq!(store.status_of(&part), Some(ReplicationState::Replicated));
+    }
+
+    #[tokio::test]
+    async fn the_digest_a_drain_commits_is_the_one_a_later_read_derives_from_the_same_files() {
+        // B-2's load-bearing assumption, checked against REAL files rather than fakes: the
+        // digest folded from the copy-time hashes inside drain_part is byte-identical to the one
+        // `observed_part_digest` derives by re-reading the same part off LocalSsd. If the two
+        // sides ever disagree — a different chunk order, a different hash rendering — every
+        // re-landing would read as diverged and the fleet would re-copy itself.
+        let ssd_dir = TempDir::new().unwrap();
+        let pool_dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        seed_ssd_part(ssd_dir.path(), &part, &[(0, b"chunk zero"), (1, b"chunk one!")]);
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let store = MemPartStore::default();
+        store.set(&part, ReplicationState::Pending);
+        drain_part(
+            &LocalFs::new(pool_dir.path()),
+            &ssd,
+            &store,
+            &NoopEnqueuer,
+            &ClaimedPart::new(part.clone(), 0),
+        )
+        .await
+        .unwrap();
+
+        let committed = store.committed_digest(&part).unwrap();
+        let observed = observed_part_digest(&ssd, &part).await.unwrap();
+        assert_eq!(committed, observed, "an untouched part re-reads to the digest it committed");
+        assert_eq!(
+            verdict_for_reland(ReplicationState::Replicated, Some(&committed), &observed),
+            RelandVerdict::Unchanged,
+        );
+        assert_eq!(
+            observed,
+            part_digest(&[sha256_hex(b"chunk zero"), sha256_hex(b"chunk one!")]),
+            "the digest is the fold of the chunks' own SHA-256s, in ascending index",
+        );
+    }
+
+    #[tokio::test]
+    async fn rewriting_a_chunk_on_disk_changes_the_digest_a_reland_derives() {
+        // The detector's other half against real files: an `UploadPart` retry replaces the
+        // chunk bytes in place, and the re-derived digest must no longer match what was
+        // committed. Same length on purpose — a size check would not catch this, which is why
+        // the divergence has to be a content hash.
+        let ssd_dir = TempDir::new().unwrap();
+        let pool_dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        seed_ssd_part(ssd_dir.path(), &part, &[(0, b"attempt one")]);
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let store = MemPartStore::default();
+        store.set(&part, ReplicationState::Pending);
+        drain_part(
+            &LocalFs::new(pool_dir.path()),
+            &ssd,
+            &store,
+            &NoopEnqueuer,
+            &ClaimedPart::new(part.clone(), 0),
+        )
+        .await
+        .unwrap();
+        let committed = store.committed_digest(&part).unwrap();
+
+        std::fs::write(ssd_dir.path().join(part.relative_dir()).join("chunk_0.bin"), b"attempt two").unwrap();
+        let observed = observed_part_digest(&ssd, &part).await.unwrap();
+
+        assert_ne!(committed, observed);
+        assert_eq!(
+            verdict_for_reland(ReplicationState::Replicated, Some(&committed), &observed),
+            RelandVerdict::Diverged,
+            "equal-length replacement bytes still diverge — only content can tell",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removed_part_dir_reads_as_not_found_at_digest_time() {
+        // The evict-vs-reland lost race against the real FS. `list_chunk_indices` maps a
+        // missing dir to an EMPTY listing for the drain's sake, which would fold to a valid
+        // empty-set digest, read as Diverged, and spuriously re-drive a servable row — while
+        // the Vanished alarm built for this exact loss stayed silent. The meta probe inside
+        // `observed_part_digest` is what turns the absence back into `NotFound`.
+        let ssd_dir = TempDir::new().unwrap();
+        let part = part_key(5, 1);
+        seed_ssd_part(ssd_dir.path(), &part, &[(0, b"chunk zero")]);
+        let ssd = LocalSsd::new(ssd_dir.path());
+        observed_part_digest(&ssd, &part).await.unwrap();
+
+        std::fs::remove_dir_all(ssd_dir.path().join(part.relative_dir())).unwrap();
+
+        let err = observed_part_digest(&ssd, &part).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[tokio::test]

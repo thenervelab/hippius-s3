@@ -113,8 +113,9 @@ async def test_a_promoted_chunk_records_residency_on_this_node(tmp_path) -> None
     """
     recorded: list[tuple[str, int, int, int]] = []
 
-    async def _record(object_id: str, version: int, part_number: int, size_bytes: int) -> None:
+    async def _record(object_id: str, version: int, part_number: int, size_bytes: int) -> bool:
         recorded.append((object_id, version, part_number, size_bytes))
+        return True
 
     dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), promote=True, on_promote=_record)
     await _write_part(dual.fallback, part_number=1, chunk=b"pool-only")
@@ -129,8 +130,9 @@ async def test_a_primary_hit_never_promotes_or_records(tmp_path) -> None:
     """The steady state costs nothing: no pool read, no copy, no residency write."""
     recorded: list[tuple[str, int, int, int]] = []
 
-    async def _record(*args: object) -> None:
+    async def _record(*args: object) -> bool:
         recorded.append(args)  # type: ignore[arg-type]
+        return True
 
     dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), promote=True, on_promote=_record)
     await _write_part(dual, part_number=1, chunk=b"on-ssd")
