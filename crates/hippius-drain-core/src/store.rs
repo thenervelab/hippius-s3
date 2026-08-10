@@ -371,10 +371,42 @@ impl Store {
     ///
     /// [`StoreError::Database`] if the delete fails.
     pub async fn gc_terminal_status_rows(&self, retention: Duration) -> Result<u64> {
+        // The residency guard is a DURABILITY gate, not an optimisation. Both readers of
+        // `cephor_ssd_residency` in this crate — `evictable_parts` and `node_cache_bytes` — INNER
+        // JOIN this table and require `status = 'replicated'`, so deleting the row of a part that
+        // is still on disk makes that part simultaneously **unevictable and unaccounted**: the
+        // evictor's worklist can never emit it, so it occupies ingest NVMe forever, and the
+        // heartbeat stops counting its bytes, which also feeds the shared-filesystem check into
+        // reading the node as though a foreign writer owned the disk.
+        //
+        // This was unreachable before read-tier retention, and that is why the retention window
+        // above was never sized against it: the drain unlinked a replicated part's SSD copy within
+        // `CEPHOR_REPLICATED_RECLAIM_GRACE_SECS` (1h in prod), so no `replicated` row could
+        // outlive its part. Retention keeps parts resident on a free-space policy instead, which
+        // on an uncontended node is indefinite — comfortably past the 7-day default.
+        //
+        // The guard covers `failed` rows too, and that is release-based, not a permanent block:
+        // `mark_failed_reclaimed` deletes the part's residency rows (all nodes) in the same
+        // statement that stamps `reclaimed_at`, so a reclaimed `failed` row GCs on schedule and
+        // the 0018-era backlog cannot regrow. A `failed` row that KEEPS residency is the
+        // held-servable case — a corrupt-live object whose SSD copy is the last good source, so
+        // the reclaimer refuses the unlink — and sparing it is the same durability argument as
+        // the `replicated` branch: the row is the record that those bytes are on a disk. That
+        // population is bounded by corruption incidents, not by the reclaim rate.
+        //
+        // `cephor_ssd_residency_part_idx (object_id, version, part_number)` already serves this
+        // lookup; migration 0016 added it for exactly this key shape and 0017 deliberately kept
+        // it. No new index, no migration.
         let affected = sqlx::query(
-            "DELETE FROM cephor_replication_status \
-             WHERE (status = 'failed' OR (status = 'replicated' AND upload_enqueued_at IS NOT NULL)) \
-               AND updated_at < now() - (interval '1 second' * $1)",
+            "DELETE FROM cephor_replication_status s \
+             WHERE (s.status = 'failed' OR (s.status = 'replicated' AND s.upload_enqueued_at IS NOT NULL)) \
+               AND s.updated_at < now() - (interval '1 second' * $1) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM cephor_ssd_residency r \
+                   WHERE r.object_id = s.object_id \
+                     AND r.version = s.version \
+                     AND r.part_number = s.part_number \
+               )",
         )
         .bind(retention.as_secs_f64())
         .execute(&self.pool)
@@ -1441,38 +1473,26 @@ impl Store {
     /// Drops this node's residency rows for `parts` — the counterpart to
     /// [`record_resident`](Self::record_resident), called by the evictor after it unlinks.
     ///
-    /// # Why the reclaim worker deliberately does NOT call this
-    ///
-    /// Not because the parts it removes never had a residency row — that argument is false twice
-    /// over. Residency is not recorded only at the drain's commit: the api records it on
-    /// read-through promotion too (see [`record_resident`](Self::record_resident)), so a part can
-    /// be resident on a node that never drained it, and `reclaim_ssd`'s walk adjudicates such a
-    /// copy against the INGESTING node's row (`part_states` has no node predicate). And a part the
-    /// drain itself made resident can still reach terminal `failed` afterwards:
-    /// [`redrive_diverged_part`](Self::redrive_diverged_part) and
-    /// [`redrive_corrupt_parts`](Self::redrive_corrupt_parts) both return a committed part to
-    /// `pending` while deliberately leaving residency alone, and the retry can then escalate via
-    /// [`defer_part_missing_source`](Self::defer_part_missing_source) or `mark_failed`. Both
-    /// reclaim dispositions — terminal `failed` and deleted-object orphan — therefore unlink parts
-    /// that leave a residency row behind.
-    ///
-    /// What makes the leftover row harmless is the STATUS FILTER, not its absence. The only two
-    /// readers of `cephor_ssd_residency` here — [`ResidentLog::evictable_parts`](crate::ResidentLog::evictable_parts)
-    /// and [`node_cache_bytes`](Self::node_cache_bytes) — INNER JOIN `cephor_replication_status`
-    /// and require `status = 'replicated'`, and every reclaim disposition is by construction the
-    /// opposite: `failed` on both `failed` paths, no replication row at all on the orphan path. So
-    /// the row is invisible to the eviction worklist and to the heartbeat's `cache_bytes`, and it
-    /// stays invisible — `failed` is terminal (every writer back to `pending` is guarded on
-    /// `draining`, `corrupt`, or `replicated`, none of which a `failed` row matches) and nothing
-    /// recreates a replication row for a part the reclaimer just unlinked. The cost is a dead row
-    /// per reclaimed resident part, bounded by the reclaim rate — not disk, and not accounting.
+    /// The failed-reclaim path does not call this: [`mark_failed_reclaimed`] deletes the part's
+    /// residency rows itself, part-keyed across ALL nodes, because a terminal `failed` part's
+    /// rows can never be read again and any survivor would block `gc_terminal_status_rows`'
+    /// residency guard forever. The delete HERE stays node-scoped because the evictor's premise
+    /// is the opposite: the part is live read tier (`replicated`), and a peer's promoted copy of
+    /// it is exactly what must survive this node's eviction. The remaining loose end is the
+    /// deleted-object orphan the walk reclaims — no replication row, so its leftover residency
+    /// row blocks no GC and drifts no signal (both `evictable_parts` and `node_cache_bytes`
+    /// INNER JOIN the replication row). A dead row bounded by the hard-delete rate, not a leak
+    /// of disk or of accounting.
     ///
     /// **Nothing enforces that.** There is no foreign key and no cascade between the two tables;
-    /// the safety is the `status = 'replicated'` predicate, written out twice. Dropping it from
-    /// either query — or adding a third consumer that reads this table by `node_id` alone — turns
-    /// every one of those dead rows into live over-accounting, compounded by the api's
-    /// `ResidencyRecorder`, which ACCUMULATES `bytes` and so would add to a stale row rather than
-    /// replace it. Such a change must also add the `drop_residency` call this doc calls needless.
+    /// what keeps the orphan-path row harmless is the `status = 'replicated'` predicate, written
+    /// out twice. Dropping it from either query — or adding a third consumer that reads this
+    /// table by `node_id` alone — turns those dead rows into live over-accounting, compounded by
+    /// the api's `ResidencyRecorder`, which ACCUMULATES `bytes` and so would add to a stale row
+    /// rather than replace it. Such a change must also add a `drop_residency` call on the orphan
+    /// path this doc calls needless.
+    ///
+    /// [`mark_failed_reclaimed`]: crate::ssd_reclaim::ReclaimLog::mark_failed_reclaimed
     ///
     /// # Errors
     ///
@@ -1533,11 +1553,37 @@ impl ReclaimLog for Store {
         // Batched: a per-part UPDATE would put a round-trip in the reclaim inner loop. Node
         // scoped like every other write here — a peer's row names a file this agent never
         // touched, so marking it would claim work it did not do.
+        //
+        // The residency DELETE rides the same statement because a marked-but-still-resident
+        // failed row is a permanent wedge: `gc_terminal_status_rows`' residency guard is
+        // part-keyed, the mark took the row off the only worklist that would retry, and
+        // `failed` is terminal — nothing would ever clear the block. Atomicity (one statement)
+        // is what rules that state out; a crash before it re-offers the part instead
+        // (`reclaimed_at` still NULL), where the idempotent unlink makes the retry safe.
+        //
+        // The delete spans ALL nodes' rows for the part, on purpose. A read-through promotion
+        // records the PROMOTING node's residency, not the ingest node's that this reclaim runs
+        // on, so a node-scoped delete would leave that row as the same permanent GC block. It
+        // is safe because reclaim only reaches here for parts adjudicated NOT servable: both
+        // residency readers (`evictable_parts`, `node_cache_bytes`) require
+        // `status = 'replicated'`, which a terminal `failed` row never regains, and an
+        // unservable version serves no GET, so promotion cannot write the row back. The
+        // promoted bytes themselves stay the peer walk's `failed`/orphan disposition, as
+        // before. Scoping through `marked` keeps the node fence: a peer's un-marked row keeps
+        // its residency rows.
         sqlx::query(
-            "UPDATE cephor_replication_status SET reclaimed_at = now() \
-             WHERE node_id = $1 \
-               AND (object_id, version, part_number) IN \
-                   (SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]))",
+            "WITH marked AS ( \
+                 UPDATE cephor_replication_status SET reclaimed_at = now() \
+                 WHERE node_id = $1 \
+                   AND (object_id, version, part_number) IN \
+                       (SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[])) \
+                 RETURNING object_id, version, part_number \
+             ) \
+             DELETE FROM cephor_ssd_residency r \
+             USING marked m \
+             WHERE r.object_id = m.object_id \
+               AND r.version = m.version \
+               AND r.part_number = m.part_number",
         )
         .bind(node)
         .bind(&object_ids)
@@ -1919,6 +1965,242 @@ mod part_tests {
             Some(ReplicationState::Pending),
             "a live pending row is never pruned"
         );
+    }
+
+    /// The retention window was sized against the reclaim path, not against a part that outlives
+    /// it on disk. Read-tier retention made the second case real, and this pins the consequence.
+    #[sqlx::test]
+    async fn gc_spares_a_terminal_row_whose_part_is_still_resident(pool: PgPool) {
+        // Deleting the row of a still-resident part makes that part BOTH unevictable and
+        // unaccounted: `evictable_parts` and `node_cache_bytes` each INNER JOIN this table, so
+        // with no row the evictor's worklist can never emit the part — it holds ingest NVMe
+        // forever — and the heartbeat stops counting its bytes.
+        //
+        // Unreachable before retention: the drain unlinked a replicated part's SSD copy within
+        // CEPHOR_REPLICATED_RECLAIM_GRACE_SECS (1h in prod), so no `replicated` row could outlive
+        // its part. Retention holds parts on a free-space policy, which on an uncontended node is
+        // indefinite — well past the 7-day default this GC runs at.
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let resident = part(UUID_A, 6, 1); // aged + enqueued, but STILL ON DISK -> must survive
+        let evicted = part(UUID_A, 6, 2); // aged + enqueued, no residency row -> pruned as before
+
+        for p in [&resident, &evicted] {
+            store.record_landed_part(p).await.unwrap();
+            force_terminal(&pool, p, "replicated").await; // backdated 2h
+            store.mark_upload_enqueued(p).await.unwrap();
+        }
+        // Only the first is claimed on this node's SSD. The second stands in for a part the
+        // evictor already reclaimed, which is the case the GC exists to clean up after.
+        store.record_resident(&resident, 4096).await.unwrap();
+
+        let pruned = store.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap();
+
+        assert_eq!(pruned, 1, "only the part that is no longer on disk may be pruned");
+        assert!(
+            store.status(&resident).await.unwrap().is_some(),
+            "a resident part's row was pruned — the evictor can no longer see the part at all"
+        );
+        assert!(
+            store.status(&evicted).await.unwrap().is_none(),
+            "a non-resident terminal row still prunes"
+        );
+    }
+
+    /// Residency is per NODE; this GC is fleet-wide. A part resident on ANY node must survive.
+    #[sqlx::test]
+    async fn gc_spares_a_row_whose_part_is_resident_on_a_different_node(pool: PgPool) {
+        // The guard is deliberately not node-scoped. `record_resident` writes the promoting node,
+        // which for a read-through promotion is NOT the ingesting node in the replication row —
+        // so a node-scoped guard would prune the row out from under the very node holding the
+        // copy, which is the leak this fix exists to prevent.
+        let ingesting = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let promoting = Store::from_pool(pool.clone()).with_node_id("node-b");
+        let promoted = part(UUID_A, 7, 1);
+
+        ingesting.record_landed_part(&promoted).await.unwrap();
+        force_terminal(&pool, &promoted, "replicated").await;
+        ingesting.mark_upload_enqueued(&promoted).await.unwrap();
+        promoting.record_resident(&promoted, 4096).await.unwrap();
+
+        let pruned = ingesting.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap();
+
+        assert_eq!(pruned, 0);
+        assert!(
+            ingesting.status(&promoted).await.unwrap().is_some(),
+            "a promoted copy on another node was orphaned"
+        );
+    }
+
+    /// The `failed` branch of the residency guard is release-based: the reclaim's mark deletes
+    /// every node's residency rows for the part, so the guard holds only while the bytes do.
+    /// Without that release a redrive-then-fail part would wedge its row behind the guard
+    /// forever, regrowing the unbounded failed-row backlog migration 0018 cleaned up.
+    #[sqlx::test]
+    async fn a_reclaimed_failed_part_releases_its_residency_and_then_gcs(pool: PgPool) {
+        let ingesting = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let promoting = Store::from_pool(pool.clone()).with_node_id("node-b");
+        let p = part(UUID_A, 8, 1);
+
+        // Drain commit: pending -> draining -> replicated, resident on the ingest node — plus a
+        // read-through promoted copy on node-b, the row a node-scoped release would strand.
+        ingesting.record_landed_part(&p).await.unwrap();
+        let claim = ingesting.claim_part().await.unwrap().expect("the landed part is claimable");
+        ingesting.record_resident(&p, 4096).await.unwrap();
+        ingesting
+            .mark_replicated(&claim, &PartVerified::for_test(), &test_digest())
+            .await
+            .unwrap();
+        promoting.record_resident(&p, 4096).await.unwrap();
+
+        // R4 flags the pool copy corrupt; the redrive returns the part to `pending` leaving
+        // residency untouched (the SSD copy really is still there), and the retry terminally
+        // fails — the exact lifecycle that used to strand residency against a `failed` row.
+        sqlx::query("UPDATE cephor_replication_status SET status = 'corrupt' WHERE object_id = $1")
+            .bind(p.object().as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ingesting.redrive_corrupt_parts(3).await.unwrap(), 1);
+        let retry = ingesting.claim_part().await.unwrap().expect("the re-driven part is claimable");
+        ingesting.mark_failed(&retry, "retry exhausted").await.unwrap();
+        force_terminal(&pool, &p, "failed").await; // backdated 2h: past grace AND retention
+
+        assert_eq!(
+            ingesting.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap(),
+            0,
+            "while the residency rows stand, the aged failed row is spared"
+        );
+
+        // The reclaim: the worklist offers the part (reclaim_failed unlinks it) and the mark
+        // stamps the cursor + releases residency in one statement.
+        let candidates = ingesting.reclaimable_failed_parts_impl(Duration::from_mins(1), 10).await.unwrap();
+        assert_eq!(candidates, vec![p.clone()], "the aged failed part is offered for reclaim");
+        <Store as ReclaimLog>::mark_failed_reclaimed(&ingesting, &candidates).await.unwrap();
+
+        let (residency,): (i64,) = sqlx::query_as("SELECT count(*) FROM cephor_ssd_residency")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(residency, 0, "the mark released BOTH nodes' residency rows");
+
+        assert_eq!(
+            ingesting.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap(),
+            1,
+            "the reclaimed failed row now prunes after retention"
+        );
+        assert_eq!(ingesting.status(&p).await.unwrap(), None, "the failed row is gone");
+    }
+
+    /// The resurrection loop, pinned end to end across the GC and the reconciler.
+    #[sqlx::test]
+    async fn a_retained_replicated_part_whose_row_was_gcd_is_not_resurrected(pool: PgPool) {
+        // Retention keeps a `replicated` part on SSD as the read tier far past this GC's 7-day
+        // default, and the reconciler — the sole drain trigger — re-records any scanned part the
+        // store has no row for. So without the residency guard the two compose into a loop: the
+        // GC prunes the row, the next scan reads `None`, `record_landed` returns the part to
+        // `pending`, and because partdrain's idempotent fast path is `status == Replicated` it
+        // misses — the part is re-copied to the pool AND the commit LPUSHes a second
+        // UploadChainRequest, re-publishing a part uploaded a week earlier. The row's absence is
+        // read as "never drained", so on a node holding ~930 GB every retained part re-drains on
+        // a rolling 7-day cycle. The guard is what keeps "no row" meaning what the reconciler
+        // assumes it means.
+        use crate::reconcile::{DiscoveredPart, PartScan, reconcile_parts};
+        use core::future::Future;
+
+        // Stands in for the SSD walk. It yields the part on every pass, which is the point:
+        // under retention a scanned part is no longer evidence that a drain is outstanding.
+        struct OnePart(DiscoveredPart);
+        impl PartScan for OnePart {
+            fn scan_parts(&self) -> impl Future<Output = std::io::Result<Vec<DiscoveredPart>>> + Send {
+                let parts = vec![self.0.clone()];
+                async move { Ok(parts) }
+            }
+        }
+
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let retained = part(UUID_A, 9, 1);
+
+        // A fully completed drain: committed to the pool, backend upload published, and STILL
+        // resident — retention, not the 1h reclaim grace, now owns when the SSD copy goes away.
+        store.record_landed_part(&retained).await.unwrap();
+        let claim = store.claim_part().await.unwrap().expect("the landed part is claimable");
+        store.record_resident(&retained, 4096).await.unwrap();
+        store.mark_replicated(&claim, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        force_terminal(&pool, &retained, "replicated").await; // backdated 2h: aged past retention
+        store.mark_upload_enqueued(&retained).await.unwrap(); // leaves updated_at aged
+
+        assert_eq!(
+            store.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap(),
+            0,
+            "the aged row of a still-resident part was pruned, arming the resurrection",
+        );
+
+        let report = reconcile_parts(
+            &OnePart(DiscoveredPart {
+                part: retained.clone(),
+                age: Duration::ZERO,
+            }),
+            &store,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.recovered, 0, "the reconciler re-recorded a part that was already drained");
+        assert_eq!(
+            report.replicated_orphan, 1,
+            "the retained part was not recognised as drained-but-resident",
+        );
+        assert_eq!(
+            store.status(&retained).await.unwrap(),
+            Some(ReplicationState::Replicated),
+            "the part was returned to pending — it will be re-copied and its upload re-published",
+        );
+        assert!(
+            store.claim_part().await.unwrap().is_none(),
+            "the drained part is claimable again, so a duplicate UploadChainRequest is inevitable",
+        );
+    }
+
+    /// `corrupt` is the one terminal-looking status whose SSD copy is the LAST GOOD SOURCE.
+    #[sqlx::test]
+    async fn a_corrupt_row_is_never_gcd(pool: PgPool) {
+        // R4 holds a part `corrupt` when a LIVE object's pool copy fails verification, so the
+        // bytes on SSD are the only intact source and the row is the record that they exist and
+        // that a bounded re-drive still owes work on them. Deleting it loses both: the re-drive
+        // worker's worklist is `status = 'corrupt'`, and the reconciler would then re-record the
+        // part `pending` from SSD, bypassing the attempt cap it was held at.
+        //
+        // The residency guard cannot be what protects this arm — the reclaimer's refusal to
+        // unlink is a filesystem decision, and a corrupt part need carry no residency row at all
+        // (nothing writes one outside drain commit and read-through promotion). So the status
+        // list must exclude `corrupt` on its own, which is what this pins.
+        let store = Store::from_pool(pool.clone());
+        let held = part(UUID_A, 9, 1);
+        let control = part(UUID_A, 9, 2);
+        seed_status_node(&pool, UUID_A, 9, 1, "corrupt", "node-a").await;
+        seed_status_node(&pool, UUID_A, 9, 2, "failed", "node-a").await;
+        force_terminal(&pool, &held, "corrupt").await; // backdated 2h; re-asserts the same status
+        force_terminal(&pool, &control, "failed").await;
+
+        let (residency,): (i64,) = sqlx::query_as("SELECT count(*) FROM cephor_ssd_residency")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(residency, 0, "no residency: the corrupt row must be spared by the STATUS list alone");
+
+        // The aged `failed` control is what makes the survival assertion mean something: a GC
+        // that matched nothing at all — a broken age gate, say — would otherwise pass vacuously.
+        assert_eq!(
+            store.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap(),
+            1,
+            "the sweep did not reap the aged failed control, so it proves nothing about corrupt",
+        );
+        assert_eq!(
+            store.status(&held).await.unwrap(),
+            Some(ReplicationState::Corrupt),
+            "an aged corrupt row was GC'd — the re-drive lost the record of the only intact copy",
+        );
+        assert_eq!(store.status(&control).await.unwrap(), None, "the aged failed control was reaped");
     }
 
     async fn force_terminal(pool: &PgPool, part: &PartKey, status: &str) {
@@ -3811,8 +4093,15 @@ mod failed_worklist_tests {
     async fn marking_is_node_scoped(pool: PgPool) {
         // A peer's row names a file this agent never touched, so marking it would claim work it
         // did not do — and take the part off the worklist of the node that actually holds it.
+        // The residency release rides the mark, so it must observe the same fence: an un-marked
+        // peer row keeps its residency claims for the peer's own reclaim to release.
         let store = Store::from_pool(pool.clone()).with_node_id("node-a");
         seed(&pool, 1, "failed", "node-b", 7200.0).await;
+        sqlx::query("INSERT INTO cephor_ssd_residency (node_id, object_id, version, part_number, bytes) VALUES ('node-b', $1, 1, 1, 100)")
+            .bind(UUID_A)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         <Store as ReclaimLog>::mark_failed_reclaimed(&store, &[part(1)]).await.unwrap();
 
@@ -3821,6 +4110,11 @@ mod failed_worklist_tests {
             .await
             .unwrap();
         assert_eq!(marked, 0, "another node's row was marked");
+        let (resident,): (i64,) = sqlx::query_as("SELECT count(*) FROM cephor_ssd_residency")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(resident, 1, "an un-marked peer row lost its residency claim");
     }
     #[sqlx::test]
     async fn an_agent_with_no_node_id_reclaims_nothing(pool: PgPool) {
