@@ -22,6 +22,10 @@ from .config import Config
 _PSQL_FIELD_SEP = "\x1f"
 
 
+# The drain agent's CEPHOR_SSD_ROOT — the node-local ingest SSD the read tier lives on.
+_SSD_PATH = "/var/lib/hippius/local_object_cache"
+
+
 class ClusterProbe:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -77,6 +81,61 @@ class ClusterProbe:
         if proc.returncode != 0:
             return []
         return proc.stdout.split()
+
+    def drain_agents(self) -> list[tuple[str, str]]:
+        """(pod, node) for every drain-agent — the pods that own the ingest SSD."""
+        cmd = [
+            "kubectl", "-n", self.cfg.namespace, "get", "pods", "-l", "app=drain-agent",
+            "--field-selector=status.phase=Running",
+            "-o", 'jsonpath={range .items[*]}{.metadata.name}:{.spec.nodeName}{"\\n"}{end}',
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return []
+        if proc.returncode != 0:
+            return []
+        out = []
+        for line in proc.stdout.splitlines():
+            if ":" in line:
+                pod, _, node = line.partition(":")
+                out.append((pod.strip(), node.strip()))
+        return out
+
+    def ssd_usage(self) -> list[dict]:
+        """Per-node ingest-SSD occupancy: the whole filesystem AND the read tier's share of it.
+
+        Both numbers, because on a shared filesystem they answer different questions and only the
+        pair is interpretable. `df` is what the evictor and `fs_cache_pressure` actually gate on;
+        `du` is how much of that this system owns and could therefore ever reclaim. A large gap
+        means free-space thresholds here are being driven by somebody else's bytes — which is the
+        state staging is in today (~1 GB of cache on a filesystem 623 GB full), and the reason a
+        fill test has to be read against `du`, not `df`.
+        """
+        rows = []
+        for pod, node in self.drain_agents():
+            entry = {"node": node, "pod": pod}
+            df = self._agent_exec(pod, ["df", "-PB1", _SSD_PATH])
+            if df:
+                parts = df.strip().splitlines()[-1].split()
+                if len(parts) >= 4:
+                    entry["total_bytes"] = int(parts[1])
+                    entry["used_bytes"] = int(parts[2])
+                    entry["free_bytes"] = int(parts[3])
+                    entry["free_ratio"] = int(parts[3]) / int(parts[1]) if int(parts[1]) else 0.0
+            du = self._agent_exec(pod, ["du", "-sb", _SSD_PATH])
+            if du:
+                entry["cache_bytes"] = int(du.split()[0])
+            rows.append(entry)
+        return rows
+
+    def _agent_exec(self, pod: str, argv: list[str]) -> str | None:
+        cmd = ["kubectl", "-n", self.cfg.namespace, "exec", pod, "-c", "agent", "--", *argv]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return None
+        return proc.stdout if proc.returncode == 0 else None
 
     def evict_ssd_parts(self, object_ids: list[str]) -> tuple[int, int, int]:
         """Delete each object's part tree from the WRITABLE SSD primary cache on every api pod.
