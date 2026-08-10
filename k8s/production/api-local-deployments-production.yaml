@@ -114,6 +114,17 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            # The landed-announcement fast path this PR's 600s poll demotes itself to a BACKSTOP
+            # for. `initialize_landed_publisher` returns None without a node identity, because an
+            # announcement on the wrong node's queue would be claimed by an agent that does not
+            # hold the bytes — so with NODE_NAME unset the api publishes nothing at all and the
+            # reconcile walk becomes 100% of discovery. Demoting the poll without this would put
+            # up to 600s between a part landing and anything knowing, i.e. single-copy exposure
+            # and cross-node read-after-write 503s for that whole window. Staging already sets it.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: K8S_NAMESPACE
               valueFrom:
                 fieldRef:
