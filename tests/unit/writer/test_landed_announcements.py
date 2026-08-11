@@ -26,6 +26,26 @@ from hippius_s3.writer.write_through_writer import WriteThroughPartsWriter
 OBJ = "466916c0-d61b-4518-b81b-9576b574270a"
 
 
+class _HangingPipe:
+    def lpush(self, *_a: object) -> None:
+        return None
+
+    def ltrim(self, *_a: object) -> None:
+        return None
+
+    async def execute(self) -> None:
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(300)
+
+
+class _HangingRedis:
+    """A queues client that accepts the pipeline and then never answers."""
+
+    def pipeline(self) -> _HangingPipe:
+        return _HangingPipe()
+
+
 class FakePipeline:
     def __init__(self, sink: list[tuple], fail: bool) -> None:
         self._sink = sink
@@ -412,7 +432,7 @@ async def test_a_failed_publish_stamps_no_recency() -> None:
 
 @pytest.mark.asyncio
 async def test_a_hanging_redis_does_not_hang_the_put() -> None:
-    """The swallow below catches a redis-queues that ERRORS. It does nothing for a slow one.
+    """The swallow catches a redis-queues that ERRORS. It does nothing for a slow one.
 
     This await is on the client PUT path and the api's queues client is built with no
     socket_timeout, so without a bound a slow redis-queues stalls every PUT — the shape of a real
@@ -420,46 +440,54 @@ async def test_a_hanging_redis_does_not_hang_the_put() -> None:
     """
     import asyncio as _asyncio
 
-    class HangingPipe:
-        def lpush(self, *_a: object) -> None:
-            return None
-
-        def ltrim(self, *_a: object) -> None:
-            return None
-
-        async def execute(self) -> None:
-            await _asyncio.sleep(30)
-
-    class HangingRedis:
-        def pipeline(self) -> HangingPipe:
-            return HangingPipe()
-
-    publisher = landed.LandedPartPublisher(HangingRedis(), "node-a")
+    publisher = landed.LandedPartPublisher(_HangingRedis(), "node-a")
 
     started = _asyncio.get_running_loop().time()
-    await _asyncio.wait_for(publisher.publish(OBJ, 1, 1), timeout=5)
+    await _asyncio.wait_for(publisher.publish(OBJ, 1, 1), timeout=landed._PUBLISH_TIMEOUT_SECONDS + 5)
     elapsed = _asyncio.get_running_loop().time() - started
 
-    assert elapsed < 3, f"publish waited {elapsed:.1f}s on a hanging redis; it must give up quickly"
+    assert elapsed < landed._PUBLISH_TIMEOUT_SECONDS + 2, (
+        f"publish waited {elapsed:.1f}s on a hanging redis; it must give up at its own bound"
+    )
 
 
 @pytest.mark.asyncio
-async def test_a_timed_out_announcement_still_never_reaches_the_caller() -> None:
-    """Timing out is the same contract as erroring: the bytes are durable, the walk still finds it."""
+async def test_a_timed_out_announcement_never_reaches_the_caller_and_is_bounded() -> None:
+    """Timing out is the same contract as erroring — but it must also actually STOP.
+
+    The elapsed assertion is the point: without it this test passes against an unbounded await,
+    just slowly, so it would pin nothing.
+    """
     import asyncio as _asyncio
 
-    class HangingPipe:
-        def lpush(self, *_a: object) -> None:
-            return None
+    started = _asyncio.get_running_loop().time()
+    await landed.LandedPartPublisher(_HangingRedis(), "node-a").publish(OBJ, 1, 1)
+    elapsed = _asyncio.get_running_loop().time() - started
 
-        def ltrim(self, *_a: object) -> None:
-            return None
+    assert elapsed < landed._PUBLISH_TIMEOUT_SECONDS + 2
 
-        async def execute(self) -> None:
-            await _asyncio.sleep(30)
 
-    class HangingRedis:
-        def pipeline(self) -> HangingPipe:
-            return HangingPipe()
+@pytest.mark.asyncio
+async def test_a_dropped_announcement_is_counted_not_just_logged(monkeypatch) -> None:
+    """A drop has to be alertable.
 
-    await landed.LandedPartPublisher(HangingRedis(), "node-a").publish(OBJ, 1, 1)
+    The announcement is the only trigger for the B-2 divergence check — the reconciler tallies an
+    already-`replicated` part as an orphan and does not content-check it — so losing one for a
+    RE-uploaded part leaves the pool serving the previous attempt's bytes under the new ETag.
+    The agent's `drain_landed_dropped_total` counts only messages it could not PARSE, so it
+    cannot see one that never arrived. If this is only a log line, nothing can page on it.
+    """
+    recorded: list[str] = []
+    monkeypatch.setattr(landed, "_record_announce_failure", lambda outcome: recorded.append(outcome))
+
+    await landed.LandedPartPublisher(_HangingRedis(), "node-a").publish(OBJ, 1, 1)
+    assert recorded == ["timeout"]
+
+    recorded.clear()
+
+    class _BrokenRedis:
+        def pipeline(self) -> object:
+            raise ConnectionError("redis-queues is down")
+
+    await landed.LandedPartPublisher(_BrokenRedis(), "node-a").publish(OBJ, 1, 1)
+    assert recorded == ["error"], "an outright failure must be distinguishable from a timeout"

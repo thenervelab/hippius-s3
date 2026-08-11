@@ -26,8 +26,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Optional
+
+
+if TYPE_CHECKING:
+    from hippius_s3.monitoring import LandedAnnounceOutcome
 
 
 logger = logging.getLogger(__name__)
@@ -36,10 +41,19 @@ logger = logging.getLogger(__name__)
 # Must match `landed_queue_key` in crates/hippius-drain-agent/src/landed.rs.
 _LANDED_QUEUE_PREFIX = "cephor:landed:"
 
-# Bounds the one await this puts on the client PUT path. Generous next to a healthy LPUSH
-# (sub-millisecond) and short next to a client timeout: the announcement is an optimisation
-# over the reconcile walk, so waiting on it is never worth a slow PUT.
-_PUBLISH_TIMEOUT_SECONDS = 1.0
+# Bounds the one await this puts on the client PUT path.
+#
+# Sized to cover a TCP CONNECT plus a round trip, not just a round trip. redis-py drops the
+# pooled connection when a command is cancelled, so the publish after a timeout has to reconnect
+# inside this same budget — at 1s that was self-reinforcing, and because redis latency is a
+# shared property every api pod crossed the threshold at the same moment, losing 100% of
+# announcements fleet-wide rather than a sampled fraction. 5s keeps the bound (an unbounded await
+# on a client with no socket_timeout was the actual defect) while putting it far outside the
+# range a merely-loaded queue reaches.
+#
+# A timeout is NOT free, which is why it is counted rather than only logged: see
+# `landed_announce_failures_total` and the note on the counter in monitoring.py.
+_PUBLISH_TIMEOUT_SECONDS = 5.0
 
 # Cap on a node's queue. The agent normally drains this within a poll, so depth is near zero;
 # the bound only matters when the agent is down. Past it the OLDEST announcements are dropped,
@@ -50,6 +64,18 @@ _DEFAULT_MAX_QUEUE_DEPTH = 200_000
 
 def landed_queue_key(node_name: str) -> str:
     return f"{_LANDED_QUEUE_PREFIX}{node_name}"
+
+
+def _record_announce_failure(outcome: "LandedAnnounceOutcome") -> None:
+    """Best-effort counter bump; metrics must never be the reason a PUT fails."""
+    try:
+        from hippius_s3.monitoring import get_metrics_collector
+
+        collector = get_metrics_collector()
+        if collector is not None:
+            collector.record_landed_announce_failure(outcome)
+    except Exception:  # noqa: BLE001 - a metrics fault must not surface on the write path
+        logger.debug("recording a landed-announce failure failed", exc_info=True)
 
 
 class LandedPartPublisher:
@@ -89,8 +115,26 @@ class LandedPartPublisher:
             # reason; the write path is the one that needed it more. On timeout the part is
             # already durable and the agent's reconcile walk still finds it.
             await asyncio.wait_for(pipe.execute(), timeout=_PUBLISH_TIMEOUT_SECONDS)
+        except TimeoutError:
+            # WARNING and counted, not DEBUG. The module docstring's "a dropped announcement costs
+            # latency and nothing else" is true only for DISCOVERY of a new part — the reconciler
+            # does find that on disk. It is false for a RE-uploaded one: the reconciler tallies an
+            # already-`replicated` part as an orphan and deliberately does not content-check it, so
+            # the announcement is the only thing that triggers the divergence check. Losing one for
+            # a rewritten part leaves the pool serving the previous attempt's ciphertext under the
+            # new ETag, decrypting cleanly, with nothing else to notice.
+            _record_announce_failure("timeout")
+            logger.warning(
+                "announcing landed part %s v%s part %s timed out after %ss; a rewrite of an already-"
+                "replicated part would not be re-driven",
+                object_id,
+                object_version,
+                part_number,
+                _PUBLISH_TIMEOUT_SECONDS,
+            )
         except Exception as exc:  # noqa: BLE001 - the part is already durable; the backstop covers this
-            logger.debug(
+            _record_announce_failure("error")
+            logger.warning(
                 "announcing landed part %s v%s part %s failed: %s", object_id, object_version, part_number, exc
             )
 

@@ -96,12 +96,20 @@ spec:
               # needs 0016's cephor_ssd_residency. Started against a pre-migration schema the
               # agent cannot commit or record ANY part while the api keeps accepting PUTs onto
               # the same SSD, and it does not self-heal until the allocator's migration lands.
+              # table_schema is load-bearing, and count(DISTINCT ...) with it. Without both,
+              # information_schema.columns spans EVERY schema the role can see, so the check
+              # answers the wrong question twice over: a same-named table in another schema
+              # (an archive, a restore staging area) can supply the missing columns and pass the
+              # gate against an un-migrated `public` — the exact outage it exists to prevent —
+              # and a duplicate of a CORRECTLY migrated table makes the count 6, so `= 3` is
+              # false and the initContainer spins forever on a healthy database.
               until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "
                 SELECT to_regclass('public.cephor_ssd_residency') IS NOT NULL
                    AND EXISTS (SELECT 1 FROM information_schema.columns
-                               WHERE table_name = 'cephor_replication_status'
+                               WHERE table_schema = 'public'
+                                 AND table_name = 'cephor_replication_status'
                                  AND column_name IN ('content_sha256', 'relanded_at', 'reclaimed_at')
-                               HAVING count(*) = 3)")" = "t" ]; do
+                               HAVING count(DISTINCT column_name) = 3)")" = "t" ]; do
                 echo "waiting for the cephor schema (allocator migrations 0016-0019)"; sleep 3
               done
           env:
@@ -165,11 +173,25 @@ spec:
             # and reads, i.e. twice the frequency of the reconcile walk this release just demoted
             # 40x for being too expensive. `ssd_reclaim.rs` already reasons about an hourly walk.
             #
-            # Nothing is delayed by the change: every disposition this worker owns is grace-gated
-            # at >= 1h (CEPHOR_RECLAIM_GRACE_SECS below), so no part becomes actionable faster
-            # than hourly and a 300s poll can only re-ask the same question twelve times.
+            # Every disposition this worker owns is grace-gated at >= 1h
+            # (CEPHOR_RECLAIM_GRACE_SECS below), so no part becomes actionable faster than hourly
+            # and a 300s poll could only re-ask the same question twelve times.
+            #
+            # That was NOT true while the R4 corrupt re-drive shared this loop. A `corrupt` part
+            # is a live object whose pool copy is bad and whose SSD copy is the last good source,
+            # and it has no grace — so for that one call the poll interval was the single-copy
+            # exposure window, and raising this to 3600 would have widened it 12x. The re-drive
+            # now runs on its own worker and its own CEPHOR_REDRIVE_POLL_SECS below; the two must
+            # stay separate, and this value must not be assumed to bound anything R4.
             - name: CEPHOR_RECLAIM_POLL_SECS
               value: "3600"
+            # Pinned at the historical 5 minutes, and pinned EXPLICITLY rather than left to the
+            # code default so that this window is visible next to the walk interval it used to be
+            # accidentally coupled to. `drain-corrupt-live-parts` (severity critical, for: 15m) is
+            # calibrated against this cadence — 15m is three cycles here, which is what lets a
+            # transient corruption clear itself before paging. Raising it breaks that calibration.
+            - name: CEPHOR_REDRIVE_POLL_SECS
+              value: "300"
             - name: CEPHOR_RECLAIM_GRACE_SECS
               value: "3600"
             # ROLLBACK-LOAD-BEARING — do not delete as manifest hygiene.

@@ -36,6 +36,7 @@ from hippius_s3.cache import dual_fs_store
 from hippius_s3.cache import peers
 from hippius_s3.cache import read_recency
 from hippius_s3.cache import residency
+from hippius_s3.writer import landed
 from hippius_s3.monitoring import MetricsCollector
 from hippius_s3.reader import streamer
 
@@ -105,6 +106,13 @@ WRAPPERS: list[tuple[str, Callable[..., None], tuple[Any, ...], str, dict[str, s
         (),
         "residency_release_failures_total",
         {},
+    ),
+    (
+        "hippius_s3/writer/landed.py::_record_announce_failure",
+        landed._record_announce_failure,
+        ("timeout",),
+        "landed_announce_failures_total",
+        {"outcome": "timeout"},
     ),
     (
         "hippius_s3/cache/peers.py::_record_shed",

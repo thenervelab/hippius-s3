@@ -62,6 +62,10 @@ PromoteFloorDivergence = Literal["stricter", "looser"]
 # erroring on every read is indistinguishable from one that is being fully absorbed by the
 # sampler, and both look like silence.
 ReadRecencyOutcome = Literal["written", "failed"]
+# Why an announcement did not reach redis-queues. `timeout` is deliberately its own value:
+# it is the outcome a slow (rather than broken) queue produces, and the one the bound on
+# the publish introduces, so it has to be distinguishable from an outright error.
+LandedAnnounceOutcome = Literal["timeout", "error"]
 
 # Where the bytes that failed a chunk's AEAD check were found, and what came of it. Closed by
 # construction. `local` means a copy on this node's flash was removed and the read retried from
@@ -189,6 +193,20 @@ class MetricsCollector:
         self.residency_release_failures = self.meter.create_counter(
             name="residency_release_failures_total",
             description="Residency claims left in place because the compensating decrement failed",
+            unit="1",
+        )
+
+        # A landed-part announcement the api could not hand to redis-queues. This MUST be
+        # alertable rather than a log line, because the announcement is the only trigger for the
+        # B-2 divergence check: the reconciler tallies an already-`replicated` part as an orphan
+        # and deliberately does not content-check it, so a lost announcement for a RE-uploaded
+        # part means the pool keeps the previous attempt's ciphertext and serves it under the new
+        # ETag, decrypting cleanly, permanently. `drain_landed_dropped_total` on the agent counts
+        # only messages it could not PARSE, so it cannot see a message that never arrived.
+        # `outcome` is a Literal, so cardinality is bounded.
+        self.landed_announce_failures = self.meter.create_counter(
+            name="landed_announce_failures_total",
+            description="Landed-part announcements the api failed to enqueue, by outcome",
             unit="1",
         )
 
@@ -626,6 +644,10 @@ class MetricsCollector:
         """Count a claim whose compensating decrement failed, leaving phantom bytes accounted."""
         self.residency_release_failures.add(1)
 
+    def record_landed_announce_failure(self, outcome: LandedAnnounceOutcome) -> None:
+        """Count one announcement that did not reach the queue. `outcome` is a Literal."""
+        self.landed_announce_failures.add(1, attributes={"outcome": outcome})
+
     def record_read_recency_write(self, outcome: ReadRecencyOutcome) -> None:
         """Count one `last_read_at` stamp attempt. `outcome` is a Literal, so bounded."""
         self.read_recency_writes.add(1, attributes={"outcome": outcome})
@@ -912,6 +934,9 @@ class NullMetricsCollector:
         pass
 
     def record_residency_release_failure(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_landed_announce_failure(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_read_recency_write(self, *args: object, **kwargs: object) -> None:
