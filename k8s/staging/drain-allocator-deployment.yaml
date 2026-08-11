@@ -100,6 +100,37 @@ spec:
             #
             # If staging gains or loses an ingest node, rescale these. The invariant to hold is
             # MB/s per stream, not the fleet total.
+            # TEMPORARY — TEST INSTRUMENT, REVERT AFTER OBSERVING. See the revert PR.
+            #
+            # Arms the SSD evictor at the CURRENT occupancy so its code path executes at all.
+            # It never has: drain_ssd_evicted_total is 0 on both nodes since deploy, which means
+            # drain_ssd_evict_blocked_unreplicated_total = 0 is an UNMEASURED counter on dead
+            # code, not a passing durability invariant. This makes it a measured one.
+            #
+            # WHY THIS KNOB AND NOT THE DAEMONSET. CEPHOR_EVICT_RESERVE_PERMILLE on drain-agent is
+            # only a FALLBACK: resolved_reserve_permille() prefers the allocator's published
+            # value, and cephor:alloc:{node} currently carries "reserve":"150". Editing the
+            # DaemonSet is a no-op. reserve_permille() interpolates base -> max on severity, and
+            # severity is 0 today (no shortfall, ceph healthy), so the base is published verbatim.
+            #
+            # 220, not 300. Both nodes sit at 208.6 and 210.6 permille free, so 220 arms both;
+            # 300 changes nothing about the outcome and pushes the promote floor further past
+            # reality. This is the smallest value that does the job.
+            #
+            # EXPECT `starved`, AND THAT IS THE CORRECT RESULT. A pass frees back to
+            # reserve + headroom, and headroom alone is 50 permille of a 941.7 GB disk = 47.1 GB,
+            # against the ~1.2 GB/node the drain actually owns (the rest of the disk is
+            # co-tenants — drain_ssd_shared_filesystem = 1 on both nodes). No reserve value makes
+            # deficit-met reachable; that needs the fill test, not a threshold.
+            #
+            # ACCEPTED SIDE EFFECTS, for the minutes this is live:
+            #   - the local read tier is fully evicted (~2.4 GB). Recoverable: those parts are
+            #     `replicated`, so reads fall to the pool and promotion repopulates them.
+            #   - the `starved` ERROR and its alert fire. This is us, not an incident.
+            #   - read-through promotion stops cluster-wide, because the published
+            #     promote_floor = reserve + headroom/2 = 245 permille lands above actual free space.
+            - name: CEPHOR_ALLOC_BASE_RESERVE_PERMILLE
+              value: "220"
             - name: CEPHOR_ALLOC_MIN_TOTAL_BPS
               value: "100000000"   # 100 MB/s floor = 50 MB/s/node = 3.1 MB/s/stream, as prod
             - name: CEPHOR_ALLOC_TARGET_P99_MS
