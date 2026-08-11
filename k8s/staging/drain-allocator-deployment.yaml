@@ -84,10 +84,39 @@ spec:
             # above the stability threshold and the p99 target above the real per-part copy
             # time lets the AIMD ramp back up (validated live: budget 0.5 -> 100 MB/s, drain
             # resumed). See drainer-optimisations.md.
+            # Mirrors the prod retune (#399) so the soak actually exercises it. Prod-only tuning
+            # meant these four values would have reached production having never run anywhere —
+            # and #399 exists because the fleet fell into a self-sustaining low-throughput state
+            # in prod, which is not a thing you want to first observe there.
+            #
+            # SCALED BY NODE COUNT, NOT COPIED. The threshold #399 is written against is
+            # per-STREAM: its comment reasons "250 MB/s -> 50 MB/s/node -> 3.1 MB/s/stream", i.e.
+            # prod's 5 ingest nodes at CEPHOR_DRAIN_CONCURRENCY=16. Staging has 2 ingest nodes at
+            # the same concurrency, so copying 250 verbatim would give 125 MB/s/node and
+            # 7.8 MB/s/stream — a different operating point, and one that pushes staging's smaller
+            # pool 2.5x harder than prod pushes its own. Halving the fleet floor to 100 restores
+            # 50 MB/s/node and 3.1 MB/s/stream exactly, which is the number the collapse argument
+            # is about. Same for the additive step: 20 MB/s over 2 nodes is prod's 10 MB/s/node.
+            #
+            # If staging gains or loses an ingest node, rescale these. The invariant to hold is
+            # MB/s per stream, not the fleet total.
             - name: CEPHOR_ALLOC_MIN_TOTAL_BPS
-              value: "50000000"    # 50 MB/s floor (was 1 MB/s) — above the collapse threshold
+              value: "100000000"   # 100 MB/s floor = 50 MB/s/node = 3.1 MB/s/stream, as prod
             - name: CEPHOR_ALLOC_TARGET_P99_MS
               value: "8000"        # 8s (was 2s) — headroom over per-part copy under load
+            # Start at the top rather than the floor, so a restart does not re-enter the latched
+            # low state it is being restarted to clear. 2x the floor, the same ratio as prod.
+            # Bounded by CEPHOR_ALLOC_MAX_TOTAL_BPS (unset -> 1 GB/s default): the allocator
+            # rejects an initial above the max at startup, so this must stay under it.
+            - name: CEPHOR_ALLOC_INITIAL_TOTAL_BPS
+              value: "200000000"   # 200 MB/s
+            # Dimensionless, so copied verbatim: a gentler multiplicative decrease (x0.95 per
+            # backing-off tick instead of the x0.8 default) keeps one latency spike from
+            # collapsing the budget several ticks deep.
+            - name: CEPHOR_ALLOC_DECREASE_PERMILLE
+              value: "950"
+            - name: CEPHOR_ALLOC_ADDITIVE_INCREASE_BPS
+              value: "20000000"    # 20 MB/s/tick fleet-wide = 10 MB/s/node, as prod
             # Live ceph-mgr ceiling probe — ENABLED. The allocator reads the real Ceph
             # pool capacity ceiling from the rook-ceph mgr Prometheus endpoint instead of
             # its static fallback ceiling. Cross-namespace reach to rook-ceph confirmed.
