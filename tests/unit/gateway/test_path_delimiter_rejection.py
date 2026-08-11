@@ -116,3 +116,38 @@ async def test_a_real_query_string_is_still_fine() -> None:
 
     assert status == 200
     assert reached == ["/bucket"]
+
+
+def test_the_key_level_guard_still_lists_both_delimiters() -> None:
+    """Defence in depth, and pinned directly because nothing else pins it any more.
+
+    The path-level check above preempts `OBJECT_KEY_AVOID_CHARS` for every request, so removing
+    `#` and `?` from that list changes no observable behaviour and the whole suite stays green —
+    verified. Before this change the sole thing holding `#` in the list was one assertion in
+    test_input_validation_internal.py, which moved to the path check when its error code changed.
+
+    The list is still the guard if the path check is ever narrowed, reordered behind the
+    SKIP_PREFIXES bypass, or fed a `decoded_path` that has already been truncated (its
+    `raw_path`-missing fallback returns `request.url.path`, which truncates). Asserting the
+    constant is the only way to pin a layer that a stricter layer in front of it makes invisible.
+    """
+    from gateway.middlewares.input_validation import OBJECT_KEY_AVOID_CHARS
+
+    assert "#" in OBJECT_KEY_AVOID_CHARS
+    assert "?" in OBJECT_KEY_AVOID_CHARS
+
+
+@pytest.mark.asyncio
+async def test_the_path_check_is_what_covers_a_bucket_only_path() -> None:
+    """The genuinely new coverage, isolated from the key-level guard.
+
+    `OBJECT_KEY_AVOID_CHARS` only runs when a key segment exists (`len(key_parts) >= 2`), so a
+    single-segment path was never judged by it. That is the privilege-confusion case:
+    `PUT /victimbucket%3Fpolicy` reached the api as `PUT /victimbucket?policy` — PutBucketPolicy —
+    while the gateway authorized it as CreateBucket, whose ACL branch performs no permission
+    check at all. Only the path check covers this shape.
+    """
+    status, reached = await _send("PUT", "/victimbucket%3Fpolicy")
+
+    assert status == 400
+    assert reached == []
