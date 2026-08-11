@@ -89,6 +89,9 @@ pub struct RuntimeConfig {
     pub reconcile_poll: Duration,
     /// How often the reclaim worker scans the SSD for `failed` (abandoned-upload) parts.
     pub reclaim_poll: Duration,
+    /// R4 corrupt re-drive cadence. Separate from `reclaim_poll` because it is the only
+    /// disposition on that path with no grace: the interval is a single-copy exposure window.
+    pub redrive_poll: Duration,
     /// How often the DB-driven `failed`-part reclaim runs. Independent of the reclaim WALK:
     /// decoupling debris cleanup from the walk is the point, so the walk can be rare.
     pub failed_reclaim_poll: Duration,
@@ -784,6 +787,21 @@ async fn failed_reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotC
                     "corrupt-live SSD parts held (pool copy corrupt) — last good source preserved (R4)"
                 );
             }
+            // A skipped removal is no longer fatal to the pass, so it has to be visible here or
+            // it is invisible everywhere. The shape that needs a human is `remove_failed` at or
+            // near `candidates` with `reclaimed` flat across cycles: the worklist has no offset,
+            // so the same page is being re-offered and this node's failed debris — which the
+            // residency guard also keeps un-GC-able — is not being reclaimed at all.
+            snapshot.record_reclaim_remove_failed(report.remove_failed);
+            if report.remove_failed > 0 {
+                tracing::warn!(
+                    remove_failed = report.remove_failed,
+                    candidates = report.candidates,
+                    reclaimed = report.reclaimed,
+                    kind = ?report.remove_failed_kind,
+                    "failed-part reclaim skipped un-removable parts; cursor is pinned if this persists with reclaimed=0"
+                );
+            }
         }
         // A backing-read abort leaves every candidate unjudged, so the pass removed nothing and
         // this GC is DISABLED rather than merely slow — the same distinction the walk draws.
@@ -1238,15 +1256,36 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             failed: FailedGrace(self.config.reclaim_grace),
             orphan: OrphanGrace(self.config.orphan_reclaim_grace),
         };
-        let redrive_max_attempts = self.config.redrive_max_attempts;
         supervisor.spawn(WorkerName::new("ssd_reclaim"), move |token| {
             run_periodic(token, reclaim_poll, move || {
                 let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
                 async move {
                     reclaim_once(&ssd, &store, &snapshot, reclaim_graces).await;
-                    // R4 re-drive: reset bounded `corrupt` parts to `pending` for a fresh copy,
-                    // then publish the held-corrupt gauge. Same cadence as reclaim (both are the
-                    // node-local SSD lifecycle); errors log and retry next poll (fail-safe).
+                }
+            })
+        });
+
+        // R4 re-drive on its OWN poll, no longer folded into the reclaim walk above.
+        //
+        // It was sharing that loop on the reasoning that both are "the node-local SSD lifecycle",
+        // which is true but hides the thing that matters: every other disposition the reclaim
+        // worker owns is grace-gated at an hour or more, so its poll interval is a cost knob. A
+        // `corrupt` part is not. It is a LIVE object whose pool copy is bad and whose SSD copy is
+        // the last good source, and the re-drive is what gets a fresh pool copy made — so for
+        // this one call the poll interval IS the single-copy exposure window.
+        //
+        // Retention made the reclaim walk proportional to the node's whole replicated shard,
+        // which is a good reason to run it hourly and NOT a reason to leave an R4 part on one
+        // copy for an hour. Splitting them lets each answer to its own clock; it also keeps the
+        // `drain-corrupt-live-parts` alert's `for:` window calibrated against a cadence that no
+        // longer moves when the walk's does.
+        let (store, snapshot) = (Arc::clone(&self.store), Arc::clone(&self.snapshot));
+        let redrive_poll = self.config.redrive_poll;
+        let redrive_max_attempts = self.config.redrive_max_attempts;
+        supervisor.spawn(WorkerName::new("redrive_corrupt"), move |token| {
+            run_periodic(token, redrive_poll, move || {
+                let (store, snapshot) = (Arc::clone(&store), Arc::clone(&snapshot));
+                async move {
                     redrive_corrupt_once(&store, &snapshot, redrive_max_attempts).await;
                 }
             })
@@ -2016,6 +2055,7 @@ mod tests {
                 reconcile_poll: Duration::from_mins(1),
                 enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
+                redrive_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
@@ -2110,6 +2150,7 @@ mod tests {
                 reconcile_poll: Duration::from_mins(1),
                 enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
+                redrive_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
@@ -2238,6 +2279,7 @@ mod tests {
                 reconcile_poll: Duration::from_mins(1),
                 enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
+                redrive_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
@@ -2312,6 +2354,7 @@ mod tests {
                 reconcile_poll: Duration::from_millis(20),
                 enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
+                redrive_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),
@@ -2369,6 +2412,7 @@ mod tests {
                 reconcile_poll: Duration::from_millis(50),
                 enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
+                redrive_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
                 grace: Duration::from_secs(5),

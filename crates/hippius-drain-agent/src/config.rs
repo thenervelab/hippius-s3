@@ -67,6 +67,12 @@ const DEFAULT_HEARTBEAT_TTL: Duration = Duration::from_secs(30);
 /// Reclaim scan period when `CEPHOR_RECLAIM_POLL_SECS` is unset: the SSD-ingest GC
 /// runs less often than the drain — eviction is a backstop, not a hot path.
 const DEFAULT_RECLAIM_POLL: Duration = Duration::from_mins(5);
+/// R4 corrupt re-drive cadence. Deliberately its OWN knob rather than riding `reclaim_poll`:
+/// a `corrupt` part is a LIVE object whose pool copy is bad and whose SSD copy is the last good
+/// source, and unlike everything else that worker owns it is not grace-gated — so it is the one
+/// disposition where the poll interval IS the exposure window. Keeping it at the historical
+/// 5 minutes means raising the walk's interval for cost reasons cannot silently widen it.
+const DEFAULT_REDRIVE_POLL: Duration = Duration::from_mins(5);
 /// Orphan-reclaim grace when `CEPHOR_ORPHAN_RECLAIM_GRACE_SECS` is unset: how long a
 /// no-DB-backing part (its object hard-deleted) is kept on SSD before eviction. Longer
 /// than the `failed` grace because this age is the FS `meta.json` mtime (a deleted object
@@ -202,6 +208,10 @@ pub struct Config {
     /// Max times an R4 `corrupt` part is re-driven before it is held and paged. Bounds the
     /// re-drive so a persistently-bad pool copy cannot loop forever.
     pub redrive_max_attempts: u32,
+    /// How often bounded `corrupt` parts are re-driven. Separate from `reclaim_poll` because a
+    /// corrupt part is a live object running on its SSD copy alone: this interval is a
+    /// single-copy exposure window, not a debris-collection cadence.
+    pub redrive_poll: Duration,
     /// How often the read-tier evictor probes the ingest disk's free space.
     pub evict_poll: Duration,
     /// The evictor's fallback free-space floor, in permille of the ingest disk, used when the
@@ -299,6 +309,7 @@ impl Config {
             grace: self.grace,
             drain_concurrency: self.drain_concurrency,
             redrive_max_attempts: self.redrive_max_attempts,
+            redrive_poll: self.redrive_poll,
             failed_reclaim_poll: self.failed_reclaim_poll,
             landed_poll: self.landed_poll,
             evict_poll: self.evict_poll,
@@ -382,6 +393,7 @@ impl Config {
             orphan_reclaim_grace: duration_secs(&get, "CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", DEFAULT_ORPHAN_RECLAIM_GRACE)?,
             drain_concurrency: positive_u32_or(&get, "CEPHOR_DRAIN_CONCURRENCY", DEFAULT_DRAIN_CONCURRENCY)?,
             redrive_max_attempts: positive_u32_or(&get, "CEPHOR_REDRIVE_MAX_ATTEMPTS", DEFAULT_REDRIVE_MAX_ATTEMPTS)?,
+            redrive_poll: duration_secs(&get, "CEPHOR_REDRIVE_POLL_SECS", DEFAULT_REDRIVE_POLL)?,
             evict_poll: duration_secs(&get, "CEPHOR_EVICT_POLL_SECS", DEFAULT_EVICT_POLL)?,
             evict_reserve_permille: permille_or(&get, "CEPHOR_EVICT_RESERVE_PERMILLE", DEFAULT_EVICT_RESERVE_PERMILLE)?,
             evict_headroom_permille: permille_or(&get, "CEPHOR_EVICT_HEADROOM_PERMILLE", DEFAULT_EVICT_HEADROOM_PERMILLE)?,

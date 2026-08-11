@@ -891,25 +891,36 @@ groups:
       # aborted on an object-backing read (ReclaimError::Backing: the object_versions table missing
       # on a deploy, or a transient PG error). On this path the failed-part SSD GC reads nothing and
       # removes NOTHING — it is silently DISABLED while failing safe, so SSD debris accrues invisibly
-      # until drain_ssd_pressure trips the critical PUT-shedding alert downstream. increase()>0 held
-      # for 15m means the failure is STANDING across the 1m reclaim cycles, not a single transient PG
-      # blip (whose lone increment ages out of the window). Warning, not critical: the reclaim fails
-      # safe (no data loss) and drain-ssd-pressure-high is the downstream hard page.
+      # until drain_ssd_pressure trips the critical PUT-shedding alert downstream. Warning, not
+      # critical: the reclaim fails safe (no data loss) and drain-ssd-pressure-high is the
+      # downstream hard page.
+      #
+      # THE WINDOW TRACKS THE POLL, and the poll has moved twice. This was written for 1m cycles,
+      # ran at 300s, and CEPHOR_RECLAIM_POLL_SECS is now 3600 on prod (retention made the walk
+      # proportional to the node's whole replicated shard). A counter that can increment at most
+      # once an hour is invisible to increase()[15m] for 45 of every 60 minutes, and `for: 15m`
+      # could then never hold — the alarm for "reclaim is silently disabled" was itself silently
+      # disabled. 3h spans three poll intervals, so a STANDING failure is still distinguished from
+      # a single transient blip (one increment ages out), which is the property the short window
+      # was chosen for. `for` drops to 0 because the window now does that work: holding a 3h
+      # increase for a further 15m would only delay the page by a quarter-hour.
+      #
+      # If the poll changes again, change this with it. The rule is: window >= 3 x poll.
       - uid: drain-reclaim-backing-errors
         title: Drain Reclaim Disabled - Object-Backing Read Failing
         condition: C
         data:
           - refId: A
             relativeTimeRange:
-              from: 900
+              from: 10800
               to: 0
             datasourceUid: PBFA97CFB590B2093
             model:
-              expr: 'sum(increase(drain_reclaim_backing_errors_total{job="otel-collector"}[15m]))'
+              expr: 'sum(increase(drain_reclaim_backing_errors_total{job="otel-collector"}[3h]))'
               refId: A
           - refId: B
             relativeTimeRange:
-              from: 900
+              from: 10800
               to: 0
             datasourceUid: __expr__
             model:
@@ -919,7 +930,7 @@ groups:
               refId: B
           - refId: C
             relativeTimeRange:
-              from: 900
+              from: 10800
               to: 0
             datasourceUid: __expr__
             model:
@@ -934,9 +945,9 @@ groups:
               refId: C
         noDataState: OK
         execErrState: Error
-        for: 15m
+        for: 0m
         annotations:
-          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} reclaim cycle(s) in 15m aborted on an object-backing read — the failed-part SSD GC is disabled and removing nothing. Check for a missing object_versions table on the drain deploy or a PG error; SSD debris will accrue until the disk-pressure alert fires.'
+          description: '{{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} reclaim cycle(s) in 3h aborted on an object-backing read — the failed-part SSD GC is disabled and removing nothing. Check for a missing object_versions table on the drain deploy or a PG error; SSD debris will accrue until the disk-pressure alert fires.'
           summary: The drain failed-part SSD reclaim is disabled (object-backing read failing)
         labels:
           severity: warning

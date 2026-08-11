@@ -161,3 +161,72 @@ async def test_delete_meta_idempotent_on_missing(store):
     await store.delete_meta(object_id, 1, 1)  # no dir at all — must not raise
     await _seed_part(store, object_id, indices=[0], with_meta=False)
     await store.delete_meta(object_id, 1, 1)  # dir without meta — must not raise
+
+
+@pytest.mark.asyncio
+async def test_a_failed_meta_write_unpublishes_rather_than_leaving_a_holed_part(store, monkeypatch):
+    """The un-publish window ends when the NEW meta lands, not at the last rename.
+
+    meta.json is the readiness gate. If the meta write fails after the renames — ENOSPC is the
+    way in, and a disk retention deliberately runs at 15-20% free is where it happens — the
+    PREVIOUS attempt's meta.json is left standing over a chunk set that is now this attempt's and
+    a different length. The part still reads as published, with a wrong declared size and holes,
+    and the drain's completeness gate then strands it as IncompleteSource: never replicated,
+    never evicted. Un-publishing instead makes it invisible, which is recoverable.
+    """
+    object_id = str(uuid.uuid4())
+    part_dir = await _seed_part(store, object_id, indices=[0, 1, 2], with_meta=True)
+    before = json.loads((part_dir / "meta.json").read_text())
+    assert int(before["num_chunks"]) == 3
+
+    await _stage(store, object_id, 1)
+
+    from hippius_s3.cache import fs_store as fs_store_mod
+
+    def _enospc(*_a, **_kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(fs_store_mod, "_write_meta_file", _enospc)
+
+    with pytest.raises(OSError):
+        await _publish(store, object_id, 1)
+
+    assert not (part_dir / "meta.json").exists(), (
+        "the previous attempt's meta survived over the new chunk set: the part reads as published "
+        "with a wrong num_chunks and holes"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_trim_cannot_be_what_triggers_the_unpublish(store, caplog):
+    """Pins the reachability claim itself, because an earlier version of this test got it wrong.
+
+    That version monkeypatched `_trim_chunk_tail` to raise and asserted the un-publish ran — which
+    passed, but tested a state the code cannot reach and left a docstring implying a risk that
+    does not exist. `_trim_chunk_tail` swallows every `OSError`: the `iterdir` returns 0 and each
+    per-file `unlink` logs at ERROR and continues, deliberately, because a surviving tail is a
+    stranded part and not a reason to fail an upload whose bytes are already durable.
+
+    So `_write_meta_file` is the only thing in that block that can trigger the un-publish. This
+    asserts the property the other test depends on: an untrimmable tail leaves the part PUBLISHED
+    and merely logs, rather than unwinding it.
+    """
+    object_id = str(uuid.uuid4())
+    part_dir = await _seed_part(store, object_id, indices=[0, 1, 2], with_meta=True)
+    await _stage(store, object_id, 1)
+
+    real_unlink = Path.unlink
+
+    def _refuse_tail(self, *args, **kwargs):
+        if self.name.startswith("chunk_") and self.name.endswith(".bin"):
+            raise OSError(13, "Permission denied")
+        return real_unlink(self, *args, **kwargs)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(Path, "unlink", _refuse_tail)
+            await _publish(store, object_id, 1)
+
+    meta = json.loads((part_dir / "meta.json").read_text())
+    assert int(meta["num_chunks"]) == 1, "the publish must still have completed"
+    assert any("trim failed" in r.message for r in caplog.records), "and must have said so loudly"

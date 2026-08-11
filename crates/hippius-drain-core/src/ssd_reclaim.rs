@@ -467,6 +467,15 @@ pub struct FailedReclaimReport {
     /// where this SSD copy is the last good source. Must never be deleted; a standing nonzero
     /// value is the same incident signal the walk's `skipped_corrupt` carries.
     pub held_servable: u64,
+    /// Parts whose unlink FAILED and were skipped so the pass could continue. Distinct parts
+    /// within a pass, never attempts — see [`reclaim_failed`] for why aborting instead was the
+    /// bug this counts. A value at or near `candidates` every pass means the cursor is pinned
+    /// and this node's `failed` debris is not being reclaimed at all.
+    pub remove_failed: u64,
+    /// The errno class of the skipped removals, ranked by what needs a human rather than by
+    /// arrival order: a transient `DirectoryNotEmpty` (the api renaming a promoted chunk into a
+    /// directory being removed) must not mask an `EROFS` behind it.
+    pub remove_failed_kind: Option<std::io::ErrorKind>,
 }
 
 /// Reclaims this node's aged `failed` parts **without walking the disk**.
@@ -496,7 +505,12 @@ pub struct FailedReclaimReport {
 /// - [`ReclaimError::Backing`] if the servability read fails — **nothing is removed**, because
 ///   without it every candidate is un-adjudicated and deleting one could destroy a live
 ///   object's last copy. Fail-safe, exactly as the walk's backing read is.
-/// - [`ReclaimError::Remove`] if unlinking fails.
+///
+/// A failing UNLINK is deliberately **not** an error: it is counted in
+/// [`remove_failed`](FailedReclaimReport::remove_failed) and the part is skipped. The distinction
+/// is between an *adjudication* failure — the worklist or backing read, where the pass does not
+/// know what is safe to delete and must stop — and an *I/O* failure on one inode, where every
+/// candidate is already adjudicated and the other 511 can proceed.
 pub async fn reclaim_failed<L, B, R>(log: &L, backing: &B, remover: &R, grace: Duration, limit: u32) -> Result<FailedReclaimReport, ReclaimError>
 where
     L: ReclaimLog,
@@ -520,7 +534,32 @@ where
             report.held_servable += 1;
             continue;
         }
-        remover.unlink_part(part).await.map_err(ReclaimError::Remove)?;
+        if let Err(err) = remover.unlink_part(part).await {
+            // Counted and skipped, NOT propagated — the same fix `evict_to_target` carries, for
+            // the same reason. Returning here landed before `mark_failed_reclaimed`, which is the
+            // only thing that advances this cursor: the worklist is `ORDER BY updated_at WHERE
+            // reclaimed_at IS NULL` with no offset, so one part refusing to be unlinked (EIO,
+            // EACCES, EROFS, or an ENOTEMPTY from the api publishing into the directory being
+            // removed) pinned the head of every later page. Worse than the evictor's version of
+            // this bug, because parts unlinked EARLIER in the same page were then never marked
+            // either, so the pass re-unlinked them every poll forever — the exact "productive
+            // metrics over a cursor that never moves" that migration 0018 exists to end. And
+            // since #407's residency guard, an unreclaimed row is also un-GC-able.
+            report.remove_failed = report.remove_failed.saturating_add(1);
+            // Ranked by what needs a human, NOT by arrival order — the worklist's order has no
+            // relationship to severity, so first-wins would let one routine race mask a mount
+            // fault behind it. Two kinds are routine and both must be demoted:
+            // `DirectoryNotEmpty` (the api winning a rename into a directory being removed)
+            // and `WouldBlock` (the api holding the part-publish flock, which
+            // `remove_part_dir_exclusive` reports as an ordinary removal failure by design).
+            // Everything else — EACCES, EIO, EROFS — means the mount needs intervention and
+            // must survive.
+            report.remove_failed_kind = match (report.remove_failed_kind, err.kind()) {
+                (None | Some(std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::WouldBlock), kind) => Some(kind),
+                (existing, _) => existing,
+            };
+            continue;
+        }
         report.reclaimed += 1;
         reclaimed.push(part.clone());
     }
@@ -1344,6 +1383,7 @@ mod failed_reclaim_tests {
         candidates: Mutex<Vec<PartKey>>,
         fail: bool,
         asked: Mutex<Vec<(u64, u32)>>,
+        marked: Mutex<Vec<u32>>,
     }
 
     impl FakeLog {
@@ -1352,7 +1392,15 @@ mod failed_reclaim_tests {
                 candidates: Mutex::new(parts.to_vec()),
                 fail: false,
                 asked: Mutex::new(Vec::new()),
+                marked: Mutex::new(Vec::new()),
             }
+        }
+
+        /// What actually reached `mark_failed_reclaimed` — the cursor's only advance.
+        fn marked(&self) -> Vec<u32> {
+            let mut out = self.marked.lock().unwrap().clone();
+            out.sort_unstable();
+            out
         }
     }
 
@@ -1365,6 +1413,7 @@ mod failed_reclaim_tests {
 
         async fn mark_failed_reclaimed(&self, parts: &[PartKey]) -> Result<(), io::Error> {
             let gone: Vec<PartKey> = parts.to_vec();
+            self.marked.lock().unwrap().extend(gone.iter().map(|p| p.part().get()));
             self.candidates.lock().unwrap().retain(|p| !gone.contains(p));
             Ok(())
         }
@@ -1405,12 +1454,30 @@ mod failed_reclaim_tests {
     #[derive(Default)]
     struct FakeRemover {
         removed: Mutex<Vec<u32>>,
+        /// Part numbers whose unlink fails, and with which errno. The old fake could only
+        /// succeed, which is precisely why a pass aborting on the first failure went unnoticed.
+        refuse: HashMap<u32, io::ErrorKind>,
+    }
+
+    impl FakeRemover {
+        fn refusing(refuse: &[(u32, io::ErrorKind)]) -> Self {
+            Self {
+                removed: Mutex::new(Vec::new()),
+                refuse: refuse.iter().copied().collect(),
+            }
+        }
     }
 
     impl PartRemover for FakeRemover {
         fn unlink_part(&self, part: &PartKey) -> impl Future<Output = io::Result<()>> + Send {
-            self.removed.lock().unwrap().push(part.part().get());
-            async { Ok(()) }
+            let n = part.part().get();
+            let outcome = if let Some(kind) = self.refuse.get(&n) {
+                Err(io::Error::from(*kind))
+            } else {
+                self.removed.lock().unwrap().push(n);
+                Ok(())
+            };
+            async move { outcome }
         }
     }
 
@@ -1436,6 +1503,8 @@ mod failed_reclaim_tests {
                 candidates: 2,
                 reclaimed: 2,
                 held_servable: 0,
+                remove_failed: 0,
+                remove_failed_kind: None,
             }
         );
         assert_eq!(*remover.removed.lock().unwrap(), vec![1, 2]);
@@ -1543,6 +1612,7 @@ mod failed_reclaim_tests {
             candidates: Mutex::new(vec![part(1)]),
             fail: true,
             asked: Mutex::new(Vec::new()),
+            marked: Mutex::new(Vec::new()),
         };
         let remover = FakeRemover::default();
 
@@ -1552,5 +1622,104 @@ mod failed_reclaim_tests {
 
         assert!(matches!(err, ReclaimError::Log(_)));
         assert!(remover.removed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_unremovable_part_does_not_stop_the_rest_of_the_page() {
+        // The bug: `?` on the unlink returned BEFORE `mark_failed_reclaimed`, which is the only
+        // thing that advances this cursor. One bad inode pinned the head of every later page, so
+        // the node's failed debris was never reclaimed — and since the residency guard, never
+        // GC'd either. Worse than the evictor's version, because parts unlinked earlier in the
+        // same page were left unmarked and re-unlinked on every subsequent poll.
+        let log = FakeLog::of(&[part(1), part(2), part(3)]);
+        let remover = FakeRemover::refusing(&[(2, io::ErrorKind::PermissionDenied)]);
+
+        // Must not be an Err: an unlink failure is a skip, not a pass failure.
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(report.candidates, 3);
+        assert_eq!(report.reclaimed, 2, "the two removable parts still go");
+        assert_eq!(report.remove_failed, 1);
+        assert_eq!(report.remove_failed_kind, Some(io::ErrorKind::PermissionDenied));
+        assert_eq!(remover.removed.lock().unwrap().clone(), vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn the_parts_that_were_unlinked_are_still_marked_when_another_fails() {
+        // The cursor half, which is the part that made this permanent: marking is what takes a
+        // row off `WHERE reclaimed_at IS NULL`. Aborting the pass left parts 1 and 3 unlinked but
+        // unmarked, so the next poll re-offered and re-unlinked them, forever.
+        let log = FakeLog::of(&[part(1), part(2), part(3)]);
+        let remover = FakeRemover::refusing(&[(2, io::ErrorKind::PermissionDenied)]);
+
+        reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(log.marked(), vec![1, 3], "unlinked parts must be marked so the cursor moves");
+    }
+
+    #[tokio::test]
+    async fn a_page_where_every_unlink_fails_marks_nothing_and_reports_it() {
+        // Terminates rather than looping, and says why: `remove_failed == candidates` with
+        // nothing reclaimed is the signature of a pinned cursor.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::refusing(&[(1, io::ErrorKind::ReadOnlyFilesystem), (2, io::ErrorKind::ReadOnlyFilesystem)]);
+
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!((report.candidates, report.reclaimed, report.remove_failed), (2, 0, 2));
+        assert!(log.marked().is_empty(), "nothing was removed, so nothing may be marked");
+    }
+
+    #[tokio::test]
+    async fn the_reported_errno_ranks_by_what_needs_a_human() {
+        // A transient DirectoryNotEmpty (the api publishing into a directory being removed) must
+        // not mask an EROFS behind it just because the worklist ordered it first.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::refusing(&[(1, io::ErrorKind::DirectoryNotEmpty), (2, io::ErrorKind::ReadOnlyFilesystem)]);
+
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(report.remove_failed_kind, Some(io::ErrorKind::ReadOnlyFilesystem));
+    }
+
+    #[tokio::test]
+    async fn a_servable_part_is_still_held_and_is_not_counted_as_a_failure() {
+        // The R4 guard and the new skip must stay distinguishable: held_servable is a durability
+        // signal, remove_failed is an I/O one, and conflating them would hide either.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::refusing(&[(2, io::ErrorKind::PermissionDenied)]);
+
+        let report = reclaim_failed(&log, &backing(&[part(1)]), &remover, Duration::from_hours(1), 256)
+            .await
+            .unwrap();
+
+        assert_eq!((report.held_servable, report.remove_failed, report.reclaimed), (1, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_flock_contention_does_not_mask_a_mount_fault() {
+        // WouldBlock is the api holding the part-publish flock — routine, and by design reported
+        // as an ordinary removal failure. Before this it was NOT demoted, so one publish race on
+        // the oldest part hid an EROFS behind it and the operator saw a promotion race where the
+        // mount had gone read-only.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::refusing(&[(1, io::ErrorKind::WouldBlock), (2, io::ErrorKind::ReadOnlyFilesystem)]);
+
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(report.remove_failed_kind, Some(io::ErrorKind::ReadOnlyFilesystem));
+    }
+
+    #[tokio::test]
+    async fn a_pass_of_only_routine_races_still_reports_one() {
+        // Demoting must not mean discarding: with nothing worse to promote, the transient is
+        // still what happened and still the reason nothing was reclaimed.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::refusing(&[(1, io::ErrorKind::WouldBlock), (2, io::ErrorKind::DirectoryNotEmpty)]);
+
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert!(report.remove_failed_kind.is_some(), "a transient-only pass must still name a kind");
+        assert_eq!(report.remove_failed, 2);
     }
 }

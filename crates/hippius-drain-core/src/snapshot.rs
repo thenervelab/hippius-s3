@@ -277,6 +277,7 @@ pub struct SnapshotCell {
     /// starved-because-removals-are-failing (a disk, permissions, or racing-promotion fault) from
     /// starved-because-the-cursor-is-empty (genuine backlog). The two need opposite responses.
     evict_remove_failed: AtomicU64,
+    reclaim_remove_failed: AtomicU64,
     /// Aborted-reclaim counter mirroring `reclaimed`: bumped once per reclaim cycle that failed
     /// its object-backing read (`ReclaimError::Backing`). Monotonic, `Relaxed` — a stat counter
     /// with no cross-counter ordering dependency (axiom `rust_quality_92`). See
@@ -462,6 +463,25 @@ impl SnapshotCell {
     #[must_use]
     pub fn evict_remove_failed(&self) -> u64 {
         self.evict_remove_failed.load(Ordering::Relaxed)
+    }
+
+    /// Records `failed`-part reclaim candidates skipped because their unlink failed.
+    ///
+    /// Separate from the evictor's counter because the two answer different questions: the
+    /// evictor's worklist re-offers a skipped part on the next pass with no lasting consequence,
+    /// while this worklist is `WHERE reclaimed_at IS NULL` with no offset — a part that never
+    /// unlinks is never marked, so it sits at the head of every later page. `remove_failed` at or
+    /// near the candidate count with `reclaimed` flat is a pinned cursor, and since the residency
+    /// guard those rows also stop being GC-able.
+    pub fn record_reclaim_remove_failed(&self, n: u64) {
+        self.reclaim_remove_failed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Cumulative reclaim skipped-on-unlink-failure count
+    /// (`drain_ssd_reclaim_remove_failed_total`).
+    #[must_use]
+    pub fn reclaim_remove_failed(&self) -> u64 {
+        self.reclaim_remove_failed.load(Ordering::Relaxed)
     }
 
     /// Records free bytes on the ingest SSD. A gauge: `store`, not add.
