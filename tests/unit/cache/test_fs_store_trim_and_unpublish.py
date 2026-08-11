@@ -198,20 +198,35 @@ async def test_a_failed_meta_write_unpublishes_rather_than_leaving_a_holed_part(
 
 
 @pytest.mark.asyncio
-async def test_a_failed_trim_also_unpublishes(store, monkeypatch):
-    """Same window, one step earlier — the trim runs between the renames and the meta write."""
+async def test_the_trim_cannot_be_what_triggers_the_unpublish(store, caplog):
+    """Pins the reachability claim itself, because an earlier version of this test got it wrong.
+
+    That version monkeypatched `_trim_chunk_tail` to raise and asserted the un-publish ran — which
+    passed, but tested a state the code cannot reach and left a docstring implying a risk that
+    does not exist. `_trim_chunk_tail` swallows every `OSError`: the `iterdir` returns 0 and each
+    per-file `unlink` logs at ERROR and continues, deliberately, because a surviving tail is a
+    stranded part and not a reason to fail an upload whose bytes are already durable.
+
+    So `_write_meta_file` is the only thing in that block that can trigger the un-publish. This
+    asserts the property the other test depends on: an untrimmable tail leaves the part PUBLISHED
+    and merely logs, rather than unwinding it.
+    """
     object_id = str(uuid.uuid4())
     part_dir = await _seed_part(store, object_id, indices=[0, 1, 2], with_meta=True)
     await _stage(store, object_id, 1)
 
-    from hippius_s3.cache import fs_store as fs_store_mod
+    real_unlink = Path.unlink
 
-    def _boom(*_a, **_kw):
-        raise OSError(5, "I/O error")
+    def _refuse_tail(self, *args, **kwargs):
+        if self.name.startswith("chunk_") and self.name.endswith(".bin"):
+            raise OSError(13, "Permission denied")
+        return real_unlink(self, *args, **kwargs)
 
-    monkeypatch.setattr(fs_store_mod, "_trim_chunk_tail", _boom)
+    with caplog.at_level(logging.ERROR):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(Path, "unlink", _refuse_tail)
+            await _publish(store, object_id, 1)
 
-    with pytest.raises(OSError):
-        await _publish(store, object_id, 1)
-
-    assert not (part_dir / "meta.json").exists()
+    meta = json.loads((part_dir / "meta.json").read_text())
+    assert int(meta["num_chunks"]) == 1, "the publish must still have completed"
+    assert any("trim failed" in r.message for r in caplog.records), "and must have said so loudly"

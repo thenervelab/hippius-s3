@@ -135,6 +135,20 @@ fn register_ssd_tier_instruments(meter: &opentelemetry::metrics::Meter, snapshot
             .build(),
     ));
 
+    // The same discriminator for the `failed`-part reclaim, which needs it MORE than the evictor
+    // does. The evictor's worklist re-offers a skipped part next pass and the existing starvation
+    // alert covers a whole page failing; this worklist is `WHERE reclaimed_at IS NULL` with no
+    // offset, so a part that never unlinks is never marked and pins the head of every later page.
+    // Rising while the reclaim's removals stay flat means this node's failed debris is not being
+    // collected at all — and since the residency guard, those rows also stop being GC-able.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_reclaim_remove_failed_total")
+            .with_callback(move |observer| observer.observe(snap.reclaim_remove_failed(), &[]))
+            .build(),
+    ));
+
     // Whether this node's ingest disk is shared with a writer the drain cannot account for (1)
     // or is its own (0). The precondition for reading ANY of the three gauges above as a
     // statement about the drain: on a shared mount the eviction reserve, the promote floor and

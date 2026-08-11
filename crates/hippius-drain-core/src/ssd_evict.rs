@@ -391,13 +391,16 @@ where
                 // unread part keeps its rank, so one un-unlinkable part pinned the head and
                 // halted ALL eviction, with no report to carry `starved`.
                 report.remove_failed = report.remove_failed.saturating_add(1);
-                // Ranked by what needs a human, NOT by arrival order. `get_or_insert` here would
-                // keep whichever fault the worklist happened to order first, and the worklist is
-                // ordered by read recency — which has no relationship to severity. One transient
-                // `DirectoryNotEmpty` on the oldest part would then mask 511 EROFS behind it and
-                // report a promotion race for a read-only mount.
+                // Ranked by what needs a human, NOT by arrival order — the worklist's order has no
+                // relationship to severity, so first-wins would let one routine race mask a mount
+                // fault behind it. Two kinds are routine and both must be demoted:
+                // `DirectoryNotEmpty` (the api winning a rename into a directory being removed)
+                // and `WouldBlock` (the api holding the part-publish flock, which
+                // `remove_part_dir_exclusive` reports as an ordinary removal failure by design).
+                // Everything else — EACCES, EIO, EROFS — means the mount needs intervention and
+                // must survive.
                 report.remove_failed_kind = match (report.remove_failed_kind, err.kind()) {
-                    (None | Some(std::io::ErrorKind::DirectoryNotEmpty), kind) => Some(kind),
+                    (None | Some(std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::WouldBlock), kind) => Some(kind),
                     (existing, _) => existing,
                 };
                 failed.insert(candidate.part);

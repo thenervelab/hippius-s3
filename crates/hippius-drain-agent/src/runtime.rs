@@ -792,6 +792,7 @@ async fn failed_reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotC
             // near `candidates` with `reclaimed` flat across cycles: the worklist has no offset,
             // so the same page is being re-offered and this node's failed debris — which the
             // residency guard also keeps un-GC-able — is not being reclaimed at all.
+            snapshot.record_reclaim_remove_failed(report.remove_failed);
             if report.remove_failed > 0 {
                 tracing::warn!(
                     remove_failed = report.remove_failed,

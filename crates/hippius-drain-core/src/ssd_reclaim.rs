@@ -546,8 +546,16 @@ where
             // metrics over a cursor that never moves" that migration 0018 exists to end. And
             // since #407's residency guard, an unreclaimed row is also un-GC-able.
             report.remove_failed = report.remove_failed.saturating_add(1);
+            // Ranked by what needs a human, NOT by arrival order — the worklist's order has no
+            // relationship to severity, so first-wins would let one routine race mask a mount
+            // fault behind it. Two kinds are routine and both must be demoted:
+            // `DirectoryNotEmpty` (the api winning a rename into a directory being removed)
+            // and `WouldBlock` (the api holding the part-publish flock, which
+            // `remove_part_dir_exclusive` reports as an ordinary removal failure by design).
+            // Everything else — EACCES, EIO, EROFS — means the mount needs intervention and
+            // must survive.
             report.remove_failed_kind = match (report.remove_failed_kind, err.kind()) {
-                (None | Some(std::io::ErrorKind::DirectoryNotEmpty), kind) => Some(kind),
+                (None | Some(std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::WouldBlock), kind) => Some(kind),
                 (existing, _) => existing,
             };
             continue;
@@ -1686,5 +1694,32 @@ mod failed_reclaim_tests {
             .unwrap();
 
         assert_eq!((report.held_servable, report.remove_failed, report.reclaimed), (1, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_flock_contention_does_not_mask_a_mount_fault() {
+        // WouldBlock is the api holding the part-publish flock — routine, and by design reported
+        // as an ordinary removal failure. Before this it was NOT demoted, so one publish race on
+        // the oldest part hid an EROFS behind it and the operator saw a promotion race where the
+        // mount had gone read-only.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::refusing(&[(1, io::ErrorKind::WouldBlock), (2, io::ErrorKind::ReadOnlyFilesystem)]);
+
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(report.remove_failed_kind, Some(io::ErrorKind::ReadOnlyFilesystem));
+    }
+
+    #[tokio::test]
+    async fn a_pass_of_only_routine_races_still_reports_one() {
+        // Demoting must not mean discarding: with nothing worse to promote, the transient is
+        // still what happened and still the reason nothing was reclaimed.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::refusing(&[(1, io::ErrorKind::WouldBlock), (2, io::ErrorKind::DirectoryNotEmpty)]);
+
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert!(report.remove_failed_kind.is_some(), "a transient-only pass must still name a kind");
+        assert_eq!(report.remove_failed, 2);
     }
 }
