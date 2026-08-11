@@ -1,6 +1,13 @@
+import logging
 from urllib.parse import unquote
 
 from fastapi import Request
+
+
+logger = logging.getLogger(__name__)
+
+# One-shot, so a misconfigured server says so once rather than per request.
+_WARNED_NO_RAW_PATH = False
 
 
 def decoded_path(request: Request) -> str:
@@ -25,6 +32,21 @@ def decoded_path(request: Request) -> str:
     if raw is None:
         # Not every ASGI server populates raw_path. Falling back to the truncating path is still
         # better than 500-ing; uvicorn (what we run) always provides it.
+        #
+        # Logged, and once, because this fallback SILENTLY DEGRADES the guards built on top of
+        # it. `request.url.path` is already truncated at `#`, so input_validation's refusal of
+        # delimiters in the path can never fire on one, and every key-view check goes back to
+        # judging a shortened key — the precise blindness this function exists to remove. A
+        # server swap is the kind of change nobody would connect to a quiet re-opening of that
+        # hole months later, so it says so the first time rather than never.
+        global _WARNED_NO_RAW_PATH
+        if not _WARNED_NO_RAW_PATH:
+            _WARNED_NO_RAW_PATH = True
+            logger.error(
+                "ASGI server did not populate scope['raw_path']; falling back to the truncating "
+                "request.url.path. Path-delimiter and object-key guards are DEGRADED until this "
+                "is fixed."
+            )
         return request.url.path
     return unquote(raw.decode("utf-8", "surrogateescape"))
 

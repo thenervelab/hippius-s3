@@ -58,11 +58,17 @@ async def _send(method: str, raw_path: str) -> tuple[int, list[str]]:
         "/victimbucket%3Fpolicy",
         "/victimbucket%3Ftagging",
         "/victimbucket%3Facl",
-        "/bucket/key%3Facl",
+        "/victimbucket%23x",
     ],
 )
-async def test_an_encoded_question_mark_is_refused(path: str) -> None:
-    """Each of these would otherwise reach the api carrying a subresource query the gateway never saw."""
+async def test_a_bucket_only_path_with_a_delimiter_is_refused(path: str) -> None:
+    """ONLY the path check covers these, which is why they are their own test.
+
+    `OBJECT_KEY_AVOID_CHARS` runs only when a key segment exists (`len(key_parts) >= 2`), so a
+    single-segment path was never judged by it at all. That is the privilege-confusion shape:
+    `PUT /victimbucket%3Fpolicy` reaches the api as `PUT /victimbucket?policy` — PutBucketPolicy —
+    while the gateway authorizes it as CreateBucket, whose branch performs no permission check.
+    """
     status, reached = await _send("PUT", path)
 
     assert status == 400, f"{path} was accepted"
@@ -70,9 +76,20 @@ async def test_an_encoded_question_mark_is_refused(path: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["/victimbucket%23x", "/bucket/report%23v1.txt"])
-async def test_an_encoded_hash_is_refused(path: str) -> None:
-    """`#` truncates identically; it was already covered for keys, now uniformly."""
+@pytest.mark.parametrize(
+    "path",
+    ["/bucket/key%3Facl", "/bucket/report%23v1.txt"],
+)
+async def test_a_key_with_a_delimiter_is_refused(path: str) -> None:
+    """Two layers can refuse these, and the assertion is deliberately on the OUTCOME.
+
+    Both the path check and `OBJECT_KEY_AVOID_CHARS` catch a key-segment case, so this test
+    passes with either one removed — it does not isolate the new code, and is not meant to. What
+    it pins is the property a client depends on: a key containing a delimiter is refused rather
+    than silently truncated onto another object. The layers are pinned separately, by
+    `test_a_bucket_only_path_with_a_delimiter_is_refused` above and
+    `test_the_key_level_guard_still_lists_both_delimiters` below.
+    """
     status, reached = await _send("PUT", path)
 
     assert status == 400
@@ -81,7 +98,11 @@ async def test_an_encoded_hash_is_refused(path: str) -> None:
 
 @pytest.mark.asyncio
 async def test_two_keys_differing_only_after_the_delimiter_cannot_collide() -> None:
-    """The data-loss shape: both forward as key `report`, so one silently overwrites the other."""
+    """The data-loss shape: both forward as key `report`, so one silently overwrites the other.
+
+    Also an outcome assertion covered by both layers — it survives removing either one alone. It
+    earns its place by naming the user-visible consequence, not by isolating a layer.
+    """
     first, reached_first = await _send("PUT", "/bucket/report%3Fv1.txt")
     second, reached_second = await _send("PUT", "/bucket/report%3Fv2.txt")
 
