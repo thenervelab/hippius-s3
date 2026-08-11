@@ -13,7 +13,7 @@ from hippius_s3 import dependencies
 from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.api.s3.objects.get_object_endpoint import handle_get_object
 from hippius_s3.api.s3.objects.head_object_endpoint import handle_head_object
-from hippius_s3.utils import get_query
+from hippius_s3.services.acl_helper import bucket_has_public_read_acl
 
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ router = APIRouter(tags=["public-s3"])
 
 
 async def _bucket_is_public(pool: asyncpg.Pool, bucket_name: str) -> bool:
-    """Whether this bucket is marked public. Missing or deleted counts as not public.
+    """Whether this bucket grants public read. Missing or deleted counts as not public.
 
     These two routes are the only api entry point the gateway does not authorize. It parses
     `/public/<bucket>/<key>` as bucket `public` with key `<bucket>/<key>`, and `public` is a
@@ -31,9 +31,16 @@ async def _bucket_is_public(pool: asyncpg.Pool, bucket_name: str) -> bool:
     permission check. `handle_get_object` in turn documents that the gateway has already checked
     permissions, and its query is keyed on bucket name and object key alone. So the publicness
     the route's own name asserts has to be established right here, before delegating.
+
+    Reads the ACL, NOT `buckets.is_public`. That column is a dead field: migration
+    20251121000000_migrate_public_buckets_to_acl moved every public bucket to an AllUsers READ
+    grant and then ran `UPDATE buckets SET is_public = false` over the whole table, and
+    `bucket_create_endpoint` has hardcoded `is_public = False` ever since. Gating on it would
+    refuse every bucket, including genuinely public ones — the column is only still written by
+    the migration's own `migrate:down`. `bucket_has_public_read_acl` is the same predicate the
+    gateway's anonymous-read path evaluates, so the two agree by construction.
     """
-    row = await pool.fetchrow(get_query("get_bucket_is_public"), bucket_name)
-    return bool(row and row["is_public"])
+    return await bucket_has_public_read_acl(pool, bucket_name)
 
 
 @router.get("/public/{bucket_name}/{object_key:path}", status_code=200)
