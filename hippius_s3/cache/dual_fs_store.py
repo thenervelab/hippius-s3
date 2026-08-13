@@ -8,6 +8,7 @@ from typing import Callable
 from typing import Optional
 
 from hippius_s3.cache.fs_store import FileSystemPartsStore
+from hippius_s3.cache.local_residency import LocalResidencyGate
 from hippius_s3.fs_pressure import FreeSpaceGate
 from hippius_s3.monitoring import ChunkReadTier
 from hippius_s3.monitoring import PromotionSkipReason
@@ -95,6 +96,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         space_gate: Optional[FreeSpaceGate] = None,
         on_local_read: Optional[LocalReadRecorder] = None,
         replication_suspect: Optional[ReplicationSuspectFn] = None,
+        local_residency: Optional[LocalResidencyGate] = None,
     ) -> None:
         super().__init__(primary_dir)
         self.fallback = FileSystemPartsStore(fallback_dir)
@@ -106,6 +108,9 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         # it. `None` (workers, tests, deployments without a drain) keeps the pool-presence gate
         # as the only condition, which is exactly the pre-probe behaviour.
         self._replication_suspect = replication_suspect
+        # Decides whether this node's own flash is an authoritative source for a part, or a
+        # copy it has no record of holding. `None` leaves the pre-gate behaviour (serve it).
+        self._local_residency = local_residency
         # Promotion yields to ingest: this is the only writer here that is pure optimisation,
         # and it shares the mount with the PUTs that `fs_cache_pressure` refuses when the disk
         # runs out. `None` means no gate (tests, and any deployment without a fallback tier).
@@ -120,10 +125,22 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         # could invalidate underneath us.
         self._promoting: set[tuple[str, int, int, int]] = set()
 
+    async def _may_serve_local(self, object_id: str, object_version: int, part_number: int) -> bool:
+        """Whether this node's own copy of the part is one it is recorded as holding."""
+        if self._local_residency is None:
+            return True
+        return await self._local_residency.may_serve_local(object_id, int(object_version), int(part_number))
+
     async def get_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
     ) -> Optional[bytes]:
         result = await super().get_chunk(object_id, object_version, part_number, chunk_index)
+        if result is not None and not await self._may_serve_local(object_id, object_version, part_number):
+            # On disk here, but this node is not recorded as holding a part the pool already has
+            # — so these bytes are an unowned copy, and the AAD cannot tell them from the real
+            # ones. Fall through to peer/pool, which ARE recorded. Costs latency, never bytes.
+            _record_tier("local_unowned")
+            result = None
         if result is not None:
             _record_tier("local")
             # Tell the evictor this part is still in use. Without it eviction orders on when a

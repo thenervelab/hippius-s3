@@ -9,6 +9,7 @@ from .dual_fs_store import PromotionRecorder
 from .dual_fs_store import PromotionReleaser
 from .dual_fs_store import ReplicationSuspectFn
 from .fs_store import FileSystemPartsStore
+from .local_residency import LocalResidencyGate
 from .notifier import ChunkNotifier
 from .object_parts import RedisObjectPartsCache
 
@@ -22,6 +23,7 @@ def create_fs_store(
     on_local_read: LocalReadRecorder | None = None,
     published_floor: PublishedFloorSource | None = None,
     replication_suspect: ReplicationSuspectFn | None = None,
+    local_residency: LocalResidencyGate | None = None,
 ) -> FileSystemPartsStore:
     """Build the parts store: dual-tier when a fallback pool is configured, else single.
 
@@ -71,6 +73,7 @@ def create_fs_store(
             space_gate=space_gate,
             on_local_read=on_local_read,
             replication_suspect=replication_suspect,
+            local_residency=local_residency,
         )
     return FileSystemPartsStore(cache_dir)
 

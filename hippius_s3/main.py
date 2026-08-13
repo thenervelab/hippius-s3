@@ -35,6 +35,7 @@ from hippius_s3.api.sub_token_scopes import router as sub_token_scopes_router
 from hippius_s3.api.user import router as user_router
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
+from hippius_s3.cache.local_residency import create_local_residency_gate
 from hippius_s3.cache.peers import PEER_PORT
 from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
@@ -235,6 +236,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # AEAD-retry guard: a redrive marks a part's pool copy stale while `chunk_exists`
             # still passes, so the invalidation path re-checks the status freshly per failure.
             replication_suspect=create_replication_suspect_probe(app.state.postgres_pool),
+            # Refuses this node's own flash for a part the pool already has and this node
+            # is not recorded as holding — the unowned copy two racing UploadParts leave
+            # behind on the losing node, which nothing else can distinguish.
+            local_residency=create_local_residency_gate(app.state.postgres_pool, node_name),
         )
         app.state.obj_cache = RedisObjectPartsCache(
             app.state.redis_client,

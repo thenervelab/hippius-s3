@@ -23,7 +23,11 @@ tracer = trace.get_tracer(__name__)
 
 # The storage tiers a chunk read can be served from, closed by construction so the `tier`
 # label cannot drift into unbounded cardinality.
-ChunkReadTier = Literal["local", "peer", "pool"]
+# `local_unowned` is a REFUSAL, not a tier that served bytes: the part was on this node's
+# flash but the node is not recorded as holding a part the pool already has, so the read
+# fell through to peer/pool instead. A sustained rate means concurrent same-part uploads
+# are leaving unowned copies behind — the read is correct, the write path is not.
+ChunkReadTier = Literal["local", "peer", "pool", "local_unowned"]
 
 # Why a peer fetch did not happen, or its answer was not used. Closed by construction, like
 # ChunkReadTier. The reasons demand different responses and must stay distinguishable:
