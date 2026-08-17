@@ -81,7 +81,11 @@ new job resumes where data remains.
 ## Operational notes
 
 - Suspension state: `account_suspensions` table (row present = suspended), cached 30s
-  in Redis (`hippius_suspension:{ss58}`) with write-through from the endpoints.
+  in Redis (`hippius_suspension:{ss58}`) with write-through from the endpoints. The
+  gateway lookup **fails open** (treats the account as active) on any DB/Redis error —
+  suspension is a billing control, so a brief lapse during a DB blip or a rollout race
+  is preferable to 500ing the read path. This is the opposite of the sub-token scope
+  cache, which fails closed because scope is a security control.
 - Purge jobs: `purge_jobs` table; the `purger` worker (single replica,
   `workers/run_purger_in_loop.py`) claims jobs with `FOR UPDATE SKIP LOCKED` and
   reclaims stale leases (`HIPPIUS_PURGER_LEASE_SECONDS`, default 600s) after a crash.

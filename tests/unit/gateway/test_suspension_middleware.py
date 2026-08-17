@@ -140,6 +140,20 @@ class TestGetAccountSuspension:
 
         assert mode == MODE_FULL
 
+    @pytest.mark.asyncio
+    async def test_db_error_fails_open(self) -> None:
+        """A billing control must never 500 the hot path — a DB error (e.g. the table
+        briefly absent during a rollout) is treated as 'not suspended'."""
+        import asyncpg
+
+        class BrokenPool:
+            async def fetchrow(self, query: str, *args: Any) -> Any:
+                raise asyncpg.PostgresError('relation "account_suspensions" does not exist')
+
+        mode = await get_account_suspension(ACCOUNT, BrokenPool(), FakeRedis())
+
+        assert mode is None
+
 
 def _suspension_app(pool: FakePool, redis: FakeRedis, state: dict[str, Any]) -> FastAPI:
     app = FastAPI()

@@ -14,14 +14,14 @@ JOB_ID = uuid.uuid4()
 
 
 def _config(**overrides: Any) -> SimpleNamespace:
-    defaults = dict(
-        delete_backends=["arion"],
-        purger_batch_size=500,
-        purger_unpin_queue_high_water=50000,
-        purger_backpressure_sleep_seconds=0,
-        purger_lease_seconds=600,
-        purger_interval_seconds=0,
-    )
+    defaults = {
+        "delete_backends": ["arion"],
+        "purger_batch_size": 500,
+        "purger_unpin_queue_high_water": 50000,
+        "purger_backpressure_sleep_seconds": 0,
+        "purger_lease_seconds": 600,
+        "purger_interval_seconds": 0,
+    }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
 
@@ -88,10 +88,7 @@ def _claim_row(deleted_objects: int = 0, deleted_bytes: int = 0) -> dict[str, An
 
 
 def _batch(n: int, bytes_each: int = 100) -> list[dict[str, Any]]:
-    return [
-        {"object_id": uuid.uuid4(), "total_bytes": bytes_each, "backends": ["arion"]}
-        for _ in range(n)
-    ]
+    return [{"object_id": uuid.uuid4(), "total_bytes": bytes_each} for _ in range(n)]
 
 
 @pytest.mark.asyncio
@@ -116,12 +113,13 @@ async def test_happy_path_purges_and_marks_done(monkeypatch: pytest.MonkeyPatch)
 
     assert worked is True
 
-    # Real, resolvable unpin payloads: object_id + version=None (all versions) + backends.
+    # Real, resolvable unpin payloads: object_id + version=None (all versions). Backends
+    # are left None — enqueue fans out and the unpinner resolves per request.
     assert len(enqueued) == 2
     for payload in enqueued:
         assert payload.address == ACCOUNT
         assert payload.object_version is None
-        assert payload.delete_backends == ["arion"]
+        assert payload.delete_backends is None
         uuid.UUID(payload.object_id)
 
     queries = [q for _, q, _a in pool.calls]

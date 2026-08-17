@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import asyncpg
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
@@ -33,9 +34,14 @@ async def get_account_suspension(
 
     Redis is a 30s cache in front of account_suspensions; the admin endpoints write
     through the same keys, so state changes take effect gateway-wide immediately.
-    Redis errors fall through to Postgres (best-effort cache); Postgres errors bubble —
-    the gateway already depends on this pool for ACL on every bucket request, so this
-    adds no new failure mode.
+
+    FAIL-OPEN on any backend error: this runs on the hot read path (every authenticated
+    request, plus the bucket-owner check on every bucket request), and it is a BILLING
+    control, not a security one. A suspended account slipping through for the seconds a
+    DB/Redis blip lasts is far cheaper than 500ing all S3 traffic — and it means the
+    `account_suspensions` table being briefly absent (rollout race, rollback) degrades
+    enforcement rather than taking the gateway down. This is the deliberate OPPOSITE of
+    sub_token_scope_cache, which fails CLOSED because scope IS a security control.
     """
     key = suspension_cache_key(account_id)
 
@@ -49,7 +55,11 @@ async def get_account_suspension(
             return None
         return cached.decode("utf-8")
 
-    row = await db_pool.fetchrow("SELECT mode FROM account_suspensions WHERE account_id = $1", account_id)
+    try:
+        row = await db_pool.fetchrow("SELECT mode FROM account_suspensions WHERE account_id = $1", account_id)
+    except (asyncpg.PostgresError, OSError) as exc:
+        logger.error(f"suspension lookup failed for {account_id}, failing OPEN (treated as active): {exc}")
+        return None
     mode: str | None = row["mode"] if row else None
 
     try:

@@ -159,13 +159,14 @@ async def acl_middleware(
         else:
             request.state.bucket_is_cache_warm = False
 
-    # Bucket-owner suspension check (issue #421). The suspension_middleware covers
-    # requests authenticated AS the suspended account; this covers everyone else
-    # touching the suspended owner's buckets — anonymous public reads and
-    # cross-account (contractor) access — which carry a different (or no) identity.
-    # 'full' blocks all access to the owner's data; 'read_only' still blocks writes
-    # so a delinquent account's storage cannot keep growing via bucket-ACL grants.
-    if bucket_owner_id is not None:
+    # Bucket-owner suspension check (issue #421). The suspension_middleware already
+    # covers requests authenticated AS the suspended account, so skip the lookup when the
+    # requester IS the owner; this branch exists only for everyone ELSE touching the
+    # suspended owner's buckets — anonymous public reads and cross-account (contractor)
+    # access — which carry a different (or no) identity. 'full' blocks all access to the
+    # owner's data; 'read_only' still blocks writes so a delinquent account's storage
+    # cannot keep growing via bucket-ACL grants.
+    if bucket_owner_id is not None and bucket_owner_id != account_id:
         owner_suspension = await get_account_suspension(
             bucket_owner_id,
             request.app.state.postgres_pool,

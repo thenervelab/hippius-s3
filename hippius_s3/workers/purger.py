@@ -70,16 +70,19 @@ async def _purge_account(
                 if not rows:
                     break
                 for row in rows:
-                    backends = [b for b in (row["backends"] or []) if b]
                     # Real (object_id, version=None → all versions) payloads, resolvable
-                    # by the unpinner — never nuke_user.py's synthetic ones.
+                    # by the unpinner — never nuke_user.py's synthetic ones. delete_backends
+                    # is left None so enqueue fans out to the configured delete backends; the
+                    # unpinner's own per-request lookup is authoritative about what each
+                    # backend holds (see purge_soft_delete_objects_batch.sql for why the batch
+                    # no longer resolves backends itself).
                     await enqueue_unpin_request(
                         payload=UnpinChainRequest(
                             address=account_id,
                             object_id=str(row["object_id"]),
                             object_version=None,
                             ray_id=f"purge-{job_id}",
-                            delete_backends=backends or None,
+                            delete_backends=None,
                         )
                     )
                 deleted_objects += len(rows)
