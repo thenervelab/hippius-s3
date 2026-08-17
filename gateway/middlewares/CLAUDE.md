@@ -12,13 +12,7 @@ Innermost on the chain. Reads `X-Ray-ID` from the request (if set), or generates
 
 Gated by `ENABLE_AUDIT_LOGGING`. Records every request with method, path, account, status, latency. Delegates to [hippius_s3/services/audit_service.py](../../hippius_s3/services/audit_service.py) (shared with the internal API).
 
-### [metrics.py](metrics.py) — `metrics_middleware`
-
-Counts `http_requests_total`, records `http_request_duration_seconds`, and attributes errors by account. Bytes-in/bytes-out are recorded by `ForwardService` after streaming completes, not here.
-
-### [tracing.py](tracing.py) — `tracing_middleware`
-
-OpenTelemetry span lifecycle. Spans carry `hippius.ray_id`, `hippius.account.main`, and error stack traces. See [hippius_s3/otel_setup.py](../../hippius_s3/otel_setup.py) for collector config.
+Metrics and tracing for the merged app live in [hippius_s3/api/middlewares/](../../hippius_s3/api/middlewares/) — the gateway-side `metrics.py`/`tracing.py` shadows were deleted with the merge.
 
 ### [frontend_hmac.py](frontend_hmac.py) — `verify_frontend_hmac_middleware`
 
@@ -84,8 +78,8 @@ Not a middleware — a class used by `auth_orchestrator` and `access_key_auth`. 
 
 ## What's NOT registered today
 
-- [rate_limit.py](rate_limit.py) — code exists (token bucket on `redis-rate-limiting`), but not wired. Reason unclear from code alone — ask Radu.
-- [banhammer.py](banhammer.py) — IP-level banning based on infraction count. Threshold is 200 infractions per memory note (#2748). Not wired.
+- [rate_limit.py](rate_limit.py) — code exists (token bucket on `redis-rate-limiting`), but not wired. Reason unclear from code alone — ask Radu. Since the merge deleted `gateway/main.py` there is no registration site at all; wiring it means registering it in [hippius_s3/main.py](../../hippius_s3/main.py).
+- [banhammer.py](banhammer.py) — IP-level banning based on infraction count. Threshold is 200 infractions per memory note (#2748). Not wired; same registration story as rate_limit.
 
 See [todo.md](../../todo.md) P2 for re-enablement discussion.
 

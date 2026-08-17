@@ -422,9 +422,9 @@ class Config:
     # SERVE this node's flash to peers. Deliberately its own flag rather than a rider on
     # peer_fetch_enabled, which governs what this pod READS. Coupling them is how the serve
     # route came to be mounted on every api pod while the flag said the feature was off — and
-    # `ip_whitelist` never bounded it, because the gateway is a pod on that same network and
-    # proxies arbitrary paths from the internet. So this flag has to gate the mount, not just
-    # the behaviour.
+    # the (since-deleted) `ip_whitelist` never bounded it, because the pre-merge gateway was
+    # a pod on that same network proxying arbitrary paths from the internet. So this flag has
+    # to gate the mount, not just the behaviour.
     #
     # `x.lower() == "true"` and not `convert=bool`: `bool("false")` is True — and `env` runs
     # the converter on the ":false" default too, so `convert=bool` makes the flag DEFAULT-ON

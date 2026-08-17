@@ -1,6 +1,6 @@
 # gateway/services/
 
-Business-logic services used by the gateway middleware. No HTTP framing here — these are called from the middleware chain.
+Business-logic services used by the (formerly gateway-side) middleware chain of the merged app. No HTTP framing here — these are called from the middlewares registered in [hippius_s3/main.py](../../hippius_s3/main.py).
 
 ## [auth_orchestrator.py](auth_orchestrator.py) — `authenticate_request`
 
@@ -36,19 +36,9 @@ Bucket-level ACLs and object-level ACLs both supported. Public buckets are model
 
 For seed-phrase auth: given a seed, derive the SS58 subaccount ID via substrateinterface (called in an executor thread to avoid blocking — [account_service.py:29](account_service.py)), then fetch cached account data from `redis-accounts`. If missing, call the Substrate node.
 
-Populates `request.state.account` with main_account, has_credits, upload/delete flags. These propagate to the internal API as `X-Hippius-Main-Account` / `X-Hippius-Has-Credits` / `X-Hippius-Can-Upload` / `X-Hippius-Can-Delete`.
+Populates `request.state.account` with main_account, has_credits, upload/delete flags. Since the merge these flow to the S3 handlers directly via [request_context](../../hippius_s3/api/middlewares/request_context.py) (the `X-Hippius-*` header contract is dead — see the grep test in [tests/unit/test_request_context.py](../../tests/unit/test_request_context.py)).
 
-## [forward_service.py](forward_service.py) — `ForwardService`
-
-The proxy. See [../CLAUDE.md](../CLAUDE.md) for the streaming model. Key invariants:
-
-- Single shared `httpx.AsyncClient`, 100 max connections, 20 keepalive, 300s overall timeout, 10s connect timeout ([forward_service.py:60-64](forward_service.py)).
-- `_filter_hop_by_hop_raw_headers` ([forward_service.py:28-54](forward_service.py)) handles RFC 7230 hop-by-hop headers plus any named in the `Connection` header, and dedupes `date`/`server` (prevents `server: uvicorn, uvicorn`).
-- **Request body is streamed** via `request.stream()` ([forward_service.py:113-126](forward_service.py)). Never buffers — supports arbitrary-sized PUTs.
-- **Response body is streamed** via `iter_upstream()` ([forward_service.py:132-165](forward_service.py)). Records `bytes_sent` vs upstream `content-length` and warns on mismatch ([forward_service.py:148-157](forward_service.py)).
-- `raw_headers` on the response preserves multi-value headers (Set-Cookie, etc).
-
-**Not here**: retry logic. If the upstream API returns 5xx, gateway forwards it. If the upstream closes the connection mid-response, client sees truncation. See [todo.md](../../todo.md) P0 (postmortem) for the proposed 503+Retry-After work.
+**Removed in the 2026-08 merge**: `forward_service.py` (the streaming proxy to the internal api — no forward hop exists anymore) and `docs_proxy_service.py`.
 
 ## [sub_token_scope.py](sub_token_scope.py) — DORMANT
 

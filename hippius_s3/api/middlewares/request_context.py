@@ -17,7 +17,6 @@ load-bearing and must stay exactly what the header round-trip produced:
   credit/upload/delete flags.
 """
 
-import time
 from typing import Awaitable
 from typing import Callable
 
@@ -31,8 +30,6 @@ async def request_context_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    request.state.api_start_time = time.time()
-
     account_id = getattr(request.state, "account_id", "") or ""
     request.state.account_id = account_id
     request.state.request_user_id = account_id

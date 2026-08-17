@@ -13,22 +13,23 @@ Two properties bound the BLAST RADIUS of what it hands over:
   per-object-version DEK that never leaves the KMS path, so these bytes are useless without
   the envelope — this endpoint grants no read access the caller does not already have.
 
-Neither is an authorization argument, and the api's `ip_whitelist` middleware is not one
-either: the gateway is a pod on that same 10.x network and it proxies arbitrary paths straight
-off the internet, so "only pods can reach it" reduced to "anyone can" — a 200-vs-404 existence
-oracle and unmetered NVMe load on a pod that is also serving ingest. What actually bounds this
-route is a shared secret every peer presents (`hippius_s3/peer_auth.py`), which is sufficient
-only because the gateway strips every inbound `x-hippius-*` header before forwarding — so a
-client cannot supply the one this checks. The route is not mounted at all unless both
+Neither is an authorization argument. Network reachability never was one either: pre-merge
+the gateway proxied arbitrary paths straight off the internet from the same 10.x network,
+so the (since-deleted) `ip_whitelist` middleware's "only pods can reach it" reduced to
+"anyone can" — a 200-vs-404 existence oracle and unmetered NVMe load on a pod that is also
+serving ingest. What actually bounds this route is the shared secret every peer presents
+(`hippius_s3/peer_auth.py`), compared in constant time — since the merge the api faces
+clients directly, so the secret IS the authentication, with no header-strip in front of it
+(see the HISTORY note in peer_auth.py). The route is not mounted at all unless both
 `HIPPIUS_PEER_SERVE_ENABLED` and a secret are set, because an "authentication disabled" mode
 would be indistinguishable from the defect that made this paragraph necessary.
 
-The durable fix is a second uvicorn port for internal routes that the gateway has no route to,
-which would make the secret a second line rather than the only one. Not done here: it changes
-the Service and probe topology, so it is deployment work, not a code change.
+The durable fix is a second uvicorn port for internal routes that the public Service does
+not expose, which would make the secret a second line rather than the only one. Not done
+here: it changes the Service and probe topology, so it is deployment work, not a code change.
 
-Peers still address each other by POD IP rather than through a `hostPort` on the node IP, so
-that the traffic stays inside the ip_whitelist as well.
+Peers still address each other by POD IP rather than through a `hostPort` on the node IP,
+keeping peer traffic on the pod network.
 """
 
 from __future__ import annotations

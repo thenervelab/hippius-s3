@@ -4,6 +4,9 @@ import hmac
 import re
 from typing import TYPE_CHECKING
 
+from gateway.utils.paths import routing_path
+from hippius_s3.config import get_config
+
 
 # 64 hex characters, matching the shape CLAUDE.md already documents for HIPPIUS_SERVICE_KEY and
 # HIPPIUS_AUTH_ENCRYPTION_KEY. Neither of those is enforced in code; this one is, because a
@@ -91,15 +94,16 @@ def is_authorized_peer_fetch(request: "Request") -> bool:
     fetches from the S3 pipeline (validation, auth, credit, ACL). Fail-closed by
     construction: no secret configured, wrong secret, or any other path → False,
     and the request faces the normal S3 middleware wall.
-    """
-    from gateway.utils.paths import routing_path
-    from hippius_s3.config import get_config
 
-    if request.method != "GET":
+    Header checked first: client traffic never carries it, so the common case
+    bails before any path decoding or config lookup.
+    """
+    presented = request.headers.get(PEER_AUTH_HEADER)
+    if presented is None or request.method != "GET":
         return False
     if not routing_path(request).startswith("/internal/parts/"):
         return False
     config = get_config()
     if not config.peer_serve_enabled:
         return False
-    return peer_auth_matches(request.headers.get(PEER_AUTH_HEADER), config.internal_peer_secret)
+    return peer_auth_matches(presented, config.internal_peer_secret)

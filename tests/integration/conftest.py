@@ -356,10 +356,11 @@ async def gateway_app(
     # chain touches. Handler-level state (fs_store, obj_cache, ...) is deliberately
     # absent — these tests exercise auth/middleware behavior, and requests bottom
     # out at DB-backed 404s before reaching storage.
-    app.state.config = __import__("hippius_s3.config", fromlist=["get_config"]).get_config()
+    from hippius_s3.config import get_config
+
+    app.state.config = get_config()
     app.state.postgres_pool = gateway_db_pool
     app.state.redis_client = gateway_redis_clients["redis"]
-    app.state.redis_accounts = gateway_redis_clients["redis_accounts"]
     app.state.redis_accounts_client = gateway_redis_clients["redis_accounts"]
     app.state.redis_rate_limiting = gateway_redis_clients["redis_rate_limiting"]
 

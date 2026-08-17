@@ -116,7 +116,7 @@ def _make_can_upload_app(
     mock_redis_accounts = AsyncMock()
     mock_redis_accounts.get = AsyncMock(return_value=None)
     mock_redis_accounts.set = AsyncMock()
-    app.state.redis_accounts = mock_redis_accounts
+    app.state.redis_accounts_client = mock_redis_accounts
     app.state.arion_client = mock_arion
 
     @app.api_route("/test-bucket/test-key", methods=["GET", "PUT", "POST", "DELETE", "HEAD"])
@@ -330,7 +330,7 @@ def _make_can_upload_app_with_redis(
     )
 
     app = FastAPI()
-    app.state.redis_accounts = mock_redis_accounts
+    app.state.redis_accounts_client = mock_redis_accounts
     app.state.arion_client = mock_arion
 
     @app.api_route("/test-bucket/test-key", methods=["GET", "PUT", "POST", "DELETE", "HEAD"])
@@ -474,7 +474,7 @@ async def test_gw4_get_skips_account_fetch_but_put_fetches(mock_config_no_bypass
     monkeypatch.setattr(account_mod, "_check_can_upload", AsyncMock(return_value=None))
 
     app = FastAPI()
-    app.state.redis_accounts = AsyncMock()
+    app.state.redis_accounts_client = AsyncMock()
 
     @app.api_route("/b/k", methods=["GET", "PUT"])
     async def ep(request: Request) -> dict[str, str]:

@@ -29,6 +29,7 @@ from hippius_s3.models.acl import GranteeType
 from hippius_s3.models.acl import Owner
 from hippius_s3.models.acl import Permission
 from hippius_s3.models.acl import validate_grant_grantees
+from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
 
 
 logger = logging.getLogger(__name__)
@@ -594,14 +595,15 @@ async def acl_subresource_middleware(
     """
     if request.method not in ("GET", "PUT"):
         return await call_next(request)
+    # Hot-path GETs (no ?acl) take nothing from this middleware; bail before any path work.
+    if request.method == "GET" and "acl" not in request.query_params:
+        return await call_next(request)
 
     bucket, key = parse_s3_path(routing_path(request))
     if not bucket:
         return await call_next(request)
     # Reserved segments (health, docs, user, ...) are app routes, never buckets — the
     # old shadow-routes couldn't intercept them either (real routes matched first).
-    from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
-
     if bucket in RESERVED_BUCKET_SEGMENTS:
         return await call_next(request)
 

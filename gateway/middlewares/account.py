@@ -115,7 +115,7 @@ async def _check_can_upload(
     )
     main_account = request.state.account.main_account
     arion_client = request.app.state.arion_client
-    redis_accounts = request.app.state.redis_accounts
+    redis_accounts = request.app.state.redis_accounts_client
 
     # Check cache before calling Arion (avoids rate limiting on multipart uploads)
     cache_key = f"can_upload:{main_account}"
@@ -254,7 +254,7 @@ async def account_middleware(
                     delete=False,
                 )
             else:
-                redis_accounts_client = request.app.state.redis_accounts
+                redis_accounts_client = request.app.state.redis_accounts_client
                 request.state.account = await fetch_account_by_main_address(
                     account_address,
                     redis_accounts_client,

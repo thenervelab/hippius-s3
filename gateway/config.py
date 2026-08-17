@@ -14,14 +14,6 @@ def _parse_csv(value: str) -> list[str]:
 
 @dataclasses.dataclass
 class GatewayConfig:
-    database_url: str = dataclasses.field(default_factory=lambda: os.getenv("DATABASE_URL", ""))
-    redis_url: str = dataclasses.field(default_factory=lambda: os.getenv("REDIS_URL", "redis://redis:6379/0"))
-    redis_accounts_url: str = dataclasses.field(
-        default_factory=lambda: os.getenv("REDIS_ACCOUNTS_URL", "redis://redis-accounts:6379/0")
-    )
-    redis_rate_limiting_url: str = dataclasses.field(
-        default_factory=lambda: os.getenv("REDIS_RATE_LIMITING_URL", "redis://redis-rate-limiting:6379/0")
-    )
     redis_acl_url: str = dataclasses.field(
         default_factory=lambda: os.getenv("REDIS_ACL_URL", "redis://redis-acl:6379/0")
     )

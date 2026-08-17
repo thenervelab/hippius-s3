@@ -36,7 +36,7 @@ def integration_app() -> Any:
         return BucketLookup(owner_id=owner, bucket_id=bid, is_cache_warm=False)
 
     app.state.acl_service.get_bucket_owner_and_id = AsyncMock(side_effect=_default_owner_and_id)
-    app.state.redis_accounts = AsyncMock()
+    app.state.redis_accounts_client = AsyncMock()
     app.state.redis_client = AsyncMock()
     # Cache misses by default so the sub-token branch goes to the repo.
     app.state.redis_client.get = AsyncMock(return_value=None)

@@ -28,10 +28,9 @@ The pipeline is deliberately split so the user-facing path (gateway + API) is fa
 
 ```
 .
-├── gateway/                 # Public-facing FastAPI on :8080 — auth, ACL, forward
-│   ├── middlewares/         # Auth chain, CORS, input validation, HMAC, etc.
-│   ├── services/            # auth_orchestrator, acl_service, auth cache, ATS purge client
-│   └── routers/             # /docs proxy, /acl endpoints
+├── gateway/                 # Middleware + auth service package (no app of its own since the merge)
+│   ├── middlewares/         # Auth chain, CORS, input validation, HMAC, ?acl dispatch, etc.
+│   └── services/            # auth_orchestrator, acl_service, auth cache, ATS purge client
 ├── hippius_s3/              # Main package
 │   ├── api/                 # Internal FastAPI on :8000
 │   │   ├── middlewares/     # request_context, fs_cache_pressure, metrics, tracing

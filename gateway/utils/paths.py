@@ -60,8 +60,17 @@ def routing_path(request: Request) -> str:
     where the path starts, and the api's answer is the one that matters — it is what actually
     routes. Layers disagreeing on that is how `/docs/../anybucket/key` skipped authentication
     while being served from `anybucket`.
+
+    Memoized per request on the ASGI scope: the merged middleware stack calls this from
+    several layers, and the value is a pure function of `raw_path`, which nothing mutates —
+    so every caller sees the identical view whether it computes or reads the cache.
     """
-    return forwarded_path(decoded_path(request))
+    cached = request.scope.get("_hippius_routing_path")
+    if cached is not None:
+        return str(cached)
+    path = forwarded_path(decoded_path(request))
+    request.scope["_hippius_routing_path"] = path
+    return path
 
 
 def first_path_segment(request: Request) -> str:

@@ -136,8 +136,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Redis client initialized")
 
         app.state.redis_accounts_client = async_redis.from_url(config.redis_accounts_url)
-        # The account middleware (formerly gateway-side) reads this name.
-        app.state.redis_accounts = app.state.redis_accounts_client
         logger.info("Redis accounts client initialized")
 
         app.state.redis_rate_limiting_client = async_redis.from_url(config.redis_rate_limiting_url)
@@ -162,8 +160,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         from hippius_s3.services.hippius_api_service import HippiusApiClient
 
         app.state.arion_client = ArionClient(
-            base_url=gateway_config.arion_base_url,
-            service_key=gateway_config.arion_service_key,
+            base_url=config.arion_base_url,
+            service_key=config.arion_service_key,
         )
         logger.info("ArionClient initialized")
 
@@ -493,8 +491,6 @@ def factory() -> FastAPI:
 
     app.openapi = custom_openapi  # ty: ignore[invalid-assignment]
 
-    gateway_config = get_gateway_config()
-
     # Starlette: last-registered = outermost. On the request path, outer
     # middlewares run first; the handler runs last; the response unwinds back
     # through them. The list below is ordered innermost → outermost. This is
@@ -526,7 +522,7 @@ def factory() -> FastAPI:
     # Outer to request_context on purpose: the audit log attributes operations to the
     # CALLER (request.state.account as the account middleware built it); request_context
     # then rewrites state.account with bucket-owner semantics for the handlers/metrics.
-    if gateway_config.enable_audit_logging:
+    if config.enable_audit_logging:
         app.middleware("http")(audit_log_middleware)
     app.middleware("http")(verify_frontend_hmac_middleware)
     app.middleware("http")(acl_middleware)
@@ -535,7 +531,7 @@ def factory() -> FastAPI:
     app.middleware("http")(auth_router_middleware)
     app.middleware("http")(input_validation_middleware)
     app.middleware("http")(fs_cache_pressure_middleware)
-    if gateway_config.read_only_mode:
+    if config.read_only_mode:
         app.middleware("http")(read_only_middleware)
     # Inside CORS so Cache-Control lands before CORS wraps the response.
     app.middleware("http")(cache_invalidation_middleware)

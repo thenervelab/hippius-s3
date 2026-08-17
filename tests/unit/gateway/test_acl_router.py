@@ -343,12 +343,9 @@ class TestGetBucketAcl:
 
     async def test_get_bucket_acl_without_query_param_doesnt_call_service(self) -> None:
         mock_service = AsyncMock()
-        mock_forward = AsyncMock()
-        mock_forward.forward_request.return_value = Response(status_code=200)
 
         app = FastAPI()
         app.state.acl_service = mock_service
-        app.state.forward_service = mock_forward
         app.middleware("http")(acl_subresource_middleware)
 
         @app.get("/{bucket}")
@@ -420,12 +417,9 @@ class TestGetObjectAcl:
 
     async def test_get_object_acl_without_query_param_doesnt_call_service(self) -> None:
         mock_service = AsyncMock()
-        mock_forward = AsyncMock()
-        mock_forward.forward_request.return_value = Response(status_code=200)
 
         app = FastAPI()
         app.state.acl_service = mock_service
-        app.state.forward_service = mock_forward
         app.middleware("http")(acl_subresource_middleware)
 
         @app.get("/{bucket}/{key:path}")
