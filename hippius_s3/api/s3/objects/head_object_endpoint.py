@@ -111,7 +111,9 @@ async def handle_head_object(
     # Backend trusts the account information from gateway
     account = getattr(request.state, "account", None)
 
-    main_account_id = account.main_account if account else "anonymous"
+    # Storage attribution is the bucket owner (caller fallback), not the caller — the account
+    # split moved this off the rebound account.main_account onto its own state key.
+    main_account_id = request.state.main_account_id
 
     # Parse versionId query parameter
     version_id = None
