@@ -1,21 +1,25 @@
 # hippius_s3/api/middlewares/
 
-API-side middleware. All of these assume `X-Hippius-*` headers are trustworthy — the gateway is responsible for setting/stripping them.
+API-side middleware, composed with the gateway middlewares into the single merged app —
+the full chain and its ordering invariants are documented at the registration site in
+[hippius_s3/main.py](../../main.py) and in [gateway/CLAUDE.md](../../../gateway/CLAUDE.md).
+There is no `X-Hippius-*` header contract anymore: auth state flows through
+`request.state` directly.
 
-Registration order at [hippius_s3/main.py:304-308](../../main.py): `metrics → tracing → parse_internal_headers → ip_whitelist → fs_cache_pressure`. Reverse order = outer-most → inner-most on the request path.
+## [request_context.py](request_context.py) — `request_context_middleware`
 
-## [parse_internal_headers.py](parse_internal_headers.py) — `parse_internal_headers_middleware`
+The state-to-state successor of the deleted `parse_internal_headers` (and of the
+gateway's `ForwardService` header injection). Runs just inside the acl middleware and
+derives what S3 handlers consume:
 
-Translates `X-Hippius-*` request headers into `request.state` so downstream endpoints don't each re-parse them. Populated ([parse_internal_headers.py:19-68](parse_internal_headers.py)):
+- `request.state.request_user_id` / `.account_id` — the authenticated caller (empty for anonymous).
+- `request.state.bucket_owner_id` — from the acl middleware, falling back to the caller.
+- `request.state.account` — `HippiusAccount` whose **`main_account` is the bucket owner**
+  (storage attribution), with credit/upload/delete flags carried from the caller's account.
+- `request.state.bucket_id` — stringified, `""` when unresolved.
 
-- `request.state.ray_id` ← `X-Hippius-Ray-ID`
-- `request.state.request_user_id`, `.account_id` ← `X-Hippius-Request-User`
-- `request.state.bucket_owner_id` ← `X-Hippius-Bucket-Owner`
-- `request.state.seed_phrase` ← `X-Hippius-Seed` (only set on seed-phrase auth)
-- `request.state.account` ← `HippiusAccount(main_account, has_credits, upload, delete, id)` built from the header bundle. `has_credits`/`upload`/`delete` are parsed from `"True"`/`"False"` strings.
-- `request.state.gateway_time_ms` ← `X-Hippius-Gateway-Time-Ms` as a float.
-
-If the gateway didn't send these (e.g. a unit test calls the API directly), the middleware populates safe defaults.
+Pinned by [tests/unit/test_request_context.py](../../../tests/unit/test_request_context.py),
+including the header-inertness property (client-sent `X-Hippius-*` headers must do nothing).
 
 ## [fs_cache_pressure.py](fs_cache_pressure.py) — `fs_cache_pressure_middleware`
 
@@ -29,17 +33,9 @@ Gates PUT writes when the FS cache disk is under pressure. Flow ([fs_cache_press
 
 Threshold is configurable (see [hippius_s3/config.py](../../config.py)); today it's ~90%.
 
-## [ip_whitelist.py](ip_whitelist.py) — `ip_whitelist_middleware`
-
-Defence-in-depth: the API rejects with 403 any client address outside `API_IP_WHITELIST_CIDRS` (comma-separated CIDRs, default `10.0.0.0/8,172.16.0.0/12,127.0.0.1/32,::1/128`). `/health` is exempt so kubelet can probe from the node IP. Normally k8s NetworkPolicy provides the primary barrier — this is belt-and-braces for when the policy is misconfigured or the API is port-forwarded during debug.
-
-Note RFC1918's middle block is `172.16.0.0/12`, **not** all of `172/8` — `172.15.x` and `172.32.x` are public address space. `192.168.0.0/16` is RFC1918 but deliberately excluded: nothing here runs on it (pod networks are 10.x, docker-compose bridges land in 172.16/12), and this list is the API's authorization boundary, so an unused range is boundary carried for free.
-
-The list is parsed into `ipaddress` network objects once, when the Config singleton is built, and an unparseable client address is a 403 rather than a 500. IPv4-mapped IPv6 addresses are normalised first (`::ffff:10.0.0.1` → `10.0.0.1`), so a dual-stack listener does not 403 every forwarded request and take the API down. Narrow the list to the real pod/service CIDRs per deployment if you want a tighter boundary; a value that fails to cover the gateway takes the API down, which is why the default is not pinned to one cluster's ranges.
-
 ## [metrics.py](metrics.py) — `metrics_middleware`
 
-OTel counters for `http_requests_total`, duration histogram, account-attributed error counts. Paired with `recorded_gateway_bandwidth` from the gateway's forward service.
+OTel counters for `http_requests_total`, duration histogram, account-attributed error counts; stamps `X-Hippius-API-Time-Ms` on responses.
 
 ## [tracing.py](tracing.py) — `tracing_middleware`
 

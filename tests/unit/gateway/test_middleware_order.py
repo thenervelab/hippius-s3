@@ -29,7 +29,7 @@ def _dispatch_order(app: Any) -> list[str | None]:
 
 
 def test_ray_id_runs_before_auth_acl_account_and_inside_cors() -> None:
-    from gateway.main import factory
+    from hippius_s3.main import factory
 
     order = _dispatch_order(factory())
 
@@ -44,3 +44,34 @@ def test_ray_id_runs_before_auth_acl_account_and_inside_cors() -> None:
     assert idx("ray_id_middleware") < idx("account_middleware"), order
     # CORS stays the absolute outermost so it still wraps error responses (incl. the ray_id header).
     assert idx("cors_middleware") < idx("ray_id_middleware"), order
+
+
+def test_merged_chain_keeps_auth_outside_the_trusting_middlewares() -> None:
+    """Post gateway/api merge, the app no longer has an internal trusted surface —
+    every middleware/handler that used to trust gateway-stamped headers is one
+    ordering mistake away from the internet. Pin the orderings that make the
+    trust structural.
+    """
+    from hippius_s3.main import factory
+
+    order = _dispatch_order(factory())
+
+    def idx(name: str) -> int:
+        assert name in order, f"{name} not registered; order={order}"
+        return order.index(name)
+
+    # Lower index == outer == runs earlier on the request path.
+    # auth_probe answers 200 to the shared-secret PURGE bounce; acl_subresource
+    # serves/creates ACLs. Neither may run before auth_router+acl have validated.
+    assert idx("auth_router_middleware") < idx("auth_probe_middleware"), order
+    assert idx("acl_middleware") < idx("auth_probe_middleware"), order
+    assert idx("auth_router_middleware") < idx("acl_subresource_middleware"), order
+    assert idx("acl_middleware") < idx("acl_subresource_middleware"), order
+    # request_context rebuilds request.state.account from what account+acl resolved,
+    # so it must be inner to both and outer to everything that consumes the account
+    # with bucket-owner semantics (metrics, audit, the routers).
+    assert idx("acl_middleware") < idx("request_context_middleware"), order
+    assert idx("account_middleware") < idx("request_context_middleware"), order
+    assert idx("request_context_middleware") < idx("metrics_middleware"), order
+    # Pressure shedding stays outside auth: a shed PUT must cost no SigV4/Arion work.
+    assert idx("fs_cache_pressure_middleware") < idx("auth_router_middleware"), order

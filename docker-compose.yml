@@ -7,53 +7,11 @@ services:
       context: .
       dockerfile: Dockerfile.base
 
-  gateway:
-    build:
-      context: .
-      dockerfile: gateway/Dockerfile
-    ports:
-      - "${HOST_BIND_IP:-127.0.0.1}:8080:8080"
-    env_file:
-      - .env.defaults
-      - .env
-    depends_on:
-      api:
-        condition: service_healthy
-      arion-uploader:
-        condition: service_healthy
-      arion-downloader:
-        condition: service_healthy
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-accounts:
-        condition: service_healthy
-      redis-rate-limiting:
-        condition: service_healthy
-      redis-acl:
-        condition: service_healthy
-    volumes:
-      - .:/app
-    restart: unless-stopped
-    environment:
-      - PYTHONUNBUFFERED=1
-      - GATEWAY_BACKEND_URL=http://api:8000
-      - GATEWAY_PORT=8080
-      - HIPPIUS_BYPASS_CREDIT_CHECK=false
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
-      interval: 60s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    networks:
-      - hippius_net
-
   api:
     build:
       context: .
-    # No external ports - only accessible via proxy on internal network
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:8080:8000"
     env_file:
       - .env.defaults
       - .env

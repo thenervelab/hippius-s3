@@ -1,20 +1,22 @@
 # gateway/
 
-Public-facing FastAPI service on port 8080. **This is the only hippius-s3 component exposed to the internet.** Its job is to authenticate, authorize, rate-limit (when enabled), audit, and **forward** to the internal API.
+**This is no longer a standalone service.** The gateway merged into the api (one FastAPI
+app, one uvicorn): this package now holds the edge-facing middleware chain (auth, ACL,
+validation, audit, purge, CORS), its services (auth orchestrator, ACLService, auth cache,
+ATS purge client) and the `?acl` subresource handlers — all composed into the single app
+by [hippius_s3/main.py `factory()`](../hippius_s3/main.py).
 
-See [../CLAUDE.md](../CLAUDE.md) for the full architectural map. This file covers gateway internals.
-
-## Entry
-
-- [gateway/main.py:43 `factory()`](main.py) — FastAPI factory. Launched by uvicorn with `factory=True`.
-- Startup ([main.py:52](main.py)) creates the Postgres pool, four Redis clients (general, accounts, rate-limiting, ACL), the `ForwardService` / `ACLService` / `DocsProxyService` / `ArionClient`, and a background task that exports Postgres pool metrics every 60s.
-- Shutdown ([main.py:131](main.py)) closes all of them in reverse order.
-
-There is **no** business logic here — the gateway never touches chunk data. It proxies.
+What disappeared in the merge: `gateway/main.py` (the second app factory),
+`ForwardService` (the HTTP relay to `api:8000`), the `X-Hippius-*` trusted-header
+contract (replaced by [hippius_s3/api/middlewares/request_context.py](../hippius_s3/api/middlewares/request_context.py)
+mapping `request.state` directly), the docs proxy, and the api's `ip_whitelist` /
+`parse_internal_headers` middlewares. There is no internal HTTP hop anymore; auth is
+structural — enforced by middleware order, pinned by
+[tests/unit/gateway/test_middleware_order.py](../tests/unit/gateway/test_middleware_order.py).
 
 ## Middleware chain
 
-Registered at [main.py:181-197](main.py). FastAPI's `@app.middleware("http")` stacks in reverse order (last-registered = outermost). On the request path, this runs top-to-bottom:
+Registered in [hippius_s3/main.py](../hippius_s3/main.py) (search for `acl_subresource_middleware`). FastAPI's `@app.middleware("http")` stacks in reverse order (last-registered = outermost). On the request path, the chain runs: cors → ray_id → cache_control → ats_purge → cache_invalidation → [read_only] → fs_cache_pressure → input_validation → auth_router → trailing_slash → account → acl → request_context → frontend_hmac → tracing → metrics → [audit_log] → auth_probe → acl_subresource → routers.
 
 | # | Middleware | Purpose | Short-circuit |
 |---|-----------|---------|---------------|
@@ -35,26 +37,12 @@ Registered at [main.py:181-197](main.py). FastAPI's `@app.middleware("http")` st
 
 ## Routing
 
-[main.py:171-179](main.py):
-
-- `GET /docs`, `GET /redoc`, `GET /openapi.json`, `DELETE /docs/cache` — via [gateway/routers/docs.py](routers/docs.py).
-- **`gateway/routers/acl.py` has NO `/acl` prefix.** `router = APIRouter()` is included bare ([main.py:190](main.py)), so it registers `GET|PUT /{bucket}` and `GET|PUT /{bucket}/{key:path}` **at the root** — every S3 request matches one of these first. Each handler takes `acl: str | None = Query(default=None)` and calls `forward_service.forward_request(request)` when `?acl` is absent, so normal traffic is forwarded from inside the ACL handler rather than from the catch-all. There is no `/acl` path in the gateway, and no `/static` mount either.
-- `/{path:path}` — catch-all for methods the ACL router doesn't declare (POST, DELETE, HEAD, PATCH), forwarding through `ForwardService.forward_request` ([gateway/services/forward_service.py:67](services/forward_service.py)).
-- `GET /health` — simple 200 `{"status": "healthy", "service": "gateway"}`. Does **not** check downstream deps (noted as a P1 improvement in [ha.md](../ha.md)).
-
-## Forwarding model (important)
-
-`ForwardService` uses a single shared `httpx.AsyncClient` with `Timeout(300, connect=10)`, `max_connections=100`, `max_keepalive_connections=20` ([forward_service.py:60-64](services/forward_service.py)). Requests are:
-
-1. Client headers cleaned up: any `X-Hippius-*` stripped to prevent header injection ([forward_service.py:71-74](services/forward_service.py)).
-2. Trusted headers injected from `request.state`:
-   - `X-Hippius-Ray-ID`, `X-Hippius-Request-User`, `X-Hippius-Bucket-Owner`, `X-Hippius-Main-Account`, `X-Hippius-Seed` (if seed auth), `X-Hippius-Has-Credits`, `X-Hippius-Can-Upload`, `X-Hippius-Can-Delete`, `X-Hippius-Gateway-Time-Ms`.
-3. Hop-by-hop headers (`host`, `x-forwarded-for`, `x-forwarded-host`) removed.
-4. Body is **streamed** (`request.stream()`), not buffered — never load a full PUT into gateway RAM.
-5. Response is also streamed back via `StreamingResponse`, with hop-by-hop headers filtered ([forward_service.py:28-54](services/forward_service.py)).
-6. If the upstream closes early and `bytes_sent < content-length`, log a warning ([forward_service.py:148-157](services/forward_service.py)).
-
-Implication: **there is no duplicate request body read**, but there's a full TCP hop per request. See [todo.md](../todo.md) P2 for the "merge gateway + API" discussion.
+Routes now live on the merged app ([hippius_s3/main.py](../hippius_s3/main.py)); this
+package contributes no routers. The `?acl` subresource is handled by
+[gateway/middlewares/acl_subresource.py](middlewares/acl_subresource.py) — the innermost
+middleware: it answers `GET|PUT` with `?acl`, validates canned-ACL headers before writes,
+materializes an object ACL after a successful `PutObject` carrying `x-amz-acl`, and passes
+everything else through to the S3 routers.
 
 ## Authentication at a glance
 

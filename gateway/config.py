@@ -14,8 +14,6 @@ def _parse_csv(value: str) -> list[str]:
 
 @dataclasses.dataclass
 class GatewayConfig:
-    backend_url: str = dataclasses.field(default_factory=lambda: os.getenv("GATEWAY_BACKEND_URL", "http://api:8000"))
-    port: int = dataclasses.field(default_factory=lambda: int(os.getenv("GATEWAY_PORT", "8080")))
     database_url: str = dataclasses.field(default_factory=lambda: os.getenv("DATABASE_URL", ""))
     redis_url: str = dataclasses.field(default_factory=lambda: os.getenv("REDIS_URL", "redis://redis:6379/0"))
     redis_accounts_url: str = dataclasses.field(
@@ -122,12 +120,6 @@ class GatewayConfig:
     hippius_secret_decryption_material: str = dataclasses.field(
         default_factory=lambda: os.getenv("HIPPIUS_AUTH_ENCRYPTION_KEY", "")
     )
-    enable_api_docs: bool = dataclasses.field(
-        default_factory=lambda: os.getenv("ENABLE_API_DOCS", "true").lower() == "true"
-    )
-    docs_cache_ttl_seconds: int = dataclasses.field(
-        default_factory=lambda: int(os.getenv("DOCS_CACHE_TTL_SECONDS", "300"))
-    )
     db_pool_min_size: int = dataclasses.field(default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_MIN_SIZE", "10")))
     db_pool_max_size: int = dataclasses.field(default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_MAX_SIZE", "50")))
     db_pool_max_queries: int = dataclasses.field(
@@ -178,5 +170,5 @@ def get_config() -> GatewayConfig:
     global _config
     if _config is None:
         _config = GatewayConfig()
-        logger.info(f"Gateway config loaded: backend_url={_config.backend_url}, port={_config.port}")
+        logger.info("Gateway config loaded")
     return _config

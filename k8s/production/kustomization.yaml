@@ -51,11 +51,19 @@ patches:
         path: /spec/selector
         value:
           app: api-local
+  # Same swap for the gateway alias Service (see k8s/base/services.yaml): the merged
+  # api-local fleet is what answers on gateway:8080 now.
+  - target:
+      kind: Service
+      name: gateway
+    patch: |-
+      - op: replace
+        path: /spec/selector
+        value:
+          app: api-local
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api
-    newTag: latest
-  - name: ghcr.io/thenervelab/hippius-s3/gateway
     newTag: latest
   - name: ghcr.io/thenervelab/hippius-s3/workers
     newTag: latest

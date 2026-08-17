@@ -1,21 +1,4 @@
 services:
-  gateway:
-    env_file:
-      - .env.defaults
-      - .env.test-docker
-    environment:
-      - HIPPIUS_BYPASS_CREDIT_CHECK=true
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
-    depends_on:
-      api:
-        condition: service_started
-      arion-uploader:
-        condition: service_started
-      arion-downloader:
-        condition: service_started
-
   api:
     build: .
     env_file:

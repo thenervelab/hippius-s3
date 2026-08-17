@@ -48,7 +48,8 @@ spec:
         - ipBlock:
             cidr: 0.0.0.0/0
       ports:
-        - port: 8080
+        # The merged api (formerly fronted by the gateway on 8080) is the public entry.
+        - port: 8000
           protocol: TCP
   egress:
     - to:
