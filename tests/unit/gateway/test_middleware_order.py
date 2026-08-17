@@ -44,3 +44,27 @@ def test_ray_id_runs_before_auth_acl_account_and_inside_cors() -> None:
     assert idx("ray_id_middleware") < idx("account_middleware"), order
     # CORS stays the absolute outermost so it still wraps error responses (incl. the ray_id header).
     assert idx("cors_middleware") < idx("ray_id_middleware"), order
+
+
+def test_suspension_runs_after_auth_router_and_outer_to_account_acl() -> None:
+    """Issue #421: suspension must see resolved identity (inner to auth_router) but run
+    OUTER to account/acl — master tokens bypass ACL on their own buckets, and
+    account_middleware clobbers account_id for bearer auth."""
+    from gateway.main import factory
+
+    order = _dispatch_order(factory())
+
+    def idx(name: str) -> int:
+        assert name in order, f"{name} not registered; order={order}"
+        return order.index(name)
+
+    assert idx("auth_router_middleware") < idx("suspension_middleware"), order
+    assert idx("suspension_middleware") < idx("account_middleware"), order
+    assert idx("suspension_middleware") < idx("acl_middleware"), order
+
+
+def test_admin_hmac_is_registered() -> None:
+    from gateway.main import factory
+
+    order = _dispatch_order(factory())
+    assert "verify_admin_hmac_middleware" in order, order

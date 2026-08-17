@@ -128,6 +128,12 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: FRONTEND_HMAC_SECRET
+            - name: HIPPIUS_ADMIN_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_ADMIN_HMAC_SECRET
+                  optional: true
             - name: HIPPIUS_UPLOAD_BACKENDS
               valueFrom:
                 secretKeyRef:

@@ -18,6 +18,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from hippius_s3.api.admin import router as admin_router
 from hippius_s3.api.middlewares.fs_cache_pressure import fs_cache_pressure_middleware
 from hippius_s3.api.middlewares.ip_whitelist import ip_whitelist_middleware
 from hippius_s3.api.middlewares.metrics import metrics_middleware
@@ -361,6 +362,7 @@ Disallow: /"""
 
     app.include_router(user_router, prefix="/user")
     app.include_router(sub_token_scopes_router, prefix="/user/sub-tokens")
+    app.include_router(admin_router, prefix="/admin")
     app.include_router(public_router, prefix="")
     app.include_router(s3_router_new, prefix="")
 

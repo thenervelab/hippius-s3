@@ -999,3 +999,150 @@ spec:
             limits:
               cpu: 100m
               memory: 128Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: purger
+
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: purger
+  template:
+    metadata:
+      labels:
+        app: purger
+        worker-type: purger
+    spec:
+      # Same drain rationale as the other workers: run_worker() cancels on SIGTERM and
+      # the cleanup closing the asyncpg pool is what stops a batch statement outliving
+      # the pod and pinning the xmin horizon.
+      terminationGracePeriodSeconds: 40
+      initContainers:
+        - name: wait-for-services
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+        # Gate on migrations: the purger reads account_suspensions/purge_jobs, which only
+        # exist once 20260817* have applied.
+        - name: wait-for-migrations
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          command:
+            - python
+            - scripts/wait_for_migrations.py
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+      containers:
+        - name: purger
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: OTEL_SERVICE_NAME
+              value: "hippius-s3-purger"
+            - name: WORKER_SCRIPT
+              value: "workers/run_purger_in_loop.py"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_URL
+            - name: REDIS_ACCOUNTS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_ACCOUNTS_URL
+            - name: REDIS_QUEUES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_QUEUES_URL
+            - name: HIPPIUS_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
+            - name: HIPPIUS_AUTH_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_AUTH_ENCRYPTION_KEY
+            - name: FRONTEND_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: FRONTEND_HMAC_SECRET
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DISCORD_WEBHOOK_URL
+            - name: HIPPIUS_OVH_KMS_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_ENDPOINT
+            - name: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+            - name: HIPPIUS_OVH_KMS_OKMS_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_OKMS_ID
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
