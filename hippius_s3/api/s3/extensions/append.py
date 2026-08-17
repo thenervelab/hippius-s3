@@ -129,7 +129,7 @@ async def handle_append(
                 bucket_name=bucket_name,
                 object_key=object_key,
                 expected_version=int(expected_version),
-                account_address=request.state.account.main_account,
+                account_address=request.state.main_account_id,
                 body_iter=body_iter,
             )
         except AppendPreconditionFailed as exc:
@@ -172,7 +172,7 @@ async def handle_append(
             request.app.state.postgres_pool,
             object_id=str(object_id),
             object_version=int(object_version),
-            address=request.state.account.main_account,
+            address=request.state.main_account_id,
             only_if_null=True,  # AP-2: no-op when already set; only fills a legacy NULL row
         )
         with contextlib.suppress(Exception):

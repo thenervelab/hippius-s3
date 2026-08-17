@@ -49,7 +49,7 @@ async def get_object(
     # Handle query variants by delegation
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
-            return await tags_get_object_tags(bucket_name, object_key, conn, request.state.account.main_account)
+            return await tags_get_object_tags(bucket_name, object_key, conn, request.state.main_account_id)
     if "uploadId" in request.query_params:
         async with pool.acquire() as conn:
             return await list_parts_internal(bucket_name, object_key, request, conn)
@@ -71,9 +71,7 @@ async def put_object(
         return await upload_part(request, pool)
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
-            return await tags_set_object_tags(
-                bucket_name, object_key, request, conn, request.state.account.main_account
-            )
+            return await tags_set_object_tags(bucket_name, object_key, request, conn, request.state.main_account_id)
     if request.headers.get("x-amz-copy-source"):
         return await handle_copy_object(bucket_name, object_key, request, pool, redis_client)
     return await handle_put_object(bucket_name, object_key, request, pool, redis_client)
@@ -92,7 +90,7 @@ async def delete_object(
             return await abort_multipart_upload(bucket_name, object_key, request, conn)
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
-            return await tags_delete_object_tags(bucket_name, object_key, conn, request.state.account.main_account)
+            return await tags_delete_object_tags(bucket_name, object_key, conn, request.state.main_account_id)
     # Bound the acquire: the delete handler holds this connection across the
     # multipart_uploads cleanup, which can be a multi-second scan on large buckets.
     # A bare pool.acquire() would block indefinitely and pin a pool slot under load;

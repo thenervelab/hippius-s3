@@ -209,7 +209,7 @@ async def handle_streaming_copy(
             "ray_id": getattr(request.state, "ray_id", None),
         },
         rng=None,
-        address=request.state.account.main_account,
+        address=request.state.main_account_id,
         bound_first_chunk=True,  # A2: fail fast (503) if the source is still draining, before writing the destination
     )
 
@@ -220,7 +220,7 @@ async def handle_streaming_copy(
         bucket_name=dest_bucket["bucket_name"],
         object_id=object_id,
         object_key=object_key,
-        account_address=request.state.account.main_account,
+        account_address=request.state.main_account_id,
         content_type=content_type,
         metadata=metadata,
         storage_version=config.target_storage_version,
@@ -235,7 +235,7 @@ async def handle_streaming_copy(
             pool,
             object_id=str(put_res.object_id),
             object_version=int(put_res.object_version),
-            address=request.state.account.main_account,
+            address=request.state.main_account_id,
         )
     except Exception:
         # B4: put_simple_stream_full already made the version serveable (size/md5 written). If the

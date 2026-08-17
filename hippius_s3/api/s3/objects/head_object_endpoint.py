@@ -148,9 +148,10 @@ async def handle_head_object(
                 logger.exception("Error in HEAD tagging request")
                 return Response(status_code=500)
 
-    # Anonymous reads on a public bucket still carry the bucket owner as main_account,
-    # so we gate on account.id. Gateway sets it to literal "anonymous" for unsigned requests;
-    # an empty string would mean the gateway didn't run account_middleware — treat as anon.
+    # Anonymous reads on a public bucket still carry the bucket owner in
+    # state.main_account_id, so we gate on the caller's account.id. The account middleware
+    # sets it to literal "anonymous" for unsigned requests; an empty string means it never
+    # ran (request_context's stand-in) — treat as anon.
     is_anonymous = account is None or account.id in ("", "anonymous")
     try:
         response_overrides = parse_response_overrides(request.query_params, is_anonymous=is_anonymous)

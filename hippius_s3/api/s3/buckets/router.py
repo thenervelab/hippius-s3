@@ -47,10 +47,10 @@ async def get_bucket(
         return await handle_get_bucket_location(bucket_name)
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
-            return await tags_get_bucket_tags(bucket_name, conn, request.state.account.main_account)
+            return await tags_get_bucket_tags(bucket_name, conn, request.state.main_account_id)
     if "lifecycle" in request.query_params:
         async with pool.acquire() as conn:
-            return await handle_get_bucket_lifecycle(bucket_name, conn, request.state.account.main_account)
+            return await handle_get_bucket_lifecycle(bucket_name, conn, request.state.main_account_id)
     if "uploads" in request.query_params:
         from hippius_s3.api.s3.multipart import list_multipart_uploads
 
@@ -58,7 +58,7 @@ async def get_bucket(
             return await list_multipart_uploads(bucket_name, request, conn)
     if "policy" in request.query_params:
         async with pool.acquire() as conn:
-            return await policy_get_bucket_policy(bucket_name, conn, request.state.account.main_account)
+            return await policy_get_bucket_policy(bucket_name, conn, request.state.main_account_id)
     ctx = get_request_context(request)
     qp = request.query_params
     return await handle_list_objects(
@@ -94,7 +94,7 @@ async def delete_bucket_tags_route(
 ) -> Response:
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
-            return await tags_delete_bucket_tags(bucket_name, conn, request.state.account.main_account)
+            return await tags_delete_bucket_tags(bucket_name, conn, request.state.main_account_id)
     async with pool.acquire() as conn:
         return await handle_delete_bucket(bucket_name, request, conn, redis_client)
 

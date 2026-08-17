@@ -507,7 +507,9 @@ def factory() -> FastAPI:
     #   without a permission check.
     # - request_context MUST stay inner to acl (it consumes the
     #   bucket_owner_id acl resolves) and outer to everything that reads
-    #   request.state.account with bucket-owner semantics.
+    #   request.state.main_account_id (metrics, tracing, the S3 handlers).
+    #   state.account itself carries CALLER semantics only and is never
+    #   rebound, so no layer is ordering-sensitive on it.
     # - fs_cache_pressure sits OUTSIDE auth on purpose: a shed PUT costs a
     #   503 and no SigV4/Arion work. Pre-merge the gateway defeated this by
     #   relaying the whole body before the api could answer.
@@ -516,9 +518,6 @@ def factory() -> FastAPI:
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
     app.middleware("http")(request_context_middleware)
-    # Outer to request_context on purpose: the audit log attributes operations to the
-    # CALLER (request.state.account as the account middleware built it); request_context
-    # then rewrites state.account with bucket-owner semantics for the handlers/metrics.
     if config.enable_audit_logging:
         app.middleware("http")(audit_log_middleware)
     app.middleware("http")(verify_frontend_hmac_middleware)

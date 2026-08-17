@@ -31,8 +31,8 @@ async def metrics_middleware(
     object_key = None
 
     if hasattr(request.state, "account"):
-        main_account = getattr(request.state.account, "main_account", None)
-        subaccount_id = getattr(request.state.account, "id", None)
+        main_account = getattr(request.state, "main_account_id", None)
+        subaccount_id = getattr(request.state, "account_id", None)
 
     bucket_name = request.path_params.get("bucket_name")
     object_key = request.path_params.get("object_key")

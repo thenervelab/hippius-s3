@@ -54,7 +54,11 @@ class _FakeDb:
 
 def _request() -> Any:
     return SimpleNamespace(
-        state=SimpleNamespace(account=SimpleNamespace(main_account="acct-main", id="sub-1"), seed_phrase="seed"),
+        state=SimpleNamespace(
+            account=SimpleNamespace(main_account="acct-main", id="sub-1"),
+            main_account_id="acct-main",
+            seed_phrase="seed",
+        ),
         headers={"Host": "h"},
         app=SimpleNamespace(state=SimpleNamespace(postgres_pool=object(), redis_client=object(), fs_store=object())),
     )

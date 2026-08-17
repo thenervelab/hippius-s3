@@ -28,16 +28,17 @@ async def audit_log_middleware(
     method = request.method
     query_params = dict(request.query_params)
 
-    # Captured BEFORE call_next: request.state is one shared object, and the inner
-    # request_context middleware rebinds state.account with bucket-owner semantics for
-    # the handlers. The audit log attributes operations to the CALLER, so the caller's
-    # account (set by the account middleware, which runs before this point) must be
-    # read here — reading it after the response unwinds would book anonymous public
-    # reads and cross-account ops to the bucket owner.
-    account = getattr(request.state, "account", None)
-    account_id = getattr(account, "main_account", "unknown") if account else "unknown"
-
     response = await call_next(request)
+
+    # The audit log attributes operations to the CALLER. state.account carries caller
+    # semantics only (request_context never rebinds it — bucket-owner attribution lives
+    # under the separate state.main_account_id), so reading it after the inner stack ran
+    # is safe: anonymous public reads and cross-account ops book to the caller, not the
+    # bucket owner.
+    account = getattr(request.state, "account", None)
+    # request_context binds an EMPTY stand-in for anonymous callers; "" must still log
+    # as "unknown", matching what a missing account always logged.
+    account_id = (getattr(account, "main_account", "") if account else "") or "unknown"
 
     processing_time = time.time() - start_time
 

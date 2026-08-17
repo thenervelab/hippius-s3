@@ -56,7 +56,7 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
     """
     try:
         # AuthN/AuthZ context
-        user = await UserRepository(db).ensure_by_main_account(request.state.account.main_account)
+        user = await UserRepository(db).ensure_by_main_account(request.state.main_account_id)
         bucket = await BucketRepository(db).get_by_name_and_owner(bucket_name, user["main_account_id"])
         if not bucket:
             return errors.s3_error_response(
@@ -125,7 +125,7 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                 object_version = int(deleted["current_object_version"])
                 db_backends = await resolve_object_backends(db, object_id, object_version)
                 unpin_payload = UnpinChainRequest(
-                    address=request.state.account.main_account,
+                    address=request.state.main_account_id,
                     object_id=object_id,
                     object_version=object_version,
                     ray_id=ray_id,

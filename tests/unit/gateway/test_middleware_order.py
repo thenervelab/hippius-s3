@@ -70,7 +70,7 @@ def test_merged_chain_keeps_auth_outside_the_trusting_middlewares() -> None:
     assert idx("acl_middleware") < idx("auth_probe_middleware"), order
     assert idx("auth_router_middleware") < idx("acl_subresource_middleware"), order
     assert idx("acl_middleware") < idx("acl_subresource_middleware"), order
-    # request_context rebuilds request.state.account from what account+acl resolved,
+    # request_context derives main_account_id from what account+acl resolved,
     # so it must be inner to both and outer to everything that consumes the account
     # with bucket-owner semantics (metrics, audit, the routers).
     assert idx("acl_middleware") < idx("request_context_middleware"), order

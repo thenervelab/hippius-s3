@@ -2,8 +2,8 @@
 header round-trip when the gateway merged into the api. These pin the two properties the
 round-trip used to provide:
 
-1. the exact state mapping S3 handlers rely on (main_account = bucket owner, caller
-   fallback, flag carriage), and
+1. the exact state mapping S3 handlers rely on (state.main_account_id = bucket owner
+   with caller fallback; state.account stays the CALLER's, never rebound), and
 2. header inertness — client-supplied X-Hippius-* headers must have zero effect on
    request.state, which is what the gateway's strip-loop used to enforce.
 """
@@ -30,6 +30,7 @@ def _app_with_upstream_state(**state: Any) -> FastAPI:
         captured["request_user_id"] = request.state.request_user_id
         captured["bucket_owner_id"] = request.state.bucket_owner_id
         captured["bucket_id"] = request.state.bucket_id
+        captured["main_account_id"] = request.state.main_account_id
         captured["account"] = request.state.account
         return {"ok": "1"}
 
@@ -61,12 +62,11 @@ async def test_account_maps_bucket_owner_to_main_account() -> None:
     assert captured["request_user_id"] == "sub-1"
     assert captured["bucket_owner_id"] == "owner-9"
     assert captured["bucket_id"] == "b-uuid"
-    # main_account is the BUCKET OWNER (storage attribution), never the caller's own main.
-    assert captured["account"].main_account == "owner-9"
-    assert captured["account"].id == "sub-1"
-    assert captured["account"].has_credits is True
-    assert captured["account"].upload is True
-    assert captured["account"].delete is False
+    # Storage attribution is the BUCKET OWNER, under its own explicit key; the caller's
+    # account object is untouched, so its main_account stays the caller's own.
+    assert captured["main_account_id"] == "owner-9"
+    assert captured["account"] is caller
+    assert captured["account"].main_account == "caller-main"
 
 
 @pytest.mark.asyncio
@@ -74,13 +74,14 @@ async def test_bucket_owner_falls_back_to_caller() -> None:
     caller = HippiusAccount(id="sub-1", main_account="caller-main", has_credits=True, upload=True, delete=True)
     captured = await _get(_app_with_upstream_state(account_id="sub-1", account=caller))
     assert captured["bucket_owner_id"] == "sub-1"
-    assert captured["account"].main_account == "sub-1"
+    assert captured["main_account_id"] == "sub-1"
 
 
 @pytest.mark.asyncio
 async def test_anonymous_request_gets_empty_account_with_no_flags() -> None:
     captured = await _get(_app_with_upstream_state())
     assert captured["request_user_id"] == ""
+    assert captured["main_account_id"] == ""
     assert captured["account"].id == ""
     assert captured["account"].has_credits is False
     assert captured["account"].upload is False
@@ -102,7 +103,7 @@ async def test_client_supplied_x_hippius_headers_are_inert() -> None:
     )
     assert captured["request_user_id"] == ""
     assert captured["bucket_owner_id"] == ""
-    assert captured["account"].main_account == ""
+    assert captured["main_account_id"] == ""
     assert captured["account"].upload is False
 
 

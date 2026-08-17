@@ -498,11 +498,11 @@ class TestPutBucketAcl:
         app.state.acl_service = mock_service
 
         app.middleware("http")(acl_subresource_middleware)
+
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
             request.state.account_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
             return await call_next(request)
-
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.put(
@@ -528,11 +528,11 @@ class TestPutBucketAcl:
         app.state.acl_service = mock_service
 
         app.middleware("http")(acl_subresource_middleware)
+
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
             request.state.account_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
             return await call_next(request)
-
 
         xml_body = """<?xml version="1.0" encoding="UTF-8"?>
         <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -612,11 +612,11 @@ class TestPutBucketAcl:
         app.state.acl_service = AsyncMock()
 
         app.middleware("http")(acl_subresource_middleware)
+
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
             request.state.account_id = "owner-123"
             return await call_next(request)
-
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.put("/my-bucket?acl")
@@ -643,11 +643,11 @@ class TestPutObjectAcl:
         app.state.acl_service = mock_service
 
         app.middleware("http")(acl_subresource_middleware)
+
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
             request.state.account_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
             return await call_next(request)
-
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.put(
@@ -673,11 +673,11 @@ class TestPutObjectAcl:
         app.state.acl_service = mock_service
 
         app.middleware("http")(acl_subresource_middleware)
+
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
             request.state.account_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
             return await call_next(request)
-
 
         xml_body = """<?xml version="1.0" encoding="UTF-8"?>
         <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -712,11 +712,11 @@ class TestPutObjectAcl:
         app.state.acl_service = mock_service
 
         app.middleware("http")(acl_subresource_middleware)
+
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
             request.state.account_id = "owner-123"
             return await call_next(request)
-
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.put(

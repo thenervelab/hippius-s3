@@ -1,8 +1,8 @@
-"""The audit log attributes operations to the CALLER. Post-merge, request_context
-(inner to audit_log) rebinds request.state.account with bucket-owner semantics for the
-S3 handlers — and request.state is one shared object, so a read after call_next sees
-the rebound value. This pins that the audit middleware snapshots the caller BEFORE the
-inner stack runs; a middleware-order test alone cannot catch a regression here.
+"""The audit log attributes operations to the CALLER. state.account carries caller
+semantics only (request_context binds an empty stand-in for anonymous requests and
+never rebinds an existing account; bucket-owner attribution lives under the separate
+state.main_account_id), so these pin that the audit line books to the caller's main
+account and that anonymous requests stay "unknown".
 """
 
 from typing import Any
@@ -14,11 +14,35 @@ from httpx import ASGITransport
 from httpx import AsyncClient
 
 from gateway.middlewares.audit_log import audit_log_middleware
+from hippius_s3.api.middlewares.request_context import request_context_middleware
 from hippius_s3.models.account import HippiusAccount
 
 
-@pytest.mark.asyncio
-async def test_audit_attributes_caller_not_rebound_bucket_owner(monkeypatch: Any) -> None:
+def _app(with_caller: bool) -> FastAPI:
+    app = FastAPI()
+
+    @app.get("/{bucket}/{key:path}")
+    async def probe(request: Request, bucket: str, key: str = "") -> dict[str, str]:
+        return {"ok": "1"}
+
+    # The real inner middleware, so a regression back to account-rebinding fails here.
+    app.middleware("http")(request_context_middleware)
+    app.middleware("http")(audit_log_middleware)
+
+    if with_caller:
+
+        @app.middleware("http")
+        async def fake_account(request: Request, call_next: Any) -> Any:
+            request.state.account = HippiusAccount(
+                id="caller-sub", main_account="caller-main", has_credits=True, upload=True, delete=True
+            )
+            request.state.bucket_owner_id = "bucket-owner"
+            return await call_next(request)
+
+    return app
+
+
+async def _logged(app: FastAPI, monkeypatch: Any) -> dict[str, Any]:
     logged: dict[str, Any] = {}
 
     def capture_log_request(self: Any, **kwargs: Any) -> None:
@@ -27,67 +51,21 @@ async def test_audit_attributes_caller_not_rebound_bucket_owner(monkeypatch: Any
     monkeypatch.setattr("hippius_s3.services.audit_service.AuditLogger.log_request", capture_log_request)
     monkeypatch.setattr("hippius_s3.services.audit_service.AuditLogger.should_skip", lambda self, path, ip: False)
 
-    app = FastAPI()
-
-    @app.get("/{bucket}/{key:path}")
-    async def probe(request: Request, bucket: str, key: str = "") -> dict[str, str]:
-        return {"ok": "1"}
-
-    # Innermost: plays request_context — rebinds state.account to bucket-owner semantics.
-    @app.middleware("http")
-    async def fake_request_context(request: Request, call_next: Any) -> Any:
-        request.state.account = HippiusAccount(
-            id="caller-sub", main_account="bucket-owner", has_credits=True, upload=True, delete=True
-        )
-        return await call_next(request)
-
-    app.middleware("http")(audit_log_middleware)
-
-    # Outermost: plays the account middleware — the caller's own account.
-    @app.middleware("http")
-    async def fake_account(request: Request, call_next: Any) -> Any:
-        request.state.account = HippiusAccount(
-            id="caller-sub", main_account="caller-main", has_credits=True, upload=True, delete=True
-        )
-        return await call_next(request)
-
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.get("/victim-bucket/key")
-
+        response = await client.get("/some-bucket/key")
     assert response.status_code == 200
+    return logged
+
+
+@pytest.mark.asyncio
+async def test_audit_attributes_caller_not_bucket_owner(monkeypatch: Any) -> None:
+    logged = await _logged(_app(with_caller=True), monkeypatch)
     assert logged["account_id"] == "caller-main"
 
 
 @pytest.mark.asyncio
-async def test_audit_attributes_anonymous_as_unknown_despite_owner_rebind(monkeypatch: Any) -> None:
-    """Anonymous public read: no account upstream of audit, but request_context still
-    binds one (bucket-owner attribution) for the handlers. The audit line must stay
-    'unknown', not book the read to the bucket owner."""
-    logged: dict[str, Any] = {}
-
-    def capture_log_request(self: Any, **kwargs: Any) -> None:
-        logged.update(kwargs)
-
-    monkeypatch.setattr("hippius_s3.services.audit_service.AuditLogger.log_request", capture_log_request)
-    monkeypatch.setattr("hippius_s3.services.audit_service.AuditLogger.should_skip", lambda self, path, ip: False)
-
-    app = FastAPI()
-
-    @app.get("/{bucket}/{key:path}")
-    async def probe(request: Request, bucket: str, key: str = "") -> dict[str, str]:
-        return {"ok": "1"}
-
-    @app.middleware("http")
-    async def fake_request_context(request: Request, call_next: Any) -> Any:
-        request.state.account = HippiusAccount(
-            id="", main_account="bucket-owner", has_credits=False, upload=False, delete=False
-        )
-        return await call_next(request)
-
-    app.middleware("http")(audit_log_middleware)
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.get("/public-bucket/key")
-
-    assert response.status_code == 200
+async def test_audit_attributes_anonymous_as_unknown(monkeypatch: Any) -> None:
+    """No caller account upstream: request_context binds the empty stand-in, and the
+    audit line must log "unknown", not the empty string and not any bucket owner."""
+    logged = await _logged(_app(with_caller=False), monkeypatch)
     assert logged["account_id"] == "unknown"

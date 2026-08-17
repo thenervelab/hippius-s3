@@ -26,9 +26,7 @@ _ALL_USERS = "http://acs.amazonaws.com/groups/global/AllUsers"
 
 def _acl(*, public: bool) -> dict[str, Any]:
     """A bucket ACL as the schema really stores it: publicness is an AllUsers READ grant."""
-    grants: list[dict[str, Any]] = [
-        {"grantee": {"type": "CanonicalUser", "id": "owner"}, "permission": "FULL_CONTROL"}
-    ]
+    grants: list[dict[str, Any]] = [{"grantee": {"type": "CanonicalUser", "id": "owner"}, "permission": "FULL_CONTROL"}]
     if public:
         grants.append({"grantee": {"type": "Group", "uri": _ALL_USERS}, "permission": "READ"})
     return {"owner": {"id": "owner"}, "grants": grants}
@@ -127,6 +125,7 @@ async def test_private_and_absent_are_indistinguishable() -> None:
 @pytest.mark.asyncio
 async def test_head_is_gated_too(monkeypatch) -> None:
     """HEAD leaks existence and size, so it needs the same gate as GET."""
+
     async def _should_not_run(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - must not run
         raise AssertionError("handle_head_object ran for a non-public bucket")
 

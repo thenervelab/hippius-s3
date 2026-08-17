@@ -14,8 +14,10 @@ derives what S3 handlers consume:
 
 - `request.state.request_user_id` / `.account_id` — the authenticated caller (empty for anonymous).
 - `request.state.bucket_owner_id` — from the acl middleware, falling back to the caller.
-- `request.state.account` — `HippiusAccount` whose **`main_account` is the bucket owner**
-  (storage attribution), with credit/upload/delete flags carried from the caller's account.
+- `request.state.main_account_id` — the **storage-attribution** account (= bucket owner with
+  caller fallback). S3 handlers bill/query against this, never the caller's own main.
+- `request.state.account` — the CALLER's `HippiusAccount`, exactly as the account middleware
+  built it, never rebound (an empty stand-in is bound for anonymous requests).
 - `request.state.bucket_id` — stringified, `""` when unresolved.
 
 Pinned by [tests/unit/test_request_context.py](../../../tests/unit/test_request_context.py),

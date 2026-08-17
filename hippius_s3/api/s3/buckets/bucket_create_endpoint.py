@@ -31,7 +31,7 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
 
     This endpoint is compatible with the S3 protocol used by MinIO and other S3 clients.
     """
-    main_account_id = request.state.account.main_account
+    main_account_id = request.state.main_account_id
 
     # An empty or anonymous main_account means gateway identity stamping was
     # bypassed (reserved-path holes). Every branch below writes on behalf of the
