@@ -10,6 +10,9 @@ from fastapi import Response
 
 from hippius_s3 import dependencies
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.acl_endpoints import get_bucket_acl
+from hippius_s3.api.s3.acl_endpoints import invalid_canned_acl_response
+from hippius_s3.api.s3.acl_endpoints import put_bucket_acl
 from hippius_s3.api.s3.buckets.bucket_create_endpoint import handle_create_bucket
 from hippius_s3.api.s3.buckets.bucket_delete_endpoint import handle_delete_bucket
 from hippius_s3.api.s3.buckets.bucket_head_endpoint import handle_head_bucket
@@ -43,6 +46,8 @@ async def get_bucket(
     request: Request,
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
+    if "acl" in request.query_params:
+        return await get_bucket_acl(bucket_name, request)
     if "location" in request.query_params:
         return await handle_get_bucket_location(bucket_name)
     if "tagging" in request.query_params:
@@ -80,6 +85,10 @@ async def create_or_modify_bucket(
     request: Request,
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
+    if "acl" in request.query_params:
+        return await put_bucket_acl(bucket_name, request)
+    if (invalid := invalid_canned_acl_response(request.headers.get("x-amz-acl"))) is not None:
+        return invalid
     # Delegate to the new comprehensive handler (supports create/tagging/lifecycle/policy)
     async with pool.acquire() as conn:
         return await handle_create_bucket(bucket_name, request, conn)

@@ -29,7 +29,7 @@ The pipeline is deliberately split so the user-facing path (gateway + API) is fa
 ```
 .
 ├── gateway/                 # Middleware + auth service package (no app of its own since the merge)
-│   ├── middlewares/         # Auth chain, CORS, input validation, HMAC, ?acl dispatch, etc.
+│   ├── middlewares/         # Auth chain, CORS, input validation, HMAC, etc.
 │   └── services/            # auth_orchestrator, acl_service, auth cache, ATS purge client
 ├── hippius_s3/              # Main package
 │   ├── api/                 # Internal FastAPI on :8000
@@ -67,7 +67,7 @@ A **subsystem index** with links to per-directory `CLAUDE.md` files is in sectio
 ### 3.1 PUT (simple object)
 
 1. **Client → Gateway** (`https://s3.hippius.com/<bucket>/<key>`). SigV4-signed.
-2. **Merged middleware chain** (registered in [hippius_s3/main.py](hippius_s3/main.py), runs outer→inner): CORS → ray_id → cache_control → ats_purge → cache_invalidation → (read-only guard) → fs_cache_pressure → input validation → auth router → trailing slash → account → ACL → request_context → frontend HMAC → tracing → metrics → audit log → auth_probe → acl_subresource. On the way back out: the same stack in reverse.
+2. **Merged middleware chain** (registered in [hippius_s3/main.py](hippius_s3/main.py), runs outer→inner): CORS → ray_id → cache_control → ats_purge → cache_invalidation → (read-only guard) → fs_cache_pressure → input validation → auth router → trailing slash → account → ACL → request_context → frontend HMAC → tracing → metrics → audit log → auth_probe. On the way back out: the same stack in reverse.
 3. **Auth orchestrator** ([gateway/services/auth_orchestrator.py:39](gateway/services/auth_orchestrator.py)) picks one of five methods (presigned URL, bearer, access key SigV4, seed-phrase SigV4, anonymous), verifies the signature, and attaches `request.state.account_id` / `request.state.account` / etc.
 4. **ACL middleware** ([gateway/middlewares/acl.py:70](gateway/middlewares/acl.py)) checks bucket ownership + permission. Master tokens bypass.
 5. **Request context** ([hippius_s3/api/middlewares/request_context.py](hippius_s3/api/middlewares/request_context.py)) maps the auth middlewares' state into what handlers consume: `state.main_account_id` (storage attribution: bucket owner, caller fallback) and the caller's own `state.account` (never rebound). No forwarding hop exists: since the 2026-08 merge the same app continues straight into the S3 handlers. `fs_cache_pressure` ([hippius_s3/api/middlewares/fs_cache_pressure.py](hippius_s3/api/middlewares/fs_cache_pressure.py)) runs before auth and short-circuits PUTs with 503 + Retry-After **before reading the body** if the cache disk is ≥90% full.
@@ -218,7 +218,7 @@ Canonicalization uses `request.scope["raw_path"]` (bytes) rather than `request.u
 ## 7. Subsystem index
 
 ### Gateway
-- [gateway/CLAUDE.md](gateway/CLAUDE.md) — middleware order, the merge, `?acl` subresource.
+- [gateway/CLAUDE.md](gateway/CLAUDE.md) — middleware order and the merge. `?acl` handlers live in [hippius_s3/api/s3/acl_endpoints.py](hippius_s3/api/s3/acl_endpoints.py), dispatched from the routers like `tagging`.
 - [gateway/middlewares/CLAUDE.md](gateway/middlewares/CLAUDE.md) — per-middleware behavior.
 - [gateway/services/CLAUDE.md](gateway/services/CLAUDE.md) — auth_orchestrator, ACLService, sub_token_scope (dormant).
 - Entry: [gateway/main.py](gateway/main.py) — `factory()` at line 43.

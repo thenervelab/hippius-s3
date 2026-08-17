@@ -23,7 +23,6 @@ from fastapi.staticfiles import StaticFiles
 
 from gateway.middlewares.account import account_middleware
 from gateway.middlewares.acl import acl_middleware
-from gateway.middlewares.acl_subresource import acl_subresource_middleware
 from gateway.middlewares.ats_purge import ats_purge_middleware
 from gateway.middlewares.audit_log import audit_log_middleware
 from gateway.middlewares.auth_probe import auth_probe_middleware
@@ -498,13 +497,12 @@ def factory() -> FastAPI:
     #   → cache_invalidation → [read_only] → fs_cache_pressure → input_validation
     #   → auth_router → trailing_slash → account → acl → frontend_hmac
     #   → [audit_log] → request_context → tracing → metrics → auth_probe
-    #   → acl_subresource → routers
+    #   → routers
     #
     # Load-bearing orderings:
-    # - auth_probe and acl_subresource MUST stay inner to auth_router + acl.
-    #   Moving either outward lets unauthenticated callers reach them: the
-    #   probe would answer 200 to anyone, and the ?acl handlers would run
-    #   without a permission check.
+    # - auth_probe MUST stay inner to auth_router + acl. Moving it outward
+    #   lets unauthenticated callers reach it: the probe would answer 200 to
+    #   anyone. (?acl is dispatched by the routers themselves, like tagging.)
     # - request_context MUST stay inner to acl (it consumes the
     #   bucket_owner_id acl resolves) and outer to everything that reads
     #   request.state.main_account_id (metrics, tracing, the S3 handlers).
@@ -513,7 +511,6 @@ def factory() -> FastAPI:
     # - fs_cache_pressure sits OUTSIDE auth on purpose: a shed PUT costs a
     #   503 and no SigV4/Arion work. Pre-merge the gateway defeated this by
     #   relaying the whole body before the api could answer.
-    app.middleware("http")(acl_subresource_middleware)
     app.middleware("http")(auth_probe_middleware)
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)

@@ -64,12 +64,11 @@ def test_merged_chain_keeps_auth_outside_the_trusting_middlewares() -> None:
         return order.index(name)
 
     # Lower index == outer == runs earlier on the request path.
-    # auth_probe answers 200 to the shared-secret PURGE bounce; acl_subresource
-    # serves/creates ACLs. Neither may run before auth_router+acl have validated.
+    # auth_probe answers 200 to the shared-secret PURGE bounce; it may not run
+    # before auth_router+acl have validated. (?acl handlers dispatch from the
+    # routers themselves, inside the whole wall, so they need no pin here.)
     assert idx("auth_router_middleware") < idx("auth_probe_middleware"), order
     assert idx("acl_middleware") < idx("auth_probe_middleware"), order
-    assert idx("auth_router_middleware") < idx("acl_subresource_middleware"), order
-    assert idx("acl_middleware") < idx("acl_subresource_middleware"), order
     # request_context derives main_account_id from what account+acl resolved,
     # so it must be inner to both and outer to everything that consumes the account
     # with bucket-owner semantics (metrics, audit, the routers).

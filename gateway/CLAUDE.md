@@ -3,7 +3,7 @@
 **This is no longer a standalone service.** The gateway merged into the api (one FastAPI
 app, one uvicorn): this package now holds the edge-facing middleware chain (auth, ACL,
 validation, audit, purge, CORS), its services (auth orchestrator, ACLService, auth cache,
-ATS purge client) and the `?acl` subresource handlers — all composed into the single app
+ATS purge client) — all composed into the single app
 by [hippius_s3/main.py `factory()`](../hippius_s3/main.py).
 
 What disappeared in the merge: `gateway/main.py` (the second app factory),
@@ -16,7 +16,7 @@ structural — enforced by middleware order, pinned by
 
 ## Middleware chain
 
-Registered in [hippius_s3/main.py](../hippius_s3/main.py) (search for `acl_subresource_middleware`). FastAPI's `@app.middleware("http")` stacks in reverse order (last-registered = outermost). On the request path, the chain runs: cors → ray_id → cache_control → ats_purge → cache_invalidation → [read_only] → fs_cache_pressure → input_validation → auth_router → trailing_slash → account → acl → request_context → frontend_hmac → tracing → metrics → [audit_log] → auth_probe → acl_subresource → routers.
+Registered in [hippius_s3/main.py](../hippius_s3/main.py). FastAPI's `@app.middleware("http")` stacks in reverse order (last-registered = outermost). On the request path, the chain runs: cors → ray_id → cache_control → ats_purge → cache_invalidation → [read_only] → fs_cache_pressure → input_validation → auth_router → trailing_slash → account → acl → request_context → frontend_hmac → tracing → metrics → [audit_log] → auth_probe → routers.
 
 | # | Middleware | Purpose | Short-circuit |
 |---|-----------|---------|---------------|
@@ -39,10 +39,9 @@ Registered in [hippius_s3/main.py](../hippius_s3/main.py) (search for `acl_subre
 
 Routes now live on the merged app ([hippius_s3/main.py](../hippius_s3/main.py)); this
 package contributes no routers. The `?acl` subresource is handled by
-[gateway/middlewares/acl_subresource.py](middlewares/acl_subresource.py) — the innermost
-middleware: it answers `GET|PUT` with `?acl`, validates canned-ACL headers before writes,
-materializes an object ACL after a successful `PutObject` carrying `x-amz-acl`, and passes
-everything else through to the S3 routers.
+[hippius_s3/api/s3/acl_endpoints.py](../hippius_s3/api/s3/acl_endpoints.py), dispatched from
+the bucket/object routers' query-param branches exactly like `tagging` — the acl MIDDLEWARE
+still maps `?acl` to READ_ACP/WRITE_ACP and enforces permission before those branches run.
 
 ## Authentication at a glance
 

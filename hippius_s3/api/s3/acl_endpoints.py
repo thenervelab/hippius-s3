@@ -1,27 +1,21 @@
-"""Bucket/object ?acl subresource handling.
+"""Bucket/object ?acl subresource handlers.
 
-Before the gateway/api merge these four handlers were routes on the gateway app
-whose paths (`/{bucket}`, `/{bucket}/{key:path}`) shadowed the whole S3 surface;
-requests without `?acl` fell through by being forwarded to the api. In the
-single app that fall-through has to be a middleware: when `?acl` is present the
-request is answered here, otherwise it continues to the S3 routers — with the
-same two write-path extras the gateway applied around the forward (canned-ACL
-header validation before a write, and object-ACL creation after a successful
-PutObject that carried `x-amz-acl`).
+Dispatched from the bucket/object routers' query-param branches, exactly like
+`tagging`/`lifecycle`/`policy`. (History: these were routes on the pre-merge
+gateway app, then briefly a dispatcher middleware in the merged app; router
+branches are the app's one idiom for S3 subresources.) The acl MIDDLEWARE is
+what maps `?acl` to READ_ACP/WRITE_ACP and enforces permission before any of
+these run; handlers only read/write grants.
 """
 
 import logging
 import xml.etree.ElementTree as ET
-from typing import Awaitable
-from typing import Callable
 
 from fastapi import Request
 from fastapi.responses import Response
 
-from gateway.middlewares.acl import parse_s3_path
 from gateway.services.acl_service import ACLService
 from gateway.utils.errors import s3_error_response
-from gateway.utils.paths import routing_path
 from hippius_s3.models.acl import ACL
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import Grantee
@@ -29,7 +23,6 @@ from hippius_s3.models.acl import GranteeType
 from hippius_s3.models.acl import Owner
 from hippius_s3.models.acl import Permission
 from hippius_s3.models.acl import validate_grant_grantees
-from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
 
 
 logger = logging.getLogger(__name__)
@@ -583,64 +576,31 @@ async def put_object_acl(bucket: str, key: str, request: Request) -> Response:
     return Response(status_code=200)
 
 
-async def acl_subresource_middleware(
-    request: Request,
-    call_next: Callable[[Request], Awaitable[Response]],
-) -> Response:
-    """Answer `?acl` requests; wrap writes with the ACL extras; pass everything else on.
+def invalid_canned_acl_response(x_amz_acl: str | None) -> Response | None:
+    """400 for an unknown canned ACL, BEFORE the write happens — an orphan
+    bucket/object with no ACL is worse than a 400. None when the header is
+    absent or valid."""
+    if x_amz_acl and x_amz_acl not in VALID_CANNED_ACLS:
+        return s3_error_response(
+            code="InvalidArgument",
+            message=f"Invalid canned ACL: {x_amz_acl}",
+            status_code=400,
+        )
+    return None
 
-    Innermost middleware — auth, account, acl-permission and request-context
-    middlewares have all populated request.state by the time this runs (the acl
-    middleware already mapped `?acl` to READ_ACP/WRITE_ACP and enforced it).
-    """
-    if request.method not in ("GET", "PUT"):
-        return await call_next(request)
-    # Hot-path GETs (no ?acl) take nothing from this middleware; bail before any path work.
-    if request.method == "GET" and "acl" not in request.query_params:
-        return await call_next(request)
 
-    bucket, key = parse_s3_path(routing_path(request))
-    if not bucket:
-        return await call_next(request)
-    # Reserved segments (health, docs, user, ...) are app routes, never buckets — the
-    # old shadow-routes couldn't intercept them either (real routes matched first).
-    if bucket in RESERVED_BUCKET_SEGMENTS:
-        return await call_next(request)
-
-    x_amz_acl = request.headers.get("x-amz-acl")
-
-    if "acl" not in request.query_params:
-        # The write-path extras the gateway used to apply around the forward:
-        # reject an invalid canned ACL before the write happens (an orphan
-        # bucket/object with no ACL is worse than a 400), and materialize the
-        # object ACL after a successful PutObject that carried x-amz-acl.
-        if request.method == "PUT" and x_amz_acl and x_amz_acl not in VALID_CANNED_ACLS:
-            return s3_error_response(
-                code="InvalidArgument",
-                message=f"Invalid canned ACL: {x_amz_acl}",
-                status_code=400,
-            )
-
-        response = await call_next(request)
-
-        if request.method == "PUT" and key and x_amz_acl and response.status_code == 200:
-            account_id = getattr(request.state, "account_id", None)
-            if account_id:
-                try:
-                    acl_svc: ACLService = request.app.state.acl_service
-                    new_acl = await acl_svc.canned_acl_to_acl(x_amz_acl, account_id, bucket)
-                    await acl_svc.acl_repo.set_object_acl(bucket, key, account_id, new_acl)
-                    await acl_svc.invalidate_cache(bucket, key)
-                    logger.info(f"Created {x_amz_acl} ACL for object {bucket}/{key}")
-                except Exception as e:
-                    logger.error(f"Failed to create ACL for object {bucket}/{key}, defaulting to private: {e}")
-
-        return response
-
-    if request.method == "GET":
-        if key:
-            return await get_object_acl(bucket, key, request)
-        return await get_bucket_acl(bucket, request)
-    if key:
-        return await put_object_acl(bucket, key, request)
-    return await put_bucket_acl(bucket, request)
+async def materialize_canned_object_acl(request: Request, bucket: str, key: str, x_amz_acl: str) -> None:
+    """After a successful object write that carried x-amz-acl: persist the canned
+    ACL for the object. Best-effort — the object exists either way and defaults to
+    private, so a cache/DB blip here must not fail the completed write."""
+    account_id = getattr(request.state, "account_id", None)
+    if not account_id:
+        return
+    try:
+        acl_svc: ACLService = request.app.state.acl_service
+        new_acl = await acl_svc.canned_acl_to_acl(x_amz_acl, account_id, bucket)
+        await acl_svc.acl_repo.set_object_acl(bucket, key, account_id, new_acl)
+        await acl_svc.invalidate_cache(bucket, key)
+        logger.info(f"Created {x_amz_acl} ACL for object {bucket}/{key}")
+    except Exception as e:
+        logger.error(f"Failed to create ACL for object {bucket}/{key}, defaulting to private: {e}")
