@@ -95,6 +95,11 @@ def is_authorized_peer_fetch(request: "Request") -> bool:
     from gateway.utils.paths import routing_path
     from hippius_s3.config import get_config
 
+    if request.method != "GET":
+        return False
     if not routing_path(request).startswith("/internal/parts/"):
         return False
-    return peer_auth_matches(request.headers.get(PEER_AUTH_HEADER), get_config().internal_peer_secret)
+    config = get_config()
+    if not config.peer_serve_enabled:
+        return False
+    return peer_auth_matches(request.headers.get(PEER_AUTH_HEADER), config.internal_peer_secret)

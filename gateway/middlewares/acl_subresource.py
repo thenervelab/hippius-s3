@@ -250,6 +250,15 @@ async def get_bucket_acl(bucket: str, request: Request) -> Response:
     """Get bucket ACL - S3 API compatible."""
     acl_service: ACLService = request.app.state.acl_service
 
+    # get_effective_acl raises on unknown buckets — answer the S3 404 instead of a 500
+    # (which doubled as a bucket-existence oracle for unauthenticated ?acl probes).
+    if not await acl_service.get_bucket_owner(bucket):
+        return s3_error_response(
+            code="NoSuchBucket",
+            message="The specified bucket does not exist",
+            status_code=404,
+        )
+
     effective_acl = await acl_service.get_effective_acl(bucket, None)
 
     xml_content = acl_to_xml(effective_acl)
@@ -588,6 +597,12 @@ async def acl_subresource_middleware(
 
     bucket, key = parse_s3_path(routing_path(request))
     if not bucket:
+        return await call_next(request)
+    # Reserved segments (health, docs, user, ...) are app routes, never buckets — the
+    # old shadow-routes couldn't intercept them either (real routes matched first).
+    from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
+
+    if bucket in RESERVED_BUCKET_SEGMENTS:
         return await call_next(request)
 
     x_amz_acl = request.headers.get("x-amz-acl")

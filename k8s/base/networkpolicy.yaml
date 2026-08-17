@@ -44,16 +44,32 @@ spec:
       ports:
         - port: 8000
           protocol: TCP
-    - from:
-        - ipBlock:
-            cidr: 0.0.0.0/0
-      ports:
-        # The merged api (formerly fronted by the gateway on 8080) is the public entry.
-        - port: 8000
-          protocol: TCP
+
   egress:
     - to:
         - namespaceSelector: {}
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
+---
+# Public entry for the merged api. Scoped to the edge-labeled pods only, so the
+# hippius.io/edge rollout latch holds at the CNI layer too — a pod without the
+# label (e.g. a pre-merge image mid-roll) is unreachable from outside even if a
+# Service were to select it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-public-edge
+spec:
+  podSelector:
+    matchLabels:
+      hippius.io/edge: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 8000
+          protocol: TCP

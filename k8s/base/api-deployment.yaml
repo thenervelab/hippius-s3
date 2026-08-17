@@ -11,6 +11,7 @@ spec:
     metadata:
       labels:
         app: api
+        hippius.io/edge: "true"
     spec:
       # 10s preStop + up to 25s uvicorn drain, with headroom before the kubelet SIGKILLs.
       terminationGracePeriodSeconds: 45

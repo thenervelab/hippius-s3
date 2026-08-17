@@ -791,18 +791,6 @@ class MetricsCollector:
         else:
             self.seed_auth_cache_misses.add(1)
 
-    def record_gateway_bandwidth(
-        self,
-        bytes_received: int,
-        bytes_sent: int,
-        method: str,
-        status_code: int,
-    ) -> None:
-        if bytes_received > 0:
-            self.gateway_bytes_received.add(bytes_received, {"method": method})
-        if bytes_sent > 0:
-            self.gateway_bytes_sent.add(bytes_sent, {"method": method, "status_code": str(status_code)})
-
     def record_backup_operation(
         self,
         database_name: str,
@@ -961,9 +949,6 @@ class NullMetricsCollector:
         pass
 
     def record_seed_auth_cache(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_gateway_bandwidth(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_backup_operation(self, *args: object, **kwargs: object) -> None:

@@ -38,11 +38,13 @@ async def _drain(body_iter: AsyncIterator[bytes]) -> None:
     """Consume the rest of the request body before an early response.
 
     Pre-merge the gateway relayed (and thereby drained) every byte regardless of how
-    early the api answered; with the client now talking to this app directly, an early
-    412/400 with unconsumed body bytes poisons the keep-alive connection — the next
-    request on it parses the leftover body and gets a bare 400. Append deltas are
-    small, so draining is cheap. A disconnect mid-drain means the connection is dying
-    anyway — nothing to poison.
+    early the api answered. Post-merge, uvicorn copes with a body it never started
+    reading (it closes rather than reuses the connection) — the e2e suite's many
+    early-403/400 PUTs pass untouched — but a PARTIALLY consumed stream is the poison
+    case: append's writer reads mid-body before the CAS 412, and the leftover bytes on
+    the kept-alive connection parse as the next request (bare 400s under the concurrent
+    e2e test). Append deltas are small, so finishing the iterator is cheap. A
+    disconnect mid-drain means the connection is dying anyway — nothing to poison.
     """
     try:
         async for _ in body_iter:

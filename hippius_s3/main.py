@@ -192,7 +192,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.residency_recorder = create_residency_recorder(app.state.postgres_pool, os.getenv("NODE_NAME", ""))
         # Peer tier: resolve who holds a part on flash and read it from them before the pool.
         # Peers address each other by POD IP (not a hostPort on the node IP), which keeps the
-        # traffic on the pod network and inside the api's 10.x/172.x ip_whitelist.
+        # traffic on the pod network; peer requests authenticate with the shared secret
+        # (is_authorized_peer_fetch) since the merge removed the ip_whitelist middleware.
         node_name = os.getenv("NODE_NAME", "")
         pod_ip = os.getenv("POD_IP", "")
         app.state.peer_registry = None
