@@ -272,6 +272,7 @@ async def gateway_redis_clients() -> AsyncGenerator[dict[str, Any], None]:
         mock_redis = MagicMock()
         mock_redis.get = AsyncMock(return_value=None)
         mock_redis.set = AsyncMock()
+        mock_redis.setex = AsyncMock()
         mock_redis.delete = AsyncMock()
         mock_redis.incr = AsyncMock(return_value=1)
         mock_redis.expire = AsyncMock()
