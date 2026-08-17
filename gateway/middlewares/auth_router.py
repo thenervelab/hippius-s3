@@ -7,6 +7,7 @@ from fastapi import Response
 from gateway.middlewares.auth_probe import is_valid_auth_probe
 from gateway.services.auth_orchestrator import authenticate_request
 from gateway.utils.paths import routing_path
+from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
 
@@ -39,7 +40,10 @@ def _is_exempt(request: Request) -> bool:
     segment = path.strip("/").split("/", 1)[0]
     if segment in EXEMPT_SEGMENTS:
         return True
-    return segment in EXEMPT_SUBPATH_ONLY_SEGMENTS and "/" in path.strip("/")
+    if segment in EXEMPT_SUBPATH_ONLY_SEGMENTS and "/" in path.strip("/"):
+        return True
+    # Secret-authenticated peer chunk fetches (see input_validation for the rationale).
+    return is_authorized_peer_fetch(request)
 
 
 async def auth_router_middleware(

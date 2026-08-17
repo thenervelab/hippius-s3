@@ -120,17 +120,6 @@ class GatewayConfig:
     hippius_secret_decryption_material: str = dataclasses.field(
         default_factory=lambda: os.getenv("HIPPIUS_AUTH_ENCRYPTION_KEY", "")
     )
-    db_pool_min_size: int = dataclasses.field(default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_MIN_SIZE", "10")))
-    db_pool_max_size: int = dataclasses.field(default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_MAX_SIZE", "50")))
-    db_pool_max_queries: int = dataclasses.field(
-        default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_MAX_QUERIES", "50000"))
-    )
-    db_pool_max_inactive_lifetime: int = dataclasses.field(
-        default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_MAX_INACTIVE_LIFETIME", "300"))
-    )
-    db_pool_command_timeout: int = dataclasses.field(
-        default_factory=lambda: int(os.getenv("GATEWAY_DB_POOL_COMMAND_TIMEOUT", "30"))
-    )
     arion_base_url: str = dataclasses.field(
         default_factory=lambda: os.getenv("HIPPIUS_ARION_BASE_URL", "https://arion.hippius.com/")
     )

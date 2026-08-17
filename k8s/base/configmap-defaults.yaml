@@ -69,7 +69,11 @@ data:
   GATEWAY_DB_POOL_MAX_INACTIVE_LIFETIME: "300"
   GATEWAY_DB_POOL_COMMAND_TIMEOUT: "30"
   API_DB_POOL_MIN_SIZE: "5"
-  API_DB_POOL_MAX_SIZE: "20"
+  # 40, not 20: the merged app also carries the former gateway's per-request DB work
+  # (bucket-owner lookups, sub-token scopes, account state) that used to run on the
+  # gateway's own 40-connection pool. Fleet total shrinks regardless: the 5x40 gateway
+  # pools are gone.
+  API_DB_POOL_MAX_SIZE: "40"
   API_DB_POOL_MAX_QUERIES: "50000"
   API_DB_POOL_MAX_INACTIVE_LIFETIME: "300"
   API_DB_POOL_COMMAND_TIMEOUT: "30"

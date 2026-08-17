@@ -34,6 +34,7 @@ from gateway.middlewares.cache_invalidation import cache_invalidation_middleware
 from gateway.middlewares.cors import cors_middleware
 from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 from gateway.middlewares.input_validation import input_validation_middleware
+from gateway.middlewares.path_normalization import path_normalization_middleware
 from gateway.middlewares.ray_id import ray_id_middleware
 from gateway.middlewares.read_only import read_only_middleware
 from gateway.middlewares.trailing_slash import trailing_slash_normalizer
@@ -499,11 +500,11 @@ def factory() -> FastAPI:
     # the pre-merge gateway chain with the api's middlewares composed in at
     # the positions the forward hop used to occupy:
     #
-    #   cors → ray_id → cache_control → ats_purge → cache_invalidation
-    #   → [read_only] → fs_cache_pressure → input_validation → auth_router
-    #   → trailing_slash → account → acl → request_context → frontend_hmac
-    #   → tracing → metrics → [audit_log] → auth_probe → acl_subresource
-    #   → routers
+    #   cors → ray_id → path_normalization → cache_control → ats_purge
+    #   → cache_invalidation → [read_only] → fs_cache_pressure → input_validation
+    #   → auth_router → trailing_slash → account → acl → frontend_hmac
+    #   → [audit_log] → request_context → tracing → metrics → auth_probe
+    #   → acl_subresource → routers
     #
     # Load-bearing orderings:
     # - auth_probe and acl_subresource MUST stay inner to auth_router + acl.
@@ -518,12 +519,15 @@ def factory() -> FastAPI:
     #   relaying the whole body before the api could answer.
     app.middleware("http")(acl_subresource_middleware)
     app.middleware("http")(auth_probe_middleware)
-    if gateway_config.enable_audit_logging:
-        app.middleware("http")(audit_log_middleware)
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
-    app.middleware("http")(verify_frontend_hmac_middleware)
     app.middleware("http")(request_context_middleware)
+    # Outer to request_context on purpose: the audit log attributes operations to the
+    # CALLER (request.state.account as the account middleware built it); request_context
+    # then rewrites state.account with bucket-owner semantics for the handlers/metrics.
+    if gateway_config.enable_audit_logging:
+        app.middleware("http")(audit_log_middleware)
+    app.middleware("http")(verify_frontend_hmac_middleware)
     app.middleware("http")(acl_middleware)
     app.middleware("http")(account_middleware)
     app.middleware("http")(trailing_slash_normalizer)
@@ -536,6 +540,10 @@ def factory() -> FastAPI:
     app.middleware("http")(cache_invalidation_middleware)
     app.middleware("http")(ats_purge_middleware)
     app.middleware("http")(cache_control_middleware)
+    # One path view for router and every security layer — set once, before anything
+    # reads scope["path"]. Replaces the collapse httpx used to apply in the forwarder;
+    # without it the router acts on the raw path while auth/acl judge the collapsed one.
+    app.middleware("http")(path_normalization_middleware)
     # Second-outermost: stamp ray_id before auth/acl/account/validation run, so
     # every inner middleware logs a real ray_id (GW-2). Kept inside CORS so CORS
     # still wraps error responses, including the ray_id header.

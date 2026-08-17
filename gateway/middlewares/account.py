@@ -15,6 +15,7 @@ from gateway.services.account_service import fetch_account_by_main_address
 from gateway.utils.errors import s3_error_response
 from gateway.utils.paths import routing_path
 from hippius_s3.models.account import HippiusAccount
+from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.services.arion_service import CanUploadResponse
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
@@ -227,6 +228,10 @@ async def account_middleware(
     ):
         resp: Response = await call_next(request)
         return resp
+
+    # Secret-authenticated peer chunk fetches (see input_validation for the rationale).
+    if is_authorized_peer_fetch(request):
+        return await call_next(request)
 
     auth_method = getattr(request.state, "auth_method", None)
 

@@ -18,6 +18,7 @@ from gateway.utils.errors import s3_error_response
 from gateway.utils.paths import collapse_dot_segments
 from gateway.utils.paths import decoded_path
 from gateway.utils.paths import forwarded_path
+from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
 
 
@@ -73,6 +74,13 @@ async def input_validation_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
+    # Peer chunk fetches are the one legitimate consumer of the reserved `internal`
+    # segment. Pre-merge they reached the api directly, bypassing the gateway; in the
+    # merged app they present the peer secret and skip the S3 pipeline. Fail-closed:
+    # anything without the valid secret faces the `internal` rejection below unchanged.
+    if is_authorized_peer_fetch(request):
+        return await call_next(request)
+
     """Validate S3 inputs for security and AWS compatibility."""
 
     decoded = _decoded_path(request)

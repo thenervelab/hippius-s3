@@ -8,6 +8,8 @@ spec:
   type: NodePort
   selector:
     app: api-local
+    # Only merged-image pods carry this label — see the DaemonSet template comment.
+    hippius.io/edge: "true"
   ports:
     - port: 8080
       targetPort: 8000

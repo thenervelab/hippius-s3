@@ -21,6 +21,7 @@ from fastapi.responses import Response
 from gateway.middlewares.acl import parse_s3_path
 from gateway.services.acl_service import ACLService
 from gateway.utils.errors import s3_error_response
+from gateway.utils.paths import routing_path
 from hippius_s3.models.acl import ACL
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import Grantee
@@ -585,7 +586,7 @@ async def acl_subresource_middleware(
     if request.method not in ("GET", "PUT"):
         return await call_next(request)
 
-    bucket, key = parse_s3_path(request.url.path)
+    bucket, key = parse_s3_path(routing_path(request))
     if not bucket:
         return await call_next(request)
 

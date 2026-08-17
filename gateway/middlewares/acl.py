@@ -15,6 +15,7 @@ from gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
 from gateway.utils.errors import s3_error_response
 from gateway.utils.paths import routing_path
 from hippius_s3.models.acl import Permission
+from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
 
@@ -121,6 +122,11 @@ async def acl_middleware(
     path = routing_path(request)
 
     if path == "/health" or path.startswith("/user/"):
+        return await call_next(request)
+
+    # Secret-authenticated peer chunk fetches carry no S3 permission model
+    # (see input_validation for the rationale).
+    if is_authorized_peer_fetch(request):
         return await call_next(request)
 
     if request.method == "OPTIONS":
