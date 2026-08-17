@@ -34,6 +34,23 @@ logger = logging.getLogger(__name__)
 config = get_config()
 
 
+async def _drain(body_iter: AsyncIterator[bytes]) -> None:
+    """Consume the rest of the request body before an early response.
+
+    Pre-merge the gateway relayed (and thereby drained) every byte regardless of how
+    early the api answered; with the client now talking to this app directly, an early
+    412/400 with unconsumed body bytes poisons the keep-alive connection — the next
+    request on it parses the leftover body and gets a bare 400. Append deltas are
+    small, so draining is cheap. A disconnect mid-drain means the connection is dying
+    anyway — nothing to poison.
+    """
+    try:
+        async for _ in body_iter:
+            pass
+    except Exception:
+        return
+
+
 async def handle_append(
     request: Request,
     db: Any,
@@ -74,6 +91,7 @@ async def handle_append(
                     payload = json.loads(cached)
                     etag = payload.get("etag")
                     if etag:
+                        await _drain(body_iter)
                         return Response(status_code=200, headers={"ETag": f'"{etag}"'})
                 except Exception:
                     pass
@@ -83,6 +101,7 @@ async def handle_append(
 
     # Validate append-if-version header early
     if expected_version_header is None:
+        await _drain(body_iter)
         return errors.s3_error_response(
             code="InvalidRequest",
             message="Missing append-if-version",
@@ -91,6 +110,7 @@ async def handle_append(
     try:
         expected_version = int(expected_version_header)
     except ValueError:
+        await _drain(body_iter)
         return errors.s3_error_response(
             code="InvalidRequest",
             message="append-if-version must be an integer",
@@ -113,6 +133,7 @@ async def handle_append(
             body_iter=body_iter,
         )
     except AppendPreconditionFailed as exc:
+        await _drain(body_iter)
         return errors.s3_error_response(
             code="PreconditionFailed",
             message="Version precondition failed",
@@ -123,6 +144,7 @@ async def handle_append(
             },
         )
     except ObjectNotFound:
+        await _drain(body_iter)
         return errors.s3_error_response(
             code="NoSuchKey",
             message=f"The specified key {object_key} does not exist",

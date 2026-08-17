@@ -304,6 +304,17 @@ async def gateway_db_pool() -> AsyncGenerator[Any, None]:
     mock_pool.fetchrow = AsyncMock(return_value=None)
     mock_pool.fetch = AsyncMock(return_value=[])
     mock_pool.execute = AsyncMock()
+    # Post-merge the request continues into the real S3 handlers (nothing forwards
+    # anymore), which `await pool.acquire()` and query for the bucket. An
+    # empty-answering connection makes those requests bottom out at NoSuchBucket /
+    # NoSuchKey 404s, which is the range these signature-acceptance tests assert.
+    mock_conn = MagicMock()
+    mock_conn.fetchrow = AsyncMock(return_value=None)
+    mock_conn.fetch = AsyncMock(return_value=[])
+    mock_conn.fetchval = AsyncMock(return_value=None)
+    mock_conn.execute = AsyncMock()
+    mock_pool.acquire = AsyncMock(return_value=mock_conn)
+    mock_pool.release = AsyncMock()
     yield mock_pool
 
 
