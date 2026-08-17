@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.config import get_config
+from hippius_s3.config import get_config
 from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 
 

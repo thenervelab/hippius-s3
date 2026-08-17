@@ -3,7 +3,6 @@ kind: ConfigMap
 metadata:
   name: hippius-s3-defaults
 data:
-  RATE_LIMIT_PER_MINUTE: "600"
   MAX_REQUEST_SIZE_MB: "100"
   MIN_BUCKET_NAME_LENGTH: "3"
   MAX_BUCKET_NAME_LENGTH: "100"
@@ -18,9 +17,6 @@ data:
   ENABLE_AUDIT_LOGGING: "true"
   ENABLE_API_DOCS: "true"
   ENABLE_REQUEST_PROFILING: "false"
-  ENABLE_BANHAMMER: "true"
-  BANHAMMER_AUTH_MAX: "100"
-  BANHAMMER_AUTH_BAN_SECONDS: "1800"
   HIPPIUS_BYPASS_CREDIT_CHECK: "false"
   HIPPIUS_SUBSTRATE_URL: "wss://rpc.hippius.network"
   HIPPIUS_VALIDATOR_REGION: "decentralized"

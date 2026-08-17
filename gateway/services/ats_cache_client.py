@@ -5,7 +5,7 @@ import logging
 
 import httpx
 
-from gateway.config import get_config
+from hippius_s3.config import get_config
 
 
 logger = logging.getLogger(__name__)

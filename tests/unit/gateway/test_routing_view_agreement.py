@@ -202,7 +202,7 @@ class TestAccountCreditGate:
         The skip returns before the identity branches run, so whether `account_id` was stamped is
         the observable difference between "treated as a docs request" and "treated as S3".
         """
-        monkeypatch.setattr("gateway.middlewares.account.config", MagicMock(bypass_credit_check=False))
+        monkeypatch.setattr("gateway.middlewares.account.config", MagicMock(enable_bypass_credit_check=False))
         request = _request(b"/docs/%2E%2E/anybucket/key.txt", method="PUT")
         request.state.auth_method = None
 
@@ -213,7 +213,7 @@ class TestAccountCreditGate:
     @pytest.mark.asyncio
     async def test_the_real_docs_route_still_skips_the_credit_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The other direction, so the fix cannot be "stop skipping" — /docs must still bypass."""
-        monkeypatch.setattr("gateway.middlewares.account.config", MagicMock(bypass_credit_check=False))
+        monkeypatch.setattr("gateway.middlewares.account.config", MagicMock(enable_bypass_credit_check=False))
         request = _request(b"/docs/oauth2-redirect")
 
         response = await account_middleware(request, _call_next)

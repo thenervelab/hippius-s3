@@ -313,7 +313,6 @@ Config is a typed dataclass: [hippius_s3/config.py](hippius_s3/config.py). Value
 | Variable | Default | Notes |
 |---|---|---|
 | `ENABLE_AUDIT_LOGGING` | `true` | Gateway audit log middleware. |
-| `ENABLE_BANHAMMER` | `true` | Code exists but middleware registration is currently commented out; see [gateway/main.py:94](gateway/main.py). |
 | `HIPPIUS_BYPASS_CREDIT_CHECK` | `false` | Test-only. |
 | `HIPPIUS_READ_ONLY_MODE` | `false` | Blocks all writes at gateway. |
 | `ENABLE_REQUEST_PROFILING` | `false` | Speedscope profiler middleware. |

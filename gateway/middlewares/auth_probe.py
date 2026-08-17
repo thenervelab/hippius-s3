@@ -7,7 +7,7 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
-from gateway.config import get_config
+from hippius_s3.config import get_config
 
 
 __all__ = ["AUTH_PROBE_HEADER", "auth_probe_middleware", "is_valid_auth_probe"]

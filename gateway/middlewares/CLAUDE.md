@@ -78,8 +78,7 @@ Not a middleware — a class used by `auth_orchestrator` and `access_key_auth`. 
 
 ## What's NOT registered today
 
-- [rate_limit.py](rate_limit.py) — code exists (token bucket on `redis-rate-limiting`), but not wired. Reason unclear from code alone — ask Radu. Since the merge deleted `gateway/main.py` there is no registration site at all; wiring it means registering it in [hippius_s3/main.py](../../hippius_s3/main.py).
-- [banhammer.py](banhammer.py) — IP-level banning based on infraction count. Threshold is 200 infractions per memory note (#2748). Not wired; same registration story as rate_limit.
+- `rate_limit.py` and `banhammer.py` were REMOVED in the gateway/api merge PR: both were parked (never registered, even pre-merge — the old `gateway/main.py` held only a commented-out banhammer registration) and their only config consumer was the deleted `GatewayConfig`. Recover from git history if the features are revived; the user-facing unban endpoint in [hippius_s3/api/user.py](../../hippius_s3/api/user.py) still clears the `hippius_banhammer:*` Redis keys.
 
 See [todo.md](../../todo.md) P2 for re-enablement discussion.
 

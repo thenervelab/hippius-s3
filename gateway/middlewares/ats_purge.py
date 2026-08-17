@@ -6,9 +6,9 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
-from gateway.config import get_config
 from gateway.middlewares.acl import parse_s3_path
 from gateway.services.ats_cache_client import schedule_purge
+from hippius_s3.config import get_config
 
 
 async def ats_purge_middleware(

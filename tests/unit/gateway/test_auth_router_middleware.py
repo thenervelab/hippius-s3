@@ -414,10 +414,12 @@ PURGE_PROBE_SECRET = "fake-test-probe-secret-not-real"
 
 @pytest.fixture  # type: ignore[misc]
 def configured_probe_secret(monkeypatch: pytest.MonkeyPatch) -> str:
-    from gateway.config import GatewayConfig
+    import dataclasses
+
+    from hippius_s3.config import get_config
     from gateway.middlewares import auth_probe as auth_probe_mod
 
-    cfg = GatewayConfig(auth_probe_secret=PURGE_PROBE_SECRET)
+    cfg = dataclasses.replace(get_config(), auth_probe_secret=PURGE_PROBE_SECRET)
     monkeypatch.setattr(auth_probe_mod, "get_config", lambda: cfg)
     return PURGE_PROBE_SECRET
 

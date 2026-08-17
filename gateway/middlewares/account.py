@@ -10,10 +10,10 @@ from fastapi import Request
 from fastapi import Response
 from starlette import status
 
-from gateway.config import get_config
 from gateway.services.account_service import fetch_account_by_main_address
 from gateway.utils.errors import s3_error_response
 from gateway.utils.paths import routing_path
+from hippius_s3.config import get_config
 from hippius_s3.models.account import HippiusAccount
 from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.arion_service import ArionClient
@@ -193,7 +193,7 @@ async def account_middleware(
     path = routing_path(request)
 
     # Test bypass: short-circuit credit and substrate/redis access entirely
-    if config.bypass_credit_check:
+    if config.enable_bypass_credit_check:
         auth_method = getattr(request.state, "auth_method", None)
 
         if auth_method == "access_key":

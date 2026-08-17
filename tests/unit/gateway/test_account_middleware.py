@@ -17,17 +17,17 @@ from tests.unit.mocks.mock_arion_service import MockArionService
 
 @pytest.fixture  # type: ignore[misc]
 def mock_config_bypass() -> Any:
-    """Mock config with bypass_credit_check enabled."""
+    """Mock config with enable_bypass_credit_check enabled."""
     config = MagicMock()
-    config.bypass_credit_check = True
+    config.enable_bypass_credit_check = True
     return config
 
 
 @pytest.fixture  # type: ignore[misc]
 def mock_config_no_bypass() -> Any:
-    """Mock config with bypass_credit_check disabled."""
+    """Mock config with enable_bypass_credit_check disabled."""
     config = MagicMock()
-    config.bypass_credit_check = False
+    config.enable_bypass_credit_check = False
     config.substrate_url = "ws://localhost:9944"
     config.can_upload_cache_ttl_seconds = 10
     config.can_upload_transient_retries = 2

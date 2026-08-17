@@ -28,7 +28,6 @@ _project_root = Path(__file__).parents[2]
 dotenv.load_dotenv(_project_root / ".env.defaults", override=True)
 dotenv.load_dotenv(_project_root / ".env.test-local", override=True)
 os.environ["HIPPIUS_BYPASS_CREDIT_CHECK"] = "true"
-os.environ["ENABLE_BANHAMMER"] = "false"
 
 # One table per migration system, so "reachable but unmigrated" is caught as loudly as
 # "unreachable": `objects` comes from dbmate, `cephor_replication_status` from the drain's own
@@ -146,7 +145,7 @@ def _mock_access_key_auth(
     """
     from nacl.secret import SecretBox
 
-    from gateway.config import get_config
+    from hippius_s3.config import get_config
     from hippius_s3.services.hippius_api_service import TokenAuthResponse
 
     key_hex = get_config().hippius_secret_decryption_material

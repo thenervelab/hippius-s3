@@ -13,11 +13,11 @@ from fastapi import Request
 from fastapi import Response
 from substrateinterface.utils.ss58 import is_valid_ss58_address
 
-from gateway.config import get_config
 from gateway.utils.errors import s3_error_response
 from gateway.utils.paths import collapse_dot_segments
 from gateway.utils.paths import decoded_path
 from gateway.utils.paths import forwarded_path
+from hippius_s3.config import get_config
 from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
 

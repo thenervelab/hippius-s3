@@ -54,7 +54,7 @@ If you're new here, read [CLAUDE.md](CLAUDE.md) first for the architectural map.
                                                                 │ Hippius chain (pub) │
                                                                 └─────────────────────┘
 
-* rate-limit + banhammer middleware currently not wired (gateway/main.py:94)
+* rate-limit + banhammer middleware were removed in the gateway/api merge PR (never wired; recover from git if revived)
 ```
 
 For detail: [CLAUDE.md section 3](CLAUDE.md) (request lifecycle).
@@ -262,11 +262,10 @@ Deliberately not done as part of #401: it changes the path every middleware sees
 
 **Also worth one query before the next release**: the new `%`-in-first-segment rejection ([input_validation.py](gateway/middlewares/input_validation.py)) makes any pre-existing bucket whose name contains `%` unreachable. Such a name cannot be created through the gateway (`BUCKET_NAME_PATTERN` refuses it), but confirm none exists: `SELECT bucket_name FROM buckets WHERE bucket_name LIKE '%\%%' ESCAPE '\';`
 
-### P2 — Rate limiting and banhammer disabled at gateway
+### P2 — Rate limiting and banhammer (REMOVED 2026-08)
 
-**File**: [gateway/main.py:94](gateway/main.py) logs `"Rate limiting and banhammer disabled"`. The middleware modules exist ([gateway/middlewares/rate_limit.py](gateway/middlewares/rate_limit.py), [gateway/middlewares/banhammer.py](gateway/middlewares/banhammer.py)) but are not registered in the middleware chain. Reasons unknown from code alone — maybe performance, maybe maturity.
+Both middleware modules were deleted in the gateway/api merge PR: they were never registered (the old `gateway/main.py` held only a commented-out banhammer registration) and their config lived on the deleted `GatewayConfig`. If the features are revived, recover the modules from git history and register them in `hippius_s3/main.py`; the unban endpoint in `hippius_s3/api/user.py` still clears `hippius_banhammer:*` Redis keys.
 
-**Ask Radu**: is this intentional for now, or should we re-enable? If enabling, verify `redis-rate-limiting` and `redis-acl` capacity/perf at current RPS.
 
 ### P2 — Seed phrase auth failure messages
 

@@ -594,7 +594,7 @@ We don't nitpick style (ruff handles that). We don't block on taste.
 
 ### 9.2 "The test passes locally but fails in CI"
 
-- CI runs with `HIPPIUS_BYPASS_CREDIT_CHECK=true` and `ENABLE_BANHAMMER=false`. Check your local env isn't setting them differently.
+- CI runs with `HIPPIUS_BYPASS_CREDIT_CHECK=true`. Check your local env isn't setting it differently.
 - Timing-sensitive tests against Redis pub/sub are often flaky. Use generous timeouts.
 - If your test requires a specific FS cache state, make sure you clean it in setup.
 
@@ -707,7 +707,7 @@ Don't optimize based on intuition. Measure, change, re-measure.
 - **Radu directly** (`radu.mutilica`) for:
   - Anything touching KMS / encryption.
   - Anything touching the janitor's replication invariants.
-  - Re-enabling disabled features (`deploy-cache-production`, rate-limit, banhammer).
+  - Re-enabling disabled features (`deploy-cache-production`; rate-limit/banhammer would need recovering from git).
   - Destructive scripts in [hippius_s3/scripts/CLAUDE.md](hippius_s3/scripts/CLAUDE.md).
 - **Open a GitHub Issue** for bugs, regressions, or design discussion. Link the ray_id or a specific commit.
 - **[todo.md](todo.md)** lists known-but-unsolved issues with context — check there before filing a new issue.

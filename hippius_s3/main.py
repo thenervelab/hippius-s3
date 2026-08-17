@@ -21,7 +21,6 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from gateway.config import get_config as get_gateway_config
 from gateway.middlewares.account import account_middleware
 from gateway.middlewares.acl import acl_middleware
 from gateway.middlewares.acl_subresource import acl_subresource_middleware
@@ -144,15 +143,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.redis_queues_client = async_redis.from_url(config.redis_queues_url)
         logger.info("Redis queues client initialized")
 
-        gateway_config = get_gateway_config()
-
-        app.state.redis_acl = async_redis.from_url(gateway_config.redis_acl_url, decode_responses=True)
+        app.state.redis_acl = async_redis.from_url(config.redis_acl_url, decode_responses=True)
         logger.info("Redis ACL client initialized")
 
         app.state.acl_service = ACLService(
             db_pool=app.state.postgres_pool,
             redis_client=app.state.redis_acl,
-            cache_ttl=gateway_config.acl_cache_ttl_seconds,
+            cache_ttl=config.acl_cache_ttl_seconds,
         )
         logger.info("ACLService initialized")
 

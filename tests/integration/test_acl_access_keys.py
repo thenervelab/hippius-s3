@@ -97,7 +97,7 @@ async def test_bucket_metadata_fetched_in_single_query(integration_app: Any) -> 
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+        with patch("gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 await client.get(
                     "/alice-bucket/test.txt",
@@ -122,7 +122,7 @@ async def test_sub_token_denied_without_grants(integration_app: Any) -> None:
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+        with patch("gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
                     "/alice-bucket/test.txt",
@@ -147,7 +147,7 @@ async def test_sub_token_allowed_with_access_key_grant(integration_app: Any) -> 
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+        with patch("gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
                     "/alice-bucket/test.txt",
@@ -173,7 +173,7 @@ async def test_sub_token_denied_with_different_key_grant(integration_app: Any) -
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+        with patch("gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
                     "/alice-bucket/test.txt",
@@ -197,7 +197,7 @@ async def test_master_token_bypasses_acl_for_owned_bucket(integration_app: Any) 
     )
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+        with patch("gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.put(
                     "/alice-bucket/test.txt",
@@ -225,7 +225,7 @@ async def test_account_grant_allows_all_keys(integration_app: Any) -> None:
         )
 
         with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-            with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+            with patch("gateway.middlewares.account.config.enable_bypass_credit_check", True):
                 async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                     response = await client.get(
                         "/alice-bucket/test.txt",
@@ -249,7 +249,7 @@ async def test_cross_account_access_key_grant(integration_app: Any) -> None:
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+        with patch("gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
                     "/alice-bucket/test.txt",
@@ -285,7 +285,7 @@ async def test_presigned_get_uses_access_key_for_acl(integration_app: Any) -> No
     )
 
     with patch("gateway.services.auth_orchestrator.verify_access_key_presigned_url", mock_verify_presigned):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+        with patch("gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get("/alice-bucket/test.txt", params=query_params)
 

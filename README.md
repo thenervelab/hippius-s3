@@ -25,7 +25,7 @@ Arion Storage Backend + Hippius Blockchain
 - **S3 Operations**: Buckets, objects, multipart uploads, metadata, tagging, ACLs, lifecycle policies
 - **S4 Extensions**: Atomic O(delta) appends with compare-and-swap semantics ([docs/s4.md](docs/s4.md))
 - **Authentication**: 5 methods (presigned URL, bearer token, access key, seed phrase SigV4, anonymous)
-- **Security**: Rate limiting, IP blocking (banhammer), input validation, credit verification
+- **Security**: Input validation, credit verification, ACLs
 - **Encryption**: NaCl per-object keys with envelope encryption (OVH KMS in production)
 - **Blockchain**: Automatic Arion storage and blockchain publishing with transaction tracking
 - **Monitoring**: OpenTelemetry with LGTM stack (Loki, Grafana, Tempo, Mimir/Prometheus)
@@ -119,7 +119,6 @@ Create a `.env` file. Base defaults are in `.env.defaults`.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ENABLE_AUDIT_LOGGING` | `true` | Operation audit trails |
-| `ENABLE_BANHAMMER` | `true` | IP-based blocking |
 | `HIPPIUS_BYPASS_CREDIT_CHECK` | `false` | Skip credit verification (testing only) |
 | `ENABLE_REQUEST_PROFILING` | `false` | Request profiling |
 | `ENABLE_API_DOCS` | `true` | Swagger UI |
@@ -284,7 +283,7 @@ hippius_s3/            Main API application
   sql/                 Migrations and parameterized queries
   scripts/             Operational scripts (migrate, requeue, nuke, purge)
 gateway/               Public-facing FastAPI gateway (port 8080)
-  middlewares/         Auth, SigV4, ACL, rate limit, banhammer, audit, CORS
+  middlewares/         Auth, SigV4, ACL, audit, CORS
   services/            Auth orchestrator, ACL, account, forwarding
 workers/               Worker entry points (run_*_in_loop.py)
 cacher/                Substrate account data cacher
