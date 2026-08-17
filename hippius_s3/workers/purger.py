@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 from redis.exceptions import RedisError
@@ -10,6 +11,7 @@ from redis.exceptions import RedisError
 from gateway.services.sub_token_scope_cache import scope_cache_key
 from hippius_s3.config import Config
 from hippius_s3.config import get_config
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.utils import get_query
@@ -32,6 +34,7 @@ async def _wait_for_unpin_headroom(redis_queues: Any, db_pool: Any, job_id: Any,
         logger.info(
             f"purger: unpin queue depth {max(depths)} >= high water {config.purger_unpin_queue_high_water}, backing off"
         )
+        get_metrics_collector().record_purger_backpressure_wait()
         await db_pool.execute("UPDATE purge_jobs SET heartbeat_at = now() WHERE job_id = $1", job_id)
         await asyncio.sleep(config.purger_backpressure_sleep_seconds)
 
@@ -129,6 +132,8 @@ async def process_one_job(db_pool: Any, redis_queues: Any, redis_cache: Any, con
         return False
 
     job_id = job["job_id"]
+    metrics = get_metrics_collector()
+    started = time.monotonic()
     logger.info(f"purger: claimed job={job_id} account={job['account_id']}")
     try:
         deleted_objects, deleted_bytes = await _purge_account(db_pool, redis_queues, redis_cache, job, config)
@@ -141,12 +146,14 @@ async def process_one_job(db_pool: Any, redis_queues: Any, redis_cache: Any, con
             job_id,
             f"{type(exc).__name__}: {exc}",
         )
+        metrics.record_purger_job(success=False, deleted_objects=0, duration=time.monotonic() - started)
         return True
 
     await db_pool.execute(
         "UPDATE purge_jobs SET state = 'done', finished_at = now(), heartbeat_at = now() WHERE job_id = $1",
         job_id,
     )
+    metrics.record_purger_job(success=True, deleted_objects=deleted_objects, duration=time.monotonic() - started)
     logger.info(f"purger: job={job_id} done — {deleted_objects} objects, {deleted_bytes} logical bytes")
     return True
 

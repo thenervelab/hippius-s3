@@ -362,7 +362,9 @@ Disallow: /"""
 
     app.include_router(user_router, prefix="/user")
     app.include_router(sub_token_scopes_router, prefix="/user/sub-tokens")
-    app.include_router(admin_router, prefix="/admin")
+    # include_in_schema=False: the admin surface is HMAC-gated staff tooling — keep it out
+    # of the public OpenAPI schema (and therefore Swagger/redoc) so it isn't advertised.
+    app.include_router(admin_router, prefix="/admin", include_in_schema=False)
     app.include_router(public_router, prefix="")
     app.include_router(s3_router_new, prefix="")
 

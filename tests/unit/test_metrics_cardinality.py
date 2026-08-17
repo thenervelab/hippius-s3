@@ -46,6 +46,8 @@ BOUNDED_LABELS = {
     # Both are closed sets fixed in code, not caller- or object-derived.
     "reason",
     "pressure_mode",
+    # Purge job outcome: "done" | "failed", fixed in record_purger_job.
+    "result",
 }
 
 
