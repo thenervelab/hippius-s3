@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import pytest
 
-from gateway.services.sub_token_scope import OP_CREATE_BUCKET
-from gateway.services.sub_token_scope import OP_DELETE_BUCKET
-from gateway.services.sub_token_scope import OP_DELETE_OBJECT
-from gateway.services.sub_token_scope import OP_LIST_BUCKET
-from gateway.services.sub_token_scope import OP_LIST_BUCKETS
-from gateway.services.sub_token_scope import OP_READ_BUCKET_META
-from gateway.services.sub_token_scope import OP_READ_OBJECT
-from gateway.services.sub_token_scope import OP_WRITE_BUCKET_META
-from gateway.services.sub_token_scope import OP_WRITE_OBJECT
-from gateway.services.sub_token_scope import bucket_in_scope
-from gateway.services.sub_token_scope import evaluate
-from gateway.services.sub_token_scope import permission_allows
-from gateway.services.sub_token_scope import required_op
+from hippius_s3.gateway.services.sub_token_scope import OP_CREATE_BUCKET
+from hippius_s3.gateway.services.sub_token_scope import OP_DELETE_BUCKET
+from hippius_s3.gateway.services.sub_token_scope import OP_DELETE_OBJECT
+from hippius_s3.gateway.services.sub_token_scope import OP_LIST_BUCKET
+from hippius_s3.gateway.services.sub_token_scope import OP_LIST_BUCKETS
+from hippius_s3.gateway.services.sub_token_scope import OP_READ_BUCKET_META
+from hippius_s3.gateway.services.sub_token_scope import OP_READ_OBJECT
+from hippius_s3.gateway.services.sub_token_scope import OP_WRITE_BUCKET_META
+from hippius_s3.gateway.services.sub_token_scope import OP_WRITE_OBJECT
+from hippius_s3.gateway.services.sub_token_scope import bucket_in_scope
+from hippius_s3.gateway.services.sub_token_scope import evaluate
+from hippius_s3.gateway.services.sub_token_scope import permission_allows
+from hippius_s3.gateway.services.sub_token_scope import required_op
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScope
 
 

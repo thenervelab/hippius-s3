@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from gateway.services.acl_service import ACLService
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.services.acl_service import ACLService
+from hippius_s3.gateway.services.acl_service import BucketLookup
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import Grantee
 from hippius_s3.models.acl import GranteeType

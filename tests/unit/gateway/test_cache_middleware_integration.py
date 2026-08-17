@@ -13,12 +13,12 @@ from httpx import ASGITransport
 from httpx import AsyncClient
 
 from hippius_s3 import config as gateway_config
-from gateway.middlewares.acl import acl_middleware
-from gateway.middlewares.ats_purge import ats_purge_middleware
-from gateway.middlewares.cache_control import PRIVATE_CACHE_CONTROL
-from gateway.middlewares.cache_control import PUBLIC_CACHE_CONTROL
-from gateway.middlewares.cache_control import cache_control_middleware
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.middlewares.ats_purge import ats_purge_middleware
+from hippius_s3.gateway.middlewares.cache_control import PRIVATE_CACHE_CONTROL
+from hippius_s3.gateway.middlewares.cache_control import PUBLIC_CACHE_CONTROL
+from hippius_s3.gateway.middlewares.cache_control import cache_control_middleware
+from hippius_s3.gateway.services.acl_service import BucketLookup
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
@@ -65,7 +65,7 @@ def _build_app(
     def fake_schedule_purge(host: str, key: str) -> None:
         captured_purges.append((host, key))
 
-    monkeypatch.setattr("gateway.middlewares.ats_purge.schedule_purge", fake_schedule_purge)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.ats_purge.schedule_purge", fake_schedule_purge)
 
     async def stub_auth(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         request.state.account_id = account_id

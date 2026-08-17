@@ -21,7 +21,7 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
-from gateway.utils.paths import routing_path
+from hippius_s3.gateway.utils.paths import routing_path
 
 
 async def path_normalization_middleware(

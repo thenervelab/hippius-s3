@@ -21,22 +21,6 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from gateway.middlewares.account import account_middleware
-from gateway.middlewares.acl import acl_middleware
-from gateway.middlewares.ats_purge import ats_purge_middleware
-from gateway.middlewares.audit_log import audit_log_middleware
-from gateway.middlewares.auth_probe import auth_probe_middleware
-from gateway.middlewares.auth_router import auth_router_middleware
-from gateway.middlewares.cache_control import cache_control_middleware
-from gateway.middlewares.cache_invalidation import cache_invalidation_middleware
-from gateway.middlewares.cors import cors_middleware
-from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
-from gateway.middlewares.input_validation import input_validation_middleware
-from gateway.middlewares.path_normalization import path_normalization_middleware
-from gateway.middlewares.ray_id import ray_id_middleware
-from gateway.middlewares.read_only import read_only_middleware
-from gateway.middlewares.trailing_slash import trailing_slash_normalizer
-from gateway.services.acl_service import ACLService
 from hippius_s3.api.internal_parts import router as internal_parts_router
 from hippius_s3.api.middlewares.fs_cache_pressure import fs_cache_pressure_middleware
 from hippius_s3.api.middlewares.metrics import metrics_middleware
@@ -59,6 +43,22 @@ from hippius_s3.cache.replication_probe import create_replication_suspect_probe
 from hippius_s3.cache.residency import create_residency_recorder
 from hippius_s3.config import Config
 from hippius_s3.config import get_config
+from hippius_s3.gateway.middlewares.account import account_middleware
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.middlewares.ats_purge import ats_purge_middleware
+from hippius_s3.gateway.middlewares.audit_log import audit_log_middleware
+from hippius_s3.gateway.middlewares.auth_probe import auth_probe_middleware
+from hippius_s3.gateway.middlewares.auth_router import auth_router_middleware
+from hippius_s3.gateway.middlewares.cache_control import cache_control_middleware
+from hippius_s3.gateway.middlewares.cache_invalidation import cache_invalidation_middleware
+from hippius_s3.gateway.middlewares.cors import cors_middleware
+from hippius_s3.gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
+from hippius_s3.gateway.middlewares.input_validation import input_validation_middleware
+from hippius_s3.gateway.middlewares.path_normalization import path_normalization_middleware
+from hippius_s3.gateway.middlewares.ray_id import ray_id_middleware
+from hippius_s3.gateway.middlewares.read_only import read_only_middleware
+from hippius_s3.gateway.middlewares.trailing_slash import trailing_slash_normalizer
+from hippius_s3.gateway.services.acl_service import ACLService
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
 from hippius_s3.peer_auth import validate_peer_secret
@@ -399,7 +399,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.exception("Error shutting down HippiusApiClient")
 
         try:
-            from gateway.services import ats_cache_client
+            from hippius_s3.gateway.services import ats_cache_client
 
             await ats_cache_client.close()
             logger.info("ATS cache client closed")

@@ -31,10 +31,10 @@ from pydantic import BaseModel
 from pydantic import Field
 from redis.exceptions import RedisError
 
-from gateway.services.sub_token_scope_cache import SCOPE_CACHE_TTL_SECONDS
-from gateway.services.sub_token_scope_cache import scope_cache_key
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.dependencies import get_postgres
+from hippius_s3.gateway.services.sub_token_scope_cache import SCOPE_CACHE_TTL_SECONDS
+from hippius_s3.gateway.services.sub_token_scope_cache import scope_cache_key
 from hippius_s3.models.sub_token import ACCESS_KEY_PATTERN
 from hippius_s3.models.sub_token import SS58_PATTERN
 from hippius_s3.models.sub_token import BucketScope

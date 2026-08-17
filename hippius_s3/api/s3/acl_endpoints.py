@@ -14,8 +14,8 @@ import xml.etree.ElementTree as ET
 from fastapi import Request
 from fastapi.responses import Response
 
-from gateway.services.acl_service import ACLService
-from gateway.utils.errors import s3_error_response
+from hippius_s3.gateway.services.acl_service import ACLService
+from hippius_s3.gateway.utils.errors import s3_error_response
 from hippius_s3.models.acl import ACL
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import Grantee

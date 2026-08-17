@@ -10,7 +10,7 @@ from httpx import ASGITransport
 from httpx import AsyncClient
 
 from hippius_s3 import config as gateway_config
-from gateway.middlewares.ats_purge import ats_purge_middleware
+from hippius_s3.gateway.middlewares.ats_purge import ats_purge_middleware
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
@@ -28,7 +28,7 @@ def captured_purges(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     def fake_schedule_purge(host: str, key: str) -> None:
         calls.append((host, key))
 
-    monkeypatch.setattr("gateway.middlewares.ats_purge.schedule_purge", fake_schedule_purge)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.ats_purge.schedule_purge", fake_schedule_purge)
     return calls
 
 

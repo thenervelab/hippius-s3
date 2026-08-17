@@ -25,9 +25,9 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.acl import _parse_copy_source_bucket
-from gateway.middlewares.acl import acl_middleware
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.middlewares.acl import _parse_copy_source_bucket
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.services.acl_service import BucketLookup
 from hippius_s3.models.sub_token import BucketScope
 from hippius_s3.models.sub_token import Permission
 from hippius_s3.models.sub_token import SubTokenScope

@@ -10,7 +10,7 @@ from httpx import ASGITransport
 from httpx import AsyncClient
 
 from hippius_s3.config import get_config
-from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
+from hippius_s3.gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
 
 
 def _signature(secret: str, method: str, path: str, query: str = "") -> str:
@@ -63,7 +63,7 @@ async def test_invalid_hmac_signature_returns_403_json(frontend_hmac_app: Any) -
 
 @pytest.mark.asyncio
 async def test_valid_hmac_signature_passes(frontend_hmac_app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    from gateway.middlewares import frontend_hmac as fh
+    from hippius_s3.gateway.middlewares import frontend_hmac as fh
 
     monkeypatch.setattr(fh.config, "frontend_hmac_secret", "unit-test-secret")
 

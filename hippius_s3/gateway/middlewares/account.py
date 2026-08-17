@@ -10,10 +10,10 @@ from fastapi import Request
 from fastapi import Response
 from starlette import status
 
-from gateway.services.account_service import fetch_account_by_main_address
-from gateway.utils.errors import s3_error_response
-from gateway.utils.paths import routing_path
 from hippius_s3.config import get_config
+from hippius_s3.gateway.services.account_service import fetch_account_by_main_address
+from hippius_s3.gateway.utils.errors import s3_error_response
+from hippius_s3.gateway.utils.paths import routing_path
 from hippius_s3.models.account import HippiusAccount
 from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.arion_service import ArionClient

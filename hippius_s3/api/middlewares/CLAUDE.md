@@ -2,7 +2,7 @@
 
 API-side middleware, composed with the gateway middlewares into the single merged app —
 the full chain and its ordering invariants are documented at the registration site in
-[hippius_s3/main.py](../../main.py) and in [gateway/CLAUDE.md](../../../gateway/CLAUDE.md).
+[hippius_s3/main.py](../../main.py) and in [hippius_s3/gateway/CLAUDE.md](../../gateway/CLAUDE.md).
 There is no `X-Hippius-*` header contract anymore: auth state flows through
 `request.state` directly.
 
@@ -47,7 +47,7 @@ Helper: `set_span_attributes(span, {...})` from [hippius_s3/api/middlewares/trac
 
 ## [input_validation.py](input_validation.py) — if present
 
-Content validation (not to be confused with gateway's [input_validation.py](../../../gateway/middlewares/input_validation.py) which is about bucket/key naming). Bounds object size at [config.max_object_size](../../config.py).
+Content validation (not to be confused with gateway's [input_validation.py](../../gateway/middlewares/input_validation.py) which is about bucket/key naming). Bounds object size at [config.max_object_size](../../config.py).
 
 ## [profiler.py](profiler.py) — `SpeedscopeProfilerMiddleware`
 

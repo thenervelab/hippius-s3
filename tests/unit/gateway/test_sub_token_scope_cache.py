@@ -14,8 +14,8 @@ import asyncpg
 import pytest
 from redis.exceptions import RedisError
 
-from gateway.services.sub_token_scope_cache import _NEGATIVE_MARKER
-from gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
+from hippius_s3.gateway.services.sub_token_scope_cache import _NEGATIVE_MARKER
+from hippius_s3.gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
 from hippius_s3.models.sub_token import BucketScope
 from hippius_s3.models.sub_token import Permission
 from hippius_s3.models.sub_token import SubTokenScope

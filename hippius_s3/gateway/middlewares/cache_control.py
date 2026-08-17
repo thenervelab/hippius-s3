@@ -6,8 +6,8 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
-from gateway.middlewares.acl import parse_s3_path
 from hippius_s3.config import get_config
+from hippius_s3.gateway.middlewares.acl import parse_s3_path
 
 
 PUBLIC_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=60"

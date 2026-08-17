@@ -5,7 +5,7 @@ import redis.asyncio as redis
 from pydantic import BaseModel
 from redis.exceptions import RedisError
 
-from gateway.repositories.cached_acl_repository import CachedACLRepository
+from hippius_s3.gateway.repositories.cached_acl_repository import CachedACLRepository
 from hippius_s3.models.acl import ACL
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import GranteeType

@@ -12,12 +12,12 @@ from httpx import AsyncClient
 import dataclasses
 
 from hippius_s3.config import get_config
-from gateway.middlewares import cache_control as cache_control_mod
-from gateway.middlewares.cache_control import PRIVATE_CACHE_CONTROL
-from gateway.middlewares.cache_control import PUBLIC_CACHE_CONTROL
-from gateway.middlewares.cache_control import VISIBILITY_HEADER
-from gateway.middlewares.cache_control import WARM_PUBLIC_CACHE_CONTROL
-from gateway.middlewares.cache_control import cache_control_middleware
+from hippius_s3.gateway.middlewares import cache_control as cache_control_mod
+from hippius_s3.gateway.middlewares.cache_control import PRIVATE_CACHE_CONTROL
+from hippius_s3.gateway.middlewares.cache_control import PUBLIC_CACHE_CONTROL
+from hippius_s3.gateway.middlewares.cache_control import VISIBILITY_HEADER
+from hippius_s3.gateway.middlewares.cache_control import WARM_PUBLIC_CACHE_CONTROL
+from hippius_s3.gateway.middlewares.cache_control import cache_control_middleware
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]

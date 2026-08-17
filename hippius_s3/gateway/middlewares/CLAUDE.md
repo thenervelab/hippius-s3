@@ -10,9 +10,9 @@ Innermost on the chain. Reads `X-Ray-ID` from the request (if set), or generates
 
 ### [audit_log.py](audit_log.py) — `audit_log_middleware`
 
-Gated by `ENABLE_AUDIT_LOGGING`. Records every request with method, path, account, status, latency. Delegates to [hippius_s3/services/audit_service.py](../../hippius_s3/services/audit_service.py) (shared with the internal API).
+Gated by `ENABLE_AUDIT_LOGGING`. Records every request with method, path, account, status, latency. Delegates to [hippius_s3/services/audit_service.py](../../services/audit_service.py) (shared with the internal API).
 
-Metrics and tracing for the merged app live in [hippius_s3/api/middlewares/](../../hippius_s3/api/middlewares/) — the gateway-side `metrics.py`/`tracing.py` shadows were deleted with the merge.
+Metrics and tracing for the merged app live in [hippius_s3/api/middlewares/](../../api/middlewares/) — the gateway-side `metrics.py`/`tracing.py` shadows were deleted with the merge.
 
 ### [frontend_hmac.py](frontend_hmac.py) — `verify_frontend_hmac_middleware`
 
@@ -78,9 +78,9 @@ Not a middleware — a class used by `auth_orchestrator` and `access_key_auth`. 
 
 ## What's NOT registered today
 
-- `rate_limit.py` and `banhammer.py` were REMOVED in the gateway/api merge PR: both were parked (never registered, even pre-merge — the old `gateway/main.py` held only a commented-out banhammer registration) and their only config consumer was the deleted `GatewayConfig`. Recover from git history if the features are revived; the user-facing unban endpoint in [hippius_s3/api/user.py](../../hippius_s3/api/user.py) still clears the `hippius_banhammer:*` Redis keys.
+- `rate_limit.py` and `banhammer.py` were REMOVED in the gateway/api merge PR: both were parked (never registered, even pre-merge — the old `gateway/main.py` held only a commented-out banhammer registration) and their only config consumer was the deleted `GatewayConfig`. Recover from git history if the features are revived; the user-facing unban endpoint in [hippius_s3/api/user.py](../../api/user.py) still clears the `hippius_banhammer:*` Redis keys.
 
-See [todo.md](../../todo.md) P2 for re-enablement discussion.
+See [todo.md](../../../todo.md) P2 for re-enablement discussion.
 
 <claude-mem-context>
 # Recent Activity

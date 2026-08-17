@@ -14,8 +14,8 @@ def integration_app() -> Any:
     """
     Create a FastAPI app with the full auth middleware chain for smoke testing.
     """
-    from gateway.middlewares.account import account_middleware
-    from gateway.middlewares.auth_router import auth_router_middleware
+    from hippius_s3.gateway.middlewares.account import account_middleware
+    from hippius_s3.gateway.middlewares.auth_router import auth_router_middleware
 
     app = FastAPI()
 

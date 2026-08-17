@@ -4,16 +4,16 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
-from gateway.middlewares.auth_probe import is_valid_auth_probe
-from gateway.services.sub_token_scope import OP_LIST_BUCKETS
-from gateway.services.sub_token_scope import OP_READ_OBJECT
-from gateway.services.sub_token_scope import bucket_in_scope
-from gateway.services.sub_token_scope import evaluate as evaluate_sub_token_scope
-from gateway.services.sub_token_scope import permission_allows
-from gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
-from gateway.utils.errors import s3_error_response
-from gateway.utils.paths import routing_path
 from hippius_s3.config import get_config
+from hippius_s3.gateway.middlewares.auth_probe import is_valid_auth_probe
+from hippius_s3.gateway.services.sub_token_scope import OP_LIST_BUCKETS
+from hippius_s3.gateway.services.sub_token_scope import OP_READ_OBJECT
+from hippius_s3.gateway.services.sub_token_scope import bucket_in_scope
+from hippius_s3.gateway.services.sub_token_scope import evaluate as evaluate_sub_token_scope
+from hippius_s3.gateway.services.sub_token_scope import permission_allows
+from hippius_s3.gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
+from hippius_s3.gateway.utils.errors import s3_error_response
+from hippius_s3.gateway.utils.paths import routing_path
 from hippius_s3.models.acl import Permission
 from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id

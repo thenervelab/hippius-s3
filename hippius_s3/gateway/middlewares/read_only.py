@@ -5,7 +5,7 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
-from gateway.utils.errors import s3_error_response
+from hippius_s3.gateway.utils.errors import s3_error_response
 
 
 logger = logging.getLogger(__name__)

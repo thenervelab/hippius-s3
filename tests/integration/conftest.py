@@ -20,7 +20,7 @@ from botocore.config import Config
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.services.acl_service import BucketLookup
 from tests.e2e.conftest import is_real_aws
 
 
@@ -164,7 +164,7 @@ def _mock_access_key_auth(
             nonce=base64.b64encode(b"\x00" * 24).decode(),
         )
 
-    monkeypatch.setattr("gateway.middlewares.access_key_auth.cached_auth", _fake_cached_auth)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.access_key_auth.cached_auth", _fake_cached_auth)
 
 
 @pytest.fixture

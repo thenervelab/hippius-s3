@@ -29,12 +29,12 @@ import pytest
 from fastapi import Request
 from fastapi import Response
 
-from gateway.middlewares.account import account_middleware
-from gateway.middlewares.acl import acl_middleware
-from gateway.middlewares.auth_router import EXEMPT_SEGMENTS
-from gateway.middlewares.auth_router import auth_router_middleware
-from gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.middlewares.account import account_middleware
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.middlewares.auth_router import EXEMPT_SEGMENTS
+from hippius_s3.gateway.middlewares.auth_router import auth_router_middleware
+from hippius_s3.gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
+from hippius_s3.gateway.services.acl_service import BucketLookup
 
 
 # Each is a client-sent raw path whose first segment reads as an exempt/skip route, paired with the
@@ -92,7 +92,7 @@ class TestAuthRouterExemption:
     def authenticate(self, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
         result = MagicMock(error_response=None, auth_method="anonymous")
         mock = AsyncMock(return_value=result)
-        monkeypatch.setattr("gateway.middlewares.auth_router.authenticate_request", mock)
+        monkeypatch.setattr("hippius_s3.gateway.middlewares.auth_router.authenticate_request", mock)
         return mock
 
     @pytest.mark.asyncio
@@ -202,7 +202,7 @@ class TestAccountCreditGate:
         The skip returns before the identity branches run, so whether `account_id` was stamped is
         the observable difference between "treated as a docs request" and "treated as S3".
         """
-        monkeypatch.setattr("gateway.middlewares.account.config", MagicMock(enable_bypass_credit_check=False))
+        monkeypatch.setattr("hippius_s3.gateway.middlewares.account.config", MagicMock(enable_bypass_credit_check=False))
         request = _request(b"/docs/%2E%2E/anybucket/key.txt", method="PUT")
         request.state.auth_method = None
 
@@ -213,7 +213,7 @@ class TestAccountCreditGate:
     @pytest.mark.asyncio
     async def test_the_real_docs_route_still_skips_the_credit_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The other direction, so the fix cannot be "stop skipping" — /docs must still bypass."""
-        monkeypatch.setattr("gateway.middlewares.account.config", MagicMock(enable_bypass_credit_check=False))
+        monkeypatch.setattr("hippius_s3.gateway.middlewares.account.config", MagicMock(enable_bypass_credit_check=False))
         request = _request(b"/docs/oauth2-redirect")
 
         response = await account_middleware(request, _call_next)

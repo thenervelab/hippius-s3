@@ -18,12 +18,12 @@ from urllib.parse import urlencode
 import pytest
 from fastapi import Request
 
-from gateway.middlewares.access_key_auth import AccessKeyAuthError
-from gateway.middlewares.access_key_auth import verify_access_key_presigned_url
-from gateway.middlewares.sigv4 import AuthParsingError
-from gateway.middlewares.sigv4 import create_canonical_request
-from gateway.services.auth_orchestrator import _authenticate_access_key_header
-from gateway.services.auth_orchestrator import authenticate_request
+from hippius_s3.gateway.middlewares.access_key_auth import AccessKeyAuthError
+from hippius_s3.gateway.middlewares.access_key_auth import verify_access_key_presigned_url
+from hippius_s3.gateway.middlewares.sigv4 import AuthParsingError
+from hippius_s3.gateway.middlewares.sigv4 import create_canonical_request
+from hippius_s3.gateway.services.auth_orchestrator import _authenticate_access_key_header
+from hippius_s3.gateway.services.auth_orchestrator import authenticate_request
 from hippius_s3.services.hippius_api_service import HippiusAPIError
 
 
@@ -57,7 +57,7 @@ def _records(caplog: pytest.LogCaptureFixture, needle: str) -> list[logging.LogR
 @pytest.mark.asyncio
 async def test_malformed_credential_logs_warning_not_error(caplog: pytest.LogCaptureFixture) -> None:
     """A SigV4 header that fails credential extraction (client input) -> WARNING, never ERROR."""
-    caplog.set_level(logging.DEBUG, logger="gateway.services.auth_orchestrator")
+    caplog.set_level(logging.DEBUG, logger="hippius_s3.gateway.services.auth_orchestrator")
 
     # Well-formed enough to be treated as a SigV4 header, but no parseable Credential=.
     request = make_request(
@@ -77,7 +77,7 @@ async def test_malformed_credential_logs_warning_not_error(caplog: pytest.LogCap
 @pytest.mark.asyncio
 async def test_presigned_invalid_credential_format_logs_warning(caplog: pytest.LogCaptureFixture) -> None:
     """A presigned URL with a malformed X-Amz-Credential (client input) -> WARNING, never ERROR."""
-    caplog.set_level(logging.DEBUG, logger="gateway.middlewares.access_key_auth")
+    caplog.set_level(logging.DEBUG, logger="hippius_s3.gateway.middlewares.access_key_auth")
 
     access_key = "hip_presigned_key_12345"
     query_params = {
@@ -102,7 +102,7 @@ async def test_presigned_invalid_credential_format_logs_warning(caplog: pytest.L
 @pytest.mark.asyncio
 async def test_presigned_expired_signature_mismatch_logs_warning(caplog: pytest.LogCaptureFixture) -> None:
     """A presigned URL whose signature doesn't match (client input) -> WARNING, never ERROR."""
-    caplog.set_level(logging.DEBUG, logger="gateway.middlewares.access_key_auth")
+    caplog.set_level(logging.DEBUG, logger="hippius_s3.gateway.middlewares.access_key_auth")
 
     access_key = "hip_presigned_key_67890"
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -126,14 +126,14 @@ async def test_presigned_expired_signature_mismatch_logs_warning(caplog: pytest.
     token_response.encrypted_secret = "enc"
     token_response.nonce = "nonce"
 
-    with patch("gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=token_response):
-        with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
+    with patch("hippius_s3.gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=token_response):
+        with patch("hippius_s3.gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with patch(
-                "gateway.middlewares.access_key_auth.create_canonical_request",
+                "hippius_s3.gateway.middlewares.access_key_auth.create_canonical_request",
                 new_callable=AsyncMock,
                 return_value="canonical",
             ):
-                with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="serversidesig"):
+                with patch("hippius_s3.gateway.middlewares.access_key_auth.calculate_signature", return_value="serversidesig"):
                     with pytest.raises(AccessKeyAuthError):
                         await verify_access_key_presigned_url(request, access_key, AsyncMock())
 
@@ -146,13 +146,13 @@ async def test_presigned_expired_signature_mismatch_logs_warning(caplog: pytest.
 @pytest.mark.asyncio
 async def test_upstream_hippius_api_error_stays_error(caplog: pytest.LogCaptureFixture) -> None:
     """A genuine upstream failure (HippiusAPIError) must STILL log at ERROR — not downgraded."""
-    caplog.set_level(logging.DEBUG, logger="gateway.services.auth_orchestrator")
+    caplog.set_level(logging.DEBUG, logger="hippius_s3.gateway.services.auth_orchestrator")
 
     request = make_request(method="PUT")
-    logger = logging.getLogger("gateway.services.auth_orchestrator")
+    logger = logging.getLogger("hippius_s3.gateway.services.auth_orchestrator")
 
     with patch(
-        "gateway.services.auth_orchestrator.verify_access_key_signature",
+        "hippius_s3.gateway.services.auth_orchestrator.verify_access_key_signature",
         new_callable=AsyncMock,
         side_effect=HippiusAPIError("arion down"),
     ):
@@ -168,7 +168,7 @@ async def test_upstream_hippius_api_error_stays_error(caplog: pytest.LogCaptureF
 @pytest.mark.asyncio
 async def test_sigv4_missing_payload_hash_logs_warning(caplog: pytest.LogCaptureFixture) -> None:
     """A non-presigned request missing x-amz-content-sha256 (client input) -> WARNING, never ERROR."""
-    caplog.set_level(logging.DEBUG, logger="gateway.middlewares.sigv4")
+    caplog.set_level(logging.DEBUG, logger="hippius_s3.gateway.middlewares.sigv4")
 
     request = make_request(method="PUT", headers={"host": "s3.hippius.com", "x-amz-date": "20260101T000000Z"})
 

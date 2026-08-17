@@ -7,13 +7,13 @@ from fastapi import Request
 from fastapi import Response
 from starlette import status
 
-from gateway.middlewares.access_key_auth import AccessKeyAuthError
-from gateway.middlewares.access_key_auth import verify_access_key_presigned_url
-from gateway.middlewares.access_key_auth import verify_access_key_signature
-from gateway.middlewares.sigv4 import AuthParsingError
-from gateway.middlewares.sigv4 import extract_credential_from_auth_header
-from gateway.services.auth_cache import cached_auth
-from gateway.utils.errors import s3_error_response
+from hippius_s3.gateway.middlewares.access_key_auth import AccessKeyAuthError
+from hippius_s3.gateway.middlewares.access_key_auth import verify_access_key_presigned_url
+from hippius_s3.gateway.middlewares.access_key_auth import verify_access_key_signature
+from hippius_s3.gateway.middlewares.sigv4 import AuthParsingError
+from hippius_s3.gateway.middlewares.sigv4 import extract_credential_from_auth_header
+from hippius_s3.gateway.services.auth_cache import cached_auth
+from hippius_s3.gateway.utils.errors import s3_error_response
 from hippius_s3.services.hippius_api_service import HippiusAPIError
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 

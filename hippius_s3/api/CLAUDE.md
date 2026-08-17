@@ -1,6 +1,6 @@
 # hippius_s3/api/
 
-Internal FastAPI app on port 8000. **Not exposed to the internet** — only the gateway talks to it. Trusts `X-Hippius-*` headers injected by [gateway/services/forward_service.py](../../gateway/services/forward_service.py).
+The single merged FastAPI app on port 8000, public-facing since the 2026-08 gateway/api merge. Auth/ACL run as middlewares in the same process ([hippius_s3/gateway/](../gateway/)); there is no `X-Hippius-*` header contract and no forward hop.
 
 See [../../CLAUDE.md](../../CLAUDE.md) for the full request lifecycle; this file covers the API layer.
 

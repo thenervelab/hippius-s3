@@ -414,7 +414,7 @@ Example: add `GET /{bucket}/{key}?acl` to return an object's ACL as XML.
 2. **Router**. In [hippius_s3/api/s3/objects/router.py](hippius_s3/api/s3/objects/router.py), the GET route already exists for `/{bucket}/{key}`. Add a branch: if `"acl" in request.query_params`, dispatch to the new handler.
 3. **Query**. If you need new SQL, add `hippius_s3/sql/queries/get_object_acl.sql` and load via `get_query("get_object_acl")`.
 4. **Tests**. [tests/unit/api/](tests/unit/) for handler logic, [tests/e2e/](tests/e2e/) for end-to-end via boto3.
-5. **Gateway permission mapping**. If the new endpoint requires a different S3 permission than the default mapping in [gateway/middlewares/acl.py:36-67](gateway/middlewares/acl.py), update it.
+5. **Gateway permission mapping**. If the new endpoint requires a different S3 permission than the default mapping in [hippius_s3/gateway/middlewares/acl.py:36-67](hippius_s3/gateway/middlewares/acl.py), update it.
 
 ### 6.2 Add a database migration
 

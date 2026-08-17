@@ -120,7 +120,7 @@ def test_no_source_reads_trusted_headers_anymore() -> None:
         re.IGNORECASE,
     )
     offenders = []
-    for package in ("hippius_s3", "gateway"):
+    for package in ("hippius_s3",):
         for path in (repo / package).rglob("*.py"):
             for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
                 if pattern.search(line) and "headers" in line:

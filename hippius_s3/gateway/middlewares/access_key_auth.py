@@ -11,15 +11,15 @@ from typing import TYPE_CHECKING
 from fastapi import Request
 from redis.asyncio import Redis
 
-from gateway.middlewares.sigv4 import calculate_signature
-from gateway.middlewares.sigv4 import canonical_path_from_scope
-from gateway.middlewares.sigv4 import canonicalize_presigned_query_string
-from gateway.middlewares.sigv4 import create_canonical_request
-from gateway.middlewares.sigv4 import extract_signature_from_auth_header
-from gateway.middlewares.sigv4 import extract_signed_headers
-from gateway.services.auth_cache import cached_auth
-from gateway.services.auth_service import decrypt_secret
 from hippius_s3.config import get_config
+from hippius_s3.gateway.middlewares.sigv4 import calculate_signature
+from hippius_s3.gateway.middlewares.sigv4 import canonical_path_from_scope
+from hippius_s3.gateway.middlewares.sigv4 import canonicalize_presigned_query_string
+from hippius_s3.gateway.middlewares.sigv4 import create_canonical_request
+from hippius_s3.gateway.middlewares.sigv4 import extract_signature_from_auth_header
+from hippius_s3.gateway.middlewares.sigv4 import extract_signed_headers
+from hippius_s3.gateway.services.auth_cache import cached_auth
+from hippius_s3.gateway.services.auth_service import decrypt_secret
 from hippius_s3.models.sub_token import ACCESS_KEY_PATTERN
 from hippius_s3.models.sub_token import SS58_PATTERN
 

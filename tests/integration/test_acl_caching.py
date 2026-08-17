@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 import pytest_asyncio
 
-from gateway.repositories.cached_acl_repository import CachedACLRepository
+from hippius_s3.gateway.repositories.cached_acl_repository import CachedACLRepository
 from hippius_s3.models.acl import ACL
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import Grantee

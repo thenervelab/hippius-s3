@@ -1,6 +1,6 @@
 # gateway/services/
 
-Business-logic services used by the (formerly gateway-side) middleware chain of the merged app. No HTTP framing here — these are called from the middlewares registered in [hippius_s3/main.py](../../hippius_s3/main.py).
+Business-logic services used by the (formerly gateway-side) middleware chain of the merged app. No HTTP framing here — these are called from the middlewares registered in [hippius_s3/main.py](../../main.py).
 
 ## [auth_orchestrator.py](auth_orchestrator.py) — `authenticate_request`
 
@@ -30,23 +30,23 @@ Redis-cached wrapper around Arion `/objectstore/tokens/auth/`. The cache key is 
 
 Per-request permission evaluator. Called from `acl_middleware`. Reads ACL rows from the main DB + ACL cache (`redis-acl`). Evaluates grant matching against the request's `(account, bucket, key, permission)` tuple.
 
-Bucket-level ACLs and object-level ACLs both supported. Public buckets are modeled as explicit ACL grants (`AllUsers` grantee) rather than a boolean flag — migration script at [hippius_s3/scripts/migrate_public_buckets_to_acl.py](../../hippius_s3/scripts/migrate_public_buckets_to_acl.py) converted legacy `is_public` bools.
+Bucket-level ACLs and object-level ACLs both supported. Public buckets are modeled as explicit ACL grants (`AllUsers` grantee) rather than a boolean flag — migration script at [hippius_s3/scripts/migrate_public_buckets_to_acl.py](../../scripts/migrate_public_buckets_to_acl.py) converted legacy `is_public` bools.
 
 ## [account_service.py](account_service.py) — `fetch_account`
 
 For seed-phrase auth: given a seed, derive the SS58 subaccount ID via substrateinterface (called in an executor thread to avoid blocking — [account_service.py:29](account_service.py)), then fetch cached account data from `redis-accounts`. If missing, call the Substrate node.
 
-Populates `request.state.account` with main_account, has_credits, upload/delete flags. Since the merge these flow to the S3 handlers directly via [request_context](../../hippius_s3/api/middlewares/request_context.py) (the `X-Hippius-*` header contract is dead — see the grep test in [tests/unit/test_request_context.py](../../tests/unit/test_request_context.py)).
+Populates `request.state.account` with main_account, has_credits, upload/delete flags. Since the merge these flow to the S3 handlers directly via [request_context](../../api/middlewares/request_context.py) (the `X-Hippius-*` header contract is dead — see the grep test in [tests/unit/test_request_context.py](../../../tests/unit/test_request_context.py)).
 
 **Removed in the 2026-08 merge**: `forward_service.py` (the streaming proxy to the internal api — no forward hop exists anymore) and `docs_proxy_service.py`.
 
 ## [sub_token_scope.py](sub_token_scope.py) — DORMANT
 
-Pure functions for evaluating a sub-token's ACL against a request: `required_s3_action`, `sub_token_allows`, `prefix_matches`, `bucket_in_scope`, `ip_allowed`, `evaluate_sub_token`. Good tests at [tests/unit/gateway/test_acl_scope.py](../../tests/unit/gateway/test_acl_scope.py).
+Pure functions for evaluating a sub-token's ACL against a request: `required_s3_action`, `sub_token_allows`, `prefix_matches`, `bucket_in_scope`, `ip_allowed`, `evaluate_sub_token`. Good tests at [tests/unit/gateway/test_acl_scope.py](../../../tests/unit/gateway/test_acl_scope.py).
 
 **Broken**: [sub_token_scope.py:3](sub_token_scope.py) imports `TokenAcl` from `hippius_s3.services.hippius_api_service` where no such symbol exists. The import would fail at runtime — but since no production code references this module, the failure never surfaces.
 
-**Status**: not wired. Master-vs-sub token distinction today is binary: master bypasses ACL entirely ([acl.py:126-130](../middlewares/acl.py)), sub goes through normal ACL check. The fine-grained scope evaluation here is not enforced. See [todo.md](../../todo.md) P2.
+**Status**: not wired. Master-vs-sub token distinction today is binary: master bypasses ACL entirely ([acl.py:126-130](../middlewares/acl.py)), sub goes through normal ACL check. The fine-grained scope evaluation here is not enforced. See [todo.md](../../../todo.md) P2.
 
 ## [docs_proxy_service.py](docs_proxy_service.py) — `DocsProxyService`
 
@@ -54,8 +54,8 @@ Proxies `/docs` to the internal Swagger UI when `ENABLE_API_DOCS=true`. Redis-ca
 
 ## Tests
 
-- [tests/unit/gateway/](../../tests/unit/gateway/) — everything gateway-specific.
-- [tests/unit/gateway/test_acl_scope.py](../../tests/unit/gateway/test_acl_scope.py) — exercises `sub_token_scope.py` with mocked `TokenAcl`. Useful even though the production code is dormant.
+- [tests/unit/gateway/](../../../tests/unit/gateway/) — everything gateway-specific.
+- [tests/unit/gateway/test_acl_scope.py](../../../tests/unit/gateway/test_acl_scope.py) — exercises `sub_token_scope.py` with mocked `TokenAcl`. Useful even though the production code is dormant.
 
 <claude-mem-context>
 # Recent Activity

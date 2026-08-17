@@ -6,10 +6,10 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.acl import acl_middleware
-from gateway.middlewares.acl import get_required_permission
-from gateway.middlewares.acl import parse_s3_path
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.middlewares.acl import get_required_permission
+from hippius_s3.gateway.middlewares.acl import parse_s3_path
+from hippius_s3.gateway.services.acl_service import BucketLookup
 from hippius_s3.models.acl import Permission
 
 

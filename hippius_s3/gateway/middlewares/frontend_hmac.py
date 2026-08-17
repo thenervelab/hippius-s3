@@ -9,8 +9,8 @@ from fastapi import Response
 from fastapi.responses import JSONResponse
 from starlette import status
 
-from gateway.utils.paths import routing_path
 from hippius_s3.config import get_config
+from hippius_s3.gateway.utils.paths import routing_path
 
 
 config = get_config()

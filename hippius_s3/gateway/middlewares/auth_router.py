@@ -4,9 +4,9 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
-from gateway.middlewares.auth_probe import is_valid_auth_probe
-from gateway.services.auth_orchestrator import authenticate_request
-from gateway.utils.paths import routing_path
+from hippius_s3.gateway.middlewares.auth_probe import is_valid_auth_probe
+from hippius_s3.gateway.services.auth_orchestrator import authenticate_request
+from hippius_s3.gateway.utils.paths import routing_path
 from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 

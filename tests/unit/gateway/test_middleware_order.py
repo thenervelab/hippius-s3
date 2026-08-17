@@ -105,7 +105,7 @@ def test_router_and_security_share_one_path_view() -> None:
     httpx collapses dot segments client-side and would mask the divergence."""
     import asyncio
 
-    from gateway.middlewares.path_normalization import path_normalization_middleware
+    from hippius_s3.gateway.middlewares.path_normalization import path_normalization_middleware
 
     app = FastAPI()
     seen: dict = {}

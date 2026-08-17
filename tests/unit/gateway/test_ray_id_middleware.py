@@ -10,7 +10,7 @@ from httpx import AsyncClient
 
 @pytest.fixture
 def ray_id_app() -> Any:
-    from gateway.middlewares.ray_id import ray_id_middleware
+    from hippius_s3.gateway.middlewares.ray_id import ray_id_middleware
 
     app = FastAPI()
 

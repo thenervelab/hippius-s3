@@ -4,8 +4,8 @@ import hmac
 import re
 from typing import TYPE_CHECKING
 
-from gateway.utils.paths import routing_path
 from hippius_s3.config import get_config
+from hippius_s3.gateway.utils.paths import routing_path
 
 
 # 64 hex characters, matching the shape CLAUDE.md already documents for HIPPIUS_SERVICE_KEY and

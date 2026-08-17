@@ -17,8 +17,8 @@ from httpx import ASGITransport
 from httpx import AsyncClient
 
 from hippius_s3 import config as gateway_config
-from gateway.middlewares.acl import acl_middleware
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.services.acl_service import BucketLookup
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]

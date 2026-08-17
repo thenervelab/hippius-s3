@@ -41,14 +41,14 @@ jobs:
 
       - name: Lint (ruff check)
         run: |
-          ruff check hippius_s3 gateway || (
+          ruff check hippius_s3 || (
             echo "=== Ruff settings ===" && ruff check --show-settings | sed -n '1,200p' && exit 1
           )
 
       - name: Format (ruff format --check)
         run: |
-          ruff format --check hippius_s3 gateway || (
-            echo "=== Ruff format DIFF (all) ===" && ruff format --diff hippius_s3 gateway | sed -n '1,400p' || true
+          ruff format --check hippius_s3 || (
+            echo "=== Ruff format DIFF (all) ===" && ruff format --diff hippius_s3 | sed -n '1,400p' || true
             exit 1
           )
 
@@ -80,7 +80,7 @@ jobs:
       - name: Type check with ty
         run: |
           source .venv/bin/activate
-          ty check hippius_s3 gateway
+          ty check hippius_s3
 
   dep-audit:
     name: Dependency Audit (pip-audit)

@@ -7,9 +7,9 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
-from gateway.repositories.cached_acl_repository import CachedACLRepository
-from gateway.services.acl_service import ACLService
-from gateway.utils.paths import decoded_path
+from hippius_s3.gateway.repositories.cached_acl_repository import CachedACLRepository
+from hippius_s3.gateway.services.acl_service import ACLService
+from hippius_s3.gateway.utils.paths import decoded_path
 
 
 logger = logging.getLogger(__name__)

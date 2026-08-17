@@ -14,9 +14,9 @@ from httpx import AsyncClient
 import dataclasses
 
 from hippius_s3.config import get_config
-from gateway.middlewares import auth_probe as auth_probe_mod
-from gateway.middlewares.auth_probe import AUTH_PROBE_HEADER
-from gateway.middlewares.auth_probe import auth_probe_middleware
+from hippius_s3.gateway.middlewares import auth_probe as auth_probe_mod
+from hippius_s3.gateway.middlewares.auth_probe import AUTH_PROBE_HEADER
+from hippius_s3.gateway.middlewares.auth_probe import auth_probe_middleware
 
 
 TEST_SECRET = "fake-test-probe-secret-not-real"

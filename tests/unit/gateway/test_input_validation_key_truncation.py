@@ -24,7 +24,7 @@ import pytest
 from fastapi import Request
 from fastapi import Response
 
-from gateway.middlewares.input_validation import input_validation_middleware
+from hippius_s3.gateway.middlewares.input_validation import input_validation_middleware
 
 
 def _request(raw_path: bytes) -> Request:
