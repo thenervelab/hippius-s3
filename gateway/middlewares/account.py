@@ -216,9 +216,10 @@ async def account_middleware(
         response: Response = await call_next(request)
         return response
 
-    # Skip credit checks for frontend user endpoints, docs, and metrics
+    # Skip credit checks for frontend user endpoints, admin endpoints, docs, and metrics
     if (
         path.startswith("/user/")
+        or path.startswith("/admin/")
         or path in ["/docs", "/openapi.json", "/redoc", "/metrics"]
         or path.startswith("/docs/")
     ):

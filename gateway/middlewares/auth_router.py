@@ -18,11 +18,12 @@ from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 # Exempt at the segment itself and at any depth below it.
 EXEMPT_SEGMENTS = frozenset({"docs", "openapi.json", "robots.txt", "metrics", "health"})
 
-# Exempt only WITH a subpath (`/user/...`), which is what the frontend endpoints actually use.
-# A bare `/user` is not a route — it is bucket-shaped — and acl.py / account.py both special-case
-# `/user/` with the slash, so exempting it here would make auth_router the only layer that treats
-# it as non-S3.
-EXEMPT_SUBPATH_ONLY_SEGMENTS = frozenset({"user"})
+# Exempt only WITH a subpath (`/user/...`, `/admin/...`), which is what the frontend and
+# admin endpoints actually use. A bare `/user` is not a route — it is bucket-shaped — and
+# acl.py / account.py both special-case `/user/` with the slash, so exempting it here would
+# make auth_router the only layer that treats it as non-S3. `/admin/...` is HMAC-gated by
+# admin_hmac_middleware instead of SigV4.
+EXEMPT_SUBPATH_ONLY_SEGMENTS = frozenset({"admin", "user"})
 
 # Every segment auth_router skips authentication for must be unusable as a bucket name, or a
 # bucket created under it lands with no owner. Enforced by

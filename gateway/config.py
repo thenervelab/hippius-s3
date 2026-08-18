@@ -170,6 +170,15 @@ class GatewayConfig:
         repr=False,
     )
 
+    # Shared secret for the /admin/* endpoints (account suspend/reactivate/purge).
+    # Deliberately separate from FRONTEND_HMAC_SECRET — the admin surface can destroy
+    # whole accounts, so its blast radius gets its own credential. Empty value
+    # fail-closes: admin_hmac_middleware 403s every /admin request when unset.
+    admin_hmac_secret: str = dataclasses.field(
+        default_factory=lambda: os.getenv("HIPPIUS_ADMIN_HMAC_SECRET", ""),
+        repr=False,
+    )
+
 
 _config: GatewayConfig | None = None
 

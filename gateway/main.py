@@ -12,6 +12,7 @@ from fastapi import Response
 from gateway.config import get_config
 from gateway.middlewares.account import account_middleware
 from gateway.middlewares.acl import acl_middleware
+from gateway.middlewares.admin_hmac import verify_admin_hmac_middleware
 from gateway.middlewares.ats_purge import ats_purge_middleware
 from gateway.middlewares.audit_log import audit_log_middleware
 from gateway.middlewares.auth_probe import auth_probe_middleware
@@ -24,6 +25,7 @@ from gateway.middlewares.input_validation import input_validation_middleware
 from gateway.middlewares.metrics import metrics_middleware
 from gateway.middlewares.ray_id import ray_id_middleware
 from gateway.middlewares.read_only import read_only_middleware
+from gateway.middlewares.suspension import suspension_middleware
 from gateway.middlewares.tracing import tracing_middleware
 from gateway.middlewares.trailing_slash import trailing_slash_normalizer
 from gateway.routers.acl import router as acl_router
@@ -213,10 +215,15 @@ def factory() -> FastAPI:
         app.middleware("http")(audit_log_middleware)
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
+    app.middleware("http")(verify_admin_hmac_middleware)
     app.middleware("http")(verify_frontend_hmac_middleware)
     app.middleware("http")(acl_middleware)
     app.middleware("http")(account_middleware)
     app.middleware("http")(trailing_slash_normalizer)
+    # Runs immediately after auth_router on the request path (identity is resolved,
+    # nothing clobbered yet) and OUTER to account/acl — master tokens bypass ACL, so a
+    # suspension check any deeper would miss them. See gateway/middlewares/suspension.py.
+    app.middleware("http")(suspension_middleware)
     app.middleware("http")(auth_router_middleware)
     app.middleware("http")(input_validation_middleware)
     if config.read_only_mode:

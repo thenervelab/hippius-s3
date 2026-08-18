@@ -12,6 +12,8 @@ from gateway.middlewares.acl import parse_s3_path
 from gateway.services.acl_service import BucketLookup
 from hippius_s3.models.acl import Permission
 
+from tests.unit.gateway._suspension_fakes import install_no_suspension_state
+
 
 class TestPathParsing:
     def test_root_path_returns_none(self) -> None:
@@ -107,6 +109,7 @@ class TestACLMiddleware:
     def acl_app(self, mock_acl_service: Any) -> Any:
         app = FastAPI()
         app.state.acl_service = mock_acl_service
+        install_no_suspension_state(app)
 
         @app.get("/test")
         async def test_endpoint() -> dict[str, str]:

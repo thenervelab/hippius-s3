@@ -12,6 +12,8 @@ from gateway.services.sub_token_scope import bucket_in_scope
 from gateway.services.sub_token_scope import evaluate as evaluate_sub_token_scope
 from gateway.services.sub_token_scope import permission_allows
 from gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
+from gateway.services.suspension import get_account_suspension
+from gateway.services.suspension import suspension_blocks
 from gateway.utils.errors import s3_error_response
 from hippius_s3.models.acl import Permission
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
@@ -115,7 +117,7 @@ async def acl_middleware(
 
     path = request.url.path
 
-    if path == "/health" or path.startswith("/user/"):
+    if path == "/health" or path.startswith("/user/") or path.startswith("/admin/"):
         return await call_next(request)
 
     if request.method == "OPTIONS":
@@ -156,6 +158,31 @@ async def acl_middleware(
             request.state.bucket_id = bucket_id
         else:
             request.state.bucket_is_cache_warm = False
+
+    # Bucket-owner suspension check (issue #421). The suspension_middleware already
+    # covers requests authenticated AS the suspended account, so skip the lookup when the
+    # requester IS the owner; this branch exists only for everyone ELSE touching the
+    # suspended owner's buckets — anonymous public reads and cross-account (contractor)
+    # access — which carry a different (or no) identity. 'full' blocks all access to the
+    # owner's data; 'read_only' still blocks writes so a delinquent account's storage
+    # cannot keep growing via bucket-ACL grants.
+    if bucket_owner_id is not None and bucket_owner_id != account_id:
+        owner_suspension = await get_account_suspension(
+            bucket_owner_id,
+            request.app.state.postgres_pool,
+            request.app.state.redis_client,
+        )
+        if owner_suspension is not None and suspension_blocks(
+            owner_suspension,
+            method=request.method,
+            query_params=query_params,
+            has_key=key is not None,
+        ):
+            logger.info(
+                f"Blocked request on suspended owner's bucket: owner={bucket_owner_id}, "
+                f"bucket={bucket}, mode={owner_suspension}"
+            )
+            return _access_denied()
 
     # -------------------------------------------------------------------------
     # Sub-token branch (R2-style): authoritative for intra-account requests,

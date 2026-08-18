@@ -31,6 +31,7 @@ from __future__ import annotations
 #   - hippius_s3/scripts/report_reserved_name_buckets.py   audits for existing collisions
 RESERVED_BUCKET_SEGMENTS = frozenset(
     {
+        "admin",
         "docs",
         "health",
         "metrics",
@@ -45,4 +46,4 @@ RESERVED_BUCKET_SEGMENTS = frozenset(
 # `path == "/health" or path.startswith("/user/")` guard at the top of gateway/middlewares/acl.py.
 # A bucket on one of these names therefore has neither authentication NOR authorization in front
 # of its objects, which is strictly worse than the merely-stranded case above.
-ACL_BYPASSED_SEGMENTS = frozenset({"health", "user"})
+ACL_BYPASSED_SEGMENTS = frozenset({"admin", "health", "user"})

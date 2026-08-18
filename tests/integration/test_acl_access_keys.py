@@ -41,6 +41,9 @@ def integration_app() -> Any:
     # Cache misses by default so the sub-token branch goes to the repo.
     app.state.redis_client.get = AsyncMock(return_value=None)
     app.state.redis_client.setex = AsyncMock(return_value=True)
+    # Suspension gate falls through to the DB on a cache miss; no suspension row → active.
+    app.state.postgres_pool = MagicMock()
+    app.state.postgres_pool.fetchrow = AsyncMock(return_value=None)
     # sub_token_scope_repo is loaded via the middleware for sub-token requests.
     # Tests that exercise sub-tokens should override this with the scope shape
     # they want to test; the default returns None (→ default-deny).
