@@ -237,6 +237,7 @@ jobs:
             --from-literal=HIPPIUS_UPLOAD_QUEUE_NAMES='${{ secrets.HIPPIUS_UPLOAD_QUEUE_NAMES }}' \
             --from-literal=HIPPIUS_DOWNLOAD_QUEUE_NAMES='${{ secrets.HIPPIUS_DOWNLOAD_QUEUE_NAMES }}' \
             --from-literal=FRONTEND_HMAC_SECRET='${{ secrets.FRONTEND_HMAC_SECRET }}' \
+            --from-literal=HIPPIUS_ADMIN_HMAC_SECRET='${{ secrets.HIPPIUS_ADMIN_HMAC_SECRET }}' \
             --from-literal=DISCORD_WEBHOOK_URL='${{ secrets.DISCORD_WEBHOOK_URL }}' \
             --from-literal=HIPPIUS_OVH_KMS_ENDPOINT='${{ secrets.HIPPIUS_OVH_KMS_ENDPOINT }}' \
             --from-literal=HIPPIUS_OVH_KMS_DEFAULT_KEY_ID='${{ secrets.HIPPIUS_OVH_KMS_DEFAULT_KEY_ID }}' \

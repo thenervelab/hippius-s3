@@ -7,6 +7,7 @@ from typing import Callable
 
 import pytest
 from fastapi import FastAPI
+from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
@@ -51,7 +52,10 @@ class FakeRedis:
 
 
 def _make_app(db: FakeDB) -> tuple[FastAPI, FakeRedis]:
-    app = FastAPI()
+    # Match the real app (hippius_s3/main.py): default_response_class=Response, whose
+    # render() 500s on a dict/model. This is what caught the prod bug where the admin
+    # endpoints lacked JSONResponse — a bare FastAPI() defaults to JSONResponse and hid it.
+    app = FastAPI(default_response_class=Response)
     app.include_router(admin_router, prefix="/admin")
     redis = FakeRedis()
     app.state.redis_client = redis

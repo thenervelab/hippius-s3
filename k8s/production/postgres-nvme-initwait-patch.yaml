@@ -75,6 +75,20 @@ spec:
             - -c
             - until nc -z postgres-nvme-rw 5432 && nc -z redis 6379; do echo waiting for services; sleep 5; done
 ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: purger
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: wait-for-services
+          command:
+            - sh
+            - -c
+            - until nc -z postgres-nvme-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
