@@ -5,8 +5,8 @@ from typing import Any
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from gateway.services.acl_service import ACLService
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.services.acl_service import ACLService
+from hippius_s3.gateway.services.acl_service import BucketLookup
 
 
 class FakePool:

@@ -10,11 +10,11 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.access_key_auth import TokenAuth
-from gateway.middlewares.account import account_middleware
-from gateway.middlewares.acl import acl_middleware
-from gateway.middlewares.auth_router import auth_router_middleware
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.middlewares.access_key_auth import TokenAuth
+from hippius_s3.gateway.middlewares.account import account_middleware
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.middlewares.auth_router import auth_router_middleware
+from hippius_s3.gateway.services.acl_service import BucketLookup
 
 
 @pytest.fixture  # type: ignore[misc]
@@ -36,7 +36,7 @@ def integration_app() -> Any:
         return BucketLookup(owner_id=owner, bucket_id=bid, is_cache_warm=False)
 
     app.state.acl_service.get_bucket_owner_and_id = AsyncMock(side_effect=_default_owner_and_id)
-    app.state.redis_accounts = AsyncMock()
+    app.state.redis_accounts_client = AsyncMock()
     app.state.redis_client = AsyncMock()
     # Cache misses by default so the sub-token branch goes to the repo.
     app.state.redis_client.get = AsyncMock(return_value=None)
@@ -96,8 +96,8 @@ async def test_bucket_metadata_fetched_in_single_query(integration_app: Any) -> 
     auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
-    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+    with patch("hippius_s3.gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
+        with patch("hippius_s3.gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 await client.get(
                     "/alice-bucket/test.txt",
@@ -121,8 +121,8 @@ async def test_sub_token_denied_without_grants(integration_app: Any) -> None:
     # Patch verify function as AsyncMock
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
-    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+    with patch("hippius_s3.gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
+        with patch("hippius_s3.gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
                     "/alice-bucket/test.txt",
@@ -146,8 +146,8 @@ async def test_sub_token_allowed_with_access_key_grant(integration_app: Any) -> 
 
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
-    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+    with patch("hippius_s3.gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
+        with patch("hippius_s3.gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
                     "/alice-bucket/test.txt",
@@ -172,8 +172,8 @@ async def test_sub_token_denied_with_different_key_grant(integration_app: Any) -
 
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
-    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+    with patch("hippius_s3.gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
+        with patch("hippius_s3.gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
                     "/alice-bucket/test.txt",
@@ -196,8 +196,8 @@ async def test_master_token_bypasses_acl_for_owned_bucket(integration_app: Any) 
         return_value=TokenAuth(access_key="hip_alice_master", account_address=alice_id, token_type="master")
     )
 
-    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+    with patch("hippius_s3.gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
+        with patch("hippius_s3.gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.put(
                     "/alice-bucket/test.txt",
@@ -224,8 +224,8 @@ async def test_account_grant_allows_all_keys(integration_app: Any) -> None:
             return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub")
         )
 
-        with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-            with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+        with patch("hippius_s3.gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
+            with patch("hippius_s3.gateway.middlewares.account.config.enable_bypass_credit_check", True):
                 async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                     response = await client.get(
                         "/alice-bucket/test.txt",
@@ -248,8 +248,8 @@ async def test_cross_account_access_key_grant(integration_app: Any) -> None:
 
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
-    with patch("gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+    with patch("hippius_s3.gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
+        with patch("hippius_s3.gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
                     "/alice-bucket/test.txt",
@@ -284,8 +284,8 @@ async def test_presigned_get_uses_access_key_for_acl(integration_app: Any) -> No
         return_value=TokenAuth(access_key=access_key, account_address=bob_id, token_type="sub")
     )
 
-    with patch("gateway.services.auth_orchestrator.verify_access_key_presigned_url", mock_verify_presigned):
-        with patch("gateway.middlewares.account.config.bypass_credit_check", True):
+    with patch("hippius_s3.gateway.services.auth_orchestrator.verify_access_key_presigned_url", mock_verify_presigned):
+        with patch("hippius_s3.gateway.middlewares.account.config.enable_bypass_credit_check", True):
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get("/alice-bucket/test.txt", params=query_params)
 

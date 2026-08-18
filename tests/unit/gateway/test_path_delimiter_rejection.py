@@ -26,7 +26,7 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.input_validation import input_validation_middleware
+from hippius_s3.gateway.middlewares.input_validation import input_validation_middleware
 
 
 def _app() -> tuple[FastAPI, list[str]]:
@@ -152,7 +152,7 @@ def test_the_key_level_guard_still_lists_both_delimiters() -> None:
     `raw_path`-missing fallback returns `request.url.path`, which truncates). Asserting the
     constant is the only way to pin a layer that a stricter layer in front of it makes invisible.
     """
-    from gateway.middlewares.input_validation import OBJECT_KEY_AVOID_CHARS
+    from hippius_s3.gateway.middlewares.input_validation import OBJECT_KEY_AVOID_CHARS
 
     assert "#" in OBJECT_KEY_AVOID_CHARS
     assert "?" in OBJECT_KEY_AVOID_CHARS

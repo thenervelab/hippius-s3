@@ -38,7 +38,7 @@ async def handle_copy_object(
 
         user, source_bucket, dest_bucket, source_object = await resolve_copy_resources(
             db=pool,
-            main_account=request.state.account.main_account,
+            main_account=request.state.main_account_id,
             source_bucket_name=source_bucket_name,
             source_object_key=source_object_key,
             dest_bucket_name=bucket_name,

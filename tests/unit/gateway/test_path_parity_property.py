@@ -28,8 +28,8 @@ from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
-from gateway.middlewares.input_validation import input_validation_middleware
-from gateway.utils.paths import forwarded_path
+from hippius_s3.gateway.middlewares.input_validation import input_validation_middleware
+from hippius_s3.gateway.utils.paths import forwarded_path
 
 
 # Segments chosen to collide with everything the forwarder rewrites or a security check reads:

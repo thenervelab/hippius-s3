@@ -5,7 +5,7 @@ import base64
 import pytest
 from nacl.secret import SecretBox
 
-from gateway.services.auth_service import decrypt_secret
+from hippius_s3.gateway.services.auth_service import decrypt_secret
 
 
 def test_decrypt_secret_with_valid_data() -> None:

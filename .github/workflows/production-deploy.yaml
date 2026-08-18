@@ -63,7 +63,7 @@ jobs:
     needs: build-base
     strategy:
       matrix:
-        service: [api, gateway, workers]
+        service: [api, workers]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -92,8 +92,6 @@ jobs:
         run: |
           if [ "${{ matrix.service }}" = "api" ]; then
             echo "dockerfile=./Dockerfile" >> $GITHUB_OUTPUT
-          elif [ "${{ matrix.service }}" = "gateway" ]; then
-            echo "dockerfile=./gateway/Dockerfile" >> $GITHUB_OUTPUT
           elif [ "${{ matrix.service }}" = "workers" ]; then
             echo "dockerfile=./workers/Dockerfile" >> $GITHUB_OUTPUT
           fi
@@ -291,7 +289,6 @@ jobs:
           cd k8s/production
           kustomize edit set image \
             ghcr.io/thenervelab/hippius-s3/api:${SHORT_SHA} \
-            ghcr.io/thenervelab/hippius-s3/gateway:${SHORT_SHA} \
             ghcr.io/thenervelab/hippius-s3/workers:${SHORT_SHA} \
             ghcr.io/thenervelab/hippius-s3/drain:${SHORT_SHA}
 
@@ -371,7 +368,6 @@ jobs:
               exit 1
             fi
           }
-          kubectl rollout status deployment/gateway -n "$ns" --timeout=10m
           # api (monolith / hybrid base) and api-local (drain-direct) — whichever exist.
           wait_deploy api 10m
           # api-local is a DaemonSet (one pod per ingest node). Wait on it, then prune the
@@ -390,6 +386,12 @@ jobs:
           else
             wait_deploy api-local 10m
           fi
+          # Gateway/api merge: prune the removed gateway Deployment (apply -k does not delete
+          # removed resources). Idempotent no-op after the first deploy. NOTE: the first prod
+          # deploy of the merge has a bounded public-unavailability window (see the staging
+          # workflow's FIRST-DEPLOY WINDOW comment for the full analysis) — run it in a
+          # maintenance window.
+          kubectl delete deployment/gateway -n "$ns" --ignore-not-found=true
           kubectl rollout status deployment/arion-downloader -n "$ns" --timeout=10m
           kubectl rollout status deployment/arion-uploader -n "$ns" --timeout=10m
           # Drain stack (allocator-first: it applies the cephor_* migrations on startup). Present

@@ -2,7 +2,7 @@
 
 import pytest
 
-from gateway.services import ats_cache_client
+from hippius_s3.gateway.services import ats_cache_client
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]

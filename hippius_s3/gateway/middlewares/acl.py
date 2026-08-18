@@ -1,0 +1,322 @@
+from typing import Awaitable
+from typing import Callable
+
+from fastapi import Request
+from fastapi import Response
+
+from hippius_s3.config import get_config
+from hippius_s3.gateway.middlewares.auth_probe import is_valid_auth_probe
+from hippius_s3.gateway.services.sub_token_scope import OP_LIST_BUCKETS
+from hippius_s3.gateway.services.sub_token_scope import OP_READ_OBJECT
+from hippius_s3.gateway.services.sub_token_scope import bucket_in_scope
+from hippius_s3.gateway.services.sub_token_scope import evaluate as evaluate_sub_token_scope
+from hippius_s3.gateway.services.sub_token_scope import permission_allows
+from hippius_s3.gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
+from hippius_s3.gateway.utils.errors import s3_error_response
+from hippius_s3.gateway.utils.paths import routing_path
+from hippius_s3.models.acl import Permission
+from hippius_s3.peer_auth import is_authorized_peer_fetch
+from hippius_s3.services.ray_id_service import get_logger_with_ray_id
+
+
+def _parse_copy_source_bucket(header_value: str) -> str | None:
+    """Extract the source bucket from an `x-amz-copy-source` header.
+
+    Accepted formats (per AWS S3 SDKs):
+      - `/sourcebucket/sourcekey`
+      - `sourcebucket/sourcekey`
+      - `sourcebucket/sourcekey?versionId=v1`
+
+    The ARN form (`arn:aws:s3:::bucket/key`) is not supported and returns None.
+    The bucket portion is never URL-encoded in real-world traffic — only the
+    key — so we don't need to decode.
+    """
+    if not header_value or header_value.startswith("arn:"):
+        return None
+    val = header_value.lstrip("/").split("?", 1)[0]
+    parts = val.split("/", 1)
+    if not parts or not parts[0]:
+        return None
+    return parts[0]
+
+
+def parse_s3_path(path: str) -> tuple[str | None, str | None]:
+    """
+    Parse S3 path into bucket and key components.
+
+    Returns:
+        (bucket, key) tuple where:
+        - (None, None) for root path /
+        - (bucket, None) for bucket-only paths
+        - (bucket, key) for object paths
+    """
+    if path == "/" or path == "":
+        return None, None
+
+    path_stripped = path.lstrip("/")
+    if not path_stripped:
+        return None, None
+
+    parts = path_stripped.split("/", 1)
+    bucket = parts[0] if parts else None
+    key = parts[1] if len(parts) > 1 else None
+
+    return bucket, key
+
+
+def get_required_permission(
+    method: str,
+    query_params: dict,
+    has_key: bool,
+) -> Permission:
+    """
+    Determine required permission from HTTP method and query parameters.
+
+    Args:
+        method: HTTP method (GET, PUT, POST, DELETE, HEAD)
+        query_params: Query parameters dict
+        has_key: Whether request has an object key
+
+    Returns:
+        Required Permission enum value
+    """
+    if "acl" in query_params:
+        return Permission.READ_ACP if method == "GET" else Permission.WRITE_ACP
+
+    if "tagging" in query_params:
+        return Permission.READ_ACP if method in ["GET", "HEAD"] else Permission.WRITE_ACP
+
+    if "uploads" in query_params or "uploadId" in query_params:
+        return Permission.WRITE
+
+    if method in ["GET", "HEAD"]:
+        return Permission.READ
+
+    if method in ["PUT", "POST", "DELETE"]:
+        return Permission.WRITE
+
+    raise ValueError(f"Unknown HTTP method: {method}")
+
+
+def _access_denied() -> Response:
+    return s3_error_response(code="AccessDenied", message="Access Denied", status_code=403)
+
+
+async def acl_middleware(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    """
+    ACL enforcement middleware that checks S3 permissions before forwarding requests.
+
+    Blocks unauthorized requests with 403 AccessDenied.
+    Allows requests that pass ACL checks to continue to backend.
+    """
+    ray_id = getattr(request.state, "ray_id", "no-ray-id")
+    logger = get_logger_with_ray_id(__name__, ray_id)
+
+    # The bucket and key the api will ACT on. `request.url.path` is the wrong lens twice over: it is
+    # uncollapsed, so `/docs/../anybucket/key` made this evaluate permissions for the bucket `docs`
+    # (ownerless in prod) while the api served `anybucket`; and it is fragment-truncated, so it
+    # disagrees with the key `input_validation` judged.
+    path = routing_path(request)
+
+    if path == "/health" or path.startswith("/user/"):
+        return await call_next(request)
+
+    # Secret-authenticated peer chunk fetches carry no S3 permission model
+    # (see input_validation for the rationale).
+    if is_authorized_peer_fetch(request):
+        return await call_next(request)
+
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    # PURGE from gateway → ATS authproxy → here. The probe secret is the
+    # trust boundary. acl can't compute a required permission for PURGE
+    # anyway (get_required_permission raises). Skip; auth_probe (innermost)
+    # returns 200 so ATS proceeds with the actual cache invalidation.
+    if request.method == "PURGE" and is_valid_auth_probe(request):
+        return await call_next(request)
+
+    bucket, key = parse_s3_path(path)
+    request.state.s3_bucket = bucket
+    request.state.s3_key = key
+    query_params = dict(request.query_params)
+
+    auth_method = getattr(request.state, "auth_method", None)
+    token_type = getattr(request.state, "token_type", None)
+    account_id = getattr(request.state, "account_id", None)
+    access_key = (
+        getattr(request.state, "access_key", None) if auth_method in ("access_key", "bearer_access_key") else None
+    )
+
+    acl_service = request.app.state.acl_service
+
+    # Resolve bucket ownership / id / warm-cache flag in a single query when a bucket is in play.
+    bucket_owner_id: str | None = None
+    bucket_id: str | None = None
+    if bucket is not None:
+        lookup = await acl_service.get_bucket_owner_and_id(bucket)
+        if lookup is not None:
+            bucket_owner_id = lookup.owner_id
+            bucket_id = lookup.bucket_id
+            request.state.bucket_is_cache_warm = lookup.is_cache_warm
+            request.state.bucket_owner_id = bucket_owner_id
+            # Forwarded to the API so it can skip its own get_bucket_by_name lookup.
+            request.state.bucket_id = bucket_id
+        else:
+            request.state.bucket_is_cache_warm = False
+
+    # -------------------------------------------------------------------------
+    # Sub-token branch (R2-style): authoritative for intra-account requests,
+    # falls through to bucket ACL grants for cross-account (contractor) access.
+    # -------------------------------------------------------------------------
+    if auth_method in ("access_key", "bearer_access_key") and token_type == "sub" and access_key:
+        is_cross_account = bucket_owner_id is not None and bucket_owner_id != account_id
+        if not is_cross_account:
+            repo = request.app.state.sub_token_scope_repo
+            redis_client = request.app.state.redis_client
+            scope = await get_cached_sub_token_scope(access_key, repo, redis_client)
+
+            # ListBuckets: no bucket in play.
+            if bucket is None:
+                if scope is None or not permission_allows(scope.permission, OP_LIST_BUCKETS):
+                    logger.info(
+                        f"Sub-token ListBuckets denied: account={account_id}, "
+                        f"permission={scope.permission if scope else 'none'}"
+                    )
+                    return _access_denied()
+                logger.info(f"Sub-token ListBuckets allowed: account={account_id}, permission={scope.permission}")
+                return await call_next(request)
+
+            # Bucket does not exist yet AND this is CreateBucket (PUT /bucket, no key, no query).
+            # evaluate_sub_token_scope handles the OP_CREATE_BUCKET check including scope='all'.
+            if bucket_owner_id is None:
+                is_create_bucket = request.method == "PUT" and key is None and len(query_params) == 0
+                if not is_create_bucket:
+                    # Non-create op on a nonexistent bucket: pass through so backend returns NoSuchBucket.
+                    return await call_next(request)
+
+            allowed, reason = evaluate_sub_token_scope(
+                scope=scope,
+                bucket_id=bucket_id,
+                method=request.method,
+                has_key=key is not None,
+                query_params=query_params,
+            )
+            logger.info(
+                f"Sub-token scope check: account={account_id}, bucket={bucket}, key={key or 'None'}, "
+                f"method={request.method}, result={'GRANTED' if allowed else 'DENIED'}"
+                f"{'' if allowed else f' ({reason})'}"
+            )
+            if not allowed:
+                return _access_denied()
+
+            # CopyObject / UploadPartCopy: scope must also cover the source
+            # bucket. The destination check above only validates write access
+            # to the destination — without this second check, a sub-token
+            # scoped to bucket B could copy data from bucket A (which it
+            # cannot read) into B. Cross-account sources fall through to the
+            # backend / bucket-ACL flow (existing contractor pattern).
+            copy_source = request.headers.get("x-amz-copy-source")
+            if copy_source and key is not None and scope is not None:
+                src_bucket_name = _parse_copy_source_bucket(copy_source)
+                if src_bucket_name:
+                    src_lookup = await acl_service.get_bucket_owner_and_id(src_bucket_name)
+                    src_owner_id = src_lookup.owner_id if src_lookup else None
+                    src_bucket_id = src_lookup.bucket_id if src_lookup else None
+                    if src_owner_id == account_id:
+                        src_allowed = bucket_in_scope(src_bucket_id, scope) and permission_allows(
+                            scope.permission, OP_READ_OBJECT
+                        )
+                        if not src_allowed:
+                            logger.info(
+                                f"Sub-token copy denied: source bucket {src_bucket_name} "
+                                f"(id={src_bucket_id}) not in scope for account={account_id}"
+                            )
+                            return _access_denied()
+
+            request.state.is_anonymous_access = False
+            return await call_next(request)
+        # cross-account sub-token falls through to check_permission below.
+
+    # -------------------------------------------------------------------------
+    # Master token + all other auth paths below here.
+    # -------------------------------------------------------------------------
+    if bucket is None:
+        return await call_next(request)
+
+    is_create_bucket = request.method == "PUT" and key is None and len(query_params) == 0
+    if is_create_bucket:
+        # AWS S3 default: BucketOwnerEnforced enabled, ACLs disabled (since April 2023)
+        x_amz_acl = request.headers.get("x-amz-acl")
+        if x_amz_acl:
+            logger.info(f"Rejecting CreateBucket with ACL header for bucket: {bucket}")
+            return s3_error_response(
+                code="InvalidBucketAclWithObjectOwnership",
+                message="Bucket cannot be created with ACLs. Object Ownership is set to BucketOwnerEnforced.",
+                status_code=400,
+            )
+        logger.info(f"Bypassing ACL check for CreateBucket: {bucket}")
+        return await call_next(request)
+
+    if bucket_owner_id is None:
+        logger.info(f"Bucket not found in ACL check: {bucket}, passing through to backend for proper S3 error")
+        return await call_next(request)
+
+    request.state.bucket_owner_id = bucket_owner_id
+
+    # Compute anonymous_read_allowed once, before any auth-bypass paths, so
+    # master-token and presigned-URL reads of public objects also populate ATS cache.
+    # Gated on ATS being active to avoid a Redis round-trip when there's no consumer.
+    request.state.anonymous_read_allowed = False
+    if get_config().ats_cache_endpoints and request.method in ("GET", "HEAD") and key is not None:
+        request.state.anonymous_read_allowed = await acl_service.check_permission(
+            account_id=None,
+            bucket=bucket,
+            key=key,
+            permission=Permission.READ,
+            access_key=None,
+            bucket_owner_id=bucket_owner_id,
+        )
+
+    if auth_method == "access_key" and token_type == "master" and bucket_owner_id == account_id:
+        logger.info(f"Master token bypass for account {account_id} on bucket {bucket}")
+        request.state.is_anonymous_access = False
+        return await call_next(request)
+
+    permission = get_required_permission(
+        method=request.method,
+        query_params=query_params,
+        has_key=key is not None,
+    )
+
+    try:
+        has_permission = await acl_service.check_permission(
+            account_id=account_id,
+            bucket=bucket,
+            key=key,
+            permission=permission,
+            access_key=access_key,
+            bucket_owner_id=bucket_owner_id,
+        )
+    except ValueError as e:
+        if "Bucket not found" in str(e):
+            logger.info(f"Bucket not found in ACL check: {bucket}, passing through to backend for proper S3 error")
+            return await call_next(request)
+        raise
+
+    if not has_permission:
+        logger.info(f"Access denied: account={account_id}, bucket={bucket}, key={key}, permission={permission.value}")
+        return _access_denied()
+
+    is_anonymous = account_id is None or account_id == "anonymous"
+    request.state.is_anonymous_access = is_anonymous
+
+    response = await call_next(request)
+
+    if is_anonymous:
+        response.headers["x-hippius-access-mode"] = "anon"
+
+    return response

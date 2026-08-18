@@ -20,7 +20,7 @@ from botocore.config import Config
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.services.acl_service import BucketLookup
 from tests.e2e.conftest import is_real_aws
 
 
@@ -28,7 +28,6 @@ _project_root = Path(__file__).parents[2]
 dotenv.load_dotenv(_project_root / ".env.defaults", override=True)
 dotenv.load_dotenv(_project_root / ".env.test-local", override=True)
 os.environ["HIPPIUS_BYPASS_CREDIT_CHECK"] = "true"
-os.environ["ENABLE_BANHAMMER"] = "false"
 
 # One table per migration system, so "reachable but unmigrated" is caught as loudly as
 # "unreachable": `objects` comes from dbmate, `cephor_replication_status` from the drain's own
@@ -146,7 +145,7 @@ def _mock_access_key_auth(
     """
     from nacl.secret import SecretBox
 
-    from gateway.config import get_config
+    from hippius_s3.config import get_config
     from hippius_s3.services.hippius_api_service import TokenAuthResponse
 
     key_hex = get_config().hippius_secret_decryption_material
@@ -165,7 +164,7 @@ def _mock_access_key_auth(
             nonce=base64.b64encode(b"\x00" * 24).decode(),
         )
 
-    monkeypatch.setattr("gateway.middlewares.access_key_auth.cached_auth", _fake_cached_auth)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.access_key_auth.cached_auth", _fake_cached_auth)
 
 
 @pytest.fixture
@@ -304,6 +303,17 @@ async def gateway_db_pool() -> AsyncGenerator[Any, None]:
     mock_pool.fetchrow = AsyncMock(return_value=None)
     mock_pool.fetch = AsyncMock(return_value=[])
     mock_pool.execute = AsyncMock()
+    # Post-merge the request continues into the real S3 handlers (nothing forwards
+    # anymore), which `await pool.acquire()` and query for the bucket. An
+    # empty-answering connection makes those requests bottom out at NoSuchBucket /
+    # NoSuchKey 404s, which is the range these signature-acceptance tests assert.
+    mock_conn = MagicMock()
+    mock_conn.fetchrow = AsyncMock(return_value=None)
+    mock_conn.fetch = AsyncMock(return_value=[])
+    mock_conn.fetchval = AsyncMock(return_value=None)
+    mock_conn.execute = AsyncMock()
+    mock_pool.acquire = AsyncMock(return_value=mock_conn)
+    mock_pool.release = AsyncMock()
     yield mock_pool
 
 
@@ -337,28 +347,21 @@ async def gateway_app(
     from unittest.mock import AsyncMock
     from unittest.mock import MagicMock
 
-    from gateway.main import factory
+    from hippius_s3.main import factory
 
     app = factory()
 
+    # ASGITransport does not run the lifespan; provide the state the middleware
+    # chain touches. Handler-level state (fs_store, obj_cache, ...) is deliberately
+    # absent — these tests exercise auth/middleware behavior, and requests bottom
+    # out at DB-backed 404s before reaching storage.
+    from hippius_s3.config import get_config
+
+    app.state.config = get_config()
     app.state.postgres_pool = gateway_db_pool
     app.state.redis_client = gateway_redis_clients["redis"]
-    app.state.redis_accounts = gateway_redis_clients["redis_accounts"]
+    app.state.redis_accounts_client = gateway_redis_clients["redis_accounts"]
     app.state.redis_rate_limiting = gateway_redis_clients["redis_rate_limiting"]
-
-    from gateway.config import get_config
-    from gateway.services.forward_service import ForwardService
-
-    config = get_config()
-    app.state.forward_service = ForwardService(config.backend_url)
-
-    mock_rate_limit_service = MagicMock()
-    mock_rate_limit_service.check_rate_limit = AsyncMock(return_value=True)
-    app.state.rate_limit_service = mock_rate_limit_service
-
-    mock_banhammer_service = MagicMock()
-    mock_banhammer_service.is_banned = AsyncMock(return_value=False)
-    app.state.banhammer_service = mock_banhammer_service
 
     mock_acl_service = MagicMock()
     mock_acl_service.check_permission = AsyncMock(return_value=True)
@@ -374,83 +377,12 @@ async def gateway_app(
     app.state.sub_token_scope_repo = mock_scope_repo
 
     yield app
-
-    if hasattr(app.state, "forward_service"):
-        await app.state.forward_service.close()
 
 
 @pytest_asyncio.fixture
 async def gateway_client(gateway_app: Any) -> AsyncGenerator[AsyncClient, None]:
     """Create an async test client for the gateway."""
     transport = ASGITransport(app=gateway_app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
-
-
-@pytest_asyncio.fixture
-async def gateway_app_no_auth(
-    gateway_db_pool: asyncpg.Pool, gateway_redis_clients: dict[str, Any]
-) -> AsyncGenerator[Any, None]:
-    """Create a gateway app without authentication for forwarding tests."""
-    from unittest.mock import AsyncMock
-    from unittest.mock import MagicMock
-
-    from fastapi import FastAPI
-    from fastapi import Request
-
-    app = FastAPI()
-
-    app.state.postgres_pool = gateway_db_pool
-    app.state.redis_client = gateway_redis_clients["redis"]
-    app.state.redis_accounts = gateway_redis_clients["redis_accounts"]
-    app.state.redis_rate_limiting = gateway_redis_clients["redis_rate_limiting"]
-
-    from gateway.config import get_config
-    from gateway.services.forward_service import ForwardService
-
-    config = get_config()
-    app.state.forward_service = ForwardService(config.backend_url)
-
-    mock_rate_limit_service = MagicMock()
-    mock_rate_limit_service.check_rate_limit = AsyncMock(return_value=True)
-    app.state.rate_limit_service = mock_rate_limit_service
-
-    mock_banhammer_service = MagicMock()
-    mock_banhammer_service.is_banned = AsyncMock(return_value=False)
-    app.state.banhammer_service = mock_banhammer_service
-
-    mock_acl_service = MagicMock()
-    mock_acl_service.check_permission = AsyncMock(return_value=True)
-    mock_acl_service.get_bucket_owner = AsyncMock(return_value="test-owner-id")
-    mock_acl_service.get_bucket_id = AsyncMock(side_effect=lambda b: b)
-    mock_acl_service.get_bucket_owner_and_id = AsyncMock(
-        return_value=BucketLookup(owner_id="test-owner-id", bucket_id="test-bucket-id", is_cache_warm=False)
-    )
-    app.state.acl_service = mock_acl_service
-
-    mock_scope_repo = MagicMock()
-    mock_scope_repo.get = AsyncMock(return_value=None)
-    app.state.sub_token_scope_repo = mock_scope_repo
-
-    @app.get("/health")
-    async def health() -> dict:
-        return {"status": "healthy", "service": "gateway"}
-
-    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH"])
-    async def forward_all(request: Request, path: str) -> Any:
-        forward_service = request.app.state.forward_service
-        return await forward_service.forward_request(request)
-
-    yield app
-
-    if hasattr(app.state, "forward_service"):
-        await app.state.forward_service.close()
-
-
-@pytest_asyncio.fixture
-async def gateway_client_no_auth(gateway_app_no_auth: Any) -> AsyncGenerator[AsyncClient, None]:
-    """Create an async test client without authentication."""
-    transport = ASGITransport(app=gateway_app_no_auth)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
 

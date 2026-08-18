@@ -27,11 +27,11 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.cache_invalidation import _bucket_from_path
-from gateway.middlewares.cache_invalidation import _is_successful_bucket_create
-from gateway.middlewares.cache_invalidation import _is_successful_bucket_delete
-from gateway.middlewares.cache_invalidation import cache_invalidation_middleware
-from gateway.repositories.cached_acl_repository import CachedACLRepository
+from hippius_s3.gateway.middlewares.cache_invalidation import _bucket_from_path
+from hippius_s3.gateway.middlewares.cache_invalidation import _is_successful_bucket_create
+from hippius_s3.gateway.middlewares.cache_invalidation import _is_successful_bucket_delete
+from hippius_s3.gateway.middlewares.cache_invalidation import cache_invalidation_middleware
+from hippius_s3.gateway.repositories.cached_acl_repository import CachedACLRepository
 
 
 class TestBucketFromPath:

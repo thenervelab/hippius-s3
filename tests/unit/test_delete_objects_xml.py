@@ -91,7 +91,9 @@ def _fake_request(body: bytes) -> Any:
 
     return SimpleNamespace(
         body=_body,
-        state=SimpleNamespace(account=SimpleNamespace(main_account="acct-main"), ray_id="ray-1"),
+        state=SimpleNamespace(
+            account=SimpleNamespace(main_account="acct-main"), main_account_id="acct-main", ray_id="ray-1"
+        ),
     )
 
 

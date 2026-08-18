@@ -249,7 +249,7 @@ async def test_the_configured_secret_is_served(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_an_unset_secret_refuses_everyone_rather_than_disabling_the_check(tmp_path) -> None:
-    """"No secret configured" must never mean "no authentication required".
+    """ "No secret configured" must never mean "no authentication required".
 
     That degradation is how a fail-closed handshake becomes a fail-open one during a bad
     rollout: the config lands empty, the check silently stops applying, and the endpoint is
@@ -350,5 +350,3 @@ async def test_each_segment_addresses_the_part_it_names(tmp_path) -> None:
         second = await client.get(f"/internal/parts/{OBJ}/1/2/chunks/0", headers=AUTH)
 
     assert (first.content, second.content) == (b"part-one", b"part-two")
-
-

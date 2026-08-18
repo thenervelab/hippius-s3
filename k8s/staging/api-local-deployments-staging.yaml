@@ -53,6 +53,12 @@ spec:
     metadata:
       labels:
         app: api-local
+        # Rollout-safety latch for the gateway/api merge: the public-facing Services
+        # (gateway-nodeport, gateway alias) select on this label IN ADDITION to
+        # app: api-local, so pods from the pre-merge image — which perform no
+        # authentication of their own — can never receive public traffic while the
+        # DaemonSet is still rolling. Inert once the fleet is on the merged image.
+        hippius.io/edge: "true"
     spec:
       # 10s preStop + up to 25s uvicorn drain, with headroom before the kubelet SIGKILLs.
       terminationGracePeriodSeconds: 45

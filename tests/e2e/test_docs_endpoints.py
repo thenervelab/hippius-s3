@@ -12,7 +12,9 @@ def test_docs_endpoint_returns_swagger_ui():
     response = requests.get(f"{BASE_URL}/docs")
     assert response.status_code == 200
     assert "text/html" in response.headers.get("content-type", "")
-    assert "Hippius S3 API Documentation" in response.text
+    # Post gateway/api merge: the stock FastAPI docs page (title "Hippius S3 - Swagger UI")
+    # replaced the gateway's custom-branded template.
+    assert "Hippius S3" in response.text
     assert "swagger-ui" in response.text
 
 

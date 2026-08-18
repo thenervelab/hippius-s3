@@ -198,7 +198,9 @@ async def test_no_published_key_behaves_exactly_as_the_static_gate() -> None:
 async def test_a_floor_source_that_raises_falls_back_instead_of_failing_the_read() -> None:
     """Promotion is awaited inline in `_promote_chunk`, so an exception here would surface on a
     GET. A Redis outage must cost the published floor, not the read."""
-    g = FreeSpaceGate("/nonexistent", 0.175, probe=FakeProbe(0.30), floor_source=FakeFloor(None, raises=RuntimeError("redis down")))
+    g = FreeSpaceGate(
+        "/nonexistent", 0.175, probe=FakeProbe(0.30), floor_source=FakeFloor(None, raises=RuntimeError("redis down"))
+    )
     assert await g.allows() is True, "fell back to the static floor"
 
 

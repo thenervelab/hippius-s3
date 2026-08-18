@@ -23,8 +23,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from gateway.utils.paths import collapse_dot_segments
-from gateway.utils.paths import forwarded_path
+from hippius_s3.gateway.utils.paths import collapse_dot_segments
+from hippius_s3.gateway.utils.paths import forwarded_path
 
 
 DOT_SEGMENT_PATHS = [

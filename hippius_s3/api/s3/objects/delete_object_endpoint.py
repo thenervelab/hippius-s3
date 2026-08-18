@@ -33,7 +33,7 @@ async def handle_delete_object(
     # Abort multipart upload path is handled in the router before delegating to us
     try:
         with tracer.start_as_current_span("delete_object.ensure_user") as span:
-            user = await UserRepository(db).ensure_by_main_account(request.state.account.main_account)
+            user = await UserRepository(db).ensure_by_main_account(request.state.main_account_id)
             set_span_attributes(span, {"hippius.account.main": user["main_account_id"]})
 
         with tracer.start_as_current_span("delete_object.get_bucket") as span:
@@ -82,7 +82,7 @@ async def handle_delete_object(
         db_backends = await resolve_object_backends(db, object_id, object_version)
         ray_id = getattr(request.state, "ray_id", None)
         unpin_payload = UnpinChainRequest(
-            address=request.state.account.main_account,
+            address=request.state.main_account_id,
             object_id=object_id,
             object_version=object_version,
             ray_id=ray_id,

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from gateway.services.acl_service import ACLService
+from hippius_s3.gateway.services.acl_service import ACLService
 from hippius_s3.models.acl import ACL
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import Grantee

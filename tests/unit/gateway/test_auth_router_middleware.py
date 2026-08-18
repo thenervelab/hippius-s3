@@ -13,14 +13,14 @@ from httpx import ASGITransport
 from httpx import AsyncClient
 from nacl.secret import SecretBox
 
-from gateway.middlewares.auth_router import ALL_EXEMPT_SEGMENTS
-from gateway.middlewares.input_validation import RESERVED_BUCKET_SEGMENTS
-from gateway.utils.paths import first_path_segment
+from hippius_s3.gateway.middlewares.auth_router import ALL_EXEMPT_SEGMENTS
+from hippius_s3.gateway.middlewares.input_validation import RESERVED_BUCKET_SEGMENTS
+from hippius_s3.gateway.utils.paths import first_path_segment
 
 
 @pytest.fixture  # type: ignore[misc]
 def auth_router_app() -> Any:
-    from gateway.middlewares.auth_router import auth_router_middleware
+    from hippius_s3.gateway.middlewares.auth_router import auth_router_middleware
 
     app = FastAPI()
     app.state.redis_client = AsyncMock()
@@ -224,13 +224,13 @@ async def test_access_key_detection_and_routing(auth_router_app: Any) -> None:
     auth_header = f"AWS4-HMAC-SHA256 Credential={test_access_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123def456"
 
     with patch(
-        "gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
+        "hippius_s3.gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
     ):
-        with patch("gateway.middlewares.access_key_auth.config") as mock_config:
+        with patch("hippius_s3.gateway.middlewares.access_key_auth.config") as mock_config:
             mock_config.hippius_secret_decryption_material = key_hex
 
-            with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="abc123def456"):
-                with patch("gateway.middlewares.access_key_auth.create_canonical_request", return_value="canonical"):
+            with patch("hippius_s3.gateway.middlewares.access_key_auth.calculate_signature", return_value="abc123def456"):
+                with patch("hippius_s3.gateway.middlewares.access_key_auth.create_canonical_request", return_value="canonical"):
                     async with AsyncClient(
                         transport=ASGITransport(app=auth_router_app), base_url="http://test"
                     ) as client:
@@ -312,13 +312,13 @@ async def test_access_key_with_invalid_signature_returns_403(auth_router_app: An
     auth_header = f"AWS4-HMAC-SHA256 Credential={test_access_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
     with patch(
-        "gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
+        "hippius_s3.gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
     ):
-        with patch("gateway.middlewares.access_key_auth.config") as mock_config:
+        with patch("hippius_s3.gateway.middlewares.access_key_auth.config") as mock_config:
             mock_config.hippius_secret_decryption_material = key_hex
 
-            with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="correct_signature"):
-                with patch("gateway.middlewares.access_key_auth.create_canonical_request", return_value="canonical"):
+            with patch("hippius_s3.gateway.middlewares.access_key_auth.calculate_signature", return_value="correct_signature"):
+                with patch("hippius_s3.gateway.middlewares.access_key_auth.create_canonical_request", return_value="canonical"):
                     async with AsyncClient(
                         transport=ASGITransport(app=auth_router_app), base_url="http://test"
                     ) as client:
@@ -344,7 +344,7 @@ async def test_presigned_get_with_access_key_uses_access_key_auth(auth_router_ap
     test_token_type = "sub"
 
     # Patch the presigned URL verifier so we don't depend on its implementation here
-    from gateway.middlewares.access_key_auth import TokenAuth
+    from hippius_s3.gateway.middlewares.access_key_auth import TokenAuth
 
     mock_verify = AsyncMock(
         return_value=TokenAuth(
@@ -363,7 +363,7 @@ async def test_presigned_get_with_access_key_uses_access_key_auth(auth_router_ap
         "X-Amz-Signature": "deadbeef",
     }
 
-    with patch("gateway.services.auth_orchestrator.verify_access_key_presigned_url", mock_verify):
+    with patch("hippius_s3.gateway.services.auth_orchestrator.verify_access_key_presigned_url", mock_verify):
         async with AsyncClient(transport=ASGITransport(app=auth_router_app), base_url="http://test") as client:
             response = await client.get("/test", params=query_params)
 
@@ -414,10 +414,12 @@ PURGE_PROBE_SECRET = "fake-test-probe-secret-not-real"
 
 @pytest.fixture  # type: ignore[misc]
 def configured_probe_secret(monkeypatch: pytest.MonkeyPatch) -> str:
-    from gateway.config import GatewayConfig
-    from gateway.middlewares import auth_probe as auth_probe_mod
+    import dataclasses
 
-    cfg = GatewayConfig(auth_probe_secret=PURGE_PROBE_SECRET)
+    from hippius_s3.config import get_config
+    from hippius_s3.gateway.middlewares import auth_probe as auth_probe_mod
+
+    cfg = dataclasses.replace(get_config(), auth_probe_secret=PURGE_PROBE_SECRET)
     monkeypatch.setattr(auth_probe_mod, "get_config", lambda: cfg)
     return PURGE_PROBE_SECRET
 

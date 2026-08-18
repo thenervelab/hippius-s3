@@ -126,7 +126,7 @@ class _FakePool:
 def _fake_request(tmp_path: Any) -> Any:
     return SimpleNamespace(
         headers={"Host": "test"},
-        state=SimpleNamespace(account=SimpleNamespace(main_account="5MainAcct")),
+        state=SimpleNamespace(account=SimpleNamespace(main_account="5MainAcct"), main_account_id="5MainAcct"),
         app=SimpleNamespace(
             state=SimpleNamespace(
                 postgres_pool=_FakePool(),

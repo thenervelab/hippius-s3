@@ -13,8 +13,9 @@ Discovery is self-registration through Redis rather than a ConfigMap of node IPs
 
 - k8s node names do not resolve in cluster DNS, so peers need an explicit address.
 - A `hostPort` address would arrive at the peer from the node IP (192.168.x) once SNAT'd,
-  which the api's `ip_whitelist` middleware rejects — it admits 10.x/172.x only. Registering
-  the POD IP keeps peer traffic on the pod network and inside that whitelist.
+  which the api's (since-deleted) `ip_whitelist` middleware rejected — it admitted 10.x/172.x
+  only. Registering the POD IP keeps peer traffic on the pod network, which remains the right
+  call post-merge: it skips the SNAT hop and keeps peer reads off the node interface.
 - Pod IPs change on every restart, so a hand-maintained map would be wrong within a day.
 
 Each api pod publishes `{prefix}{node_name} -> {"url": ...}` with a TTL and refreshes it; a

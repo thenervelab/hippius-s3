@@ -19,6 +19,7 @@ def _fake_request(headers: dict[str, str] | None = None) -> Any:
     return SimpleNamespace(
         state=SimpleNamespace(
             account=SimpleNamespace(main_account="acct-main", id="sub-1"),
+            main_account_id="acct-main",
             ray_id="ray-1",
         ),
         headers=Headers(headers or {}),

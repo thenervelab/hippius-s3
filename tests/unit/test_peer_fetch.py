@@ -418,7 +418,9 @@ async def test_both_shed_paths_are_recorded_with_their_reason(monkeypatch) -> No
 
     # Client cap: one slot, held by a request that has not come back yet.
     blocking = BlockingHttp()
-    capped = PeerChunkFetcher(FakePool(residency_row()), registry, "node-a", blocking, max_inflight=1, auth_secret=SECRET)
+    capped = PeerChunkFetcher(
+        FakePool(residency_row()), registry, "node-a", blocking, max_inflight=1, auth_secret=SECRET
+    )
     first = asyncio.create_task(capped(OBJ, 1, 3, 0))
     await asyncio.wait_for(blocking.started.wait(), timeout=1)
     assert await capped(OBJ, 1, 3, 1) is None
@@ -426,7 +428,9 @@ async def test_both_shed_paths_are_recorded_with_their_reason(monkeypatch) -> No
     await first
 
     # Server cap: the peer sheds it back with a 503.
-    busy = PeerChunkFetcher(FakePool(residency_row()), registry, "node-a", FakeHttp(503), max_inflight=8, auth_secret=SECRET)
+    busy = PeerChunkFetcher(
+        FakePool(residency_row()), registry, "node-a", FakeHttp(503), max_inflight=8, auth_secret=SECRET
+    )
     assert await busy(OBJ, 1, 4, 0) is None
 
     assert recorded == ["client_cap", "server_busy"], (
@@ -503,7 +507,9 @@ async def test_the_cap_still_sheds_when_readers_genuinely_contend() -> None:
     registry = PeerRegistry(redis, "node-a", SELF_URL, 90)
     http = BlockingHttp()
     cap = 4
-    fetcher = PeerChunkFetcher(FakePool(residency_row()), registry, "node-a", http, max_inflight=cap, auth_secret=SECRET)
+    fetcher = PeerChunkFetcher(
+        FakePool(residency_row()), registry, "node-a", http, max_inflight=cap, auth_secret=SECRET
+    )
 
     saturating = [asyncio.create_task(fetcher(OBJ, 1, 3, i)) for i in range(cap)]
     await asyncio.wait_for(http.started.wait(), timeout=1)
@@ -697,7 +703,9 @@ async def test_a_wrong_length_is_counted_under_its_own_reason(monkeypatch) -> No
     redis = FakeRedis()
     await PeerRegistry(redis, "node-b", PEER_URL, 90).register()
     registry = PeerRegistry(redis, "node-a", SELF_URL, 90)
-    fetcher = PeerChunkFetcher(FakePool(sized_row([100, 100])), registry, "node-a", FakeHttp(200, b"t" * 40), auth_secret=SECRET)
+    fetcher = PeerChunkFetcher(
+        FakePool(sized_row([100, 100])), registry, "node-a", FakeHttp(200, b"t" * 40), auth_secret=SECRET
+    )
 
     assert await fetcher(OBJ, 1, 3, 0) is None
 
@@ -725,7 +733,9 @@ async def test_a_peer_404_is_counted_rather_than_leaving_only_a_gap_in_the_tier_
     """
     recorded: list[str] = []
     monkeypatch.setattr("hippius_s3.cache.peers._record_shed", recorded.append)
-    fetcher = PeerChunkFetcher(FakePool(residency_row()), await _registered_peer(), "node-a", FakeHttp(404), auth_secret=SECRET)
+    fetcher = PeerChunkFetcher(
+        FakePool(residency_row()), await _registered_peer(), "node-a", FakeHttp(404), auth_secret=SECRET
+    )
 
     assert await fetcher(OBJ, 1, 3, 2) is None, "the chunk still falls through to the pool"
 
@@ -743,7 +753,9 @@ async def test_a_peer_5xx_is_counted_apart_from_a_miss(monkeypatch) -> None:
     """
     recorded: list[str] = []
     monkeypatch.setattr("hippius_s3.cache.peers._record_shed", recorded.append)
-    fetcher = PeerChunkFetcher(FakePool(residency_row()), await _registered_peer(), "node-a", FakeHttp(500), auth_secret=SECRET)
+    fetcher = PeerChunkFetcher(
+        FakePool(residency_row()), await _registered_peer(), "node-a", FakeHttp(500), auth_secret=SECRET
+    )
 
     assert await fetcher(OBJ, 1, 3, 2) is None
 
@@ -761,7 +773,9 @@ async def test_neither_a_404_nor_a_5xx_poisons_the_part_memo() -> None:
     """
     for status in (404, 500):
         http = Flaky(status)
-        fetcher = PeerChunkFetcher(FakePool(residency_row()), await _registered_peer(), "node-a", http, auth_secret=SECRET)
+        fetcher = PeerChunkFetcher(
+            FakePool(residency_row()), await _registered_peer(), "node-a", http, auth_secret=SECRET
+        )
 
         assert await fetcher(OBJ, 1, 3, 0) is None, f"the {status} chunk reads from the pool"
         assert await fetcher(OBJ, 1, 3, 1) == b"peer-bytes", f"a {status} kept the part off the peer tier"

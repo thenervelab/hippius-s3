@@ -16,17 +16,17 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway import config as gateway_config
-from gateway.middlewares.acl import acl_middleware
-from gateway.services.acl_service import BucketLookup
+from hippius_s3 import config as gateway_config
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.services.acl_service import BucketLookup
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
 def _ats_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ATS_CACHE_ENDPOINT", "http://ats.local:8080")
-    gateway_config._config = None
+    gateway_config.reset_config()
     yield
-    gateway_config._config = None
+    gateway_config.reset_config()
 
 
 def _build_app(acl_service: Any, *, account_id: str | None = None) -> Any:

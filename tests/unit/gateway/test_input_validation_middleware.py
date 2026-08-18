@@ -10,7 +10,7 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.input_validation import input_validation_middleware
+from hippius_s3.gateway.middlewares.input_validation import input_validation_middleware
 
 
 @pytest.fixture
@@ -276,7 +276,7 @@ async def test_reserved_check_uses_the_path_the_api_will_receive() -> None:
     `#` — so judging it as the bucket `docs#x` was judging a request that is never sent. Both
     spellings are refused, but only this one is refused for the true reason: `docs` is reserved.
     """
-    from gateway.utils.paths import first_path_segment
+    from hippius_s3.gateway.utils.paths import first_path_segment
 
     request = MagicMock()
     request.scope = {"raw_path": b"/docs%23x"}

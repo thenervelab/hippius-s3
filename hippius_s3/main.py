@@ -23,10 +23,9 @@ from fastapi.staticfiles import StaticFiles
 
 from hippius_s3.api.internal_parts import router as internal_parts_router
 from hippius_s3.api.middlewares.fs_cache_pressure import fs_cache_pressure_middleware
-from hippius_s3.api.middlewares.ip_whitelist import ip_whitelist_middleware
 from hippius_s3.api.middlewares.metrics import metrics_middleware
-from hippius_s3.api.middlewares.parse_internal_headers import parse_internal_headers_middleware
 from hippius_s3.api.middlewares.profiler import SpeedscopeProfilerMiddleware
+from hippius_s3.api.middlewares.request_context import request_context_middleware
 from hippius_s3.api.middlewares.tracing import tracing_middleware
 from hippius_s3.api.s3 import errors as s3_errors
 from hippius_s3.api.s3.public_router import router as public_router
@@ -44,6 +43,22 @@ from hippius_s3.cache.replication_probe import create_replication_suspect_probe
 from hippius_s3.cache.residency import create_residency_recorder
 from hippius_s3.config import Config
 from hippius_s3.config import get_config
+from hippius_s3.gateway.middlewares.account import account_middleware
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.middlewares.ats_purge import ats_purge_middleware
+from hippius_s3.gateway.middlewares.audit_log import audit_log_middleware
+from hippius_s3.gateway.middlewares.auth_probe import auth_probe_middleware
+from hippius_s3.gateway.middlewares.auth_router import auth_router_middleware
+from hippius_s3.gateway.middlewares.cache_control import cache_control_middleware
+from hippius_s3.gateway.middlewares.cache_invalidation import cache_invalidation_middleware
+from hippius_s3.gateway.middlewares.cors import cors_middleware
+from hippius_s3.gateway.middlewares.frontend_hmac import verify_frontend_hmac_middleware
+from hippius_s3.gateway.middlewares.input_validation import input_validation_middleware
+from hippius_s3.gateway.middlewares.path_normalization import path_normalization_middleware
+from hippius_s3.gateway.middlewares.ray_id import ray_id_middleware
+from hippius_s3.gateway.middlewares.read_only import read_only_middleware
+from hippius_s3.gateway.middlewares.trailing_slash import trailing_slash_normalizer
+from hippius_s3.gateway.services.acl_service import ACLService
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
 from hippius_s3.peer_auth import validate_peer_secret
@@ -127,6 +142,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.redis_queues_client = async_redis.from_url(config.redis_queues_url)
         logger.info("Redis queues client initialized")
 
+        app.state.redis_acl = async_redis.from_url(config.redis_acl_url, decode_responses=True)
+        logger.info("Redis ACL client initialized")
+
+        app.state.acl_service = ACLService(
+            db_pool=app.state.postgres_pool,
+            redis_client=app.state.redis_acl,
+            cache_ttl=config.acl_cache_ttl_seconds,
+        )
+        logger.info("ACLService initialized")
+
+        from hippius_s3.services.arion_service import ArionClient
+        from hippius_s3.services.hippius_api_service import HippiusApiClient
+
+        app.state.arion_client = ArionClient(
+            base_url=config.arion_base_url,
+            service_key=config.arion_service_key,
+        )
+        logger.info("ArionClient initialized")
+
+        # NET-5: one long-lived HippiusApiClient so auth-cache misses reuse a warm connection pool
+        # instead of building and tearing down a client per miss.
+        app.state.hippius_api_client = HippiusApiClient()
+        logger.info("HippiusApiClient initialized")
+
         from hippius_s3.queue import initialize_queue_client
         from hippius_s3.redis_cache import initialize_cache_client
 
@@ -147,7 +186,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.residency_recorder = create_residency_recorder(app.state.postgres_pool, os.getenv("NODE_NAME", ""))
         # Peer tier: resolve who holds a part on flash and read it from them before the pool.
         # Peers address each other by POD IP (not a hostPort on the node IP), which keeps the
-        # traffic on the pod network and inside the api's 10.x/172.x ip_whitelist.
+        # traffic on the pod network; peer requests authenticate with the shared secret
+        # (is_authorized_peer_fetch) since the merge removed the ip_whitelist middleware.
         node_name = os.getenv("NODE_NAME", "")
         pod_ip = os.getenv("POD_IP", "")
         app.state.peer_registry = None
@@ -341,6 +381,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.exception("Error shutting down Redis queues client")
 
         try:
+            await app.state.redis_acl.close()
+            logger.info("Redis ACL client closed")
+        except Exception:
+            logger.exception("Error shutting down Redis ACL client")
+
+        try:
+            await app.state.arion_client.close()
+            logger.info("ArionClient closed")
+        except Exception:
+            logger.exception("Error shutting down ArionClient")
+
+        try:
+            await app.state.hippius_api_client.close()
+            logger.info("HippiusApiClient closed")
+        except Exception:
+            logger.exception("Error shutting down HippiusApiClient")
+
+        try:
+            from hippius_s3.gateway.services import ats_cache_client
+
+            await ats_cache_client.close()
+            logger.info("ATS cache client closed")
+        except Exception:
+            logger.exception("Error shutting down ATS cache client")
+
+        try:
             await app.state.postgres_pool.close()
             logger.info("Postgres connection pool closed")
         except Exception:
@@ -421,15 +487,59 @@ def factory() -> FastAPI:
 
     app.openapi = custom_openapi  # ty: ignore[invalid-assignment]
 
-    # Custom middlewares - middleware("http") executes in REVERSE order
-    # Backend now relies on gateway for authentication/authorization
-    # All middleware here assume X-Hippius-* headers are already set by gateway
-    # Audit logging has been moved to gateway (which sees real client IPs)
+    # Starlette: last-registered = outermost. On the request path, outer
+    # middlewares run first; the handler runs last; the response unwinds back
+    # through them. The list below is ordered innermost → outermost. This is
+    # the pre-merge gateway chain with the api's middlewares composed in at
+    # the positions the forward hop used to occupy:
+    #
+    #   cors → ray_id → path_normalization → cache_control → ats_purge
+    #   → cache_invalidation → [read_only] → fs_cache_pressure → input_validation
+    #   → auth_router → trailing_slash → account → acl → frontend_hmac
+    #   → [audit_log] → request_context → tracing → metrics → auth_probe
+    #   → routers
+    #
+    # Load-bearing orderings:
+    # - auth_probe MUST stay inner to auth_router + acl. Moving it outward
+    #   lets unauthenticated callers reach it: the probe would answer 200 to
+    #   anyone. (?acl is dispatched by the routers themselves, like tagging.)
+    # - request_context MUST stay inner to acl (it consumes the
+    #   bucket_owner_id acl resolves) and outer to everything that reads
+    #   request.state.main_account_id (metrics, tracing, the S3 handlers).
+    #   state.account itself carries CALLER semantics only and is never
+    #   rebound, so no layer is ordering-sensitive on it.
+    # - fs_cache_pressure sits OUTSIDE auth on purpose: a shed PUT costs a
+    #   503 and no SigV4/Arion work. Pre-merge the gateway defeated this by
+    #   relaying the whole body before the api could answer.
+    app.middleware("http")(auth_probe_middleware)
     app.middleware("http")(metrics_middleware)
     app.middleware("http")(tracing_middleware)
-    app.middleware("http")(parse_internal_headers_middleware)
-    app.middleware("http")(ip_whitelist_middleware)
+    app.middleware("http")(request_context_middleware)
+    if config.enable_audit_logging:
+        app.middleware("http")(audit_log_middleware)
+    app.middleware("http")(verify_frontend_hmac_middleware)
+    app.middleware("http")(acl_middleware)
+    app.middleware("http")(account_middleware)
+    app.middleware("http")(trailing_slash_normalizer)
+    app.middleware("http")(auth_router_middleware)
+    app.middleware("http")(input_validation_middleware)
     app.middleware("http")(fs_cache_pressure_middleware)
+    if config.read_only_mode:
+        app.middleware("http")(read_only_middleware)
+    # Inside CORS so Cache-Control lands before CORS wraps the response.
+    app.middleware("http")(cache_invalidation_middleware)
+    app.middleware("http")(ats_purge_middleware)
+    app.middleware("http")(cache_control_middleware)
+    # One path view for router and every security layer — set once, before anything
+    # reads scope["path"]. Replaces the collapse httpx used to apply in the forwarder;
+    # without it the router acts on the raw path while auth/acl judge the collapsed one.
+    app.middleware("http")(path_normalization_middleware)
+    # Second-outermost: stamp ray_id before auth/acl/account/validation run, so
+    # every inner middleware logs a real ray_id (GW-2). Kept inside CORS so CORS
+    # still wraps error responses, including the ray_id header.
+    app.middleware("http")(ray_id_middleware)
+    # Outermost: CORS must wrap everything so error responses get CORS headers
+    app.middleware("http")(cors_middleware)
     if config.enable_request_profiling:
         app.add_middleware(SpeedscopeProfilerMiddleware)
 

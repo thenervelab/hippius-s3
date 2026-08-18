@@ -7,7 +7,7 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.read_only import read_only_middleware
+from hippius_s3.gateway.middlewares.read_only import read_only_middleware
 
 
 @pytest.fixture  # type: ignore[misc]

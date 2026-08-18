@@ -10,16 +10,18 @@ spec:
       targetPort: 8000
       name: http
 ---
+# The gateway service survives the gateway/api merge as an alias: in-cluster
+# clients and the ingress keep resolving gateway:8080, served by the merged api.
 apiVersion: v1
 kind: Service
 metadata:
   name: gateway
 spec:
   selector:
-    app: gateway
+    app: api
   ports:
     - port: 8080
-      targetPort: 8080
+      targetPort: 8000
       name: http
 ---
 apiVersion: v1

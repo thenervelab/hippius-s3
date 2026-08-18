@@ -5,14 +5,16 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi import FastAPI
-from fastapi.responses import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.routers.acl import acl_to_xml
-from gateway.routers.acl import router
-from gateway.routers.acl import xml_to_acl
-from gateway.services.acl_service import ACLService
+from hippius_s3.gateway.services.acl_service import ACLService
+from hippius_s3.api.s3.acl_endpoints import acl_to_xml
+from hippius_s3.api.s3.acl_endpoints import get_bucket_acl
+from hippius_s3.api.s3.acl_endpoints import get_object_acl
+from hippius_s3.api.s3.acl_endpoints import put_bucket_acl
+from hippius_s3.api.s3.acl_endpoints import put_object_acl
+from hippius_s3.api.s3.acl_endpoints import xml_to_acl
 from hippius_s3.models.acl import ACL
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import Grantee
@@ -20,6 +22,37 @@ from hippius_s3.models.acl import GranteeType
 from hippius_s3.models.acl import Owner
 from hippius_s3.models.acl import Permission
 from hippius_s3.models.acl import WellKnownGroups
+
+
+def _mount_acl_dispatch(app: FastAPI) -> None:
+    """Mirror the production routers' ?acl query-param branches (the handlers moved
+    from middleware dispatch to router dispatch with the gateway/api merge cleanup)."""
+    from fastapi import Request
+    from fastapi.responses import JSONResponse
+
+    @app.get("/{bucket}")
+    async def _bucket_get(bucket: str, request: Request) -> Any:
+        if "acl" in request.query_params:
+            return await get_bucket_acl(bucket, request)
+        return JSONResponse({"fallback": True})
+
+    @app.put("/{bucket}")
+    async def _bucket_put(bucket: str, request: Request) -> Any:
+        if "acl" in request.query_params:
+            return await put_bucket_acl(bucket, request)
+        return JSONResponse({"fallback": True})
+
+    @app.get("/{bucket}/{key:path}")
+    async def _object_get(bucket: str, key: str, request: Request) -> Any:
+        if "acl" in request.query_params:
+            return await get_object_acl(bucket, key, request)
+        return JSONResponse({"fallback": True})
+
+    @app.put("/{bucket}/{key:path}")
+    async def _object_put(bucket: str, key: str, request: Request) -> Any:
+        if "acl" in request.query_params:
+            return await put_object_acl(bucket, key, request)
+        return JSONResponse({"fallback": True})
 
 
 class TestAclToXml:
@@ -327,7 +360,7 @@ class TestGetBucketAcl:
 
         app = FastAPI()
         app.state.acl_service = mock_service
-        app.include_router(router)
+        _mount_acl_dispatch(app)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/my-bucket?acl")
@@ -343,17 +376,10 @@ class TestGetBucketAcl:
 
     async def test_get_bucket_acl_without_query_param_doesnt_call_service(self) -> None:
         mock_service = AsyncMock()
-        mock_forward = AsyncMock()
-        mock_forward.forward_request.return_value = Response(status_code=200)
 
         app = FastAPI()
         app.state.acl_service = mock_service
-        app.state.forward_service = mock_forward
-        app.include_router(router)
-
-        @app.get("/{bucket}")
-        async def fallback(bucket: str) -> dict[str, Any]:
-            return {"bucket": bucket, "fallback": True}
+        _mount_acl_dispatch(app)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/my-bucket")
@@ -379,7 +405,7 @@ class TestGetBucketAcl:
 
         app = FastAPI()
         app.state.acl_service = mock_service
-        app.include_router(router)
+        _mount_acl_dispatch(app)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/my-bucket?acl")
@@ -407,7 +433,7 @@ class TestGetObjectAcl:
 
         app = FastAPI()
         app.state.acl_service = mock_service
-        app.include_router(router)
+        _mount_acl_dispatch(app)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/my-bucket/my-key?acl")
@@ -420,17 +446,10 @@ class TestGetObjectAcl:
 
     async def test_get_object_acl_without_query_param_doesnt_call_service(self) -> None:
         mock_service = AsyncMock()
-        mock_forward = AsyncMock()
-        mock_forward.forward_request.return_value = Response(status_code=200)
 
         app = FastAPI()
         app.state.acl_service = mock_service
-        app.state.forward_service = mock_forward
-        app.include_router(router)
-
-        @app.get("/{bucket}/{key:path}")
-        async def fallback(bucket: str, key: str) -> dict[str, Any]:
-            return {"bucket": bucket, "key": key, "fallback": True}
+        _mount_acl_dispatch(app)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/my-bucket/my-key")
@@ -452,7 +471,7 @@ class TestGetObjectAcl:
 
         app = FastAPI()
         app.state.acl_service = mock_service
-        app.include_router(router)
+        _mount_acl_dispatch(app)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/my-bucket/folder/subfolder/key.txt?acl")
@@ -503,12 +522,12 @@ class TestPutBucketAcl:
         app = FastAPI()
         app.state.acl_service = mock_service
 
+        _mount_acl_dispatch(app)
+
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
             request.state.account_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
             return await call_next(request)
-
-        app.include_router(router)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.put(
@@ -533,12 +552,12 @@ class TestPutBucketAcl:
         app = FastAPI()
         app.state.acl_service = mock_service
 
+        _mount_acl_dispatch(app)
+
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
             request.state.account_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
             return await call_next(request)
-
-        app.include_router(router)
 
         xml_body = """<?xml version="1.0" encoding="UTF-8"?>
         <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -568,7 +587,7 @@ class TestPutBucketAcl:
     async def test_put_bucket_acl_without_auth_returns_403(self) -> None:
         app = FastAPI()
         app.state.acl_service = AsyncMock()
-        app.include_router(router)
+        _mount_acl_dispatch(app)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.put(
@@ -584,7 +603,7 @@ class TestPutBucketAcl:
 
         app = FastAPI()
         app.state.acl_service = mock_service
-        app.include_router(router)
+        _mount_acl_dispatch(app)
 
         xml_body = """<?xml version="1.0" encoding="UTF-8"?>
         <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -617,12 +636,12 @@ class TestPutBucketAcl:
         app = FastAPI()
         app.state.acl_service = AsyncMock()
 
+        _mount_acl_dispatch(app)
+
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
             request.state.account_id = "owner-123"
             return await call_next(request)
-
-        app.include_router(router)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.put("/my-bucket?acl")
@@ -648,12 +667,12 @@ class TestPutObjectAcl:
         app = FastAPI()
         app.state.acl_service = mock_service
 
+        _mount_acl_dispatch(app)
+
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
             request.state.account_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
             return await call_next(request)
-
-        app.include_router(router)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.put(
@@ -678,12 +697,12 @@ class TestPutObjectAcl:
         app = FastAPI()
         app.state.acl_service = mock_service
 
+        _mount_acl_dispatch(app)
+
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
             request.state.account_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
             return await call_next(request)
-
-        app.include_router(router)
 
         xml_body = """<?xml version="1.0" encoding="UTF-8"?>
         <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -717,12 +736,12 @@ class TestPutObjectAcl:
         app = FastAPI()
         app.state.acl_service = mock_service
 
+        _mount_acl_dispatch(app)
+
         @app.middleware("http")
         async def mock_auth_middleware(request: Any, call_next: Any) -> Any:
             request.state.account_id = "owner-123"
             return await call_next(request)
-
-        app.include_router(router)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.put(
@@ -737,7 +756,7 @@ class TestPutObjectAcl:
     async def test_put_object_acl_without_auth_returns_403(self) -> None:
         app = FastAPI()
         app.state.acl_service = AsyncMock()
-        app.include_router(router)
+        _mount_acl_dispatch(app)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.put(
@@ -753,7 +772,7 @@ class TestPutObjectAcl:
 
         app = FastAPI()
         app.state.acl_service = mock_service
-        app.include_router(router)
+        _mount_acl_dispatch(app)
 
         xml_body = """<?xml version="1.0" encoding="UTF-8"?>
         <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -784,7 +803,7 @@ class TestPutObjectAcl:
 class TestAccessKeyXMLParsing:
     async def test_xml_to_acl_parses_access_key_grantee(self) -> None:
         """Test parsing AccessKey grantee type from XML"""
-        from gateway.routers.acl import xml_to_acl
+        from hippius_s3.api.s3.acl_endpoints import xml_to_acl
 
         xml = """<?xml version="1.0" encoding="UTF-8"?>
         <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -809,7 +828,7 @@ class TestAccessKeyXMLParsing:
 
     async def test_xml_to_acl_parses_multiple_access_keys(self) -> None:
         """Test parsing multiple AccessKey grantees"""
-        from gateway.routers.acl import xml_to_acl
+        from hippius_s3.api.s3.acl_endpoints import xml_to_acl
 
         xml = """<?xml version="1.0" encoding="UTF-8"?>
         <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -842,7 +861,7 @@ class TestAccessKeyXMLParsing:
 
     async def test_xml_to_acl_mixes_canonical_and_access_key(self) -> None:
         """Test parsing ACL with both CanonicalUser and AccessKey grants"""
-        from gateway.routers.acl import xml_to_acl
+        from hippius_s3.api.s3.acl_endpoints import xml_to_acl
 
         xml = """<?xml version="1.0" encoding="UTF-8"?>
         <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -874,7 +893,7 @@ class TestAccessKeyXMLParsing:
 class TestAccessKeyXMLGeneration:
     async def test_acl_to_xml_generates_access_key_grantee(self) -> None:
         """Test generating XML with AccessKey grantee"""
-        from gateway.routers.acl import acl_to_xml
+        from hippius_s3.api.s3.acl_endpoints import acl_to_xml
         from hippius_s3.models.acl import ACL
         from hippius_s3.models.acl import Owner
 
@@ -896,8 +915,8 @@ class TestAccessKeyXMLGeneration:
 
     async def test_acl_to_xml_round_trip_with_access_key(self) -> None:
         """Test XML round-trip preserves AccessKey grants"""
-        from gateway.routers.acl import acl_to_xml
-        from gateway.routers.acl import xml_to_acl
+        from hippius_s3.api.s3.acl_endpoints import acl_to_xml
+        from hippius_s3.api.s3.acl_endpoints import xml_to_acl
         from hippius_s3.models.acl import ACL
         from hippius_s3.models.acl import Owner
 
@@ -925,7 +944,7 @@ class TestAccessKeyXMLGeneration:
 class TestAccessKeyHeaderParsing:
     async def test_parse_grant_header_with_access_key(self) -> None:
         """Test parsing accessKey from grant header"""
-        from gateway.routers.acl import parse_grant_header
+        from hippius_s3.api.s3.acl_endpoints import parse_grant_header
 
         grants = parse_grant_header('accessKey="hip_bob_key"', Permission.READ)
 
@@ -936,7 +955,7 @@ class TestAccessKeyHeaderParsing:
 
     async def test_parse_grant_header_multiple_access_keys(self) -> None:
         """Test parsing multiple access keys from header"""
-        from gateway.routers.acl import parse_grant_header
+        from hippius_s3.api.s3.acl_endpoints import parse_grant_header
 
         grants = parse_grant_header('accessKey="hip_key1", accessKey="hip_key2"', Permission.WRITE)
 
@@ -948,7 +967,7 @@ class TestAccessKeyHeaderParsing:
 
     async def test_parse_grant_header_mix_id_and_access_key(self) -> None:
         """Test parsing mixed id and accessKey from header"""
-        from gateway.routers.acl import parse_grant_header
+        from hippius_s3.api.s3.acl_endpoints import parse_grant_header
 
         grants = parse_grant_header(
             'id="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", accessKey="hip_bob_key"', Permission.READ
@@ -962,7 +981,7 @@ class TestAccessKeyHeaderParsing:
 
     async def test_parse_grant_header_rejects_invalid_access_key_format(self) -> None:
         """Test that invalid access key format in header is rejected"""
-        from gateway.routers.acl import parse_grant_header
+        from hippius_s3.api.s3.acl_endpoints import parse_grant_header
 
         with pytest.raises(ValueError, match="Invalid access key format"):
             parse_grant_header('accessKey="invalid_key"', Permission.READ)
@@ -972,7 +991,7 @@ class TestAccessKeyHeaderParsing:
 
     async def test_parse_grant_header_rejects_empty_access_key(self) -> None:
         """Test that empty access key in header is rejected"""
-        from gateway.routers.acl import parse_grant_header
+        from hippius_s3.api.s3.acl_endpoints import parse_grant_header
 
         with pytest.raises(ValueError, match="Access key ID cannot be empty"):
             parse_grant_header('accessKey=""', Permission.READ)

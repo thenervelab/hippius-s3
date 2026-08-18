@@ -1,6 +1,6 @@
 # hippius_s3/api/
 
-Internal FastAPI app on port 8000. **Not exposed to the internet** — only the gateway talks to it. Trusts `X-Hippius-*` headers injected by [gateway/services/forward_service.py](../../gateway/services/forward_service.py).
+The single merged FastAPI app on port 8000, public-facing since the 2026-08 gateway/api merge. Auth/ACL run as middlewares in the same process ([hippius_s3/gateway/](../gateway/)); there is no `X-Hippius-*` header contract and no forward hop.
 
 See [../../CLAUDE.md](../../CLAUDE.md) for the full request lifecycle; this file covers the API layer.
 
@@ -19,12 +19,11 @@ See [../../CLAUDE.md](../../CLAUDE.md) for the full request lifecycle; this file
 
 ## Middleware chain
 
-Registered at [main.py:304-308](../main.py). Reverse order means on the request path: `metrics → tracing → parse_internal_headers → ip_whitelist → fs_cache_pressure` (outer → inner).
+Registered in [main.py](../main.py) together with the gateway middlewares (single merged app). Full request-path order: `cors → ray_id → cache_control → ats_purge → cache_invalidation → [read_only] → fs_cache_pressure → input_validation → auth_router → trailing_slash → account → acl → request_context → frontend_hmac → tracing → metrics → [audit_log] → auth_probe → acl_subresource → routers`.
 
 - **`metrics_middleware`** ([hippius_s3/api/middlewares/metrics.py](middlewares/metrics.py)) — OTel request-level metrics.
 - **`tracing_middleware`** ([hippius_s3/api/middlewares/tracing.py](middlewares/tracing.py)) — OTel spans.
-- **`parse_internal_headers_middleware`** ([hippius_s3/api/middlewares/parse_internal_headers.py](middlewares/parse_internal_headers.py)) — reads `X-Hippius-*` from the gateway, populates `request.state.account`, `request.state.ray_id`, `request.state.seed_phrase`, etc. The API **assumes these are trustworthy** because it only listens inside the cluster.
-- **`ip_whitelist_middleware`** — only allows client addresses inside `API_IP_WHITELIST_CIDRS` (default `10.0.0.0/8,172.16.0.0/12,127.0.0.1/32,::1/128`); `/health` is exempt for kubelet probes. Defence-in-depth for a misconfigured k8s network policy.
+- **`request_context_middleware`** ([middlewares/request_context.py](middlewares/request_context.py)) — derives `request.state.account` (main_account = bucket owner) and caller ids from what the auth/account/acl middlewares resolved. Replaced the header-parsing `parse_internal_headers` after the gateway merge.
 - **`fs_cache_pressure_middleware`** — returns **503 + Retry-After BEFORE reading the body** when the cache disk is above the configured usage threshold. Saves RAM/disk on doomed PUTs. See [middlewares/CLAUDE.md](middlewares/CLAUDE.md).
 - **`SpeedscopeProfilerMiddleware`** ([hippius_s3/api/middlewares/profiler.py](middlewares/profiler.py)) — optional, only added when `ENABLE_REQUEST_PROFILING=true`.
 

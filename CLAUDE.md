@@ -15,7 +15,7 @@ Companion files:
 What makes this stack different from a normal S3 proxy:
 
 1. **Server-side envelope encryption with OVH KMS.** Every object chunk is AES-256-GCM encrypted with a per-object-version DEK; the DEK is wrapped by a per-bucket KEK; KEK is wrapped by an OVH KMS master key reachable only via mTLS from our API pods. Decryption therefore cannot be done on the client — every read flows through our API for decryption.
-2. **Two FastAPI services: a gateway and an internal API.** The gateway does auth, ACL, rate-limit decisions, and forwards to the internal API with trusted `X-Hippius-*` headers. This is a full streaming proxy, not a redirect.
+2. **One FastAPI service** (the 2026-08 gateway/api merge): the former gateway's middleware chain (auth, ACL, validation, audit, purge) and the S3 handlers run in a single app — [hippius_s3/main.py `factory()`](hippius_s3/main.py). There is no internal forwarding hop and no trusted-header contract; auth state flows through `request.state`, and the ordering that makes that safe is pinned by [tests/unit/gateway/test_middleware_order.py](tests/unit/gateway/test_middleware_order.py).
 3. **Filesystem-first cache.** Chunk data lives on a shared NVMe/CephFS volume (`/var/lib/hippius/object_cache`). Redis is used for pub/sub chunk-ready notifications and for work queues — **not** for chunk storage. This is new as of 2026-04-21 (the old Redis download cache is gone — see [todo.md](todo.md)). On ingest nodes there is additionally a node-local NVMe tier read before the pool — see [hippius_s3/cache/CLAUDE.md](hippius_s3/cache/CLAUDE.md); it is **staging-only**, behind `HIPPIUS_PEER_FETCH_ENABLED` / `HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ`.
 4. **Async backend writes (drain-direct).** Client PUT returns success once data hits the node SSD cache + DB row. The API does **not** enqueue the backend upload; it persists the version address. A Rust drain-agent replicates the part SSD→Ceph and then LPUSHes the `UploadChainRequest` itself, so the arion-uploader only ever dequeues Ceph-ready data. Replication state lives in the drain's `cephor_replication_status` (`pending → draining → replicated | failed | corrupt`, where `corrupt` is a live object whose pool copy failed verification — its SSD copy is the last good source and is never reclaimed); `object_versions.status` no longer progresses through `uploading/uploaded/published`.
 5. **S4 append extension.** On top of standard S3 we support atomic O(delta) appends with compare-and-swap semantics, spec at [docs/s4.md](docs/s4.md).
@@ -28,13 +28,12 @@ The pipeline is deliberately split so the user-facing path (gateway + API) is fa
 
 ```
 .
-├── gateway/                 # Public-facing FastAPI on :8080 — auth, ACL, forward
+├── gateway/                 # Middleware + auth service package (no app of its own since the merge)
 │   ├── middlewares/         # Auth chain, CORS, input validation, HMAC, etc.
-│   ├── services/            # auth_orchestrator, acl_service, forward_service
-│   └── routers/             # /docs proxy, /acl endpoints
+│   └── services/            # auth_orchestrator, acl_service, auth cache, ATS purge client
 ├── hippius_s3/              # Main package
 │   ├── api/                 # Internal FastAPI on :8000
-│   │   ├── middlewares/     # parse_internal_headers, fs_cache_pressure, ip_whitelist
+│   │   ├── middlewares/     # request_context, fs_cache_pressure, metrics, tracing
 │   │   └── s3/              # buckets/, objects/, multipart.py, extensions/append.py
 │   ├── writer/              # Upload pipeline: object_writer, chunker, write_through_writer
 │   ├── reader/              # Read pipeline: planner, streamer, decrypter
@@ -68,25 +67,24 @@ A **subsystem index** with links to per-directory `CLAUDE.md` files is in sectio
 ### 3.1 PUT (simple object)
 
 1. **Client → Gateway** (`https://s3.hippius.com/<bucket>/<key>`). SigV4-signed.
-2. **Gateway middleware chain** ([gateway/main.py:181-197](gateway/main.py)) — registered bottom-up, runs top-down: CORS → (read-only guard) → input validation → auth router → trailing slash → account → ACL → frontend HMAC → tracing → metrics → audit log → ray_id. On the way back out: the same stack in reverse.
-3. **Auth orchestrator** ([gateway/services/auth_orchestrator.py:39](gateway/services/auth_orchestrator.py)) picks one of five methods (presigned URL, bearer, access key SigV4, seed-phrase SigV4, anonymous), verifies the signature, and attaches `request.state.account_id` / `request.state.account` / etc.
-4. **ACL middleware** ([gateway/middlewares/acl.py:70](gateway/middlewares/acl.py)) checks bucket ownership + permission. Master tokens bypass.
-5. **Forward** ([gateway/services/forward_service.py:67](gateway/services/forward_service.py)). Gateway strips client-supplied `X-Hippius-*` headers ([forward_service.py:71-74](gateway/services/forward_service.py)), then adds trusted headers: `X-Hippius-Ray-ID`, `X-Hippius-Request-User`, `X-Hippius-Bucket-Owner`, `X-Hippius-Main-Account`, `X-Hippius-Seed` (if seed auth), `X-Hippius-Has-Credits`, `X-Hippius-Can-Upload`, `X-Hippius-Can-Delete`, `X-Hippius-Gateway-Time-Ms`. Body is **streamed** (`request.stream()`), not buffered.
-6. **API middleware chain** ([hippius_s3/main.py:304-308](hippius_s3/main.py)): `metrics → tracing → parse_internal_headers → ip_whitelist → fs_cache_pressure`. `fs_cache_pressure` ([hippius_s3/api/middlewares/fs_cache_pressure.py](hippius_s3/api/middlewares/fs_cache_pressure.py)) short-circuits PUTs with 503 + Retry-After **before reading the body** if the cache disk is ≥90% full.
-7. **PutObject endpoint** ([hippius_s3/api/s3/objects/put_object_endpoint.py:29](hippius_s3/api/s3/objects/put_object_endpoint.py)). Resolves bucket, decides if this is an S4 append (`x-amz-meta-append: true` → [extensions/append.py](hippius_s3/api/s3/extensions/append.py)), builds metadata.
-8. **Object writer** ([hippius_s3/writer/object_writer.py:169 `put_simple_stream_full`](hippius_s3/writer/object_writer.py)):
+2. **Merged middleware chain** (registered in [hippius_s3/main.py](hippius_s3/main.py), runs outer→inner): CORS → ray_id → cache_control → ats_purge → cache_invalidation → (read-only guard) → fs_cache_pressure → input validation → auth router → trailing slash → account → ACL → request_context → frontend HMAC → tracing → metrics → audit log → auth_probe. On the way back out: the same stack in reverse.
+3. **Auth orchestrator** ([hippius_s3/gateway/services/auth_orchestrator.py:39](hippius_s3/gateway/services/auth_orchestrator.py)) picks one of five methods (presigned URL, bearer, access key SigV4, seed-phrase SigV4, anonymous), verifies the signature, and attaches `request.state.account_id` / `request.state.account` / etc.
+4. **ACL middleware** ([hippius_s3/gateway/middlewares/acl.py:70](hippius_s3/gateway/middlewares/acl.py)) checks bucket ownership + permission. Master tokens bypass.
+5. **Request context** ([hippius_s3/api/middlewares/request_context.py](hippius_s3/api/middlewares/request_context.py)) maps the auth middlewares' state into what handlers consume: `state.main_account_id` (storage attribution: bucket owner, caller fallback) and the caller's own `state.account` (never rebound). No forwarding hop exists: since the 2026-08 merge the same app continues straight into the S3 handlers. `fs_cache_pressure` ([hippius_s3/api/middlewares/fs_cache_pressure.py](hippius_s3/api/middlewares/fs_cache_pressure.py)) runs before auth and short-circuits PUTs with 503 + Retry-After **before reading the body** if the cache disk is ≥90% full.
+6. **PutObject endpoint** ([hippius_s3/api/s3/objects/put_object_endpoint.py:29](hippius_s3/api/s3/objects/put_object_endpoint.py)). Resolves bucket, decides if this is an S4 append (`x-amz-meta-append: true` → [extensions/append.py](hippius_s3/api/s3/extensions/append.py)), builds metadata.
+7. **Object writer** ([hippius_s3/writer/object_writer.py:169 `put_simple_stream_full`](hippius_s3/writer/object_writer.py)):
    - **Reserve version**: `upsert_object_basic` inserts/bumps `object_versions` with placeholder size/md5 ([object_writer.py:210](hippius_s3/writer/object_writer.py)). **The DB-returned `object_id` is authoritative** — a concurrent create on the same (bucket, key) may override the client-generated candidate UUID ([object_writer.py:222-227](hippius_s3/writer/object_writer.py)).
    - **Generate DEK**, wrap it with the bucket KEK, and **immediately write the envelope to DB** ([object_writer.py:244-261](hippius_s3/writer/object_writer.py)) — a concurrent GET between the upsert and this write would otherwise hit a NULL `kek_id`/`wrapped_dek` and 500. See [analysis.md](analysis.md) for the broken-v5 bug that still produces orphan rows when the PUT aborts mid-stream.
    - **Producer/consumer pipeline**: a coroutine drains `body_iter`, encrypts each chunk under the global `chunk_index` (required for AEAD nonce determinism), and enqueues onto an asyncio queue (maxsize 16). A consumer reads the queue and writes to `fs_store.set_chunk` ([object_writer.py:308-333](hippius_s3/writer/object_writer.py)). FS writes are fatal; Redis batched `set_chunks` is best-effort ([object_writer.py:285-306](hippius_s3/writer/object_writer.py)).
    - **Write FS meta** last ([object_writer.py:420](hippius_s3/writer/object_writer.py)) — `meta.json` is the "part complete" signal, so it must land after every chunk.
    - **Update object_versions** with final size/md5 ([object_writer.py:442](hippius_s3/writer/object_writer.py)). Until this runs, the download query skips the version — it's reserved but not serveable.
    - **Return**. Client sees 200 OK.
-9. **Persist version address** ([put_object_endpoint.py:186-200 `set_object_version_address`](hippius_s3/api/s3/objects/put_object_endpoint.py)). No upload is enqueued on the write path (drain-direct cutover) — the API records the main-account address and returns.
-10. **Rust drain-agent** replicates the part SSD→Ceph, then LPUSHes the `UploadChainRequest` to `arion_upload_requests` itself (sole producer). The **Arion uploader worker** ([workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py)) then dequeues the (Ceph-ready) request, reads chunks, uploads to Arion, records `chunk_backend` rows, and publishes to the Hippius chain via [hippius_s3/services/hippius_api_service.py](hippius_s3/services/hippius_api_service.py).
+8. **Persist version address** ([put_object_endpoint.py:186-200 `set_object_version_address`](hippius_s3/api/s3/objects/put_object_endpoint.py)). No upload is enqueued on the write path (drain-direct cutover) — the API records the main-account address and returns.
+9. **Rust drain-agent** replicates the part SSD→Ceph, then LPUSHes the `UploadChainRequest` to `arion_upload_requests` itself (sole producer). The **Arion uploader worker** ([workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py)) then dequeues the (Ceph-ready) request, reads chunks, uploads to Arion, records `chunk_backend` rows, and publishes to the Hippius chain via [hippius_s3/services/hippius_api_service.py](hippius_s3/services/hippius_api_service.py).
 
 ### 3.2 GET (full object or Range)
 
-1. Gateway middleware chain (same as PUT, minus write-only middlewares).
+1. Merged middleware chain (same as PUT, minus write-only middlewares).
 2. **GetObject endpoint** → [hippius_s3/services/object_reader.py `build_stream_context`](hippius_s3/services/object_reader.py):
    - Read parts list from DB.
    - Build chunk plan ([hippius_s3/reader/planner.py](hippius_s3/reader/planner.py)) — maps Range bytes to (part_number, chunk_index, slice_start, slice_end).
@@ -203,31 +201,31 @@ Separate keystore DB for encryption keys (`HIPPIUS_KEYSTORE_DATABASE_URL`, falls
 
 ## 6. Authentication (five methods)
 
-Orchestrated by [gateway/services/auth_orchestrator.py:39 `authenticate_request`](gateway/services/auth_orchestrator.py). Priority order:
+Orchestrated by [hippius_s3/gateway/services/auth_orchestrator.py:39 `authenticate_request`](hippius_s3/gateway/services/auth_orchestrator.py). Priority order:
 
-1. **Presigned URL** — query params `X-Amz-Algorithm=AWS4-HMAC-SHA256`, `X-Amz-Credential`, `X-Amz-Signature`. Credential starts with `hip_`. Verified by [gateway/middlewares/access_key_auth.py:139](gateway/middlewares/access_key_auth.py).
-2. **Bearer token** — `Authorization: Bearer hip_...`. Verified against the Hippius API via [gateway/services/auth_cache.py](gateway/services/auth_cache.py) (Redis-cached).
-3. **Access key header** — SigV4 Authorization with credential starting `hip_`. Same verifier as presigned URL ([access_key_auth.py:35](gateway/middlewares/access_key_auth.py)).
-4. **Seed phrase SigV4** — base64-encoded 12-word seed as access key ID, raw seed as secret. Verified by [gateway/middlewares/sigv4.py `SigV4Verifier`](gateway/middlewares/sigv4.py).
+1. **Presigned URL** — query params `X-Amz-Algorithm=AWS4-HMAC-SHA256`, `X-Amz-Credential`, `X-Amz-Signature`. Credential starts with `hip_`. Verified by [hippius_s3/gateway/middlewares/access_key_auth.py:139](hippius_s3/gateway/middlewares/access_key_auth.py).
+2. **Bearer token** — `Authorization: Bearer hip_...`. Verified against the Hippius API via [hippius_s3/gateway/services/auth_cache.py](hippius_s3/gateway/services/auth_cache.py) (Redis-cached).
+3. **Access key header** — SigV4 Authorization with credential starting `hip_`. Same verifier as presigned URL ([access_key_auth.py:35](hippius_s3/gateway/middlewares/access_key_auth.py)).
+4. **Seed phrase SigV4** — base64-encoded 12-word seed as access key ID, raw seed as secret. Verified by [hippius_s3/gateway/middlewares/sigv4.py `SigV4Verifier`](hippius_s3/gateway/middlewares/sigv4.py).
 5. **Anonymous** — GET/HEAD on public buckets with no Authorization header.
 
 Canonicalization uses `request.scope["raw_path"]` (bytes) rather than `request.url.path` to preserve exact percent-encoding. `hmac.compare_digest` is used for signature comparison (constant-time).
 
-**Token types**: Arion returns `master` or `sub` for access keys. Master tokens bypass ACL entirely ([gateway/middlewares/acl.py:126-130](gateway/middlewares/acl.py)) — authorization is enforced upstream by Arion. Sub-token scope evaluation is partially implemented ([gateway/services/sub_token_scope.py](gateway/services/sub_token_scope.py)) but **not wired** and currently imports a nonexistent `TokenAcl` — see [todo.md](todo.md).
+**Token types**: Arion returns `master` or `sub` for access keys. Master tokens bypass ACL entirely ([hippius_s3/gateway/middlewares/acl.py:126-130](hippius_s3/gateway/middlewares/acl.py)) — authorization is enforced upstream by Arion. Sub-token scope evaluation is partially implemented ([hippius_s3/gateway/services/sub_token_scope.py](hippius_s3/gateway/services/sub_token_scope.py)) but **not wired** and currently imports a nonexistent `TokenAcl` — see [todo.md](todo.md).
 
 ---
 
 ## 7. Subsystem index
 
 ### Gateway
-- [gateway/CLAUDE.md](gateway/CLAUDE.md) — entry, middleware order, ForwardService.
-- [gateway/middlewares/CLAUDE.md](gateway/middlewares/CLAUDE.md) — per-middleware behavior.
-- [gateway/services/CLAUDE.md](gateway/services/CLAUDE.md) — auth_orchestrator, ACLService, ForwardService, sub_token_scope (dormant).
-- Entry: [gateway/main.py](gateway/main.py) — `factory()` at line 43.
+- [hippius_s3/gateway/CLAUDE.md](hippius_s3/gateway/CLAUDE.md) — middleware order and the merge. `?acl` handlers live in [hippius_s3/api/s3/acl_endpoints.py](hippius_s3/api/s3/acl_endpoints.py), dispatched from the routers like `tagging`.
+- [hippius_s3/gateway/middlewares/CLAUDE.md](hippius_s3/gateway/middlewares/CLAUDE.md) — per-middleware behavior.
+- [hippius_s3/gateway/services/CLAUDE.md](hippius_s3/gateway/services/CLAUDE.md) — auth_orchestrator, ACLService, sub_token_scope (dormant).
+- Entry: [hippius_s3/gateway/main.py](hippius_s3/gateway/main.py) — `factory()` at line 43.
 
 ### Internal API
 - [hippius_s3/api/CLAUDE.md](hippius_s3/api/CLAUDE.md) — router structure, lifespan, middleware chain.
-- [hippius_s3/api/middlewares/CLAUDE.md](hippius_s3/api/middlewares/CLAUDE.md) — `fs_cache_pressure`, `parse_internal_headers`, `ip_whitelist`.
+- [hippius_s3/api/middlewares/CLAUDE.md](hippius_s3/api/middlewares/CLAUDE.md) — `fs_cache_pressure`, `request_context`, metrics/tracing.
 - [hippius_s3/api/s3/objects/CLAUDE.md](hippius_s3/api/s3/objects/CLAUDE.md) — PUT/GET/HEAD/DELETE/COPY endpoints.
 - Entry: [hippius_s3/main.py](hippius_s3/main.py) — `factory()` at line 248, `lifespan` at 87.
 
@@ -315,7 +313,6 @@ Config is a typed dataclass: [hippius_s3/config.py](hippius_s3/config.py). Value
 | Variable | Default | Notes |
 |---|---|---|
 | `ENABLE_AUDIT_LOGGING` | `true` | Gateway audit log middleware. |
-| `ENABLE_BANHAMMER` | `true` | Code exists but middleware registration is currently commented out; see [gateway/main.py:94](gateway/main.py). |
 | `HIPPIUS_BYPASS_CREDIT_CHECK` | `false` | Test-only. |
 | `HIPPIUS_READ_ONLY_MODE` | `false` | Blocks all writes at gateway. |
 | `ENABLE_REQUEST_PROFILING` | `false` | Speedscope profiler middleware. |

@@ -10,7 +10,6 @@ resources:
   - redis-statefulsets.yaml
   - migration-job.yaml
   - api-deployment.yaml
-  - gateway-deployment.yaml
   - workers-deployments.yaml
   - services.yaml
   - ingress.yaml

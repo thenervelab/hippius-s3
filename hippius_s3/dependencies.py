@@ -88,7 +88,7 @@ class RequestContext:
 
 def get_request_context(request: Request) -> RequestContext:
     """Lightweight context extracted from request.state for passing to services."""
-    main_account_id = getattr(request.state.account, "main_account", "") or ""
+    main_account_id = getattr(request.state, "main_account_id", "") or ""
     return RequestContext(main_account_id=main_account_id)
 
 

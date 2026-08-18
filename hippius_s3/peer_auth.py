@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import hmac
 import re
+from typing import TYPE_CHECKING
+
+from hippius_s3.config import get_config
+from hippius_s3.gateway.utils.paths import routing_path
 
 
 # 64 hex characters, matching the shape CLAUDE.md already documents for HIPPIUS_SERVICE_KEY and
@@ -48,9 +52,16 @@ def validate_peer_secret(secret: str) -> None:
 # string literals is how a fail-closed handshake silently stops matching: each side's own tests
 # keep passing because each side agrees with itself.
 #
-# The X-Hippius- prefix is load-bearing, not cosmetic: the gateway strips every inbound
-# x-hippius-* header before forwarding (gateway/services/forward_service.py), so a client
-# cannot forge this one. That strip is what makes a shared secret sufficient here.
+# HISTORY: the X-Hippius- prefix predates the gateway/api merge, when the gateway's
+# forward-time strip of inbound x-hippius-* headers guaranteed a client could not present
+# this header at all. That strip is gone with the forwarder; the 64-hex shared secret,
+# compared in constant time, is the authentication now — presenting the header from the
+# internet without the secret behaves exactly like any wrong secret (a 404 from the
+# endpoint, a 400 from input_validation). The durable upgrade remains a second,
+# edge-unreachable port for internal routes (see input_validation's `internal` note).
+if TYPE_CHECKING:
+    from fastapi import Request
+
 PEER_AUTH_HEADER = "X-Hippius-Peer-Auth"
 
 
@@ -74,3 +85,25 @@ def peer_auth_matches(presented: str | None, expected: str) -> bool:
     # It is here so this function's "never raises" contract also holds for a caller that hands
     # it a str from somewhere other than a request header.
     return hmac.compare_digest(presented.encode("latin-1", errors="replace"), expected.encode("utf-8"))
+
+
+def is_authorized_peer_fetch(request: "Request") -> bool:
+    """True only for a /internal/parts request presenting the valid peer secret.
+
+    The single predicate the merged app's middlewares use to exempt peer chunk
+    fetches from the S3 pipeline (validation, auth, credit, ACL). Fail-closed by
+    construction: no secret configured, wrong secret, or any other path → False,
+    and the request faces the normal S3 middleware wall.
+
+    Header checked first: client traffic never carries it, so the common case
+    bails before any path decoding or config lookup.
+    """
+    presented = request.headers.get(PEER_AUTH_HEADER)
+    if presented is None or request.method != "GET":
+        return False
+    if not routing_path(request).startswith("/internal/parts/"):
+        return False
+    config = get_config()
+    if not config.peer_serve_enabled:
+        return False
+    return peer_auth_matches(presented, config.internal_peer_secret)

@@ -55,8 +55,9 @@ async def test_publish_waits_for_a_lock_another_process_holds(tmp_path) -> None:
     fcntl.flock(other, fcntl.LOCK_EX)
     try:
         task = asyncio.create_task(
-            store.publish_part(OBJ, 1, 1, chunk_size=len(CHUNK), num_chunks=1,
-                               size_bytes=len(CHUNK), attempt_id="attemptaa")
+            store.publish_part(
+                OBJ, 1, 1, chunk_size=len(CHUNK), num_chunks=1, size_bytes=len(CHUNK), attempt_id="attemptaa"
+            )
         )
         # Long enough that a publish which ignored the lock would have finished: the whole swap is
         # a handful of local renames.
@@ -76,8 +77,9 @@ async def test_the_lock_is_released_after_publishing(tmp_path) -> None:
     """A held-forever lock would wedge every later attempt at that part on that node."""
     store = FileSystemPartsStore(str(tmp_path))
     await _stage_one_chunk(store, "attemptaa")
-    await store.publish_part(OBJ, 1, 1, chunk_size=len(CHUNK), num_chunks=1,
-                             size_bytes=len(CHUNK), attempt_id="attemptaa")
+    await store.publish_part(
+        OBJ, 1, 1, chunk_size=len(CHUNK), num_chunks=1, size_bytes=len(CHUNK), attempt_id="attemptaa"
+    )
 
     probe = os.open(_part_dir(store), os.O_RDONLY)
     try:
@@ -101,8 +103,9 @@ async def test_a_failed_publish_still_releases_the_lock(tmp_path) -> None:
         staged.unlink()
 
     with pytest.raises(FileNotFoundError):
-        await store.publish_part(OBJ, 1, 1, chunk_size=len(CHUNK), num_chunks=1,
-                                 size_bytes=len(CHUNK), attempt_id="attemptaa")
+        await store.publish_part(
+            OBJ, 1, 1, chunk_size=len(CHUNK), num_chunks=1, size_bytes=len(CHUNK), attempt_id="attemptaa"
+        )
 
     probe = os.open(part_dir, os.O_RDONLY)
     try:
@@ -123,8 +126,7 @@ async def test_different_parts_do_not_block_each_other(tmp_path) -> None:
     fcntl.flock(held, fcntl.LOCK_EX)
     try:
         await asyncio.wait_for(
-            store.publish_part(OBJ, 1, 2, chunk_size=len(CHUNK), num_chunks=1,
-                               size_bytes=len(CHUNK), attempt_id="aa"),
+            store.publish_part(OBJ, 1, 2, chunk_size=len(CHUNK), num_chunks=1, size_bytes=len(CHUNK), attempt_id="aa"),
             timeout=5,
         )
     finally:
