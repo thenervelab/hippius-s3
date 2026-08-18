@@ -16,12 +16,15 @@ import asyncpg
 from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
+from hippius_s3.blake3_hash import new_hasher as new_blake3
+from hippius_s3.blake3_hash import persist_version_hash
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.db_retry import retry_on_object_version_conflict
+from hippius_s3.reader.decrypter import decrypt_chunk_if_needed
 from hippius_s3.repositories import fs_cache_inventory
 from hippius_s3.services.crypto_pool import run_crypto
 from hippius_s3.services.crypto_service import CryptoService
@@ -214,6 +217,7 @@ class ObjectWriter:
             object_id, object_version = await retry_on_object_version_conflict(_reserve_version)
 
         hasher = hashlib.md5()
+        blake3_hasher = new_blake3()
         total_size = 0
         writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
 
@@ -267,6 +271,7 @@ class ObjectWriter:
                         buf = bytes(pt_buf[:chunk_size])
                         del pt_buf[:chunk_size]
                         hasher.update(buf)
+                        blake3_hasher.update(buf)
                         total_size += len(buf)
                         # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                         # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
@@ -295,6 +300,7 @@ class ObjectWriter:
                     buf = bytes(pt_buf)
                     pt_buf.clear()
                     hasher.update(buf)
+                    blake3_hasher.update(buf)
                     total_size += len(buf)
                     # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
                     # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
@@ -323,6 +329,7 @@ class ObjectWriter:
                     raise consumer_error
 
                 md5_hash = hasher.hexdigest()
+                blake3_hex = blake3_hasher.hexdigest()
                 perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
                 set_span_attributes(
                     span,
@@ -385,6 +392,12 @@ class ObjectWriter:
                         datetime.now(timezone.utc),
                         object_id,
                         int(object_version),
+                    )
+                    await persist_version_hash(
+                        conn,
+                        object_id=object_id,
+                        object_version=int(object_version),
+                        digest=blake3_hex,
                     )
                     # Envelope (kek_id, wrapped_dek) was already written in the head transaction
                     # to prevent the read-race on concurrent overwrites.
@@ -800,6 +813,50 @@ class ObjectWriter:
 
         return PartResult(etag=md5_hash, size_bytes=int(total_size), part_number=int(part_number))
 
+    async def _blake3_of_parts(
+        self,
+        *,
+        bucket_id: str,
+        object_id: str,
+        object_version: int,
+        upload_id: str,
+        part_numbers: list[int],
+        storage_version: int,
+        suite_id: str,
+    ) -> str:
+        """BLAKE3 of the concatenated plaintext parts, in part-number order."""
+        key_bytes = await self._ensure_and_get_v5_dek(
+            bucket_id=bucket_id,
+            object_id=str(object_id),
+            object_version=int(object_version),
+            chunk_size=self.config.object_chunk_size_bytes,
+            suite_id=suite_id,
+            rotate=False,
+        )
+        hasher = new_blake3()
+        for part_number in part_numbers:
+            meta = await self.fs_store.get_meta(object_id, int(object_version), int(part_number))
+            if not meta:
+                raise RuntimeError(f"missing part meta for blake3 part={part_number}")
+            num_chunks = int(meta["num_chunks"])
+            for chunk_index in range(num_chunks):
+                cipher = await self.fs_store.get_chunk(object_id, int(object_version), int(part_number), chunk_index)
+                if cipher is None:
+                    raise RuntimeError(f"missing chunk for blake3 part={part_number} chunk={chunk_index}")
+                plain = await decrypt_chunk_if_needed(
+                    cipher,
+                    object_id=str(object_id),
+                    part_number=int(part_number),
+                    chunk_index=int(chunk_index),
+                    storage_version=int(storage_version),
+                    key_bytes=key_bytes,
+                    suite_id=suite_id,
+                    bucket_id=str(bucket_id),
+                    upload_id=str(upload_id),
+                )
+                hasher.update(plain)
+        return hasher.hexdigest()
+
     async def mpu_complete(
         self,
         *,
@@ -858,6 +915,38 @@ class ObjectWriter:
             [p for p in size_rows if int(p["part_number"]) in selected_set] if selected_set is not None else size_rows
         )
         total_size = sum(int(p["size_bytes"]) for p in size_parts)
+        part_numbers = [int(p["part_number"]) for p in size_parts]
+
+        blake3_hex: str | None = None
+        version_row = await self.pool.fetchrow(
+            """
+            SELECT o.bucket_id, ov.storage_version, ov.enc_suite_id
+              FROM objects o
+              JOIN object_versions ov
+                ON ov.object_id = o.object_id
+               AND ov.object_version = $2
+             WHERE o.object_id = $1
+            """,
+            object_id,
+            int(object_version),
+        )
+        if version_row is not None:
+            try:
+                blake3_hex = await self._blake3_of_parts(
+                    bucket_id=str(version_row["bucket_id"]),
+                    object_id=object_id,
+                    object_version=int(object_version),
+                    upload_id=upload_id,
+                    part_numbers=part_numbers,
+                    storage_version=int(version_row["storage_version"] or 5),
+                    suite_id=str(version_row["enc_suite_id"] or "hip-enc/aes256gcm"),
+                )
+            except Exception:
+                logger.exception(
+                    "blake3 of multipart object failed; leaving hash unset object_id=%s v=%s",
+                    object_id,
+                    object_version,
+                )
 
         # Only persist the filter when the client named a STRICT subset — a full-set completion
         # (the overwhelming common case) leaves the column NULL so no per-read filter/array is
@@ -890,6 +979,13 @@ class ObjectWriter:
                 int(object_version),
                 subset_to_store,
             )
+            if blake3_hex is not None:
+                await persist_version_hash(
+                    conn,
+                    object_id=object_id,
+                    object_version=int(object_version),
+                    digest=blake3_hex,
+                )
 
             # Mark MPU completed
             await conn.execute(
