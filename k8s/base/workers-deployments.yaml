@@ -1084,6 +1084,16 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: REDIS_QUEUES_URL
+            # The purger enqueues unpin requests with delete_backends=None, which fans out
+            # to config.delete_backends. Without this it defaults to "arion" only
+            # (config.py:211) and never enqueues ovh_unpin_requests, so every purge leaks
+            # the OVH copies and leaves objects un-hard-deletable. Every delete-doing worker
+            # carries this; the purger was missing it.
+            - name: HIPPIUS_DELETE_BACKENDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_DELETE_BACKENDS
             - name: HIPPIUS_SERVICE_KEY
               valueFrom:
                 secretKeyRef:
