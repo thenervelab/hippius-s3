@@ -1634,7 +1634,7 @@
               }
             ]
           },
-          "unit": "ops"
+          "unit": "short"
         },
         "overrides": [
           {
@@ -1692,12 +1692,12 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
-          "expr": "sum by (result) (rate(purger_jobs_total{service_namespace=\"$namespace\"}[5m]))",
+          "expr": "sum by (result) (purger_jobs_total{service_namespace=\"$namespace\"})",
           "legendFormat": "{{result}}",
           "refId": "A"
         }
       ],
-      "title": "Purge jobs/s (done vs failed)",
+      "title": "Purge jobs (cumulative done vs failed)",
       "type": "timeseries",
       "description": "Account-purge jobs finishing, split by result. Any sustained 'failed' means the purger is erroring on a job \u2014 check the purger pod logs and purge_jobs.error."
     },
@@ -1759,7 +1759,7 @@
               }
             ]
           },
-          "unit": "ops"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -1786,12 +1786,12 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
-          "expr": "sum(rate(purger_objects_deleted_total{service_namespace=\"$namespace\"}[5m]))",
+          "expr": "sum(purger_objects_deleted_total{service_namespace=\"$namespace\"})",
           "legendFormat": "objects",
           "refId": "A"
         }
       ],
-      "title": "Objects purged/s",
+      "title": "Objects purged (cumulative)",
       "type": "timeseries",
       "description": "Soft-delete throughput of active purge jobs (logical progress). Zero while no purge is running."
     },
@@ -1853,7 +1853,7 @@
               }
             ]
           },
-          "unit": "ops"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -1880,12 +1880,12 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
-          "expr": "sum(rate(purger_backpressure_waits_total{service_namespace=\"$namespace\"}[5m]))",
+          "expr": "sum(purger_backpressure_waits_total{service_namespace=\"$namespace\"}) or vector(0)",
           "legendFormat": "waits",
           "refId": "A"
         }
       ],
-      "title": "Purge unpin backpressure/s",
+      "title": "Purge unpin backpressure (cumulative)",
       "type": "timeseries",
       "description": "Times a purge job parked because an unpin queue was over its high-water mark. This is the safety valve working; a SUSTAINED rate means unpins are not draining fast enough and the purge is throttled \u2014 check the unpin queues above."
     },
