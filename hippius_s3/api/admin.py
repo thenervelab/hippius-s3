@@ -32,6 +32,7 @@ from fastapi import HTTPException
 from fastapi import Path as FPath
 from fastapi import Request
 from fastapi import status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pydantic import Field
 from redis.exceptions import RedisError
@@ -45,7 +46,11 @@ from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
-router = APIRouter(tags=["admin"])
+# default_response_class=JSONResponse is load-bearing: the app is built with
+# default_response_class=Response (hippius_s3/main.py), whose render() calls
+# content.encode() and 500s on a dict/model. Every model-returning endpoint here relies
+# on this router default (mirrors the explicit JSONResponse on the sub-token endpoints).
+router = APIRouter(tags=["admin"], default_response_class=JSONResponse)
 
 # Bound on the status endpoint's bucket/bytes aggregate — a 10+ TB account can push the
 # SUM into tens of seconds; the endpoint degrades to null counts instead of 500ing.
