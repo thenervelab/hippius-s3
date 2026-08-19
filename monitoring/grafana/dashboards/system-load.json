@@ -189,7 +189,7 @@
       ],
       "title": "Request rate (status class)",
       "type": "timeseries",
-      "description": "Request rate of the merged S3 app collapsed into HTTP status classes (2xx/3xx/4xx/5xx), one line each \u2014 the at-a-glance health shape. Since the 2026-08 gateway/api merge there is a single app, so no handler filter is applied."
+      "description": "Request rate of the merged S3 app collapsed into HTTP status classes (2xx/3xx/4xx/5xx), one line each \u2014 the at-a-glance health shape. Since the 2026-08 gateway/api merge there is a single app, so no handler filter is applied. Requests rejected by the outer middlewares (auth/ACL/validation/read-only/fs-pressure) are not counted here \u2014 the metrics middleware sits inside them; pressure sheds appear on the fs_cache_shed panel."
     },
     {
       "datasource": {
@@ -374,12 +374,12 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
-          "expr": "sum by (error_type) (rate(s3_errors_total{service_namespace=\"$namespace\"}[5m]))",
+          "expr": "sum by (error_type) (rate(s3_errors_total{service_namespace=\"$namespace\", error_type=~\"http_.*\"}[5m]))",
           "legendFormat": "{{error_type}}",
           "refId": "A"
         }
       ],
-      "title": "Errors/s",
+      "title": "Errors/s (HTTP status)",
       "type": "timeseries"
     },
     {
@@ -472,6 +472,7 @@
           "refId": "A"
         }
       ],
+      "description": "Object payload bytes recorded by the GET handler at response creation \u2014 intended transfer size, not wire bytes (client aborts still count in full; HEAD/LIST/error bodies not counted).",
       "title": "Egress (download throughput)",
       "type": "timeseries"
     },
@@ -565,6 +566,7 @@
           "refId": "A"
         }
       ],
+      "description": "Object payload bytes recorded on SUCCESSFUL put_object/upload_part \u2014 not wire bytes (failed/aborted uploads count zero; UploadPartCopy counts as upload despite no client ingress).",
       "title": "Ingress (upload throughput)",
       "type": "timeseries"
     },

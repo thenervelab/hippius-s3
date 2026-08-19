@@ -157,7 +157,7 @@ groups:
           severity: critical
 
       - uid: s3-system-down
-        title: S3 Gateway - No Traffic Received
+        title: S3 API - No Traffic Received
         condition: C
         data:
           - refId: A
