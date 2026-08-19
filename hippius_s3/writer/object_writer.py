@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import hashlib
 import json
@@ -23,7 +24,8 @@ from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.repositories import fs_cache_inventory
-from hippius_s3.services.crypto_pool import run_crypto
+from hippius_s3.services.crypto_pool import submit_crypto
+from hippius_s3.services.crypto_pool import submit_hash
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.storage_version import require_supported_storage_version
@@ -49,6 +51,73 @@ def _append_version_conflict(current: int | None, expected: int) -> bool:
     A missing row (None) is not a conflict here — the reservation/finalize path handles that case.
     """
     return current is not None and int(current) != int(expected)
+
+
+class _ChunkEncryptPipeline:
+    """Overlap socket reads with the MD5 + AES-GCM of already-framed chunks (WU-2).
+
+    The serial predecessor did, per 4 MiB chunk, ON the event loop or awaited inline:
+    ``hasher.update(buf)`` (blocking the loop ~6 ms) then ``await run_crypto(encrypt)``
+    (the loop idles while one chunk encrypts) — so the socket was never being read
+    while a chunk was being hashed or encrypted, and a single stream was capped by the
+    SUM of read+hash+encrypt instead of their MAX.
+
+    This pipeline submits both to their pools and returns to the read loop, draining
+    oldest-first once ``lookahead`` chunks are in flight. Invariants it preserves —
+    each one is pinned by tests/unit/writer/test_stream_content_pins.py:
+
+    - **Rolling MD5 order**: updates go to the single-thread hash pool, whose FIFO
+      queue executes them in submission (= chunk-index) order; ``digest()`` must only
+      be read after :meth:`flush`, which awaits every update future (that await is
+      also the happens-before edge that makes the hasher's state visible here).
+    - **AEAD identity**: each encrypt is submitted with its EXPLICIT global
+      chunk_index; concurrent encrypts cannot collide because the nonce/AAD derive
+      from the index, never from completion order.
+    - **Downstream ordering**: results are drained strictly oldest-first, so
+      ``chunk_cipher_sizes`` and the write queue see exactly the serial ordering.
+    - **Failure direction**: encrypt/hash exceptions surface on the next
+      :meth:`push`/:meth:`flush` await — the same points the serial code raised at.
+      When the caller unwinds early (client disconnect, size cap), in-flight futures
+      are simply abandoned: their results are never enqueued, threads finish and the
+      buffers are garbage-collected; nothing is written on their behalf.
+    - **Memory bound**: at most ``lookahead`` plaintext chunks are alive beyond the
+      write queue (peak extra ≈ chunk_size × lookahead per active PUT).
+    """
+
+    def __init__(
+        self,
+        *,
+        hasher: "hashlib._Hash",
+        encrypt_submit: Any,  # Callable[[bytes, int], asyncio.Future[tuple[bytes, float]]]
+        sink: Any,  # Callable[[int, bytes], Awaitable[None]] — receives (chunk_index, ciphertext) in order
+        lookahead: int,
+    ) -> None:
+        self._hasher = hasher
+        self._encrypt_submit = encrypt_submit
+        self._sink = sink
+        self._lookahead = max(1, int(lookahead))
+        self._inflight: collections.deque[tuple[int, asyncio.Future[tuple[bytes, float]], asyncio.Future[None]]] = (
+            collections.deque()
+        )
+        self.encrypt_thread_ms = 0.0  # true in-thread encrypt CPU-time (what `enc=` used to mean)
+
+    async def push(self, buf: bytes, chunk_index: int) -> None:
+        md5_fut = submit_hash(self._hasher.update, buf)
+        enc_fut = self._encrypt_submit(buf, chunk_index)
+        self._inflight.append((chunk_index, enc_fut, md5_fut))
+        if len(self._inflight) >= self._lookahead:
+            await self._drain_oldest()
+
+    async def flush(self) -> None:
+        while self._inflight:
+            await self._drain_oldest()
+
+    async def _drain_oldest(self) -> None:
+        chunk_index, enc_fut, md5_fut = self._inflight.popleft()
+        ct, enc_seconds = await enc_fut
+        await md5_fut
+        self.encrypt_thread_ms += enc_seconds * 1000
+        await self._sink(chunk_index, ct)
 
 
 class ObjectWriter:
@@ -254,6 +323,38 @@ class ObjectWriter:
                 perf_fs_ms += io_ms
                 logger.debug(f"PERF chunk {chunk_idx}: io={io_ms:.1f}ms (fs) size={len(ct)}")
 
+        def _timed_encrypt(buf: bytes, chunk_index: int) -> "asyncio.Future[tuple[bytes, float]]":
+            # AEAD nonce/AAD identity comes from the EXPLICIT global chunk_index below, so
+            # concurrent in-flight encrypts are safe — order of completion is irrelevant.
+            def _work(b: bytes = buf, idx: int = chunk_index) -> tuple[bytes, float]:
+                t0 = time.monotonic()
+                ct = adapter.encrypt_chunk(
+                    b,
+                    key=key_bytes,
+                    bucket_id=str(bucket_id),
+                    object_id=object_id,
+                    part_number=int(part_number),
+                    chunk_index=idx,
+                    upload_id="",
+                )
+                return ct, time.monotonic() - t0
+
+            return submit_crypto(_work)
+
+        async def _sink(chunk_index: int, ct: bytes) -> None:
+            nonlocal perf_queue_wait_ms
+            chunk_cipher_sizes.append(len(ct))
+            tq0 = time.monotonic()
+            await write_queue.put((chunk_index, ct))
+            perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+
+        pipeline = _ChunkEncryptPipeline(
+            hasher=hasher,
+            encrypt_submit=_timed_encrypt,
+            sink=_sink,
+            lookahead=self.config.write_pipeline_lookahead,
+        )
+
         with tracer.start_as_current_span("put_simple_stream_full.encrypt_and_cache") as span:
             consumer_task = asyncio.create_task(_consumer())
             try:
@@ -266,27 +367,8 @@ class ObjectWriter:
                     while len(pt_buf) >= chunk_size:
                         buf = bytes(pt_buf[:chunk_size])
                         del pt_buf[:chunk_size]
-                        hasher.update(buf)
                         total_size += len(buf)
-                        # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
-                        # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
-                        t0 = time.monotonic()
-                        ct = await run_crypto(
-                            adapter.encrypt_chunk,
-                            buf,
-                            key=key_bytes,
-                            bucket_id=str(bucket_id),
-                            object_id=object_id,
-                            part_number=int(part_number),
-                            chunk_index=int(next_chunk_index),
-                            upload_id="",
-                        )
-                        t1 = time.monotonic()
-                        perf_encrypt_ms += (t1 - t0) * 1000
-                        chunk_cipher_sizes.append(len(ct))
-                        tq0 = time.monotonic()
-                        await write_queue.put((next_chunk_index, ct))
-                        perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+                        await pipeline.push(buf, int(next_chunk_index))
                         next_chunk_index += 1
 
                 if pt_buf:
@@ -294,34 +376,20 @@ class ObjectWriter:
                         raise consumer_error
                     buf = bytes(pt_buf)
                     pt_buf.clear()
-                    hasher.update(buf)
                     total_size += len(buf)
-                    # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
-                    # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
-                    t0 = time.monotonic()
-                    ct = await run_crypto(
-                        adapter.encrypt_chunk,
-                        buf,
-                        key=key_bytes,
-                        bucket_id=str(bucket_id),
-                        object_id=object_id,
-                        part_number=int(part_number),
-                        chunk_index=int(next_chunk_index),
-                        upload_id="",
-                    )
-                    t1 = time.monotonic()
-                    perf_encrypt_ms += (t1 - t0) * 1000
-                    chunk_cipher_sizes.append(len(ct))
-                    tq0 = time.monotonic()
-                    await write_queue.put((next_chunk_index, ct))
-                    perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+                    await pipeline.push(buf, int(next_chunk_index))
                     next_chunk_index += 1
+
+                await pipeline.flush()
+                perf_encrypt_ms = pipeline.encrypt_thread_ms
 
                 await write_queue.put(None)
                 await consumer_task
                 if consumer_error:
                     raise consumer_error
 
+                # Safe only after flush(): every hash-pool update future has been awaited,
+                # so the rolling digest has seen all chunks, in order.
                 md5_hash = hasher.hexdigest()
                 perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
                 set_span_attributes(
@@ -644,6 +712,38 @@ class ObjectWriter:
                 perf_fs_ms += io_ms
                 logger.debug(f"PERF mpu chunk {chunk_idx}: io={io_ms:.1f}ms (fs) size={len(ct)}")
 
+        def _timed_encrypt(buf: bytes, chunk_index: int) -> "asyncio.Future[tuple[bytes, float]]":
+            # AEAD nonce/AAD identity comes from the EXPLICIT global chunk_index below, so
+            # concurrent in-flight encrypts are safe — order of completion is irrelevant.
+            def _work(b: bytes = buf, idx: int = chunk_index) -> tuple[bytes, float]:
+                t0 = time.monotonic()
+                ct = adapter.encrypt_chunk(
+                    b,
+                    key=key_bytes,
+                    bucket_id=bucket_id,
+                    object_id=str(object_id),
+                    part_number=int(part_number),
+                    chunk_index=idx,
+                    upload_id=str(upload_id),
+                )
+                return ct, time.monotonic() - t0
+
+            return submit_crypto(_work)
+
+        async def _sink(chunk_index: int, ct: bytes) -> None:
+            nonlocal perf_queue_wait_ms
+            chunk_cipher_sizes.append(len(ct))
+            tq0 = time.monotonic()
+            await write_queue.put((chunk_index, ct))
+            perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+
+        pipeline = _ChunkEncryptPipeline(
+            hasher=hasher,
+            encrypt_submit=_timed_encrypt,
+            sink=_sink,
+            lookahead=self.config.write_pipeline_lookahead,
+        )
+
         consumer_task = asyncio.create_task(_consumer())
         try:
             async for piece in body_iter:
@@ -653,33 +753,17 @@ class ObjectWriter:
                     continue
                 pt_buf.extend(piece)
                 if max_size and total_size + len(pt_buf) > int(max_size):
+                    # In-flight pipeline futures are deliberately abandoned here: their results
+                    # are never enqueued (only _drain_oldest feeds the sink), so aborting cannot
+                    # stage a chunk behind our back.
                     await write_queue.put(None)
                     await consumer_task
                     raise ValueError("part_size_exceeds_max")
                 while len(pt_buf) >= chunk_size:
                     buf = bytes(pt_buf[:chunk_size])
                     del pt_buf[:chunk_size]
-                    hasher.update(buf)
                     total_size += len(buf)
-                    # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
-                    # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
-                    t0 = time.monotonic()
-                    ct = await run_crypto(
-                        adapter.encrypt_chunk,
-                        buf,
-                        key=key_bytes,
-                        bucket_id=bucket_id,
-                        object_id=str(object_id),
-                        part_number=int(part_number),
-                        chunk_index=int(next_chunk_index),
-                        upload_id=str(upload_id),
-                    )
-                    t1 = time.monotonic()
-                    perf_encrypt_ms += (t1 - t0) * 1000
-                    chunk_cipher_sizes.append(len(ct))
-                    tq0 = time.monotonic()
-                    await write_queue.put((next_chunk_index, ct))
-                    perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+                    await pipeline.push(buf, int(next_chunk_index))
                     next_chunk_index += 1
 
             if pt_buf:
@@ -687,28 +771,12 @@ class ObjectWriter:
                     raise consumer_error
                 buf = bytes(pt_buf)
                 pt_buf.clear()
-                hasher.update(buf)
                 total_size += len(buf)
-                # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
-                # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
-                t0 = time.monotonic()
-                ct = await run_crypto(
-                    adapter.encrypt_chunk,
-                    buf,
-                    key=key_bytes,
-                    bucket_id=bucket_id,
-                    object_id=str(object_id),
-                    part_number=int(part_number),
-                    chunk_index=int(next_chunk_index),
-                    upload_id=str(upload_id),
-                )
-                t1 = time.monotonic()
-                perf_encrypt_ms += (t1 - t0) * 1000
-                chunk_cipher_sizes.append(len(ct))
-                tq0 = time.monotonic()
-                await write_queue.put((next_chunk_index, ct))
-                perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+                await pipeline.push(buf, int(next_chunk_index))
                 next_chunk_index += 1
+
+            await pipeline.flush()
+            perf_encrypt_ms = pipeline.encrypt_thread_ms
 
             if total_size == 0:
                 await write_queue.put(None)
