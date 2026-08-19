@@ -58,12 +58,19 @@ data:
   HTTP_STREAM_INITIAL_TIMEOUT_SECONDS: "0.5"
   HIPPIUS_DLQ_DIR: "/tmp/hippius_dlq"
   HIPPIUS_DLQ_ARCHIVE_DIR: "/tmp/hippius_dlq_archive"
-  API_DB_POOL_MIN_SIZE: "5"
-  # 40, not 20: the merged app also carries the former gateway's per-request DB work
-  # (bucket-owner lookups, sub-token scopes, account state) that used to run on the
-  # gateway's own 40-connection pool. Fleet total shrinks regardless: the 5x40 gateway
-  # pools are gone.
-  API_DB_POOL_MAX_SIZE: "40"
+  # These pool bounds are PER UVICORN WORKER (asyncpg pools are per process), and the
+  # api runs UVICORN_WORKERS=4 — so a pod's ceiling is 4x MAX_SIZE and its idle floor is
+  # 4x MIN_SIZE. The previous value (40) was reasoned as if a pod held ONE pool: "the
+  # merged app absorbs the gateway's per-request DB work (bucket-owner lookups,
+  # sub-token scopes, account state), so 40 replaces the gateway's deleted 5x40 pools".
+  # At 4 workers that math was wrong by 4x: prod potential became 5 nodes x 4 x 40 = 800
+  # backends for api-local alone, against max_connections=1000 shared with the uploader
+  # fleet (40x8=320 cap), drain, janitor, and replicas — a burst away from PG refusing
+  # connections. 15/worker (pod ceiling 60, prod api ceiling 300) is plenty: a single
+  # event loop holds only short acquires and rarely needs >10 concurrent; min 3 keeps
+  # the idle floor at 12/pod instead of 20.
+  API_DB_POOL_MIN_SIZE: "3"
+  API_DB_POOL_MAX_SIZE: "15"
   API_DB_POOL_MAX_QUERIES: "50000"
   API_DB_POOL_MAX_INACTIVE_LIFETIME: "300"
   API_DB_POOL_COMMAND_TIMEOUT: "30"
