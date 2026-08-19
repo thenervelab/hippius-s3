@@ -165,8 +165,16 @@ jobs:
       # psql applies the drain crate's migrations below.
       - name: Install redis-server and postgresql-client
         run: |
-          sudo apt-get update
-          sudo apt-get install -y redis-server postgresql-client
+          # azure.archive.ubuntu.com periodically hangs mid-fetch on GH-hosted runners
+          # (2026-08-19: three consecutive runs died to the 10-min job timeout INSIDE
+          # `apt-get update`, pytest never started). Bound every fetch and retry, so a
+          # dead mirror costs a bounded retry instead of the whole job.
+          APT_OPTS="-o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=3"
+          for i in 1 2 3; do
+            timeout 180 sudo apt-get update $APT_OPTS && break
+            echo "apt-get update attempt $i timed out or failed; retrying"
+          done
+          timeout 300 sudo apt-get install -y $APT_OPTS redis-server postgresql-client
 
       # hippius_s3.scripts.migrate shells out to dbmate, which the runner image does not ship
       # (the app image installs it in the Dockerfile).
