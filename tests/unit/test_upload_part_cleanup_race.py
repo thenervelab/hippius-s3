@@ -163,6 +163,13 @@ def small_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = get_config()
     monkeypatch.setattr(cfg, "object_chunk_size_bytes", 4)
     monkeypatch.setattr(cfg, "cache_ttl_seconds", 60)
+    # These tests choreograph on write timing (a chunk is on disk before the body yields
+    # the next piece). The encrypt pipeline delays writes by up to `lookahead` chunks, so
+    # pin lookahead=1 — drain-after-every-push, the serial-equivalent mode — which
+    # reconstructs the exact interleavings these races need. The invariants proven here
+    # (attempt-unique staged names; late writes can't clobber a published part) are
+    # lookahead-independent: only staging/publish provide durability, never write order.
+    monkeypatch.setattr(cfg, "write_pipeline_lookahead", 1)
     monkeypatch.setattr("hippius_s3.writer.object_writer.get_config", lambda: cfg)
 
 

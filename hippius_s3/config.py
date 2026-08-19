@@ -331,6 +331,12 @@ class Config:
     # CF-3: depth of the encrypt producer/consumer queue per streaming write. Peak buffered memory
     # per PUT ≈ chunk_size × this. Exposed so it can move with chunk size (CF-1).
     write_queue_maxsize: int = env("HIPPIUS_WRITE_QUEUE_MAXSIZE:16", convert=int)
+    # WU-2: how many chunks the streaming writer may hold in flight (submitted to the
+    # crypto/hash pools, not yet drained to the write queue) so socket reads overlap
+    # MD5+encrypt of earlier chunks. Each in-flight chunk can pin plaintext AND (once
+    # encrypted) ciphertext, so extra peak memory per PUT ≈ 2 × chunk_size × this, ON
+    # TOP of the write queue above. 1 = no look-ahead (serial-equivalent, still off-loop).
+    write_pipeline_lookahead: int = env("HIPPIUS_WRITE_PIPELINE_LOOKAHEAD:4", convert=int)
     # RD-2 / WU-1: worker threads for the dedicated AES-GCM encrypt/decrypt pool (off the event loop).
     crypto_pool_workers: int = env("HIPPIUS_CRYPTO_POOL_WORKERS:4", convert=int)
     # NET-3: keep the expensive mTLS KMS connection warm across sparse/bursty calls.
