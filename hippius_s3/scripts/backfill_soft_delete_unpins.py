@@ -22,23 +22,39 @@ chunk is a no-op).
 
 THROTTLE: the load-bearing guard against re-flooding the unpin queues — before each batch
 we wait until the combined depth of --throttle-queues is under --queue-cap, so we never
-enqueue faster than the workers drain. Pass every unpin queue you want paced against here.
+enqueue faster than the workers drain. Pass every unpin queue you want paced against here;
+a --backends queue missing from --throttle-queues is enqueued uncapped and logs a WARNING
+(it is not auto-added — pacing against a subset can be deliberate).
 
 Resumable: keyset-paginates by (deleted_at, object_id); pass the last printed cursor via
 --start-after-ts/--start-after-id to resume. --loop re-scans from the start after each full
 pass (continuous sweeper mode) to catch newly soft-deleted objects.
 
+ROUTING (--backends): by default unpins fan out to `<backend>_unpin_requests` for each
+backend in `config.delete_backends`. --backends instead enqueues DIRECTLY to each named
+queue — deliberately bypassing `enqueue_unpin_request`'s allowlist intersection with
+config.delete_backends, which would otherwise drop the override (empty intersection =>
+"disallowed; not enqueuing", zero work reaches the queue). Reaching an off-allowlist
+backend is the whole point: on prod delete_backends is ['arion'], but the objects that
+block the hard-delete scan have their LIVE rows on **ovh** (arion is already fully
+unpinned). `ovh_unpin_requests` is consumed by the s3-backup `cleanup` worker, which
+deletes from OVH *and* marks `chunk_backend.deleted`.
+
   python -m hippius_s3.scripts.backfill_soft_delete_unpins --dry-run
   python -m hippius_s3.scripts.backfill_soft_delete_unpins --batch 1000 --queue-cap 50000 \
-      --throttle-queues arion_unpin_requests
+      --backends ovh --deprecated-backends ipfs \
+      --throttle-queues arion_unpin_requests,ovh_unpin_requests
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import datetime
 import logging
+from typing import Any
+from typing import Mapping
 
 import asyncpg
 import redis.asyncio as async_redis
@@ -97,6 +113,99 @@ _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 _ZERO_UUID = "00000000-0000-0000-0000-000000000000"
 
 
+def _parse_csv_flag(raw: str) -> list[str]:
+    """Split one comma-separated CLI flag into trimmed, non-empty, de-duplicated values.
+
+    Deduping is load-bearing for --backends: a repeat would LPUSH the same payload twice
+    to one queue and count the object twice against --queue-cap. Harmless for the other
+    two flags, but they share the helper so one flag can't parse differently from another.
+    """
+    values: list[str] = []
+    for item in raw.split(","):
+        value = item.strip()
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _unpin_queue(backend: str) -> str:
+    return f"{backend}_unpin_requests"
+
+
+@dataclasses.dataclass(frozen=True)
+class _RunPlan:
+    """The per-run decisions taken once from the CLI flags, so every scanned object is
+    handled the same way — and dry-run and real runs differ only in side effects."""
+
+    backends: list[str]
+    deprecated: list[str]
+    dry_run: bool
+
+
+async def _enqueue_unpin(payload: UnpinChainRequest, backends: list[str]) -> None:
+    """Route one unpin. An explicit --backends override enqueues directly to each named
+    queue: the generic path intersects the request with config.delete_backends, which
+    would drop exactly the off-allowlist backend the operator is trying to reach."""
+    if backends:
+        for b in backends:
+            await enqueue_unpin_request(payload=payload, queue_name=_unpin_queue(b))
+    else:
+        await enqueue_unpin_request(payload=payload)
+
+
+def _warn_unthrottled_backends(backends: list[str], throttle_queues: list[str]) -> None:
+    """Warn when --backends routes to a queue that --throttle-queues does not pace.
+
+    Deliberately not auto-included: an operator may be pacing against a subset on
+    purpose (say, only the slower worker's queue), and silently widening the throttle
+    set would change the sweep rate they asked for. Naming the gap is the whole job.
+    """
+    unthrottled = [_unpin_queue(b) for b in backends if _unpin_queue(b) not in throttle_queues]
+    if unthrottled:
+        logger.warning(
+            "--backends routes to %s but --throttle-queues only paces %s; "
+            "those queues are enqueued without a depth cap",
+            unthrottled,
+            throttle_queues or "nothing",
+        )
+
+
+async def _process_object(row: Mapping[str, Any], plan: _RunPlan, db: asyncpg.Connection) -> tuple[int, int]:
+    """Handle one scanned object; return its (enqueued, reconciled) counter deltas.
+
+    Dry-run takes the same branches and yields the same deltas as a real run — only the
+    enqueue and the UPDATE are skipped. Counting in a separate dry-run arm is how a
+    summary starts lying about what a real run would do.
+    """
+    enqueued = reconciled = 0
+    oid = row["object_id"]
+
+    if row["needs_unpin"]:
+        if not row["main_account_id"]:
+            logger.warning(f"skip {oid}: bucket has no main_account_id")
+        else:
+            if not plan.dry_run:
+                await _enqueue_unpin(
+                    UnpinChainRequest(
+                        address=row["main_account_id"],
+                        object_id=str(oid),
+                        object_version=int(row["object_version"]),
+                        # Provenance only when --backends routes directly; None
+                        # => the generic path falls back to config.delete_backends.
+                        delete_backends=plan.backends or None,
+                    ),
+                    plan.backends,
+                )
+            enqueued = 1
+
+    if row["has_deprecated"]:
+        if not plan.dry_run:
+            await db.execute(_RECONCILE_DEPRECATED, oid, plan.deprecated)
+        reconciled = 1
+
+    return enqueued, reconciled
+
+
 async def _wait_for_queue_room(redis_q: async_redis.Redis, queues: list[str], cap: int) -> None:
     """Block until the combined depth of `queues` is under cap (throttle)."""
     while True:
@@ -109,8 +218,18 @@ async def _wait_for_queue_room(redis_q: async_redis.Redis, queues: list[str], ca
 
 async def main_async(args: argparse.Namespace) -> int:
     config = get_config()
-    deprecated = [b.strip() for b in args.deprecated_backends.split(",") if b.strip()]
-    throttle_queues = [q.strip() for q in args.throttle_queues.split(",") if q.strip()]
+    deprecated = _parse_csv_flag(args.deprecated_backends)
+    throttle_queues = _parse_csv_flag(args.throttle_queues)
+    backends = _parse_csv_flag(args.backends)
+    plan = _RunPlan(backends=backends, deprecated=deprecated, dry_run=args.dry_run)
+    logger.info(
+        "unpin routing: %s (deprecated, reconciled in-DB: %s)",
+        f"--backends {backends} (direct to queues, allowlist bypassed)"
+        if backends
+        else f"config.delete_backends {config.delete_backends}",
+        deprecated or "none",
+    )
+    _warn_unthrottled_backends(backends, throttle_queues)
     db = await asyncpg.connect(config.database_url)
     redis_q = async_redis.from_url(config.redis_queues_url)
     initialize_queue_client(redis_q)
@@ -137,25 +256,9 @@ async def main_async(args: argparse.Namespace) -> int:
 
             for r in rows:
                 scanned += 1
-                oid = r["object_id"]
-                if r["needs_unpin"]:
-                    if not r["main_account_id"]:
-                        logger.warning(f"skip {oid}: bucket has no main_account_id")
-                    elif args.dry_run:
-                        enqueued += 1
-                    else:
-                        await enqueue_unpin_request(
-                            payload=UnpinChainRequest(
-                                address=r["main_account_id"],
-                                object_id=str(oid),
-                                object_version=int(r["object_version"]),
-                            )
-                        )
-                        enqueued += 1
-                if r["has_deprecated"]:
-                    if not args.dry_run:
-                        await db.execute(_RECONCILE_DEPRECATED, oid, deprecated)
-                    reconciled += 1
+                e, d = await _process_object(dict(r), plan, db)
+                enqueued += e
+                reconciled += d
 
             last = rows[-1]
             cursor_ts, cursor_id = last["deleted_at"], last["object_id"]
@@ -196,6 +299,19 @@ def main() -> None:
         "--deprecated-backends",
         default="ipfs",
         help="Comma-separated backends with no unpin worker; their rows are reconciled in-DB (no backend call)",
+    )
+    ap.add_argument(
+        "--backends",
+        default="",
+        help=(
+            "Comma-separated backends to route the unpins to. Each is enqueued DIRECTLY to its "
+            "`<backend>_unpin_requests` queue, bypassing the config.delete_backends allowlist "
+            "(which would intersect an off-allowlist override away). REQUIRED when the blocking "
+            "rows are on a backend that delete_backends omits: on prod delete_backends is "
+            "['arion'] but the stuck objects' live rows are on ovh, so allowlist routing could "
+            "never reach them. `ovh_unpin_requests` is consumed by the s3-backup `cleanup` "
+            "worker, which deletes from OVH AND marks chunk_backend. Repeats are collapsed."
+        ),
     )
     ap.add_argument("--max-objects", type=int, default=0, help="Stop after scanning this many objects (0 = all)")
     ap.add_argument("--sleep", type=float, default=0.0, help="Seconds to sleep between batches")
