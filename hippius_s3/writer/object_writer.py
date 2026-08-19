@@ -71,8 +71,9 @@ class _ChunkEncryptPipeline:
       be read after :meth:`flush`, which awaits every update future (that await is
       also the happens-before edge that makes the hasher's state visible here).
     - **AEAD identity**: each encrypt is submitted with its EXPLICIT global
-      chunk_index; concurrent encrypts cannot collide because the nonce/AAD derive
-      from the index, never from completion order.
+      chunk_index; the AAD binds (bucket, object, part, chunk_index) — never call or
+      completion order — and the nonce is random per call, so concurrent encrypts
+      cannot collide or mis-bind.
     - **Downstream ordering**: results are drained strictly oldest-first, so
       ``chunk_cipher_sizes`` and the write queue see exactly the serial ordering.
     - **Failure direction**: encrypt/hash exceptions surface on the next
@@ -80,8 +81,9 @@ class _ChunkEncryptPipeline:
       When the caller unwinds early (client disconnect, size cap), in-flight futures
       are simply abandoned: their results are never enqueued, threads finish and the
       buffers are garbage-collected; nothing is written on their behalf.
-    - **Memory bound**: at most ``lookahead`` plaintext chunks are alive beyond the
-      write queue (peak extra ≈ chunk_size × lookahead per active PUT).
+    - **Memory bound**: at most ``lookahead`` chunks are in flight beyond the write
+      queue; each can pin its plaintext AND (once encrypted) its ciphertext, so peak
+      extra ≈ 2 × chunk_size × lookahead per active PUT.
     """
 
     def __init__(
@@ -324,7 +326,7 @@ class ObjectWriter:
                 logger.debug(f"PERF chunk {chunk_idx}: io={io_ms:.1f}ms (fs) size={len(ct)}")
 
         def _timed_encrypt(buf: bytes, chunk_index: int) -> "asyncio.Future[tuple[bytes, float]]":
-            # AEAD nonce/AAD identity comes from the EXPLICIT global chunk_index below, so
+            # The AAD binds the EXPLICIT chunk_index below (nonce is random per call), so
             # concurrent in-flight encrypts are safe — order of completion is irrelevant.
             def _work(b: bytes = buf, idx: int = chunk_index) -> tuple[bytes, float]:
                 t0 = time.monotonic()
@@ -713,7 +715,7 @@ class ObjectWriter:
                 logger.debug(f"PERF mpu chunk {chunk_idx}: io={io_ms:.1f}ms (fs) size={len(ct)}")
 
         def _timed_encrypt(buf: bytes, chunk_index: int) -> "asyncio.Future[tuple[bytes, float]]":
-            # AEAD nonce/AAD identity comes from the EXPLICIT global chunk_index below, so
+            # The AAD binds the EXPLICIT chunk_index below (nonce is random per call), so
             # concurrent in-flight encrypts are safe — order of completion is irrelevant.
             def _work(b: bytes = buf, idx: int = chunk_index) -> tuple[bytes, float]:
                 t0 = time.monotonic()

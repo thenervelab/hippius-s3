@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from typing import Callable
@@ -50,8 +51,8 @@ def submit_crypto(func: Callable[..., T], /, *args: Any, **kwargs: Any) -> "asyn
 
     The writer's streaming pipeline uses this to keep a bounded look-ahead of encrypts
     in flight while the event loop returns to reading the socket. Safe out-of-order:
-    AES-GCM's nonce/AAD identity comes from the explicit chunk_index argument, never
-    from call order.
+    the AAD binds the explicit chunk_index argument (the nonce is random per call),
+    never call order.
     """
     loop = asyncio.get_running_loop()
     if kwargs:
@@ -70,12 +71,18 @@ def submit_crypto(func: Callable[..., T], /, *args: Any, **kwargs: Any) -> "asyn
 # minus the loop blocking. Kept separate from the crypto pool so a burst of encrypts
 # can never reorder or starve the ordered hash stream.
 _hash_pool: ThreadPoolExecutor | None = None
+# The single-worker FIFO IS the ETag ordering guarantee, so its creation must never
+# race into two pools (two threads = unordered updates = silently wrong digest).
+# Unreachable from one event loop per process today, but a lock makes it structural.
+_hash_pool_lock = threading.Lock()
 
 
 def _get_hash_pool() -> ThreadPoolExecutor:
     global _hash_pool
     if _hash_pool is None:
-        _hash_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="etag-hash")
+        with _hash_pool_lock:
+            if _hash_pool is None:
+                _hash_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="etag-hash")
     return _hash_pool
 
 
