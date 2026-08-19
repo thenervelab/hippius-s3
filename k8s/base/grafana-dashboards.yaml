@@ -189,14 +189,14 @@ data:
           "pluginVersion": "12.3.1",
           "targets": [
             {
-              "expr": "sum by (class) (label_replace(rate(http_requests_total{service_namespace=\"$namespace\", handler=~\"gateway.*\"}[5m]), \"class\", \"${1}xx\", \"status_code\", \"([0-9])[0-9][0-9]\"))",
+              "expr": "sum by (class) (label_replace(rate(http_requests_total{service_namespace=\"$namespace\"}[5m]), \"class\", \"${1}xx\", \"status_code\", \"([0-9])[0-9][0-9]\"))",
               "legendFormat": "{{class}}",
               "refId": "A"
             }
           ],
-          "title": "Gateway Type/s",
+          "title": "Request rate (status class)",
           "type": "timeseries",
-          "description": "Gateway request rate collapsed into HTTP status classes (2xx/3xx/4xx/5xx), one line each. Individual status codes are in \"Gateway req/s\" below; this is the at-a-glance health shape."
+          "description": "Request rate of the merged S3 app collapsed into HTTP status classes (2xx/3xx/4xx/5xx), one line each \u2014 the at-a-glance health shape. Since the 2026-08 gateway/api merge there is a single app, so no handler filter is applied."
         },
         {
           "datasource": {
@@ -283,17 +283,17 @@ data:
           "pluginVersion": "12.3.1",
           "targets": [
             {
-              "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service_namespace=\"$namespace\", handler=~\"gateway.*\"}[5m])))",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service_namespace=\"$namespace\"}[5m])))",
               "legendFormat": "p95",
               "refId": "A"
             },
             {
-              "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service_namespace=\"$namespace\", handler=~\"gateway.*\"}[5m])))",
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{service_namespace=\"$namespace\"}[5m])))",
               "legendFormat": "p50",
               "refId": "B"
             }
           ],
-          "title": "Gateway latency",
+          "title": "Request latency",
           "type": "timeseries"
         },
         {
@@ -381,7 +381,7 @@ data:
           "pluginVersion": "12.3.1",
           "targets": [
             {
-              "expr": "sum by (error_type) (rate(s3_errors_total{service_namespace=\"$namespace\", operation=~\"gateway_.*\"}[5m]))",
+              "expr": "sum by (error_type) (rate(s3_errors_total{service_namespace=\"$namespace\"}[5m]))",
               "legendFormat": "{{error_type}}",
               "refId": "A"
             }
@@ -474,8 +474,8 @@ data:
           "pluginVersion": "12.3.1",
           "targets": [
             {
-              "expr": "sum by (method) (rate(gateway_bytes_sent_total{service_namespace=\"$namespace\"}[5m]))",
-              "legendFormat": "{{method}}",
+              "expr": "sum by (operation) (rate(s3_bytes_downloaded_total{service_namespace=\"$namespace\"}[5m]))",
+              "legendFormat": "{{operation}}",
               "refId": "A"
             }
           ],
@@ -567,8 +567,8 @@ data:
           "pluginVersion": "12.3.1",
           "targets": [
             {
-              "expr": "sum by (method) (rate(gateway_bytes_received_total{service_namespace=\"$namespace\"}[5m]))",
-              "legendFormat": "{{method}}",
+              "expr": "sum by (operation) (rate(s3_bytes_uploaded_total{service_namespace=\"$namespace\"}[5m]))",
+              "legendFormat": "{{operation}}",
               "refId": "A"
             }
           ],
@@ -665,12 +665,12 @@ data:
           "pluginVersion": "12.3.1",
           "targets": [
             {
-              "expr": "sum(increase(gateway_bytes_received_total{service_namespace=\"$namespace\"}[$__range]))",
+              "expr": "sum(increase(s3_bytes_uploaded_total{service_namespace=\"$namespace\"}[$__range]))",
               "legendFormat": "ingress",
               "refId": "A"
             },
             {
-              "expr": "sum(increase(gateway_bytes_sent_total{service_namespace=\"$namespace\"}[$__range]))",
+              "expr": "sum(increase(s3_bytes_downloaded_total{service_namespace=\"$namespace\"}[$__range]))",
               "legendFormat": "egress",
               "refId": "B"
             }

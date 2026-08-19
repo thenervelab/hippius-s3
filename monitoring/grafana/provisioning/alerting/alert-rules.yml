@@ -197,7 +197,7 @@ groups:
         execErrState: Error
         for: 10m
         annotations:
-          summary: 'S3 gateway not receiving traffic for 10+ minutes'
+          summary: 'S3 API not receiving traffic for 10+ minutes'
           description: 'No HTTP requests detected. System may be down or unreachable.'
         labels:
           severity: critical
