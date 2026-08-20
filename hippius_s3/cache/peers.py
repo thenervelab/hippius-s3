@@ -36,6 +36,7 @@ import httpx
 import redis.asyncio as async_redis
 
 from hippius_s3.cache.part_memo import PartMemo
+from hippius_s3.config import get_config
 from hippius_s3.monitoring import PeerShedReason
 from hippius_s3.peer_auth import PEER_AUTH_HEADER
 
@@ -60,6 +61,14 @@ _PEER_NETWORKS = (
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
 )
+
+# The hostNetwork exception (HIPPIUS_PEER_ALLOW_NODE_NETWORK): under `hostNetwork: true`
+# a pod's POD_IP IS its node address, so registrations are 192.168.x by construction and
+# the exclusion above would darken the whole tier. The SNAT-ambiguity rationale for the
+# exclusion assumes a hostPort in front of a pod-networked pod; with hostNetwork there is
+# no translation and exactly one api owns the port per node, so the node address
+# identifies the peer as precisely as a pod IP does. See config.py for the flag's terms.
+_NODE_NETWORK = ipaddress.ip_network("192.168.0.0/16")
 
 
 def _is_peer_address(url: str) -> bool:
@@ -92,7 +101,9 @@ def _is_peer_address(url: str) -> bool:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return any(ip in network for network in _PEER_NETWORKS)
+    if any(ip in network for network in _PEER_NETWORKS):
+        return True
+    return get_config().peer_allow_node_network and ip in _NODE_NETWORK
 
 
 # How long a resolved peer address for a part is reused. Which node holds a part is a per-PART

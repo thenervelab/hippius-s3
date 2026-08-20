@@ -1,0 +1,49 @@
+# Companion to the api-local hostNetwork trial (see api-local-deployments-staging.yaml).
+#
+# A hostNetwork pod is not a calico workload endpoint: its outbound connections
+# reach other pods sourced from the NODE — the node's vRack IP for same-node
+# targets, the node's calico VXLAN tunnel address for cross-node targets — and
+# neither matches the `podSelector: {}` ingress rule in the base allow-internal
+# policy. Without this additive policy, the hostNetwork api-local cannot reach
+# postgres, the redis fleet, or the otel-collector: the CNI drops the very
+# connections the app needs to boot.
+#
+# NetworkPolicies are additive (OR'd), so this opens ONLY the four addresses of
+# the two staging ingest nodes. The addresses are stable per node (calico
+# assigns the tunnel address from the node's pod CIDR block); if the ingest
+# node list in ingest-node-labels-staging.yaml changes, this list must change
+# with it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-hostnet-ingest-nodes
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # k8s-v3-node2: vRack IP + calico VXLAN tunnel address
+        - ipBlock:
+            cidr: 192.168.1.200/32
+        - ipBlock:
+            cidr: 10.42.234.0/32
+        # k8s-v3-node3: vRack IP + calico VXLAN tunnel address
+        - ipBlock:
+            cidr: 192.168.1.152/32
+        - ipBlock:
+            cidr: 10.42.165.128/32
+      # Only what the hostnet api actually dials: postgres, the redis fleet, and
+      # the otel-collector OTLP receivers — least privilege, rather than the four
+      # addresses reaching every pod on every port. These are POD ports, not
+      # service ports: every redis instance listens on containerPort 6379 (the
+      # per-service 6380/6382/6383/6384 exist only in the Service mapping).
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 6379
+          protocol: TCP
+        - port: 4317
+          protocol: TCP
+        - port: 4318
+          protocol: TCP

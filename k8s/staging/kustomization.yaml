@@ -19,6 +19,9 @@ resources:
   # The workflow applies that file in its own server-side step with a dedicated
   # --field-manager, which scopes ownership to our label key. Do not re-add it here.
   - api-local-deployments-staging.yaml
+  # hostNetwork trial companion: without it the CNI drops the hostnet pod's own
+  # connections to postgres/redis/otel (see the file's header comment).
+  - networkpolicy-ingest-hostnet.yaml
   # The hippius-drain stack: the singleton allocator (also the cephor_* schema owner)
   # and the per-ingest-node drain agent DaemonSet. Both use the `drain` image.
   - drain-allocator-deployment.yaml
