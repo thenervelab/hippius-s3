@@ -293,6 +293,32 @@ async def test_a_fresh_part_claimed_by_this_node_resolves_to_no_peer(conn: async
     assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == (None, {})
 
 
+async def test_a_corrupt_part_resolves_to_the_claimant_whose_ssd_is_the_last_good_source(
+    conn: asyncpg.Connection,
+) -> None:
+    """'corrupt' means the POOL copy failed verification while the claimant's SSD copy is,
+    in the drain's own words, "the last good source" (store.rs, R4). Resolving no peer here
+    routed readers to exactly the copy that failed verification."""
+    object_id = str(uuid.uuid4())
+    await _seed(conn, object_id=object_id, sizes=[100], resident_on=None, status="corrupt", claimed_by=PEER)
+
+    owner, sizes = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+
+    assert owner == PEER
+    assert sizes == {0: 100}
+
+
+async def test_a_failed_part_still_resolves_to_no_peer(conn: asyncpg.Connection) -> None:
+    """'failed' is terminal: the drain may have reclaimed the SSD copy (residency deleted in
+    the same statement that stamps reclaimed_at), so the claimant is not a promise anymore.
+    Deliberately NOT in the fallback — a failed part with a held-servable SSD copy is redriven
+    to 'pending' by the operator flow, at which point the fallback covers it."""
+    object_id = str(uuid.uuid4())
+    await _seed(conn, object_id=object_id, sizes=[100], resident_on=None, status="failed", claimed_by=PEER)
+
+    assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == (None, {})
+
+
 async def test_a_redriven_part_resolves_to_the_claimant_not_the_stale_residency(
     conn: asyncpg.Connection,
 ) -> None:
