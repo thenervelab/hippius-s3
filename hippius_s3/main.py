@@ -64,6 +64,7 @@ from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
 from hippius_s3.peer_auth import validate_peer_secret
 from hippius_s3.promote_floor import create_published_floor_source
 from hippius_s3.repositories.sub_token_scope_repository import SubTokenScopeRepository
+from hippius_s3.uvicorn_tuning import raise_receive_high_water
 from hippius_s3.writer.landed import initialize_landed_publisher
 
 
@@ -430,6 +431,11 @@ def factory() -> FastAPI:
     load_dotenv()
     config = get_config()
     setup_loki_logging(config, "api")
+
+    # Must precede serving: widens uvicorn's 64 KiB receive lockstep, the measured
+    # single-connection ingest cap (~181 MB/s with every thread idle). Each worker
+    # process runs factory() during its own startup, so every worker gets it.
+    raise_receive_high_water(config.uvicorn_high_water_limit)
 
     # A malformed peer secret fails on the READ path: httpx ascii-encodes header values and raises
     # UnicodeEncodeError, which is a ValueError, so the fetcher's `except (httpx.HTTPError, OSError)`

@@ -337,6 +337,10 @@ class Config:
     # encrypted) ciphertext, so extra peak memory per PUT ≈ 2 × chunk_size × this, ON
     # TOP of the write queue above. 1 = no look-ahead (serial-equivalent, still off-loop).
     write_pipeline_lookahead: int = env("HIPPIUS_WRITE_PIPELINE_LOOKAHEAD:4", convert=int)
+    # Per-connection body buffer uvicorn allows before pausing the transport (see
+    # uvicorn_tuning.raise_receive_high_water). 0 = leave uvicorn's stock 64 KiB.
+    # Peak extra memory ≈ this × concurrent in-flight uploads per worker.
+    uvicorn_high_water_limit: int = env("HIPPIUS_UVICORN_HIGH_WATER_LIMIT:1048576", convert=int)
     # RD-2 / WU-1: worker threads for the dedicated AES-GCM encrypt/decrypt pool (off the event loop).
     crypto_pool_workers: int = env("HIPPIUS_CRYPTO_POOL_WORKERS:4", convert=int)
     # NET-3: keep the expensive mTLS KMS connection warm across sparse/bursty calls.
