@@ -113,7 +113,9 @@ async def conn() -> AsyncGenerator[asyncpg.Connection, None]:
             object_id   text   NOT NULL,
             version     bigint NOT NULL,
             part_number bigint NOT NULL,
-            status      text   NOT NULL
+            status      text   NOT NULL,
+            node_id     text,
+            claimed_at  timestamptz
         ) ON COMMIT PRESERVE ROWS;
 
         CREATE TEMP TABLE parts (
@@ -163,27 +165,37 @@ async def _seed(
     *,
     object_id: str,
     sizes: list[int],
-    resident_on: str = PEER,
+    resident_on: Optional[str] = PEER,
     status: str = "replicated",
     part_number: int = 3,
     version: int = 1,
     resident_at: Optional[datetime] = None,
+    claimed_by: Optional[str] = None,
+    claimed_at: Optional[datetime] = None,
 ) -> None:
-    """One replicated part, resident on `resident_on`, with `sizes` as its chunk sizes."""
-    await _add_residency(
-        conn,
-        object_id=object_id,
-        node=resident_on,
-        resident_at=resident_at,
-        version=version,
-        part_number=part_number,
-    )
+    """One part with `sizes` as its chunk sizes; resident on `resident_on` unless None.
+
+    `claimed_by` is the drain claimant recorded on the replication-status row — for a part
+    still in 'pending'/'draining' that names the INGEST node, the only holder of the bytes.
+    """
+    if resident_on is not None:
+        await _add_residency(
+            conn,
+            object_id=object_id,
+            node=resident_on,
+            resident_at=resident_at,
+            version=version,
+            part_number=part_number,
+        )
     await conn.execute(
-        "INSERT INTO cephor_replication_status (object_id, version, part_number, status) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id, claimed_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6)",
         object_id,
         version,
         part_number,
         status,
+        claimed_by,
+        claimed_at,
     )
     part_id = str(uuid.uuid4())
     await conn.execute(
@@ -241,16 +253,73 @@ async def test_a_part_no_other_node_holds_resolves_to_no_peer(conn: asyncpg.Conn
     assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == (None, {})
 
 
-async def test_a_part_that_is_not_replicated_yet_resolves_to_no_peer(conn: asyncpg.Connection) -> None:
-    """Reading a peer's copy before the pool has one would make the peer the only source.
+async def test_an_unreplicated_part_with_no_claimant_resolves_to_no_peer(conn: asyncpg.Connection) -> None:
+    """Before the drain claims a fresh part (a ~1s window), nothing records who holds it.
 
-    The pool copy is what makes a failed peer fetch merely slow instead of fatal, so the join
-    on `status = 'replicated'` is a safety gate, not a filter.
+    Residency rows exist only for the read tier (replicated or promoted copies), and the
+    status row's node_id is NULL until the ingest node's drain agent claims it — so there is
+    genuinely no answer to give, and the read falls through the tiers exactly as before.
     """
     object_id = str(uuid.uuid4())
     await _seed(conn, object_id=object_id, sizes=[100], status="draining")
 
     assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == (None, {})
+
+
+async def test_a_fresh_part_resolves_to_its_drain_claimant(conn: asyncpg.Connection) -> None:
+    """The fresh-object window: from PUT until replication completes, the ingest node's SSD is
+    the ONLY copy anywhere — and the drain gate makes it undeletable until replicated.
+
+    Before this branch existed, a wrong-node read of a just-written part could not resolve a
+    peer, fell through every tier, and ended up tailing the drain's ceph copy at replication
+    speed (~45 MB/s measured on staging) while the ingest node would have served at 540+.
+    The residency row for `resident_on=None` here mirrors reality: none exists yet.
+    """
+    object_id = str(uuid.uuid4())
+    await _seed(conn, object_id=object_id, sizes=[100, 40], resident_on=None, status="pending", claimed_by=PEER)
+
+    owner, sizes = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+
+    assert owner == PEER
+    assert sizes == {0: 100, 1: 40}, "the size check applies to fresh parts exactly as to replicated ones"
+
+
+async def test_a_fresh_part_claimed_by_this_node_resolves_to_no_peer(conn: asyncpg.Connection) -> None:
+    """The reader on the ingest node itself serves locally; offering it itself as a peer would
+    turn one local read into a loopback HTTP fetch."""
+    object_id = str(uuid.uuid4())
+    await _seed(conn, object_id=object_id, sizes=[100], resident_on=None, status="pending", claimed_by=NODE)
+
+    assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == (None, {})
+
+
+async def test_a_redriven_part_resolves_to_the_claimant_not_the_stale_residency(
+    conn: asyncpg.Connection,
+) -> None:
+    """The redrive shape: residency rows survive while the status flips back to 'pending'.
+
+    The two owner branches are mutually exclusive by status — one status row per part, so a
+    'pending' part can never yield a replicated-residency candidate. What CAN coexist with
+    'pending' is a residency row left from before the redrive, and the branch structure makes
+    it unreachable — correctly so: during a redrive the claimant's SSD copy is the SOURCE the
+    drain re-copies from (current bytes by definition), while a promoted copy elsewhere is of
+    unknown vintage. Before this branch existed, a redriven part resolved to NO peer and reads
+    fell to the pool — the exact copy the redrive marked suspect.
+    """
+    object_id = str(uuid.uuid4())
+    await _seed(
+        conn,
+        object_id=object_id,
+        sizes=[100],
+        resident_on=PROMOTED_PEER,
+        status="pending",
+        claimed_by=PEER,
+        claimed_at=datetime(2026, 8, 1, 9, 0, tzinfo=timezone.utc),
+    )
+
+    owner, _ = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+
+    assert owner == PEER, "the claimant's SSD copy is the source during a redrive; stale residency must not win"
 
 
 async def test_a_part_with_no_recorded_chunks_resolves_to_an_owner_but_no_sizes(conn: asyncpg.Connection) -> None:

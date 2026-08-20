@@ -529,14 +529,7 @@ class FileSystemPartsStore:
         """
         part_dir = Path(self.part_path(object_id, object_version, part_number))
         meta_path = self._meta_file(part_dir)
-
-        # Only read if meta.json exists (indicates part is complete)
-        if not meta_path.exists():
-            return None
-
         chunk_path = self._chunk_file(part_dir, chunk_index)
-        if not chunk_path.exists():
-            return None
 
         try:
             # Read-recency for hot retention is recorded in
@@ -545,11 +538,23 @@ class FileSystemPartsStore:
             # read-only mounts (prod api-local) and an MDS metadata WRITE on
             # every read elsewhere. stat atime now reflects write recency only.
 
-            def _read() -> bytes:
+            # The existence probes run INSIDE the offloaded callable, with the
+            # read: on the CephFS fallback tier each is a network metadata
+            # round trip, and probing inline blocked the event loop on every
+            # miss (0.8s of on-loop pathlib.stat in a 12s py-spy window during
+            # a cold read). meta.json first — readers only see chunks once the
+            # part is marked ready.
+            def _read() -> bytes | None:
+                if not meta_path.exists():
+                    return None
+                if not chunk_path.exists():
+                    return None
                 with chunk_path.open("rb") as f:
                     return f.read()
 
             data = await asyncio.to_thread(_read)
+            if data is None:
+                return None
             # Sync, sampled, no-op in processes that never initialize the
             # tracker (workers/janitor).
             tracker = get_access_tracker()
