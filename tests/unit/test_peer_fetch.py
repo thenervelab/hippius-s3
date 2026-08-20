@@ -576,6 +576,42 @@ async def test_a_pod_network_address_on_the_api_port_is_accepted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_node_network_is_admitted_only_under_the_hostnetwork_flag(monkeypatch) -> None:
+    """Under hostNetwork, POD_IP is the node address, so registrations are 192.168.x by
+    construction; HIPPIUS_PEER_ALLOW_NODE_NETWORK is what keeps the tier lit there."""
+    from hippius_s3.config import get_config
+
+    monkeypatch.setattr(get_config(), "peer_allow_node_network", True)
+    redis = FakeRedis()
+    await _publish_raw(redis, "node-b", f"http://192.168.1.200:{PEER_PORT}")
+    registry = PeerRegistry(redis, "node-a", SELF_URL, 90)
+
+    assert await registry.resolve("node-b") == f"http://192.168.1.200:{PEER_PORT}"
+
+
+@pytest.mark.parametrize(
+    ("url", "why"),
+    [
+        ("http://169.254.169.254/", "the metadata endpoint is not the node network"),
+        (f"http://8.8.8.8:{PEER_PORT}", "a public address stays refused"),
+        (f"http://127.0.0.1:{PEER_PORT}", "loopback stays refused"),
+        ("http://192.168.1.200:9999", "the node network but the wrong port"),
+        (f"http://192.168.1.200:{PEER_PORT}/../admin", "a path stays refused on the node network too"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_hostnetwork_flag_widens_nothing_but_the_node_network(monkeypatch, url: str, why: str) -> None:
+    from hippius_s3.config import get_config
+
+    monkeypatch.setattr(get_config(), "peer_allow_node_network", True)
+    redis = FakeRedis()
+    await _publish_raw(redis, "node-b", url)
+    registry = PeerRegistry(redis, "node-a", SELF_URL, 90)
+
+    assert await registry.resolve("node-b") is None, f"accepted {url!r} ({why})"
+
+
+@pytest.mark.asyncio
 async def test_a_refused_peer_address_reaches_no_http_client_at_all() -> None:
     """The point of refusing in `resolve` is that nothing downstream ever sees the URL.
 

@@ -469,6 +469,14 @@ class Config:
     # the converter on the ":false" default too, so `convert=bool` makes the flag DEFAULT-ON
     # and impossible to turn off. The exact inversion this flag exists to prevent.
     peer_serve_enabled: bool = env("HIPPIUS_PEER_SERVE_ENABLED:false", convert=lambda x: x.lower() == "true")
+    # hostNetwork trial: with `hostNetwork: true` the pod's POD_IP IS the node address
+    # (192.168.x), so peer registrations land outside the pod-network allow-list in
+    # cache/peers.py and the peer tier silently goes dark. This flag admits the node
+    # network as peer addresses. Only sound where exactly one api pod owns :8000 per
+    # node (the hostNetwork DaemonSet) — the SNAT ambiguity that justified excluding
+    # 192.168.x does not exist there, and peer requests still authenticate via the
+    # shared-secret header either way. Default off; set by the staging overlay only.
+    peer_allow_node_network: bool = env("HIPPIUS_PEER_ALLOW_NODE_NETWORK:false", convert=lambda x: x.lower() == "true")
     # Shared secret every peer presents on /internal/parts. It is sufficient BECAUSE the gateway
     # strips all inbound x-hippius-* headers before forwarding, so no client can supply it; the
     # pod network on its own is not a boundary. Empty means the route is not mounted AT ALL —
