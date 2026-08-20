@@ -341,14 +341,35 @@ class PeerChunkFetcher:
             row = await conn.fetchrow(
                 """
                 WITH owner AS (
-                    SELECT r.node_id
-                    FROM cephor_ssd_residency r
-                    JOIN cephor_replication_status s
-                      ON s.object_id = r.object_id AND s.version = r.version AND s.part_number = r.part_number
-                    WHERE r.object_id = $1 AND r.version = $2 AND r.part_number = $3
-                      AND r.node_id <> $4
-                      AND s.status = 'replicated'
-                    ORDER BY r.resident_at
+                    SELECT node_id FROM (
+                        -- The read tier proper: any node holding a REPLICATED copy on flash.
+                        SELECT r.node_id, 0 AS tier_pref, r.resident_at AS ord
+                        FROM cephor_ssd_residency r
+                        JOIN cephor_replication_status s
+                          ON s.object_id = r.object_id AND s.version = r.version AND s.part_number = r.part_number
+                        WHERE r.object_id = $1 AND r.version = $2 AND r.part_number = $3
+                          AND r.node_id <> $4
+                          AND s.status = 'replicated'
+                        UNION ALL
+                        -- The fresh-part fallback: before replication completes the ONLY copy
+                        -- anywhere is the ingest node's SSD — the drain agent on that node
+                        -- claims the row within ~1s of landing, so its node_id names the
+                        -- holder for the whole replication window. Without this branch a
+                        -- wrong-node read of a just-written part cannot resolve a peer, falls
+                        -- through every tier, and ends up TAILING the drain's ceph copy at
+                        -- replication speed (~45 MB/s measured) while 540+ MB/s sat one hop
+                        -- away. Safe because the drain's replication gate makes an
+                        -- unreplicated SSD copy undeletable, and during a redrive ('pending'
+                        -- again) that SSD copy is the SOURCE the drain re-copies from —
+                        -- current bytes by definition (see the memo note below).
+                        SELECT s.node_id, 1 AS tier_pref, s.claimed_at AS ord
+                        FROM cephor_replication_status s
+                        WHERE s.object_id = $1 AND s.version = $2 AND s.part_number = $3
+                          AND s.status IN ('pending', 'draining')
+                          AND s.node_id IS NOT NULL
+                          AND s.node_id <> $4
+                    ) candidates
+                    ORDER BY tier_pref, ord
                     LIMIT 1
                 )
                 SELECT o.node_id, sizes.chunk_indexes, sizes.cipher_sizes
