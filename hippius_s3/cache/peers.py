@@ -361,11 +361,15 @@ class PeerChunkFetcher:
                         -- away. Safe because the drain's replication gate makes an
                         -- unreplicated SSD copy undeletable, and during a redrive ('pending'
                         -- again) that SSD copy is the SOURCE the drain re-copies from —
-                        -- current bytes by definition (see the memo note below).
+                        -- current bytes by definition (see the memo note below). 'corrupt'
+                        -- belongs here for the same reason, stated by the drain itself
+                        -- (store.rs, R4): a corrupt part's SSD copy is "the last good
+                        -- source" — the POOL copy is what failed verification, and without
+                        -- this branch readers resolve no peer and read exactly that copy.
                         SELECT s.node_id, 1 AS tier_pref, s.claimed_at AS ord
                         FROM cephor_replication_status s
                         WHERE s.object_id = $1 AND s.version = $2 AND s.part_number = $3
-                          AND s.status IN ('pending', 'draining')
+                          AND s.status IN ('pending', 'draining', 'corrupt')
                           AND s.node_id IS NOT NULL
                           AND s.node_id <> $4
                     ) candidates
