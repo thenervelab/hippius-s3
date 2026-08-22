@@ -46,7 +46,8 @@ CREATE TABLE objects(
 );
 CREATE TABLE object_versions(
     object_id uuid, object_version bigint, size_bytes bigint, md5_hash text,
-    content_type text DEFAULT 'application/octet-stream', multipart bool DEFAULT false, status text DEFAULT 'published'
+    content_type text DEFAULT 'application/octet-stream', multipart bool DEFAULT false, status text DEFAULT 'published',
+    is_delete_marker bool NOT NULL DEFAULT false, deleted_at timestamptz
 );
 CREATE INDEX idx_obj_bucket_key ON objects(bucket_id, object_key);
 """
@@ -137,6 +138,42 @@ async def test_sql_rollup_matches_python_across_params() -> None:
                     "INSERT INTO object_versions(object_id, object_version, size_bytes, md5_hash) VALUES($1,1,$2,$3)",
                     oid, len(key), uuid.uuid4().hex,
                 )
+
+            # Two extra keys exercising delete-marker resolution, which the two implementations
+            # express very differently: list_objects filters `NOT ov.is_delete_marker` outside its
+            # LATERAL, while list_objects_delimited uses a "newest admitted version is not a marker"
+            # scalar subquery. A zero-size marker also fails the shared serveable predicate
+            # (size>0 OR md5!=''), so a regression here shows up as the listing falling back to the
+            # previous content version — i.e. a deleted key reappearing. Both must agree.
+            for key, marker in (("data/03-marked.txt", True), ("data/04-live.txt", False)):
+                oid = uuid.uuid4()
+                await pool.execute(
+                    "INSERT INTO objects(object_id, bucket_id, object_key, current_object_version) VALUES($1,$2,$3,2)",
+                    oid, bucket_id, key,
+                )
+                await pool.execute(
+                    "INSERT INTO object_versions(object_id, object_version, size_bytes, md5_hash) VALUES($1,1,$2,$3)",
+                    oid, len(key), uuid.uuid4().hex,
+                )
+                await pool.execute(
+                    "INSERT INTO object_versions(object_id, object_version, size_bytes, md5_hash, is_delete_marker)"
+                    " VALUES($1,2,$2,$3,$4)",
+                    oid, 0 if marker else len(key), "" if marker else uuid.uuid4().hex, marker,
+                )
+
+            # Agreement alone would be satisfied by both implementations being wrong together, so
+            # pin the absolute expectation too: the marked key is gone, its live sibling remains.
+            for collect in (_collect_page, _collect_page_sql):
+                listed = {
+                    key
+                    for page, _, _ in await _crawl(
+                        collect, pool, bucket_id, prefix="data/", delimiter=None, max_keys=100, start_after=None
+                    )
+                    for kind, key in page
+                    if kind == "content"
+                }
+                assert "data/03-marked.txt" not in listed, f"delete-marked key was listed by {collect.__name__}"
+                assert "data/04-live.txt" in listed, f"live key was hidden by {collect.__name__}"
 
             combos = 0
             for prefix in _PREFIXES:
