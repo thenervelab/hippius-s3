@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Any
+from urllib.parse import parse_qs
 from urllib.parse import unquote
 
 import asyncpg
@@ -27,7 +28,13 @@ from hippius_s3.writer.object_writer import ObjectWriter
 logger = logging.getLogger(__name__)
 
 
-def parse_copy_source(copy_source: str | None) -> tuple[str, str]:
+def parse_copy_source(copy_source: str | None) -> tuple[str, str, int | None]:
+    """Split `x-amz-copy-source` into (bucket, key, version_id).
+
+    The version id used to be discarded along with the rest of the query string, so
+    `CopySource={"VersionId": N}` silently copied the CURRENT version instead — the standard
+    "restore an old version" move returned the wrong bytes with no error.
+    """
     if not copy_source:
         raise errors.S3Error(
             code="InvalidArgument",
@@ -35,7 +42,7 @@ def parse_copy_source(copy_source: str | None) -> tuple[str, str]:
             status_code=400,
         )
 
-    copy_source_path = copy_source.split("?", 1)[0]
+    copy_source_path, _, query = copy_source.partition("?")
     copy_source_path = unquote(copy_source_path).lstrip("/")
 
     path_parts = copy_source_path.split("/", 1)
@@ -46,7 +53,26 @@ def parse_copy_source(copy_source: str | None) -> tuple[str, str]:
             status_code=400,
         )
 
-    return path_parts[0], path_parts[1]
+    return path_parts[0], path_parts[1], _parse_source_version_id(query)
+
+
+def _parse_source_version_id(query: str) -> int | None:
+    raw = parse_qs(query).get("versionId", [""])[0]
+    # "null" is the version id AWS reports for objects predating versioning; we never mint it, so
+    # it means "current". Other query params (partNumber, ...) are not ours to interpret.
+    if not raw or raw == "null":
+        return None
+    try:
+        version_id = int(raw)
+    except ValueError:
+        version_id = 0
+    if version_id <= 0:
+        raise errors.S3Error(
+            code="InvalidArgument",
+            message=f"Invalid version ID: {raw}",
+            status_code=400,
+        )
+    return version_id
 
 
 async def resolve_copy_resources(
@@ -55,6 +81,7 @@ async def resolve_copy_resources(
     source_bucket_name: str,
     source_object_key: str,
     dest_bucket_name: str,
+    source_version_id: int | None = None,
 ) -> tuple[dict, dict, dict, dict]:
     user = await UserRepository(db).ensure_by_main_account(main_account)
     user_id = user["main_account_id"]
@@ -76,12 +103,33 @@ async def resolve_copy_resources(
             status_code=404,
         )
 
-    source_object = await ObjectRepository(db).get_by_path(source_bucket["bucket_id"], source_object_key)
+    if source_version_id is None:
+        source_object = await ObjectRepository(db).get_by_path(source_bucket["bucket_id"], source_object_key)
+    else:
+        source_object = await ObjectRepository(db).get_by_path_and_version(
+            source_bucket["bucket_id"], source_object_key, source_version_id
+        )
+        if not source_object:
+            raise errors.S3Error(
+                code="NoSuchVersion",
+                message=f"The specified version does not exist: {source_version_id}",
+                status_code=404,
+            )
+
     if not source_object:
         raise errors.S3Error(
             code="NoSuchKey",
             message=f"The specified key {source_object_key} does not exist",
             status_code=404,
+        )
+
+    # A delete marker has no bytes to copy; AWS answers a GET on one with 405, and a copy from one
+    # is the same category of mistake.
+    if source_object.get("is_delete_marker"):
+        raise errors.S3Error(
+            code="MethodNotAllowed",
+            message="The specified version is a delete marker and has no content",
+            status_code=405,
         )
 
     return user, source_bucket, dest_bucket, source_object
@@ -135,7 +183,7 @@ async def should_use_v5_fast_path(
     return False, None, "v5_fast_path_disabled_object_id_binding"
 
 
-def build_copy_success_response(etag: str, last_modified: datetime) -> Response:
+def build_copy_success_response(etag: str, last_modified: datetime, version_id: int | None = None) -> Response:
     root = ET.Element("CopyObjectResult")
     etag_elem = ET.SubElement(root, "ETag")
     etag_elem.text = etag or ""
@@ -148,13 +196,15 @@ def build_copy_success_response(etag: str, last_modified: datetime) -> Response:
         xml_declaration=True,
     )
 
+    headers = {"ETag": f'"{etag}"' if etag else '""'}
+    if version_id is not None:
+        headers["x-amz-version-id"] = str(version_id)
+
     return Response(
         content=xml_bytes,
         media_type="application/xml",
         status_code=200,
-        headers={
-            "ETag": f'"{etag}"' if etag else '""',
-        },
+        headers=headers,
     )
 
 
@@ -260,4 +310,4 @@ async def handle_streaming_copy(
             str(put_res.upload_id),
         )
 
-    return build_copy_success_response(put_res.etag, copy_created_at)
+    return build_copy_success_response(put_res.etag, copy_created_at, int(put_res.object_version))

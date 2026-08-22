@@ -214,6 +214,30 @@ async def handle_get_object(
                     },
                 )
 
+        # A delete marker has no bytes. AWS answers a plain GET on one with 404 and an explicit
+        # ?versionId= on one with 405, both carrying x-amz-delete-marker: true.
+        if object_info.get("is_delete_marker"):
+            marker_headers = {"x-amz-delete-marker": "true"}
+            if version_id is None:
+                return errors.s3_error_response(
+                    code="NoSuchKey",
+                    message=f"The specified key {object_key} does not exist",
+                    status_code=404,
+                    extra_headers=marker_headers,
+                    Key=object_key,
+                )
+            return errors.s3_error_response(
+                code="MethodNotAllowed",
+                message="The specified method is not allowed against this resource.",
+                status_code=405,
+                extra_headers={
+                    **marker_headers,
+                    "Last-Modified": object_info["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                },
+                Key=object_key,
+                VersionId=str(version_id),
+            )
+
         md5_hash = object_info.get("md5_hash") or ""
         if md5_hash and if_none_match_matches(request.headers.get("if-none-match"), md5_hash):
             return Response(status_code=304, headers={"ETag": f'"{md5_hash}"'})

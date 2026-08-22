@@ -1152,6 +1152,7 @@ async def complete_multipart_upload(
                     "Content-Type": "application/xml; charset=utf-8",
                     "x-amz-request-id": str(uuid.uuid4()),
                     "Content-Length": str(len(xml_content)),
+                    "x-amz-version-id": str(int(multipart_upload.get("current_object_version") or 1)),
                 },
             )
 
@@ -1318,6 +1319,7 @@ async def complete_multipart_upload(
             headers={
                 "Content-Type": "application/xml; charset=utf-8",
                 "Content-Length": str(len(xml_bytes)),
+                "x-amz-version-id": str(object_version),
             },
         )
     except Exception as e:

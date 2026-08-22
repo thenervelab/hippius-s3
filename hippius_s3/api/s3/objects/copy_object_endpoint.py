@@ -34,7 +34,9 @@ async def handle_copy_object(
     redis_client: Any,
 ) -> Response:
     try:
-        source_bucket_name, source_object_key = parse_copy_source(request.headers.get("x-amz-copy-source"))
+        source_bucket_name, source_object_key, source_version_id = parse_copy_source(
+            request.headers.get("x-amz-copy-source")
+        )
 
         user, source_bucket, dest_bucket, source_object = await resolve_copy_resources(
             db=pool,
@@ -42,6 +44,7 @@ async def handle_copy_object(
             source_bucket_name=source_bucket_name,
             source_object_key=source_object_key,
             dest_bucket_name=bucket_name,
+            source_version_id=source_version_id,
         )
 
         existing_dest = await ObjectRepository(pool).get_by_path(dest_bucket["bucket_id"], object_key)

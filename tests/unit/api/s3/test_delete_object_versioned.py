@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from hippius_s3.api.s3.objects import delete_object_endpoint as mod
+
+
+class _FakeDb:
+    """Branches on query NAME — `get_query` is monkeypatched to the identity function."""
+
+    def __init__(
+        self,
+        *,
+        versions: list[dict[str, Any]],
+        current: int,
+        object_id: str = "obj-1",
+    ) -> None:
+        self.versions = {int(v["object_version"]): v for v in versions}
+        self.current = current
+        self.object_id = object_id
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def _record(self, query: str, args: tuple[Any, ...]) -> None:
+        self.calls.append((query, args))
+
+    def names(self) -> list[str]:
+        return [q for q, _ in self.calls]
+
+    def args_for(self, name: str) -> list[tuple[Any, ...]]:
+        return [a for q, a in self.calls if q == name]
+
+    async def fetchrow(self, query: str, *args: Any) -> Any:
+        self._record(query, args)
+        if query == "get_object_version_for_delete":
+            row = self.versions.get(int(args[2]))
+            if row is None:
+                return None
+            return {
+                "object_id": self.object_id,
+                "object_version": row["object_version"],
+                "is_delete_marker": row.get("is_delete_marker", False),
+                "current_object_version": self.current,
+            }
+        if query == "soft_delete_object_version":
+            v = int(args[1])
+            if v in self.versions:
+                self.versions[v]["deleted"] = True
+                return {"object_id": self.object_id, "object_version": v}
+            return None
+        if query == "next_live_object_version":
+            live = [v for v, row in self.versions.items() if not row.get("deleted") and v != int(args[1])]
+            return {"object_version": max(live)} if live else None
+        if query == "swap_current_version_cas":
+            self.current = int(args[2])
+            return {"object_id": self.object_id, "current_object_version": self.current}
+        if query == "insert_delete_marker":
+            new_v = max(self.versions) + 1 if self.versions else 1
+            self.versions[new_v] = {"object_version": new_v, "is_delete_marker": True}
+            self.current = new_v
+            return {"object_id": self.object_id, "object_version": new_v}
+        if query == "soft_delete_object":
+            return {"object_id": self.object_id, "current_object_version": self.current}
+        return None
+
+    async def fetch(self, query: str, *args: Any) -> list[Any]:
+        self._record(query, args)
+        if query == "list_object_versions_for_unpin":
+            return [{"object_version": v} for v in sorted(self.versions)]
+        return []
+
+    async def execute(self, query: str, *args: Any) -> str:
+        self._record(query, args)
+        return "OK"
+
+
+def _request(version_id: str | None = None) -> Any:
+    qp: dict[str, str] = {} if version_id is None else {"versionId": version_id}
+    return SimpleNamespace(
+        state=SimpleNamespace(main_account_id="acct-main", ray_id="ray-1"),
+        query_params=qp,
+        headers={"Host": "h"},
+    )
+
+
+@pytest.fixture
+def wiring(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Neutralise collaborators and record every unpin enqueued."""
+    enqueued: list[Any] = []
+    bucket: dict[str, Any] = {
+        "bucket_id": "bkt-1",
+        "bucket_name": "b",
+        "main_account_id": "acct-main",
+        "versioning_status": None,
+    }
+
+    monkeypatch.setattr(mod, "get_query", lambda name: name)
+
+    class _FakeUserRepo:
+        def __init__(self, _db: Any) -> None: ...
+
+        async def ensure_by_main_account(self, account: str) -> dict[str, Any]:
+            return {"main_account_id": account}
+
+    class _FakeBucketRepo:
+        def __init__(self, _db: Any) -> None: ...
+
+        async def get_by_name_and_owner(self, _name: str, _owner: str) -> Any:
+            return bucket
+
+    async def _resolve_backends(_db: Any, _oid: str, _ver: int | None = None) -> list[str]:
+        return ["arion"]
+
+    async def _enqueue(payload: Any = None, **_kw: Any) -> None:
+        enqueued.append(payload)
+
+    monkeypatch.setattr(mod, "UserRepository", _FakeUserRepo)
+    monkeypatch.setattr(mod, "BucketRepository", _FakeBucketRepo)
+    monkeypatch.setattr(mod, "resolve_object_backends", _resolve_backends)
+    monkeypatch.setattr(mod, "enqueue_unpin_request", _enqueue)
+
+    return {"enqueued": enqueued, "bucket": bucket}
+
+
+def _unpinned_versions(enqueued: list[Any]) -> list[int]:
+    return sorted(int(p.object_version) for p in enqueued if p.object_version is not None)
+
+
+# --- The regression this whole change exists for ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_versioned_delete_removes_only_that_version(wiring: dict[str, Any]) -> None:
+    """DELETE ?versionId=1 must NOT destroy the object.
+
+    Prod previously ignored the versionId and soft-deleted the whole object, taking every
+    version with it. Guard that: `soft_delete_object` must not be reached.
+    """
+    db = _FakeDb(
+        versions=[{"object_version": 1}, {"object_version": 2}, {"object_version": 3}],
+        current=3,
+    )
+    resp = await mod.handle_delete_object("b", "k", _request("1"), db, None)
+
+    assert resp.status_code == 204
+    assert "soft_delete_object" not in db.names()
+    assert db.args_for("soft_delete_object_version") == [("obj-1", 1)]
+    assert _unpinned_versions(wiring["enqueued"]) == [1]
+    assert db.current == 3
+
+
+@pytest.mark.asyncio
+async def test_versioned_delete_of_current_rolls_pointer_back(wiring: dict[str, Any]) -> None:
+    db = _FakeDb(versions=[{"object_version": 1}, {"object_version": 2}], current=2)
+    resp = await mod.handle_delete_object("b", "k", _request("2"), db, None)
+
+    assert resp.status_code == 204
+    assert db.args_for("swap_current_version_cas") == [("obj-1", 2, 1)]
+    assert db.current == 1
+    assert _unpinned_versions(wiring["enqueued"]) == [2]
+
+
+@pytest.mark.asyncio
+async def test_versioned_delete_of_only_version_soft_deletes_object(wiring: dict[str, Any]) -> None:
+    db = _FakeDb(versions=[{"object_version": 1}], current=1)
+    resp = await mod.handle_delete_object("b", "k", _request("1"), db, None)
+
+    assert resp.status_code == 204
+    # Nothing left to point at, so the object itself goes.
+    assert "soft_delete_object" in db.names()
+    assert _unpinned_versions(wiring["enqueued"]) == [1]
+
+
+@pytest.mark.asyncio
+async def test_versioned_delete_of_marker_is_an_undelete(wiring: dict[str, Any]) -> None:
+    db = _FakeDb(
+        versions=[{"object_version": 1}, {"object_version": 2, "is_delete_marker": True}],
+        current=2,
+    )
+    resp = await mod.handle_delete_object("b", "k", _request("2"), db, None)
+
+    assert resp.status_code == 204
+    assert resp.headers.get("x-amz-delete-marker") == "true"
+    assert resp.headers.get("x-amz-version-id") == "2"
+    # A marker holds no data, so there is nothing to unpin.
+    assert wiring["enqueued"] == []
+    assert db.current == 1
+
+
+@pytest.mark.asyncio
+async def test_versioned_delete_unknown_version_is_idempotent(wiring: dict[str, Any]) -> None:
+    db = _FakeDb(versions=[{"object_version": 1}], current=1)
+    resp = await mod.handle_delete_object("b", "k", _request("99"), db, None)
+
+    assert resp.status_code == 204
+    assert "soft_delete_object" not in db.names()
+    assert wiring["enqueued"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["abc", "0", "-1", "1.5"])
+async def test_invalid_version_id_rejected(wiring: dict[str, Any], bad: str) -> None:
+    db = _FakeDb(versions=[{"object_version": 1}], current=1)
+    resp = await mod.handle_delete_object("b", "k", _request(bad), db, None)
+
+    assert resp.status_code == 400
+    assert b"InvalidArgument" in resp.body
+    assert db.names() == [] or "soft_delete_object" not in db.names()
+
+
+# --- Delete markers on a versioning-enabled bucket ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_simple_delete_on_enabled_bucket_inserts_marker(wiring: dict[str, Any]) -> None:
+    wiring["bucket"]["versioning_status"] = "Enabled"
+    db = _FakeDb(versions=[{"object_version": 1}, {"object_version": 2}], current=2)
+
+    resp = await mod.handle_delete_object("b", "k", _request(), db, None)
+
+    assert resp.status_code == 204
+    assert resp.headers.get("x-amz-delete-marker") == "true"
+    assert resp.headers.get("x-amz-version-id") == "3"
+    assert "insert_delete_marker" in db.names()
+    # A delete marker destroys nothing.
+    assert "soft_delete_object" not in db.names()
+    assert wiring["enqueued"] == []
+
+
+@pytest.mark.asyncio
+async def test_simple_delete_on_unversioned_bucket_unpins_every_version(
+    wiring: dict[str, Any],
+) -> None:
+    """The storage leak: prod only ever unpinned `current_object_version`."""
+    db = _FakeDb(
+        versions=[{"object_version": 1}, {"object_version": 2}, {"object_version": 3}],
+        current=3,
+    )
+    resp = await mod.handle_delete_object("b", "k", _request(), db, None)
+
+    assert resp.status_code == 204
+    assert "soft_delete_object" in db.names()
+    assert "insert_delete_marker" not in db.names()
+    assert _unpinned_versions(wiring["enqueued"]) == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_version_id_null_alias_behaves_as_simple_delete(wiring: dict[str, Any]) -> None:
+    db = _FakeDb(versions=[{"object_version": 1}], current=1)
+    resp = await mod.handle_delete_object("b", "k", _request("null"), db, None)
+
+    assert resp.status_code == 204
+    assert "soft_delete_object" in db.names()
+
+
+@pytest.mark.asyncio
+async def test_missing_bucket_returns_404(wiring: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    class _NoBucketRepo:
+        def __init__(self, _db: Any) -> None: ...
+
+        async def get_by_name_and_owner(self, _n: str, _o: str) -> Any:
+            return None
+
+    monkeypatch.setattr(mod, "BucketRepository", _NoBucketRepo)
+    db = _FakeDb(versions=[{"object_version": 1}], current=1)
+    resp = await mod.handle_delete_object("b", "k", _request("1"), db, None)
+
+    assert resp.status_code == 404
+    assert b"NoSuchBucket" in resp.body

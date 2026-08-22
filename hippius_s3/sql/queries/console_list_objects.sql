@@ -6,6 +6,7 @@ SELECT o.object_id, o.bucket_id, o.object_key, o.current_object_version,
        ov.status, b.bucket_name, ov.multipart
 FROM objects o
 JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
+ AND NOT ov.is_delete_marker
 JOIN buckets b ON o.bucket_id = b.bucket_id
 LEFT JOIN cids c ON ov.cid_id = c.id
 WHERE o.bucket_id = $1

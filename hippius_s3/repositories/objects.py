@@ -41,6 +41,9 @@ class ObjectRepository:
     async def get_by_path(self, bucket_id: str, object_key: str) -> Any:
         return await self._db.fetchrow(get_query("get_object_by_path"), bucket_id, object_key)
 
+    async def get_by_path_and_version(self, bucket_id: str, object_key: str, version: int) -> Any:
+        return await self._db.fetchrow(get_query("get_object_by_path_and_version"), bucket_id, object_key, version)
+
     async def upsert_with_cid(
         self,
         object_id: str,

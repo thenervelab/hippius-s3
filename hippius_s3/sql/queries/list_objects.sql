@@ -23,11 +23,16 @@ FROM objects o,
                 v.content_type,
                 v.md5_hash,
                 v.status,
-                v.multipart
+                v.multipart,
+                v.is_delete_marker
          FROM object_versions v
          WHERE v.object_id = o.object_id
            AND v.object_version <= o.current_object_version
-           AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+           AND v.deleted_at IS NULL
+           -- A delete marker is zero-size with no md5, so it fails the serveable half of this
+           -- predicate. Admit it explicitly, or resolution silently falls back to the previous
+           -- content version and serves deleted data.
+           AND (v.is_delete_marker OR v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
          ORDER BY v.object_version DESC
          LIMIT 1
      ) ov
@@ -38,6 +43,10 @@ WHERE o.bucket_id = $1
   -- both ends even under a generic prepared plan (a sparse prefix no longer scans to partition end).
   AND ($5::text IS NULL OR o.object_key < $5::text COLLATE "C")
   AND o.deleted_at IS NULL
+  -- The key vanishes from the listing when its newest version is a delete marker. This must sit
+  -- OUTSIDE the LATERAL: filtering markers inside it would make the subquery fall through to the
+  -- previous content version and list a deleted key as though it were still there.
+  AND NOT ov.is_delete_marker
 -- DB is C-collation; an explicit COLLATE here would defeat the (bucket_id, object_key) index ordered scan.
 ORDER BY o.object_key
 LIMIT $4::int

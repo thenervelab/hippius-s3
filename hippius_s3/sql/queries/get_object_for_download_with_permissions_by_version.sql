@@ -24,9 +24,15 @@ WITH object_info AS (
         ov.enc_suite_id,
         ov.enc_chunk_size_bytes,
         ov.kek_id,
-        ov.wrapped_dek
+        ov.wrapped_dek,
+        ov.is_delete_marker
     FROM objects o
-    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = $3
+    -- A version soft-deleted by a versioned DELETE is gone as far as reads are concerned, even
+    -- though the row lingers until the janitor confirms its backend copies are unpinned.
+    JOIN object_versions ov
+      ON ov.object_id = o.object_id
+     AND ov.object_version = $3
+     AND ov.deleted_at IS NULL
     JOIN buckets b ON o.bucket_id = b.bucket_id
     LEFT JOIN cids c ON ov.cid_id = c.id
     WHERE b.bucket_name = $1
@@ -70,6 +76,7 @@ SELECT
     oi.enc_chunk_size_bytes,
     oi.kek_id,
     oi.wrapped_dek,
+    oi.is_delete_marker,
     (
         SELECT mu.upload_id
         FROM multipart_uploads mu

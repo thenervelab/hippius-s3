@@ -8,10 +8,11 @@ from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
-from hippius_s3.backend_routing import resolve_object_backends
+from hippius_s3.api.s3.objects.delete_object_endpoint import delete_object_version
+from hippius_s3.api.s3.objects.delete_object_endpoint import enqueue_unpins_for_versions
+from hippius_s3.api.s3.objects.delete_object_endpoint import insert_delete_marker
+from hippius_s3.api.s3.objects.delete_object_endpoint import parse_version_id
 from hippius_s3.config import get_config
-from hippius_s3.queue import UnpinChainRequest
-from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.utils import get_query
@@ -52,7 +53,8 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
     - Accepts XML body with up to 1000 <Object><Key>...</Key></Object> entries
     - "Quiet" flag suppresses <Deleted> entries when true
     - Non-existent keys are treated as successfully deleted (idempotent)
-    - Versioning is not supported: keys with VersionId yield per-key <Error NotImplemented>
+    - A per-key VersionId deletes exactly that version; without one, a versioning-enabled bucket
+      gets a delete marker and any other bucket is soft-deleted whole
     """
     try:
         # AuthN/AuthZ context
@@ -95,17 +97,35 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
             )
 
         bucket_id = bucket["bucket_id"]
-        deleted_keys: list[str] = []
+        # Each entry is a key, the version id to report back (None when unversioned), and whether
+        # the delete produced a marker.
+        deleted_keys: list[tuple[str, str | None, bool]] = []
         errors_list: list[dict[str, str]] = []
 
-        for key, version_id in object_entries:
+        ray_id = getattr(request.state, "ray_id", None)
+        versioning_enabled = bucket.get("versioning_status") == "Enabled"
+
+        for key, raw_version in object_entries:
             if not key:
                 # Skip invalid entries
                 errors_list.append({"Key": "", "Code": "MalformedXML", "Message": "Invalid Delete Object entry"})
                 continue
 
-            if version_id:
-                errors_list.append({"Key": key, "Code": "NotImplemented", "Message": "Versioning not supported"})
+            version_id, invalid = parse_version_id(raw_version or None)
+            if invalid is not None:
+                errors_list.append(
+                    {"Key": key, "Code": "InvalidArgument", "Message": f"Invalid version ID: {raw_version}"}
+                )
+                continue
+
+            if version_id is not None:
+                resp = await delete_object_version(bucket_id, key, version_id, request, db)
+                deleted_keys.append((key, str(version_id), resp.headers.get("x-amz-delete-marker") == "true"))
+                continue
+
+            if versioning_enabled:
+                resp = await insert_delete_marker(bucket_id, key, db)
+                deleted_keys.append((key, resp.headers.get("x-amz-version-id"), True))
                 continue
 
             # Soft-delete the object
@@ -120,21 +140,21 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                 deleted = None
 
             if deleted:
-                ray_id = getattr(request.state, "ray_id", None)
                 object_id = str(deleted["object_id"])
-                object_version = int(deleted["current_object_version"])
-                db_backends = await resolve_object_backends(db, object_id, object_version)
-                unpin_payload = UnpinChainRequest(
-                    address=request.state.main_account_id,
+                # Every version holding a backend copy, not just the current one — see
+                # enqueue_unpins_for_versions for why this is resolved here rather than deferred.
+                rows = await db.fetch(get_query("list_object_versions_for_unpin"), object_id)
+                versions = [int(r["object_version"]) for r in rows] or [int(deleted["current_object_version"])]
+                await enqueue_unpins_for_versions(
+                    db,
                     object_id=object_id,
-                    object_version=object_version,
+                    versions=versions,
+                    address=request.state.main_account_id,
                     ray_id=ray_id,
-                    delete_backends=db_backends if db_backends else None,
                 )
-                await enqueue_unpin_request(payload=unpin_payload)
 
             # S3 semantics: even if not found, include as Deleted (unless Quiet)
-            deleted_keys.append(key)
+            deleted_keys.append((key, None, False))
 
         # Build XML response
         resp_root = ET.Element(
@@ -143,9 +163,13 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
         )
 
         if not quiet:
-            for key in deleted_keys:
+            for key, version_id, was_marker in deleted_keys:
                 d = ET.SubElement(resp_root, "Deleted")
                 ET.SubElement(d, "Key").text = key
+                if version_id:
+                    ET.SubElement(d, "VersionId").text = version_id
+                if was_marker:
+                    ET.SubElement(d, "DeleteMarker").text = "true"
 
         for err in errors_list:
             e = ET.SubElement(resp_root, "Error")

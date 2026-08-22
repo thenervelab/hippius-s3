@@ -318,6 +318,8 @@ Overwriting an object creates a new `object_version` with a new DEK, a new objec
 
 **Proposed**: on successful `update_object_version_metadata` for a new version (see [hippius_s3/writer/db.py](hippius_s3/writer/db.py)), schedule a targeted `fs_store.delete_object(object_id, object_version=prev_version)` once we've confirmed the new version is serving. Has to wait for any in-flight reads against the old version (check by stat-ing atime recency, or just let janitor handle the wind-down).
 
+This section covers only the **local FS bytes**. The worse half — superseded versions keeping their **backend pins** forever, because object DELETE only ever unpinned `current_object_version` — is fixed by the object-versioning work; see [object-versions.md](object-versions.md). Note the two are independent: the janitor's FS eviction is *gated on* live `chunk_backend` rows, so it never unpins anything.
+
 ### 5.2 Soft-deleted objects linger in cache
 
 `chunk_backend.deleted_at` is set on DELETE but the FS copy stays. The ACL/existence check in the read path (`get_object_for_download_with_permissions`) should filter these out before reaching the streamer, but if any legacy path doesn't filter, a stale GET could 200 on data the user believes they deleted.

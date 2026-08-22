@@ -21,8 +21,11 @@ from hippius_s3.api.s3.buckets.bucket_location_endpoint import handle_get_bucket
 from hippius_s3.api.s3.buckets.bucket_policy_endpoint import get_bucket_policy as policy_get_bucket_policy
 from hippius_s3.api.s3.buckets.bucket_tagging_endpoint import delete_bucket_tags as tags_delete_bucket_tags
 from hippius_s3.api.s3.buckets.bucket_tagging_endpoint import get_bucket_tags as tags_get_bucket_tags
+from hippius_s3.api.s3.buckets.bucket_versioning_endpoint import handle_get_bucket_versioning
+from hippius_s3.api.s3.buckets.bucket_versioning_endpoint import handle_put_bucket_versioning
 from hippius_s3.api.s3.buckets.delete_objects_endpoint import handle_delete_objects
 from hippius_s3.api.s3.buckets.list_buckets_endpoint import handle_list_buckets
+from hippius_s3.api.s3.buckets.list_object_versions_endpoint import handle_list_object_versions
 from hippius_s3.api.s3.buckets.list_objects_endpoint import handle_list_objects
 from hippius_s3.dependencies import RequestContext
 from hippius_s3.dependencies import get_request_context
@@ -64,8 +67,23 @@ async def get_bucket(
     if "policy" in request.query_params:
         async with pool.acquire() as conn:
             return await policy_get_bucket_policy(bucket_name, conn, request.state.main_account_id)
+    if "versioning" in request.query_params:
+        async with pool.acquire() as conn:
+            return await handle_get_bucket_versioning(bucket_name, conn, request.state.main_account_id)
     ctx = get_request_context(request)
     qp = request.query_params
+    if "versions" in request.query_params:
+        return await handle_list_object_versions(
+            bucket_name,
+            ctx,
+            pool,
+            prefix=qp.get("prefix"),
+            key_marker=qp.get("key-marker"),
+            version_id_marker=qp.get("version-id-marker"),
+            max_keys=qp.get("max-keys"),
+            encoding_type=qp.get("encoding-type"),
+            delimiter=qp.get("delimiter"),
+        )
     return await handle_list_objects(
         bucket_name,
         ctx,
@@ -87,6 +105,11 @@ async def create_or_modify_bucket(
 ) -> Response:
     if "acl" in request.query_params:
         return await put_bucket_acl(bucket_name, request)
+    # Must precede handle_create_bucket: without this branch ?versioning fell through to the
+    # create path and answered PutBucketVersioning with BucketAlreadyExists.
+    if "versioning" in request.query_params:
+        async with pool.acquire() as conn:
+            return await handle_put_bucket_versioning(bucket_name, request, conn)
     if (invalid := invalid_canned_acl_response(request.headers.get("x-amz-acl"))) is not None:
         return invalid
     # Delegate to the new comprehensive handler (supports create/tagging/lifecycle/policy)

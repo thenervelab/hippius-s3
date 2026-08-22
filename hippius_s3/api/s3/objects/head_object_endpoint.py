@@ -180,6 +180,16 @@ async def handle_head_object(
                     "content_type": row.get("content_type", ""),
                 },
             )
+        # A delete marker has no bytes. HEAD carries no body, so the signal is the status plus
+        # x-amz-delete-marker: 404 for a plain HEAD, 405 when the marker was addressed by version.
+        if row.get("is_delete_marker"):
+            marker_headers = {
+                "x-amz-delete-marker": "true",
+                "Last-Modified": row["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                "x-amz-version-id": str(int(row.get("object_version") or 1)),
+            }
+            return Response(status_code=404 if version_id is None else 405, headers=marker_headers)
+
         # Build headers
         created_at = row["created_at"]
         size_bytes = int(row["size_bytes"]) if row.get("size_bytes") is not None else 0

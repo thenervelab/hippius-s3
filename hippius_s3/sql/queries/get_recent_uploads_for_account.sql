@@ -31,6 +31,7 @@ CROSS JOIN LATERAL (
 JOIN object_versions ov
     ON ov.object_id = recent.object_id
    AND ov.object_version = recent.current_object_version
+   AND NOT ov.is_delete_marker
 LEFT JOIN cids c ON c.id = ov.cid_id
 WHERE b.main_account_id = $1
   AND b.deleted_at IS NULL
