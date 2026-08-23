@@ -23,12 +23,6 @@ logger = logging.getLogger(__name__)
 
 S3_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 
-# Passed as the query's current_only flag. A bucket that never enabled versioning reports one entry
-# per key, matching AWS's shape for an unversioned bucket, rather than exposing the overwrite
-# history we happen to retain for it.
-CURRENT_ONLY = True
-ALL_VERSIONS = False
-
 
 def _invalid_arg(message: str) -> Response:
     return errors.s3_error_response(code="InvalidArgument", message=message, status_code=400)
@@ -82,7 +76,9 @@ async def handle_list_object_versions(
         )
 
     bucket_owner = bucket["main_account_id"] or ctx.main_account_id
-    current_only = CURRENT_ONLY if not bucket["versioning_status"] else ALL_VERSIONS
+    # A bucket that never enabled versioning reports one entry per key, matching AWS's shape for
+    # an unversioned bucket, rather than exposing the overwrite history we happen to retain.
+    current_only = not bucket["versioning_status"]
 
     entries, is_truncated, next_key, next_version = await _collect_page(
         pool,
@@ -213,21 +209,23 @@ async def _collect_page(
             key = row["object_key"]
             di = key.find(delimiter, plen) if delimiter else -1
 
-            if di != -1:
-                common_prefix = key[: di + dlen]
-                if common_prefix in seen_prefixes:
-                    continue
-                if len(entries) >= target:
-                    return entries, True, key, int(row["object_version"])
+            common_prefix = key[: di + dlen] if di != -1 else None
+            # A key already folded into an emitted prefix is not a result, so it must not count
+            # toward max-keys — check this before the truncation test.
+            if common_prefix is not None and common_prefix in seen_prefixes:
+                continue
+
+            if len(entries) >= target:
+                # The first entry we did NOT return becomes the caller's Next*Marker pair.
+                return entries, True, key, int(row["object_version"])
+
+            if common_prefix is not None:
                 seen_prefixes.add(common_prefix)
                 entries.append(("prefix", common_prefix))
                 # Skip the whole collapsed group in one index descent on the next batch.
                 cursor_key = _prefix_resume(common_prefix)
                 cursor_version = None
                 continue
-
-            if len(entries) >= target:
-                return entries, True, key, int(row["object_version"])
 
             entries.append(("marker" if row["is_delete_marker"] else "version", row))
             cursor_key = key

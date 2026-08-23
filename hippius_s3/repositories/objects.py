@@ -41,6 +41,17 @@ class ObjectRepository:
     async def get_by_path(self, bucket_id: str, object_key: str) -> Any:
         return await self._db.fetchrow(get_query("get_object_by_path"), bucket_id, object_key)
 
+    async def get_serveable_by_path(self, bucket_id: str, object_key: str) -> Any:
+        """`get_by_path`, but a key whose current version is a delete marker reads as absent.
+
+        `get_by_path` deliberately resolves TO markers — filtering them inside its version-resolution
+        subquery would fall through to the previous content version and serve deleted data. Callers
+        that need to distinguish "deleted" from "never existed" (CopyObject, which owes a 404 vs a
+        405) read the flag themselves; callers for which a marker is simply "not found" use this.
+        """
+        row = await self.get_by_path(bucket_id, object_key)
+        return None if row is not None and row["is_delete_marker"] else row
+
     async def get_by_path_and_version(self, bucket_id: str, object_key: str, version: int) -> Any:
         return await self._db.fetchrow(get_query("get_object_by_path_and_version"), bucket_id, object_key, version)
 

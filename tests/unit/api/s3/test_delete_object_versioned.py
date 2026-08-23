@@ -34,15 +34,17 @@ class _FakeDb:
 
     async def fetchrow(self, query: str, *args: Any) -> Any:
         self._record(query, args)
-        if query == "get_object_version_for_delete":
+        if query == "lock_object_and_get_version":
+            # LEFT JOIN: the locked objects row comes back even when the version is absent,
+            # with NULL version columns.
             row = self.versions.get(int(args[2]))
-            if row is None:
-                return None
+            if row is not None and row.get("deleted"):
+                row = None
             return {
                 "object_id": self.object_id,
-                "object_version": row["object_version"],
-                "is_delete_marker": row.get("is_delete_marker", False),
                 "current_object_version": self.current,
+                "object_version": row["object_version"] if row else None,
+                "is_delete_marker": bool(row.get("is_delete_marker", False)) if row else False,
             }
         if query == "soft_delete_object_version":
             v = int(args[1])
@@ -50,8 +52,6 @@ class _FakeDb:
                 self.versions[v]["deleted"] = True
                 return {"object_id": self.object_id, "object_version": v}
             return None
-        if query == "lock_object_for_update":
-            return {"object_id": self.object_id, "current_object_version": self.current}
         if query == "repoint_current_version_after_delete":
             # Mirrors the SQL: newest live version strictly BELOW the deleted one, or no row.
             below = [v for v, row in self.versions.items() if not row.get("deleted") and v < int(args[1])]

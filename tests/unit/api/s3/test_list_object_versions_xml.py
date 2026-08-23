@@ -241,9 +241,9 @@ async def test_unversioned_bucket_lists_only_current_versions() -> None:
 
     root = ET.fromstring(resp.body)
     assert [_text(v, "VersionId") for v in _children(root, "Version")] == ["4"]
-    # The query must have been asked for current-only.
+    # The query must have been asked for current-only (trailing `current_only` flag).
     assert pool.fetch_args, "expected the listing query to run"
-    assert mod.CURRENT_ONLY in pool.fetch_args[0]
+    assert pool.fetch_args[0][-1] is True
 
 
 @pytest.mark.asyncio

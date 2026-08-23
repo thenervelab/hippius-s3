@@ -27,12 +27,11 @@ config = get_config()
 class _DeletedEntry(NamedTuple):
     """One <Deleted> row. AWS splits the two ids: a version that was removed reports VersionId, a
     delete marker that was created or removed reports DeleteMarkerVersionId, and removing a marker
-    reports both (with the same value)."""
+    reports both (with the same value). `DeleteMarker` is emitted iff the second id is set."""
 
     key: str
     version_id: str | None
     delete_marker_version_id: str | None
-    is_marker: bool
 
 
 def parse_delete_request(root: Any) -> tuple[bool, list[tuple[str, str]]]:
@@ -148,7 +147,6 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                         version_id=str(version_id),
                         # Removing a marker reports the SAME id in both fields, per AWS.
                         delete_marker_version_id=str(version_id) if removed_a_marker else None,
-                        is_marker=removed_a_marker,
                     )
                 )
                 continue
@@ -162,7 +160,6 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                         # undo the delete later.
                         version_id=None,
                         delete_marker_version_id=resp.headers.get("x-amz-version-id"),
-                        is_marker=True,
                     )
                 )
                 continue
@@ -191,7 +188,7 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                 )
 
             # S3 semantics: even if not found, include as Deleted (unless Quiet)
-            deleted_keys.append(_DeletedEntry(key=key, version_id=None, delete_marker_version_id=None, is_marker=False))
+            deleted_keys.append(_DeletedEntry(key=key, version_id=None, delete_marker_version_id=None))
 
         # Build XML response
         resp_root = ET.Element(
@@ -205,9 +202,8 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                 ET.SubElement(d, "Key").text = entry.key
                 if entry.version_id:
                     ET.SubElement(d, "VersionId").text = entry.version_id
-                if entry.is_marker:
-                    ET.SubElement(d, "DeleteMarker").text = "true"
                 if entry.delete_marker_version_id:
+                    ET.SubElement(d, "DeleteMarker").text = "true"
                     ET.SubElement(d, "DeleteMarkerVersionId").text = entry.delete_marker_version_id
 
         for err in errors_list:

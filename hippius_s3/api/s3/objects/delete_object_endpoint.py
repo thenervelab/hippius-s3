@@ -85,11 +85,10 @@ async def delete_object_version(
     # current_object_version off it must be atomic against a concurrent versioned DELETE of a
     # DIFFERENT version, which could otherwise leave the pointer on a soft-deleted row.
     async with db.transaction():
-        await db.fetchrow(get_query("lock_object_for_update"), bucket_id, object_key)
-
-        row = await db.fetchrow(get_query("get_object_version_for_delete"), bucket_id, object_key, version_id)
-        if not row:
-            # Absent or already deleted — AWS treats a versioned DELETE as idempotent.
+        row = await db.fetchrow(get_query("lock_object_and_get_version"), bucket_id, object_key, version_id)
+        if not row or row["object_version"] is None:
+            # Key or version absent, or the version is already deleted — AWS treats a versioned
+            # DELETE as idempotent.
             return Response(status_code=204)
 
         object_id = str(row["object_id"])

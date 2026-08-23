@@ -37,11 +37,7 @@ async def get_object_tags(
             )
 
         try:
-            object_info = await ObjectRepository(db).get_by_path(bucket["bucket_id"], object_key)
-            # A key whose current version is a delete marker is deleted as far as clients
-            # are concerned — get_by_path resolves to the marker, so drop it here.
-            if object_info is not None and object_info["is_delete_marker"]:
-                object_info = None
+            object_info = await ObjectRepository(db).get_serveable_by_path(bucket["bucket_id"], object_key)
         except Exception:
             object_info = None
         if not object_info:
@@ -98,11 +94,7 @@ async def set_object_tags(
             )
 
         try:
-            object_info = await ObjectRepository(db).get_by_path(bucket["bucket_id"], object_key)
-            # A key whose current version is a delete marker is deleted as far as clients
-            # are concerned — get_by_path resolves to the marker, so drop it here.
-            if object_info is not None and object_info["is_delete_marker"]:
-                object_info = None
+            object_info = await ObjectRepository(db).get_serveable_by_path(bucket["bucket_id"], object_key)
         except Exception:
             object_info = None
         if not object_info:
@@ -171,11 +163,7 @@ async def delete_object_tags(
             )
 
         try:
-            object_info = await ObjectRepository(db).get_by_path(bucket["bucket_id"], object_key)
-            # A key whose current version is a delete marker is deleted as far as clients
-            # are concerned — get_by_path resolves to the marker, so drop it here.
-            if object_info is not None and object_info["is_delete_marker"]:
-                object_info = None
+            object_info = await ObjectRepository(db).get_serveable_by_path(bucket["bucket_id"], object_key)
         except Exception:
             object_info = None
         if not object_info:

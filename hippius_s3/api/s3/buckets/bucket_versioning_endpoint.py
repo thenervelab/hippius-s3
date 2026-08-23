@@ -7,6 +7,7 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.utils import get_query
 from hippius_s3.xml_helpers import add_subelement
 from hippius_s3.xml_helpers import create_element
@@ -34,7 +35,7 @@ def _no_such_bucket(bucket_name: str) -> Response:
 
 
 async def handle_get_bucket_versioning(bucket_name: str, db: Any, main_account_id: str) -> Response:
-    bucket = await db.fetchrow(get_query("get_bucket_by_name_and_owner"), bucket_name, main_account_id)
+    bucket = await BucketRepository(db).get_by_name_and_owner(bucket_name, main_account_id)
     if not bucket:
         return _no_such_bucket(bucket_name)
 
@@ -53,11 +54,7 @@ async def handle_get_bucket_versioning(bucket_name: str, db: Any, main_account_i
 
 
 async def handle_put_bucket_versioning(bucket_name: str, request: Request, db: Any) -> Response:
-    bucket = await db.fetchrow(
-        get_query("get_bucket_by_name_and_owner"),
-        bucket_name,
-        request.state.main_account_id,
-    )
+    bucket = await BucketRepository(db).get_by_name_and_owner(bucket_name, request.state.main_account_id)
     if not bucket:
         return _no_such_bucket(bucket_name)
 

@@ -14,6 +14,7 @@ from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import parse_version_id
 from hippius_s3.config import Config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.repositories.buckets import BucketRepository
@@ -57,22 +58,16 @@ def parse_copy_source(copy_source: str | None) -> tuple[str, str, int | None]:
 
 
 def _parse_source_version_id(query: str) -> int | None:
+    # Other query params (partNumber, ...) are not ours to interpret.
     raw = parse_qs(query).get("versionId", [""])[0]
-    # "null" is the version id AWS reports for objects predating versioning; we never mint it, so
-    # it means "current". Other query params (partNumber, ...) are not ours to interpret.
-    if not raw or raw == "null":
-        return None
     try:
-        version_id = int(raw)
-    except ValueError:
-        version_id = 0
-    if version_id <= 0:
+        return parse_version_id(raw)
+    except (ValueError, TypeError) as exc:
         raise errors.S3Error(
             code="InvalidArgument",
             message=f"Invalid version ID: {raw}",
             status_code=400,
-        )
-    return version_id
+        ) from exc
 
 
 async def resolve_copy_resources(

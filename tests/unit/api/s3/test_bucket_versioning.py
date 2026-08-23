@@ -13,9 +13,19 @@ NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 
 
 @pytest.fixture(autouse=True)
-def _query_names(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Let the fake DB branch on query NAME instead of the loaded SQL text."""
+def _query_names(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    """Let the fake DB branch on query NAME instead of the loaded SQL text, and stand in for the
+    bucket lookup (which goes through BucketRepository, with its own get_query import)."""
     monkeypatch.setattr(mod, "get_query", lambda name: name)
+
+    class _FakeBucketRepo:
+        def __init__(self, db: Any) -> None:
+            self._db = db
+
+        async def get_by_name_and_owner(self, _name: str, _owner: str) -> Any:
+            return self._db.bucket
+
+    monkeypatch.setattr(mod, "BucketRepository", _FakeBucketRepo)
 
 
 class _FakeDb:
@@ -26,11 +36,6 @@ class _FakeDb:
     ) -> None:
         self.bucket = bucket
         self.executed: list[tuple[str, tuple[Any, ...]]] = []
-
-    async def fetchrow(self, query: str, *args: Any) -> Any:
-        if query in ("get_bucket_by_name_and_owner", "get_bucket_by_name"):
-            return self.bucket
-        return None
 
     async def execute(self, query: str, *args: Any) -> str:
         self.executed.append((query, args))
