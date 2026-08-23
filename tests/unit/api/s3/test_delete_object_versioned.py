@@ -50,12 +50,15 @@ class _FakeDb:
                 self.versions[v]["deleted"] = True
                 return {"object_id": self.object_id, "object_version": v}
             return None
-        if query == "next_live_object_version":
-            live = [v for v, row in self.versions.items() if not row.get("deleted") and v != int(args[1])]
-            return {"object_version": max(live)} if live else None
-        if query == "swap_current_version_cas":
-            self.current = int(args[2])
+        if query == "lock_object_for_update":
             return {"object_id": self.object_id, "current_object_version": self.current}
+        if query == "repoint_current_version_after_delete":
+            # Mirrors the SQL: newest live version strictly BELOW the deleted one, or no row.
+            below = [v for v, row in self.versions.items() if not row.get("deleted") and v < int(args[1])]
+            if not below:
+                return None
+            self.current = max(below)
+            return {"current_object_version": self.current}
         if query == "insert_delete_marker":
             new_v = max(self.versions) + 1 if self.versions else 1
             self.versions[new_v] = {"object_version": new_v, "is_delete_marker": True}
@@ -67,13 +70,25 @@ class _FakeDb:
 
     async def fetch(self, query: str, *args: Any) -> list[Any]:
         self._record(query, args)
-        if query == "list_object_versions_for_unpin":
-            return [{"object_version": v} for v in sorted(self.versions)]
         return []
 
     async def execute(self, query: str, *args: Any) -> str:
         self._record(query, args)
         return "OK"
+
+    def transaction(self) -> Any:
+        db = self
+
+        class _Txn:
+            async def __aenter__(self) -> Any:
+                db._record("BEGIN", ())
+                return db
+
+            async def __aexit__(self, *_exc: Any) -> bool:
+                db._record("COMMIT", ())
+                return False
+
+        return _Txn()
 
 
 def _request(version_id: str | None = None) -> Any:
@@ -157,7 +172,7 @@ async def test_versioned_delete_of_current_rolls_pointer_back(wiring: dict[str, 
     resp = await mod.handle_delete_object("b", "k", _request("2"), db, None)
 
     assert resp.status_code == 204
-    assert db.args_for("swap_current_version_cas") == [("obj-1", 2, 1)]
+    assert db.args_for("repoint_current_version_after_delete") == [("obj-1", 2)]
     assert db.current == 1
     assert _unpinned_versions(wiring["enqueued"]) == [2]
 
@@ -233,7 +248,12 @@ async def test_simple_delete_on_enabled_bucket_inserts_marker(wiring: dict[str, 
 async def test_simple_delete_on_unversioned_bucket_unpins_every_version(
     wiring: dict[str, Any],
 ) -> None:
-    """The storage leak: prod only ever unpinned `current_object_version`."""
+    """The storage leak: prod only ever unpinned `current_object_version`.
+
+    The fix enqueues ONE request with object_version=None, meaning "every version". Fanning out
+    per version here would be O(versions) work inside the request — prod holds an object with
+    646,993 of them — so the unpinner resolves the list under its own batching instead.
+    """
     db = _FakeDb(
         versions=[{"object_version": 1}, {"object_version": 2}, {"object_version": 3}],
         current=3,
@@ -243,7 +263,8 @@ async def test_simple_delete_on_unversioned_bucket_unpins_every_version(
     assert resp.status_code == 204
     assert "soft_delete_object" in db.names()
     assert "insert_delete_marker" not in db.names()
-    assert _unpinned_versions(wiring["enqueued"]) == [1, 2, 3]
+    assert len(wiring["enqueued"]) == 1, "must not fan out per version on the request path"
+    assert wiring["enqueued"][0].object_version is None
 
 
 @pytest.mark.asyncio

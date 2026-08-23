@@ -167,10 +167,10 @@ loss, and the unpin leak.
 | `ListObjectVersions` | `GET /bucket?versions` with `prefix`, `delimiter`, `key-marker`, `version-id-marker`, `max-keys`, `encoding-type`, and real `(key, version)` keyset pagination. |
 | Delete markers | Simple `DELETE` on an `Enabled` bucket inserts a marker. `GET`/`HEAD` 404 with `x-amz-delete-marker: true`; an explicit `?versionId` on a marker returns 405. |
 | Versioned `DELETE` | Deletes **only** the named version, rolling the current pointer back to the next-newest. Deleting a marker is an undelete. |
-| `DeleteObjects` | Accepts per-key `VersionId`. |
-| `CopyObject` | Honours `?versionId=` on `x-amz-copy-source` — version restore works. |
-| `x-amz-version-id` | Returned on `PutObject`, `CopyObject`, and `CompleteMultipartUpload`. |
-| Unpin leak | Object delete enqueues one unpin **per version**. |
+| `DeleteObjects` | Accepts per-key `VersionId`, and reports `VersionId` / `DeleteMarkerVersionId` the way AWS splits them. |
+| `CopyObject` / `UploadPartCopy` | Honour `?versionId=` on `x-amz-copy-source` — version restore works, including for sources large enough to need a multipart copy. |
+| `x-amz-version-id` | Returned on `PutObject`, `CopyObject`, and `CompleteMultipartUpload`; `x-amz-copy-source-version-id` on copies. |
+| Unpin leak | Object delete enqueues one unpin covering **every** version. |
 | Backlog repair | `scripts/backfill_superseded_version_unpins.py` (dry-run by default) + a k8s Job. |
 
 ### 5.1 Version ID format
@@ -207,8 +207,36 @@ The unpinner resolves backend identifiers *at processing time*, by joining
 queued unpin with nothing to find — leaking the backend data, which is the exact bug being fixed.
 
 So a version DELETE marks a new `object_versions.deleted_at`, enqueues the unpin, and repoints
-`current_object_version`. The janitor reaps the row via `delete_version_and_parts.sql` once every
-`chunk_backend` row is confirmed deleted.
+`current_object_version`. A janitor sweep then reclaims the `parts` rows once every `chunk_backend`
+row is confirmed deleted, on the same two-tier readiness gate the object-level hard delete uses:
+no live backend copy, **and** either evidence the version was replicated at all or a 24-hour age.
+That second tier matters — a version deleted while its upload is still queued has *zero*
+`chunk_backend` rows, and reaping it there would strand the upload and orphan the bytes on Arion.
+
+The `object_versions` row itself is deliberately kept as a tombstone. Version allocation is
+`GREATEST(current_object_version, MAX(object_version)) + 1`, and a versioned DELETE moves
+`current_object_version` *down*; removing the row would let `MAX` drop too and re-mint a version
+number that already existed — colliding with stale FS cache under `v<version>/` and letting a
+queued unpin target live data. The tombstone costs one narrow row and is removed when the object is
+hard-deleted.
+
+### 5.4 Why unpinning superseded versions cannot destroy live data
+
+Deleting one version of a *live* object is the first path that unpins a version while siblings
+remain readable, so it depends on backend identifiers never being shared between versions of the
+same object.
+
+They cannot be. Each `object_version` gets its own DEK, and chunk ciphertext is bound to
+`(bucket_id, object_id, object_version)` through the AEAD AAD — so identical plaintext written
+twice to the same key produces *different* ciphertext, hence a different content hash and a
+different identifier. (This is the same binding that keeps the v5 copy fast path disabled.)
+Confirmed empirically on prod: a two-version object has 5 `chunk_backend` rows and 5 distinct
+identifiers.
+
+Note this is narrower than "identifiers are globally unique" — they are not, and
+`insert_chunk_backend.sql` says so: a content-addressed backend returns the same identifier for the
+same bytes, so two *different objects* holding identical ciphertext can share one. That is
+pre-existing and unchanged here; what this change relies on is only the per-version property above.
 
 ---
 
@@ -226,15 +254,30 @@ So a version DELETE marks a new `object_versions.deleted_at`, enqueues the unpin
 
 ## 7. Operational notes
 
-- The migration adds three columns. All are metadata-only on PostgreSQL 18.1 (nullable, or
-  `NOT NULL DEFAULT false`), so they are safe against the 144M-row `object_versions` table.
-- Backend identifiers are unique per chunk row with no sharing across versions — verified on prod: a
-  two-version object has 5 `chunk_backend` rows and 5 distinct identifiers. This is what makes
-  "unpin all versions" safe rather than a way to destroy live data. If the currently-dead v5 copy
-  fast path (`should_use_v5_fast_path` hardcodes `False`) is ever re-enabled, re-verify that
-  property — it reuses source identifiers via duplicated `part_chunks`.
-- Enabling versioning on a bucket is irreversible in AWS and here. With no lifecycle expiration
-  (§6), an `Enabled` bucket accrues versions indefinitely.
+- **Two migrations, deliberately.** `20260822120000` adds the three columns — all metadata-only on
+  PostgreSQL 18.1 (nullable, or `NOT NULL DEFAULT false`), so no table rewrite. `20260822120001`
+  builds the partial index `CONCURRENTLY` under `transaction:false`. They cannot be one file: a
+  plain `CREATE INDEX` takes a lock that blocks writes for the whole build, and the build must scan
+  the full ~49 GB heap to evaluate the partial predicate. Since migrations run on API pod startup,
+  that would be a multi-minute data-plane outage. Same shape as
+  `20260706000000_parts_upload_uploaded_at_index.sql`, including its invalid-index recovery caveat.
+- **Object delete enqueues one unpin, not one per version.** The unpin request carries a NULL
+  version meaning "every version", and the unpinner expands it under its own batching. Expanding it
+  in the handler is not viable: prod holds an object with **646,993** versions (S4 append mints one
+  per append), so a single DELETE would run a 647k-row join and push 647k queue entries before
+  responding — a replay of the 1.29M-entry unpin overrun that made redis slow enough to break prod
+  GETs.
+- **Delete-marked keys stay in the active-objects index.** `idx_objects_bucket_prefix_active` is
+  partial on `deleted_at IS NULL`, and a versioned DELETE deliberately leaves `objects.deleted_at`
+  alone. So on a versioning-enabled bucket, deleted keys keep occupying the index that `ListObjects`
+  scans, and are filtered out per row. A bucket that is mostly delete-marked pays proportionally
+  more index rows per listing page, indefinitely. Combined with the absence of lifecycle expiration
+  (§6), this is the main reason not to recommend versioning for a high-churn workload yet.
+- Enabling versioning on a bucket is irreversible in AWS and here, and `Suspended` is not
+  implemented — so today enabling it is a **one-way door** with no API-level way to stop accruing
+  versions and no `NoncurrentVersionExpiration` to prune them. Treat it as opt-in per bucket,
+  deliberately, until one of those lands.
 - The existing backlog is not repaired by deploying this change. Run
   `backfill_superseded_version_unpins.py --dry-run` first; it reports object count and reclaimable
-  bytes before anything is enqueued.
+  bytes before anything is enqueued. Sanity-check the totals against §4 (~70k objects, ~5.6 TB)
+  before applying — a wildly different figure means something else changed.

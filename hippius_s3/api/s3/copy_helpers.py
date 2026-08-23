@@ -123,9 +123,18 @@ async def resolve_copy_resources(
             status_code=404,
         )
 
-    # A delete marker has no bytes to copy; AWS answers a GET on one with 405, and a copy from one
-    # is the same category of mistake.
+    # A delete marker has no bytes to copy. AWS distinguishes the two ways you can reach one: if
+    # the key's CURRENT version is a marker the object simply looks deleted (404 NoSuchKey), and
+    # only addressing the marker explicitly by version is a 405. The distinction matters because
+    # `except ClientError as e: e.response["Error"]["Code"] == "NoSuchKey"` is the common guard,
+    # and aws-cli/rclone treat a 405 as a hard error rather than "source is gone".
     if source_object.get("is_delete_marker"):
+        if source_version_id is None:
+            raise errors.S3Error(
+                code="NoSuchKey",
+                message=f"The specified key {source_object_key} does not exist",
+                status_code=404,
+            )
         raise errors.S3Error(
             code="MethodNotAllowed",
             message="The specified version is a delete marker and has no content",
@@ -183,7 +192,12 @@ async def should_use_v5_fast_path(
     return False, None, "v5_fast_path_disabled_object_id_binding"
 
 
-def build_copy_success_response(etag: str, last_modified: datetime, version_id: int | None = None) -> Response:
+def build_copy_success_response(
+    etag: str,
+    last_modified: datetime,
+    version_id: int | None = None,
+    source_version_id: int | None = None,
+) -> Response:
     root = ET.Element("CopyObjectResult")
     etag_elem = ET.SubElement(root, "ETag")
     etag_elem.text = etag or ""
@@ -199,6 +213,9 @@ def build_copy_success_response(etag: str, last_modified: datetime, version_id: 
     headers = {"ETag": f'"{etag}"' if etag else '""'}
     if version_id is not None:
         headers["x-amz-version-id"] = str(version_id)
+    if source_version_id is not None:
+        # AWS reports which SOURCE version was read, so a restore flow can confirm what it got.
+        headers["x-amz-copy-source-version-id"] = str(source_version_id)
 
     return Response(
         content=xml_bytes,
@@ -310,4 +327,9 @@ async def handle_streaming_copy(
             str(put_res.upload_id),
         )
 
-    return build_copy_success_response(put_res.etag, copy_created_at, int(put_res.object_version))
+    return build_copy_success_response(
+        put_res.etag,
+        copy_created_at,
+        int(put_res.object_version),
+        int(src_obj_row.get("object_version") or 1),
+    )

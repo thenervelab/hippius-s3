@@ -2168,14 +2168,17 @@ def _load_version_reap_cursor(state: dict[str, Any] | None) -> tuple[datetime, s
 
 
 async def reap_deleted_object_versions(pool: asyncpg.Pool) -> int:
-    """Drop object_versions rows left behind by a versioned DELETE, once their backend copies are
-    confirmed gone.
+    """Reclaim the `parts` rows of versions left behind by a versioned DELETE, once their backend
+    copies are confirmed gone.
 
-    A versioned DELETE cannot drop the row itself: the unpinner resolves backend identifiers at
+    A versioned DELETE cannot drop those rows itself: the unpinner resolves backend identifiers at
     processing time by joining parts/part_chunks/chunk_backend, so deleting them in the request
     handler would strand the queued unpin and leak the backend copy. The endpoint marks
     object_versions.deleted_at instead (making the version invisible to every read), and this sweep
     finishes the job.
+
+    The object_versions row itself is deliberately KEPT as a tombstone so version numbers stay
+    monotonic — see reap_deleted_version_parts.sql. It goes away with the object's hard-delete.
 
     Same ring discipline as gc_soft_deleted_objects: reap only the ready rows, but advance the
     cursor over the whole slice so an unready head cannot block everything behind it."""
@@ -2193,15 +2196,22 @@ async def reap_deleted_object_versions(pool: asyncpg.Pool) -> int:
 
         ready = sum(1 for r in rows if r["ready"])
         reaped = 0
+        skipped = 0
         for row in rows:
             if not row["ready"]:
                 continue  # cursor still advances past it below — no head-of-line block
             try:
-                await db.fetchrow(
-                    get_query("delete_version_and_parts"),
+                # Guarded delete re-verifies readiness atomically (mirrors the finder), so a
+                # version whose lagging upload landed between the find and here is left untouched.
+                # "DELETE 0" => skipped, not reaped.
+                tag = await db.execute(
+                    get_query("reap_deleted_version_parts"),
                     row["object_id"],
                     row["object_version"],
                 )
+                if tag == "DELETE 0":
+                    skipped += 1
+                    continue
                 reaped += 1
             except Exception as e:
                 logger.warning(
@@ -2219,10 +2229,11 @@ async def reap_deleted_object_versions(pool: asyncpg.Pool) -> int:
             },
         )
         logger.info(
-            "Version-reap cycle: scanned=%d ready=%d reaped=%d wrapped=False",
+            "Version-reap cycle: scanned=%d ready=%d reaped=%d skipped=%d wrapped=False",
             len(rows),
             ready,
             reaped,
+            skipped,
         )
     return reaped
 

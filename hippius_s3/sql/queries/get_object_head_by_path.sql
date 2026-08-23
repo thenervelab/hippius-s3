@@ -20,7 +20,8 @@ WITH object_info AS (
         ov.append_version,
         b.bucket_name,
         ov.object_version AS object_version,
-        ov.is_delete_marker
+        ov.is_delete_marker,
+        COALESCE(ov.last_modified, ov.created_at) AS version_last_modified
     FROM objects o
     JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = (
         SELECT v.object_version
@@ -56,6 +57,7 @@ SELECT
     oi.bucket_name,
     oi.object_version,
     oi.is_delete_marker,
+    oi.version_last_modified,
     arion.backend_identifier AS arion_file_hash
 FROM object_info oi
 LEFT JOIN LATERAL (

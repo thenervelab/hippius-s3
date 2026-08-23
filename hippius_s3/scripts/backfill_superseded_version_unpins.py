@@ -37,10 +37,20 @@ logger = logging.getLogger("backfill_superseded_unpins")
 _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 _ZERO_UUID = "00000000-0000-0000-0000-000000000000"
 
-# Soft-deleted objects past the grace window that still hold live backend copies on a version
-# OTHER than the one the original delete unpinned. Keyset-paged on (deleted_at, object_id) via
-# idx_objects_deleted, and MATERIALIZED so the per-object EXISTS probes run against a small slice
-# instead of folding into a hash join over the ~336M-row chunk_backend table.
+# Soft-deleted objects past the grace window, each flagged with whether it still holds a live
+# backend copy on a version OTHER than the one the original delete unpinned.
+#
+# The slice is returned UNFILTERED with a per-row `needs_unpin` boolean, mirroring
+# find_objects_ready_for_hard_delete. Filtering inside the query would make a page where no
+# candidate qualifies come back empty, which the caller cannot distinguish from "scan exhausted" —
+# and since most soft-deleted objects have only one version, the very first page would end the run.
+#
+# Byte accounting comes from object_versions, NOT from the chunk join: summing size_bytes across
+# parts x part_chunks x chunk_backend counts each version once per (chunk x backend) row, which
+# inflates the figure by orders of magnitude — and that figure is what gates the prod run.
+#
+# Keyset-paged on (deleted_at, object_id) via idx_objects_deleted, MATERIALIZED so the per-object
+# probes run against a small slice instead of folding into a hash join over ~343M chunk_backend rows.
 _SELECT = """
 WITH c AS MATERIALIZED (
     SELECT object_id, current_object_version, deleted_at, bucket_id
@@ -52,27 +62,26 @@ WITH c AS MATERIALIZED (
     LIMIT $1
 )
 SELECT c.object_id,
-       c.current_object_version,
        c.deleted_at,
        b.main_account_id,
-       v.versions,
-       v.reclaimable_bytes
+       EXISTS (
+           SELECT 1
+           FROM parts p
+           JOIN part_chunks pc ON pc.part_id = p.part_id
+           JOIN chunk_backend cb ON cb.chunk_id = pc.id
+           WHERE p.object_id = c.object_id
+             AND NOT cb.deleted
+             AND cb.backend_identifier IS NOT NULL
+             AND p.object_version <> c.current_object_version
+       ) AS needs_unpin,
+       COALESCE((
+           SELECT sum(ov.size_bytes)
+           FROM object_versions ov
+           WHERE ov.object_id = c.object_id
+             AND ov.object_version <> c.current_object_version
+       ), 0) AS superseded_bytes
 FROM c
 JOIN buckets b ON b.bucket_id = c.bucket_id
-CROSS JOIN LATERAL (
-    SELECT array_agg(DISTINCT p.object_version) AS versions,
-           COALESCE(sum(ov.size_bytes), 0) AS reclaimable_bytes
-    FROM parts p
-    JOIN part_chunks pc ON pc.part_id = p.part_id
-    JOIN chunk_backend cb ON cb.chunk_id = pc.id
-    LEFT JOIN object_versions ov
-           ON ov.object_id = p.object_id AND ov.object_version = p.object_version
-    WHERE p.object_id = c.object_id
-      AND NOT cb.deleted
-      AND cb.backend_identifier IS NOT NULL
-      AND p.object_version <> c.current_object_version
-) v
-WHERE v.versions IS NOT NULL
 ORDER BY c.deleted_at, c.object_id
 """
 
@@ -94,47 +103,52 @@ async def main_async(args: argparse.Namespace) -> int:
 
     cursor_at = _EPOCH
     cursor_id = _ZERO_UUID
-    objects = 0
-    versions = 0
+    scanned = 0
+    matched = 0
     reclaimable = 0
 
     try:
-        while args.limit <= 0 or objects < args.limit:
-            batch = min(args.batch, args.limit - objects) if args.limit > 0 else args.batch
-            rows = await db.fetch(_SELECT, batch, cursor_at, cursor_id, str(args.older_than_hours))
+        while args.limit <= 0 or matched < args.limit:
+            rows = await db.fetch(_SELECT, args.batch, cursor_at, cursor_id, str(args.older_than_hours))
             if not rows:
-                break
+                break  # the ring is exhausted: no candidates at all past the cursor
 
             for row in rows:
-                object_id = str(row["object_id"])
-                stale_versions = sorted(int(v) for v in row["versions"])
-                objects += 1
-                versions += len(stale_versions)
-                reclaimable += int(row["reclaimable_bytes"] or 0)
+                scanned += 1
+                if not row["needs_unpin"]:
+                    continue
+
+                matched += 1
+                reclaimable += int(row["superseded_bytes"] or 0)
 
                 if args.apply:
-                    for object_version in stale_versions:
-                        await enqueue_unpin_request(
-                            payload=UnpinChainRequest(
-                                address=row["main_account_id"],
-                                object_id=object_id,
-                                object_version=object_version,
-                                ray_id=None,
-                            )
+                    # One request per object, NULL version = "every version". The unpinner resolves
+                    # the list under its own batching; expanding it here would enqueue hundreds of
+                    # thousands of entries for a heavily-appended object.
+                    await enqueue_unpin_request(
+                        payload=UnpinChainRequest(
+                            address=row["main_account_id"],
+                            object_id=str(row["object_id"]),
+                            object_version=None,
+                            ray_id=None,
                         )
+                    )
                     # Pace the enqueue so a large backlog cannot flood redis-queues the way the
                     # 1.29M-entry unpin overrun did.
                     if args.sleep_ms:
                         await asyncio.sleep(args.sleep_ms / 1000.0)
+
+                if args.limit > 0 and matched >= args.limit:
+                    break
 
             last = rows[-1]
             cursor_at = last["deleted_at"]
             cursor_id = str(last["object_id"])
 
             logger.info(
-                "progress: objects=%d versions=%d reclaimable=%s cursor=%s",
-                objects,
-                versions,
+                "progress: scanned=%d matched=%d reclaimable=%s cursor=%s",
+                scanned,
+                matched,
                 _fmt_bytes(reclaimable),
                 cursor_at.isoformat(),
             )
@@ -144,10 +158,10 @@ async def main_async(args: argparse.Namespace) -> int:
 
     mode = "ENQUEUED" if args.apply else "DRY RUN (nothing enqueued)"
     logger.info(
-        "%s — objects=%d superseded_versions=%d reclaimable=%s",
+        "%s — scanned=%d objects_needing_unpin=%d reclaimable=%s",
         mode,
-        objects,
-        versions,
+        scanned,
+        matched,
         _fmt_bytes(reclaimable),
     )
     return 0

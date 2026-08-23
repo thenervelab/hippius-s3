@@ -9,6 +9,7 @@ from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import parse_version_id
 from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.config import get_config
 from hippius_s3.db_retry import retry_on_object_version_conflict
@@ -23,58 +24,49 @@ logger = logging.getLogger(__name__)
 config = get_config()
 tracer = trace.get_tracer(__name__)
 
-# AWS clients send the literal "null" as the version id of an object that predates versioning.
-# We never mint that id, so it means "whatever the current version is" — i.e. a plain DELETE.
-NULL_VERSION_ID = "null"
 
-
-def parse_version_id(raw: str | None) -> tuple[int | None, Response | None]:
+def parse_version_id_or_error(raw: str | None) -> tuple[int | None, Response | None]:
     """Returns (version_id, error). A None version_id means "no version specified"."""
-    if raw is None or raw == "" or raw == NULL_VERSION_ID:
-        return None, None
     try:
-        version_id = int(raw)
-    except ValueError:
-        version_id = 0
-    if version_id <= 0:
+        return parse_version_id(raw), None
+    except (ValueError, TypeError):
         return None, errors.s3_error_response(
             "InvalidArgument",
             f"Invalid version ID: {raw}",
             status_code=400,
         )
-    return version_id, None
 
 
-async def enqueue_unpins_for_versions(
+async def enqueue_object_unpin(
     db: Any,
     *,
     object_id: str,
-    versions: list[int],
+    object_version: int | None,
     address: str,
     ray_id: str | None,
 ) -> None:
-    """Enqueue one unpin per version.
+    """Enqueue ONE unpin. `object_version=None` means "every version of this object".
 
-    Deliberately one request per version rather than a single NULL-version request meaning "all
-    versions, resolved later": a re-PUT between the soft delete and the unpin revives the object
-    and changes what NULL would resolve to. Resolving the list here is race-free, and
-    `get_chunk_backend_identifiers` still refuses to hand back the current version of a live
-    object. Backends are resolved once across all versions rather than per version.
+    Fanning out one request per version is not viable on the request path: prod holds an object
+    with 646,993 versions (S4 append churn mints a version per append), so a single DELETE would
+    run a 647k-row join and LPUSH 647k queue entries before responding — a replay of the 1.29M
+    `arion_unpin_requests` overrun that made redis slow enough to break prod GETs.
+
+    A NULL version defers the resolution to the unpinner, which already handles it
+    (`get_chunk_backend_identifiers` takes a nullable version) under its own batching and pacing.
+    The revive race is covered there too: that query's guard refuses to return the current version
+    of a live object, so a re-PUT between the soft delete and the unpin cannot destroy live data.
     """
-    if not versions:
-        return
-
-    db_backends = await resolve_object_backends(db, object_id, None)
-    for object_version in versions:
-        await enqueue_unpin_request(
-            payload=UnpinChainRequest(
-                address=address,
-                object_id=object_id,
-                object_version=object_version,
-                ray_id=ray_id,
-                delete_backends=db_backends if db_backends else None,
-            )
+    db_backends = await resolve_object_backends(db, object_id, object_version)
+    await enqueue_unpin_request(
+        payload=UnpinChainRequest(
+            address=address,
+            object_id=object_id,
+            object_version=object_version,
+            ray_id=ray_id,
+            delete_backends=db_backends if db_backends else None,
         )
+    )
 
 
 async def delete_object_version(
@@ -89,40 +81,39 @@ async def delete_object_version(
     This used to ignore the version id entirely and soft-delete the whole object, taking every
     version with it — a silent data loss for any client pruning old versions.
     """
-    row = await db.fetchrow(get_query("get_object_version_for_delete"), bucket_id, object_key, version_id)
-    if not row:
-        # Absent or already deleted — AWS treats a versioned DELETE as idempotent.
-        return Response(status_code=204)
+    # One transaction with the objects row locked up front: soft-deleting the version and moving
+    # current_object_version off it must be atomic against a concurrent versioned DELETE of a
+    # DIFFERENT version, which could otherwise leave the pointer on a soft-deleted row.
+    async with db.transaction():
+        await db.fetchrow(get_query("lock_object_for_update"), bucket_id, object_key)
 
-    object_id = str(row["object_id"])
-    is_delete_marker = bool(row["is_delete_marker"])
-    was_current = int(row["current_object_version"]) == version_id
+        row = await db.fetchrow(get_query("get_object_version_for_delete"), bucket_id, object_key, version_id)
+        if not row:
+            # Absent or already deleted — AWS treats a versioned DELETE as idempotent.
+            return Response(status_code=204)
 
-    deleted = await db.fetchrow(get_query("soft_delete_object_version"), object_id, version_id)
-    if not deleted:
-        return Response(status_code=204)
+        object_id = str(row["object_id"])
+        is_delete_marker = bool(row["is_delete_marker"])
+        was_current = int(row["current_object_version"]) == version_id
 
-    if was_current:
-        # Removing the current version exposes the next-newest one. With nothing left to point at,
-        # the object itself goes, which is the pre-existing whole-object soft-delete path.
-        successor = await db.fetchrow(get_query("next_live_object_version"), object_id, version_id)
-        if successor:
-            await db.fetchrow(
-                get_query("swap_current_version_cas"),
-                object_id,
-                version_id,
-                int(successor["object_version"]),
-            )
-        else:
-            await db.fetchrow(get_query("soft_delete_object"), bucket_id, object_key)
+        deleted = await db.fetchrow(get_query("soft_delete_object_version"), object_id, version_id)
+        if not deleted:
+            return Response(status_code=204)
+
+        if was_current:
+            # Removing the current version exposes the next-newest one. With nothing left to point
+            # at, the object itself goes — the pre-existing whole-object soft-delete path.
+            repointed = await db.fetchrow(get_query("repoint_current_version_after_delete"), object_id, version_id)
+            if not repointed:
+                await db.fetchrow(get_query("soft_delete_object"), bucket_id, object_key)
 
     # A delete marker holds no data, so there is nothing to unpin. Must run AFTER the pointer
     # moves: get_chunk_backend_identifiers refuses to unpin the current version of a live object.
     if not is_delete_marker:
-        await enqueue_unpins_for_versions(
+        await enqueue_object_unpin(
             db,
             object_id=object_id,
-            versions=[version_id],
+            object_version=version_id,
             address=request.state.main_account_id,
             ray_id=getattr(request.state, "ray_id", None),
         )
@@ -161,7 +152,7 @@ async def handle_delete_object(
     redis_client: Any,
 ) -> Response:
     # Abort multipart upload path is handled in the router before delegating to us
-    version_id, invalid = parse_version_id(request.query_params.get("versionId"))
+    version_id, invalid = parse_version_id_or_error(request.query_params.get("versionId"))
     if invalid is not None:
         return invalid
 
@@ -223,25 +214,23 @@ async def handle_delete_object(
             except Exception:
                 logger.debug("Failed to cleanup provisional multipart uploads on object delete", exc_info=True)
 
-        # Every version that still holds a backend copy, not just the current one. Unpinning only
-        # current_object_version left superseded versions pinned forever, which also wedged the
-        # object's hard-delete: its readiness gate waits on ALL versions being unpinned.
-        rows = await db.fetch(get_query("list_object_versions_for_unpin"), object_id)
-        versions = [int(r["object_version"]) for r in rows] or [object_version]
-
         with tracer.start_as_current_span(
             "delete_object.enqueue_unpin",
             attributes={
                 "object_id": object_id,
                 "has_object_id": True,
                 "object_version": object_version,
-                "unpinned_versions": len(versions),
             },
         ):
-            await enqueue_unpins_for_versions(
+            # NULL version = every version of this object. Unpinning only current_object_version
+            # left superseded versions pinned forever, which also wedged the object's hard-delete
+            # (its readiness gate waits on ALL versions). Resolving the version list here instead
+            # would be O(versions) work on the request path — prod holds an object with 646,993 of
+            # them — so the unpinner resolves it under its own batching.
+            await enqueue_object_unpin(
                 db,
                 object_id=object_id,
-                versions=versions,
+                object_version=None,
                 address=request.state.main_account_id,
                 ray_id=getattr(request.state, "ray_id", None),
             )

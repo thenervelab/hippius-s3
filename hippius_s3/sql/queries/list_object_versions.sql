@@ -40,10 +40,19 @@ WHERE o.bucket_id = $1
   AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
   -- Bounded on both ends so the (bucket_id, object_key) index range cannot scan to partition end.
   AND ($6::text IS NULL OR o.object_key < $6::text COLLATE "C")
+  -- Redundant but load-bearing: the precise marker clause below spans BOTH tables in its third
+  -- branch, so the planner demotes the whole disjunction to a Filter and every page re-scans the
+  -- bucket's key range from the start (measured: 439 pages x ~220k rows on a 438k-key bucket).
+  -- This single-table lower bound is implied by that clause, so it changes no results, but it does
+  -- give the (bucket_id, object_key) index an Index Cond — measured cost 84206 -> 5769.
+  AND ($3::text IS NULL OR o.object_key >= $3::text)
   AND (
         $3::text IS NULL
         OR o.object_key > $3::text
-        OR (o.object_key = $3::text AND ($4::bigint IS NULL OR ov.object_version <= $4::bigint))
+        -- key-marker WITHOUT version-id-marker is EXCLUSIVE per AWS: resume strictly after the
+        -- key. Making this branch unconditional would re-emit every version of the marker key,
+        -- which loops forever for a client paginating on key-marker alone.
+        OR (o.object_key = $3::text AND $4::bigint IS NOT NULL AND ov.object_version <= $4::bigint)
       )
   AND (ov.is_delete_marker OR ov.size_bytes > 0 OR (ov.md5_hash IS NOT NULL AND ov.md5_hash != ''))
   AND (NOT $7::boolean OR ov.object_version = o.current_object_version)

@@ -12,6 +12,10 @@ SELECT o.object_id, o.bucket_id, o.object_key,
        ov.enc_chunk_size_bytes,
        ov.kek_id,
        ov.wrapped_dek,
+       -- Projected because the version-resolution subquery below now ADMITS delete markers (it
+       -- has to — otherwise resolution falls through to the previous content version and serves
+       -- deleted data). Callers that copy or serve these bytes must reject a marker explicitly.
+       ov.is_delete_marker,
        b.bucket_name
 FROM objects o
 JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = (

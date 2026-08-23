@@ -19,6 +19,7 @@ from hippius_s3.api.s3.common import if_none_match_matches
 from hippius_s3.api.s3.common import parse_range
 from hippius_s3.api.s3.common import parse_read_mode
 from hippius_s3.api.s3.common import parse_response_overrides
+from hippius_s3.api.s3.common import parse_version_id
 from hippius_s3.api.s3.range_utils import parse_range_header
 from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
@@ -66,19 +67,15 @@ async def handle_get_object(
             async with pool.acquire() as conn:
                 return await list_parts_internal(bucket_name, object_key, request, conn)
 
-    # Parse versionId query parameter
-    version_id = None
-    if "versionId" in request.query_params:
-        try:
-            version_id = int(request.query_params["versionId"])
-            if version_id <= 0:
-                raise ValueError("Version must be positive")
-        except (ValueError, TypeError):
-            return errors.s3_error_response(
-                code="InvalidArgument",
-                message=f"Invalid version ID: {request.query_params.get('versionId')}",
-                status_code=400,
-            )
+    # Parse versionId query parameter ("null" means the current version, per AWS)
+    try:
+        version_id = parse_version_id(request.query_params.get("versionId"))
+    except (ValueError, TypeError):
+        return errors.s3_error_response(
+            code="InvalidArgument",
+            message=f"Invalid version ID: {request.query_params.get('versionId')}",
+            status_code=400,
+        )
 
     # Parse read mode and range
     hdr_mode = parse_read_mode(request)
@@ -217,7 +214,11 @@ async def handle_get_object(
         # A delete marker has no bytes. AWS answers a plain GET on one with 404 and an explicit
         # ?versionId= on one with 405, both carrying x-amz-delete-marker: true.
         if object_info.get("is_delete_marker"):
-            marker_headers = {"x-amz-delete-marker": "true"}
+            marker_version = int(object_info.get("object_version") or 1)
+            marker_headers = {
+                "x-amz-delete-marker": "true",
+                "x-amz-version-id": str(marker_version),
+            }
             if version_id is None:
                 return errors.s3_error_response(
                     code="NoSuchKey",
@@ -232,7 +233,8 @@ async def handle_get_object(
                 status_code=405,
                 extra_headers={
                     **marker_headers,
-                    "Last-Modified": object_info["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                    # The marker's own timestamp — `created_at` is the key's first PUT.
+                    "Last-Modified": object_info["version_last_modified"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
                 },
                 Key=object_key,
                 VersionId=str(version_id),

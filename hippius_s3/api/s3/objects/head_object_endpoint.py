@@ -15,6 +15,7 @@ from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.common import apply_response_overrides
 from hippius_s3.api.s3.common import if_none_match_matches
 from hippius_s3.api.s3.common import parse_response_overrides
+from hippius_s3.api.s3.common import parse_version_id
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.utils import get_query
@@ -115,21 +116,17 @@ async def handle_head_object(
     # split moved this off the rebound account.main_account onto its own state key.
     main_account_id = request.state.main_account_id
 
-    # Parse versionId query parameter
-    version_id = None
-    if "versionId" in request.query_params:
-        try:
-            version_id = int(request.query_params["versionId"])
-            if version_id <= 0:
-                raise ValueError("Version must be positive")
-        except (ValueError, TypeError):
-            return Response(
-                status_code=400,
-                headers={
-                    "x-amz-error-code": "InvalidArgument",
-                    "x-amz-error-message": f"Invalid version ID: {request.query_params.get('versionId')}",
-                },
-            )
+    # Parse versionId query parameter ("null" means the current version, per AWS)
+    try:
+        version_id = parse_version_id(request.query_params.get("versionId"))
+    except (ValueError, TypeError):
+        return Response(
+            status_code=400,
+            headers={
+                "x-amz-error-code": "InvalidArgument",
+                "x-amz-error-message": f"Invalid version ID: {request.query_params.get('versionId')}",
+            },
+        )
 
     # Tagging HEAD: only verify existence
     if "tagging" in request.query_params:
@@ -185,7 +182,8 @@ async def handle_head_object(
         if row.get("is_delete_marker"):
             marker_headers = {
                 "x-amz-delete-marker": "true",
-                "Last-Modified": row["created_at"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                # The marker's own timestamp — `created_at` is the key's first PUT.
+                "Last-Modified": row["version_last_modified"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
                 "x-amz-version-id": str(int(row.get("object_version") or 1)),
             }
             return Response(status_code=404 if version_id is None else 405, headers=marker_headers)

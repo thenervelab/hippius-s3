@@ -11,6 +11,7 @@ from hippius_s3.api.s3.buckets.list_objects_endpoint import MAX_KEYS_LIMIT
 from hippius_s3.api.s3.buckets.list_objects_endpoint import _maybe_url_encode
 from hippius_s3.api.s3.buckets.list_objects_endpoint import _prefix_resume
 from hippius_s3.api.s3.common import format_s3_timestamp
+from hippius_s3.api.s3.common import parse_version_id
 from hippius_s3.dependencies import RequestContext
 from hippius_s3.utils import get_query
 from hippius_s3.xml_helpers import add_subelement
@@ -61,12 +62,15 @@ async def handle_list_object_versions(
             return _invalid_arg("max-keys must be non-negative")
         target = min(target, MAX_KEYS_LIMIT)
 
-    version_marker: int | None = None
-    if version_id_marker:
-        try:
-            version_marker = int(version_id_marker)
-        except ValueError:
-            return _invalid_arg("version-id-marker must be a version id returned by a previous response")
+    # "null" is accepted here for the same reason it is on GET/DELETE: clients echo back the
+    # version id AWS reports for pre-versioning objects.
+    try:
+        version_marker = parse_version_id(version_id_marker)
+    except (ValueError, TypeError):
+        return _invalid_arg("version-id-marker must be a version id returned by a previous response")
+
+    if encoding_type and encoding_type.lower() != "url":
+        return _invalid_arg("encoding-type must be 'url'")
 
     bucket = await pool.fetchrow(get_query("get_bucket_by_name"), bucket_name)
     if not bucket:
@@ -91,8 +95,9 @@ async def handle_list_object_versions(
         current_only=current_only,
     )
 
-    # Element order follows the AWS ListObjectVersions response schema so strict XML validators
-    # accept it: scalars first, then interleaved Version/DeleteMarker, then CommonPrefixes.
+    # Scalars first, then interleaved Version/DeleteMarker, then CommonPrefixes — matching AWS's
+    # own sample responses. (Its Response Syntax block orders these differently from its
+    # examples; every SDK parses by element name, so the sample order is the safer one to copy.)
     root = create_element("ListVersionsResult", xmlns=S3_NS)
     add_subelement(root, "Name", bucket_name)
     add_subelement(root, "Prefix", _maybe_url_encode(prefix or "", encoding_type))

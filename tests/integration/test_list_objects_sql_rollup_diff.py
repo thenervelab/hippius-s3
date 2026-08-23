@@ -29,10 +29,19 @@ from hippius_s3.api.s3.buckets.list_objects_endpoint import _content_resume
 
 
 _KEYS = [
-    "data/01.txt", "data/02.txt",
-    "images/a.png", "images/b.png", "images/c.png",
-    "logs/2023/old.txt", "logs/2024/a.txt", "logs/2024/b.txt", "logs/2024/c.txt", "logs/2025/new.txt",
-    "root-a.txt", "root-b.txt", "zzz-last.txt",
+    "data/01.txt",
+    "data/02.txt",
+    "images/a.png",
+    "images/b.png",
+    "images/c.png",
+    "logs/2023/old.txt",
+    "logs/2024/a.txt",
+    "logs/2024/b.txt",
+    "logs/2024/c.txt",
+    "logs/2025/new.txt",
+    "root-a.txt",
+    "root-b.txt",
+    "zzz-last.txt",
 ]
 _PREFIXES = [None, "logs/", "logs/2024/", "log", "images/", "nope/"]
 _DELIMITERS = [None, "/"]
@@ -69,7 +78,7 @@ async def _provision_c_collation_db() -> tuple[str, str]:
     except (OSError, asyncpg.PostgresError) as exc:
         pytest.skip(f"Postgres unreachable: {exc}")
     try:
-        await conn.execute(f'CREATE DATABASE "{name}" LC_COLLATE \'C\' LC_CTYPE \'C\' TEMPLATE template0')
+        await conn.execute(f"CREATE DATABASE \"{name}\" LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0")
     finally:
         await conn.close()
     # Rebuild the DSN with the new database name.
@@ -106,8 +115,13 @@ async def _crawl(
     cp_floor: str | None = start_after
     for _ in range(60):  # generous page cap; the keyspace is tiny
         items, truncated, next_cursor = await collect(
-            pool, bucket_id,
-            prefix=prefix, delimiter=delimiter, cursor=cursor, target=max_keys, cp_floor=cp_floor,
+            pool,
+            bucket_id,
+            prefix=prefix,
+            delimiter=delimiter,
+            cursor=cursor,
+            target=max_keys,
+            cp_floor=cp_floor,
         )
         pages.append((_normalize(items), truncated, next_cursor))
         if not truncated:
@@ -132,11 +146,15 @@ async def test_sql_rollup_matches_python_across_params() -> None:
                 oid = uuid.uuid4()
                 await pool.execute(
                     "INSERT INTO objects(object_id, bucket_id, object_key, current_object_version) VALUES($1,$2,$3,1)",
-                    oid, bucket_id, key,
+                    oid,
+                    bucket_id,
+                    key,
                 )
                 await pool.execute(
                     "INSERT INTO object_versions(object_id, object_version, size_bytes, md5_hash) VALUES($1,1,$2,$3)",
-                    oid, len(key), uuid.uuid4().hex,
+                    oid,
+                    len(key),
+                    uuid.uuid4().hex,
                 )
 
             # Two extra keys exercising delete-marker resolution, which the two implementations
@@ -149,16 +167,23 @@ async def test_sql_rollup_matches_python_across_params() -> None:
                 oid = uuid.uuid4()
                 await pool.execute(
                     "INSERT INTO objects(object_id, bucket_id, object_key, current_object_version) VALUES($1,$2,$3,2)",
-                    oid, bucket_id, key,
+                    oid,
+                    bucket_id,
+                    key,
                 )
                 await pool.execute(
                     "INSERT INTO object_versions(object_id, object_version, size_bytes, md5_hash) VALUES($1,1,$2,$3)",
-                    oid, len(key), uuid.uuid4().hex,
+                    oid,
+                    len(key),
+                    uuid.uuid4().hex,
                 )
                 await pool.execute(
                     "INSERT INTO object_versions(object_id, object_version, size_bytes, md5_hash, is_delete_marker)"
                     " VALUES($1,2,$2,$3,$4)",
-                    oid, 0 if marker else len(key), "" if marker else uuid.uuid4().hex, marker,
+                    oid,
+                    0 if marker else len(key),
+                    "" if marker else uuid.uuid4().hex,
+                    marker,
                 )
 
             # Agreement alone would be satisfied by both implementations being wrong together, so
@@ -181,12 +206,22 @@ async def test_sql_rollup_matches_python_across_params() -> None:
                     for max_keys in _MAX_KEYS:
                         for start_after in _START_AFTER:
                             py = await _crawl(
-                                _collect_page, pool, bucket_id,
-                                prefix=prefix, delimiter=delimiter, max_keys=max_keys, start_after=start_after,
+                                _collect_page,
+                                pool,
+                                bucket_id,
+                                prefix=prefix,
+                                delimiter=delimiter,
+                                max_keys=max_keys,
+                                start_after=start_after,
                             )
                             sql = await _crawl(
-                                _collect_page_sql, pool, bucket_id,
-                                prefix=prefix, delimiter=delimiter, max_keys=max_keys, start_after=start_after,
+                                _collect_page_sql,
+                                pool,
+                                bucket_id,
+                                prefix=prefix,
+                                delimiter=delimiter,
+                                max_keys=max_keys,
+                                start_after=start_after,
                             )
                             assert sql == py, (
                                 f"LS-1 divergence for prefix={prefix!r} delimiter={delimiter!r} "

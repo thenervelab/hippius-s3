@@ -25,7 +25,8 @@ WITH object_info AS (
         ov.enc_chunk_size_bytes,
         ov.kek_id,
         ov.wrapped_dek,
-        ov.is_delete_marker
+        ov.is_delete_marker,
+        COALESCE(ov.last_modified, ov.created_at) AS version_last_modified
     FROM objects o
     -- A version soft-deleted by a versioned DELETE is gone as far as reads are concerned, even
     -- though the row lingers until the janitor confirms its backend copies are unpinned.
@@ -77,6 +78,7 @@ SELECT
     oi.kek_id,
     oi.wrapped_dek,
     oi.is_delete_marker,
+    oi.version_last_modified,
     (
         SELECT mu.upload_id
         FROM multipart_uploads mu

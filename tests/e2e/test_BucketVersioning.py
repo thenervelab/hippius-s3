@@ -130,10 +130,26 @@ def test_simple_delete_creates_marker_and_hides_key(
     listing = boto3_client.list_object_versions(Bucket=bucket)
     assert [m["VersionId"] for m in listing["DeleteMarkers"]] == [marker_id]
 
+    # HEAD must agree with GET on the status matrix — clients branch on exactly this.
+    with pytest.raises(ClientError) as exc:
+        boto3_client.head_object(Bucket=bucket, Key=key)
+    head_meta = exc.value.response["ResponseMetadata"]
+    assert head_meta["HTTPStatusCode"] == 404
+    assert head_meta["HTTPHeaders"].get("x-amz-delete-marker") == "true"
+
     # Addressing the marker directly is a 405, not a download.
     with pytest.raises(ClientError) as exc:
         boto3_client.get_object(Bucket=bucket, Key=key, VersionId=marker_id)
-    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 405
+    get_meta = exc.value.response["ResponseMetadata"]
+    assert get_meta["HTTPStatusCode"] == 405
+    assert get_meta["HTTPHeaders"].get("x-amz-delete-marker") == "true"
+
+    with pytest.raises(ClientError) as exc:
+        boto3_client.head_object(Bucket=bucket, Key=key, VersionId=marker_id)
+    head_marker = exc.value.response["ResponseMetadata"]
+    assert head_marker["HTTPStatusCode"] == 405
+    assert head_marker["HTTPHeaders"].get("x-amz-delete-marker") == "true"
+    assert head_marker["HTTPHeaders"].get("last-modified")
 
     # Removing the marker undeletes the object.
     boto3_client.delete_object(Bucket=bucket, Key=key, VersionId=marker_id)
@@ -210,10 +226,12 @@ def test_copy_from_source_version_id_restores_old_version(
     # the source to be backend-ready before copying (same guard as test_ObjectVersioning.py).
     assert wait_for_all_backends_ready(bucket, key, min_count=1), "Source object not ready for copy"
 
-    boto3_client.copy_object(
+    copied = boto3_client.copy_object(
         Bucket=bucket,
         Key="restored.txt",
         CopySource={"Bucket": bucket, "Key": key, "VersionId": "1"},
     )
 
     assert boto3_client.get_object(Bucket=bucket, Key="restored.txt")["Body"].read() == b"ORIGINAL"
+    # AWS reports which source version was read, so a restore flow can confirm what it got.
+    assert copied["ResponseMetadata"]["HTTPHeaders"].get("x-amz-copy-source-version-id") == "1"

@@ -25,7 +25,8 @@ WITH object_info AS (
         ov.enc_chunk_size_bytes,
         ov.kek_id,
         ov.wrapped_dek,
-        ov.is_delete_marker
+        ov.is_delete_marker,
+        COALESCE(ov.last_modified, ov.created_at) AS version_last_modified
     FROM objects o
     JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = (
         -- Prefer current_object_version, but skip incomplete multipart placeholders
@@ -87,6 +88,7 @@ SELECT
     oi.kek_id,
     oi.wrapped_dek,
     oi.is_delete_marker,
+    oi.version_last_modified,
     (
         SELECT mu.upload_id
         FROM multipart_uploads mu
