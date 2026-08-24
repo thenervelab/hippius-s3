@@ -1,7 +1,11 @@
 -- List objects in a bucket with optional prefix and pagination (console/user endpoint)
 -- Parameters: $1: bucket_id, $2: prefix (optional), $3: limit, $4: offset
+-- ipfs_cid is the legacy manifest CID: NULL on everything written since the Arion cutover, kept
+-- only so pre-2026 rows still resolve. body_blake3 is the live digest and the one the console
+-- should read — it is the same value ListObjects surfaces in Owner.ID.
 SELECT o.object_id, o.bucket_id, o.object_key, o.current_object_version,
        COALESCE(c.cid, ov.ipfs_cid) as ipfs_cid,
+       ov.body_blake3,
        ov.size_bytes, ov.content_type, o.created_at, ov.md5_hash,
        ov.status, b.bucket_name, ov.multipart
 FROM objects o

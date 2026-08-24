@@ -167,6 +167,7 @@ async def list_objects(
                 "object_id": str(obj["object_id"]),
                 "object_key": obj["object_key"],
                 "ipfs_cid": obj["ipfs_cid"],
+                "body_blake3": obj["body_blake3"],
                 "size_bytes": obj["size_bytes"],
                 "content_type": obj["content_type"],
                 "created_at": obj["created_at"].isoformat(),
@@ -231,6 +232,7 @@ async def recent_uploads(
             "content_type": row["content_type"],
             "md5_hash": row["md5_hash"],
             "ipfs_cid": row["ipfs_cid"],
+            "body_blake3": row["body_blake3"],
             "uploaded_at": row["uploaded_at"].isoformat() if row["uploaded_at"] is not None else None,
         }
         for row in rows
