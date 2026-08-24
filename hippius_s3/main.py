@@ -504,8 +504,8 @@ def factory() -> FastAPI:
     #
     #   cors → ray_id → path_normalization → cache_control → ats_purge
     #   → cache_invalidation → [read_only] → fs_cache_pressure → input_validation
-    #   → auth_router → trailing_slash → account → acl → frontend_hmac
-    #   → [audit_log] → request_context → tracing → metrics → auth_probe
+    #   → auth_router → suspension → trailing_slash → account → acl → frontend_hmac
+    #   → admin_hmac → [audit_log] → request_context → tracing → metrics → auth_probe
     #   → routers
     #
     # Load-bearing orderings:
