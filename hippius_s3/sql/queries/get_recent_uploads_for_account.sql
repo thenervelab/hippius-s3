@@ -17,7 +17,10 @@ SELECT
     ov.size_bytes,
     ov.content_type,
     ov.md5_hash,
+    -- Legacy manifest CID (NULL post-Arion) kept for pre-2026 rows; body_blake3 is the live
+    -- digest, the same value ListObjects surfaces in Owner.ID.
     COALESCE(c.cid, ov.ipfs_cid) AS ipfs_cid,
+    ov.body_blake3,
     recent.created_at AS uploaded_at
 FROM buckets b
 CROSS JOIN LATERAL (

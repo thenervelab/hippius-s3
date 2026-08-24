@@ -14,7 +14,8 @@ SELECT o.object_id,
        o.created_at,
        ov.md5_hash,
        ov.status,
-       ov.multipart
+       ov.multipart,
+       ov.body_blake3
 FROM objects o,
      LATERAL (
          -- Skip incomplete multipart placeholders (InitiateMultipartUpload without Complete)
@@ -23,7 +24,8 @@ FROM objects o,
                 v.content_type,
                 v.md5_hash,
                 v.status,
-                v.multipart
+                v.multipart,
+                v.body_blake3
          FROM object_versions v
          WHERE v.object_id = o.object_id
            AND v.object_version <= o.current_object_version

@@ -1,6 +1,11 @@
 services:
   api:
-    build: .
+    # Long form, not `build: .` — a scalar here REPLACES the base file's build mapping and would
+    # drop the BASE_IMAGE arg, silently pinning the api to the published base image.
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     env_file:
       - .env.defaults
       - .env.test-docker
