@@ -40,6 +40,14 @@ WITH object_info AS (
       AND b.deleted_at IS NULL
       AND o.object_key = $2
       AND o.deleted_at IS NULL
+      -- Reserved placeholders must not be reachable by explicit versionId either: they carry no
+      -- parts, so serving one yields a 0-byte body instead of NoSuchVersion. Every in-flight MPU
+      -- has one and an aborted MPU leaves one behind permanently
+      -- (abort_cleanup_orphan_version.sql). Only the completeness half of the unversioned
+      -- resolver's rule is adopted — its `<= current_object_version` bound is deliberately not,
+      -- since pinning a version is how you reach one that is not current. A legitimately empty
+      -- object stores the md5 of the empty string, so the md5 disjunct still admits it.
+      AND (ov.size_bytes > 0 OR (ov.md5_hash IS NOT NULL AND ov.md5_hash != ''))
 ),
 multipart_chunks AS (
     -- CIDs are optional: allow cid_id NULL by falling back to parts.ipfs_cid; may still be NULL

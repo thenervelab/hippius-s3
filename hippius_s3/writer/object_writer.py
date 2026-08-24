@@ -17,6 +17,8 @@ import asyncpg
 from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
+from hippius_s3.blake3_hash import new_hasher as new_blake3
+from hippius_s3.blake3_hash import persist_version_hash
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
@@ -54,7 +56,7 @@ def _append_version_conflict(current: int | None, expected: int) -> bool:
 
 
 class _ChunkEncryptPipeline:
-    """Overlap socket reads with the MD5 + AES-GCM of already-framed chunks (WU-2).
+    """Overlap socket reads with MD5 + BLAKE3 + AES-GCM of already-framed chunks.
 
     The serial predecessor did, per 4 MiB chunk, ON the event loop or awaited inline:
     ``hasher.update(buf)`` (blocking the loop ~6 ms) then ``await run_crypto(encrypt)``
@@ -66,10 +68,14 @@ class _ChunkEncryptPipeline:
     oldest-first once ``lookahead`` chunks are in flight. Invariants it preserves —
     each one is pinned by tests/unit/writer/test_stream_content_pins.py:
 
-    - **Rolling MD5 order**: updates go to the single-thread hash pool, whose FIFO
-      queue executes them in submission (= chunk-index) order; ``digest()`` must only
-      be read after :meth:`flush`, which awaits every update future (that await is
-      also the happens-before edge that makes the hasher's state visible here).
+    - **Rolling hash order**: MD5 and BLAKE3 updates share ONE submit_hash FIFO job
+      so they execute in chunk-index order without a second pool (a second FIFO
+      would be legal for independent hashers but would oversubscribe the write
+      path). ``digest()`` / ``hexdigest()`` must only be read after :meth:`flush`.
+    - **In-flight BLAKE3**: plaintext is hashed as each frame is pushed — overlapping
+      encrypt of this chunk and the next socket read — never by re-reading FS at
+      Complete. Multipart passes ``blake3_first_chunk_only=True`` so only
+      chunk_index 0 of part 1 updates the hasher.
     - **AEAD identity**: each encrypt is submitted with its EXPLICIT global
       chunk_index; the AAD binds (bucket, object, part, chunk_index) — never call or
       completion order — and the nonce is random per call, so concurrent encrypts
@@ -93,8 +99,12 @@ class _ChunkEncryptPipeline:
         encrypt_submit: Any,  # Callable[[bytes, int], asyncio.Future[tuple[bytes, float]]]
         sink: Any,  # Callable[[int, bytes], Awaitable[None]] — receives (chunk_index, ciphertext) in order
         lookahead: int,
+        blake3_hasher: Any | None = None,
+        blake3_first_chunk_only: bool = False,
     ) -> None:
         self._hasher = hasher
+        self._blake3 = blake3_hasher
+        self._blake3_first_chunk_only = blake3_first_chunk_only
         self._encrypt_submit = encrypt_submit
         self._sink = sink
         self._lookahead = max(1, int(lookahead))
@@ -104,9 +114,18 @@ class _ChunkEncryptPipeline:
         self.encrypt_thread_ms = 0.0  # true in-thread encrypt CPU-time (what `enc=` used to mean)
 
     async def push(self, buf: bytes, chunk_index: int) -> None:
-        md5_fut = submit_hash(self._hasher.update, buf)
+        md5 = self._hasher
+        blake = self._blake3
+        first_only = self._blake3_first_chunk_only
+
+        def _update(b: bytes = buf, idx: int = chunk_index) -> None:
+            md5.update(b)
+            if blake is not None and (not first_only or idx == 0):
+                blake.update(b)
+
+        hash_fut = submit_hash(_update)
         enc_fut = self._encrypt_submit(buf, chunk_index)
-        self._inflight.append((chunk_index, enc_fut, md5_fut))
+        self._inflight.append((chunk_index, enc_fut, hash_fut))
         if len(self._inflight) >= self._lookahead:
             await self._drain_oldest()
 
@@ -285,6 +304,7 @@ class ObjectWriter:
             object_id, object_version = await retry_on_object_version_conflict(_reserve_version)
 
         hasher = hashlib.md5()
+        blake3_hasher = new_blake3()
         total_size = 0
         writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
 
@@ -355,6 +375,7 @@ class ObjectWriter:
             encrypt_submit=_timed_encrypt,
             sink=_sink,
             lookahead=self.config.write_pipeline_lookahead,
+            blake3_hasher=blake3_hasher,
         )
 
         with tracer.start_as_current_span("put_simple_stream_full.encrypt_and_cache") as span:
@@ -393,6 +414,7 @@ class ObjectWriter:
                 # Safe only after flush(): every hash-pool update future has been awaited,
                 # so the rolling digest has seen all chunks, in order.
                 md5_hash = hasher.hexdigest()
+                blake3_hex = blake3_hasher.hexdigest()
                 perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
                 set_span_attributes(
                     span,
@@ -455,6 +477,7 @@ class ObjectWriter:
                         datetime.now(timezone.utc),
                         object_id,
                         int(object_version),
+                        blake3_hex,
                     )
                     # Envelope (kek_id, wrapped_dek) was already written in the head transaction
                     # to prevent the read-race on concurrent overwrites.
@@ -640,6 +663,9 @@ class ObjectWriter:
         adapter = CryptoService.get_adapter(suite_id)
 
         hasher = hashlib.md5()
+        # First framed chunk of part 1 is the listing hash. Later parts must not
+        # clobber it; S4 appends new parts after part 1 and leave the digest.
+        blake3_hasher = new_blake3() if int(part_number) == 1 else None
         total_size = 0
         next_chunk_index = 0
         chunk_cipher_sizes: list[int] = []
@@ -744,6 +770,8 @@ class ObjectWriter:
             encrypt_submit=_timed_encrypt,
             sink=_sink,
             lookahead=self.config.write_pipeline_lookahead,
+            blake3_hasher=blake3_hasher,
+            blake3_first_chunk_only=True,
         )
 
         consumer_task = asyncio.create_task(_consumer())
@@ -850,6 +878,13 @@ class ObjectWriter:
             object_version=int(object_version),
             chunk_cipher_sizes=chunk_cipher_sizes,
         )
+        if blake3_hasher is not None:
+            await persist_version_hash(
+                self.pool,
+                object_id=str(object_id),
+                object_version=int(object_version),
+                digest=blake3_hasher.hexdigest(),
+            )
         # The part's chunks+meta are on FS; record it so the janitor's SQL discovery finds it.
         # Advisory-only, on the autocommit pool (no open transaction here — upsert_part_placeholder
         # above also writes via self.pool). This hook also covers the APPEND path, which materializes

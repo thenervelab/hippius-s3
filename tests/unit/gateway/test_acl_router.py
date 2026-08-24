@@ -8,13 +8,13 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from hippius_s3.gateway.services.acl_service import ACLService
 from hippius_s3.api.s3.acl_endpoints import acl_to_xml
 from hippius_s3.api.s3.acl_endpoints import get_bucket_acl
 from hippius_s3.api.s3.acl_endpoints import get_object_acl
 from hippius_s3.api.s3.acl_endpoints import put_bucket_acl
 from hippius_s3.api.s3.acl_endpoints import put_object_acl
 from hippius_s3.api.s3.acl_endpoints import xml_to_acl
+from hippius_s3.gateway.services.acl_service import ACLService
 from hippius_s3.models.acl import ACL
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import Grantee

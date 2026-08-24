@@ -44,6 +44,7 @@ dependencies = [
     "prometheus-client>=0.23.1",
     "loki-logger-handler>=1.1.2",
     "sentry-sdk[fastapi]>=2.0.0",
+    "blake3==1.0.9",
 ]
 
 [project.optional-dependencies]

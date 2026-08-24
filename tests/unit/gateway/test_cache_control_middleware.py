@@ -1,5 +1,6 @@
 """Tests for cache_control_middleware — Cache-Control header injection by method/status/ACL."""
 
+import dataclasses
 from typing import Any
 
 import pytest
@@ -8,8 +9,6 @@ from fastapi import Request
 from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
-
-import dataclasses
 
 from hippius_s3.config import get_config
 from hippius_s3.gateway.middlewares import cache_control as cache_control_mod

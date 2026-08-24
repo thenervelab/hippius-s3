@@ -24,7 +24,14 @@ S3_NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 SAMPLE_TS = datetime(2026, 4, 30, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _row(key: str, *, size: int = 100, md5: str = "deadbeef", multipart: bool = False) -> dict[str, Any]:
+def _row(
+    key: str,
+    *,
+    size: int = 100,
+    md5: str = "deadbeef",
+    multipart: bool = False,
+    body_blake3: str | None = None,
+) -> dict[str, Any]:
     return {
         "object_id": f"id-{key}",
         "object_key": key,
@@ -34,6 +41,7 @@ def _row(key: str, *, size: int = 100, md5: str = "deadbeef", multipart: bool = 
         "created_at": SAMPLE_TS,
         "multipart": multipart,
         "status": "uploaded",
+        "body_blake3": body_blake3,
     }
 
 
@@ -786,6 +794,50 @@ async def test_owner_falls_back_to_requestor_when_bucket_owner_missing() -> None
     root = _parse(resp.body)
     owner_id = root.find(f"{S3_NS}Contents/{S3_NS}Owner/{S3_NS}ID").text
     assert owner_id == "5HWAJ-test-account"
+
+
+@pytest.mark.asyncio
+async def test_owner_id_is_blake3_file_hash_when_body_blake3_set() -> None:
+    digest = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+    pool = _make_pool(
+        bucket_row=_bucket(owner="5BUCKET-OWNER"),
+        list_rows=[_row("k", body_blake3=digest)],
+    )
+    resp = await handle_list_objects(
+        "b",
+        _ctx(),
+        pool,
+        prefix=None,
+        start_after=None,
+        continuation_token=None,
+        max_keys=None,
+        encoding_type=None,
+        delimiter=None,
+    )
+    root = _parse(resp.body)
+    owner_id = root.find(f"{S3_NS}Contents/{S3_NS}Owner/{S3_NS}ID").text
+    owner_dn = root.find(f"{S3_NS}Contents/{S3_NS}Owner/{S3_NS}DisplayName").text
+    assert owner_id == digest
+    assert owner_dn == "5BUCKET-OWNER"
+
+
+@pytest.mark.asyncio
+async def test_owner_id_stays_account_until_a_digest_lands() -> None:
+    pool = _make_pool(bucket_row=_bucket(owner="5BUCKET-OWNER"), list_rows=[_row("k")])
+    resp = await handle_list_objects(
+        "b",
+        _ctx(),
+        pool,
+        prefix=None,
+        start_after=None,
+        continuation_token=None,
+        max_keys=None,
+        encoding_type=None,
+        delimiter=None,
+    )
+    root = _parse(resp.body)
+    owner_id = root.find(f"{S3_NS}Contents/{S3_NS}Owner/{S3_NS}ID").text
+    assert owner_id == "5BUCKET-OWNER"
 
 
 @pytest.mark.asyncio

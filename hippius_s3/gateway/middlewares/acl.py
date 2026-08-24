@@ -12,6 +12,8 @@ from hippius_s3.gateway.services.sub_token_scope import bucket_in_scope
 from hippius_s3.gateway.services.sub_token_scope import evaluate as evaluate_sub_token_scope
 from hippius_s3.gateway.services.sub_token_scope import permission_allows
 from hippius_s3.gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
+from hippius_s3.gateway.services.suspension import get_account_suspension
+from hippius_s3.gateway.services.suspension import suspension_blocks
 from hippius_s3.gateway.utils.errors import s3_error_response
 from hippius_s3.gateway.utils.paths import routing_path
 from hippius_s3.models.acl import Permission
@@ -60,6 +62,13 @@ def parse_s3_path(path: str) -> tuple[str | None, str | None]:
     parts = path_stripped.split("/", 1)
     bucket = parts[0] if parts else None
     key = parts[1] if len(parts) > 1 else None
+
+    # A trailing slash is not an object key. Every caller asks `key is not None` to mean
+    # "this is an object operation", so an empty key would make `/bucket/` evaluate as one:
+    # `is_create_bucket` stops firing and bucket ops map to object ops in the sub-token
+    # scope check. Belt to trailing_slash_normalizer's braces — either alone closes it.
+    if key is not None and key.strip("/") == "":
+        key = None
 
     return bucket, key
 
@@ -121,7 +130,7 @@ async def acl_middleware(
     # disagrees with the key `input_validation` judged.
     path = routing_path(request)
 
-    if path == "/health" or path.startswith("/user/"):
+    if path == "/health" or path.startswith("/user/") or path.startswith("/admin/"):
         return await call_next(request)
 
     # Secret-authenticated peer chunk fetches carry no S3 permission model
@@ -167,6 +176,31 @@ async def acl_middleware(
             request.state.bucket_id = bucket_id
         else:
             request.state.bucket_is_cache_warm = False
+
+    # Bucket-owner suspension check (issue #421). The suspension_middleware already
+    # covers requests authenticated AS the suspended account, so skip the lookup when the
+    # requester IS the owner; this branch exists only for everyone ELSE touching the
+    # suspended owner's buckets — anonymous public reads and cross-account (contractor)
+    # access — which carry a different (or no) identity. 'full' blocks all access to the
+    # owner's data; 'read_only' still blocks writes so a delinquent account's storage
+    # cannot keep growing via bucket-ACL grants.
+    if bucket_owner_id is not None and bucket_owner_id != account_id:
+        owner_suspension = await get_account_suspension(
+            bucket_owner_id,
+            request.app.state.postgres_pool,
+            request.app.state.redis_client,
+        )
+        if owner_suspension is not None and suspension_blocks(
+            owner_suspension,
+            method=request.method,
+            query_params=query_params,
+            has_key=key is not None,
+        ):
+            logger.info(
+                f"Blocked request on suspended owner's bucket: owner={bucket_owner_id}, "
+                f"bucket={bucket}, mode={owner_suspension}"
+            )
+            return _access_denied()
 
     # -------------------------------------------------------------------------
     # Sub-token branch (R2-style): authoritative for intra-account requests,
