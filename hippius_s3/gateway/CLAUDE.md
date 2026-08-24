@@ -16,22 +16,28 @@ structural — enforced by middleware order, pinned by
 
 ## Middleware chain
 
-Registered in [hippius_s3/main.py](../main.py). FastAPI's `@app.middleware("http")` stacks in reverse order (last-registered = outermost). On the request path, the chain runs: cors → ray_id → cache_control → ats_purge → cache_invalidation → [read_only] → fs_cache_pressure → input_validation → auth_router → trailing_slash → account → acl → request_context → frontend_hmac → tracing → metrics → [audit_log] → auth_probe → routers.
+Registered in [hippius_s3/main.py](../main.py). FastAPI's `@app.middleware("http")` stacks in reverse order (last-registered = outermost). On the request path, the chain runs: cors → ray_id → cache_control → ats_purge → cache_invalidation → [read_only] → fs_cache_pressure → input_validation → auth_router → suspension → trailing_slash → account → acl → request_context → frontend_hmac → admin_hmac → tracing → metrics → [audit_log] → auth_probe → routers.
 
 | # | Middleware | Purpose | Short-circuit |
 |---|-----------|---------|---------------|
 | 1 (outermost) | `cors_middleware` | Adds CORS headers to every response (including error paths). | — |
-| 2 | `read_only_middleware` | If `HIPPIUS_READ_ONLY_MODE=true`, block writes. | 403 |
-| 3 | `input_validation_middleware` | Bucket name / object key / metadata validation. | 400 |
-| 4 | `auth_router_middleware` | Dispatches to `auth_orchestrator` (see below), populates `request.state.auth_method`, `.account_id`, `.token_type`, etc. | 403 |
-| 5 | `trailing_slash_normalizer` | Harmonizes `/path` vs `/path/`. | — |
-| 6 | `account_middleware` | For seed-phrase auth, fetches account info from Arion + Redis cache. | 503 on Arion error |
-| 7 | `acl_middleware` | Checks bucket/object permission via `ACLService`. Master tokens bypass. | 403 |
-| 8 | `verify_frontend_hmac_middleware` | If `FRONTEND_HMAC_SECRET` is set, verify HMAC on internal frontend requests. | 403 |
-| 9 | `tracing_middleware` | OTel span attachment. | — |
-| 10 | `metrics_middleware` | Request latency, status codes, account attribution. | — |
-| 11 | `audit_log_middleware` | Comprehensive operation audit (when `ENABLE_AUDIT_LOGGING=true`). | — |
-| 12 (innermost) | `ray_id_middleware` | Generates or propagates `X-Ray-ID`. Populates `request.state.ray_id`. | — |
+| 2 | `ray_id_middleware` | Generates or propagates ray id + stamps `gateway_start_time`; runs early so every inner middleware logs a real ray_id. | — |
+| 3 | `cache_control_middleware` | Cache-Control stamping for anonymous-readable objects (ATS/browser caching). | — |
+| 4 | `ats_purge_middleware` | Fans PURGE requests out to ATS cache endpoints. | — |
+| 5 | `cache_invalidation_middleware` | Invalidates ATS cache on writes. | — |
+| 6 | `read_only_middleware` | Only when `HIPPIUS_READ_ONLY_MODE=true`: block all writes. | 405 |
+| 7 | `input_validation_middleware` | Bucket name / object key / metadata validation; rejects CreateBucket on reserved names. | 400 |
+| 8 | `auth_router_middleware` | Dispatches to `auth_orchestrator`, populates `request.state.auth_method`, `.account_address`, `.account_id`, `.token_type`. | 403 |
+| 9 | `suspension_middleware` | Account-level suspend/read_only gate (issue #421), keyed on `account_address`. Must stay inner to auth_router and outer to account/acl (master tokens bypass ACL). | 403 |
+| 10 | `trailing_slash_normalizer` | Harmonizes `/path` vs `/path/`. | — |
+| 11 | `account_middleware` | Credit / can_upload checks for mutating requests (redis-accounts + Arion). | 402/503 |
+| 12 | `acl_middleware` | Bucket/object permission via `ACLService`; also blocks access to a suspended owner's buckets. Master tokens bypass the permission check. | 403 |
+| 13 | `verify_frontend_hmac_middleware` | HMAC gate for `/user/*` (`FRONTEND_HMAC_SECRET`). | 401/403 |
+| 14 | `verify_admin_hmac_middleware` | HMAC gate for `/admin/*` (`HIPPIUS_ADMIN_HMAC_SECRET`, fail-closed when unset). | 401/403 |
+| 15 | `tracing_middleware` | OTel span attachment. | — |
+| 16 | `metrics_middleware` | Request latency, status codes, account attribution. | — |
+| 17 | `audit_log_middleware` | Operation audit (when `ENABLE_AUDIT_LOGGING=true`). | — |
+| 18 (innermost) | `auth_probe_middleware` | ATS auth-probe short-circuit; MUST stay innermost (see warning in main.py). | 200 |
 
 **Not wired today**: `rate_limit` and `banhammer`. The modules at [gateway/middlewares/rate_limit.py](middlewares/rate_limit.py) and [gateway/middlewares/banhammer.py](middlewares/banhammer.py) exist but `main.py` doesn't register them — see the log line `"Rate limiting and banhammer disabled"` at [main.py:94](main.py). See [todo.md](../../todo.md) P2.
 

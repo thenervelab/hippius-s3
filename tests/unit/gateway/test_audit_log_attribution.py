@@ -13,8 +13,8 @@ from fastapi import Request
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from hippius_s3.gateway.middlewares.audit_log import audit_log_middleware
 from hippius_s3.api.middlewares.request_context import request_context_middleware
+from hippius_s3.gateway.middlewares.audit_log import audit_log_middleware
 from hippius_s3.models.account import HippiusAccount
 
 

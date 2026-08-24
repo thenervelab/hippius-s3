@@ -19,6 +19,7 @@ from httpx import AsyncClient
 from hippius_s3 import config as gateway_config
 from hippius_s3.gateway.middlewares.acl import acl_middleware
 from hippius_s3.gateway.services.acl_service import BucketLookup
+from tests.unit.gateway._suspension_fakes import install_no_suspension_state
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
@@ -32,6 +33,7 @@ def _ats_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
 def _build_app(acl_service: Any, *, account_id: str | None = None) -> Any:
     app = FastAPI()
     app.state.acl_service = acl_service
+    install_no_suspension_state(app)
 
     @app.api_route("/{path:path}", methods=["GET", "HEAD", "PUT", "DELETE"])
     async def catch_all(request: Request) -> dict[str, Any]:
@@ -106,6 +108,7 @@ async def test_warm_bucket_head_request_sets_flag() -> None:
 
     app = FastAPI()
     app.state.acl_service = _make_service(lookup=lookup)
+    install_no_suspension_state(app)
 
     @app.api_route("/{path:path}", methods=["HEAD"])
     async def head_handler(request: Request) -> Response:

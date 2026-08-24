@@ -54,6 +54,10 @@ class Config:
 
     # Security
     frontend_hmac_secret: str = env("FRONTEND_HMAC_SECRET")
+    # Separate secret for the /admin/* account suspend/reactivate/purge endpoints — the
+    # admin surface can destroy whole accounts, so it gets its own credential. Verified
+    # by admin_hmac middleware (fail-closed when empty).
+    admin_hmac_secret: str = env("HIPPIUS_ADMIN_HMAC_SECRET:", convert=str)
     max_request_size_mb: int = env("MAX_REQUEST_SIZE_MB", convert=int)
 
     # Logging
@@ -523,6 +527,23 @@ class Config:
     # Well above the measured runtime, far below anything that can hurt the horizon; a cycle
     # that trips it is logged and retried on the next interval.
     mpu_reaper_statement_timeout_seconds: int = env("HIPPIUS_MPU_REAPER_STATEMENT_TIMEOUT_SECONDS:60", convert=int)
+    # --- purger (account purge jobs, issue #421) ---
+    # Poll interval between claim attempts when no job is queued.
+    purger_interval_seconds: int = env("HIPPIUS_PURGER_INTERVAL_SECONDS:10", convert=int)
+    # Objects soft-deleted (and unpin requests enqueued) per batch statement.
+    purger_batch_size: int = env("HIPPIUS_PURGER_BATCH_SIZE:500", convert=int)
+    # Backpressure gate: the purger checks LLEN on every configured unpin queue before
+    # enqueueing a batch and sleeps while any is above this. 1.29M queued unpin requests
+    # once degraded redis-queues badly enough to break prod GETs — a mass purge must
+    # never be able to reproduce that.
+    purger_unpin_queue_high_water: int = env("HIPPIUS_PURGER_UNPIN_QUEUE_HIGH_WATER:50000", convert=int)
+    purger_backpressure_sleep_seconds: int = env("HIPPIUS_PURGER_BACKPRESSURE_SLEEP_SECONDS:5", convert=int)
+    # A running job whose heartbeat is older than this is considered abandoned (worker
+    # crash / pod kill) and gets reclaimed by the next claim attempt.
+    purger_lease_seconds: int = env("HIPPIUS_PURGER_LEASE_SECONDS:600", convert=int)
+    # Same xmin-horizon rationale as mpu_reaper_statement_timeout_seconds: every purger
+    # statement is batch-bounded, so anything longer than this is a bad plan, not work.
+    purger_statement_timeout_seconds: int = env("HIPPIUS_PURGER_STATEMENT_TIMEOUT_SECONDS:60", convert=int)
     # Replication SLA grace for the G2 under-replication sentinel. `address` is stamped at
     # PUT completion but the chunk_backend coverage row is written much later by the async
     # drain→pool→backend pipeline, so every servable chunk is briefly under-covered while it

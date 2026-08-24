@@ -460,6 +460,25 @@ class MetricsCollector:
             unit="s",
         )
 
+        self.purger_jobs_total = self.meter.create_counter(
+            name="purger_jobs_total",
+            description="Account purge jobs finished, by result (done|failed)",
+            unit="1",
+        )
+        self.purger_objects_deleted_total = self.meter.create_counter(
+            name="purger_objects_deleted_total",
+            description="Objects soft-deleted by account purge jobs",
+            unit="1",
+        )
+        self.purger_duration_seconds = self.meter.create_histogram(
+            name="purger_duration_seconds", description="Account purge job duration", unit="s"
+        )
+        self.purger_backpressure_waits_total = self.meter.create_counter(
+            name="purger_backpressure_waits_total",
+            description="Times a purge job parked because an unpin queue was over its high-water mark",
+            unit="1",
+        )
+
         self.orphan_checker_cycles_total = self.meter.create_counter(
             name="orphan_checker_cycles_total", description="Total orphan-checker cycles run", unit="1"
         )
@@ -846,6 +865,15 @@ class MetricsCollector:
         if oldest_reaped_age is not None:
             self.mpu_reaper_oldest_reaped_age_seconds.record(oldest_reaped_age)
 
+    def record_purger_job(self, success: bool, deleted_objects: int, duration: float) -> None:
+        self.purger_jobs_total.add(1, attributes={"result": "done" if success else "failed"})
+        self.purger_duration_seconds.record(duration)
+        if deleted_objects > 0:
+            self.purger_objects_deleted_total.add(deleted_objects)
+
+    def record_purger_backpressure_wait(self) -> None:
+        self.purger_backpressure_waits_total.add(1)
+
     def record_orphan_checker_cycle(
         self,
         success: bool,
@@ -961,6 +989,12 @@ class NullMetricsCollector:
         pass
 
     def record_mpu_reaper_cycle(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_purger_job(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_purger_backpressure_wait(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_orphan_checker_cycle(self, *args: object, **kwargs: object) -> None:

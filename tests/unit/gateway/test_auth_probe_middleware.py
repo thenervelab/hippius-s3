@@ -1,6 +1,7 @@
 """Tests for auth_probe_middleware — short-circuits ATS authproxy subrequests with 200 OK
 when the request carries X-Hippius-Auth-Probe = <shared secret>."""
 
+import dataclasses
 from typing import Any
 from typing import Generator
 
@@ -10,8 +11,6 @@ from fastapi import Request
 from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
-
-import dataclasses
 
 from hippius_s3.config import get_config
 from hippius_s3.gateway.middlewares import auth_probe as auth_probe_mod
