@@ -15,7 +15,12 @@
 --
 -- No index. Nothing looks objects up BY digest; it is projected alongside rows already being
 -- read by key. An index here would only re-add the write amplification 20260528120000 removed.
-ALTER TABLE object_versions ADD COLUMN body_blake3 text;
+--
+-- IF NOT EXISTS, and this file is byte-identical on feat/object-versioning: both PRs target
+-- staging and both need the column, so carrying the same file on both lets them merge in either
+-- order (git dedupes an identical path, dbmate records one migration) without either branch
+-- landing a query against a column the other was going to create.
+ALTER TABLE object_versions ADD COLUMN IF NOT EXISTS body_blake3 text;
 
 -- migrate:down
 
