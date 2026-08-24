@@ -23,9 +23,14 @@ class FakeObjCache:
 
 
 class FakeDB:
-    def __init__(self, fetchrow_returns: dict | None = None) -> None:
+    def __init__(self, fetchrow_returns: dict | None = None, prev_version: int | None = None) -> None:
         self.fetch = AsyncMock(return_value=[])
         self.fetchrow = AsyncMock(return_value=fetchrow_returns)
+        # The envelope fallback asks for the highest SERVEABLE version below the current one
+        # (get_prev_serveable_version). Default to version-1 so the existing cases keep their
+        # shape; the sparse-numbering case overrides it.
+        default = None if fetchrow_returns is None else (fetchrow_returns or {}).get("object_version")
+        self.fetchval = AsyncMock(return_value=prev_version if prev_version is not None else default)
 
 
 def _make_info(
@@ -403,8 +408,10 @@ async def test_cold_fallback_with_none_redis_does_not_crash():
 
 
 @pytest.mark.asyncio
-async def test_fallback_queries_correct_version():
-    """The fallback query uses version-1, not version-2 or some other number."""
+async def test_fallback_queries_the_highest_serveable_version_below_current():
+    """The fallback resolves its target by query, not by decrementing. Version numbers are sparse:
+    an aborted MPU retains its reserved row and the migrator mints versions out of band, so
+    version-1 can be a placeholder with no envelope."""
     with (
         _PATCHES[0] as m0,
         _PATCHES[1] as m1,
@@ -431,4 +438,31 @@ async def test_fallback_queries_correct_version():
         call_args = db.fetchrow.call_args
         assert call_args[0][1] == "my-bucket"
         assert call_args[0][2] == "my-key.bin"
-        assert call_args[0][3] == 41  # version - 1
+        assert call_args[0][3] == 41  # whatever get_prev_serveable_version resolved to
+
+
+@pytest.mark.asyncio
+async def test_fallback_skips_a_gap_in_version_numbers():
+    """v42 has no envelope and v41 is a retained abort placeholder, so the fallback must land on
+    v40. Decrementing would query v41, get nothing back, and turn a recoverable read into a 500."""
+    with (
+        _PATCHES[0] as m0,
+        _PATCHES[1] as m1,
+        _PATCHES[2] as m2,
+        _PATCHES[3] as m3,
+        _PATCHES[4] as m4,
+        _PATCHES[5] as m5,
+        _PATCHES[6] as m6,
+    ):
+        _apply_patches([m0, m1, m2, m3, m4, m5, m6])
+
+        prev_info = _make_info(object_version=40, kek_id="kek-1", wrapped_dek=b"\x00" * 32)
+        db = FakeDB(fetchrow_returns=prev_info, prev_version=40)
+        info = _make_info(object_version=42, kek_id=None, wrapped_dek=None)
+
+        from hippius_s3.services.object_reader import build_stream_context
+
+        await build_stream_context(db, None, FakeObjCache([True]), info, rng=None, address="addr1")
+
+        assert db.fetchval.await_args[0][3] == 42, "the gap query must be anchored at the current version"
+        assert db.fetchrow.call_args[0][3] == 40, "the fallback skipped past the placeholder to v40"
