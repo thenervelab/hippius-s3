@@ -47,7 +47,13 @@ WITH object_info AS (
       -- resolver's rule is adopted — its `<= current_object_version` bound is deliberately not,
       -- since pinning a version is how you reach one that is not current. A legitimately empty
       -- object stores the md5 of the empty string, so the md5 disjunct still admits it.
-      AND (ov.size_bytes > 0 OR (ov.md5_hash IS NOT NULL AND ov.md5_hash != ''))
+      --
+      -- A delete marker is ALSO zero-size with no md5, and is indistinguishable from a reserved
+      -- placeholder by that rule — but it must stay reachable, because addressing one by version
+      -- is how a client gets the 405 + x-amz-delete-marker that tells it the version is a marker
+      -- rather than missing. Admitting it explicitly keeps both behaviours: placeholders stay
+      -- unreachable, markers resolve and the handler rejects them.
+      AND (ov.is_delete_marker OR ov.size_bytes > 0 OR (ov.md5_hash IS NOT NULL AND ov.md5_hash != ''))
 ),
 multipart_chunks AS (
     -- CIDs are optional: allow cid_id NULL by falling back to parts.ipfs_cid; may still be NULL
