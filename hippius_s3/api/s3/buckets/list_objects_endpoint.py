@@ -171,7 +171,12 @@ async def handle_list_objects(
         add_subelement(content, "Size", str(obj["size_bytes"]))
         add_subelement(content, "StorageClass", "STANDARD")
         owner = add_subelement(content, "Owner")
-        add_subelement(owner, "ID", bucket_owner)
+        # Console reads Owner.ID as the Arion file hash. Once PUT/MPU stores
+        # BLAKE3 of the plaintext, surface it here; otherwise keep the account
+        # id (the pre-hash placeholder the console treats as pending).
+        file_hash = obj.get("ipfs_cid") or ""
+        owner_id = file_hash if file_hash and file_hash != "pending" else bucket_owner
+        add_subelement(owner, "ID", owner_id)
         add_subelement(owner, "DisplayName", bucket_owner)
 
     for common_prefix in common_prefixes:

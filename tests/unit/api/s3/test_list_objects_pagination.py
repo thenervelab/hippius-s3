@@ -789,6 +789,51 @@ async def test_owner_falls_back_to_requestor_when_bucket_owner_missing() -> None
 
 
 @pytest.mark.asyncio
+async def test_owner_id_is_blake3_file_hash_when_ipfs_cid_set() -> None:
+    digest = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+    row = _row("k")
+    row["ipfs_cid"] = digest
+    pool = _make_pool(bucket_row=_bucket(owner="5BUCKET-OWNER"), list_rows=[row])
+    resp = await handle_list_objects(
+        "b",
+        _ctx(),
+        pool,
+        prefix=None,
+        start_after=None,
+        continuation_token=None,
+        max_keys=None,
+        encoding_type=None,
+        delimiter=None,
+    )
+    root = _parse(resp.body)
+    owner_id = root.find(f"{S3_NS}Contents/{S3_NS}Owner/{S3_NS}ID").text
+    owner_dn = root.find(f"{S3_NS}Contents/{S3_NS}Owner/{S3_NS}DisplayName").text
+    assert owner_id == digest
+    assert owner_dn == "5BUCKET-OWNER"
+
+
+@pytest.mark.asyncio
+async def test_owner_id_stays_account_when_ipfs_cid_is_pending() -> None:
+    row = _row("k")
+    row["ipfs_cid"] = "pending"
+    pool = _make_pool(bucket_row=_bucket(owner="5BUCKET-OWNER"), list_rows=[row])
+    resp = await handle_list_objects(
+        "b",
+        _ctx(),
+        pool,
+        prefix=None,
+        start_after=None,
+        continuation_token=None,
+        max_keys=None,
+        encoding_type=None,
+        delimiter=None,
+    )
+    root = _parse(resp.body)
+    owner_id = root.find(f"{S3_NS}Contents/{S3_NS}Owner/{S3_NS}ID").text
+    assert owner_id == "5BUCKET-OWNER"
+
+
+@pytest.mark.asyncio
 async def test_request_echoes_continuation_token_when_provided() -> None:
     pool = _make_pool(bucket_row=_bucket(), list_rows=[])
     token = _encode_continuation_token("k50")

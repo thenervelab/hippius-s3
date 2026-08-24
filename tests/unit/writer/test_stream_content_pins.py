@@ -19,6 +19,7 @@ from typing import AsyncIterator
 
 import pytest
 
+from hippius_s3.blake3_hash import hex_of
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.config import get_config
 from hippius_s3.services.crypto_service import CryptoService
@@ -81,9 +82,15 @@ def rig(tmp_path: Any, monkeypatch: Any):
     async def fake_parts(db: Any, **kw: Any) -> None:
         captured["placeholder"] = kw
 
+    async def fake_persist(_db: Any, **kw: Any) -> None:
+        captured["blake3"] = kw["digest"]
+        captured["blake3_object_id"] = kw["object_id"]
+        captured["blake3_object_version"] = kw["object_version"]
+
     monkeypatch.setattr("hippius_s3.writer.object_writer.upsert_object_basic", fake_upsert)
     monkeypatch.setattr("hippius_s3.writer.object_writer.ensure_upload_row", fake_ensure)
     monkeypatch.setattr("hippius_s3.writer.object_writer.upsert_part_placeholder", fake_parts)
+    monkeypatch.setattr("hippius_s3.writer.object_writer.persist_version_hash", fake_persist)
 
     fs_store = FileSystemPartsStore(str(tmp_path))
     writer = ObjectWriter(pool=make_fake_pool(), redis_client=DummyRedis(), fs_store=fs_store)
@@ -139,6 +146,7 @@ async def test_etag_is_md5_and_chunks_decrypt_back(rig: Any, name: str) -> None:
 
     assert res.etag == hashlib.md5(body).hexdigest(), "ETag must be the MD5 of the whole body"
     assert res.size_bytes == len(body)
+    assert captured["blake3"] == hex_of(body), "PUT must persist BLAKE3 of the whole plaintext"
 
     expected_chunks = (len(body) + CHUNK - 1) // CHUNK
     plain, ct_sizes = _reassemble(fs_store, bucket_id, res.object_id, expected_chunks)
@@ -157,6 +165,7 @@ async def test_empty_body(rig: Any) -> None:
     assert res.etag == hashlib.md5(b"").hexdigest()
     assert res.size_bytes == 0
     assert captured["placeholder"]["chunk_cipher_sizes"] == []
+    assert captured["blake3"] == hex_of(b"")
     assert _meta_file(fs_store, res.object_id, 1).exists()
 
 
@@ -181,6 +190,7 @@ async def test_consumer_error_propagates_and_nothing_finalizes(rig: Any, monkeyp
 
     assert "ensure_called" not in captured, "the DB tail must not run after a consumer failure"
     assert "placeholder" not in captured
+    assert "blake3" not in captured, "a failed PUT must not persist a hash"
 
 
 @pytest.mark.asyncio
@@ -210,6 +220,7 @@ async def test_body_iter_error_cancels_consumer_and_writes_no_meta(rig: Any) -> 
     assert len(asyncio.all_tasks()) <= tasks_before, "consumer task leaked past the failed PUT"
     assert "ensure_called" not in captured
     assert "placeholder" not in captured
+    assert "blake3" not in captured
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +239,13 @@ def mpu_rig(tmp_path: Any, monkeypatch: Any):
     async def fake_parts(db: Any, **kw: Any) -> None:
         captured["placeholder"] = kw
 
+    async def fake_persist(_db: Any, **kw: Any) -> None:
+        captured["blake3"] = kw["digest"]
+        captured["blake3_object_id"] = kw["object_id"]
+        captured["blake3_object_version"] = kw["object_version"]
+
     monkeypatch.setattr("hippius_s3.writer.object_writer.upsert_part_placeholder", fake_parts)
+    monkeypatch.setattr("hippius_s3.writer.object_writer.persist_version_hash", fake_persist)
 
     fs_store = FileSystemPartsStore(str(tmp_path))
     writer = ObjectWriter(pool=make_fake_pool(), redis_client=DummyRedis(), fs_store=fs_store)
@@ -240,7 +257,14 @@ def mpu_rig(tmp_path: Any, monkeypatch: Any):
     return writer, fs_store, captured
 
 
-async def _put_part(writer: ObjectWriter, bucket_id: str, object_id: str, *pieces: bytes, **kw: Any) -> Any:
+async def _put_part(
+    writer: ObjectWriter,
+    bucket_id: str,
+    object_id: str,
+    *pieces: bytes,
+    part_number: int = 3,
+    **kw: Any,
+) -> Any:
     return await writer.mpu_upload_part_stream(
         upload_id="up-1",
         object_id=object_id,
@@ -248,7 +272,7 @@ async def _put_part(writer: ObjectWriter, bucket_id: str, object_id: str, *piece
         bucket_name="bkt",
         bucket_id=bucket_id,
         account_address="acct",
-        part_number=3,
+        part_number=part_number,
         body_iter=_body(*pieces),
         **kw,
     )
@@ -277,6 +301,7 @@ async def test_mpu_part_etag_decrypt_and_size_order(mpu_rig: Any) -> None:
     assert plain == body, "published MPU chunks must decrypt back to the part body"
     assert captured["placeholder"]["chunk_cipher_sizes"] == ct_sizes
     assert _meta_file(fs_store, object_id, 3).exists()
+    assert "blake3" not in captured, "part 3 must not persist a first-chunk hash"
 
 
 @pytest.mark.asyncio
@@ -287,6 +312,7 @@ async def test_mpu_zero_length_part_raises_and_publishes_nothing(mpu_rig: Any) -
         await _put_part(writer, str(uuid.uuid4()), object_id)
     assert "placeholder" not in captured
     assert not _meta_file(fs_store, object_id, 3).exists()
+    assert "blake3" not in captured
 
 
 @pytest.mark.asyncio
@@ -299,6 +325,7 @@ async def test_mpu_oversize_aborts_without_publish(mpu_rig: Any) -> None:
         )
     assert "placeholder" not in captured
     assert not _meta_file(fs_store, object_id, 3).exists()
+    assert "blake3" not in captured
 
 
 @pytest.mark.asyncio
@@ -314,6 +341,7 @@ async def test_mpu_stage_failure_propagates_without_publish(mpu_rig: Any, monkey
         await _put_part(writer, str(uuid.uuid4()), object_id, b"m" * (CHUNK * 3))
     assert "placeholder" not in captured
     assert not _meta_file(fs_store, object_id, 3).exists()
+    assert "blake3" not in captured
 
 
 @pytest.mark.asyncio
@@ -324,3 +352,43 @@ async def test_mpu_empty_pieces_skipped(mpu_rig: Any) -> None:
     res = await _put_part(writer, bucket_id, object_id, b"", body[:5], b"", body[5:], b"")
     assert res.etag == hashlib.md5(body).hexdigest()
     assert res.size_bytes == len(body)
+
+
+@pytest.mark.asyncio
+async def test_mpu_part1_persists_blake3_of_first_framed_chunk_only(mpu_rig: Any) -> None:
+    writer, fs_store, captured = mpu_rig
+    bucket_id, object_id = str(uuid.uuid4()), str(uuid.uuid4())
+    body = b"P" * (CHUNK * 2 + 50)
+
+    await _put_part(writer, bucket_id, object_id, body, part_number=1)
+
+    assert captured["blake3"] == hex_of(body[:CHUNK])
+    assert captured["blake3"] != hex_of(body)
+    assert captured["blake3_object_id"] == object_id
+    assert captured["blake3_object_version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_mpu_part1_shorter_than_one_chunk_hashes_the_whole_part(mpu_rig: Any) -> None:
+    writer, fs_store, captured = mpu_rig
+    bucket_id, object_id = str(uuid.uuid4()), str(uuid.uuid4())
+    body = b"tiny-part"
+
+    await _put_part(writer, bucket_id, object_id, body, part_number=1)
+
+    assert captured["blake3"] == hex_of(body)
+
+
+@pytest.mark.asyncio
+async def test_mpu_reupload_part1_overwrites_the_digest(mpu_rig: Any) -> None:
+    writer, fs_store, captured = mpu_rig
+    bucket_id, object_id = str(uuid.uuid4()), str(uuid.uuid4())
+
+    await _put_part(writer, bucket_id, object_id, b"A" * (CHUNK + 1), part_number=1)
+    first = captured["blake3"]
+    await _put_part(writer, bucket_id, object_id, b"B" * (CHUNK + 1), part_number=1)
+    second = captured["blake3"]
+
+    assert first == hex_of(b"A" * CHUNK)
+    assert second == hex_of(b"B" * CHUNK)
+    assert first != second
