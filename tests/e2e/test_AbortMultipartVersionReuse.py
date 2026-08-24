@@ -13,6 +13,9 @@ the real API rather than against the schema.
 from typing import Any
 from typing import Callable
 
+import pytest
+from botocore.exceptions import ClientError
+
 
 def _version_of(client: Any, bucket: str, key: str) -> int:
     return int(client.head_object(Bucket=bucket, Key=key)["ResponseMetadata"]["HTTPHeaders"]["x-amz-version-id"])
@@ -35,7 +38,7 @@ def test_abort_does_not_reissue_the_version_number(
     # The aborted attempt consumes exactly one version number, which must never come back.
     create = boto3_client.create_multipart_upload(Bucket=bucket, Key=key, ContentType="application/octet-stream")
     upload_id = create["UploadId"]
-    boto3_client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=1, Body=b"a" * (5 * 1024 * 1024))
+    boto3_client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=1, Body=b"a" * 1024)
     boto3_client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
 
     boto3_client.put_object(Bucket=bucket, Key=key, Body=b"second")
@@ -66,12 +69,8 @@ def test_aborted_version_is_not_fetchable_by_version_id(
 
     create = boto3_client.create_multipart_upload(Bucket=bucket, Key=key, ContentType="application/octet-stream")
     upload_id = create["UploadId"]
-    boto3_client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=1, Body=b"a" * (5 * 1024 * 1024))
+    boto3_client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=1, Body=b"a" * 1024)
     boto3_client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
 
-    try:
-        body = boto3_client.get_object(Bucket=bucket, Key=key, VersionId=str(aborted_version))["Body"].read()
-    except Exception as exc:  # noqa: BLE001 - any refusal is correct; serving bytes is not
-        assert "NoSuchVersion" in str(exc) or "NoSuchKey" in str(exc), f"unexpected error: {exc}"
-    else:
-        raise AssertionError(f"aborted version {aborted_version} served {len(body)} bytes instead of NoSuchVersion")
+    with pytest.raises(ClientError, match="NoSuchVersion|NoSuchKey"):
+        boto3_client.get_object(Bucket=bucket, Key=key, VersionId=str(aborted_version))

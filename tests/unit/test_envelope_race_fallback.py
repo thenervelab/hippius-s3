@@ -29,7 +29,7 @@ class FakeDB:
         # The envelope fallback asks for the highest SERVEABLE version below the current one
         # (get_prev_serveable_version). Default to version-1 so the existing cases keep their
         # shape; the sparse-numbering case overrides it.
-        default = None if fetchrow_returns is None else (fetchrow_returns or {}).get("object_version")
+        default = (fetchrow_returns or {}).get("object_version")
         self.fetchval = AsyncMock(return_value=prev_version if prev_version is not None else default)
 
 
@@ -464,5 +464,5 @@ async def test_fallback_skips_a_gap_in_version_numbers():
 
         await build_stream_context(db, None, FakeObjCache([True]), info, rng=None, address="addr1")
 
-        assert db.fetchval.await_args[0][3] == 42, "the gap query must be anchored at the current version"
+        assert db.fetchval.await_args[0][2] == 42, "the gap query must be anchored at the current version"
         assert db.fetchrow.call_args[0][3] == 40, "the fallback skipped past the placeholder to v40"

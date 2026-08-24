@@ -33,18 +33,13 @@ WITH object_info AS (
       AND b.deleted_at IS NULL
       AND o.object_key = $2
       AND o.deleted_at IS NULL
-      -- The "this version is complete, not a reserved placeholder" half of the rule the
-      -- unversioned resolver applies (get_object_for_download_with_permissions.sql). Only that
-      -- half: the resolver's other clause, object_version <= current_object_version, is
-      -- deliberately NOT adopted, because pinning a version explicitly is how you reach one that
-      -- is not current. Pinning a version
-      -- explicitly must not reach a row that a normal GET would skip: a reserved row carries no
-      -- parts and no envelope, so serving it yields a 0-byte body instead of NoSuchVersion.
-      -- Reserved rows are not hypothetical — every in-flight MPU has one, an aborted MPU leaves
-      -- one behind permanently (abort_cleanup_orphan_version.sql), and the B4 address-write
-      -- rollback reverts a version to this shape (put_object_endpoint.py, copy_helpers.py).
-      -- A legitimately empty object is admitted by the md5 disjunct: a 0-byte PUT stores the
-      -- md5 of the empty string, so only the never-completed shape (0 bytes AND no md5) fails.
+      -- Reserved placeholders must not be reachable by explicit versionId either: they carry no
+      -- parts, so serving one yields a 0-byte body instead of NoSuchVersion. Every in-flight MPU
+      -- has one and an aborted MPU leaves one behind permanently
+      -- (abort_cleanup_orphan_version.sql). Only the completeness half of the unversioned
+      -- resolver's rule is adopted — its `<= current_object_version` bound is deliberately not,
+      -- since pinning a version is how you reach one that is not current. A legitimately empty
+      -- object stores the md5 of the empty string, so the md5 disjunct still admits it.
       AND (ov.size_bytes > 0 OR (ov.md5_hash IS NOT NULL AND ov.md5_hash != ''))
 ),
 multipart_chunks AS (
