@@ -63,6 +63,13 @@ def parse_s3_path(path: str) -> tuple[str | None, str | None]:
     bucket = parts[0] if parts else None
     key = parts[1] if len(parts) > 1 else None
 
+    # A trailing slash is not an object key. Every caller asks `key is not None` to mean
+    # "this is an object operation", so an empty key would make `/bucket/` evaluate as one:
+    # `is_create_bucket` stops firing and bucket ops map to object ops in the sub-token
+    # scope check. Belt to trailing_slash_normalizer's braces — either alone closes it.
+    if key is not None and key.strip("/") == "":
+        key = None
+
     return bucket, key
 
 
