@@ -150,7 +150,12 @@ def _append_entry(
         add_subelement(entry, "Size", str(row["size_bytes"]))
         add_subelement(entry, "StorageClass", "STANDARD")
     owner = add_subelement(entry, "Owner")
-    add_subelement(owner, "ID", bucket_owner)
+    # Same contract as ListObjects: the console reads Owner.ID as the Arion file hash, so a
+    # version that has a plaintext BLAKE3 surfaces it and one that doesn't falls back to the
+    # account id. A delete marker has no content, so it always carries the account id — the two
+    # listings must not disagree about the same version.
+    file_hash = "" if is_marker else (row["body_blake3"] or "")
+    add_subelement(owner, "ID", file_hash or bucket_owner)
     add_subelement(owner, "DisplayName", bucket_owner)
 
 

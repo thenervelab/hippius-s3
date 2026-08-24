@@ -9,6 +9,7 @@ import lxml.etree as ET
 import pytest
 
 from hippius_s3.api.s3.buckets import list_object_versions_endpoint as mod
+from hippius_s3.utils import get_query
 
 
 TS = datetime(2026, 8, 22, 9, 32, 42, tzinfo=timezone.utc)
@@ -45,6 +46,7 @@ def _row(
     marker: bool = False,
     size: int = 11,
     md5: str = "abc",
+    body_blake3: str | None = None,
 ) -> dict[str, Any]:
     return {
         "object_key": key,
@@ -52,6 +54,7 @@ def _row(
         "is_delete_marker": marker,
         "size_bytes": size,
         "md5_hash": md5,
+        "body_blake3": body_blake3,
         "last_modified": TS,
         "current_object_version": current,
     }
@@ -263,3 +266,65 @@ async def test_invalid_max_keys_rejected(bad: str) -> None:
 
     assert resp.status_code == 400
     assert b"InvalidArgument" in resp.body
+
+
+# ---------------------------------------------------------------------------
+# Arion file hash in Owner.ID — must match ListObjects exactly, or the console
+# shows a digest for a key in one listing and an SS58 for the same key in the other.
+# ---------------------------------------------------------------------------
+
+BLAKE3_HEX = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+
+
+def _owner_id(entry: Any) -> str | None:
+    return _text(entry.xpath("./*[local-name()='Owner']")[0], "ID")
+
+
+@pytest.mark.asyncio
+async def test_version_owner_id_is_the_digest_when_present() -> None:
+    pool = _FakePool(bucket=_bucket(), rows=[_row("a.txt", 2, current=2, body_blake3=BLAKE3_HEX)])
+    resp = await _call(pool)
+
+    version = _children(ET.fromstring(resp.body), "Version")[0]
+    assert _owner_id(version) == BLAKE3_HEX
+    assert _text(version.xpath("./*[local-name()='Owner']")[0], "DisplayName") == "owner-1"
+
+
+@pytest.mark.asyncio
+async def test_version_owner_id_falls_back_to_the_account_without_a_digest() -> None:
+    pool = _FakePool(bucket=_bucket(), rows=[_row("a.txt", 2, current=2)])
+    resp = await _call(pool)
+
+    assert _owner_id(_children(ET.fromstring(resp.body), "Version")[0]) == "owner-1"
+
+
+@pytest.mark.asyncio
+async def test_delete_marker_owner_id_is_always_the_account() -> None:
+    """A marker has no content to hash, so it must never carry a digest — even a stale one."""
+    row = _row("a.txt", 3, current=3, marker=True, size=0, md5="", body_blake3=BLAKE3_HEX)
+    pool = _FakePool(bucket=_bucket(), rows=[row])
+    resp = await _call(pool)
+
+    assert _owner_id(_children(ET.fromstring(resp.body), "DeleteMarker")[0]) == "owner-1"
+
+
+@pytest.mark.asyncio
+async def test_each_version_carries_its_own_digest() -> None:
+    """Per-version digests, not the current version's — an overwrite changes the content."""
+    older = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    pool = _FakePool(
+        bucket=_bucket(),
+        rows=[
+            _row("a.txt", 2, current=2, body_blake3=BLAKE3_HEX),
+            _row("a.txt", 1, current=2, body_blake3=older),
+        ],
+    )
+    resp = await _call(pool)
+
+    versions = _children(ET.fromstring(resp.body), "Version")
+    assert [_owner_id(v) for v in versions] == [BLAKE3_HEX, older]
+
+
+def test_the_query_projects_the_digest() -> None:
+    """Without this column the endpoint KeyErrors — the two listings must read the same column."""
+    assert "body_blake3" in get_query("list_object_versions")

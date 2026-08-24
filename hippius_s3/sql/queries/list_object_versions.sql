@@ -29,6 +29,7 @@ SELECT o.object_key,
        ov.is_delete_marker,
        ov.size_bytes,
        ov.md5_hash,
+       ov.body_blake3,
        COALESCE(ov.last_modified, ov.created_at) AS last_modified,
        o.current_object_version
 FROM objects o
