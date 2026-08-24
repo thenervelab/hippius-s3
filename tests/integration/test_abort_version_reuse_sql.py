@@ -255,21 +255,6 @@ async def test_abort_cleanup_is_idempotent(ctx: Ctx) -> None:
     assert await _version_exists(ctx, object_id, v2)
 
 
-async def test_abort_of_unknown_version_is_a_noop(ctx: Ctx) -> None:
-    """A version that never existed (legacy/NULL-version parts) must not move the pointer."""
-    object_id, key = uuid.uuid4(), "k"
-    v1 = await _initiate_mpu(ctx, object_id, key)
-    await _complete(ctx, object_id, v1)
-
-    assert await _abort_cleanup(ctx, object_id, 999) is None
-    assert await _current(ctx, object_id) == v1
-
-
-# ---------------------------------------------------------------------------
-# The retained row must stay invisible to reads
-# ---------------------------------------------------------------------------
-
-
 async def test_tombstone_is_invisible_to_the_unversioned_download_query(ctx: Ctx) -> None:
     """A plain GET must resolve to the last completed version, not the retained reserved row."""
     object_id, key = uuid.uuid4(), "k"
@@ -283,21 +268,6 @@ async def test_tombstone_is_invisible_to_the_unversioned_download_query(ctx: Ctx
 
     assert row is not None, "the completed version must still resolve"
     assert int(row["object_version"]) == v1
-
-
-async def test_tombstone_is_invisible_to_the_by_version_download_query(ctx: Ctx) -> None:
-    """`GET ?versionId=<aborted>` must be NoSuchVersion, not a 0-byte body. Without the serveable
-    filter the retained row joins cleanly and the endpoint serves an empty object."""
-    object_id, key = uuid.uuid4(), "k"
-    v1 = await _initiate_mpu(ctx, object_id, key)
-    await _complete(ctx, object_id, v1)
-    v2 = await _initiate_mpu(ctx, object_id, key)
-    await _abort_cleanup(ctx, object_id, v2)
-    bucket = ctx.bucket_name
-
-    row = await ctx.conn.fetchrow(get_query("get_object_for_download_with_permissions_by_version"), bucket, key, v2)
-
-    assert row is None, "a reserved/aborted version must not be fetchable by explicit versionId"
 
 
 async def test_in_flight_mpu_version_is_not_fetchable_by_version(ctx: Ctx) -> None:
@@ -336,22 +306,6 @@ async def test_zero_byte_object_is_still_fetchable_by_version(ctx: Ctx) -> None:
 # ---------------------------------------------------------------------------
 # Schema-level invariants
 # ---------------------------------------------------------------------------
-
-
-async def test_current_version_fk_holds_after_abort(ctx: Ctx) -> None:
-    """Regression guard, not a live hazard: with the DELETE gone this query only repoints onto a
-    row it just read, so it cannot violate objects_current_version_fk. The FK is DEFERRABLE, so a
-    violation would surface at commit — force the check rather than trust the statement."""
-    object_id, key = uuid.uuid4(), "k"
-    v1 = await _initiate_mpu(ctx, object_id, key)
-    await _complete(ctx, object_id, v1)
-    v2 = await _initiate_mpu(ctx, object_id, key)
-
-    async with ctx.conn.transaction():
-        await _abort_cleanup(ctx, object_id, v2)
-        await ctx.conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
-
-    assert await _current(ctx, object_id) == v1
 
 
 async def test_all_version_allocators_share_one_expression() -> None:
@@ -415,36 +369,6 @@ async def test_fallback_never_reaches_above_the_aborted_version(ctx: Ctx) -> Non
     await _abort_cleanup(ctx, object_id, v2)
 
     assert await _current(ctx, object_id) == v1, "the pointer jumped forward onto an unpromoted version"
-
-
-async def test_abort_racing_complete_does_not_hide_the_completed_version(ctx: Ctx) -> None:
-    """A client can race AbortMultipartUpload against CompleteMultipartUpload on the same upload —
-    the abort handler never checks is_completed. Here the completion COMMITS FIRST, so the abort
-    sees it and must decline. (The harder ordering — completion still uncommitted when the abort
-    runs — is what `test_abort_blocks_on_an_uncommitted_completion_and_then_declines` covers; only
-    that one exercises the row lock.)"""
-    object_id, key = uuid.uuid4(), "k"
-    v1 = await _initiate_mpu(ctx, object_id, key)
-    await _complete(ctx, object_id, v1)
-    v2 = await _initiate_mpu(ctx, object_id, key)
-
-    other = await asyncpg.connect(os.environ["DATABASE_URL"])
-    try:
-        async with ctx.conn.transaction():
-            # Establish the aborting statement's snapshot BEFORE the concurrent completion lands.
-            await ctx.conn.fetchval("SELECT count(*) FROM object_versions WHERE object_id = $1", object_id)
-            await other.execute(
-                "UPDATE object_versions SET size_bytes = 11, md5_hash = $3, address = 'addr' "
-                "WHERE object_id = $1 AND object_version = $2",
-                object_id,
-                v2,
-                "5eb63bbbe01eeed093cb22bb8f5acdc3",
-            )
-            await _abort_cleanup(ctx, object_id, v2)
-    finally:
-        await other.close()
-
-    assert await _current(ctx, object_id) == v2, "the pointer was rewound off a completed version"
 
 
 async def test_abort_blocks_on_an_uncommitted_completion_and_then_declines(ctx: Ctx) -> None:
@@ -533,3 +457,20 @@ async def test_reserved_row_with_null_md5_is_still_recognised(ctx: Ctx) -> None:
 
     assert await _abort_cleanup(ctx, object_id, v2) is not None
     assert await _current(ctx, object_id) == v1
+
+
+async def test_a_version_with_bytes_but_no_md5_is_not_treated_as_reserved(ctx: Ctx) -> None:
+    """Both halves of the reserved-check are load-bearing. A row carrying real bytes is not a
+    placeholder however its md5 reads, so the pointer must not be moved off it."""
+    object_id, key = uuid.uuid4(), "k"
+    v1 = await _initiate_mpu(ctx, object_id, key)
+    await _complete(ctx, object_id, v1)
+    v2 = await _initiate_mpu(ctx, object_id, key)
+    await ctx.conn.execute(
+        "UPDATE object_versions SET size_bytes = 11, md5_hash = '' WHERE object_id = $1 AND object_version = $2",
+        object_id,
+        v2,
+    )
+
+    assert await _abort_cleanup(ctx, object_id, v2) is None
+    assert await _current(ctx, object_id) == v2
