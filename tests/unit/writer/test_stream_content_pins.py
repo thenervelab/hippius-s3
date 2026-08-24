@@ -56,6 +56,14 @@ def _meta_file(fs_store: FileSystemPartsStore, object_id: str, part: int) -> pat
     return pathlib.Path(fs_store.part_path(object_id, 1, part)) / "meta.json"
 
 
+def _persisted_blake3(writer: ObjectWriter) -> str | None:
+    """The digest the PUT tail wrote — it rides on the metadata UPDATE, not a statement of its own."""
+    for e in writer.pool.calls("execute"):
+        if e["query"] and "body_blake3" in e["query"]:
+            return e["args"][7]
+    return None
+
+
 
 @pytest.fixture
 def rig(tmp_path: Any, monkeypatch: Any):
@@ -82,15 +90,9 @@ def rig(tmp_path: Any, monkeypatch: Any):
     async def fake_parts(db: Any, **kw: Any) -> None:
         captured["placeholder"] = kw
 
-    async def fake_persist(_db: Any, **kw: Any) -> None:
-        captured["blake3"] = kw["digest"]
-        captured["blake3_object_id"] = kw["object_id"]
-        captured["blake3_object_version"] = kw["object_version"]
-
     monkeypatch.setattr("hippius_s3.writer.object_writer.upsert_object_basic", fake_upsert)
     monkeypatch.setattr("hippius_s3.writer.object_writer.ensure_upload_row", fake_ensure)
     monkeypatch.setattr("hippius_s3.writer.object_writer.upsert_part_placeholder", fake_parts)
-    monkeypatch.setattr("hippius_s3.writer.object_writer.persist_version_hash", fake_persist)
 
     fs_store = FileSystemPartsStore(str(tmp_path))
     writer = ObjectWriter(pool=make_fake_pool(), redis_client=DummyRedis(), fs_store=fs_store)
@@ -146,7 +148,7 @@ async def test_etag_is_md5_and_chunks_decrypt_back(rig: Any, name: str) -> None:
 
     assert res.etag == hashlib.md5(body).hexdigest(), "ETag must be the MD5 of the whole body"
     assert res.size_bytes == len(body)
-    assert captured["blake3"] == hex_of(body), "PUT must persist BLAKE3 of the whole plaintext"
+    assert _persisted_blake3(writer) == hex_of(body), "PUT must persist BLAKE3 of the whole plaintext"
 
     expected_chunks = (len(body) + CHUNK - 1) // CHUNK
     plain, ct_sizes = _reassemble(fs_store, bucket_id, res.object_id, expected_chunks)
@@ -165,7 +167,7 @@ async def test_empty_body(rig: Any) -> None:
     assert res.etag == hashlib.md5(b"").hexdigest()
     assert res.size_bytes == 0
     assert captured["placeholder"]["chunk_cipher_sizes"] == []
-    assert captured["blake3"] == hex_of(b"")
+    assert _persisted_blake3(writer) == hex_of(b"")
     assert _meta_file(fs_store, res.object_id, 1).exists()
 
 
@@ -190,7 +192,7 @@ async def test_consumer_error_propagates_and_nothing_finalizes(rig: Any, monkeyp
 
     assert "ensure_called" not in captured, "the DB tail must not run after a consumer failure"
     assert "placeholder" not in captured
-    assert "blake3" not in captured, "a failed PUT must not persist a hash"
+    assert _persisted_blake3(writer) is None, "a failed PUT must not persist a hash"
 
 
 @pytest.mark.asyncio
@@ -220,7 +222,7 @@ async def test_body_iter_error_cancels_consumer_and_writes_no_meta(rig: Any) -> 
     assert len(asyncio.all_tasks()) <= tasks_before, "consumer task leaked past the failed PUT"
     assert "ensure_called" not in captured
     assert "placeholder" not in captured
-    assert "blake3" not in captured
+    assert _persisted_blake3(writer) is None
 
 
 # ---------------------------------------------------------------------------

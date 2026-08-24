@@ -10,7 +10,7 @@ from typing import Any
 
 import blake3
 
-from hippius_s3.utils_core import upsert_cid_and_get_id
+from hippius_s3.utils_core import get_query
 
 
 def hex_of(data: bytes) -> str:
@@ -30,18 +30,15 @@ async def persist_version_hash(
     object_version: int,
     digest: str,
 ) -> None:
-    """Write the file hash onto the version so listings can surface it."""
-    cid_id = await upsert_cid_and_get_id(db, digest)
+    """Write the file hash onto the version so listings can surface it.
+
+    Its own column, deliberately — NOT ipfs_cid/cid_id. Those are read back as real CIDs by the
+    purge/unpin scripts (`COALESCE(c.cid, ov.ipfs_cid)`, guarded only against ''/'pending'/NULL),
+    so a 64-hex digest parked there would enter the unpin worklist as though it were a pin.
+    """
     await db.execute(
-        """
-        UPDATE object_versions
-           SET ipfs_cid = $1,
-               cid_id = $2::uuid
-         WHERE object_id = $3
-           AND object_version = $4
-        """,
+        get_query("update_object_version_body_blake3"),
         digest,
-        cid_id,
         object_id,
         int(object_version),
     )

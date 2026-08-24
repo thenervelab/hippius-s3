@@ -477,12 +477,7 @@ class ObjectWriter:
                         datetime.now(timezone.utc),
                         object_id,
                         int(object_version),
-                    )
-                    await persist_version_hash(
-                        conn,
-                        object_id=object_id,
-                        object_version=int(object_version),
-                        digest=blake3_hex,
+                        blake3_hex,
                     )
                     # Envelope (kek_id, wrapped_dek) was already written in the head transaction
                     # to prevent the read-race on concurrent overwrites.

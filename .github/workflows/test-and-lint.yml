@@ -225,6 +225,9 @@ jobs:
       DOCKER_BUILDKIT: "1"
       COMPOSE_DOCKER_CLI_BUILD: "1"
       HIPPIUS_KEY: ${{ secrets.HIPPIUS_KEY }}
+      # Job-wide, not per-step: conftest's `docker compose up --build` rebuilds too, so both the
+      # explicit build step and the pytest run must resolve the same locally-built base.
+      BASE_IMAGE: hippius-s3-base:latest
     steps:
       - uses: actions/checkout@v4
 
@@ -257,6 +260,9 @@ jobs:
         run: |
           if [ -f .env.example ]; then cp .env.example .env; else touch .env; fi
 
+      # BASE_IMAGE (job env) points the app images at the base we just built from THIS commit's
+      # pyproject.toml. Without it they layer onto the published base and any dependency added in
+      # the PR is missing at runtime — the api container then fails to import and goes unhealthy.
       - name: Build Docker images
         run: |
           docker compose --profile build-base -f docker-compose.yml -f docker-compose.e2e.yml build base

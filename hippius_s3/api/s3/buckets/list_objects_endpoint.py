@@ -171,12 +171,12 @@ async def handle_list_objects(
         add_subelement(content, "Size", str(obj["size_bytes"]))
         add_subelement(content, "StorageClass", "STANDARD")
         owner = add_subelement(content, "Owner")
-        # Console reads Owner.ID as the Arion file hash. Once PUT/MPU stores
-        # BLAKE3 of the plaintext, surface it here; otherwise keep the account
-        # id (the pre-hash placeholder the console treats as pending).
-        file_hash = obj.get("ipfs_cid") or ""
-        owner_id = file_hash if file_hash and file_hash != "pending" else bucket_owner
-        add_subelement(owner, "ID", owner_id)
+        # Console reads Owner.ID as the Arion file hash. Surface the plaintext BLAKE3 once PUT/MPU
+        # has stored it; until then keep the account id, which the console treats as pending.
+        # Bracket access, not .get(): if a listing query ever loses the column, that must be a
+        # KeyError, not a silently empty <ID/> on every object.
+        file_hash = obj["body_blake3"] or ""
+        add_subelement(owner, "ID", file_hash or bucket_owner)
         add_subelement(owner, "DisplayName", bucket_owner)
 
     for common_prefix in common_prefixes:

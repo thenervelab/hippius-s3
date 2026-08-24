@@ -1,4 +1,8 @@
 services:
+  # The base image is where `pip install -e .` runs — every app image below is FROM it and only
+  # COPYs source. So a new dependency in pyproject.toml does NOT reach a container until the base
+  # is rebuilt: build this service, then `BASE_IMAGE=hippius-s3-base:latest docker compose build`.
+  # Without that the app images layer onto the published base and the new import fails at runtime.
   base:
     image: hippius-s3-base:latest
     profiles:
@@ -10,6 +14,8 @@ services:
   api:
     build:
       context: .
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     ports:
       - "${HOST_BIND_IP:-127.0.0.1}:8080:8000"
     env_file:
@@ -203,6 +209,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     env_file:
       - .env.defaults
       - .env
@@ -236,6 +244,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     env_file:
       - .env.defaults
       - .env
@@ -266,6 +276,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     env_file:
       - .env.defaults
       - .env
@@ -296,6 +308,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     env_file:
       - .env.defaults
       - .env
@@ -330,6 +344,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     env_file:
       - .env.defaults
       - .env
@@ -354,6 +370,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     depends_on:
       redis-accounts:
         condition: service_healthy

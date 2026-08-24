@@ -47,7 +47,7 @@ CREATE TABLE objects(
 CREATE TABLE object_versions(
     object_id uuid, object_version bigint, size_bytes bigint, md5_hash text,
     content_type text DEFAULT 'application/octet-stream', multipart bool DEFAULT false, status text DEFAULT 'published',
-    ipfs_cid text
+    body_blake3 text
 );
 CREATE INDEX idx_obj_bucket_key ON objects(bucket_id, object_key);
 """
