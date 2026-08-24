@@ -449,6 +449,114 @@ groups:
           severity: critical
 
   - orgId: 1
+    name: hippius-s3-admin-purge
+    folder: Hippius S3 Alerts
+    interval: 1m
+    rules:
+      # Account purge jobs (issue #421) landing in the 'failed' state. A purge that fails is
+      # retryable (re-issue DELETE .../data), but a job failing at all means the purger hit an
+      # error mid-run (statement timeout on a huge object, DB/Redis blip) and an account's data
+      # was only partially deleted — a billing-enforcement action that did not complete. High,
+      # not critical: no data loss and it is self-healing on retry, but staff must know.
+      - uid: purge-jobs-failing
+        title: Account Purge - Jobs Failing
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(increase(purger_jobs_total{job="otel-collector",result="failed"}[15m])) or vector(0)'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: 'Account purge jobs are failing - {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} failed in last 15 minutes'
+          description: 'One or more DELETE /admin/accounts/{id}/data purge jobs entered state=failed. The account is left partially purged (retryable by re-issuing the purge). Read purge_jobs.error and the purger pod logs; a statement timeout on a very large object means lowering HIPPIUS_PURGER_BATCH_SIZE.'
+        labels:
+          severity: high
+
+      # Sustained unpin-queue backpressure during a purge. The purger parks when a
+      # {backend}_unpin_requests list exceeds HIPPIUS_PURGER_UNPIN_QUEUE_HIGH_WATER (50k) so a
+      # mass purge cannot flood redis-queues (the 1.29M-unpin incident that broke prod GETs).
+      # An occasional park is the safety valve WORKING; a sustained rate means the unpinner is
+      # not draining fast enough and the purge is effectively stalled behind it. Warning: the
+      # gate is protecting prod correctly, but the purge will not finish until unpins catch up.
+      - uid: purge-unpin-backpressure-sustained
+        title: Account Purge - Sustained Unpin Backpressure
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: 'sum(increase(purger_backpressure_waits_total{job="otel-collector"}[15m])) or vector(0)'
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              refId: B
+          - refId: C
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params:
+                      - 60
+                    type: gt
+                  type: query
+              refId: C
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        annotations:
+          summary: 'A purge job has been throttled by unpin-queue backpressure - {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} parks in 15m'
+          description: 'A purge job is repeatedly parking because an unpin queue is over its high-water mark (HIPPIUS_PURGER_UNPIN_QUEUE_HIGH_WATER). The backpressure gate is protecting redis-queues correctly, but the purge cannot finish until the unpinner drains the backlog. Check the unpin queues + unpinner throughput; scale unpinner replicas if this persists.'
+        labels:
+          severity: warning
+
+  - orgId: 1
     name: hippius-s3-drain
     folder: Hippius S3 Alerts
     interval: 1m

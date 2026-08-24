@@ -21,6 +21,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from hippius_s3.api.admin import router as admin_router
 from hippius_s3.api.internal_parts import router as internal_parts_router
 from hippius_s3.api.middlewares.fs_cache_pressure import fs_cache_pressure_middleware
 from hippius_s3.api.middlewares.metrics import metrics_middleware
@@ -45,6 +46,7 @@ from hippius_s3.config import Config
 from hippius_s3.config import get_config
 from hippius_s3.gateway.middlewares.account import account_middleware
 from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.middlewares.admin_hmac import verify_admin_hmac_middleware
 from hippius_s3.gateway.middlewares.ats_purge import ats_purge_middleware
 from hippius_s3.gateway.middlewares.audit_log import audit_log_middleware
 from hippius_s3.gateway.middlewares.auth_probe import auth_probe_middleware
@@ -57,6 +59,7 @@ from hippius_s3.gateway.middlewares.input_validation import input_validation_mid
 from hippius_s3.gateway.middlewares.path_normalization import path_normalization_middleware
 from hippius_s3.gateway.middlewares.ray_id import ray_id_middleware
 from hippius_s3.gateway.middlewares.read_only import read_only_middleware
+from hippius_s3.gateway.middlewares.suspension import suspension_middleware
 from hippius_s3.gateway.middlewares.trailing_slash import trailing_slash_normalizer
 from hippius_s3.gateway.services.acl_service import ACLService
 from hippius_s3.logging_config import setup_loki_logging
@@ -523,10 +526,15 @@ def factory() -> FastAPI:
     app.middleware("http")(request_context_middleware)
     if config.enable_audit_logging:
         app.middleware("http")(audit_log_middleware)
+    app.middleware("http")(verify_admin_hmac_middleware)
     app.middleware("http")(verify_frontend_hmac_middleware)
     app.middleware("http")(acl_middleware)
     app.middleware("http")(account_middleware)
     app.middleware("http")(trailing_slash_normalizer)
+    # Runs immediately after auth_router on the request path (identity is resolved,
+    # nothing clobbered yet) and OUTER to account/acl — master tokens bypass ACL, so a
+    # suspension check any deeper would miss them. See gateway/middlewares/suspension.py.
+    app.middleware("http")(suspension_middleware)
     app.middleware("http")(auth_router_middleware)
     app.middleware("http")(input_validation_middleware)
     app.middleware("http")(fs_cache_pressure_middleware)
@@ -601,6 +609,9 @@ Disallow: /"""
 
     app.include_router(user_router, prefix="/user")
     app.include_router(sub_token_scopes_router, prefix="/user/sub-tokens")
+    # include_in_schema=False: the admin surface is HMAC-gated staff tooling — keep it out
+    # of the public OpenAPI schema (and therefore Swagger/redoc) so it isn't advertised.
+    app.include_router(admin_router, prefix="/admin", include_in_schema=False)
     app.include_router(public_router, prefix="")
     # Mounted only when serving is on AND a secret exists: an absent route is the only honest
     # representation of "peer serving is off", since a mounted one is reachable from the public

@@ -20,6 +20,8 @@ from hippius_s3.gateway.middlewares.cache_control import PUBLIC_CACHE_CONTROL
 from hippius_s3.gateway.middlewares.cache_control import cache_control_middleware
 from hippius_s3.gateway.services.acl_service import BucketLookup
 
+from tests.unit.gateway._suspension_fakes import install_no_suspension_state
+
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
 def _ats_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -57,6 +59,7 @@ def _build_app(
 ) -> Any:
     app = FastAPI()
     app.state.acl_service = acl_service
+    install_no_suspension_state(app)
 
     @app.api_route("/{path:path}", methods=["GET", "HEAD", "PUT", "POST", "DELETE"])
     async def catch_all(request: Request) -> Response:

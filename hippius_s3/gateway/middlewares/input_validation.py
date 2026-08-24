@@ -55,7 +55,7 @@ OBJECT_KEY_AVOID_CHARS = (
 PROHIBITED_BUCKET_PREFIXES = ["xn--", "sthree-", "amzn-s3-demo-"]
 PROHIBITED_BUCKET_SUFFIXES = ["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3"]
 
-SKIP_PREFIXES = {"health", "user", "docs", "robots.txt", "openapi.json"}
+SKIP_PREFIXES = {"admin", "health", "user", "docs", "robots.txt", "openapi.json"}
 
 # Re-exported so this module keeps reading as the place bucket-name policy is enforced. The set
 # itself is defined in hippius_s3/reserved_bucket_names.py — the audit script needs it too, and a

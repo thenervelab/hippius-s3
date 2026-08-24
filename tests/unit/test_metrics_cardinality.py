@@ -56,6 +56,8 @@ BOUNDED_LABELS = {
     # Outcome of a read-recency stamp: "written" | "failed", typed as the ReadRecencyOutcome
     # Literal and passed from exactly two call sites in ReadRecencyRecorder. Closed in code.
     "outcome",
+    # Purge job outcome: "done" | "failed", fixed in record_purger_job.
+    "result",
 }
 
 

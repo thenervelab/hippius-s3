@@ -151,3 +151,27 @@ def test_router_and_security_share_one_path_view() -> None:
     assert seen["bucket"] == "other-bucket", seen
     assert seen["key"] == "key.txt", seen
     assert seen["scope_path"] == "/other-bucket/key.txt", seen
+
+
+def test_suspension_runs_after_auth_router_and_outer_to_account_acl() -> None:
+    """Issue #421: suspension must see resolved identity (inner to auth_router) but run
+    OUTER to account/acl — master tokens bypass ACL on their own buckets, and
+    account_middleware clobbers account_id for bearer auth."""
+    from hippius_s3.main import factory
+
+    order = _dispatch_order(factory())
+
+    def idx(name: str) -> int:
+        assert name in order, f"{name} not registered; order={order}"
+        return order.index(name)
+
+    assert idx("auth_router_middleware") < idx("suspension_middleware"), order
+    assert idx("suspension_middleware") < idx("account_middleware"), order
+    assert idx("suspension_middleware") < idx("acl_middleware"), order
+
+
+def test_admin_hmac_is_registered() -> None:
+    from hippius_s3.main import factory
+
+    order = _dispatch_order(factory())
+    assert "verify_admin_hmac_middleware" in order, order

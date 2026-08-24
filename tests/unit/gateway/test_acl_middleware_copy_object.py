@@ -32,6 +32,8 @@ from hippius_s3.models.sub_token import BucketScope
 from hippius_s3.models.sub_token import Permission
 from hippius_s3.models.sub_token import SubTokenScope
 
+from tests.unit.gateway._suspension_fakes import install_no_suspension_state
+
 
 # ---- Helpers ---------------------------------------------------------------
 
@@ -72,6 +74,7 @@ def _make_app(
 
     acl_service.get_bucket_owner_and_id = AsyncMock(side_effect=_lookup)
     app.state.acl_service = acl_service
+    install_no_suspension_state(app)
 
     repo = AsyncMock()
     repo.get = AsyncMock(return_value=scope)

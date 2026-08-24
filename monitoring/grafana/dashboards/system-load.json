@@ -1573,6 +1573,332 @@
         "x": 0,
         "y": 61
       },
+      "id": 200,
+      "panels": [],
+      "title": "Account Purge (#421)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "done"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 62
+      },
+      "id": 201,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "expr": "sum by (result) (purger_jobs_total{service_namespace=\"$namespace\"})",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Purge jobs (cumulative done vs failed)",
+      "type": "timeseries",
+      "description": "Account-purge jobs finishing, split by result. Any sustained 'failed' means the purger is erroring on a job \u2014 check the purger pod logs and purge_jobs.error."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 62
+      },
+      "id": 202,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "expr": "sum(purger_objects_deleted_total{service_namespace=\"$namespace\"})",
+          "legendFormat": "objects",
+          "refId": "A"
+        }
+      ],
+      "title": "Objects purged (cumulative)",
+      "type": "timeseries",
+      "description": "Soft-delete throughput of active purge jobs (logical progress). Zero while no purge is running."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 62
+      },
+      "id": 203,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "expr": "sum(purger_backpressure_waits_total{service_namespace=\"$namespace\"}) or vector(0)",
+          "legendFormat": "waits",
+          "refId": "A"
+        }
+      ],
+      "title": "Purge unpin backpressure (cumulative)",
+      "type": "timeseries",
+      "description": "Times a purge job parked because an unpin queue was over its high-water mark. This is the safety valve working; a SUSTAINED rate means unpins are not draining fast enough and the purge is throttled \u2014 check the unpin queues above."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      },
       "id": 50,
       "panels": [],
       "title": "System Resources",
@@ -1644,7 +1970,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 62
+        "y": 71
       },
       "id": 51,
       "options": {
@@ -1771,7 +2097,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 62
+        "y": 71
       },
       "id": 52,
       "options": {
@@ -1847,7 +2173,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 62
+        "y": 71
       },
       "id": 53,
       "options": {
@@ -1913,7 +2239,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 62
+        "y": 71
       },
       "id": 54,
       "options": {
@@ -2011,7 +2337,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 70
+        "y": 79
       },
       "id": 65,
       "options": {
@@ -2050,7 +2376,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 87
       },
       "id": 60,
       "panels": [],
@@ -2129,7 +2455,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 79
+        "y": 88
       },
       "id": 61,
       "options": {
@@ -2316,7 +2642,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 79
+        "y": 88
       },
       "id": 62,
       "options": {
@@ -2410,7 +2736,7 @@
         "h": 8,
         "w": 4,
         "x": 16,
-        "y": 79
+        "y": 88
       },
       "id": 63,
       "options": {
@@ -2503,7 +2829,7 @@
         "h": 8,
         "w": 4,
         "x": 20,
-        "y": 79
+        "y": 88
       },
       "id": 64,
       "options": {
@@ -2544,7 +2870,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 87
+        "y": 96
       },
       "id": 70,
       "panels": [],
@@ -2623,7 +2949,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 88
+        "y": 97
       },
       "id": 71,
       "options": {
@@ -2735,7 +3061,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 88
+        "y": 97
       },
       "id": 72,
       "options": {
@@ -2802,7 +3128,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 88
+        "y": 97
       },
       "id": 73,
       "options": {
@@ -2840,7 +3166,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 96
+        "y": 105
       },
       "id": 84,
       "panels": [],
@@ -2879,7 +3205,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 97
+        "y": 106
       },
       "id": 85,
       "options": {
@@ -2944,7 +3270,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 97
+        "y": 106
       },
       "id": 86,
       "options": {
@@ -3007,7 +3333,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 97
+        "y": 106
       },
       "id": 87,
       "options": {
@@ -3070,7 +3396,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 97
+        "y": 106
       },
       "id": 88,
       "options": {
@@ -3142,7 +3468,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 105
+        "y": 114
       },
       "id": 89,
       "options": {
@@ -3205,7 +3531,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 105
+        "y": 114
       },
       "id": 90,
       "options": {
@@ -3268,7 +3594,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 105
+        "y": 114
       },
       "id": 91,
       "options": {
@@ -3331,7 +3657,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 105
+        "y": 114
       },
       "id": 92,
       "options": {
@@ -3391,7 +3717,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 113
+        "y": 122
       },
       "id": 93,
       "options": {
@@ -3454,7 +3780,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 113
+        "y": 122
       },
       "id": 94,
       "options": {
@@ -3517,7 +3843,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 113
+        "y": 122
       },
       "id": 95,
       "options": {
