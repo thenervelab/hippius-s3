@@ -82,6 +82,39 @@ services:
       - HIPPIUS_DOWNLOAD_BACKENDS=arion
       - HIPPIUS_DELETE_BACKENDS=arion
 
+  # Unpin is a real backend call, so it points at the same toxiproxy hop the uploader and
+  # downloader use — otherwise it would resolve the production Arion host from .env.defaults.
+  arion-unpinner:
+    env_file:
+      - .env.defaults
+      - .env.test-docker
+    environment:
+      - HIPPIUS_KEY=${HIPPIUS_KEY}
+      - HIPPIUS_ARION_BASE_URL=http://toxiproxy:19090
+      - HIPPIUS_UPLOAD_BACKENDS=arion
+      - HIPPIUS_DOWNLOAD_BACKENDS=arion
+      - HIPPIUS_DELETE_BACKENDS=arion
+    volumes:
+      - .:/app
+      - kms_certs:/kms_certs:ro
+    depends_on:
+      mock-kms:
+        condition: service_healthy
+      mock-arion:
+        condition: service_healthy
+
+  # The purger only touches Postgres and the queues — it enqueues UnpinChainRequests rather than
+  # calling a backend itself — so it needs the test env but no Arion hop.
+  purger:
+    env_file:
+      - .env.defaults
+      - .env.test-docker
+    environment:
+      - HIPPIUS_KEY=${HIPPIUS_KEY}
+    volumes:
+      - .:/app
+      - kms_certs:/kms_certs:ro
+
   mock-hippius-api:
     build:
       context: .

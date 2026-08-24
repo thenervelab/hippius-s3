@@ -60,6 +60,9 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
+    # tests/unit/test_compose_e2e_worker_env.py parses the compose files. It resolved only as a
+    # transitive of pre-commit before, which would break the moment that dep changed.
+    "pyyaml>=6.0",
     "ruff>=0.12.0",
     # ty must be pinned exactly: the same code can be "clean" on one version
     # and "broken" on the next. Keep this in lockstep with

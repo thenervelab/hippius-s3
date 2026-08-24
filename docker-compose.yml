@@ -232,11 +232,15 @@ services:
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
       - /var/lib/hippius/kms:/kms_certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "exit 0"]
+      test:
+        [
+          "CMD-SHELL",
+          "python -c 'from hippius_s3.config import get_config; get_config()'",
+        ]
       interval: 5s
-      timeout: 3s
+      timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     networks:
       - hippius_net
 
@@ -257,11 +261,15 @@ services:
       redis-queues:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD-SHELL", "exit 0" ]
+      test:
+        [
+          "CMD-SHELL",
+          "python -c 'from hippius_s3.config import get_config; get_config()'",
+        ]
       interval: 5s
-      timeout: 3s
+      timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     deploy:
       replicas: 1
     restart: unless-stopped
@@ -289,11 +297,15 @@ services:
       redis-queues:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD-SHELL", "exit 0" ]
+      test:
+        [
+          "CMD-SHELL",
+          "python -c 'from hippius_s3.config import get_config; get_config()'",
+        ]
       interval: 5s
-      timeout: 3s
+      timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     deploy:
       replicas: 1
     restart: unless-stopped
@@ -332,11 +344,15 @@ services:
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
       - /var/lib/hippius/kms:/kms_certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "exit 0"]
+      test:
+        [
+          "CMD-SHELL",
+          "python -c 'from hippius_s3.config import get_config; get_config()'",
+        ]
       interval: 5s
-      timeout: 3s
+      timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     networks:
       - hippius_net
 
