@@ -14,13 +14,12 @@ already looking.
 from __future__ import annotations
 
 import pytest
-
-from tests.unit.routing_helpers import route_names
 from fastapi import FastAPI
 
 from hippius_s3.config import reset_config
 from hippius_s3.peer_auth import PeerSecretError
 from hippius_s3.peer_auth import validate_peer_secret
+from tests.unit.routing_helpers import route_names
 
 
 # `openssl rand -hex 32` shaped, for the cases that need a secret the validator accepts.

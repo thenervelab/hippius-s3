@@ -31,7 +31,6 @@ from hippius_s3.gateway.services.acl_service import BucketLookup
 from hippius_s3.models.sub_token import BucketScope
 from hippius_s3.models.sub_token import Permission
 from hippius_s3.models.sub_token import SubTokenScope
-
 from tests.unit.gateway._suspension_fakes import install_no_suspension_state
 
 

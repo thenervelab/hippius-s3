@@ -20,7 +20,8 @@ from fastapi import FastAPI
 from starlette.routing import Match
 
 from hippius_s3.config import reset_config
-from tests.unit.routing_helpers import leaf_routes, route_names
+from tests.unit.routing_helpers import leaf_routes
+from tests.unit.routing_helpers import route_names
 
 
 OBJ = "466916c0-d61b-4518-b81b-9576b574270a"

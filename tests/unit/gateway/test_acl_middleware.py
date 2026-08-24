@@ -11,7 +11,6 @@ from hippius_s3.gateway.middlewares.acl import get_required_permission
 from hippius_s3.gateway.middlewares.acl import parse_s3_path
 from hippius_s3.gateway.services.acl_service import BucketLookup
 from hippius_s3.models.acl import Permission
-
 from tests.unit.gateway._suspension_fakes import install_no_suspension_state
 
 

@@ -17,8 +17,6 @@ truncated today rather than stored intact.
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 from fastapi import FastAPI
 from fastapi import Request

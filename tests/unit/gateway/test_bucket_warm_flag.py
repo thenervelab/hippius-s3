@@ -19,7 +19,6 @@ from httpx import AsyncClient
 from hippius_s3 import config as gateway_config
 from hippius_s3.gateway.middlewares.acl import acl_middleware
 from hippius_s3.gateway.services.acl_service import BucketLookup
-
 from tests.unit.gateway._suspension_fakes import install_no_suspension_state
 
 

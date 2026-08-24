@@ -19,7 +19,6 @@ from hippius_s3.gateway.middlewares.cache_control import PRIVATE_CACHE_CONTROL
 from hippius_s3.gateway.middlewares.cache_control import PUBLIC_CACHE_CONTROL
 from hippius_s3.gateway.middlewares.cache_control import cache_control_middleware
 from hippius_s3.gateway.services.acl_service import BucketLookup
-
 from tests.unit.gateway._suspension_fakes import install_no_suspension_state
 
 
