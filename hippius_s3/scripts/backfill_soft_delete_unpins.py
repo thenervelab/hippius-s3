@@ -36,9 +36,9 @@ queue — deliberately bypassing `enqueue_unpin_request`'s allowlist intersectio
 config.delete_backends, which would otherwise drop the override (empty intersection =>
 "disallowed; not enqueuing", zero work reaches the queue). Reaching an off-allowlist
 backend is the whole point: on prod delete_backends is ['arion'], but the objects that
-block the hard-delete scan have their LIVE rows on **ovh** (arion is already fully
-unpinned). `ovh_unpin_requests` is consumed by the s3-backup `cleanup` worker, which
-deletes from OVH *and* marks `chunk_backend.deleted`.
+block the hard-delete scan have their LIVE rows on a secondary backend (arion is already
+fully unpinned). That backend's unpin queue has its own consumer, which performs the
+delete *and* marks `chunk_backend.deleted`.
 
   python -m hippius_s3.scripts.backfill_soft_delete_unpins --dry-run
   python -m hippius_s3.scripts.backfill_soft_delete_unpins --batch 1000 --queue-cap 50000 \
@@ -308,9 +308,9 @@ def main() -> None:
             "`<backend>_unpin_requests` queue, bypassing the config.delete_backends allowlist "
             "(which would intersect an off-allowlist override away). REQUIRED when the blocking "
             "rows are on a backend that delete_backends omits: on prod delete_backends is "
-            "['arion'] but the stuck objects' live rows are on ovh, so allowlist routing could "
-            "never reach them. `ovh_unpin_requests` is consumed by the s3-backup `cleanup` "
-            "worker, which deletes from OVH AND marks chunk_backend. Repeats are collapsed."
+            "['arion'] but the stuck objects' live rows are on a secondary backend, so allowlist "
+            "routing could never reach them. That queue has its own consumer, which performs the "
+            "delete AND marks chunk_backend. Repeats are collapsed."
         ),
     )
     ap.add_argument("--max-objects", type=int, default=0, help="Stop after scanning this many objects (0 = all)")

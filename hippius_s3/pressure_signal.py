@@ -2,12 +2,12 @@
 
 The janitor computes pressure as max(local statvfs, fullest Ceph pool %USED
 from the mgr exporter) and publishes it here; every writer that must back off
-(api PUT throttle, the s3-backup hydrator, future writers) reads the published
+(the api PUT throttle and every external bulk writer) reads the published
 key instead of probing the mgr or guessing from its own mount. Independent
 per-writer probes are how the api middleware ended up gating on the local NVMe
 while the backing pool filled to the read-only cliff (2026-07-24 incident).
 
-Contract (mirrored in s3-backup docs/plans/2026-07-25-hydrator-audit-remediation.md §C1):
+Contract (external consumers mirror this; keep the two in step):
     key   fs_cache:pressure                       (cache Redis)
     value {"mode": 0|1|2, "ratio": float, "source": "janitor", "ts": unix}
     SET every PUBLISH_INTERVAL_SECONDS with EX=PRESSURE_TTL_SECONDS
@@ -105,7 +105,7 @@ class PressurePublisher:
     """Publishes the pressure mode to the cache Redis on a fixed interval.
 
     Owns its own hysteresis state — sampled every 30s rather than once per
-    janitor cycle (~20min), because a mass writer (hydrator restore, drain
+    janitor cycle (~20min), because a mass writer (a bulk restore, a drain
     burst) can move the pool percent materially inside one cycle.
     """
 

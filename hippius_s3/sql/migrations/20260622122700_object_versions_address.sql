@@ -2,7 +2,7 @@
 
 -- s3-2.1 PR-7: the main-account address (SS58) for the drain-gated upload promoter.
 --
--- The arion-uploader / ovh-backup workers re-derive everything they need about an
+-- The upload workers re-derive everything they need about an
 -- object from the DB by object_id EXCEPT the main-account address (the Arion/S3
 -- upload identity). Today the api carries it in the enqueued UploadChainRequest. The
 -- drain-gated promoter (PR-7d) builds that request itself once a part replicates, so
