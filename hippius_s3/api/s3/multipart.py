@@ -947,10 +947,11 @@ async def abort_multipart_upload(
                 upload_id,
             )
 
-        # B5: drop the empty reserved object_versions row this aborted upload left behind and
-        # repoint current_object_version off it. Reads already fall back to the latest completed
-        # version, so this is DB hygiene (no data loss) — best-effort so a hiccup never fails the
-        # abort. Skipped when the upload had no version of its own.
+        # B5: repoint current_object_version off the empty reserved row this aborted upload left
+        # behind. The row itself is RETAINED — deleting it let MAX(object_version) drop, so the
+        # next upload was handed this same number and its parts landed on this attempt's terminal
+        # 'failed' drain rows (see abort_cleanup_orphan_version.sql). Best-effort so a hiccup never
+        # fails the abort. Skipped when the upload had no version of its own.
         if object_version is not None:
             with contextlib.suppress(Exception):
                 await db.fetchrow(

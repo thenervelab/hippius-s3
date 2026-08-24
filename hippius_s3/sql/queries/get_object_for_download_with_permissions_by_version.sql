@@ -33,8 +33,11 @@ WITH object_info AS (
       AND b.deleted_at IS NULL
       AND o.object_key = $2
       AND o.deleted_at IS NULL
-      -- Same "this version is complete, not a reserved placeholder" rule the unversioned
-      -- resolver applies (get_object_for_download_with_permissions.sql). Pinning a version
+      -- The "this version is complete, not a reserved placeholder" half of the rule the
+      -- unversioned resolver applies (get_object_for_download_with_permissions.sql). Only that
+      -- half: the resolver's other clause, object_version <= current_object_version, is
+      -- deliberately NOT adopted, because pinning a version explicitly is how you reach one that
+      -- is not current. Pinning a version
       -- explicitly must not reach a row that a normal GET would skip: a reserved row carries no
       -- parts and no envelope, so serving it yields a 0-byte body instead of NoSuchVersion.
       -- Reserved rows are not hypothetical — every in-flight MPU has one, an aborted MPU leaves

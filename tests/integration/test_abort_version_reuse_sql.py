@@ -21,6 +21,7 @@ exercised as deployed, not mocked.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -38,8 +39,6 @@ from hippius_s3.utils import get_query
 
 pytestmark = pytest.mark.asyncio
 
-_DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/hippius?sslmode=disable")
-
 
 class Ctx:
     """Connection plus the bucket everything in a test hangs off (asyncpg conns use __slots__)."""
@@ -51,16 +50,13 @@ class Ctx:
 
 
 @pytest_asyncio.fixture
-async def ctx() -> AsyncGenerator[Ctx, None]:
-    try:
-        c = await asyncpg.connect(_DB_URL)
-    except (OSError, asyncpg.PostgresError) as e:
-        pytest.skip(f"integration Postgres unavailable ({e}); run `docker compose up -d db`")
-    # Real tables, committed writes: a rollback would skip the DEFERRABLE FK check entirely, and
-    # that check is precisely what constrains this query. Everything hangs off one bucket row, so
+async def ctx(pg_conn: asyncpg.Connection) -> AsyncGenerator[Ctx, None]:
+    # Committed writes, not pg_tx: the locking test needs a SECOND connection to observe this one's
+    # rows, which a rolled-back transaction would hide. Everything hangs off one bucket row, so
     # cleanup is a single cascading delete.
+    c = pg_conn
     bucket_id = uuid.uuid4()
-    account = "abort-reuse-test-account"
+    account = f"abort-reuse-{bucket_id}"
     name = f"abort-reuse-{bucket_id}"
     await c.execute("INSERT INTO users (main_account_id) VALUES ($1) ON CONFLICT DO NOTHING", account)
     await c.execute(
@@ -73,7 +69,7 @@ async def ctx() -> AsyncGenerator[Ctx, None]:
         yield Ctx(c, bucket_id, name)
     finally:
         await c.execute("DELETE FROM buckets WHERE bucket_id = $1", bucket_id)
-        await c.close()
+        await c.execute("DELETE FROM users WHERE main_account_id = $1", account)
 
 
 async def _initiate_mpu(ctx: Ctx, object_id: uuid.UUID, key: str) -> int:
@@ -343,8 +339,9 @@ async def test_zero_byte_object_is_still_fetchable_by_version(ctx: Ctx) -> None:
 
 
 async def test_current_version_fk_holds_after_abort(ctx: Ctx) -> None:
-    """objects_current_version_fk is DEFERRABLE INITIALLY DEFERRED, so a violation surfaces only at
-    commit. Force the check explicitly rather than trusting the statement to have raised."""
+    """Regression guard, not a live hazard: with the DELETE gone this query only repoints onto a
+    row it just read, so it cannot violate objects_current_version_fk. The FK is DEFERRABLE, so a
+    violation would surface at commit — force the check rather than trust the statement."""
     object_id, key = uuid.uuid4(), "k"
     v1 = await _initiate_mpu(ctx, object_id, key)
     await _complete(ctx, object_id, v1)
@@ -384,14 +381,155 @@ async def test_repoint_skips_a_concurrent_in_flight_reserved_version(ctx: Ctx) -
     assert await _version_exists(ctx, object_id, v2), "the in-flight upload's row must be untouched"
 
 
-async def test_no_repoint_when_no_completed_version_exists(ctx: Ctx) -> None:
-    """Every version is still reserved, so there is nothing serveable to point at. Fail safe: leave
-    the pointer alone rather than move it to another placeholder."""
+async def test_repoints_to_the_highest_remaining_version_when_none_are_complete(ctx: Ctx) -> None:
+    """Two MPUs open on a new key at once: at abort time BOTH versions are still reserved, so there
+    is no completed row to point at. The pointer must still move off the aborted version — leaving
+    it stranded there is permanent, because CompleteMultipartUpload writes only object_versions and
+    assumes initiate already set the pointer. A stranded pointer makes DELETE resolve to a version
+    with no chunk_backend rows, so the real version's chunks are never unpinned."""
     object_id, key = uuid.uuid4(), "k"
-    await _initiate_mpu(ctx, object_id, key)
+    v1 = await _initiate_mpu(ctx, object_id, key)
     v2 = await _initiate_mpu(ctx, object_id, key)
+
+    assert await _abort_cleanup(ctx, object_id, v2) is not None
+    assert await _current(ctx, object_id) == v1, "pointer stranded on the aborted version"
+
+    # The surviving upload completes; the pointer must already be on it.
+    await _complete(ctx, object_id, v1)
+    assert await _current(ctx, object_id) == v1
+    assert await _initiate_mpu(ctx, object_id, key) == 3, "monotonicity still holds"
+
+
+async def test_fallback_never_reaches_above_the_aborted_version(ctx: Ctx) -> None:
+    """The migrator finalizes a version ABOVE current before its CAS promotes it. An unbounded MAX
+    would promote it early and break that CAS, so both fallback arms are bounded below $2."""
+    object_id, key = uuid.uuid4(), "k"
+    v1 = await _initiate_mpu(ctx, object_id, key)
+    await _complete(ctx, object_id, v1)
+    v2 = await _initiate_mpu(ctx, object_id, key)
+    v3 = await _initiate_mpu(ctx, object_id, key)
+    await _complete(ctx, object_id, v3)
+    # current still points at v2 (v3 is finalized but unpromoted).
+    await ctx.conn.execute("UPDATE objects SET current_object_version = $2 WHERE object_id = $1", object_id, v2)
+
+    await _abort_cleanup(ctx, object_id, v2)
+
+    assert await _current(ctx, object_id) == v1, "the pointer jumped forward onto an unpromoted version"
+
+
+async def test_abort_racing_complete_does_not_hide_the_completed_version(ctx: Ctx) -> None:
+    """A client can race AbortMultipartUpload against CompleteMultipartUpload on the same upload —
+    the abort handler never checks is_completed. Here the completion COMMITS FIRST, so the abort
+    sees it and must decline. (The harder ordering — completion still uncommitted when the abort
+    runs — is what `test_abort_blocks_on_an_uncommitted_completion_and_then_declines` covers; only
+    that one exercises the row lock.)"""
+    object_id, key = uuid.uuid4(), "k"
+    v1 = await _initiate_mpu(ctx, object_id, key)
+    await _complete(ctx, object_id, v1)
+    v2 = await _initiate_mpu(ctx, object_id, key)
+
+    other = await asyncpg.connect(os.environ["DATABASE_URL"])
+    try:
+        async with ctx.conn.transaction():
+            # Establish the aborting statement's snapshot BEFORE the concurrent completion lands.
+            await ctx.conn.fetchval("SELECT count(*) FROM object_versions WHERE object_id = $1", object_id)
+            await other.execute(
+                "UPDATE object_versions SET size_bytes = 11, md5_hash = $3, address = 'addr' "
+                "WHERE object_id = $1 AND object_version = $2",
+                object_id,
+                v2,
+                "5eb63bbbe01eeed093cb22bb8f5acdc3",
+            )
+            await _abort_cleanup(ctx, object_id, v2)
+    finally:
+        await other.close()
+
+    assert await _current(ctx, object_id) == v2, "the pointer was rewound off a completed version"
+
+
+async def test_abort_blocks_on_an_uncommitted_completion_and_then_declines(ctx: Ctx) -> None:
+    """The reserved-check must be a locked CAS, not a snapshot read.
+
+    T2 completes v2 inside an open transaction; T1's abort must BLOCK on that row rather than act
+    on its own (stale) snapshot. When T2 commits, T1 re-reads the latest row, sees a completed
+    version, and declines to repoint. Without `FOR UPDATE` T1 never blocks: it repoints to v1 on
+    the stale snapshot and hides the just-completed v2 from every read.
+    """
+    object_id, key = uuid.uuid4(), "k"
+    v1 = await _initiate_mpu(ctx, object_id, key)
+    await _complete(ctx, object_id, v1)
+    v2 = await _initiate_mpu(ctx, object_id, key)
+
+    other = await asyncpg.connect(os.environ["DATABASE_URL"])
+    try:
+        tx = other.transaction()
+        await tx.start()
+        await other.execute(
+            "UPDATE object_versions SET size_bytes = 11, md5_hash = $3, address = 'addr' "
+            "WHERE object_id = $1 AND object_version = $2",
+            object_id,
+            v2,
+            "5eb63bbbe01eeed093cb22bb8f5acdc3",
+        )
+
+        abort = asyncio.create_task(_abort_cleanup(ctx, object_id, v2))
+        await asyncio.sleep(0.3)
+        assert not abort.done(), "abort did not block on the uncommitted completion — the CAS is not locking"
+
+        await tx.commit()
+        assert await abort is None, "abort repointed off a version that had just completed"
+    finally:
+        await other.close()
+
+    assert await _current(ctx, object_id) == v2
+
+
+async def test_repoint_lands_on_the_NEWEST_completed_version(ctx: Ctx) -> None:
+    """MAX, not MIN. With two completed versions below the aborted one, picking the older would
+    silently roll the object back to ancient content on every abort."""
+    object_id, key = uuid.uuid4(), "k"
+    v1 = await _initiate_mpu(ctx, object_id, key)
+    await _complete(ctx, object_id, v1)
+    v2 = await _initiate_mpu(ctx, object_id, key)
+    await _complete(ctx, object_id, v2)
+    v3 = await _initiate_mpu(ctx, object_id, key)
+
+    await _abort_cleanup(ctx, object_id, v3)
+
+    assert await _current(ctx, object_id) == v2
+
+
+async def test_abort_of_a_completed_zero_byte_version_is_a_noop(ctx: Ctx) -> None:
+    """A 0-byte object is a real object: size 0 but a real md5. The reserved-check must require
+    BOTH halves, or aborting a completed empty object rewinds the pointer off live data."""
+    object_id, key = uuid.uuid4(), "k"
+    v1 = await _initiate_mpu(ctx, object_id, key)
+    await _complete(ctx, object_id, v1)
+    v2 = await _initiate_mpu(ctx, object_id, key)
+    await ctx.conn.execute(
+        "UPDATE object_versions SET size_bytes = 0, md5_hash = $3, address = 'addr' "
+        "WHERE object_id = $1 AND object_version = $2",
+        object_id,
+        v2,
+        "d41d8cd98f00b204e9800998ecf8427e",
+    )
 
     assert await _abort_cleanup(ctx, object_id, v2) is None
     assert await _current(ctx, object_id) == v2
-    assert await _version_exists(ctx, object_id, v2)
-    assert await _initiate_mpu(ctx, object_id, key) == 3, "monotonicity holds even with no repoint"
+
+
+async def test_reserved_row_with_null_md5_is_still_recognised(ctx: Ctx) -> None:
+    """InitiateMultipartUpload can leave md5_hash NULL rather than ''. Both spellings of "never
+    completed" must satisfy the guard, or the pointer is stranded on the aborted version."""
+    object_id, key = uuid.uuid4(), "k"
+    v1 = await _initiate_mpu(ctx, object_id, key)
+    await _complete(ctx, object_id, v1)
+    v2 = await _initiate_mpu(ctx, object_id, key)
+    await ctx.conn.execute(
+        "UPDATE object_versions SET md5_hash = NULL WHERE object_id = $1 AND object_version = $2",
+        object_id,
+        v2,
+    )
+
+    assert await _abort_cleanup(ctx, object_id, v2) is not None
+    assert await _current(ctx, object_id) == v1
