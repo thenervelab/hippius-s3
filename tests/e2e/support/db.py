@@ -111,12 +111,12 @@ def get_object_versioning_info(bucket_name: str, object_key: str, *, dsn: str | 
         # Get object_id and current version
         cur.execute(
             """
-            SELECT object_id, current_object_version
-            FROM objects
-            WHERE bucket_id = (SELECT bucket_id FROM buckets WHERE bucket_name = %s)
-              AND object_key = %s
+            SELECT o.object_id, o.current_object_version
+            FROM buckets b
+            JOIN objects o ON o.object_id = resolve_object_id(b.bucket_id, %s)
+            WHERE b.bucket_name = %s
             """,
-            (bucket_name, object_key),
+            (object_key, bucket_name),
         )
         obj_row = cur.fetchone()
         if not obj_row:

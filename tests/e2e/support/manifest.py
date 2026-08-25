@@ -22,7 +22,8 @@ def get_object_row(bucket: str, key: str) -> Optional[dict[str, Any]]:
                   ON ov.object_id = o.object_id
                  AND ov.object_version = o.current_object_version
                 JOIN buckets b ON b.bucket_id = o.bucket_id
-                WHERE b.bucket_name = %s AND o.object_key = %s
+                WHERE b.bucket_name = %s
+                  AND o.object_id = resolve_object_id(b.bucket_id, %s)
                   AND o.deleted_at IS NULL
                 LIMIT 1
                 """,
