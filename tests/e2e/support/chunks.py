@@ -36,7 +36,7 @@ def get_part_chunks(
         "JOIN parts p ON p.object_id = o.object_id AND p.part_number = %s\n"
         "JOIN part_chunks pc ON pc.part_id = p.part_id\n"
         "LEFT JOIN chunk_backend cb ON cb.chunk_id = pc.id AND cb.backend = %s AND NOT cb.deleted\n"
-        "WHERE b.bucket_name = %s AND o.object_key = %s\n"
+        "WHERE b.bucket_name = %s AND o.object_id = resolve_object_id(b.bucket_id, %s)\n"
         "ORDER BY pc.chunk_index ASC"
     )
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:

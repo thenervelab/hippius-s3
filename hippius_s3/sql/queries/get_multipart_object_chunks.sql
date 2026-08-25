@@ -8,7 +8,7 @@ JOIN parts p ON p.object_id = o.object_id AND p.object_version = ov.object_versi
 JOIN cids c ON p.cid_id = c.id
 WHERE b.bucket_name = $1
   AND b.deleted_at IS NULL
-  AND o.object_key = $2
+  AND o.object_id = resolve_object_id(o.bucket_id, $2)
   AND b.main_account_id = $3
   AND ov.multipart = TRUE
   AND o.deleted_at IS NULL

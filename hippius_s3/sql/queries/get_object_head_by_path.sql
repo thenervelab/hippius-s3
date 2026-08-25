@@ -33,8 +33,8 @@ WITH object_info AS (
     JOIN buckets b ON o.bucket_id = b.bucket_id
     WHERE b.bucket_name = $1
       AND b.deleted_at IS NULL
-      AND o.object_key = $2
       AND o.deleted_at IS NULL
+      AND o.object_id = resolve_object_id(b.bucket_id, $2)
 )
 SELECT
     oi.object_id,

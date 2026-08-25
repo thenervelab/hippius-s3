@@ -31,8 +31,8 @@ WITH object_info AS (
     LEFT JOIN cids c ON ov.cid_id = c.id
     WHERE b.bucket_name = $1
       AND b.deleted_at IS NULL
-      AND o.object_key = $2
       AND o.deleted_at IS NULL
+      AND o.object_id = resolve_object_id(b.bucket_id, $2)
       -- Reserved placeholders must not be reachable by explicit versionId either: they carry no
       -- parts, so serving one yields a 0-byte body instead of NoSuchVersion. Every in-flight MPU
       -- has one and an aborted MPU leaves one behind permanently

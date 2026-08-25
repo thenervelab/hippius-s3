@@ -3,11 +3,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import asyncpg
 from fastapi import Request
 from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.object_names import drop_s3_name
 from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.config import get_config
 from hippius_s3.queue import UnpinChainRequest
@@ -106,6 +108,33 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
 
             if version_id:
                 errors_list.append({"Key": key, "Code": "NotImplemented", "Message": "Versioning not supported"})
+                continue
+
+            try:
+                kind = await drop_s3_name(db, str(bucket_id), key)
+            except asyncpg.UniqueViolationError:
+                logger.exception("drop_s3_name name conflict for key %s", key)
+                errors_list.append(
+                    {
+                        "Key": key,
+                        "Code": "InternalError",
+                        "Message": "Name conflict while deleting",
+                    }
+                )
+                continue
+            except Exception:
+                logger.exception("drop_s3_name failed for key %s", key)
+                errors_list.append(
+                    {
+                        "Key": key,
+                        "Code": "InternalError",
+                        "Message": "Delete failed",
+                    }
+                )
+                continue
+
+            if kind in {"alias", "promoted"}:
+                deleted_keys.append(key)
                 continue
 
             # Soft-delete the object

@@ -8,13 +8,24 @@ SELECT o.object_id, o.bucket_id, o.object_key, o.current_object_version,
        ov.body_blake3,
        ov.size_bytes, ov.content_type, o.created_at, ov.md5_hash,
        ov.status, b.bucket_name, ov.multipart
-FROM objects o
+FROM (
+    SELECT o.object_id, o.bucket_id, o.object_key, o.current_object_version, o.created_at
+    FROM objects o
+    WHERE o.bucket_id = $1
+      AND o.deleted_at IS NULL
+      AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
+    UNION ALL
+    SELECT o.object_id, n.bucket_id, n.object_key, o.current_object_version, n.created_at
+    FROM object_names n
+    JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
+    WHERE n.bucket_id = $1
+      AND ($2::text IS NULL OR n.object_key LIKE $2::text || '%')
+) o
 JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
 JOIN buckets b ON o.bucket_id = b.bucket_id
 LEFT JOIN cids c ON ov.cid_id = c.id
 WHERE o.bucket_id = $1
   AND b.deleted_at IS NULL
   AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
-  AND o.deleted_at IS NULL
 ORDER BY o.object_key COLLATE "C"
 LIMIT $3 OFFSET $4

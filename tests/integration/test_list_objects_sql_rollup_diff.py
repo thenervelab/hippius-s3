@@ -49,6 +49,22 @@ CREATE TABLE object_versions(
     content_type text DEFAULT 'application/octet-stream', multipart bool DEFAULT false, status text DEFAULT 'published',
     body_blake3 text
 );
+CREATE TABLE object_names(
+    bucket_id uuid NOT NULL, object_key text NOT NULL, object_id uuid NOT NULL,
+    created_at timestamptz DEFAULT now(),
+    PRIMARY KEY (bucket_id, object_key)
+);
+CREATE FUNCTION resolve_object_id(p_bucket_id uuid, p_object_key text) RETURNS uuid
+LANGUAGE sql STABLE AS $$
+    SELECT object_id FROM (
+        SELECT o.object_id, 0 AS pri FROM objects o
+        WHERE o.bucket_id = p_bucket_id AND o.object_key = p_object_key AND o.deleted_at IS NULL
+        UNION ALL
+        SELECT n.object_id, 1 AS pri FROM object_names n
+        JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
+        WHERE n.bucket_id = p_bucket_id AND n.object_key = p_object_key
+    ) hits ORDER BY pri LIMIT 1
+$$;
 CREATE INDEX idx_obj_bucket_key ON objects(bucket_id, object_key);
 """
 
