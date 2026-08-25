@@ -1,5 +1,6 @@
 from typing import Awaitable
 from typing import Callable
+from urllib.parse import unquote
 
 from fastapi import Request
 from fastapi import Response
@@ -43,6 +44,29 @@ def _parse_copy_source_bucket(header_value: str) -> str | None:
     return parts[0]
 
 
+def parse_copy_source(header_value: str) -> tuple[str | None, str | None]:
+    """Split `x-amz-copy-source` into (bucket, key), exactly as the HANDLERS split it.
+
+    This must mirror `copy_helpers.parse_copy_source` and the inline parse in
+    `multipart.upload_part`: **percent-decode first, then strip the leading slash, then split.**
+    Deriving the bucket any other way reintroduces the split-view class one layer up — a header
+    of `victim%2Fkey` reads as the (nonexistent) bucket `victim%2Fkey` under a decode-last
+    parser while both handlers read it as bucket `victim`, so the authorised resource and the
+    accessed resource are different objects.
+
+    Note the ARN form is deliberately NOT special-cased here: neither handler recognises it, so
+    treating it as unparseable while they treat it as a literal bucket name is itself a
+    disagreement. Let it through as the name they will use.
+    """
+    if not header_value:
+        return None, None
+    src = unquote(header_value.strip()).lstrip("/")
+    bucket, sep, key = src.partition("/")
+    if not sep or not bucket:
+        return None, None
+    return bucket, (key.split("?", 1)[0] or None)
+
+
 def parse_s3_path(path: str) -> tuple[str | None, str | None]:
     """
     Parse S3 path into bucket and key components.
@@ -74,6 +98,17 @@ def parse_s3_path(path: str) -> tuple[str | None, str | None]:
     return bucket, key
 
 
+# Query params that select a bucket SUBRESOURCE on PUT — i.e. make the request something other
+# than CreateBucket. Must stay in step with the dispatch in api/s3/buckets/router.py: judging
+# CreateBucket as "no query params at all" while the router treats any unrecognised param as a
+# create meant `PUT /new?x=1` skipped this middleware's CreateBucket branch entirely.
+BUCKET_PUT_SUBRESOURCES = frozenset({"acl", "tagging", "lifecycle", "policy", "cors"})
+
+
+def is_create_bucket_shape(method: str, key: str | None, query_params: dict) -> bool:
+    return method == "PUT" and key is None and not (BUCKET_PUT_SUBRESOURCES & query_params.keys())
+
+
 def get_required_permission(
     method: str,
     query_params: dict,
@@ -92,6 +127,12 @@ def get_required_permission(
     """
     if "acl" in query_params:
         return Permission.READ_ACP if method == "GET" else Permission.WRITE_ACP
+
+    # `policy` is an access-control operation, not a data one: PUT ?policy replaces the bucket
+    # ACL (see bucket_policy_endpoint.set_bucket_policy). Falling through to the method-only
+    # mapping below graded it WRITE, so a write-only grantee could publish a bucket to AllUsers.
+    if "policy" in query_params:
+        return Permission.READ_ACP if method in ("GET", "HEAD") else Permission.WRITE_ACP
 
     if "tagging" in query_params:
         return Permission.READ_ACP if method in ["GET", "HEAD"] else Permission.WRITE_ACP
@@ -131,7 +172,13 @@ async def acl_middleware(
     # disagrees with the key `input_validation` judged.
     path = routing_path(request)
 
-    if path == "/health" or path.startswith("/user/") or path.startswith("/admin/"):
+    # `/health` is a real route, but it is also a valid `/{bucket_name}` shape, and the S3
+    # routers bind DELETE/POST on that shape while the health route is GET-only. Bypassing the
+    # ACL check for every method therefore handed the destructive bucket handlers — which carry
+    # no ownership predicate of their own — an unauthenticated caller. `/user/` and `/admin/`
+    # are prefix-matched and sit behind their own HMAC middlewares; `/health` has no such
+    # backstop, so it is scoped to the methods its route actually serves.
+    if (request.method in ("GET", "HEAD") and path == "/health") or path.startswith(("/user/", "/admin/")):
         return await call_next(request)
 
     # Secret-authenticated peer chunk fetches carry no S3 permission model
@@ -203,6 +250,38 @@ async def acl_middleware(
             )
             return _access_denied()
 
+    # CopyObject and UploadPartCopy name their SOURCE in a header. Every permission check in
+    # this middleware is derived from the request PATH, which describes only the destination —
+    # so the source was never authorised at all, and the handlers resolve it by name with no
+    # ownership predicate (multipart.py) or scoped to the DESTINATION owner (copy_helpers.py).
+    # A write grant on a bucket you control was therefore enough to read any object in any
+    # bucket in the system. This runs ahead of every branch below, including the sub-token and
+    # master-token bypasses, because each of those returns early on the destination alone.
+    if key is not None:
+        copy_source = request.headers.get("x-amz-copy-source")
+        if copy_source:
+            src_bucket, src_key = parse_copy_source(copy_source)
+            if src_bucket is None:
+                logger.info(f"Rejecting unparseable x-amz-copy-source: {copy_source!r}")
+                return _access_denied()
+
+            src_lookup = await acl_service.get_bucket_owner_and_id(src_bucket)
+            if src_lookup is not None:
+                src_allowed = await acl_service.check_permission(
+                    account_id=account_id,
+                    bucket=src_bucket,
+                    key=src_key,
+                    permission=Permission.READ,
+                    access_key=access_key,
+                    bucket_owner_id=src_lookup.owner_id,
+                )
+                if not src_allowed:
+                    logger.info(
+                        f"Copy source denied: account={account_id}, source={src_bucket}/{src_key}, dest={bucket}/{key}"
+                    )
+                    return _access_denied()
+            # A source bucket that does not exist is left to the handler's NoSuchBucket.
+
     # -------------------------------------------------------------------------
     # Sub-token branch (R2-style): authoritative for intra-account requests,
     # falls through to bucket ACL grants for cross-account (contractor) access.
@@ -228,7 +307,7 @@ async def acl_middleware(
             # Bucket does not exist yet AND this is CreateBucket (PUT /bucket, no key, no query).
             # evaluate_sub_token_scope handles the OP_CREATE_BUCKET check including scope='all'.
             if bucket_owner_id is None:
-                is_create_bucket = request.method == "PUT" and key is None and len(query_params) == 0
+                is_create_bucket = is_create_bucket_shape(request.method, key, query_params)
                 if not is_create_bucket:
                     # Non-create op on a nonexistent bucket: pass through so backend returns NoSuchBucket.
                     return await call_next(request)
@@ -282,7 +361,7 @@ async def acl_middleware(
     if bucket is None:
         return await call_next(request)
 
-    is_create_bucket = request.method == "PUT" and key is None and len(query_params) == 0
+    is_create_bucket = is_create_bucket_shape(request.method, key, query_params)
     if is_create_bucket:
         # Bypassing the ACL check here is correct — the bucket does not exist, so there is nothing
         # to authorise against. But "nothing to authorise against" is not "no identity required",
@@ -326,7 +405,12 @@ async def acl_middleware(
             bucket_owner_id=bucket_owner_id,
         )
 
-    if auth_method == "access_key" and token_type == "master" and bucket_owner_id == account_id:
+    if (
+        auth_method == "access_key"
+        and token_type == "master"
+        and not is_sentinel_account_id(account_id)
+        and bucket_owner_id == account_id
+    ):
         logger.info(f"Master token bypass for account {account_id} on bucket {bucket}")
         request.state.is_anonymous_access = False
         return await call_next(request)
