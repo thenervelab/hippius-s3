@@ -16,7 +16,17 @@ SELECT o.object_id,
        ov.status,
        ov.multipart,
        ov.body_blake3
-FROM objects o,
+FROM (
+    SELECT o.object_id, o.object_key, o.created_at, o.current_object_version, o.bucket_id
+    FROM objects o
+    WHERE o.bucket_id = $1
+      AND o.deleted_at IS NULL
+    UNION ALL
+    SELECT o.object_id, n.object_key, n.created_at, o.current_object_version, n.bucket_id
+    FROM object_names n
+    JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
+    WHERE n.bucket_id = $1
+) o,
      LATERAL (
          -- Skip incomplete multipart placeholders (InitiateMultipartUpload without Complete)
          SELECT v.object_version,
@@ -39,7 +49,6 @@ WHERE o.bucket_id = $1
   -- LS-2: explicit exclusive upper bound so the (bucket_id, object_key) index range is bounded on
   -- both ends even under a generic prepared plan (a sparse prefix no longer scans to partition end).
   AND ($5::text IS NULL OR o.object_key < $5::text COLLATE "C")
-  AND o.deleted_at IS NULL
 -- DB is C-collation; an explicit COLLATE here would defeat the (bucket_id, object_key) index ordered scan.
 ORDER BY o.object_key
 LIMIT $4::int

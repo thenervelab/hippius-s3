@@ -9,6 +9,7 @@ from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.object_names import drop_s3_name
 from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.config import get_config
 from hippius_s3.queue import UnpinChainRequest
@@ -47,6 +48,10 @@ async def handle_delete_object(
                 )
             bucket_id = bucket["bucket_id"]
             set_span_attributes(span, {"bucket_id": str(bucket_id)})
+
+        kind = await drop_s3_name(db, str(bucket_id), object_key)
+        if kind in {"alias", "promoted"}:
+            return Response(status_code=204)
 
         # HD-78: no existence pre-check — soft_delete_object's RETURNING already distinguishes
         # absent/already-deleted (both → idempotent 204 below), so the pre-check was a wasted read.

@@ -8,6 +8,7 @@ from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.object_names import drop_s3_name
 from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.config import get_config
 from hippius_s3.queue import UnpinChainRequest
@@ -106,6 +107,16 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
 
             if version_id:
                 errors_list.append({"Key": key, "Code": "NotImplemented", "Message": "Versioning not supported"})
+                continue
+
+            try:
+                kind = await drop_s3_name(db, str(bucket_id), key)
+            except Exception:
+                logger.exception("drop_s3_name failed for key %s", key)
+                kind = "last"
+
+            if kind in {"alias", "promoted"}:
+                deleted_keys.append(key)
                 continue
 
             # Soft-delete the object

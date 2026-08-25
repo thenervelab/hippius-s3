@@ -47,7 +47,7 @@ async def upsert_object_basic(
     storage_version: int,
     upload_backends: list[str] | None = None,
 ) -> Any:
-    return await db.fetchrow(
+    row = await db.fetchrow(
         get_query("upsert_object_basic"),
         object_id,
         bucket_id,
@@ -60,6 +60,9 @@ async def upsert_object_basic(
         int(storage_version),
         upload_backends,
     )
+    # A PUT of this key must not leave a CopyObject alias shadowing it.
+    await db.execute(get_query("delete_object_name"), bucket_id, object_key)
+    return row
 
 
 async def ensure_upload_row(

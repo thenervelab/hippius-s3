@@ -20,6 +20,7 @@ from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.services.object_reader import stream_object
 from hippius_s3.storage_version import require_supported_storage_version
+from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
 
@@ -99,6 +100,42 @@ def parse_object_metadata(raw_meta: Any) -> dict[str, Any]:
             return {}
 
     return {}
+
+
+async def handle_same_bucket_copy(
+    db: Any,
+    *,
+    dest_bucket_id: str,
+    dest_key: str,
+    src_obj_row: Any,
+    copy_created_at: datetime,
+) -> Response | None:
+    """Metadata CopyObject: extra name on the source object_id.
+
+    Returns None when dest is a live primary of a different object (overwrite
+    needs the streaming path). Same-bucket Harbor Move always hits this.
+    """
+    src_id = str(src_obj_row["object_id"])
+    live = await db.fetchrow(
+        get_query("get_live_object_id_by_key"),
+        dest_bucket_id,
+        dest_key,
+    )
+    if live is not None:
+        if str(live["object_id"]) == src_id:
+            etag = str(src_obj_row.get("md5_hash") or "")
+            return build_copy_success_response(etag, copy_created_at)
+        return None
+
+    await db.fetchrow(
+        get_query("insert_object_name"),
+        dest_bucket_id,
+        dest_key,
+        src_id,
+    )
+    logger.info("CopyObject using object_names alias (same-bucket, no byte copy)")
+    etag = str(src_obj_row.get("md5_hash") or "")
+    return build_copy_success_response(etag, copy_created_at)
 
 
 def is_multipart_object(obj_row: Any) -> bool:

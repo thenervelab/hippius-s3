@@ -56,14 +56,14 @@ Since the writer trusts the DB-returned object_id ([object_writer.py:222-227](..
 
 [object_writer.py:244-261](../../../writer/object_writer.py) now writes `kek_id`/`wrapped_dek` immediately after `upsert_object_basic` to prevent a concurrent GET seeing NULL envelope columns during an overwrite. Before this fix, `v5_missing_envelope_metadata` 500s appeared in prod whenever a concurrent GET raced a new PUT.
 
-### Streaming copy vs fast-path
+### Streaming copy vs same-bucket alias vs v5 CID-reuse
 
 [copy_object_endpoint.py](copy_object_endpoint.py) branches:
 
-- v5 single-part source + v5 destination, same-KMS, same-suite → **fast path** ([../../../services/copy_service_v5.py `execute_v5_fast_path_copy`](../../../services/copy_service_v5.py)). Re-wraps the DEK under the destination AAD, reuses CIDs via `chunk_backend` duplication. No byte copy.
-- Multipart source OR cross-KMS → **streaming fallback** via `handle_streaming_copy` in [../copy_helpers.py](../copy_helpers.py). Full decrypt + re-encrypt round trip.
+- **Same bucket** → extra name on the source `object_id` (`object_names` + `handle_same_bucket_copy`). Ciphertext AAD binds `bucket_id`+`object_id`, so CopyObject cannot allocate a new id. Harbor blob commit is Copy + Delete of `_uploads/…` → `blobs/sha256/…`; Delete of the primary name promotes the alias. Do not re-enable [../../../services/copy_service_v5.py `execute_v5_fast_path_copy`](../../../services/copy_service_v5.py) — CID reuse onto a new `object_id` is not decryptable.
+- Dest is already a live primary of a *different* object, or **cross-bucket** → **streaming fallback** via `handle_streaming_copy` in [../copy_helpers.py](../copy_helpers.py). Full decrypt + re-encrypt.
 
-See [todo.md](../../../../todo.md) P1 for the latent risk if fast-path is re-enabled for MPU without FS backfill.
+See [todo.md](../../../../todo.md) P1.
 
 ### Append contract
 

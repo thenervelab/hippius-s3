@@ -3,6 +3,9 @@
 from typing import Any
 from typing import Callable
 
+import pytest
+from botocore.exceptions import ClientError
+
 
 def test_copy_object_same_bucket(
     docker_services: Any,
@@ -121,3 +124,51 @@ def test_copy_with_empty_metadata(
 
     head = boto3_client.head_object(Bucket=bucket, Key=dst_key)
     assert "Metadata" in head
+
+
+def test_copy_object_keeps_source(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    bucket = unique_bucket_name("copy-keeps-src")
+    cleanup_buckets(bucket)
+    boto3_client.create_bucket(Bucket=bucket)
+
+    body = b"keep-me"
+    boto3_client.put_object(Bucket=bucket, Key="src.bin", Body=body)
+    boto3_client.copy_object(
+        Bucket=bucket,
+        Key="dst.bin",
+        CopySource=f"/{bucket}/src.bin",
+    )
+
+    assert boto3_client.get_object(Bucket=bucket, Key="src.bin")["Body"].read() == body
+    assert boto3_client.get_object(Bucket=bucket, Key="dst.bin")["Body"].read() == body
+
+
+def test_copy_then_delete_source_keeps_dest(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    """Harbor blob commit: CopyObject then DeleteObject of the upload key."""
+    bucket = unique_bucket_name("copy-move")
+    cleanup_buckets(bucket)
+    boto3_client.create_bucket(Bucket=bucket)
+
+    body = b"harbor-move"
+    boto3_client.put_object(Bucket=bucket, Key="uploads/uuid/data", Body=body)
+    boto3_client.copy_object(
+        Bucket=bucket,
+        Key="blobs/sha256/ab/digest/data",
+        CopySource=f"/{bucket}/uploads/uuid/data",
+    )
+    boto3_client.delete_object(Bucket=bucket, Key="uploads/uuid/data")
+
+    assert boto3_client.get_object(Bucket=bucket, Key="blobs/sha256/ab/digest/data")["Body"].read() == body
+    with pytest.raises(ClientError) as exc:
+        boto3_client.head_object(Bucket=bucket, Key="uploads/uuid/data")
+    assert exc.value.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}

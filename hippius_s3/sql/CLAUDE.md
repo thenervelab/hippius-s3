@@ -13,7 +13,11 @@ Root SQL files:
 
 ### `objects`
 
-Logical objects. Points at `current_object_version` for the serve-able row.
+Logical objects. Points at `current_object_version` for the serve-able row. `object_key` is the primary S3 name.
+
+### `object_names`
+
+Extra S3 keys for the same `object_id` (same-bucket CopyObject). Ciphertext AAD binds `bucket_id`+`object_id`, so CopyObject cannot mint a new id. `resolve_object_id(bucket_id, key)` prefers `objects.object_key` then this table. Delete of the primary name promotes one alias.
 
 ### `object_versions`
 
