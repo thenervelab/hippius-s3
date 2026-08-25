@@ -237,7 +237,12 @@ services:
           "CMD-SHELL",
           "python -c 'from hippius_s3.config import get_config; get_config()'",
         ]
-      interval: 5s
+      # start_interval probes every 2s while the container is starting, so `up --wait` learns
+      # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
+      # to 30s: this spawns a python interpreter and imports the config each time (~0.3s), and at
+      # 5s across four workers that was ~24% of a core burning continuously for no added signal.
+      interval: 30s
+      start_interval: 2s
       timeout: 10s
       retries: 3
       start_period: 15s
@@ -266,7 +271,12 @@ services:
           "CMD-SHELL",
           "python -c 'from hippius_s3.config import get_config; get_config()'",
         ]
-      interval: 5s
+      # start_interval probes every 2s while the container is starting, so `up --wait` learns
+      # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
+      # to 30s: this spawns a python interpreter and imports the config each time (~0.3s), and at
+      # 5s across four workers that was ~24% of a core burning continuously for no added signal.
+      interval: 30s
+      start_interval: 2s
       timeout: 10s
       retries: 3
       start_period: 15s
@@ -302,7 +312,12 @@ services:
           "CMD-SHELL",
           "python -c 'from hippius_s3.config import get_config; get_config()'",
         ]
-      interval: 5s
+      # start_interval probes every 2s while the container is starting, so `up --wait` learns
+      # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
+      # to 30s: this spawns a python interpreter and imports the config each time (~0.3s), and at
+      # 5s across four workers that was ~24% of a core burning continuously for no added signal.
+      interval: 30s
+      start_interval: 2s
       timeout: 10s
       retries: 3
       start_period: 15s
@@ -349,7 +364,12 @@ services:
           "CMD-SHELL",
           "python -c 'from hippius_s3.config import get_config; get_config()'",
         ]
-      interval: 5s
+      # start_interval probes every 2s while the container is starting, so `up --wait` learns
+      # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
+      # to 30s: this spawns a python interpreter and imports the config each time (~0.3s), and at
+      # 5s across four workers that was ~24% of a core burning continuously for no added signal.
+      interval: 30s
+      start_interval: 2s
       timeout: 10s
       retries: 3
       start_period: 15s
