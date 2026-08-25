@@ -39,6 +39,7 @@ from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.envelope_service import unwrap_dek
 from hippius_s3.services.kek_service import get_bucket_kek_bytes
 from hippius_s3.storage_version import require_supported_storage_version
+from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
@@ -165,8 +166,6 @@ async def _enqueue_download_for_parts(
         by_index: dict[int, tuple[str | None, int | None]] = {}
         if needs_cid:
             try:
-                from hippius_s3.utils import get_query  # local import
-
                 rows = await db.fetch(
                     get_query("get_part_chunks_by_object_and_number"),
                     object_id,
@@ -310,20 +309,25 @@ async def build_stream_context(
     kek_id = info.get("kek_id")
     wrapped_dek = info.get("wrapped_dek")
     if not bucket_id or not kek_id or not wrapped_dek:
-        # Current version is mid-write (overwrite in progress). Fall back to the
-        # previous version which is guaranteed to have a complete envelope.
-        prev_version = object_version - 1
-        if prev_version >= 1:
+        # Current version is mid-write (overwrite in progress). Fall back to the highest COMPLETED
+        # version below it. Not `object_version - 1`: numbering is sparse, because an aborted MPU
+        # retains its reserved row (abort_cleanup_orphan_version.sql) and the migrator mints
+        # versions out of band, so the immediately-preceding number can be a placeholder with no
+        # envelope — falling onto one turns a recoverable read into a 500.
+        prev_version = await db.fetchval(
+            get_query("get_prev_serveable_version"),
+            info.get("object_id"),
+            object_version,
+        )
+        if prev_version:
             logger.warning(
                 "Envelope missing on v%s of %s, falling back to v%s",
                 object_version,
                 info.get("object_id"),
                 prev_version,
             )
-            from hippius_s3.utils import get_query as _get_query
-
             prev_info = await db.fetchrow(
-                _get_query("get_object_for_download_with_permissions_by_version"),
+                get_query("get_object_for_download_with_permissions_by_version"),
                 info.get("bucket_name"),
                 info.get("object_key"),
                 prev_version,

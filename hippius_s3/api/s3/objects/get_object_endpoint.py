@@ -46,13 +46,12 @@ async def handle_get_object(
         with tracer.start_as_current_span("get_object.check_tagging_request"):
             from hippius_s3.api.s3.objects.tagging_endpoint import get_object_tags  # local import to avoid cycles
 
-            account = getattr(request.state, "account", None)
             async with pool.acquire() as conn:
                 return await get_object_tags(
                     bucket_name,
                     object_key,
                     conn,
-                    account.main_account if account else "",
+                    request.state.main_account_id,
                 )
 
     # List parts for an ongoing multipart upload
@@ -100,9 +99,10 @@ async def handle_get_object(
     # Backend trusts the account information from gateway
     account = getattr(request.state, "account", None)
     account_id = account.main_account if account else "anonymous"
-    # Anonymous reads on a public bucket still carry the bucket owner as main_account,
-    # so we gate on account.id. Gateway sets it to literal "anonymous" for unsigned requests;
-    # an empty string would mean the gateway didn't run account_middleware — treat as anon.
+    # Anonymous reads on a public bucket still carry the bucket owner in
+    # state.main_account_id, so we gate on the caller's account.id. The account middleware
+    # sets it to literal "anonymous" for unsigned requests; an empty string means it never
+    # ran (request_context's stand-in) — treat as anon.
     is_anonymous = account is None or account.id in ("", "anonymous")
 
     try:
@@ -117,14 +117,14 @@ async def handle_get_object(
     db = await pool.acquire()
     try:
         # Skip user creation for anonymous accounts
-        if account and account.main_account != "anonymous":
+        if request.state.main_account_id and request.state.main_account_id != "anonymous":
             with tracer.start_as_current_span(
                 "get_object.get_or_create_user",
-                attributes={"hippius.account.main": account.main_account},
+                attributes={"hippius.account.main": request.state.main_account_id},
             ):
                 await db.fetchrow(
                     get_query("get_or_create_user_by_main_account"),
-                    account.main_account,
+                    request.state.main_account_id,
                     datetime.now(timezone.utc),
                 )
 
@@ -314,9 +314,12 @@ async def handle_get_object(
         bucket_owner_id = str(object_info.get("bucket_owner_id") or "")
         is_anonymous = account_id == "anonymous"
 
-        # Resolve key address: for anonymous users always use bucket owner id (ACL already verified access)
-        # Otherwise, use the caller's main account when authenticated
-        resolved_address = bucket_owner_id if is_anonymous else (account.main_account if account else "")
+        # Chunks are stored under the bucket OWNER's Arion namespace, never the caller's, so the
+        # download address is always the storage-attribution account (state.main_account_id =
+        # bucket owner, caller fallback). Before the state.account split this read the rebound
+        # account.main_account (also the owner); reading the un-rebound caller here sent
+        # cross-account and signed-public-bucket reads to the wrong namespace on a cache miss.
+        resolved_address = bucket_owner_id if is_anonymous else request.state.main_account_id
 
         info_dict = {
             "object_id": str(object_info["object_id"]),

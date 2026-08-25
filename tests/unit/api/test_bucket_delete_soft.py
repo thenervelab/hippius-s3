@@ -77,6 +77,7 @@ def _bucket_app(pool_factory: Any) -> Any:
             delete=True,
             has_credits=True,
         )
+        request.state.main_account_id = "test-main-account"
         request.state.ray_id = "test-ray"
         return await call_next(request)
 

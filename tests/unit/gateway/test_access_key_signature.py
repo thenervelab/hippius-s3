@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 from fastapi import Request
 
-from gateway.middlewares.access_key_auth import verify_access_key_signature
+from hippius_s3.gateway.middlewares.access_key_auth import verify_access_key_signature
 
 
 def make_request(
@@ -92,14 +92,14 @@ async def test_access_key_signature_uses_raw_path_for_canonical_path() -> None:
         return "canonical"
 
     with patch(
-        "gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
+        "hippius_s3.gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
     ):
-        with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
+        with patch("hippius_s3.gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with patch(
-                "gateway.middlewares.access_key_auth.create_canonical_request",
+                "hippius_s3.gateway.middlewares.access_key_auth.create_canonical_request",
                 new=fake_create_canonical_request,
             ):
-                with patch("gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
+                with patch("hippius_s3.gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
                     token_auth = await verify_access_key_signature(request, access_key, mock_redis)
 
     assert token_auth.access_key == access_key
@@ -146,8 +146,8 @@ async def test_access_key_signature_raises_when_raw_path_missing() -> None:
     mock_token_response.nonce = "nonce"
 
     with patch(
-        "gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
+        "hippius_s3.gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
     ):
-        with patch("gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
+        with patch("hippius_s3.gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with pytest.raises(RuntimeError):
                 await verify_access_key_signature(request, access_key, mock_redis)

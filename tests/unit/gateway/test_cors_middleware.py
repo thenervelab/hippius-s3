@@ -10,7 +10,7 @@ from httpx import AsyncClient
 
 @pytest.fixture  # type: ignore[misc]
 def cors_app() -> Any:
-    from gateway.middlewares.cors import cors_middleware
+    from hippius_s3.gateway.middlewares.cors import cors_middleware
 
     app = FastAPI()
 

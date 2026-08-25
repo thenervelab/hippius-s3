@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from gateway.services.acl_service import ACLService
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.services.acl_service import ACLService
+from hippius_s3.gateway.services.acl_service import BucketLookup
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import Grantee
 from hippius_s3.models.acl import GranteeType
@@ -217,6 +217,98 @@ class TestPermissionEvaluation:
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
 
         assert await acl_service.check_permission(None, "bucket1", None, Permission.WRITE) is True
+
+
+class TestSentinelOwnerNeverGrants:
+    """A bucket row whose owner column holds a sentinel is owned by nobody, not by everybody.
+
+    Unauthenticated callers are stamped with the literal id "anonymous", so before this guard a
+    row with `main_account_id = 'anonymous'` matched every anonymous caller on the owner check and
+    handed out FULL_CONTROL — with no public flag and no ACL row anywhere to show for it. The
+    routes that produced such rows were closed in 3880fbec; this covers the rows themselves.
+    """
+
+    @pytest.mark.parametrize("sentinel", ["anonymous", "none", "null", "ANONYMOUS", " anonymous "])
+    @pytest.mark.asyncio
+    async def test_sentinel_caller_never_matches_sentinel_owner(
+        self, acl_service: Any, mock_db_pool: Any, sentinel: str
+    ) -> None:
+        acl = await acl_service.canned_acl_to_acl("private", sentinel)
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
+
+        assert await acl_service.check_permission(sentinel, "bucket1", None, Permission.READ) is False
+        assert await acl_service.check_permission(sentinel, "bucket1", None, Permission.WRITE) is False
+        assert await acl_service.check_permission(sentinel, "bucket1", None, Permission.FULL_CONTROL) is False
+
+    @pytest.mark.asyncio
+    async def test_empty_owner_cannot_even_build_an_acl(self, acl_service: Any, mock_db_pool: Any) -> None:
+        """`main_account_id = ''` (how the `docs` row landed) fails closed one layer earlier.
+
+        The Grantee model refuses a CANONICAL_USER with no id, so synthesizing the private ACL
+        raises rather than granting. Worth pinning: it means '' and 'anonymous' fail differently,
+        and only the latter was ever exploitable.
+        """
+        with pytest.raises(ValueError, match="CanonicalUser grantee must have id"):
+            await acl_service.canned_acl_to_acl("private", "")
+
+    @pytest.mark.asyncio
+    async def test_synthesized_acl_over_ownerless_row_denies_anonymous(
+        self, acl_service: Any, mock_db_pool: Any
+    ) -> None:
+        """The production shape: no stored ACL rows, so the owner column IS the entire ACL."""
+        acl_service.acl_repo.get_object_acl = AsyncMock(return_value=None)
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=None)
+
+        for permission in (Permission.READ, Permission.WRITE):
+            assert (
+                await acl_service.check_permission(
+                    "anonymous", "health", "pwn.txt", permission, bucket_owner_id="anonymous"
+                )
+                is False
+            )
+
+    @pytest.mark.asyncio
+    async def test_sentinel_caller_denied_on_a_properly_owned_bucket(
+        self, acl_service: Any, mock_db_pool: Any
+    ) -> None:
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        acl = await acl_service.canned_acl_to_acl("private", owner_id)
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
+
+        assert await acl_service.check_permission("anonymous", "bucket1", None, Permission.READ) is False
+
+    @pytest.mark.asyncio
+    async def test_sentinel_canonical_user_grant_does_not_match(self, acl_service: Any, mock_db_pool: Any) -> None:
+        """Same trap one layer down: a stored grant naming the sentinel must not match either."""
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        acl = await acl_service.canned_acl_to_acl("private", owner_id)
+        acl.grants.append(
+            Grant(
+                grantee=Grantee(type=GranteeType.CANONICAL_USER, id="anonymous"),
+                permission=Permission.FULL_CONTROL,
+            )
+        )
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
+
+        assert await acl_service.check_permission("anonymous", "bucket1", None, Permission.WRITE) is False
+
+    @pytest.mark.asyncio
+    async def test_real_owner_is_unaffected(self, acl_service: Any, mock_db_pool: Any) -> None:
+        owner_id = "5EvT2ccmmY6t3q1U3PXwjzwFBjE2KzvWdC6mMsCvBbiBDs55"
+        acl = await acl_service.canned_acl_to_acl("private", owner_id)
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
+
+        assert await acl_service.check_permission(owner_id, "bucket1", None, Permission.FULL_CONTROL) is True
+
+    @pytest.mark.asyncio
+    async def test_public_read_still_serves_anonymous(self, acl_service: Any, mock_db_pool: Any) -> None:
+        """A deliberate ALL_USERS grant is how anonymous access is meant to work — unchanged."""
+        owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        acl = await acl_service.canned_acl_to_acl("public-read", owner_id)
+        acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
+
+        assert await acl_service.check_permission("anonymous", "bucket1", None, Permission.READ) is True
+        assert await acl_service.check_permission(None, "bucket1", None, Permission.READ) is True
 
 
 class TestACLRetrieval:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import collections
+import contextlib
 import hashlib
 import json
 import logging
@@ -15,6 +17,8 @@ import asyncpg
 from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
+from hippius_s3.blake3_hash import new_hasher as new_blake3
+from hippius_s3.blake3_hash import persist_version_hash
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
@@ -22,7 +26,8 @@ from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.repositories import fs_cache_inventory
-from hippius_s3.services.crypto_pool import run_crypto
+from hippius_s3.services.crypto_pool import submit_crypto
+from hippius_s3.services.crypto_pool import submit_hash
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.parts_service import upsert_part_placeholder
 from hippius_s3.storage_version import require_supported_storage_version
@@ -48,6 +53,92 @@ def _append_version_conflict(current: int | None, expected: int) -> bool:
     A missing row (None) is not a conflict here — the reservation/finalize path handles that case.
     """
     return current is not None and int(current) != int(expected)
+
+
+class _ChunkEncryptPipeline:
+    """Overlap socket reads with MD5 + BLAKE3 + AES-GCM of already-framed chunks.
+
+    The serial predecessor did, per 4 MiB chunk, ON the event loop or awaited inline:
+    ``hasher.update(buf)`` (blocking the loop ~6 ms) then ``await run_crypto(encrypt)``
+    (the loop idles while one chunk encrypts) — so the socket was never being read
+    while a chunk was being hashed or encrypted, and a single stream was capped by the
+    SUM of read+hash+encrypt instead of their MAX.
+
+    This pipeline submits both to their pools and returns to the read loop, draining
+    oldest-first once ``lookahead`` chunks are in flight. Invariants it preserves —
+    each one is pinned by tests/unit/writer/test_stream_content_pins.py:
+
+    - **Rolling hash order**: MD5 and BLAKE3 updates share ONE submit_hash FIFO job
+      so they execute in chunk-index order without a second pool (a second FIFO
+      would be legal for independent hashers but would oversubscribe the write
+      path). ``digest()`` / ``hexdigest()`` must only be read after :meth:`flush`.
+    - **In-flight BLAKE3**: plaintext is hashed as each frame is pushed — overlapping
+      encrypt of this chunk and the next socket read — never by re-reading FS at
+      Complete. Multipart passes ``blake3_first_chunk_only=True`` so only
+      chunk_index 0 of part 1 updates the hasher.
+    - **AEAD identity**: each encrypt is submitted with its EXPLICIT global
+      chunk_index; the AAD binds (bucket, object, part, chunk_index) — never call or
+      completion order — and the nonce is random per call, so concurrent encrypts
+      cannot collide or mis-bind.
+    - **Downstream ordering**: results are drained strictly oldest-first, so
+      ``chunk_cipher_sizes`` and the write queue see exactly the serial ordering.
+    - **Failure direction**: encrypt/hash exceptions surface on the next
+      :meth:`push`/:meth:`flush` await — the same points the serial code raised at.
+      When the caller unwinds early (client disconnect, size cap), in-flight futures
+      are simply abandoned: their results are never enqueued, threads finish and the
+      buffers are garbage-collected; nothing is written on their behalf.
+    - **Memory bound**: at most ``lookahead`` chunks are in flight beyond the write
+      queue; each can pin its plaintext AND (once encrypted) its ciphertext, so peak
+      extra ≈ 2 × chunk_size × lookahead per active PUT.
+    """
+
+    def __init__(
+        self,
+        *,
+        hasher: "hashlib._Hash",
+        encrypt_submit: Any,  # Callable[[bytes, int], asyncio.Future[tuple[bytes, float]]]
+        sink: Any,  # Callable[[int, bytes], Awaitable[None]] — receives (chunk_index, ciphertext) in order
+        lookahead: int,
+        blake3_hasher: Any | None = None,
+        blake3_first_chunk_only: bool = False,
+    ) -> None:
+        self._hasher = hasher
+        self._blake3 = blake3_hasher
+        self._blake3_first_chunk_only = blake3_first_chunk_only
+        self._encrypt_submit = encrypt_submit
+        self._sink = sink
+        self._lookahead = max(1, int(lookahead))
+        self._inflight: collections.deque[tuple[int, asyncio.Future[tuple[bytes, float]], asyncio.Future[None]]] = (
+            collections.deque()
+        )
+        self.encrypt_thread_ms = 0.0  # true in-thread encrypt CPU-time (what `enc=` used to mean)
+
+    async def push(self, buf: bytes, chunk_index: int) -> None:
+        md5 = self._hasher
+        blake = self._blake3
+        first_only = self._blake3_first_chunk_only
+
+        def _update(b: bytes = buf, idx: int = chunk_index) -> None:
+            md5.update(b)
+            if blake is not None and (not first_only or idx == 0):
+                blake.update(b)
+
+        hash_fut = submit_hash(_update)
+        enc_fut = self._encrypt_submit(buf, chunk_index)
+        self._inflight.append((chunk_index, enc_fut, hash_fut))
+        if len(self._inflight) >= self._lookahead:
+            await self._drain_oldest()
+
+    async def flush(self) -> None:
+        while self._inflight:
+            await self._drain_oldest()
+
+    async def _drain_oldest(self) -> None:
+        chunk_index, enc_fut, md5_fut = self._inflight.popleft()
+        ct, enc_seconds = await enc_fut
+        await md5_fut
+        self.encrypt_thread_ms += enc_seconds * 1000
+        await self._sink(chunk_index, ct)
 
 
 class ObjectWriter:
@@ -94,88 +185,6 @@ class ObjectWriter:
             int(new_version),
         )
         return bool(row)
-
-    async def put_simple(
-        self,
-        *,
-        bucket_id: str,
-        bucket_name: str,
-        object_id: str,
-        object_key: str,
-        object_version: int,
-        account_address: str,
-        content_type: str,
-        metadata: dict[str, Any],
-        body_bytes: bytes,
-    ) -> PutResult:
-        """Deprecated: prefer put_simple_full which will upsert + write.
-
-        This method assumes the object row/version already exists in DB.
-        """
-        # Encrypt into chunks
-        chunk_size = self.config.object_chunk_size_bytes
-        suite_id = "hip-enc/aes256gcm"
-        key_bytes = await self._ensure_and_get_v5_dek(
-            bucket_id=bucket_id,
-            object_id=object_id,
-            object_version=int(object_version),
-            chunk_size=int(chunk_size),
-            suite_id=suite_id,
-            rotate=True,
-        )
-        ct_chunks = CryptoService.encrypt_part_to_chunks(
-            body_bytes,
-            object_id=object_id,
-            part_number=1,
-            chunk_size=chunk_size,
-            key=key_bytes,
-            suite_id=suite_id,
-            bucket_id=str(bucket_id),
-            upload_id="",
-        )
-
-        ttl = self.config.cache_ttl_seconds
-        writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
-        await writer.write_chunks(object_id, int(object_version), 1, ct_chunks)
-        await writer.write_meta(
-            object_id,
-            int(object_version),
-            1,
-            chunk_size=chunk_size,
-            num_chunks=len(ct_chunks),
-            plain_size=len(body_bytes),
-        )
-
-        md5_hash = hashlib.md5(body_bytes).hexdigest()
-
-        # Ensure upload row and insert part placeholder
-        upload_id = await ensure_upload_row(
-            self.pool,
-            object_id=object_id,
-            bucket_id=bucket_id,
-            object_key=object_key,
-            content_type=content_type,
-            metadata=metadata,
-        )
-        await upsert_part_placeholder(
-            self.pool,
-            object_id=object_id,
-            upload_id=str(upload_id),
-            part_number=1,
-            size_bytes=int(len(body_bytes)),
-            etag=md5_hash,
-            chunk_size_bytes=int(chunk_size),
-            object_version=int(object_version),
-            chunk_cipher_sizes=[len(ct) for ct in ct_chunks],
-        )
-
-        return PutResult(
-            object_id=str(object_id),
-            etag=md5_hash,
-            size_bytes=len(body_bytes),
-            upload_id=str(upload_id),
-            object_version=int(object_version),
-        )
 
     async def put_simple_stream_full(
         self,
@@ -295,6 +304,7 @@ class ObjectWriter:
             object_id, object_version = await retry_on_object_version_conflict(_reserve_version)
 
         hasher = hashlib.md5()
+        blake3_hasher = new_blake3()
         total_size = 0
         writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
 
@@ -335,84 +345,95 @@ class ObjectWriter:
                 perf_fs_ms += io_ms
                 logger.debug(f"PERF chunk {chunk_idx}: io={io_ms:.1f}ms (fs) size={len(ct)}")
 
-        with tracer.start_as_current_span("put_simple_stream_full.encrypt_and_cache") as span:
-            consumer_task = asyncio.create_task(_consumer())
-
-            async for piece in body_iter:
-                if consumer_error:
-                    raise consumer_error
-                if not piece:
-                    continue
-                pt_buf.extend(piece)
-                while len(pt_buf) >= chunk_size:
-                    buf = bytes(pt_buf[:chunk_size])
-                    del pt_buf[:chunk_size]
-                    hasher.update(buf)
-                    total_size += len(buf)
-                    # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
-                    # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
-                    t0 = time.monotonic()
-                    ct = await run_crypto(
-                        adapter.encrypt_chunk,
-                        buf,
-                        key=key_bytes,
-                        bucket_id=str(bucket_id),
-                        object_id=object_id,
-                        part_number=int(part_number),
-                        chunk_index=int(next_chunk_index),
-                        upload_id="",
-                    )
-                    t1 = time.monotonic()
-                    perf_encrypt_ms += (t1 - t0) * 1000
-                    chunk_cipher_sizes.append(len(ct))
-                    tq0 = time.monotonic()
-                    await write_queue.put((next_chunk_index, ct))
-                    perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
-                    next_chunk_index += 1
-
-            if pt_buf:
-                if consumer_error:
-                    raise consumer_error
-                buf = bytes(pt_buf)
-                pt_buf.clear()
-                hasher.update(buf)
-                total_size += len(buf)
-                # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
-                # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
+        def _timed_encrypt(buf: bytes, chunk_index: int) -> "asyncio.Future[tuple[bytes, float]]":
+            # The AAD binds the EXPLICIT chunk_index below (nonce is random per call), so
+            # concurrent in-flight encrypts are safe — order of completion is irrelevant.
+            def _work(b: bytes = buf, idx: int = chunk_index) -> tuple[bytes, float]:
                 t0 = time.monotonic()
-                ct = await run_crypto(
-                    adapter.encrypt_chunk,
-                    buf,
+                ct = adapter.encrypt_chunk(
+                    b,
                     key=key_bytes,
                     bucket_id=str(bucket_id),
                     object_id=object_id,
                     part_number=int(part_number),
-                    chunk_index=int(next_chunk_index),
+                    chunk_index=idx,
                     upload_id="",
                 )
-                t1 = time.monotonic()
-                perf_encrypt_ms += (t1 - t0) * 1000
-                chunk_cipher_sizes.append(len(ct))
-                tq0 = time.monotonic()
-                await write_queue.put((next_chunk_index, ct))
-                perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
-                next_chunk_index += 1
+                return ct, time.monotonic() - t0
 
-            await write_queue.put(None)
-            await consumer_task
-            if consumer_error:
-                raise consumer_error
+            return submit_crypto(_work)
 
-            md5_hash = hasher.hexdigest()
-            perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
-            set_span_attributes(
-                span,
-                {
-                    "total_size": total_size,
-                    "num_chunks": next_chunk_index,
-                    "md5_hash": md5_hash,
-                },
-            )
+        async def _sink(chunk_index: int, ct: bytes) -> None:
+            nonlocal perf_queue_wait_ms
+            chunk_cipher_sizes.append(len(ct))
+            tq0 = time.monotonic()
+            await write_queue.put((chunk_index, ct))
+            perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+
+        pipeline = _ChunkEncryptPipeline(
+            hasher=hasher,
+            encrypt_submit=_timed_encrypt,
+            sink=_sink,
+            lookahead=self.config.write_pipeline_lookahead,
+            blake3_hasher=blake3_hasher,
+        )
+
+        with tracer.start_as_current_span("put_simple_stream_full.encrypt_and_cache") as span:
+            consumer_task = asyncio.create_task(_consumer())
+            try:
+                async for piece in body_iter:
+                    if consumer_error:
+                        raise consumer_error
+                    if not piece:
+                        continue
+                    pt_buf.extend(piece)
+                    while len(pt_buf) >= chunk_size:
+                        buf = bytes(pt_buf[:chunk_size])
+                        del pt_buf[:chunk_size]
+                        total_size += len(buf)
+                        await pipeline.push(buf, int(next_chunk_index))
+                        next_chunk_index += 1
+
+                if pt_buf:
+                    if consumer_error:
+                        raise consumer_error
+                    buf = bytes(pt_buf)
+                    pt_buf.clear()
+                    total_size += len(buf)
+                    await pipeline.push(buf, int(next_chunk_index))
+                    next_chunk_index += 1
+
+                await pipeline.flush()
+                perf_encrypt_ms = pipeline.encrypt_thread_ms
+
+                await write_queue.put(None)
+                await consumer_task
+                if consumer_error:
+                    raise consumer_error
+
+                # Safe only after flush(): every hash-pool update future has been awaited,
+                # so the rolling digest has seen all chunks, in order.
+                md5_hash = hasher.hexdigest()
+                blake3_hex = blake3_hasher.hexdigest()
+                perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
+                set_span_attributes(
+                    span,
+                    {
+                        "total_size": total_size,
+                        "num_chunks": next_chunk_index,
+                        "md5_hash": md5_hash,
+                    },
+                )
+            finally:
+                # A client disconnect mid-stream unwinds without the success path's `None`
+                # sentinel, leaving the consumer blocked on `write_queue.get()` for the life of
+                # the pod — one leaked task and up to HIPPIUS_WRITE_QUEUE_MAXSIZE chunks per
+                # failed PUT. Unlike the MPU path this dir is per object-version, so a late
+                # write corrupts nothing; the leak alone is reason enough to stop it.
+                if not consumer_task.done():
+                    consumer_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await consumer_task
 
         # Write FS meta BEFORE making this version visible in DB.
         # The download query skips versions with size=0/md5='', so the version
@@ -456,6 +477,7 @@ class ObjectWriter:
                         datetime.now(timezone.utc),
                         object_id,
                         int(object_version),
+                        blake3_hex,
                     )
                     # Envelope (kek_id, wrapped_dek) was already written in the head transaction
                     # to prevent the read-race on concurrent overwrites.
@@ -602,85 +624,6 @@ class ObjectWriter:
             )
             return dek
 
-    async def mpu_upload_part(
-        self,
-        *,
-        upload_id: str,
-        object_id: str,
-        object_version: int,
-        bucket_name: str,
-        account_address: str,
-        part_number: int,
-        body_bytes: bytes,
-    ) -> PartResult:
-        file_size = len(body_bytes)
-        if file_size == 0:
-            raise ValueError("Zero-length part not allowed")
-
-        chunk_size = self.config.object_chunk_size_bytes
-        # Resolve bucket_id for this version
-        meta = await self.pool.fetchrow(
-            """
-            SELECT o.bucket_id, ov.storage_version
-              FROM objects o
-              JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = $2
-             WHERE o.object_id = $1
-             LIMIT 1
-            """,
-            object_id,
-            int(object_version),
-        )
-        bucket_id = str(meta["bucket_id"]) if meta and meta.get("bucket_id") else ""
-        suite_id = "hip-enc/aes256gcm"
-        key_bytes = await self._ensure_and_get_v5_dek(
-            bucket_id=bucket_id,
-            object_id=str(object_id),
-            object_version=int(object_version),
-            chunk_size=int(chunk_size),
-            suite_id=suite_id,
-            rotate=False,
-        )
-        ct_chunks = CryptoService.encrypt_part_to_chunks(
-            body_bytes,
-            object_id=str(object_id),
-            part_number=int(part_number),
-            chunk_size=chunk_size,
-            key=key_bytes,
-            suite_id=suite_id,
-            bucket_id=bucket_id,
-            upload_id=str(upload_id),
-        )
-
-        ttl = self.config.cache_ttl_seconds
-        writer = WriteThroughPartsWriter(self.fs_store, self.obj_cache, ttl_seconds=ttl)
-        await writer.write_chunks(str(object_id), int(object_version), int(part_number), ct_chunks)
-        await writer.write_meta(
-            str(object_id),
-            int(object_version),
-            int(part_number),
-            chunk_size=chunk_size,
-            num_chunks=len(ct_chunks),
-            plain_size=len(body_bytes),
-        )
-
-        # AWS parity: md5 of the part only
-        loop = asyncio.get_event_loop()
-        md5_hash = await loop.run_in_executor(None, lambda: hashlib.md5(body_bytes).hexdigest())
-
-        await upsert_part_placeholder(
-            self.pool,
-            object_id=str(object_id),
-            upload_id=str(upload_id),
-            part_number=int(part_number),
-            size_bytes=int(file_size),
-            etag=str(md5_hash),
-            chunk_size_bytes=int(chunk_size),
-            object_version=int(object_version),
-            chunk_cipher_sizes=[len(ct) for ct in ct_chunks],
-        )
-
-        return PartResult(etag=md5_hash, size_bytes=file_size, part_number=int(part_number))
-
     async def mpu_upload_part_stream(
         self,
         *,
@@ -720,12 +663,20 @@ class ObjectWriter:
         adapter = CryptoService.get_adapter(suite_id)
 
         hasher = hashlib.md5()
+        # First framed chunk of part 1 is the listing hash. Later parts must not
+        # clobber it; S4 appends new parts after part 1 and leave the digest.
+        blake3_hasher = new_blake3() if int(part_number) == 1 else None
         total_size = 0
         next_chunk_index = 0
         chunk_cipher_sizes: list[int] = []
         pt_buf = bytearray()
         written_chunk_indices: list[int] = []
-        meta_written = False
+        published = False
+        # Hedged duplicate UploadParts share one part dir. Every chunk this attempt writes goes
+        # under a name only this attempt uses, and becomes `chunk_<i>.bin` only when the whole
+        # set is published — so a losing attempt can never overwrite a chunk of an already
+        # acknowledged one, whatever it was doing when it died.
+        attempt_id = uuid.uuid4().hex
 
         perf_encrypt_ms = 0.0
         perf_fs_ms = 0.0
@@ -737,12 +688,16 @@ class ObjectWriter:
 
         async def _cleanup_partial() -> None:
             # Deliberately NO fs_store.delete_part here. Hedged duplicate UploadPart attempts
-            # share one part dir; chunk files are atomic-rename + byte-identical across
-            # duplicates and invisible to readers/reconciler until meta.json lands — so a
-            # failure-path deletion is pure hazard: on 2026-07-26 a cancelled duplicate's
-            # cleanup wiped a completed part's data after its 200 was already returned.
-            # A never-published dir merely leaks until SSD GC; leak beats loss (same doctrine
-            # as the drain reclaim).
+            # share one part dir, so a failure-path deletion of anything at the canonical names
+            # is pure hazard: on 2026-07-26 a cancelled duplicate's cleanup wiped a completed
+            # part's data after its 200 was already returned. This attempt's own bytes ARE
+            # removable — `discard_staged` above does exactly that — precisely because staging
+            # gives them names nobody else uses.
+            #
+            # Redis only: these keys are vestigial (the cache delegates back to the FS store),
+            # and the meta key here is the SHARED one, so on a failure path this can only ever
+            # drop an entry another attempt published. Harmless because it is cache, but it is
+            # a wart, and the UploadPart endpoint duplicates it.
             if written_chunk_indices:
                 try:
                     keys = [
@@ -768,12 +723,13 @@ class ObjectWriter:
                 chunk_idx, ct = item
                 t_io_start = time.monotonic()
                 try:
-                    await self.fs_store.set_chunk(
+                    await self.fs_store.stage_chunk(
                         str(object_id),
                         int(object_version),
                         int(part_number),
                         chunk_idx,
                         ct,
+                        attempt_id=attempt_id,
                     )
                 except BaseException as e:
                     consumer_error = e
@@ -784,9 +740,42 @@ class ObjectWriter:
                 perf_fs_ms += io_ms
                 logger.debug(f"PERF mpu chunk {chunk_idx}: io={io_ms:.1f}ms (fs) size={len(ct)}")
 
-        try:
-            consumer_task = asyncio.create_task(_consumer())
+        def _timed_encrypt(buf: bytes, chunk_index: int) -> "asyncio.Future[tuple[bytes, float]]":
+            # The AAD binds the EXPLICIT chunk_index below (nonce is random per call), so
+            # concurrent in-flight encrypts are safe — order of completion is irrelevant.
+            def _work(b: bytes = buf, idx: int = chunk_index) -> tuple[bytes, float]:
+                t0 = time.monotonic()
+                ct = adapter.encrypt_chunk(
+                    b,
+                    key=key_bytes,
+                    bucket_id=bucket_id,
+                    object_id=str(object_id),
+                    part_number=int(part_number),
+                    chunk_index=idx,
+                    upload_id=str(upload_id),
+                )
+                return ct, time.monotonic() - t0
 
+            return submit_crypto(_work)
+
+        async def _sink(chunk_index: int, ct: bytes) -> None:
+            nonlocal perf_queue_wait_ms
+            chunk_cipher_sizes.append(len(ct))
+            tq0 = time.monotonic()
+            await write_queue.put((chunk_index, ct))
+            perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+
+        pipeline = _ChunkEncryptPipeline(
+            hasher=hasher,
+            encrypt_submit=_timed_encrypt,
+            sink=_sink,
+            lookahead=self.config.write_pipeline_lookahead,
+            blake3_hasher=blake3_hasher,
+            blake3_first_chunk_only=True,
+        )
+
+        consumer_task = asyncio.create_task(_consumer())
+        try:
             async for piece in body_iter:
                 if consumer_error:
                     raise consumer_error
@@ -794,33 +783,17 @@ class ObjectWriter:
                     continue
                 pt_buf.extend(piece)
                 if max_size and total_size + len(pt_buf) > int(max_size):
+                    # In-flight pipeline futures are deliberately abandoned here: their results
+                    # are never enqueued (only _drain_oldest feeds the sink), so aborting cannot
+                    # stage a chunk behind our back.
                     await write_queue.put(None)
                     await consumer_task
                     raise ValueError("part_size_exceeds_max")
                 while len(pt_buf) >= chunk_size:
                     buf = bytes(pt_buf[:chunk_size])
                     del pt_buf[:chunk_size]
-                    hasher.update(buf)
                     total_size += len(buf)
-                    # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
-                    # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
-                    t0 = time.monotonic()
-                    ct = await run_crypto(
-                        adapter.encrypt_chunk,
-                        buf,
-                        key=key_bytes,
-                        bucket_id=bucket_id,
-                        object_id=str(object_id),
-                        part_number=int(part_number),
-                        chunk_index=int(next_chunk_index),
-                        upload_id=str(upload_id),
-                    )
-                    t1 = time.monotonic()
-                    perf_encrypt_ms += (t1 - t0) * 1000
-                    chunk_cipher_sizes.append(len(ct))
-                    tq0 = time.monotonic()
-                    await write_queue.put((next_chunk_index, ct))
-                    perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+                    await pipeline.push(buf, int(next_chunk_index))
                     next_chunk_index += 1
 
             if pt_buf:
@@ -828,28 +801,12 @@ class ObjectWriter:
                     raise consumer_error
                 buf = bytes(pt_buf)
                 pt_buf.clear()
-                hasher.update(buf)
                 total_size += len(buf)
-                # IMPORTANT: For AEAD suites that bind chunk_index (e.g. AES-GCM with deterministic nonces),
-                # we must encrypt with the *global* chunk index. We therefore encrypt one chunk at a time.
-                t0 = time.monotonic()
-                ct = await run_crypto(
-                    adapter.encrypt_chunk,
-                    buf,
-                    key=key_bytes,
-                    bucket_id=bucket_id,
-                    object_id=str(object_id),
-                    part_number=int(part_number),
-                    chunk_index=int(next_chunk_index),
-                    upload_id=str(upload_id),
-                )
-                t1 = time.monotonic()
-                perf_encrypt_ms += (t1 - t0) * 1000
-                chunk_cipher_sizes.append(len(ct))
-                tq0 = time.monotonic()
-                await write_queue.put((next_chunk_index, ct))
-                perf_queue_wait_ms += (time.monotonic() - tq0) * 1000
+                await pipeline.push(buf, int(next_chunk_index))
                 next_chunk_index += 1
+
+            await pipeline.flush()
+            perf_encrypt_ms = pipeline.encrypt_thread_ms
 
             if total_size == 0:
                 await write_queue.put(None)
@@ -861,38 +818,50 @@ class ObjectWriter:
             if consumer_error:
                 raise consumer_error
 
-            await writer.write_meta(
+            # Publishing renames this attempt's staged set onto the canonical chunk names,
+            # trims any stale tail, and writes meta.json — one operation under a per-part lock,
+            # so the part goes from the previous attempt's content to this one's without ever
+            # exposing a mixture of the two.
+            await writer.publish_part(
                 str(object_id),
                 int(object_version),
                 int(part_number),
+                attempt_id=attempt_id,
                 chunk_size=chunk_size,
                 num_chunks=int(next_chunk_index),
                 plain_size=int(total_size),
             )
-            meta_written = True
-        except Exception:
-            if not meta_written:
-                await _cleanup_partial()
-            raise
+            published = True
+        finally:
+            if not published:
+                # Stop the consumer before unwinding. Without this it is left PENDING holding up
+                # to HIPPIUS_WRITE_QUEUE_MAXSIZE already-queued chunks, which it then writes on
+                # later event-loop turns — after the request has already failed. It also leaked
+                # the task and its queue permanently: the `None` sentinel is only sent on the
+                # success path, so the consumer blocked on `write_queue.get()` forever.
+                #
+                # Cancellation alone never closed the corruption window — a chunk already inside
+                # the worker thread lands regardless. Staging is what closes it: those late
+                # writes go to names only this attempt uses, so discarding them is unambiguous,
+                # and a chunk of an already-acknowledged attempt is never at risk either way.
+                consumer_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await consumer_task
 
-        # Publish-time exact-set trim (covers MPU and append, which materializes its delta
-        # part here). The drain replicates a part only when the SSD chunk set is EXACTLY
-        # {0..num_chunks-1} (partdrain.rs completeness gate → IncompleteSource); a stale tail
-        # from a LARGER earlier attempt would strand the part forever — never replicated,
-        # never evicted. Races, honestly: an identical concurrent duplicate never writes
-        # indices >= our N (same content ⇒ same N), so this only ever deletes another
-        # attempt's bytes when that attempt has DIFFERENT content — and there S3 semantics
-        # are already last-writer-wins for concurrent same-part uploads. Different-content
-        # attempts interleave arbitrarily; whichever publishes last rewrites meta and its
-        # trim enforces its own N, so any transiently mixed (meta, chunk set) state resolves
-        # to the last publisher's. A drain that catches the mid-window mismatch defers once
-        # as IncompleteSource and retries — benign, not permanent, because the settled state
-        # is exact. Trim never raises by contract (failures are ERROR-logged inside —
-        # stranded-part risk — but the part itself is durable on SSD), and it sits outside
-        # the try above so a bug in it can never masquerade as a stream failure.
-        await self.fs_store.trim_chunks_from(
-            str(object_id), int(object_version), int(part_number), int(next_chunk_index)
-        )
+                # `finally`, not `except Exception`: a client disconnect can arrive as
+                # CancelledError, which is a BaseException, and that is exactly the case whose
+                # staged bytes most need dropping. Shielded because once a CancelledError is
+                # unwinding, every further await raises immediately — an unshielded discard
+                # would be skipped precisely when it is needed. Suppressed because cleanup must
+                # never replace the exception that is already on its way to the client.
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(
+                        self.fs_store.discard_staged(
+                            str(object_id), int(object_version), int(part_number), attempt_id=attempt_id
+                        )
+                    )
+                with contextlib.suppress(BaseException):
+                    await _cleanup_partial()
 
         perf_stream_total_ms = (time.monotonic() - perf_stream_start) * 1000
         md5_hash = hasher.hexdigest()
@@ -909,6 +878,13 @@ class ObjectWriter:
             object_version=int(object_version),
             chunk_cipher_sizes=chunk_cipher_sizes,
         )
+        if blake3_hasher is not None:
+            await persist_version_hash(
+                self.pool,
+                object_id=str(object_id),
+                object_version=int(object_version),
+                digest=blake3_hasher.hexdigest(),
+            )
         # The part's chunks+meta are on FS; record it so the janitor's SQL discovery finds it.
         # Advisory-only, on the autocommit pool (no open transaction here — upsert_part_placeholder
         # above also writes via self.pool). This hook also covers the APPEND path, which materializes
@@ -1043,7 +1019,7 @@ class ObjectWriter:
             """
             SELECT o.object_id, o.current_object_version AS cov
             FROM objects o
-            WHERE o.bucket_id = $1 AND o.object_key = $2
+            WHERE o.object_id = resolve_object_id($1::uuid, $2)
             """,
             bucket_id,
             object_key,

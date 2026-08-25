@@ -44,6 +44,12 @@ class _Guard(Protocol):
     def check(self, probe: Probe) -> GuardResult: ...
 
 
+def _pg_bool(cell: str) -> bool:
+    """Read a boolean column out of a `probe.pg` row. `psql -tA` renders booleans as `t`/`f`, so
+    anything else — including the empty cell a NULL would give — is False."""
+    return cell.strip().lower() in ("t", "true")
+
+
 class SingleLeaderEpoch:
     """G1: at most one allocator leads, and the leadership epoch never decreases.
 
@@ -143,6 +149,15 @@ class SoleProducer:
         return GuardResult(self.name, "ok", "no duplicate (chunk_id, backend)")
 
 
+@dataclasses.dataclass(frozen=True)
+class _StatusSample:
+    """One `cephor_replication_status` row as G6 samples it: its status plus whether the row
+    carries a fresh B-2 re-landing stamp (see `TerminalMonotonicity`)."""
+
+    status: str
+    recently_relanded: bool
+
+
 class TerminalMonotonicity:
     """G6: a terminal replication state (`replicated`/`failed`) is never left.
 
@@ -160,28 +175,82 @@ class TerminalMonotonicity:
     NOTE: `corrupt` (R4) is deliberately NOT terminal — the bounded re-drive worker legitimately
     resets `corrupt->pending` to re-copy a live object's intact SSD source over its corrupt pool
     copy. Only `replicated`/`failed` are inert sinks, so `corrupt->pending` must not be flagged.
+
+    CARVE-OUT (B-2 content-change re-drive): `Store::redrive_diverged_part` legitimately returns a
+    `replicated` part to `pending` when a re-landed part's `content_sha256` no longer matches what
+    was committed — the pool holds superseded bytes and must be re-copied. That is a real exit from
+    a terminal state, so it is permitted, but only under the predicate that makes it recognisable:
+    the re-drive is causally DOWNSTREAM of a re-landing, and `record_landed_part` stamps
+    `relanded_at` in the same statement that reads the prior `replicated` status — strictly before
+    the divergence check can flip the row. So a legitimate `replicated->pending` ALWAYS carries a
+    fresh `relanded_at`, and the guard permits the transition only when the current sample says so
+    (`_RELAND_RECENCY`, sized as the drain's 10-minute reland eviction grace plus slack, since the
+    stamp is never cleared and only its recency is meaningful). A `replicated->pending` with a NULL
+    or stale stamp is the silent-data-loss shape G6 exists to catch and still breaches, as does
+    every other terminal exit — `replicated->failed`, `replicated->draining`, `failed->*`. On a
+    cluster predating the B-2 migration the carve-out cannot apply at all; see `_sample`.
     """
 
     name = "G6"
     _TERMINAL = frozenset({"replicated", "failed"})
+    _KEY_COLUMNS = "object_id, version, part_number, status"
+    # Evaluated in the sample SQL rather than against a fetched timestamp: `now()` is then
+    # Postgres' clock, so the predicate never depends on the asserter host's clock skew.
+    _RECENCY = "(relanded_at IS NOT NULL AND relanded_at > now() - interval '15 minutes')"
 
     def __init__(self) -> None:
-        self._prev: dict[tuple[str, str, str], str] = {}
+        self._prev: dict[tuple[str, str, str], _StatusSample] = {}
+        self._samples_recency = True
 
     def check(self, probe: Probe) -> GuardResult:
-        rows = probe.pg("SELECT object_id, version, part_number, status FROM cephor_replication_status")
+        rows, columns = self._sample(probe)
         if rows is None:
             return GuardResult(self.name, "skip", "postgres unreachable")
-        current = {(r[0], r[1], r[2]): r[3] for r in rows if len(r) >= 4}
+        current = {
+            (r[0], r[1], r[2]): _StatusSample(r[3], columns == 5 and _pg_bool(r[4])) for r in rows if len(r) >= columns
+        }
+        if rows and not current:
+            # Every sampled row was too short to read, i.e. the sample query and this parser have
+            # diverged. Dropping them silently would leave the guard tracking nothing and reporting
+            # `ok` forever — a silent pass on the invariant, which is worse than an explicit skip.
+            return GuardResult(
+                self.name, "skip", f"unreadable sample rows (got {len(rows[0])} columns, want {columns})"
+            )
         breaches = [
-            f"{key}: {prev}->{current[key]}"
+            f"{key}: {prev.status}->{current[key].status}"
             for key, prev in self._prev.items()
-            if prev in self._TERMINAL and key in current and current[key] != prev
+            if key in current and self._is_regression(prev.status, current[key])
         ]
         self._prev = current
         if breaches:
             return GuardResult(self.name, "breach", f"terminal-state regression: {breaches[:3]}")
         return GuardResult(self.name, "ok", f"{len(current)} rows tracked, no terminal regression")
+
+    def _sample(self, probe: Probe) -> tuple[list[list[str]] | None, int]:
+        """Sample every row's status, with the reland-recency column when the cluster has it.
+
+        A cluster older than the B-2 migration (0019) has no `relanded_at`, and psql fails that
+        query indistinguishably from an unreachable pg. So the absent-column case falls back to the
+        plain sample ONCE and latches: with no column no re-drive can have happened, making the
+        pre-B-2 rule (every terminal exit breaches) the correct one — far better than mislabelling
+        the whole run's G6 as `postgres unreachable` and asserting nothing. Both queries failing is
+        the genuinely-unreachable case and does NOT latch, so the recency sample resumes on recovery.
+        """
+        if self._samples_recency:
+            rows = probe.pg(f"SELECT {self._KEY_COLUMNS}, {self._RECENCY} FROM cephor_replication_status")
+            if rows is not None:
+                return (rows, 5)
+            rows = probe.pg(f"SELECT {self._KEY_COLUMNS} FROM cephor_replication_status")
+            if rows is None:
+                return (None, 5)
+            self._samples_recency = False
+            return (rows, 4)
+        return (probe.pg(f"SELECT {self._KEY_COLUMNS} FROM cephor_replication_status"), 4)
+
+    def _is_regression(self, prev: str, now: _StatusSample) -> bool:
+        if prev not in self._TERMINAL or now.status == prev:
+            return False
+        return not (prev == "replicated" and now.status == "pending" and now.recently_relanded)
 
 
 class AgedPendingOrphanBacklog:

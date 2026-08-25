@@ -11,6 +11,7 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.copy_helpers import handle_same_bucket_copy
 from hippius_s3.api.s3.copy_helpers import handle_streaming_copy
 from hippius_s3.api.s3.copy_helpers import is_multipart_object
 from hippius_s3.api.s3.copy_helpers import parse_copy_source
@@ -38,7 +39,7 @@ async def handle_copy_object(
 
         user, source_bucket, dest_bucket, source_object = await resolve_copy_resources(
             db=pool,
-            main_account=request.state.account.main_account,
+            main_account=request.state.main_account_id,
             source_bucket_name=source_bucket_name,
             source_object_key=source_object_key,
             dest_bucket_name=bucket_name,
@@ -50,6 +51,17 @@ async def handle_copy_object(
 
         src_obj_row = source_object
         src_multipart = is_multipart_object(src_obj_row)
+
+        if str(source_bucket["bucket_id"]) == str(dest_bucket["bucket_id"]):
+            aliased = await handle_same_bucket_copy(
+                pool,
+                dest_bucket_id=str(dest_bucket["bucket_id"]),
+                dest_key=object_key,
+                src_obj_row=src_obj_row,
+                copy_created_at=copy_created_at,
+            )
+            if aliased is not None:
+                return aliased
 
         raw_storage_version = src_obj_row.get("storage_version")
         if raw_storage_version is None:

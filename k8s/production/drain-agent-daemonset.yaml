@@ -1,9 +1,9 @@
 # The hippius-drain agent: the per-node drain daemon.
 # One pod per ingest node, draining that node's local-SSD ingest dir to
 # the shared CephFS pool, path-preservingly per the api part layout
-# (<object_id>/v<version>/part_<n>/). The reconciler is the sole trigger — it scans the
-# SSD for complete parts (a meta.json marker) with no replication row and records them,
-# so the api needs no change.
+# (<object_id>/v<version>/part_<n>/). Parts are discovered from the api's landed-part
+# announcements (cephor:landed:<node> on the queue Redis); the reconciler's SSD scan is the
+# BACKSTOP for an announcement that was never delivered, not the primary trigger.
 #
 # == Node alignment ==
 # Selects the SAME node label `s3-prod-local-ingest=true` as the api-local
@@ -88,8 +88,29 @@ spec:
             - -c
             - |
               until pg_isready -h postgres-nvme-rw -p 5432; do echo "waiting for postgres"; sleep 3; done
-              until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "SELECT to_regclass('public.cephor_replication_status') IS NOT NULL")" = "t" ]; do
-                echo "waiting for the cephor schema (allocator migration)"; sleep 3
+              # Gate on the columns THIS binary needs, not on the table existing. The table has
+              # been there since migration 0005, so the old check passed instantly and guarded
+              # nothing — while `record_landed_part` (the only record path, so the landed queue
+              # AND the reconciler backstop fail together) needs 0019's content_sha256 and
+              # relanded_at, `mark_replicated` needs content_sha256, and the evictor's worklist
+              # needs 0016's cephor_ssd_residency. Started against a pre-migration schema the
+              # agent cannot commit or record ANY part while the api keeps accepting PUTs onto
+              # the same SSD, and it does not self-heal until the allocator's migration lands.
+              # table_schema is load-bearing, and count(DISTINCT ...) with it. Without both,
+              # information_schema.columns spans EVERY schema the role can see, so the check
+              # answers the wrong question twice over: a same-named table in another schema
+              # (an archive, a restore staging area) can supply the missing columns and pass the
+              # gate against an un-migrated `public` — the exact outage it exists to prevent —
+              # and a duplicate of a CORRECTLY migrated table makes the count 6, so `= 3` is
+              # false and the initContainer spins forever on a healthy database.
+              until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "
+                SELECT to_regclass('public.cephor_ssd_residency') IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_schema = 'public'
+                                 AND table_name = 'cephor_replication_status'
+                                 AND column_name IN ('content_sha256', 'relanded_at', 'reclaimed_at')
+                               HAVING count(DISTINCT column_name) = 3)")" = "t" ]; do
+                echo "waiting for the cephor schema (allocator migrations 0016-0019)"; sleep 3
               done
           env:
             - name: CEPHOR_DATABASE_URL
@@ -142,12 +163,46 @@ spec:
             # SSD-ingest reclaim worker: clean up broken/abandoned uploads (failed parts
             # the drain skips forever), replicated crash-orphans (a crash between the
             # mark_replicated commit and the drain's own unlink), and orphan write-temps,
-            # once aged, so junk does not accumulate on the node-local disk. All have safe
-            # code defaults (300s poll / 1h graces); set here for visibility + per-node tuning.
+            # once aged, so junk does not accumulate on the node-local disk.
+            #
+            # 3600, not the 300s code default, for the SAME reason the reconcile poll above is
+            # 600: this worker still runs the full SSD tree walk (`reclaim_ssd` ->
+            # `scanner.scan_parts()`), and retention grew that tree from the undrained backlog to
+            # this node's ENTIRE replicated shard — the 2.28M parts / ~930 GB measured on prod
+            # 2026-08-07. At 300s that is 12 walks/hour per node, on the same NVMe serving ingest
+            # and reads, i.e. twice the frequency of the reconcile walk this release just demoted
+            # 40x for being too expensive. `ssd_reclaim.rs` already reasons about an hourly walk.
+            #
+            # Every disposition this worker owns is grace-gated at >= 1h
+            # (CEPHOR_RECLAIM_GRACE_SECS below), so no part becomes actionable faster than hourly
+            # and a 300s poll could only re-ask the same question twelve times.
+            #
+            # That was NOT true while the R4 corrupt re-drive shared this loop. A `corrupt` part
+            # is a live object whose pool copy is bad and whose SSD copy is the last good source,
+            # and it has no grace — so for that one call the poll interval was the single-copy
+            # exposure window, and raising this to 3600 would have widened it 12x. The re-drive
+            # now runs on its own worker and its own CEPHOR_REDRIVE_POLL_SECS below; the two must
+            # stay separate, and this value must not be assumed to bound anything R4.
             - name: CEPHOR_RECLAIM_POLL_SECS
+              value: "3600"
+            # Pinned at the historical 5 minutes, and pinned EXPLICITLY rather than left to the
+            # code default so that this window is visible next to the walk interval it used to be
+            # accidentally coupled to. `drain-corrupt-live-parts` (severity critical, for: 15m) is
+            # calibrated against this cadence — 15m is three cycles here, which is what lets a
+            # transient corruption clear itself before paging. Raising it breaks that calibration.
+            - name: CEPHOR_REDRIVE_POLL_SECS
               value: "300"
             - name: CEPHOR_RECLAIM_GRACE_SECS
               value: "3600"
+            # ROLLBACK-LOAD-BEARING — do not delete as manifest hygiene.
+            # Read by the CURRENT (pre-retention) binary, which unlinks a replicated part once
+            # it ages past this grace. The retention binary ignores it: ssd_reclaim skips
+            # `replicated` outright, because those parts are the read tier and the evictor owns
+            # them instead. It looks dead the moment retention ships here — and it is exactly
+            # then that it matters most, because `kubectl rollout undo daemonset/drain-agent`
+            # restores unlink-on-commit AND needs this grace to sweep the cache the rolled-back
+            # fleet is still holding. Deleting it would leave a rolled-back node with a full
+            # disk and nothing to reclaim it.
             - name: CEPHOR_REPLICATED_RECLAIM_GRACE_SECS
               value: "3600"
             # Max parts drained concurrently — the in-flight gate that lets the node
@@ -174,19 +229,30 @@ spec:
             # AND defer_attempts), so a just-completed MPU's parts drain promptly regardless.
             - name: CEPHOR_DRAIN_POLL_SECS
               value: "1"
-            # Reconciler scan period (was the 60s code default). The reconciler is the SOLE
-            # drain trigger — a freshly-landed part is invisible until the next scan records its
-            # `pending` row — so this interval, not the 1s drain poll, is the dominant, jittery
-            # replication-sync tail (0–60s at the old default; ~30s avg). 15s cuts it to ~7.5s avg.
-            # Safe to lower: a scan is a walk of the node-local SSD ingest tree (undrained parts
-            # only — drained parts are unlinked; the Ceph pool and the 94M-row parts table are
-            # never walked) + ONE batched UNNEST status read. record_landed writes fire only for
-            # genuinely-new parts (a known part is seen as already_pending and skipped), so a
-            # faster poll adds NO extra write load — just the cheap walk + one read, jittered per
-            # node. The real fix (an api landing fast-path + mtime-incremental scan) collapses
-            # this to ~1s; 15s is the zero-code interim. See drainer-optimisations.md Tier 1.
+            # Reconciler scan period — the BACKSTOP for a lost landed announcement, not the
+            # drain trigger. Primary discovery is the api's cephor:landed:<node> announcement,
+            # drained every 1s (landed.rs); this walk only recovers a part whose announcement
+            # was never delivered, so its interval bounds nothing but that recovery lag. An
+            # unrecovered part waits safely on SSD in the meantime: with no DB row the evictor
+            # never selects it, and the orphan reclaim grace is 24h.
+            #
+            # 600 (was 15): retention (PR #398) turns the walked tree from the small undrained
+            # backlog into the node's ENTIRE replicated shard — measured 2026-08-07 at 2.28M
+            # parts / ~930 GB per node, i.e. ~2.28M stats + ~4,560 batched status queries per
+            # cycle. At 15s that walk would run 4x a minute per node from the moment retention
+            # lands; at 600s it runs 6x an hour (a 40x reduction) while a dropped announcement
+            # still recovers within the ~10min backstop the 2026-08-07 note planned. 600s also
+            # matches the code's own backstop scale (CEPHOR_DEFER_BACKOFF_CAP defaults to 600s)
+            # and is 10x the 60s code default set back when this walk was the sole — and cheap —
+            # trigger. Watch drain_scan_parts_total / drain_scan_duration_ms.
+            #
+            # ORDERING CONSTRAINT (closed): PR #400's review gated promoting retention to prod
+            # on this demotion landing first. Done here, on the staging branch, ahead of the
+            # retention stack's promotion — so it rides the same staging->main train as
+            # retention and prod can never receive retention without it. Staging deliberately
+            # keeps 15s (see k8s/staging/drain-agent-daemonset.yaml for why).
             - name: CEPHOR_RECONCILE_POLL_SECS
-              value: "15"
+              value: "600"
             - name: RUST_LOG
               value: "info"
             # OTLP metrics -> otel-collector -> Prometheus -> Grafana (feature `otel`, on by

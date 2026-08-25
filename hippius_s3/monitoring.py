@@ -1,5 +1,6 @@
 import logging
 import os
+from typing import Literal
 from typing import Optional
 from typing import Union
 
@@ -18,6 +19,63 @@ from hippius_s3.otel_setup import build_resource
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
+
+
+# The storage tiers a chunk read can be served from, closed by construction so the `tier`
+# label cannot drift into unbounded cardinality.
+ChunkReadTier = Literal["local", "peer", "pool"]
+
+# Why a peer fetch did not happen, or its answer was not used. Closed by construction, like
+# ChunkReadTier. The reasons demand different responses and must stay distinguishable:
+# `client_cap` and `server_busy` are capacity; `peer_miss` is the peer having evicted the chunk
+# between the residency read and the fetch, which is routine and settles on its own; and the
+# rest mean something is wrong. `bad_peer_url` is a peer registration this cluster did not
+# write, `bad_length` a peer serving bodies that are not the chunk that was asked for,
+# `unknown_size` a chunk with no recorded ciphertext size to check an answer against, and
+# `peer_error` any other non-200 — a half-rolled deploy, which is a pod to go find.
+#
+# Every one of these has to be counted, including the routine `peer_miss`. The alternative is
+# that a wholesale peer-tier failure — an eviction storm, or a bad image on every pod — shows up
+# only as a DROP in `chunk_reads_by_tier_total{tier=peer}`, and an absence is indistinguishable
+# from the tier simply being idle, so nothing can alert on it.
+PeerShedReason = Literal[
+    "client_cap",
+    "server_busy",
+    "bad_peer_url",
+    "bad_length",
+    "unknown_size",
+    "peer_miss",
+    "peer_error",
+]
+
+# Why a chunk that could have been promoted onto local flash was not. Closed by construction.
+# `residency_failed` is the fail-closed arm: the claim that makes this node's evictor the owner
+# of the copy did not land, so the copy is not made.
+PromotionSkipReason = Literal["disk_pressure", "residency_failed"]
+
+# Which way the drain agent's published promote floor differs from this process's configured
+# one. Closed by construction, like the labels above.
+PromoteFloorDivergence = Literal["stricter", "looser"]
+
+# Outcome of a read-recency stamp. Closed by construction. `failed` is separate rather than
+# uncounted because the write is best-effort and swallowed: without it, a recency path that is
+# erroring on every read is indistinguishable from one that is being fully absorbed by the
+# sampler, and both look like silence.
+ReadRecencyOutcome = Literal["written", "failed"]
+# Why an announcement did not reach redis-queues. `timeout` is deliberately its own value:
+# it is the outcome a slow (rather than broken) queue produces, and the one the bound on
+# the publish introduces, so it has to be distinguishable from an outright error.
+LandedAnnounceOutcome = Literal["timeout", "error"]
+
+# Where the bytes that failed a chunk's AEAD check were found, and what came of it. Closed by
+# construction. `local` means a copy on this node's flash was removed and the read retried from
+# the next tier; `remote` means nothing local held it (a peer or the pool served it), so there
+# was nothing this node could invalidate and no retry was worth making. A sustained
+# `local`/`recovered` rate is a poisoner planting bad bytes on this node — the pool copy is fine.
+# Anything `unrecovered` survived a tier change, so it is a key or object fault, not local
+# corruption; the two must stay distinguishable or a DEK fault reads like cache poisoning.
+AeadFailureTier = Literal["local", "remote"]
+AeadFailureOutcome = Literal["recovered", "unrecovered"]
 
 
 class MetricsCollector:
@@ -94,6 +152,97 @@ class MetricsCollector:
 
         self.cache_misses = self.meter.create_counter(
             name="cache_misses_total", description="Total cache misses", unit="1"
+        )
+
+        # Which storage tier actually served a chunk: local NVMe, a peer node's NVMe, or the
+        # CephFS pool. Without this split the SSD read tier is unmeasurable — every tier reads
+        # as "cache" — so there is no way to tell whether retention, promotion, and peer fetch
+        # are doing anything, or to catch a silent regression back to all-pool reads.
+        # Every peer fetch that did not yield bytes, under the reason it did not — see
+        # PeerShedReason. This is the only POSITIVE signal the peer tier has: without it a tier
+        # that has failed wholesale reads on a dashboard exactly like a tier nobody is using.
+        self.peer_fetch_shed = self.meter.create_counter(
+            name="peer_fetch_shed_total",
+            description="Peer chunk fetches that yielded no bytes, by reason (see PeerShedReason)",
+            unit="1",
+        )
+
+        self.chunk_reads_by_tier = self.meter.create_counter(
+            name="chunk_reads_by_tier_total",
+            description="Chunk reads served, by storage tier (local|peer|pool)",
+            unit="1",
+        )
+
+        # Chunks served but deliberately NOT copied onto local flash. This is the promotion
+        # backpressure made visible: `disk_pressure` must start rising BEFORE fs_cache_shed does,
+        # because promotion yielding is what keeps the disk from reaching the PUT-refusal
+        # threshold. Flat at zero while free space falls means the gate is not engaging.
+        # `residency_failed` says promotion is off because the residency DB is unreachable —
+        # sustained, it means the read tier has stopped warming and only this counter says so.
+        self.promotion_skipped = self.meter.create_counter(
+            name="promotion_skipped_total",
+            description="Chunks not promoted to the local read tier, by reason (disk_pressure|residency_failed)",
+            unit="1",
+        )
+
+        # A residency claim that could not be given back after its disk write failed. Each one
+        # leaves phantom bytes in cephor_ssd_residency (the claim ACCUMULATES on conflict), so a
+        # sustained rate means node_cache_bytes is inflating and the allocator is steering on a
+        # figure the disk does not hold. Reaching this at all takes a DB fault inside the same
+        # promotion whose claim just succeeded, so it should be near zero.
+        self.residency_release_failures = self.meter.create_counter(
+            name="residency_release_failures_total",
+            description="Residency claims left in place because the compensating decrement failed",
+            unit="1",
+        )
+
+        # A landed-part announcement the api could not hand to redis-queues. This MUST be
+        # alertable rather than a log line, because the announcement is the only trigger for the
+        # B-2 divergence check: the reconciler tallies an already-`replicated` part as an orphan
+        # and deliberately does not content-check it, so a lost announcement for a RE-uploaded
+        # part means the pool keeps the previous attempt's ciphertext and serves it under the new
+        # ETag, decrypting cleanly, permanently. `drain_landed_dropped_total` on the agent counts
+        # only messages it could not PARSE, so it cannot see a message that never arrived.
+        # `outcome` is a Literal, so cardinality is bounded.
+        self.landed_announce_failures = self.meter.create_counter(
+            name="landed_announce_failures_total",
+            description="Landed-part announcements the api failed to enqueue, by outcome",
+            unit="1",
+        )
+
+        # Gate decisions taken on the drain agent's published floor rather than the configured
+        # one. `stricter` rising means the allocator has raised this node's eviction reserve —
+        # the read tier is deliberately backing off a stressed disk, and that must be visible
+        # rather than looking like promotion silently stopped working.
+        self.promote_floor_divergence = self.meter.create_counter(
+            name="promote_floor_divergence_total",
+            description="Promotion gate decisions using a published floor that differs from the configured one (stricter|looser)",
+            unit="1",
+        )
+
+        # Read-recency stamps actually written to cephor_ssd_residency. This is a DB UPDATE on
+        # the read path, sampled to at most one per part per window — so the rate is bounded by
+        # DISTINCT parts read per window, not by read throughput. That bound is weakest for the
+        # workload the read tier exists for: a full-shard scan (a training epoch) touches far
+        # more distinct parts than the sampler's memo holds, so the memo stops absorbing and
+        # every part read becomes one write. Counting it is what tells us whether that is
+        # happening before Postgres does.
+        self.read_recency_writes = self.meter.create_counter(
+            name="read_recency_writes_total",
+            description="last_read_at stamps written to cephor_ssd_residency, by outcome (written|failed)",
+            unit="1",
+        )
+
+        # Chunks whose stored ciphertext failed to authenticate. Every one is either bad bytes in
+        # a cache or a key fault, and before this counter existed both were invisible — the only
+        # handling was a 500 mapped by class name at the edge. The tier is what makes a poisoner
+        # actionable: `local` failures are a copy this node holds and just dropped, so a sustained
+        # rate names the node being poisoned rather than the object being broken.
+        self.chunk_aead_failures = self.meter.create_counter(
+            name="chunk_aead_failures_total",
+            description="Chunk decrypts that failed authentication, by tier (local|remote) and "
+            "outcome (recovered|unrecovered)",
+            unit="1",
         )
 
         self.uploader_requests_total = self.meter.create_counter(
@@ -498,6 +647,42 @@ class MetricsCollector:
         else:
             self.cache_misses.add(1, attributes=attributes)
 
+    def record_peer_fetch_shed(self, reason: PeerShedReason) -> None:
+        """Count a declined peer fetch. `reason` is a Literal, so the label stays bounded."""
+        self.peer_fetch_shed.add(1, attributes={"reason": reason})
+
+    def record_promotion_skipped(self, reason: PromotionSkipReason) -> None:
+        """Count a chunk served without being promoted. `reason` is a Literal, so bounded."""
+        self.promotion_skipped.add(1, attributes={"reason": reason})
+
+    def record_promote_floor_divergence(self, direction: PromoteFloorDivergence) -> None:
+        """Count a gate decision on a published floor unequal to the configured one."""
+        self.promote_floor_divergence.add(1, attributes={"direction": direction})
+
+    def record_residency_release_failure(self) -> None:
+        """Count a claim whose compensating decrement failed, leaving phantom bytes accounted."""
+        self.residency_release_failures.add(1)
+
+    def record_landed_announce_failure(self, outcome: LandedAnnounceOutcome) -> None:
+        """Count one announcement that did not reach the queue. `outcome` is a Literal."""
+        self.landed_announce_failures.add(1, attributes={"outcome": outcome})
+
+    def record_read_recency_write(self, outcome: ReadRecencyOutcome) -> None:
+        """Count one `last_read_at` stamp attempt. `outcome` is a Literal, so bounded."""
+        self.read_recency_writes.add(1, attributes={"outcome": outcome})
+
+    def record_aead_failure(self, tier: AeadFailureTier, outcome: AeadFailureOutcome) -> None:
+        """Count one chunk that failed to authenticate. Both labels are Literals, so bounded."""
+        self.chunk_aead_failures.add(1, attributes={"tier": tier, "outcome": outcome})
+
+    def record_chunk_read_tier(self, tier: ChunkReadTier) -> None:
+        """Count one chunk read against the tier that served it.
+
+        The `Literal` is what keeps this label bounded: three values fixed in code, so it
+        cannot become a cardinality problem the way a caller-supplied string would.
+        """
+        self.chunk_reads_by_tier.add(1, attributes={"tier": tier})
+
     def record_uploader_operation(
         self,
         success: bool,
@@ -625,18 +810,6 @@ class MetricsCollector:
         else:
             self.seed_auth_cache_misses.add(1)
 
-    def record_gateway_bandwidth(
-        self,
-        bytes_received: int,
-        bytes_sent: int,
-        method: str,
-        status_code: int,
-    ) -> None:
-        if bytes_received > 0:
-            self.gateway_bytes_received.add(bytes_received, {"method": method})
-        if bytes_sent > 0:
-            self.gateway_bytes_sent.add(bytes_sent, {"method": method, "status_code": str(status_code)})
-
     def record_backup_operation(
         self,
         database_name: str,
@@ -761,6 +934,30 @@ class NullMetricsCollector:
     def record_fs_cache_shed(self, *args: object, **kwargs: object) -> None:
         pass
 
+    def record_chunk_read_tier(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_aead_failure(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_peer_fetch_shed(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_promotion_skipped(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_promote_floor_divergence(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_residency_release_failure(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_landed_announce_failure(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_read_recency_write(self, *args: object, **kwargs: object) -> None:
+        pass
+
     def record_cache_operation(self, *args: object, **kwargs: object) -> None:
         pass
 
@@ -780,9 +977,6 @@ class NullMetricsCollector:
         pass
 
     def record_seed_auth_cache(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_gateway_bandwidth(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_backup_operation(self, *args: object, **kwargs: object) -> None:

@@ -669,6 +669,7 @@ dependencies = [
  "redis",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "thiserror",
  "tokio",

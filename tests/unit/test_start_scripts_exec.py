@@ -29,7 +29,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 START_SCRIPTS = [
     REPO_ROOT / "start-api.sh",
-    REPO_ROOT / "gateway" / "start-gateway.sh",
 ]
 
 

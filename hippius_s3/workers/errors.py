@@ -229,7 +229,7 @@ _TRANSIENT_KEYWORDS = (
     "part_meta_not_ready",
     "part_row_missing",
     # Defense-in-depth for the meta-write/race-window error shape — the
-    # consumer (arion-uploader, s3-backup) now polls meta within a bounded
+    # consumer (arion-uploader and the other queue consumers) now polls meta within a bounded
     # deadline before raising, so this string should not appear in practice.
     # Kept here so any stray race-window raise still classifies as transient.
     "missing meta in filesystem cache for",
@@ -259,7 +259,7 @@ _PERMANENT_KEYWORDS = (
     "invalid token",
     "expired token",
     # Source bytes are genuinely gone — the data is unrecoverable. These two
-    # cover (a) the after-deadline raise from arion-uploader / s3-backup once
+    # cover (a) the after-deadline raise from a queue consumer once
     # the meta-poll deadline expires (writer crashed or chunks evicted) and
     # (b) the operator misconfig case where the cache root is unmounted. The
     # transient race-window form ("missing meta in filesystem cache for ...")
@@ -411,8 +411,8 @@ classify_error = classify_upload_error
 def is_retryable(error: Exception, attempts: int, max_attempts: int) -> bool:
     """Whether an upload payload with `attempts` prior attempts should be requeued.
 
-    Mirrors the s3-backup contract so the two repos share the same calling
-    convention even though they live in separate codebases.
+    External consumers mirror this contract, so the same calling convention holds
+    across codebases; keep them in step.
     """
     return classify_upload_error(error) == "transient" and (attempts + 1) < max_attempts
 

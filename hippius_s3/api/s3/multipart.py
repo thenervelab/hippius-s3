@@ -232,7 +232,7 @@ async def list_parts_internal(
         return s3_error_response("InvalidRequest", "Object key does not match upload", status_code=400)
 
     _ = await db.fetchrow(
-        get_query("get_or_create_user_by_main_account"), request.state.account.main_account, datetime.now(timezone.utc)
+        get_query("get_or_create_user_by_main_account"), request.state.main_account_id, datetime.now(timezone.utc)
     )
     bucket = await db.fetchrow(get_query("get_bucket_by_name"), bucket_name)
     if not bucket or bucket["bucket_id"] != mpu["bucket_id"]:
@@ -342,7 +342,7 @@ async def initiate_multipart_upload(
         # Get user for user-scoped bucket lookup
         _ = await db.fetchrow(
             get_query("get_or_create_user_by_main_account"),
-            request.state.account.main_account,
+            request.state.main_account_id,
             datetime.now(timezone.utc),
         )
 
@@ -578,10 +578,17 @@ async def upload_part(
         # Resolve source object and fetch bytes from IPFS (require CID available)
         _ = await pool.fetchrow(
             get_query("get_or_create_user_by_main_account"),
-            request.state.account.main_account,
+            request.state.main_account_id,
             datetime.now(timezone.utc),
         )
-        source_bucket = await pool.fetchrow(get_query("get_bucket_by_name"), source_bucket_name)
+        # Owner-scoped, matching CopyObject (copy_helpers.resolve_copy_resources). A name-only
+        # lookup here resolved a source bucket belonging to ANY account, and the ACL layer only
+        # ever authorised the destination — so the pair amounted to a cross-tenant read.
+        source_bucket = await pool.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            source_bucket_name,
+            request.state.main_account_id,
+        )
         if not source_bucket:
             return s3_error_response("NoSuchBucket", f"Bucket {source_bucket_name} does not exist", status_code=404)
 
@@ -662,8 +669,8 @@ async def upload_part(
                 object_storage_version=int(source_obj.get("storage_version") or 0),
                 object_key=source_object_key,
                 bucket_name=source_bucket_name,
-                address=request.state.account.main_account,
-                subaccount=request.state.account.main_account,
+                address=request.state.main_account_id,
+                subaccount=request.state.main_account_id,
                 substrate_url=config.substrate_url,
                 size=int(source_obj.get("size_bytes") or 0),
                 multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
@@ -707,7 +714,7 @@ async def upload_part(
             from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
 
             key_bytes = await get_or_create_encryption_key_bytes(
-                main_account_id=request.state.account.main_account,
+                main_account_id=request.state.main_account_id,
                 bucket_name=source_bucket_name,
             )
         chunks_iter = stream_plan(
@@ -720,7 +727,7 @@ async def upload_part(
             suite_id=suite_id,
             bucket_id=bucket_id,
             upload_id="",
-            address=request.state.account.main_account,
+            address=request.state.main_account_id,
             bucket_name=source_bucket_name,
         )
         body_iter: AsyncIterator[bytes] = chunks_iter
@@ -751,7 +758,7 @@ async def upload_part(
                 object_version=int(current_object_version),
                 bucket_name=str(dest_bucket_name or ""),
                 bucket_id=str(dest_bucket_id),
-                account_address=request.state.account.main_account,
+                account_address=request.state.main_account_id,
                 part_number=int(part_number),
                 body_iter=body_iter,
             )
@@ -947,10 +954,11 @@ async def abort_multipart_upload(
                 upload_id,
             )
 
-        # B5: drop the empty reserved object_versions row this aborted upload left behind and
-        # repoint current_object_version off it. Reads already fall back to the latest completed
-        # version, so this is DB hygiene (no data loss) — best-effort so a hiccup never fails the
-        # abort. Skipped when the upload had no version of its own.
+        # B5: repoint current_object_version off the empty reserved row this aborted upload left
+        # behind. The row itself is RETAINED — deleting it let MAX(object_version) drop, so the
+        # next upload was handed this same number and its parts landed on this attempt's terminal
+        # 'failed' drain rows (see abort_cleanup_orphan_version.sql). Best-effort so a hiccup never
+        # fails the abort. Skipped when the upload had no version of its own.
         if object_version is not None:
             with contextlib.suppress(Exception):
                 await db.fetchrow(
@@ -994,7 +1002,7 @@ async def list_multipart_uploads(
         # Get user for user-scoped bucket lookup
         _ = await db.fetchrow(
             get_query("get_or_create_user_by_main_account"),
-            request.state.account.main_account,
+            request.state.main_account_id,
             datetime.now(timezone.utc),
         )
 
@@ -1258,7 +1266,7 @@ async def complete_multipart_upload(
             object_key=object_key,
             upload_id=str(upload_id),
             object_version=int(object_version),
-            address=request.state.account.main_account,
+            address=request.state.main_account_id,
             # B1: the client's <Part> selection — the final object (bytes + ETag + size) reflects
             # only these; a strict subset is recorded so the reader excludes the unlisted parts.
             selected_parts=[pn for pn, _ in part_info],
@@ -1275,7 +1283,7 @@ async def complete_multipart_upload(
             request.app.state.postgres_pool,
             object_id=str(object_id),
             object_version=int(object_version),
-            address=request.state.account.main_account,
+            address=request.state.main_account_id,
         )
 
         # Drain wake: the address write above removes the cause of this version's defer

@@ -20,6 +20,9 @@ from hippius_s3.dependencies import get_redis
 from hippius_s3.utils import get_query
 
 
+BLAKE3_HEX = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+
+
 def _make_row(
     object_id: str,
     object_key: str,
@@ -30,6 +33,7 @@ def _make_row(
     content_type: str = "application/octet-stream",
     md5_hash: str = "deadbeef",
     ipfs_cid: str | None = "Qm...",
+    body_blake3: str | None = None,
 ) -> dict[str, Any]:
     return {
         "object_id": UUID(object_id),
@@ -40,6 +44,7 @@ def _make_row(
         "content_type": content_type,
         "md5_hash": md5_hash,
         "ipfs_cid": ipfs_cid,
+        "body_blake3": body_blake3,
         "uploaded_at": uploaded_at,
     }
 
@@ -84,6 +89,7 @@ async def test_cache_hit_skips_db(app: FastAPI, mocks: tuple[MagicMock, MagicMoc
                 "content_type": "text/plain",
                 "md5_hash": "abc",
                 "ipfs_cid": None,
+                "body_blake3": None,
                 "uploaded_at": "2026-04-27T12:00:00+00:00",
             }
         ],
@@ -111,6 +117,7 @@ async def test_cache_miss_queries_db_and_populates_cache(app: FastAPI, mocks: tu
             "00000000-0000-0000-0000-0000000000aa",
             "alpha",
             datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
+            body_blake3=BLAKE3_HEX,
         ),
         _make_row(
             "00000000-0000-0000-0000-000000000002",
@@ -140,9 +147,11 @@ async def test_cache_miss_queries_db_and_populates_cache(app: FastAPI, mocks: tu
     assert first["bucket_name"] == "alpha"
     assert first["uploaded_at"] == "2026-04-27T12:00:00+00:00"
     assert first["ipfs_cid"] == "Qm..."
+    assert first["body_blake3"] == BLAKE3_HEX, "the live digest is what the console should read"
 
     second = body["uploads"][1]
     assert second["ipfs_cid"] is None
+    assert second["body_blake3"] is None
 
     mock_db.fetch.assert_awaited_once()
     args = mock_db.fetch.await_args.args

@@ -40,12 +40,22 @@ BOUNDED_LABELS = {
     # Cachet component status, mapped through _STATUS_LABELS from {1, 3, 4} with an
     # "unknown" fallback — four values, fixed in code.
     "status",
-    # FS-cache shed attribution. `reason` is returned by should_reject_fs_cache_write as one of
-    # "threshold" | "pool" ("ok" never reaches the counter — it is the not-rejected case), and
-    # `pressure_mode` is the janitor's published signal stringified: "0" | "1" | "2" | "None".
-    # Both are closed sets fixed in code, not caller- or object-derived.
+    # FS-cache shed attribution, peer-fetch shed attribution, and promotion-skip attribution.
+    # `reason` is returned by should_reject_fs_cache_write as one of "threshold" | "pool" ("ok"
+    # never reaches the counter — it is the not-rejected case), or is one of the PeerShedReason
+    # / PromotionSkipReason Literals. Enumerating their members here would only drift as
+    # reasons are added; what matters is that each is a Literal fixed in code, never
+    # caller-derived. And `pressure_mode` is the janitor's published signal stringified:
+    # "0" | "1" | "2" | "None". All closed sets, not caller- or object-derived.
     "reason",
     "pressure_mode",
+    # Which storage tier served a chunk read: "local" | "peer" | "pool", typed as a Literal
+    # on record_chunk_read_tier and passed only from the three fixed call sites in
+    # DualFileSystemPartsStore.get_chunk. Closed in code, never object- or caller-derived.
+    "tier",
+    # Outcome of a read-recency stamp: "written" | "failed", typed as the ReadRecencyOutcome
+    # Literal and passed from exactly two call sites in ReadRecencyRecorder. Closed in code.
+    "outcome",
     # Purge job outcome: "done" | "failed", fixed in record_purger_job.
     "result",
 }

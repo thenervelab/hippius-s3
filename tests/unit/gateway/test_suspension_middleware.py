@@ -13,12 +13,12 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.suspension import suspension_middleware
-from gateway.services.suspension import MODE_FULL
-from gateway.services.suspension import MODE_READ_ONLY
-from gateway.services.suspension import get_account_suspension
-from gateway.services.suspension import suspension_blocks
-from gateway.services.suspension import suspension_cache_key
+from hippius_s3.gateway.middlewares.suspension import suspension_middleware
+from hippius_s3.gateway.services.suspension import MODE_FULL
+from hippius_s3.gateway.services.suspension import MODE_READ_ONLY
+from hippius_s3.gateway.services.suspension import get_account_suspension
+from hippius_s3.gateway.services.suspension import suspension_blocks
+from hippius_s3.gateway.services.suspension import suspension_cache_key
 
 
 ACCOUNT = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"

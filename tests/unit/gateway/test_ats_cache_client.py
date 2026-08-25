@@ -5,16 +5,16 @@ import asyncio
 import httpx
 import pytest
 
-from gateway import config as gateway_config
-from gateway.services import ats_cache_client
+from hippius_s3 import config as gateway_config
+from hippius_s3.gateway.services import ats_cache_client
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
 def _reset_state() -> None:
-    gateway_config._config = None
+    gateway_config.reset_config()
     ats_cache_client._client = None
     yield
-    gateway_config._config = None
+    gateway_config.reset_config()
     ats_cache_client._client = None
 
 

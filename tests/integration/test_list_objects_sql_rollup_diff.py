@@ -46,8 +46,25 @@ CREATE TABLE objects(
 );
 CREATE TABLE object_versions(
     object_id uuid, object_version bigint, size_bytes bigint, md5_hash text,
-    content_type text DEFAULT 'application/octet-stream', multipart bool DEFAULT false, status text DEFAULT 'published'
+    content_type text DEFAULT 'application/octet-stream', multipart bool DEFAULT false, status text DEFAULT 'published',
+    body_blake3 text
 );
+CREATE TABLE object_names(
+    bucket_id uuid NOT NULL, object_key text NOT NULL, object_id uuid NOT NULL,
+    created_at timestamptz DEFAULT now(),
+    PRIMARY KEY (bucket_id, object_key)
+);
+CREATE FUNCTION resolve_object_id(p_bucket_id uuid, p_object_key text) RETURNS uuid
+LANGUAGE sql STABLE AS $$
+    SELECT object_id FROM (
+        SELECT o.object_id, 0 AS pri FROM objects o
+        WHERE o.bucket_id = p_bucket_id AND o.object_key = p_object_key AND o.deleted_at IS NULL
+        UNION ALL
+        SELECT n.object_id, 1 AS pri FROM object_names n
+        JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
+        WHERE n.bucket_id = p_bucket_id AND n.object_key = p_object_key
+    ) hits ORDER BY pri LIMIT 1
+$$;
 CREATE INDEX idx_obj_bucket_key ON objects(bucket_id, object_key);
 """
 
@@ -91,7 +108,7 @@ def _normalize(items: list[tuple[str, Any]]) -> list[tuple[str, str]]:
 
 async def _crawl(
     collect: Callable[..., Any],
-    conn: asyncpg.Connection,
+    pool: asyncpg.Pool,
     bucket_id: uuid.UUID,
     *,
     prefix: str | None,
@@ -105,7 +122,7 @@ async def _crawl(
     cp_floor: str | None = start_after
     for _ in range(60):  # generous page cap; the keyspace is tiny
         items, truncated, next_cursor = await collect(
-            conn, bucket_id,
+            pool, bucket_id,
             prefix=prefix, delimiter=delimiter, cursor=cursor, target=max_keys, cp_floor=cp_floor,
         )
         pages.append((_normalize(items), truncated, next_cursor))
@@ -120,17 +137,20 @@ async def _crawl(
 async def test_sql_rollup_matches_python_across_params() -> None:
     dsn, name = await _provision_c_collation_db()
     try:
-        conn = await asyncpg.connect(dsn=dsn)
+        # Both collectors take a pool, not a connection: since LS-45 they hold one pooled
+        # connection for the whole skip-scan and call pool.acquire() themselves.
+        pool = await asyncpg.create_pool(dsn=dsn)
+        assert pool is not None
         try:
-            await conn.execute(_SCHEMA)
+            await pool.execute(_SCHEMA)
             bucket_id = uuid.uuid4()
             for key in _KEYS:
                 oid = uuid.uuid4()
-                await conn.execute(
+                await pool.execute(
                     "INSERT INTO objects(object_id, bucket_id, object_key, current_object_version) VALUES($1,$2,$3,1)",
                     oid, bucket_id, key,
                 )
-                await conn.execute(
+                await pool.execute(
                     "INSERT INTO object_versions(object_id, object_version, size_bytes, md5_hash) VALUES($1,1,$2,$3)",
                     oid, len(key), uuid.uuid4().hex,
                 )
@@ -141,11 +161,11 @@ async def test_sql_rollup_matches_python_across_params() -> None:
                     for max_keys in _MAX_KEYS:
                         for start_after in _START_AFTER:
                             py = await _crawl(
-                                _collect_page, conn, bucket_id,
+                                _collect_page, pool, bucket_id,
                                 prefix=prefix, delimiter=delimiter, max_keys=max_keys, start_after=start_after,
                             )
                             sql = await _crawl(
-                                _collect_page_sql, conn, bucket_id,
+                                _collect_page_sql, pool, bucket_id,
                                 prefix=prefix, delimiter=delimiter, max_keys=max_keys, start_after=start_after,
                             )
                             assert sql == py, (
@@ -155,6 +175,6 @@ async def test_sql_rollup_matches_python_across_params() -> None:
                             combos += 1
             assert combos == len(_PREFIXES) * len(_DELIMITERS) * len(_MAX_KEYS) * len(_START_AFTER)
         finally:
-            await conn.close()
+            await pool.close()
     finally:
         await _drop_db(name)

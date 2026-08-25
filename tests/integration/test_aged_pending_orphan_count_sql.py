@@ -50,11 +50,14 @@ async def conn() -> AsyncGenerator[asyncpg.Connection, None]:
         ) ON COMMIT PRESERVE ROWS;
 
         CREATE TEMP TABLE cephor_replication_status (
-            object_id   text        NOT NULL,
-            version     bigint      NOT NULL,
-            part_number bigint      NOT NULL,
-            status      text        NOT NULL,
-            landed_at   timestamptz NOT NULL DEFAULT now(),
+            object_id         text        NOT NULL,
+            version           bigint      NOT NULL,
+            part_number       bigint      NOT NULL,
+            status            text        NOT NULL,
+            landed_at         timestamptz NOT NULL DEFAULT now(),
+            -- Mirrors drain migration 0012; count_aged_pending_orphans reads it, so a mirror
+            -- without it makes every case here fail on an undefined column.
+            upload_enqueued_at timestamptz,
             PRIMARY KEY (object_id, version, part_number)
         ) ON COMMIT PRESERVE ROWS;
         """
@@ -93,17 +96,22 @@ async def _seed_status(
     *,
     status: str,
     landed_age_seconds: int = 7200,
+    upload_enqueued: bool = False,
 ) -> None:
     # landed_age defaults to 2h (stale vs _STALE=3600) so the common case counts; pass a
     # small value to model a freshly-landed part that should spare its version.
+    # upload_enqueued only matters for status='replicated': set means the backend upload was
+    # published, which is what makes such a part legitimately done rather than a Tier-2 orphan.
     await conn.execute(
-        "INSERT INTO cephor_replication_status (object_id, version, part_number, status, landed_at) "
-        "VALUES ($1, $2, $3, $4, now() - make_interval(secs => $5))",
+        "INSERT INTO cephor_replication_status "
+        "(object_id, version, part_number, status, landed_at, upload_enqueued_at) "
+        "VALUES ($1, $2, $3, $4, now() - make_interval(secs => $5), CASE WHEN $6 THEN now() END)",
         object_id,
         version,
         part_number,
         status,
         landed_age_seconds,
+        upload_enqueued,
     )
 
 
@@ -164,13 +172,31 @@ async def test_multiple_parts_of_one_version_count_once(conn):
 # =========================================================== NOT counted
 
 
-@pytest.mark.parametrize("status", ["replicated", "failed"])
-async def test_terminal_status_is_not_counted(conn, status):
-    # Terminal versions are not the leak: 'replicated' is done, 'failed' is already terminal.
+@pytest.mark.parametrize(
+    ("status", "upload_enqueued"),
+    [
+        # 'failed' is already terminal.
+        ("failed", False),
+        # A 'replicated' part is only done once its backend upload was ENQUEUED: that proves
+        # the address existed, so the object completed.
+        ("replicated", True),
+    ],
+)
+async def test_terminal_status_is_not_counted(conn, status, upload_enqueued):
     oid = _oid()
     await _seed_version(conn, oid, 1, address=None, size_bytes=0, md5_hash="")
-    await _seed_status(conn, oid, 1, 1, status=status)
+    await _seed_status(conn, oid, 1, 1, status=status, upload_enqueued=upload_enqueued)
     assert await _count(conn) == 0
+
+
+async def test_replicated_but_unenqueued_is_counted(conn):
+    # The Tier-2 decoupled-commit orphan the gauge must see: committed 'replicated' before its
+    # object's address was written, then abandoned, so the enqueue sweep can never publish its
+    # backend upload and the janitor's replication gate pins the pool copy forever.
+    oid = _oid()
+    await _seed_version(conn, oid, 1, address=None, size_bytes=0, md5_hash="")
+    await _seed_status(conn, oid, 1, 1, status="replicated", upload_enqueued=False)
+    assert await _count(conn) == 1
 
 
 @pytest.mark.parametrize(
@@ -280,7 +306,7 @@ async def test_mixed_population_counts_only_the_leak(conn):
     await _seed_version(conn, fresh, 1, address=None, size_bytes=0, md5_hash="")
     await _seed_status(conn, fresh, 1, 1, status="pending", landed_age_seconds=1)
     await _seed_version(conn, terminal, 1, address=None, size_bytes=0, md5_hash="")
-    await _seed_status(conn, terminal, 1, 1, status="replicated")
+    await _seed_status(conn, terminal, 1, 1, status="replicated", upload_enqueued=True)
     await _seed_status(conn, deleted, 1, 1, status="pending")  # no object_versions row
 
     assert await _count(conn) == 2

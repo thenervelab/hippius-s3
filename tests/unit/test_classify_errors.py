@@ -531,8 +531,8 @@ def test_real_world_error_messages(real_message: str, expected: str) -> None:
 @pytest.mark.parametrize(
     "msg, expected",
     [
-        # Pre-deadline race-window message — defense-in-depth: arion-uploader /
-        # s3-backup now polls and only raises after the deadline, but if this
+        # Pre-deadline race-window message — defense-in-depth: the queue consumers
+        # now poll and only raise after the deadline, but if this
         # string is ever raised it MUST classify as transient and retry.
         (
             "Missing meta in filesystem cache for backup: object_id=abc-123 version=1 part=1",

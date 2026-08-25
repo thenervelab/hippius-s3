@@ -3,14 +3,27 @@ kind: Service
 metadata:
   name: gateway-nodeport
   labels:
-    app: gateway
+    app: api-local
 spec:
   type: NodePort
+  # Site-pinning (s3-speed-tests.md §4.1): a request entering a node's NodePort is served
+  # by THAT node's api pod — no second kube-proxy DNAT to a random (often cross-site,
+  # ~10 ms away) pod. Also restores real client IPs in the audit log.
+  #
+  # SEMANTICS, not a preference: on a node with no ready local pod (rolling update with
+  # maxUnavailable:1, node without the ingest label), kube-proxy DROPS NodePort traffic.
+  # The edge (HAProxy/ATS) must therefore only target ingest nodes that carry api-local
+  # pods, with health checks on this nodePort. NOTE: type=NodePort gets NO
+  # healthCheckNodePort (that is LoadBalancer-only) — the edge checks the data port
+  # itself; a drop fails the check by timeout.
+  externalTrafficPolicy: Local
   selector:
-    app: gateway
+    app: api-local
+    # Only merged-image pods carry this label — see the DaemonSet template comment.
+    hippius.io/edge: "true"
   ports:
     - port: 8080
-      targetPort: 8080
+      targetPort: 8000
       protocol: TCP
       name: http
       nodePort: 30081

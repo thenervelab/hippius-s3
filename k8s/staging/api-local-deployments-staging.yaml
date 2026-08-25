@@ -53,7 +53,30 @@ spec:
     metadata:
       labels:
         app: api-local
+        # Rollout-safety latch for the gateway/api merge: the public-facing Services
+        # (gateway-nodeport, gateway alias) select on this label IN ADDITION to
+        # app: api-local, so pods from the pre-merge image — which perform no
+        # authentication of their own — can never receive public traffic while the
+        # DaemonSet is still rolling. Inert once the fleet is on the merged image.
+        hippius.io/edge: "true"
     spec:
+      # STAGING TRIAL (2026-08-20): run on the node's network stack instead of the
+      # calico/VXLAN pod network. Measured on these nodes: the overlay delivers
+      # ~1450-byte packets into the pod with no GRO coalescing, capping ANY app
+      # (nc, bare asyncio, uvicorn alike) at ~150-176 MB/s per connection, while
+      # the same receiver on the host network does 463+ MB/s (physical-NIC GRO
+      # hands the loop ~64KB segments). hostNetwork removes veth+vxlan from every
+      # ingested byte. NodePort 30080 semantics are unchanged (endpoints become
+      # nodeIP:8000; externalTrafficPolicy: Local holds trivially).
+      # Trade-off, signed off in PR: calico NetworkPolicies do not apply to
+      # hostNetwork pods. Acceptable here: every route does in-process auth since
+      # the gateway/api merge (#420), and UVICORN_HOST below binds the internal
+      # address only instead of 0.0.0.0.
+      hostNetwork: true
+      # Mandatory with hostNetwork: keep CLUSTER DNS, otherwise the pod inherits
+      # the node's resolv.conf and every in-cluster service name (postgres-rw,
+      # redis-*) stops resolving.
+      dnsPolicy: ClusterFirstWithHostNet
       # 10s preStop + up to 25s uvicorn drain, with headroom before the kubelet SIGKILLs.
       terminationGracePeriodSeconds: 45
       nodeSelector:
@@ -105,6 +128,63 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            # Which node this pod runs on. A promoted chunk is claimed for this node in
+            # cephor_ssd_residency so the drain-agent evictor on the SAME node can reclaim
+            # it; without an identity there is no recorder and promotion stays off.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # With hostNetwork, status.podIP IS the node's vRack address, so peers
+            # register and address each other by node IP. The registry's pod-network
+            # allow-list is extended for exactly this shape by the flag below — sound
+            # because one api owns :8000 per node (no SNAT ambiguity) and peer requests
+            # still authenticate via the shared-secret header.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HIPPIUS_PEER_ALLOW_NODE_NETWORK
+              value: "true"
+            # Bind the node's internal address only, never 0.0.0.0: NodePort DNAT,
+            # kubelet probes, and peer fetches all target this same hostIP, so
+            # nothing else is needed.
+            - name: UVICORN_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            # Read a chunk from the peer node holding it on flash (~6 ms + ~1 ms network)
+            # before falling through to the CephFS pool (~40 ms). Staging only.
+            - name: HIPPIUS_PEER_FETCH_ENABLED
+              value: "true"
+            # The other half of the tier: without this the route is not mounted, every peer
+            # fetch 404s, and the tier is dark while FETCH_ENABLED above still says it is on.
+            # It is a separate flag on purpose (see config.py) — fetch governs what this pod
+            # reads, serve what it hands out — so enabling one does not enable the other.
+            # Mounting is gated on this AND a non-empty HIPPIUS_INTERNAL_PEER_SECRET, which
+            # arrives from the hippius-s3-secrets envFrom above.
+            - name: HIPPIUS_PEER_SERVE_ENABLED
+              value: "true"
+            # Warm this node's flash from whatever it had to read remotely, so a repeat read
+            # is local. Requires NODE_NAME (above) to claim residency for the evictor.
+            - name: HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ
+              value: "true"
+            # Per-peer fanout caps. A part that is hot and resident on ONE node otherwise
+            # draws every other node's fetches onto that node's api pod — the same uvicorn
+            # serving its own ingest. The client cap bounds what one pod sends; the serve cap
+            # sheds with 503 so five pods each within their own cap still cannot crowd out
+            # that node's PUTs.
+            #
+            # The client cap must be >= HTTP_STREAM_PREFETCH_CHUNKS (16). Every chunk of one
+            # PART resolves to the same peer, so at the previous value of 8 a single reader
+            # shed half its own prefetch window to CephFS while the peer sat idle — and booked
+            # it as `client_cap`, which reads as contention on the dashboard. The api floors
+            # this at the prefetch depth anyway (effective_max_inflight); set correctly here
+            # so the manifest states the intent rather than relying on the correction.
+            - name: HIPPIUS_PEER_FETCH_MAX_INFLIGHT
+              value: "16"
+            - name: HIPPIUS_PEER_SERVE_MAX_INFLIGHT
+              value: "16"
             - name: K8S_NAMESPACE
               valueFrom:
                 fieldRef:

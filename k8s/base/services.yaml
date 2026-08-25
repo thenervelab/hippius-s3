@@ -5,21 +5,30 @@ metadata:
 spec:
   selector:
     app: api
+  # Site-pinning: prefer the api pod on the CALLER's node, falling back gracefully to any
+  # healthy pod (beta, default-on in our v1.34 — KEP-3015). Deliberately NOT
+  # internalTrafficPolicy: Local, which has no fallback and blackholes one node at a time
+  # on every DaemonSet roll (maxUnavailable: 1).
+  trafficDistribution: PreferSameNode
   ports:
     - port: 8000
       targetPort: 8000
       name: http
 ---
+# The gateway service survives the gateway/api merge as an alias: in-cluster
+# clients and the ingress keep resolving gateway:8080, served by the merged api.
 apiVersion: v1
 kind: Service
 metadata:
   name: gateway
 spec:
   selector:
-    app: gateway
+    app: api
+  # Same node-local preference as the api Service above (this is its alias).
+  trafficDistribution: PreferSameNode
   ports:
     - port: 8080
-      targetPort: 8080
+      targetPort: 8000
       name: http
 ---
 apiVersion: v1

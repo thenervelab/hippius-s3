@@ -364,7 +364,7 @@ def _is_uuid_name(name: str) -> bool:
 def _safe_iterdir(path: Path) -> Iterator[Path]:
     """Lazily list a directory, tolerating concurrent removal.
 
-    The cleanup workers delete (and prune empty parent) directories while the
+    Concurrent reclaim passes delete (and prune empty parent) directories while the
     producer is still walking the tree, so a vanished dir/entry is expected.
     Stays lazy — the cache root can hold millions of object dirs, so we must not
     materialize it — and swallows the OSError rather than aborting the walk.
@@ -2245,7 +2245,7 @@ async def run_janitor_loop():
         queue_sampler_task = asyncio.create_task(queue_sampler.run())
 
         # Publish the shared pressure signal (fs_cache:pressure on the CACHE
-        # Redis — where the api middleware and the s3-backup hydrator read it).
+        # Redis — where the api middleware and external bulk writers read it).
         # Sampled every 30s rather than once per cycle: a mass writer can move
         # the pool percent materially inside one ~20min cycle. The janitor's own
         # per-cycle _pressure_mode stays authoritative for eviction pacing; both

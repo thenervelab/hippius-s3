@@ -63,7 +63,7 @@ jobs:
     needs: build-base
     strategy:
       matrix:
-        service: [api, gateway, workers]
+        service: [api, workers]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -92,8 +92,6 @@ jobs:
         run: |
           if [ "${{ matrix.service }}" = "api" ]; then
             echo "dockerfile=./Dockerfile" >> $GITHUB_OUTPUT
-          elif [ "${{ matrix.service }}" = "gateway" ]; then
-            echo "dockerfile=./gateway/Dockerfile" >> $GITHUB_OUTPUT
           elif [ "${{ matrix.service }}" = "workers" ]; then
             echo "dockerfile=./workers/Dockerfile" >> $GITHUB_OUTPUT
           fi
@@ -292,7 +290,6 @@ jobs:
           cd k8s/staging
           kustomize edit set image \
             ghcr.io/thenervelab/hippius-s3/api:${SHORT_SHA} \
-            ghcr.io/thenervelab/hippius-s3/gateway:${SHORT_SHA} \
             ghcr.io/thenervelab/hippius-s3/workers:${SHORT_SHA} \
             ghcr.io/thenervelab/hippius-s3/drain:${SHORT_SHA}
 
@@ -361,7 +358,6 @@ jobs:
 
       - name: Wait for rollout
         run: |
-          kubectl rollout status deployment/gateway -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/api -n hippius-s3-staging --timeout=10m
           # api-local is a DaemonSet (one pod per ingest node). Wait on it, then prune the
           # pre-DaemonSet Deployment of the same name: kustomize can't change a resource's kind
@@ -372,6 +368,19 @@ jobs:
             kubectl rollout status daemonset/api-local -n hippius-s3-staging --timeout=10m
             kubectl delete deployment/api-local -n hippius-s3-staging --ignore-not-found=true
           fi
+          # Gateway/api merge: prune the gateway Deployment (apply -k does not delete removed
+          # resources). Idempotent no-op after the first deploy.
+          #
+          # FIRST-DEPLOY WINDOW, documented honestly: the apply above flips the public
+          # Services to the edge-labeled selector immediately, and no pod carries the label
+          # until the DaemonSet replaces its first pod — so the NodePort has no backends for
+          # roughly the first pod's replace time (image pull + start + probes). This is the
+          # least-bad transition: keeping the Services on the old gateway during the roll
+          # would instead 403 a growing fraction of traffic for the WHOLE roll, because the
+          # old gateway strips the Host header its forwards, and the merged app re-verifies
+          # SigV4 against it. Old header-trusting pods receiving public traffic (an auth
+          # bypass) is prevented by the label either way.
+          kubectl delete deployment/gateway -n hippius-s3-staging --ignore-not-found=true
           kubectl rollout status deployment/arion-downloader -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
           # Drain stack, allocator-first: the allocator applies the cephor_* migrations

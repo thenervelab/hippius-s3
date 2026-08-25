@@ -414,7 +414,7 @@ Example: add `GET /{bucket}/{key}?acl` to return an object's ACL as XML.
 2. **Router**. In [hippius_s3/api/s3/objects/router.py](hippius_s3/api/s3/objects/router.py), the GET route already exists for `/{bucket}/{key}`. Add a branch: if `"acl" in request.query_params`, dispatch to the new handler.
 3. **Query**. If you need new SQL, add `hippius_s3/sql/queries/get_object_acl.sql` and load via `get_query("get_object_acl")`.
 4. **Tests**. [tests/unit/api/](tests/unit/) for handler logic, [tests/e2e/](tests/e2e/) for end-to-end via boto3.
-5. **Gateway permission mapping**. If the new endpoint requires a different S3 permission than the default mapping in [gateway/middlewares/acl.py:36-67](gateway/middlewares/acl.py), update it.
+5. **Gateway permission mapping**. If the new endpoint requires a different S3 permission than the default mapping in [hippius_s3/gateway/middlewares/acl.py:36-67](hippius_s3/gateway/middlewares/acl.py), update it.
 
 ### 6.2 Add a database migration
 
@@ -594,7 +594,7 @@ We don't nitpick style (ruff handles that). We don't block on taste.
 
 ### 9.2 "The test passes locally but fails in CI"
 
-- CI runs with `HIPPIUS_BYPASS_CREDIT_CHECK=true` and `ENABLE_BANHAMMER=false`. Check your local env isn't setting them differently.
+- CI runs with `HIPPIUS_BYPASS_CREDIT_CHECK=true`. Check your local env isn't setting it differently.
 - Timing-sensitive tests against Redis pub/sub are often flaky. Use generous timeouts.
 - If your test requires a specific FS cache state, make sure you clean it in setup.
 
@@ -707,7 +707,7 @@ Don't optimize based on intuition. Measure, change, re-measure.
 - **Radu directly** (`radu.mutilica`) for:
   - Anything touching KMS / encryption.
   - Anything touching the janitor's replication invariants.
-  - Re-enabling disabled features (`deploy-cache-production`, rate-limit, banhammer).
+  - Re-enabling disabled features (`deploy-cache-production`; rate-limit/banhammer would need recovering from git).
   - Destructive scripts in [hippius_s3/scripts/CLAUDE.md](hippius_s3/scripts/CLAUDE.md).
 - **Open a GitHub Issue** for bugs, regressions, or design discussion. Link the ray_id or a specific commit.
 - **[todo.md](todo.md)** lists known-but-unsolved issues with context — check there before filing a new issue.

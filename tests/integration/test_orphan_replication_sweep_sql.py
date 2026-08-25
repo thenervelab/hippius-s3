@@ -63,11 +63,14 @@ async def conn() -> AsyncGenerator[asyncpg.Connection, None]:
         ) ON COMMIT PRESERVE ROWS;
 
         CREATE TEMP TABLE cephor_replication_status (
-            object_id   text        NOT NULL,
-            version     bigint      NOT NULL,
-            part_number bigint      NOT NULL,
-            status      text        NOT NULL,
-            landed_at   timestamptz NOT NULL DEFAULT now(),
+            object_id         text        NOT NULL,
+            version           bigint      NOT NULL,
+            part_number       bigint      NOT NULL,
+            status            text        NOT NULL,
+            landed_at         timestamptz NOT NULL DEFAULT now(),
+            -- Mirrors drain migration 0012; the sweep's Tier-2 arm reads it, so a mirror
+            -- without it makes every case here fail on an undefined column.
+            upload_enqueued_at timestamptz,
             PRIMARY KEY (object_id, version, part_number)
         ) ON COMMIT PRESERVE ROWS;
         """
@@ -106,17 +109,22 @@ async def _seed_status(
     *,
     status: str,
     landed_age_seconds: int = 7200,
+    upload_enqueued: bool = False,
 ) -> None:
     # landed_age defaults to 2h (stale vs _STALE=3600) so the common case sweeps; pass a
     # small value to model a freshly-landed part that should protect its version.
+    # upload_enqueued only matters for status='replicated': set means the backend upload was
+    # published, which is what makes such a part legitimately done rather than a Tier-2 orphan.
     await conn.execute(
-        "INSERT INTO cephor_replication_status (object_id, version, part_number, status, landed_at) "
-        "VALUES ($1, $2, $3, $4, now() - make_interval(secs => $5))",
+        "INSERT INTO cephor_replication_status "
+        "(object_id, version, part_number, status, landed_at, upload_enqueued_at) "
+        "VALUES ($1, $2, $3, $4, now() - make_interval(secs => $5), CASE WHEN $6 THEN now() END)",
         object_id,
         version,
         part_number,
         status,
         landed_age_seconds,
+        upload_enqueued,
     )
 
 
@@ -170,14 +178,33 @@ async def test_orphan_with_no_multipart_upload_row_is_swept(conn):
 # =========================================================== FALSE: terminal status
 
 
-@pytest.mark.parametrize("status", ["replicated", "failed"])
-async def test_terminal_status_is_not_swept(conn, status):
-    # 'replicated' is legitimately done; 'failed' is already terminal — re-marking is a
-    # no-op but selecting it would churn the sweep, so the predicate excludes both.
+@pytest.mark.parametrize(
+    ("status", "upload_enqueued"),
+    [
+        # 'failed' is already terminal — re-marking is a no-op but selecting it would churn.
+        ("failed", False),
+        # A 'replicated' part is only done once its backend upload was ENQUEUED: that proves
+        # the address existed, so the object completed.
+        ("replicated", True),
+    ],
+)
+async def test_terminal_status_is_not_swept(conn, status, upload_enqueued):
     oid = _oid()
     await _seed_version(conn, oid, 1, address=None, size_bytes=0, md5_hash="")
-    await _seed_status(conn, oid, 1, 1, status=status)
+    await _seed_status(conn, oid, 1, 1, status=status, upload_enqueued=upload_enqueued)
     assert await _swept(conn) == set()
+
+
+async def test_replicated_but_unenqueued_is_swept(conn):
+    # The Tier-2 decoupled-commit orphan: the part reached the pool before its object's address
+    # was written, so it committed 'replicated' with the enqueue deferred to the sweep. The
+    # object was then abandoned, so the address never landed and the enqueue never happens —
+    # leaving no chunk_backend rows and a pool copy the janitor's replication gate pins
+    # forever. Marking it terminal is what lets that copy be reclaimed.
+    oid = _oid()
+    await _seed_version(conn, oid, 1, address=None, size_bytes=0, md5_hash="")
+    await _seed_status(conn, oid, 1, 1, status="replicated", upload_enqueued=False)
+    assert await _swept(conn) == {(oid, 1)}
 
 
 # =========================================================== FALSE: servable versions
@@ -289,7 +316,7 @@ async def test_full_truth_table(conn):
     draining_oid = _oid()  # draining + unservable + aged → SWEPT
     servable_oid = _oid()  # pending + servable          → protected
     fresh_oid = _oid()  # pending + unservable + fresh → protected
-    replicated_oid = _oid()  # replicated + unservable     → protected
+    replicated_oid = _oid()  # replicated + ENQUEUED       → protected
 
     await _seed_version(conn, swept_oid, 1, address=None, size_bytes=0, md5_hash="")
     await _seed_status(conn, swept_oid, 1, 1, status="pending")
@@ -304,6 +331,6 @@ async def test_full_truth_table(conn):
     await _seed_status(conn, fresh_oid, 1, 1, status="pending", landed_age_seconds=30)
 
     await _seed_version(conn, replicated_oid, 1, address=None, size_bytes=0, md5_hash="")
-    await _seed_status(conn, replicated_oid, 1, 1, status="replicated")
+    await _seed_status(conn, replicated_oid, 1, 1, status="replicated", upload_enqueued=True)
 
     assert await _swept(conn) == {(swept_oid, 1), (draining_oid, 1)}

@@ -36,6 +36,15 @@ def main() -> int:
     ap.add_argument("--no-cluster", action="store_true", help="skip Postgres/Prometheus invariant probes")
     ap.add_argument("--keep", action="store_true", help="keep test buckets after the run")
     ap.add_argument("--timeout", type=int, default=None, help="drain-convergence timeout (s)")
+    # OPT-IN and OPERATOR-SIZED. The scenario never computes this: the ingest SSD on staging is
+    # shared with other tenants, so how much may be written is a judgement about the cluster on the
+    # day, not a property the suite can derive. Read the disk first (./ssd_disk_report.sh).
+    ap.add_argument("--fill-gb", type=float, default=0.0,
+                    help="GB to write at the ingest SSD to exercise eviction (0 = skip). "
+                         "Requires cluster access. Check ./ssd_disk_report.sh first.")
+    ap.add_argument("--fill-object-mb", type=int, default=64,
+                    help="object size for --fill-gb (default 64 MB)")
+    ap.add_argument("--fill-workers", type=int, default=8, help="concurrent uploads for --fill-gb")
     args = ap.parse_args()
 
     cfg = config.load()
@@ -81,6 +90,18 @@ def main() -> int:
         print("-- invariants + convergence: skipped (no cluster) --")
         # give the drain a moment before the durability re-verify even without cluster probes
         time.sleep(10)
+
+    if args.fill_gb > 0:
+        if not cluster:
+            print("-- ssd fill: SKIPPED, needs cluster access to read the disk and the evictor's metrics --")
+        else:
+            with probe.prometheus():
+                guarded(f"ssd fill pressure ({args.fill_gb} GB, operator-specified)",
+                        lambda: scenarios.ssd_fill_pressure(
+                            client, cfg, ledger, report, buckets, probe,
+                            fill_bytes=int(args.fill_gb * 1e9),
+                            obj_bytes=args.fill_object_mb * 1024 * 1024,
+                            workers=args.fill_workers))
 
     # Pass the probe only when the cluster is reachable: the re-verify uses it to evict the SSD ingest
     # cache so the re-GET reads the drained copy, not the intact ingest copy (see durability_reverify).

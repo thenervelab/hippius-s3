@@ -34,6 +34,25 @@ logger = logging.getLogger(__name__)
 config = get_config()
 
 
+async def _drain(body_iter: AsyncIterator[bytes]) -> None:
+    """Consume the rest of the request body before an early response.
+
+    Pre-merge the gateway relayed (and thereby drained) every byte regardless of how
+    early the api answered. Post-merge, uvicorn copes with a body it never started
+    reading (it closes rather than reuses the connection) — the e2e suite's many
+    early-403/400 PUTs pass untouched — but a PARTIALLY consumed stream is the poison
+    case: append's writer reads mid-body before the CAS 412, and the leftover bytes on
+    the kept-alive connection parse as the next request (bare 400s under the concurrent
+    e2e test). Append deltas are small, so finishing the iterator is cheap. A
+    disconnect mid-drain means the connection is dying anyway — nothing to poison.
+    """
+    try:
+        async for _ in body_iter:
+            pass
+    except Exception:
+        return
+
+
 async def handle_append(
     request: Request,
     db: Any,
@@ -60,126 +79,132 @@ async def handle_append(
         Response compatible with S3 clients
     """
 
-    # Version-based CAS for append
-    expected_version_header = request.headers.get("x-amz-meta-append-if-version")
-    append_id = request.headers.get("x-amz-meta-append-id")
+    try:
+        # Version-based CAS for append
+        expected_version_header = request.headers.get("x-amz-meta-append-if-version")
+        append_id = request.headers.get("x-amz-meta-append-id")
 
-    # Idempotency: if append-id is provided and we've seen it for this object, return stored result
-    if append_id and append_id.strip():
-        id_key = f"append_id:{bucket_id}:{object_key}:{append_id}"
+        # Idempotency: if append-id is provided and we've seen it for this object, return stored result
+        if append_id and append_id.strip():
+            id_key = f"append_id:{bucket_id}:{object_key}:{append_id}"
+            try:
+                cached = await redis_client.get(id_key)
+                if cached:
+                    try:
+                        payload = json.loads(cached)
+                        etag = payload.get("etag")
+                        if etag:
+                            return Response(status_code=200, headers={"ETag": f'"{etag}"'})
+                    except Exception:
+                        pass
+            except Exception:
+                # On Redis issues, proceed without idempotency
+                pass
+
+        # Validate append-if-version header early
+        if expected_version_header is None:
+            return errors.s3_error_response(
+                code="InvalidRequest",
+                message="Missing append-if-version",
+                status_code=400,
+            )
         try:
-            cached = await redis_client.get(id_key)
-            if cached:
-                try:
-                    payload = json.loads(cached)
-                    etag = payload.get("etag")
-                    if etag:
-                        return Response(status_code=200, headers={"ETag": f'"{etag}"'})
-                except Exception:
-                    pass
-        except Exception:
-            # On Redis issues, proceed without idempotency
-            pass
+            expected_version = int(expected_version_header)
+        except ValueError:
+            return errors.s3_error_response(
+                code="InvalidRequest",
+                message="append-if-version must be an integer",
+                status_code=400,
+            )
 
-    # Validate append-if-version header early
-    if expected_version_header is None:
-        return errors.s3_error_response(
-            code="InvalidRequest",
-            message="Missing append-if-version",
-            status_code=400,
-        )
-    try:
-        expected_version = int(expected_version_header)
-    except ValueError:
-        return errors.s3_error_response(
-            code="InvalidRequest",
-            message="append-if-version must be an integer",
-            status_code=400,
-        )
+        # Endpoint delegates CAS and locking to writer.append
 
-    # Endpoint delegates CAS and locking to writer.append
-
-    # PHASE 2 (out-of-DB): delegate to ObjectWriter to append, cache, and update version
-    writer = ObjectWriter(
-        pool=request.app.state.postgres_pool, redis_client=redis_client, fs_store=request.app.state.fs_store
-    )
-    try:
-        result = await writer.append_stream(
-            bucket_id=bucket_id,
-            bucket_name=bucket_name,
-            object_key=object_key,
-            expected_version=int(expected_version),
-            account_address=request.state.account.main_account,
-            body_iter=body_iter,
+        # PHASE 2 (out-of-DB): delegate to ObjectWriter to append, cache, and update version
+        writer = ObjectWriter(
+            pool=request.app.state.postgres_pool, redis_client=redis_client, fs_store=request.app.state.fs_store
         )
-    except AppendPreconditionFailed as exc:
-        return errors.s3_error_response(
-            code="PreconditionFailed",
-            message="Version precondition failed",
-            status_code=412,
-            extra_headers={
-                "x-amz-meta-append-version": str(exc.current_version),
-                "Retry-After": "0.1",
+        try:
+            result = await writer.append_stream(
+                bucket_id=bucket_id,
+                bucket_name=bucket_name,
+                object_key=object_key,
+                expected_version=int(expected_version),
+                account_address=request.state.main_account_id,
+                body_iter=body_iter,
+            )
+        except AppendPreconditionFailed as exc:
+            return errors.s3_error_response(
+                code="PreconditionFailed",
+                message="Version precondition failed",
+                status_code=412,
+                extra_headers={
+                    "x-amz-meta-append-version": str(exc.current_version),
+                    "Retry-After": "0.1",
+                },
+            )
+        except ObjectNotFound:
+            return errors.s3_error_response(
+                code="NoSuchKey",
+                message=f"The specified key {object_key} does not exist",
+                status_code=404,
+                Key=object_key,
+            )
+        except EmptyAppendError:
+            return errors.s3_error_response(
+                code="InvalidRequest",
+                message="Empty append not allowed",
+                status_code=400,
+            )
+        object_id = result["object_id"]
+        next_part = int(result["part_number"])
+        composite_etag = str(result["etag"])
+        object_version = int(result.get("object_version", 1))
+        new_append_version = int(result.get("new_append_version", 0))
+
+        # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It
+        # persists the main-account address on this version; the Rust drain reads it and
+        # LPUSHes the appended part's UploadChainRequest itself once the part replicates to
+        # ceph, so the drain is the sole upload producer. The version already carries an
+        # address from the object's original create, so this is normally idempotent — but it
+        # also corrects a legacy pre-cutover version whose address is NULL, which the drain
+        # would otherwise defer forever (leaving the appended part un-backed).
+        await set_object_version_address(
+            request.app.state.postgres_pool,
+            object_id=str(object_id),
+            object_version=int(object_version),
+            address=request.state.main_account_id,
+            only_if_null=True,  # AP-2: no-op when already set; only fills a legacy NULL row
+        )
+        with contextlib.suppress(Exception):
+            logger.info(
+                f"APPEND persisted upload address object_id={object_id} v={int(object_version)} part={int(next_part)}"
+            )
+
+        # Successful append: return the new append version so clients can avoid a HEAD
+        resp = Response(
+            status_code=200,
+            headers={
+                "ETag": f'"{composite_etag}"',
+                "x-amz-meta-append-version": str(new_append_version),
             },
         )
-    except ObjectNotFound:
-        return errors.s3_error_response(
-            code="NoSuchKey",
-            message=f"The specified key {object_key} does not exist",
-            status_code=404,
-            Key=object_key,
-        )
-    except EmptyAppendError:
-        return errors.s3_error_response(
-            code="InvalidRequest",
-            message="Empty append not allowed",
-            status_code=400,
-        )
-    object_id = result["object_id"]
-    next_part = int(result["part_number"])
-    composite_etag = str(result["etag"])
-    object_version = int(result.get("object_version", 1))
-    new_append_version = int(result.get("new_append_version", 0))
-
-    # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It
-    # persists the main-account address on this version; the Rust drain reads it and
-    # LPUSHes the appended part's UploadChainRequest itself once the part replicates to
-    # ceph, so the drain is the sole upload producer. The version already carries an
-    # address from the object's original create, so this is normally idempotent — but it
-    # also corrects a legacy pre-cutover version whose address is NULL, which the drain
-    # would otherwise defer forever (leaving the appended part un-backed).
-    await set_object_version_address(
-        request.app.state.postgres_pool,
-        object_id=str(object_id),
-        object_version=int(object_version),
-        address=request.state.account.main_account,
-        only_if_null=True,  # AP-2: no-op when already set; only fills a legacy NULL row
-    )
-    with contextlib.suppress(Exception):
-        logger.info(
-            f"APPEND persisted upload address object_id={object_id} v={int(object_version)} part={int(next_part)}"
-        )
-
-    # Successful append: return the new append version so clients can avoid a HEAD
-    resp = Response(
-        status_code=200,
-        headers={
-            "ETag": f'"{composite_etag}"',
-            "x-amz-meta-append-version": str(new_append_version),
-        },
-    )
-    with contextlib.suppress(Exception):
-        logger.info(
-            f"APPEND success bucket={bucket_name} key={object_key} new_version={new_append_version} next_part={int(next_part)} size_delta={int(result.get('size_bytes', 0))}"
-        )
-
-    # Record idempotency result for future retries (best-effort)
-    if append_id and append_id.strip():
-        id_key = f"append_id:{bucket_id}:{object_key}:{append_id}"
         with contextlib.suppress(Exception):
-            await redis_client.setex(id_key, 3600, json.dumps({"etag": composite_etag}))
+            logger.info(
+                f"APPEND success bucket={bucket_name} key={object_key} new_version={new_append_version} next_part={int(next_part)} size_delta={int(result.get('size_bytes', 0))}"
+            )
 
-    return resp
+        # Record idempotency result for future retries (best-effort)
+        if append_id and append_id.strip():
+            id_key = f"append_id:{bucket_id}:{object_key}:{append_id}"
+            with contextlib.suppress(Exception):
+                await redis_client.setex(id_key, 3600, json.dumps({"etag": composite_etag}))
+
+        return resp
+    finally:
+        # One drain site instead of one before every early return (which each future
+        # edit would have to remember). A fully consumed iterator makes this a no-op;
+        # exceptions propagate through unchanged.
+        await _drain(body_iter)
 
 
 async def _upsert_cid(db: Any, cid: str) -> uuid.UUID:

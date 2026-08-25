@@ -1,13 +1,22 @@
 //! The SSD-ingest reclaim backstop: clean up parts stranded on the node-local SSD that the
 //! drain pipeline structurally cannot reach.
 //!
-//! Scope is the leaks whose row `claim_part` never re-selects, so the drain never unlinks
-//! their SSD copy and it leaks with nothing else to reclaim it — three dispositions, each
-//! detailed below: aborted/abandoned uploads ([`Failed`](ReplicationState::Failed) — an MPU
-//! abort, an abandoned MPU the reaper marked terminal, or a failed single-part PUT),
-//! `replicated` crash-orphans (a crash between the `mark_replicated` commit and the drain's
-//! own unlink), and deleted-object orphans (a part whose object was hard-deleted). This
-//! worker is that missing owner.
+//! Scope is the leaks whose row `claim_part` never re-selects, so nothing else would ever
+//! remove them — two dispositions, each detailed below: aborted/abandoned uploads
+//! ([`Failed`](ReplicationState::Failed) — an MPU abort, an abandoned MPU the reaper marked
+//! terminal, or a failed single-part PUT), and deleted-object orphans (a part whose object was
+//! hard-deleted). This worker is that missing owner.
+//!
+//! It is emphatically NOT the owner of `replicated` parts. Those are RETAINED on purpose —
+//! they are the node's read tier, served from local `NVMe` at ~705 MB/s / ~6 ms per chunk
+//! against the pool's ~94 MB/s / ~40 ms — and they are reclaimed by
+//! [`evict_to_target`](crate::evict_to_target) on a free-space policy, least-recently-used first
+//! and only as much as the disk needs. This module handles DEBRIS; the evictor handles CACHE.
+//! Before retention the drain unlinked its own copy at commit, so anything `replicated` left
+//! on disk could only be a crash between the commit and that unlink, and this worker
+//! re-drove it. Retention removed that inference: a lingering `replicated` part is now the
+//! normal steady state. Sweeping it on an age gate would discard hot cache from a disk with
+//! terabytes free and quietly undo retention entirely.
 //!
 //! But `failed` is not a clean proxy for "safe to delete": the drain's corruption path
 //! (`mark_failed` on a persistent `ChunkMismatch`) can mark a part of a *servable, live*
@@ -31,31 +40,8 @@
 //! `failed`-marking sweep + the `failed` path here, NOT treated as an orphan — that
 //! avoids racing an in-progress MPU whose reserved row is also unservable.
 //!
-//! It reclaims **`replicated` crash-orphans**: on the happy path the drain unlinks its own
-//! SSD copy the instant it commits a replication. A replicated copy that lingers is a
-//! **drain crash-orphan** — a crash between the `mark_replicated` commit and the unlink —
-//! which `claim_part` never re-selects, so nothing else re-drives the unlink and it leaks
-//! (an inode/dir leak on `/s3-data`, unbounded across agent restarts). This worker re-drives
-//! it: a `replicated` part older than `replicated_grace` is unlinked, which is exactly what
-//! the happy-path unlink would have done. The safety argument is that this is strictly weaker
-//! than the happy path, not stronger: that unlink runs milliseconds after the commit, so
-//! re-driving it after a grace introduces no risk the happy path does not already accept.
-//! Note the ingest SSD IS read — it is the api-local reader's *primary* tier, with the
-//! `CephFS` pool as its read *fallback* (`DualFileSystemPartsStore`) — so a same-node GET can
-//! hit the SSD copy first. But `mark_replicated` is committed only after the pool copy is
-//! written, byte-verified, and fsynced, so deleting the SSD copy merely makes a same-node read
-//! fall through to that durable fallback (the exact behaviour the fallback tier exists for),
-//! identical to the drain's own post-commit unlink. The pool copy is thus authoritative — the
-//! `replicated` state IS the drain's own record that the `CephFS` copy exists — and, unlike a
-//! `failed` part, a `replicated` one is never a corrupt-live object's last good source (a
-//! corrupt pool copy transitions the row to `failed`/`corrupt`, out of this arm), so no
-//! servability gate is needed. The grace only avoids racing a just-committed part whose
-//! in-process unlink has not yet run; a young `replicated` part is left (`skipped_replicated`).
-//! (An in-flight MPU whose address takes longer than the grace to finalize is reclaimed while
-//! still `replicated`/un-enqueued — safe: reads are served from the pool and the janitor's
-//! replication gate holds the pool copy until the upload backends have it.) `pending`/`draining`
-//! parts are live (owned by the drain pipeline) and a no-row part whose object still exists may
-//! be mid-upload — both are left strictly alone.
+//! `pending`/`draining` parts are live (owned by the drain pipeline) and a no-row part whose
+//! object still exists may be mid-upload — both are left strictly alone.
 //!
 //! Safety: `failed` is a terminal sink (nothing returns a row to `pending` except
 //! `release_part`/`defer_part`, each guarded on `status='draining'`), so the read can
@@ -103,21 +89,51 @@ pub struct PartStatusAge {
     pub age: Duration,
 }
 
+/// How long an aged `failed` (aborted/abandoned-upload) part is kept before reclaim — a
+/// diagnosis / abort-settle window. Keyed on the store clock (`updated_at`).
+///
+/// A newtype rather than a bare `Duration` because the grace it is NOT is minutes-scale while
+/// [`OrphanGrace`] is hours-scale, and the two are handed to the same functions. Field labels
+/// alone stopped protecting that once a callee unwrapped them back into positional args.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailedGrace(pub Duration);
+
+impl FailedGrace {
+    /// The window as a plain `Duration`, for comparison against an age.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
+/// How long a no-DB-backing (deleted-object) orphan — or an unpublished upload's staged chunk —
+/// is kept before reclaim. Keyed on the part's FS `meta.json` / file age, so set generously to
+/// absorb the agent-clock dependence and to outlive a slow multi-GB `UploadPart`.
+///
+/// See [`FailedGrace`] for why this is a newtype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanGrace(pub Duration);
+
+impl OrphanGrace {
+    /// The window as a plain `Duration`, for comparison against an age.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
 /// The per-disposition grace windows [`reclaim_ssd`] gates each deletion on. Grouped into a
-/// named struct so the three same-typed `Duration`s are labelled at every call site rather
-/// than passed as three adjacent positional args (which are trivial to transpose).
+/// named struct so the two grace windows are labelled at every call site rather than passed as
+/// adjacent positional args (which are trivial to transpose), and typed as [`FailedGrace`] /
+/// [`OrphanGrace`] so a transposition anywhere downstream of the struct fails to COMPILE — the
+/// labels stopped at the struct, and the callee that unwrapped them (the agent's staged-chunk
+/// sweep) could still swap them silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReclaimGraces {
-    /// How long an aged `failed` (aborted/abandoned-upload) part is kept before reclaim — a
-    /// diagnosis / abort-settle window. Keyed on the store clock (`updated_at`).
-    pub failed: Duration,
-    /// How long a no-DB-backing (deleted-object) orphan is kept before reclaim. Keyed on the
-    /// part's FS `meta.json` age, so set generously to absorb the agent-clock dependence.
-    pub orphan: Duration,
-    /// How long a `replicated` crash-orphan is kept before the reclaim re-drives the drain's
-    /// own unlink. Keyed on the store clock (`updated_at`); only clears the in-flight-unlink
-    /// window, so it can be short.
-    pub replicated: Duration,
+    /// The `failed`-part window; see [`FailedGrace`].
+    pub failed: FailedGrace,
+    /// The deleted-object-orphan window; see [`OrphanGrace`].
+    pub orphan: OrphanGrace,
 }
 
 /// The store seam the reclaim worker needs: read the replication state + age of a
@@ -134,6 +150,28 @@ pub trait ReclaimLog: Send + Sync {
     /// The replication state + age of every `parts` entry the store has a row for.
     /// A part with no row is simply absent from the map (the caller skips it).
     fn part_states(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashMap<PartKey, PartStatusAge>, Self::Error>> + Send;
+
+    /// This node's `failed` parts older than `grace`, oldest first, at most `limit`.
+    ///
+    /// **Candidates only — deliberately no servability logic here.** Whether a `failed` part is
+    /// a corrupt-live object's last good copy is decided by
+    /// [`BackingLog::servable_parts`](BackingLog::servable_parts), which already carries that
+    /// predicate under a "MUST stay in lockstep" warning shared with
+    /// `janitor_part_terminally_abandoned.sql` and the A21 sweep. Expressing it a third time in
+    /// this query is how that warning eventually gets ignored, and the failure mode is deleting
+    /// a live object's last good source. So this finds candidates; the existing seam judges them.
+    fn reclaimable_failed_parts(&self, grace: Duration, limit: u32) -> impl Future<Output = Result<Vec<PartKey>, Self::Error>> + Send;
+
+    /// Stamps `reclaimed_at` so these parts leave the worklist, and releases whatever residency
+    /// claims the parts still carry (the caller just unlinked the bytes, so a surviving claim
+    /// would block the terminal-row GC forever).
+    ///
+    /// Without the stamp the cursor never advances: unlinking a part changes nothing about its
+    /// row, so the next poll re-selects the same oldest page, re-unlinks it (idempotently, a
+    /// no-op) and re-counts it as reclaimed — productive-looking metrics over a cursor pinned in
+    /// place, with everything past the first page waiting on the hourly walk. The walk-driven
+    /// path did not need this because it is disk-keyed; a status-keyed worklist does.
+    fn mark_failed_reclaimed(&self, parts: &[PartKey]) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// The `object_versions` backing seam: answers two questions about a batch of parts, both
@@ -189,17 +227,11 @@ pub struct ReclaimReport {
     /// `object_versions` row (a hard-deleted object), aged past `orphan_grace`. The
     /// deleted-object leak the `failed` path cannot reach — see the module doc.
     pub reclaimed_orphan: u64,
-    /// `replicated` crash-orphans reclaimed: the drain committed `mark_replicated` but crashed
-    /// before unlinking its SSD copy, so nothing re-drove the unlink. Reclaimed once older than
-    /// `replicated_grace` — re-driving the happy-path unlink the crash skipped. See the module
-    /// doc and [`skipped_replicated`](Self::skipped_replicated).
-    pub reclaimed_replicated: u64,
     /// Left alone because still `pending`/`draining` — owned by the drain pipeline.
     pub skipped_live: u64,
-    /// Left alone because `replicated` but still within `replicated_grace` — a just-committed
-    /// part whose happy-path unlink may not have run yet. Aged ones are reclaimed
-    /// ([`reclaimed_replicated`](Self::reclaimed_replicated)), so this counts only the
-    /// transient in-flight-unlink window, not an unreclaimable leak.
+    /// Retained `replicated` parts — the node's read tier. Not a leak and not a backlog: this
+    /// is the steady-state population on a healthy node, and it is the evictor's to reclaim,
+    /// never this worker's. Expect it to dominate the scan.
     pub skipped_replicated: u64,
     /// Left alone because the store has no replication row and the part still has a live
     /// `object_versions` row (pre-reconcile or mid-upload) — or is not yet past
@@ -227,7 +259,6 @@ impl ReclaimReport {
     pub fn categorized(&self) -> u64 {
         self.reclaimed
             .saturating_add(self.reclaimed_orphan)
-            .saturating_add(self.reclaimed_replicated)
             .saturating_add(self.skipped_live)
             .saturating_add(self.skipped_replicated)
             .saturating_add(self.skipped_absent)
@@ -277,12 +308,21 @@ impl ReclaimError {
 /// back as `skipped_corrupt`, never deleted; see the module doc). A part with NO replication
 /// row is checked against [`BackingLog::unbacked_parts`]: if its object was hard-deleted (no
 /// `object_versions` row) AND it has aged past `graces.orphan`, it is a deleted-object orphan
-/// and is reclaimed too. A `replicated` part older than `graces.replicated` is a drain
-/// crash-orphan (the drain crashed between the `mark_replicated` commit and its own unlink)
-/// and is unlinked — re-driving the happy-path unlink the crash skipped. Everything else is
-/// left untouched: `pending`/`draining` are live (drain-owned), a young `replicated` part
-/// may have an in-flight unlink still pending, and a no-row part that still has a live
-/// `object_versions` row may be mid-upload — the absolute safety gate.
+/// and is reclaimed too.
+///
+/// A `replicated` part is **never** reclaimed here, at any age. That inverts what this
+/// function used to do — the drain unlinked its own copy at commit, so a lingering `replicated`
+/// part could only be a crash between the two, and it was swept after `graces.replicated`.
+/// Retention removed that inference: a retained `replicated` part is the node's read tier and
+/// the intended steady state, so it is counted as
+/// [`skipped_replicated`](ReclaimReport::skipped_replicated) and left to the evictor, which
+/// removes parts on a free-space policy rather than on age. `graces.replicated` and
+/// `CEPHOR_REPLICATED_RECLAIM_GRACE_SECS` are gone with it — the env var survives in the prod
+/// manifest only because the PRE-retention binary reads it, which is what makes an image
+/// rollback sweep the retained cache.
+///
+/// Everything else is left untouched: `pending`/`draining` are live (drain-owned), and a no-row
+/// part that still has a live `object_versions` row may be mid-upload — the absolute safety gate.
 ///
 /// The servability read ([`BackingLog::servable_parts`]) and the orphan-backing read
 /// ([`BackingLog::unbacked_parts`]) each run over a disjoint subset (aged-`failed` vs
@@ -342,7 +382,7 @@ where
         .filter(|discovered| {
             states
                 .get(&discovered.part)
-                .is_some_and(|status| status.state == ReplicationState::Failed && status.age >= graces.failed)
+                .is_some_and(|status| status.state == ReplicationState::Failed && status.age >= graces.failed.get())
         })
         .map(|discovered| discovered.part.clone())
         .collect();
@@ -361,7 +401,7 @@ where
         // live row is mid-upload or pre-reconcile — never touched (the absolute safety
         // gate; reserve-before-write means an absent row can only be a deleted object).
         let Some(status) = states.get(part) else {
-            if unbacked.contains(part) && discovered.age >= graces.orphan {
+            if unbacked.contains(part) && discovered.age >= graces.orphan.get() {
                 remover.unlink_part(part).await.map_err(ReclaimError::Remove)?;
                 report.reclaimed_orphan += 1;
             } else {
@@ -373,27 +413,25 @@ where
         match status.state {
             // Live: owned by the drain pipeline.
             ReplicationState::Pending | ReplicationState::Draining => report.skipped_live += 1,
-            // Replicated: the drain unlinks its own SSD copy the instant it commits, so a
-            // lingering one is a crash-orphan (a crash between the commit and the unlink).
-            // Re-drive that unlink once past `replicated_grace` — exactly what the happy path
-            // would have done, and strictly weaker than it (see the module doc). No
-            // servability gate is needed: unlike `failed`, a `replicated` part is never a
-            // corrupt-live object's last good source. A young one is left in case its
-            // in-flight unlink has simply not run yet.
-            ReplicationState::Replicated => {
-                if status.age >= graces.replicated {
-                    remover.unlink_part(part).await.map_err(ReclaimError::Remove)?;
-                    report.reclaimed_replicated += 1;
-                } else {
-                    report.skipped_replicated += 1;
-                }
-            }
+            // Replicated: RETAINED on purpose. This is the node's read tier — a local GET
+            // serves it at ~705 MB/s / ~6 ms per chunk instead of ~94 MB/s / ~40 ms from the
+            // pool — so a lingering `replicated` part is the intended steady state, not a
+            // crash-orphan to sweep. It used to be the latter, because the drain unlinked its
+            // own copy at commit and anything left behind could only be a crash between the
+            // two; retention removed that inference entirely.
+            //
+            // Reclaiming these is now the EVICTOR's job (`crate::evict_to_target`), and the
+            // distinction is not cosmetic: the evictor deletes on a free-space policy,
+            // least-recently-USED first, only as much as the disk needs. An age-based sweep here would
+            // throw away hot cache on a disk with terabytes free, quietly undoing retention —
+            // which is exactly what shipping the retention change without this arm would do.
+            ReplicationState::Replicated => report.skipped_replicated += 1,
             // Failed = a broken/abandoned upload (MPU abort, abandoned MPU, or a failed
             // single-part PUT) — reclaimed once past grace — UNLESS the version is still
             // servable, in which case `failed` means "corrupt pool copy on a live object"
             // and this SSD part is the last good source (skipped_corrupt; never deleted).
             ReplicationState::Failed => {
-                if status.age < graces.failed {
+                if status.age < graces.failed.get() {
                     report.skipped_young += 1;
                 } else if servable.contains(part) {
                     report.skipped_corrupt += 1;
@@ -418,10 +456,134 @@ where
     Ok(report)
 }
 
+/// What one DB-driven `failed`-reclaim pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FailedReclaimReport {
+    /// Aged `failed` parts the worklist offered.
+    pub candidates: u64,
+    /// Parts unlinked — debris from an aborted or abandoned upload.
+    pub reclaimed: u64,
+    /// Parts REFUSED because their object version is still servable: the R4 corrupt-live case,
+    /// where this SSD copy is the last good source. Must never be deleted; a standing nonzero
+    /// value is the same incident signal the walk's `skipped_corrupt` carries.
+    pub held_servable: u64,
+    /// Parts whose unlink FAILED and were skipped so the pass could continue. Distinct parts
+    /// within a pass, never attempts — see [`reclaim_failed`] for why aborting instead was the
+    /// bug this counts. A value at or near `candidates` every pass means the cursor is pinned
+    /// and this node's `failed` debris is not being reclaimed at all.
+    pub remove_failed: u64,
+    /// The errno class of the skipped removals, ranked by what needs a human rather than by
+    /// arrival order: a transient `DirectoryNotEmpty` (the api renaming a promoted chunk into a
+    /// directory being removed) must not mask an `EROFS` behind it.
+    pub remove_failed_kind: Option<std::io::ErrorKind>,
+}
+
+/// Reclaims this node's aged `failed` parts **without walking the disk**.
+///
+/// The walk found these by scanning every part on the SSD and asking the database about each.
+/// That was proportional to the whole tree — which retention grew to this node's entire
+/// replicated shard — to find a population that is tiny and directly queryable: prod carries
+/// 22,123 `failed` rows fleet-wide against 11.4 M replicated. Asking the database for them is
+/// the obvious shape; it only became worth doing once the walk stopped being cheap.
+///
+/// # The guard, and why it is not re-implemented here
+///
+/// A `failed` part whose object version is still SERVABLE is not debris — it is a live object
+/// whose pool copy is corrupt, and this SSD copy is its last good source (R4). Deleting it is
+/// data loss.
+///
+/// That judgement stays in [`BackingLog::servable_parts`], which the walk already used. Its
+/// predicate carries a "MUST stay in lockstep" warning shared with
+/// `janitor_part_terminally_abandoned.sql` and the A21 sweep, so it is already expressed twice;
+/// writing it a third time in a worklist query is how such a warning eventually gets ignored.
+/// The worklist therefore returns CANDIDATES and this function judges them with the existing,
+/// tested seam.
+///
+/// # Errors
+///
+/// - [`ReclaimError::Log`] if the worklist read fails (nothing is removed).
+/// - [`ReclaimError::Backing`] if the servability read fails — **nothing is removed**, because
+///   without it every candidate is un-adjudicated and deleting one could destroy a live
+///   object's last copy. Fail-safe, exactly as the walk's backing read is.
+///
+/// A failing UNLINK is deliberately **not** an error: it is counted in
+/// [`remove_failed`](FailedReclaimReport::remove_failed) and the part is skipped. The distinction
+/// is between an *adjudication* failure — the worklist or backing read, where the pass does not
+/// know what is safe to delete and must stop — and an *I/O* failure on one inode, where every
+/// candidate is already adjudicated and the other 511 can proceed.
+pub async fn reclaim_failed<L, B, R>(log: &L, backing: &B, remover: &R, grace: Duration, limit: u32) -> Result<FailedReclaimReport, ReclaimError>
+where
+    L: ReclaimLog,
+    B: BackingLog,
+    R: PartRemover,
+{
+    let mut report = FailedReclaimReport::default();
+    let candidates = log.reclaimable_failed_parts(grace, limit).await.map_err(ReclaimError::log)?;
+    if candidates.is_empty() {
+        return Ok(report);
+    }
+    report.candidates = candidates.len() as u64;
+
+    // Fail-safe: a backing read that errors leaves EVERY candidate unjudged, so the pass must
+    // remove nothing rather than assume "not in the set means safe to delete".
+    let servable = backing.servable_parts(&candidates).await.map_err(ReclaimError::backing)?;
+
+    let mut reclaimed = Vec::with_capacity(candidates.len());
+    for part in &candidates {
+        if servable.contains(part) {
+            report.held_servable += 1;
+            continue;
+        }
+        if let Err(err) = remover.unlink_part(part).await {
+            // Counted and skipped, NOT propagated — the same fix `evict_to_target` carries, for
+            // the same reason. Returning here landed before `mark_failed_reclaimed`, which is the
+            // only thing that advances this cursor: the worklist is `ORDER BY updated_at WHERE
+            // reclaimed_at IS NULL` with no offset, so one part refusing to be unlinked (EIO,
+            // EACCES, EROFS, or an ENOTEMPTY from the api publishing into the directory being
+            // removed) pinned the head of every later page. Worse than the evictor's version of
+            // this bug, because parts unlinked EARLIER in the same page were then never marked
+            // either, so the pass re-unlinked them every poll forever — the exact "productive
+            // metrics over a cursor that never moves" that migration 0018 exists to end. And
+            // since #407's residency guard, an unreclaimed row is also un-GC-able.
+            report.remove_failed = report.remove_failed.saturating_add(1);
+            // Ranked by what needs a human, NOT by arrival order — the worklist's order has no
+            // relationship to severity, so first-wins would let one routine race mask a mount
+            // fault behind it. Two kinds are routine and both must be demoted:
+            // `DirectoryNotEmpty` (the api winning a rename into a directory being removed)
+            // and `WouldBlock` (the api holding the part-publish flock, which
+            // `remove_part_dir_exclusive` reports as an ordinary removal failure by design).
+            // Everything else — EACCES, EIO, EROFS — means the mount needs intervention and
+            // must survive.
+            report.remove_failed_kind = match (report.remove_failed_kind, err.kind()) {
+                (None | Some(std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::WouldBlock), kind) => Some(kind),
+                (existing, _) => existing,
+            };
+            continue;
+        }
+        report.reclaimed += 1;
+        reclaimed.push(part.clone());
+    }
+
+    // Unlink THEN mark, the same ordering the evictor uses and for the same reason: the two
+    // crash windows are not equally bad. Unlink-then-crash leaves an unmarked row whose disk
+    // copy is gone — the next pass re-offers it, the idempotent unlink is a no-op, and it is
+    // marked then. Mark-then-crash would take a still-present part off the worklist forever,
+    // leaving debris only the hourly walk could find.
+    //
+    // Marking is what makes the cursor advance at all; without it this pass re-processes its
+    // own first page until gc_terminal_status_rows removes the rows seven days later.
+    if !reclaimed.is_empty() {
+        log.mark_failed_reclaimed(&reclaimed).await.map_err(ReclaimError::log)?;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{BackingLog, PartRemover, PartStatusAge, ReclaimError, ReclaimGraces, ReclaimLog, ReclaimReport, reclaim_ssd};
+    use super::{
+        BackingLog, FailedGrace, OrphanGrace, PartRemover, PartStatusAge, ReclaimError, ReclaimGraces, ReclaimLog, ReclaimReport, reclaim_ssd,
+    };
     use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
     use crate::reconcile::{DiscoveredPart, PartScan};
     use crate::state::ReplicationState;
@@ -607,6 +769,16 @@ mod tests {
     impl ReclaimLog for FakeLog {
         type Error = io::Error;
 
+        async fn mark_failed_reclaimed(&self, _parts: &[PartKey]) -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        /// The walk-driven tests never exercise the DB worklist — `reclaim_failed` owns that
+        /// path and has its own suite in `failed_reclaim_tests`.
+        async fn reclaimable_failed_parts(&self, _grace: Duration, _limit: u32) -> Result<Vec<PartKey>, io::Error> {
+            Ok(Vec::new())
+        }
+
         fn part_states(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashMap<PartKey, PartStatusAge>, io::Error>> + Send {
             let outcome = if self.fail {
                 Err(io::Error::other("status failed"))
@@ -627,14 +799,10 @@ mod tests {
     const HOUR: Duration = Duration::from_hours(1);
     const GRACE: Duration = Duration::from_mins(30);
     const ORPHAN_GRACE: Duration = Duration::from_mins(45);
-    // Larger than the `HOUR` age the existing `replicated` fixtures use, so those parts stay
-    // within grace (`skipped_replicated`); the reclaim-when-aged cases below use ages past it.
-    const REPLICATED_GRACE: Duration = Duration::from_hours(2);
     // The default graces most tests pass; the boundary/proptest cases build their own.
     const GRACES: ReclaimGraces = ReclaimGraces {
-        failed: GRACE,
-        orphan: ORPHAN_GRACE,
-        replicated: REPLICATED_GRACE,
+        failed: FailedGrace(GRACE),
+        orphan: OrphanGrace(ORPHAN_GRACE),
     };
 
     #[tokio::test]
@@ -650,10 +818,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_replicated_part_within_grace_is_left_for_the_drains_own_unlink() {
-        // A `replicated` part younger than `replicated_grace` may have just committed, with its
-        // happy-path unlink still in flight — leave it; the crash-orphan reclaim waits out the
-        // grace before re-driving. HOUR < REPLICATED_GRACE (2h), so this is within grace.
+    async fn a_freshly_replicated_part_is_retained() {
+        // Retention is unconditional and immediate: a part is the read tier from the moment it
+        // commits, with no window in which this worker might still take it.
         let part = part_at(UUID_A, 5, 1);
         let scan = FakeScan::of(std::slice::from_ref(&part));
         let remover = FakeRemover::default();
@@ -661,12 +828,11 @@ mod tests {
 
         let report = reclaim_ssd(&scan, &remover, &log, &FakeBacking::all_backed(), GRACES).await.unwrap();
         assert_eq!(report.skipped_replicated, 1);
-        assert_eq!(report.reclaimed_replicated, 0);
-        assert!(remover.removed().is_empty(), "a within-grace replicated part is not reclaimed");
+        assert!(remover.removed().is_empty(), "a replicated part is never reclaimed here");
     }
 
     #[tokio::test]
-    async fn an_aged_replicated_crash_orphan_is_reclaimed() {
+    async fn an_aged_replicated_part_is_retained_not_reclaimed() {
         // The leak this fix targets: the drain committed `mark_replicated` but crashed before
         // unlinking its SSD copy (agent SIGKILL on eviction/OOM/restart), so nothing re-drove
         // the unlink and the dir lingers forever. Past `replicated_grace` it is unlinked —
@@ -677,32 +843,21 @@ mod tests {
         let log = FakeLog::with(&[(&part, ReplicationState::Replicated, Duration::from_hours(3))]);
 
         let report = reclaim_ssd(&scan, &remover, &log, &FakeBacking::all_backed(), GRACES).await.unwrap();
-        assert_eq!(report.reclaimed_replicated, 1);
-        assert_eq!(report.skipped_replicated, 0);
-        assert_eq!(remover.removed(), vec![key(&part)], "the aged replicated crash-orphan was unlinked");
+        assert_eq!(report.skipped_replicated, 1, "a replicated part is the read tier, held at any age");
+        assert!(
+            remover.removed().is_empty(),
+            "the reclaimer must never evict a retained part — the evictor owns that, on a free-space policy",
+        );
     }
 
     #[tokio::test]
-    async fn a_replicated_crash_orphan_exactly_at_the_grace_boundary_is_reclaimed() {
-        // The gate is `age >= replicated_grace -> reclaim`, mirroring the failed/orphan arms,
-        // so age == grace reclaims. Pins the boundary against a future `>=` vs `>` slip.
-        let part = part_at(UUID_A, 5, 1);
-        let scan = FakeScan::of(std::slice::from_ref(&part));
-        let remover = FakeRemover::default();
-        let log = FakeLog::with(&[(&part, ReplicationState::Replicated, REPLICATED_GRACE)]);
-
-        let report = reclaim_ssd(&scan, &remover, &log, &FakeBacking::all_backed(), GRACES).await.unwrap();
-        assert_eq!(report.reclaimed_replicated, 1, "age == replicated_grace reclaims");
-        assert_eq!(report.skipped_replicated, 0);
-    }
-
-    #[tokio::test]
-    async fn an_aged_replicated_crash_orphan_is_reclaimed_even_when_servable() {
-        // Unlike `failed`, a `replicated` part is reclaimed regardless of servability — a
-        // servable object is the normal case, and its pool copy is authoritative (a corrupt
-        // pool copy would have transitioned the row to failed/corrupt, out of this arm). The
-        // servability read is for the `failed` arm only and must NOT gate this one, so it is
-        // never even consulted for a `replicated` part.
+    async fn a_replicated_part_is_retained_without_consulting_servability() {
+        // A `replicated` part is held regardless of servability — a servable object is the
+        // normal case, and its pool copy is authoritative (a corrupt pool copy would have
+        // transitioned the row to failed/corrupt, out of this arm). The servability read
+        // exists for the `failed` arm only, so it must never be consulted here: paying an
+        // object_versions round-trip for the single most common state on the disk would put
+        // a query on the steady-state path for no decision it can influence.
         let part = part_at(UUID_A, 5, 1);
         let scan = FakeScan::of(std::slice::from_ref(&part));
         let remover = FakeRemover::default();
@@ -710,8 +865,8 @@ mod tests {
         let backing = FakeBacking::servable(&[&part]);
 
         let report = reclaim_ssd(&scan, &remover, &log, &backing, GRACES).await.unwrap();
-        assert_eq!(report.reclaimed_replicated, 1, "a servable replicated part is still reclaimed");
-        assert_eq!(remover.removed(), vec![key(&part)]);
+        assert_eq!(report.skipped_replicated, 1, "a servable replicated part is retained");
+        assert!(remover.removed().is_empty());
         assert!(
             backing.servable_asked().is_empty(),
             "the servability read is never consulted for a replicated part"
@@ -808,7 +963,6 @@ mod tests {
                 scanned: 5,
                 reclaimed: 1,
                 reclaimed_orphan: 0,
-                reclaimed_replicated: 0,
                 skipped_live: 1,
                 skipped_replicated: 1,
                 skipped_absent: 1,
@@ -1192,7 +1346,7 @@ mod tests {
                 let refs: Vec<&PartKey> = unbacked_refs.iter().collect();
                 let backing = FakeBacking::unbacked(&refs);
 
-                let graces = ReclaimGraces { failed: GRACE, orphan: orphan_grace, replicated: REPLICATED_GRACE };
+                let graces = ReclaimGraces { failed: FailedGrace(GRACE), orphan: OrphanGrace(orphan_grace) };
                 let report = reclaim_ssd(&scan, &remover, &log, &backing, graces).await.unwrap();
                 expected_removed.sort();
                 proptest::prop_assert_eq!(remover.removed(), expected_removed.clone());
@@ -1201,5 +1355,371 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod failed_reclaim_tests {
+    use super::{BackingLog, FailedReclaimReport, PartRemover, PartStatusAge, ReclaimError, ReclaimLog, reclaim_failed};
+    use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
+    use core::future::Future;
+    use core::str::FromStr;
+    use core::time::Duration;
+    use std::collections::{HashMap, HashSet};
+    use std::io;
+    use std::sync::Mutex;
+
+    const UUID: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+
+    fn part(n: u32) -> PartKey {
+        PartKey::new(ObjectId::from_str(UUID).unwrap(), Version::new(1), PartNumber::new(n))
+    }
+
+    /// A worklist whose cursor actually advances: `mark_failed_reclaimed` removes rows, exactly
+    /// as the store's `reclaimed_at` stamp takes them out of the query. Modelling that is the
+    /// point — a fake that kept returning the same page would hide a pass that never advances.
+    struct FakeLog {
+        candidates: Mutex<Vec<PartKey>>,
+        fail: bool,
+        asked: Mutex<Vec<(u64, u32)>>,
+        marked: Mutex<Vec<u32>>,
+    }
+
+    impl FakeLog {
+        fn of(parts: &[PartKey]) -> Self {
+            Self {
+                candidates: Mutex::new(parts.to_vec()),
+                fail: false,
+                asked: Mutex::new(Vec::new()),
+                marked: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// What actually reached `mark_failed_reclaimed` — the cursor's only advance.
+        fn marked(&self) -> Vec<u32> {
+            let mut out = self.marked.lock().unwrap().clone();
+            out.sort_unstable();
+            out
+        }
+    }
+
+    impl ReclaimLog for FakeLog {
+        type Error = io::Error;
+
+        async fn part_states(&self, _parts: &[PartKey]) -> Result<HashMap<PartKey, PartStatusAge>, io::Error> {
+            Ok(HashMap::new())
+        }
+
+        async fn mark_failed_reclaimed(&self, parts: &[PartKey]) -> Result<(), io::Error> {
+            let gone: Vec<PartKey> = parts.to_vec();
+            self.marked.lock().unwrap().extend(gone.iter().map(|p| p.part().get()));
+            self.candidates.lock().unwrap().retain(|p| !gone.contains(p));
+            Ok(())
+        }
+
+        fn reclaimable_failed_parts(&self, grace: Duration, limit: u32) -> impl Future<Output = Result<Vec<PartKey>, io::Error>> + Send {
+            let outcome = if self.fail {
+                Err(io::Error::other("worklist read failed"))
+            } else {
+                self.asked.lock().unwrap().push((grace.as_secs(), limit));
+                Ok(self.candidates.lock().unwrap().iter().take(limit as usize).cloned().collect())
+            };
+            async move { outcome }
+        }
+    }
+
+    struct FakeBacking {
+        servable: HashSet<PartKey>,
+        fail: bool,
+    }
+
+    impl BackingLog for FakeBacking {
+        type Error = io::Error;
+
+        async fn unbacked_parts(&self, _parts: &[PartKey]) -> Result<HashSet<PartKey>, io::Error> {
+            Ok(HashSet::new())
+        }
+
+        fn servable_parts(&self, _parts: &[PartKey]) -> impl Future<Output = Result<HashSet<PartKey>, io::Error>> + Send {
+            let outcome = if self.fail {
+                Err(io::Error::other("backing read failed"))
+            } else {
+                Ok(self.servable.clone())
+            };
+            async move { outcome }
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRemover {
+        removed: Mutex<Vec<u32>>,
+        /// Part numbers whose unlink fails, and with which errno. The old fake could only
+        /// succeed, which is precisely why a pass aborting on the first failure went unnoticed.
+        refuse: HashMap<u32, io::ErrorKind>,
+    }
+
+    impl FakeRemover {
+        fn refusing(refuse: &[(u32, io::ErrorKind)]) -> Self {
+            Self {
+                removed: Mutex::new(Vec::new()),
+                refuse: refuse.iter().copied().collect(),
+            }
+        }
+    }
+
+    impl PartRemover for FakeRemover {
+        fn unlink_part(&self, part: &PartKey) -> impl Future<Output = io::Result<()>> + Send {
+            let n = part.part().get();
+            let outcome = if let Some(kind) = self.refuse.get(&n) {
+                Err(io::Error::from(*kind))
+            } else {
+                self.removed.lock().unwrap().push(n);
+                Ok(())
+            };
+            async move { outcome }
+        }
+    }
+
+    fn backing(servable: &[PartKey]) -> FakeBacking {
+        FakeBacking {
+            servable: servable.iter().cloned().collect(),
+            fail: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn aged_failed_debris_is_reclaimed_without_a_disk_walk() {
+        // The point of the change: the worklist comes from the database, so finding a handful of
+        // failed parts no longer costs a scan proportional to the node's whole replicated shard.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::default();
+
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(
+            report,
+            FailedReclaimReport {
+                candidates: 2,
+                reclaimed: 2,
+                held_servable: 0,
+                remove_failed: 0,
+                remove_failed_kind: None,
+            }
+        );
+        assert_eq!(*remover.removed.lock().unwrap(), vec![1, 2]);
+        assert_eq!(*log.asked.lock().unwrap(), vec![(3600, 256)], "grace and limit reach the worklist");
+    }
+
+    #[tokio::test]
+    async fn a_second_pass_does_not_re_offer_what_the_first_already_reclaimed() {
+        // THE cursor bug, and it is invisible without this test. Unlinking a part changes
+        // NOTHING about its replication row, so a status-keyed worklist re-selects the same
+        // oldest page every poll: it re-unlinks (idempotent, a no-op), re-counts the parts as
+        // reclaimed, and never reaches anything past the first page. Metrics and logs look
+        // productive the whole time.
+        //
+        // The walk-driven path did not have this bug because it is DISK-keyed — once the
+        // directory is gone the scan simply does not find it. gc_terminal_status_rows would
+        // eventually clear the rows, but at a 7-day retention, so on prod (~4.4k aged failed
+        // rows per node against a 512-row page) this was the normal case, not an edge one.
+        let log = FakeLog::of(&[part(1), part(2), part(3)]);
+        let remover = FakeRemover::default();
+
+        let first = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 2).await.unwrap();
+        assert_eq!(first.reclaimed, 2, "the first page");
+
+        let second = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 2).await.unwrap();
+
+        assert_eq!(second.candidates, 1, "the cursor advanced past the reclaimed page");
+        assert_eq!(*remover.removed.lock().unwrap(), vec![1, 2, 3], "each part is unlinked exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_part_held_as_servable_stays_on_the_worklist() {
+        // Held is not done. An R4 corrupt-live part must be re-offered on the next pass — its
+        // pool copy may be repaired by the re-drive, after which it becomes ordinary debris.
+        // Marking it alongside the reclaimed ones would strand it until the 7-day GC.
+        let log = FakeLog::of(&[part(1)]);
+        let remover = FakeRemover::default();
+
+        let first = reclaim_failed(&log, &backing(&[part(1)]), &remover, Duration::from_hours(1), 8)
+            .await
+            .unwrap();
+        assert_eq!(first.held_servable, 1);
+        assert_eq!(first.reclaimed, 0);
+
+        let second = reclaim_failed(&log, &backing(&[part(1)]), &remover, Duration::from_hours(1), 8)
+            .await
+            .unwrap();
+        assert_eq!(second.candidates, 1, "a held part is still a candidate next pass");
+        assert!(remover.removed.lock().unwrap().is_empty(), "and was never unlinked");
+    }
+    #[tokio::test]
+    async fn a_servable_versions_part_is_held_not_deleted() {
+        // THE guard (R4). A `failed` part whose object version is still servable is not debris:
+        // the pool copy is corrupt and this SSD copy is the object's last good source. The
+        // judgement is delegated to BackingLog::servable_parts rather than re-expressed in the
+        // worklist query, precisely so it cannot drift from the two places that already carry it.
+        let log = FakeLog::of(&[part(1), part(2), part(3)]);
+        let remover = FakeRemover::default();
+
+        let report = reclaim_failed(&log, &backing(&[part(2)]), &remover, Duration::from_hours(1), 256)
+            .await
+            .unwrap();
+
+        assert_eq!(report.held_servable, 1);
+        assert_eq!(report.reclaimed, 2);
+        assert_eq!(*remover.removed.lock().unwrap(), vec![1, 3], "the servable part survived");
+    }
+
+    #[tokio::test]
+    async fn a_failing_backing_read_removes_nothing() {
+        // Without the servability answer every candidate is unjudged, so proceeding could delete
+        // a live object's last good copy. The pass must remove NOTHING rather than treat an
+        // unanswered question as permission.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::default();
+        let failing = FakeBacking {
+            servable: HashSet::new(),
+            fail: true,
+        };
+
+        let err = reclaim_failed(&log, &failing, &remover, Duration::from_hours(1), 256).await.unwrap_err();
+
+        assert!(matches!(err, ReclaimError::Backing(_)));
+        assert!(remover.removed.lock().unwrap().is_empty(), "nothing may be unlinked unjudged");
+    }
+
+    #[tokio::test]
+    async fn an_empty_worklist_never_asks_about_backing() {
+        // The steady state on a healthy node, and it must cost one query, not two.
+        let log = FakeLog::of(&[]);
+        let remover = FakeRemover::default();
+        let never = FakeBacking {
+            servable: HashSet::new(),
+            fail: true,
+        };
+
+        let report = reclaim_failed(&log, &never, &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(report, FailedReclaimReport::default());
+    }
+
+    #[tokio::test]
+    async fn a_failing_worklist_read_removes_nothing() {
+        let log = FakeLog {
+            candidates: Mutex::new(vec![part(1)]),
+            fail: true,
+            asked: Mutex::new(Vec::new()),
+            marked: Mutex::new(Vec::new()),
+        };
+        let remover = FakeRemover::default();
+
+        let err = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ReclaimError::Log(_)));
+        assert!(remover.removed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_unremovable_part_does_not_stop_the_rest_of_the_page() {
+        // The bug: `?` on the unlink returned BEFORE `mark_failed_reclaimed`, which is the only
+        // thing that advances this cursor. One bad inode pinned the head of every later page, so
+        // the node's failed debris was never reclaimed — and since the residency guard, never
+        // GC'd either. Worse than the evictor's version, because parts unlinked earlier in the
+        // same page were left unmarked and re-unlinked on every subsequent poll.
+        let log = FakeLog::of(&[part(1), part(2), part(3)]);
+        let remover = FakeRemover::refusing(&[(2, io::ErrorKind::PermissionDenied)]);
+
+        // Must not be an Err: an unlink failure is a skip, not a pass failure.
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(report.candidates, 3);
+        assert_eq!(report.reclaimed, 2, "the two removable parts still go");
+        assert_eq!(report.remove_failed, 1);
+        assert_eq!(report.remove_failed_kind, Some(io::ErrorKind::PermissionDenied));
+        assert_eq!(remover.removed.lock().unwrap().clone(), vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn the_parts_that_were_unlinked_are_still_marked_when_another_fails() {
+        // The cursor half, which is the part that made this permanent: marking is what takes a
+        // row off `WHERE reclaimed_at IS NULL`. Aborting the pass left parts 1 and 3 unlinked but
+        // unmarked, so the next poll re-offered and re-unlinked them, forever.
+        let log = FakeLog::of(&[part(1), part(2), part(3)]);
+        let remover = FakeRemover::refusing(&[(2, io::ErrorKind::PermissionDenied)]);
+
+        reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(log.marked(), vec![1, 3], "unlinked parts must be marked so the cursor moves");
+    }
+
+    #[tokio::test]
+    async fn a_page_where_every_unlink_fails_marks_nothing_and_reports_it() {
+        // Terminates rather than looping, and says why: `remove_failed == candidates` with
+        // nothing reclaimed is the signature of a pinned cursor.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::refusing(&[(1, io::ErrorKind::ReadOnlyFilesystem), (2, io::ErrorKind::ReadOnlyFilesystem)]);
+
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!((report.candidates, report.reclaimed, report.remove_failed), (2, 0, 2));
+        assert!(log.marked().is_empty(), "nothing was removed, so nothing may be marked");
+    }
+
+    #[tokio::test]
+    async fn the_reported_errno_ranks_by_what_needs_a_human() {
+        // A transient DirectoryNotEmpty (the api publishing into a directory being removed) must
+        // not mask an EROFS behind it just because the worklist ordered it first.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::refusing(&[(1, io::ErrorKind::DirectoryNotEmpty), (2, io::ErrorKind::ReadOnlyFilesystem)]);
+
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(report.remove_failed_kind, Some(io::ErrorKind::ReadOnlyFilesystem));
+    }
+
+    #[tokio::test]
+    async fn a_servable_part_is_still_held_and_is_not_counted_as_a_failure() {
+        // The R4 guard and the new skip must stay distinguishable: held_servable is a durability
+        // signal, remove_failed is an I/O one, and conflating them would hide either.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::refusing(&[(2, io::ErrorKind::PermissionDenied)]);
+
+        let report = reclaim_failed(&log, &backing(&[part(1)]), &remover, Duration::from_hours(1), 256)
+            .await
+            .unwrap();
+
+        assert_eq!((report.held_servable, report.remove_failed, report.reclaimed), (1, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_flock_contention_does_not_mask_a_mount_fault() {
+        // WouldBlock is the api holding the part-publish flock — routine, and by design reported
+        // as an ordinary removal failure. Before this it was NOT demoted, so one publish race on
+        // the oldest part hid an EROFS behind it and the operator saw a promotion race where the
+        // mount had gone read-only.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::refusing(&[(1, io::ErrorKind::WouldBlock), (2, io::ErrorKind::ReadOnlyFilesystem)]);
+
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert_eq!(report.remove_failed_kind, Some(io::ErrorKind::ReadOnlyFilesystem));
+    }
+
+    #[tokio::test]
+    async fn a_pass_of_only_routine_races_still_reports_one() {
+        // Demoting must not mean discarding: with nothing worse to promote, the transient is
+        // still what happened and still the reason nothing was reclaimed.
+        let log = FakeLog::of(&[part(1), part(2)]);
+        let remover = FakeRemover::refusing(&[(1, io::ErrorKind::WouldBlock), (2, io::ErrorKind::DirectoryNotEmpty)]);
+
+        let report = reclaim_failed(&log, &backing(&[]), &remover, Duration::from_hours(1), 256).await.unwrap();
+
+        assert!(report.remove_failed_kind.is_some(), "a transient-only pass must still name a kind");
+        assert_eq!(report.remove_failed, 2);
     }
 }

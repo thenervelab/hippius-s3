@@ -2,11 +2,18 @@
 
 Clients hedge UploadPart with concurrent duplicate PUTs of the same
 (object, version, part_number); all attempts share ONE part dir on the SSD.
-Chunk writes are atomic tmp+rename and byte-identical across duplicates
-(deterministic AES-GCM nonces), so concurrent writers are harmless — but a
-loser that fails/cancels AFTER another attempt published (meta.json + parts
-row + 200 to the client) must NOT delete the shared part dir: that destroys
-acknowledged data.
+Chunk writes are atomic tmp+rename, so a concurrent writer cannot produce a
+torn file — but a loser that fails/cancels AFTER another attempt published
+(meta.json + parts row + 200 to the client) must NOT delete the shared part
+dir, and must not overwrite it either: both destroy acknowledged data.
+
+Duplicates are NOT byte-identical. Nonces are random per chunk as of the
+change this file ships with, so B's encryption of even the SAME plaintext
+differs from A's on disk; and the AAD binds (bucket, object, part, chunk)
+rather than attempt identity, so B's bytes still decrypt cleanly inside A's
+part. The loser therefore writes DISTINCT plaintext (`LOSER_BODY`): it makes
+a surviving loser chunk unambiguous rather than something the reader has to
+argue is or is not a re-encryption of the same content.
 
 These tests publish a part as attempt A, then drive attempt B through each
 failure path and assert A's published data survives B's cleanup.
@@ -14,6 +21,8 @@ failure path and assert A's published data survives B's cleanup.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,11 +33,17 @@ import pytest
 
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.config import get_config
+from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.writer.types import AppendPreconditionFailed
 
 
 PART_BODY = b"abcdefgh"  # 2 chunks at chunk_size=4
+SUITE_ID = "hip-enc/aes256gcm"
+TEST_DEK = b"\x00" * 32  # matches _make_writer's stubbed _ensure_and_get_v5_dek
+# One chunk, and deliberately NOT a prefix of PART_BODY: a loser chunk that survived
+# on disk has to be distinguishable from the winner's by plaintext alone.
+LOSER_BODY = b"ZZZZ"
 
 
 class DummyRedis:
@@ -91,11 +106,70 @@ def _read_chunks(fs_store: FileSystemPartsStore, object_id: str, version: int, p
     return {p.name: p.read_bytes() for p in part_dir.glob("chunk_*.bin")}
 
 
+def _read_plaintext(
+    fs_store: FileSystemPartsStore,
+    object_id: str,
+    version: int,
+    part: int,
+    *,
+    upload_id: str,
+) -> bytes:
+    """Decrypt the published part exactly as a reader would: meta.json says how many chunks.
+
+    Assert on THIS, not on ciphertext bytes — nonces are random since d5e6b939, so two attempts
+    encrypting the same plaintext produce different ciphertext, and the corruption this file
+    guards against is wrong PLAINTEXT under a valid AEAD tag.
+    """
+    part_dir = Path(fs_store.part_path(object_id, version, part))
+    meta = json.loads((part_dir / "meta.json").read_text())
+    adapter = CryptoService.get_adapter(SUITE_ID)
+    out = bytearray()
+    for index in range(int(meta["num_chunks"])):
+        out += adapter.decrypt_chunk(
+            (part_dir / f"chunk_{index}.bin").read_bytes(),
+            key=TEST_DEK,
+            bucket_id="bucket",
+            object_id=object_id,
+            part_number=part,
+            chunk_index=index,
+            upload_id=upload_id,
+        )
+    return bytes(out)
+
+
+class _WriteSignallingStore(FileSystemPartsStore):
+    """The real store, plus an event fired once a chunk write has landed on disk.
+
+    Lets a test order an attempt's failure strictly AFTER its write completed — the window
+    consumer cancellation cannot reach, because by then the bytes are already on the disk.
+    Both write entry points are hooked so the same test drives either implementation.
+    """
+
+    def __init__(self, root: str) -> None:
+        super().__init__(root)
+        self.chunk_written = asyncio.Event()
+
+    async def set_chunk(self, *args: Any, **kwargs: Any) -> None:
+        await super().set_chunk(*args, **kwargs)
+        self.chunk_written.set()
+
+    async def stage_chunk(self, *args: Any, **kwargs: Any) -> None:
+        await super().stage_chunk(*args, **kwargs)
+        self.chunk_written.set()
+
+
 @pytest.fixture()
 def small_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = get_config()
     monkeypatch.setattr(cfg, "object_chunk_size_bytes", 4)
     monkeypatch.setattr(cfg, "cache_ttl_seconds", 60)
+    # These tests choreograph on write timing (a chunk is on disk before the body yields
+    # the next piece). The encrypt pipeline delays writes by up to `lookahead` chunks, so
+    # pin lookahead=1 — drain-after-every-push, the serial-equivalent mode — which
+    # reconstructs the exact interleavings these races need. The invariants proven here
+    # (attempt-unique staged names; late writes can't clobber a published part) are
+    # lookahead-independent: only staging/publish provide durability, never write order.
+    monkeypatch.setattr(cfg, "write_pipeline_lookahead", 1)
     monkeypatch.setattr("hippius_s3.writer.object_writer.get_config", lambda: cfg)
 
 
@@ -111,7 +185,7 @@ async def test_mpu_duplicate_failure_after_publish_preserves_part(tmp_path, monk
     assert set(published) == {"chunk_0.bin", "chunk_1.bin"}
 
     async def dying_body() -> AsyncIterator[bytes]:
-        yield PART_BODY[:4]
+        yield LOSER_BODY
         raise ConnectionError("client disconnected mid-stream")
 
     with pytest.raises(ConnectionError):
@@ -135,6 +209,89 @@ async def test_mpu_duplicate_failure_after_publish_preserves_part(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_mpu_duplicate_cancellation_after_publish_preserves_part(tmp_path, monkeypatch, small_chunks):
+    """The same guarantee when the loser is CANCELLED rather than raising a plain exception.
+
+    This is the case that actually happens in production. A client that disconnects mid-body has
+    its request task cancelled, and `asyncio.CancelledError` derives from `BaseException`, so an
+    `except Exception` handler does not run at all — the consumer is left pending holding queued
+    chunks it then writes into the SHARED part dir on a later event-loop turn, overwriting an
+    attempt that already returned 200.
+
+    Distinct from the sibling test above by the exception TYPE alone, which is the whole point:
+    that one passes against an `except Exception` handler and this one does not.
+    """
+    object_id = str(uuid.uuid4())
+    fs_store = FileSystemPartsStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    await _publish_attempt_a(writer, object_id=object_id, object_version=1, part_number=1, upload_id="upload")
+    published = _read_chunks(fs_store, object_id, 1, 1)
+
+    async def cancelled_body() -> AsyncIterator[bytes]:
+        yield LOSER_BODY
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await writer.mpu_upload_part_stream(
+            upload_id="upload",
+            object_id=object_id,
+            object_version=1,
+            bucket_name="bucket",
+            bucket_id="bucket",
+            account_address="acct",
+            part_number=1,
+            body_iter=cancelled_body(),
+        )
+
+    # Give any consumer the handler failed to cancel the event-loop turns it would need to
+    # drain its queue onto disk. Without the fix this is where the overwrite lands.
+    await asyncio.sleep(0.05)
+
+    meta = await fs_store.get_meta(object_id, 1, 1)
+    assert meta is not None, "published meta.json was destroyed by the cancelled loser"
+    assert int(meta["num_chunks"]) == 2
+    assert _read_chunks(fs_store, object_id, 1, 1) == published, (
+        "a cancelled attempt's queued chunks were written into the published part dir"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_attempt_leaves_no_pending_consumer(tmp_path, monkeypatch, small_chunks):
+    """The leak half: cancellation must not strand the consumer task holding its queue.
+
+    The `None` sentinel that retires the consumer is only sent on the success path, so a handler
+    that never runs leaves the task blocked on `write_queue.get()` for the life of the process —
+    once per cancelled UploadPart, which is once per client disconnect.
+    """
+    object_id = str(uuid.uuid4())
+    fs_store = FileSystemPartsStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    before = {t for t in asyncio.all_tasks()}
+
+    async def cancelled_body() -> AsyncIterator[bytes]:
+        yield LOSER_BODY
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await writer.mpu_upload_part_stream(
+            upload_id="upload",
+            object_id=object_id,
+            object_version=1,
+            bucket_name="bucket",
+            bucket_id="bucket",
+            account_address="acct",
+            part_number=1,
+            body_iter=cancelled_body(),
+        )
+
+    await asyncio.sleep(0.05)
+    leaked = [t for t in asyncio.all_tasks() if t not in before and not t.done()]
+    assert not leaked, f"cancelled UploadPart stranded {len(leaked)} pending task(s): {leaked}"
+
+
+@pytest.mark.asyncio
 async def test_failed_attempt_preserves_unpublished_chunks(tmp_path, monkeypatch, small_chunks):
     """B fails while A is mid-write (A's chunks on disk, meta NOT yet written): A's chunks survive.
 
@@ -152,7 +309,7 @@ async def test_failed_attempt_preserves_unpublished_chunks(tmp_path, monkeypatch
     assert not (part_dir / "meta.json").exists()
 
     async def dying_body() -> AsyncIterator[bytes]:
-        yield PART_BODY[:4]
+        yield LOSER_BODY
         raise ConnectionError("client disconnected mid-stream")
 
     with pytest.raises(ConnectionError):
@@ -221,6 +378,204 @@ async def test_trim_failure_is_loud_but_publish_succeeds(tmp_path, monkeypatch, 
     assert (part_dir / "meta.json").exists()
     errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert any(object_id in r.getMessage() for r in errors), "surviving tail must be loud"
+
+
+@pytest.mark.asyncio
+async def test_interleaved_attempt_write_landing_after_publish_leaves_plaintext_intact(
+    tmp_path, monkeypatch, small_chunks
+):
+    """B is mid-stream while A publishes; B's next chunk lands AFTER A's 200, then B dies.
+
+    The case consumer cancellation cannot reach: the write is already on disk before the
+    failure propagates, so nothing the failure path does can take it back. Two attempts must
+    therefore never write the same file names in the first place.
+    """
+    object_id = str(uuid.uuid4())
+    fs_store = _WriteSignallingStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    b_first_chunk_queued = asyncio.Event()
+    a_published = asyncio.Event()
+
+    async def b_body() -> AsyncIterator[bytes]:
+        yield b"ZZZZ"  # chunk 0, while A has not published yet
+        b_first_chunk_queued.set()
+        await a_published.wait()
+        fs_store.chunk_written.clear()
+        yield b"YYYY"  # chunk 1, lands after A's part was published and acknowledged
+        await fs_store.chunk_written.wait()
+        raise ConnectionError("client disconnected mid-stream")
+
+    b_task = asyncio.create_task(
+        writer.mpu_upload_part_stream(
+            upload_id="upload",
+            object_id=object_id,
+            object_version=1,
+            bucket_name="bucket",
+            bucket_id="bucket",
+            account_address="acct",
+            part_number=1,
+            body_iter=b_body(),
+        )
+    )
+    await b_first_chunk_queued.wait()
+
+    await _publish_attempt_a(writer, object_id=object_id, object_version=1, part_number=1, upload_id="upload")
+    a_published.set()
+
+    with pytest.raises(ConnectionError):
+        await b_task
+
+    assert _read_plaintext(fs_store, object_id, 1, 1, upload_id="upload") == PART_BODY
+
+
+@pytest.mark.asyncio
+async def test_later_attempt_replaces_the_whole_part_not_a_prefix_of_it(tmp_path, monkeypatch, small_chunks):
+    """A duplicate that SUCCEEDS after A must leave its own complete set, never a mixture."""
+    object_id = str(uuid.uuid4())
+    fs_store = FileSystemPartsStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    await _publish_attempt_a(writer, object_id=object_id, object_version=1, part_number=1, upload_id="upload")
+
+    async def b_body() -> AsyncIterator[bytes]:
+        yield b"wxyz"  # 1 chunk — shorter than A's 2, so a prefix-overwrite would strand a tail
+
+    res = await writer.mpu_upload_part_stream(
+        upload_id="upload",
+        object_id=object_id,
+        object_version=1,
+        bucket_name="bucket",
+        bucket_id="bucket",
+        account_address="acct",
+        part_number=1,
+        body_iter=b_body(),
+    )
+
+    assert res.size_bytes == 4
+    part_dir = Path(fs_store.part_path(object_id, 1, 1))
+    assert sorted(p.name for p in part_dir.iterdir()) == ["chunk_0.bin", "meta.json"]
+    assert _read_plaintext(fs_store, object_id, 1, 1, upload_id="upload") == b"wxyz"
+
+
+@pytest.mark.asyncio
+async def test_partial_publish_unpublishes_rather_than_leaving_a_mixed_set(tmp_path, monkeypatch, small_chunks):
+    """A publish that fails part-way must remove meta.json, not leave a half-swapped part readable.
+
+    Renaming a set of files is not atomic, so an FS error mid-publish CAN leave one attempt's
+    chunks next to another's. That state must at least be invisible: with meta.json gone the
+    reader treats the part as a cache miss and the drain as IncompleteSource, instead of both
+    serving a mixture that AEAD-verifies as the wrong plaintext.
+    """
+    object_id = str(uuid.uuid4())
+    fs_store = FileSystemPartsStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    async def a_body() -> AsyncIterator[bytes]:
+        yield b"abcdefghijkl"  # 3 chunks
+
+    await writer.mpu_upload_part_stream(
+        upload_id="upload",
+        object_id=object_id,
+        object_version=1,
+        bucket_name="bucket",
+        bucket_id="bucket",
+        account_address="acct",
+        part_number=1,
+        body_iter=a_body(),
+    )
+
+    # Real-FS fault injection: a directory where chunk_2.bin belongs fails the third rename
+    # (and, before this change, the third chunk write) after the first two already landed.
+    part_dir = Path(fs_store.part_path(object_id, 1, 1))
+    (part_dir / "chunk_2.bin").unlink()
+    (part_dir / "chunk_2.bin").mkdir()
+
+    async def b_body() -> AsyncIterator[bytes]:
+        yield b"MMMMNNNNOOOO"
+
+    with pytest.raises(OSError):
+        await writer.mpu_upload_part_stream(
+            upload_id="upload",
+            object_id=object_id,
+            object_version=1,
+            bucket_name="bucket",
+            bucket_id="bucket",
+            account_address="acct",
+            part_number=1,
+            body_iter=b_body(),
+        )
+
+    assert not (part_dir / "meta.json").exists(), "a half-published part must not stay readable"
+
+
+@pytest.mark.asyncio
+async def test_failed_attempt_leaves_no_staged_files_behind(tmp_path, monkeypatch, small_chunks):
+    """A dying attempt cleans up its own in-progress files — they are private to it, so unlike
+    the published chunk names there is no ambiguity about whose data they are."""
+    object_id = str(uuid.uuid4())
+    fs_store = _WriteSignallingStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    await _publish_attempt_a(writer, object_id=object_id, object_version=1, part_number=1, upload_id="upload")
+
+    async def dying_body() -> AsyncIterator[bytes]:
+        fs_store.chunk_written.clear()
+        yield b"ZZZZ"
+        await fs_store.chunk_written.wait()
+        raise ConnectionError("client disconnected mid-stream")
+
+    with pytest.raises(ConnectionError):
+        await writer.mpu_upload_part_stream(
+            upload_id="upload",
+            object_id=object_id,
+            object_version=1,
+            bucket_name="bucket",
+            bucket_id="bucket",
+            account_address="acct",
+            part_number=1,
+            body_iter=dying_body(),
+        )
+
+    part_dir = Path(fs_store.part_path(object_id, 1, 1))
+    assert sorted(p.name for p in part_dir.iterdir()) == ["chunk_0.bin", "chunk_1.bin", "meta.json"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_attempt_still_discards_its_staged_chunks(tmp_path, monkeypatch, small_chunks):
+    """Cancellation is a BaseException, so `except Exception` would skip cleanup for the very
+    case whose staged bytes most need dropping — and nothing else can reap an unpublished part
+    dir before the drain's 24h orphan sweep."""
+    object_id = str(uuid.uuid4())
+    fs_store = _WriteSignallingStore(str(tmp_path))
+    writer = _make_writer(DummyPool(), fs_store, monkeypatch)
+
+    async def stalling_body() -> AsyncIterator[bytes]:
+        fs_store.chunk_written.clear()
+        yield b"ZZZZ"
+        await fs_store.chunk_written.wait()
+        await asyncio.sleep(30)  # still streaming when the client goes away
+        yield b"YYYY"
+
+    task = asyncio.create_task(
+        writer.mpu_upload_part_stream(
+            upload_id="upload",
+            object_id=object_id,
+            object_version=1,
+            bucket_name="bucket",
+            bucket_id="bucket",
+            account_address="acct",
+            part_number=1,
+            body_iter=stalling_body(),
+        )
+    )
+    await fs_store.chunk_written.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    part_dir = Path(fs_store.part_path(object_id, 1, 1))
+    assert list(part_dir.iterdir()) == [], "a cancelled attempt leaves nothing behind"
 
 
 class _AppendFakeConn:

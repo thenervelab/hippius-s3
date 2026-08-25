@@ -14,8 +14,25 @@ SELECT o.object_id,
        o.created_at,
        ov.md5_hash,
        ov.status,
-       ov.multipart
-FROM objects o,
+       ov.multipart,
+       ov.body_blake3
+FROM (
+    SELECT o.object_id, o.object_key, o.created_at, o.current_object_version, o.bucket_id
+    FROM objects o
+    WHERE o.bucket_id = $1
+      AND o.deleted_at IS NULL
+      AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
+      AND ($3::text IS NULL OR o.object_key >= $3::text)
+      AND ($5::text IS NULL OR o.object_key < $5::text COLLATE "C")
+    UNION ALL
+    SELECT o.object_id, n.object_key, n.created_at, o.current_object_version, n.bucket_id
+    FROM object_names n
+    JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
+    WHERE n.bucket_id = $1
+      AND ($2::text IS NULL OR n.object_key LIKE $2::text || '%')
+      AND ($3::text IS NULL OR n.object_key >= $3::text)
+      AND ($5::text IS NULL OR n.object_key < $5::text COLLATE "C")
+) o,
      LATERAL (
          -- Skip incomplete multipart placeholders (InitiateMultipartUpload without Complete)
          SELECT v.object_version,
@@ -23,7 +40,8 @@ FROM objects o,
                 v.content_type,
                 v.md5_hash,
                 v.status,
-                v.multipart
+                v.multipart,
+                v.body_blake3
          FROM object_versions v
          WHERE v.object_id = o.object_id
            AND v.object_version <= o.current_object_version
@@ -37,7 +55,6 @@ WHERE o.bucket_id = $1
   -- LS-2: explicit exclusive upper bound so the (bucket_id, object_key) index range is bounded on
   -- both ends even under a generic prepared plan (a sparse prefix no longer scans to partition end).
   AND ($5::text IS NULL OR o.object_key < $5::text COLLATE "C")
-  AND o.deleted_at IS NULL
 -- DB is C-collation; an explicit COLLATE here would defeat the (bucket_id, object_key) index ordered scan.
 ORDER BY o.object_key
 LIMIT $4::int

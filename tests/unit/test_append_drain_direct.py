@@ -34,6 +34,7 @@ def _request(pool: Any) -> MagicMock:
     req.app.state.postgres_pool = pool
     req.app.state.fs_store = MagicMock()
     req.state.account.main_account = ADDRESS
+    req.state.main_account_id = ADDRESS
     req.state.seed_phrase = "seed words"
     req.state.ray_id = "ray-123"
     return req

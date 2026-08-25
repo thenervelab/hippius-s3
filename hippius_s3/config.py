@@ -56,10 +56,8 @@ class Config:
     frontend_hmac_secret: str = env("FRONTEND_HMAC_SECRET")
     # Separate secret for the /admin/* account suspend/reactivate/purge endpoints — the
     # admin surface can destroy whole accounts, so it gets its own credential. Verified
-    # at the gateway (fail-closed when empty); declared here so the API side can share
-    # test tooling and docs generation.
+    # by admin_hmac middleware (fail-closed when empty).
     admin_hmac_secret: str = env("HIPPIUS_ADMIN_HMAC_SECRET:", convert=str)
-    rate_limit_per_minute: int = env("RATE_LIMIT_PER_MINUTE", convert=int)
     max_request_size_mb: int = env("MAX_REQUEST_SIZE_MB", convert=int)
 
     # Logging
@@ -77,7 +75,6 @@ class Config:
     enable_audit_logging: bool = env("ENABLE_AUDIT_LOGGING", convert=lambda x: x.lower() == "true")
     enable_api_docs: bool = env("ENABLE_API_DOCS", convert=lambda x: x.lower() == "true")
     enable_request_profiling: bool = env("ENABLE_REQUEST_PROFILING:false", convert=lambda x: x.lower() == "true")
-    enable_banhammer: bool = env("ENABLE_BANHAMMER:true", convert=lambda x: x.lower() == "true")
     enable_public_read: bool = env("HIPPIUS_ENABLE_PUBLIC_READ:true", convert=lambda x: x.lower() == "true")
     public_bucket_cache_ttl_seconds: int = env("PUBLIC_BUCKET_CACHE_TTL_SECONDS:60", convert=int)
     enable_bypass_credit_check: bool = env("HIPPIUS_BYPASS_CREDIT_CHECK:false", convert=lambda x: x.lower() == "true")
@@ -122,6 +119,41 @@ class Config:
 
     # Redis for queues (persistent)
     redis_queues_url: str = env("REDIS_QUEUES_URL:redis://127.0.0.1:6382/0")
+
+    # Redis for the ACL cache (formerly gateway-side)
+    redis_acl_url: str = env("REDIS_ACL_URL:redis://redis-acl:6379/0")
+    acl_cache_ttl_seconds: int = env("ACL_CACHE_TTL_SECONDS:300", convert=int)
+
+    # How long a positive can_upload result is cached per main_account. Kept short so an account that
+    # exhausts its credit mid-burst stops slipping uploads through the cache within seconds.
+    can_upload_cache_ttl_seconds: int = env("CAN_UPLOAD_CACHE_TTL_SECONDS:10", convert=int)
+    # A transient billing-service failure (the upstream balance lookup blipped) comes back as
+    # result=False with a distinct error string, NOT a genuine "out of credit" denial. Retry the
+    # can_upload call this many times before surfacing anything; if it still fails, we return a
+    # retryable 503 SlowDown rather than a hard 402 that clients read as "insufficient funds".
+    can_upload_transient_retries: int = env("CAN_UPLOAD_TRANSIENT_RETRIES:2", convert=int)
+    can_upload_transient_retry_delay_seconds: float = env("CAN_UPLOAD_TRANSIENT_RETRY_DELAY_SECONDS:0.4", convert=float)
+
+    # ATS (Apache Traffic Server) reverse-proxy cache endpoints (CSV). When ATS_CACHE_ENDPOINT is unset,
+    # all PURGE + public Cache-Control logic becomes a no-op — safe default for local dev.
+    # Multiple endpoints are purged in parallel so every ATS pod's cache stays consistent.
+    ats_cache_endpoints: list[str] = env("ATS_CACHE_ENDPOINT:", convert=_parse_csv_urls)
+
+    # Host sent on PURGE requests. ATS keys its cache on the remapped upstream
+    # (cachekey.so), so the key is identical for every public alias — any host
+    # ATS can remap to this app's pool works. Must match the pool: the
+    # cache boxes also serve staging on a different upstream, so a staging
+    # deployment sets this to its own public host. NOT derived from the request:
+    # internal callers (JuiceFS service DNS, NodePort writers) carry an
+    # unmappable Host that ATS rejects as ERR_INVALID_URL.
+    ats_purge_host: str = env("ATS_PURGE_HOST:s3.hippius.com")
+
+    # Shared secret stamped on the X-Hippius-Auth-Probe header by an ATS header_rewrite
+    # rule on the auth-host remap. The app short-circuits with 200 OK when the
+    # header value matches (constant-time compare). Empty value disables the feature
+    # entirely — auth_probe_middleware becomes a pass-through. Required for prod use.
+    # repr=False so a stray str(config)/print(config) doesn't leak the secret.
+    auth_probe_secret: str = env("HIPPIUS_AUTH_PROBE_SECRET:", repr=False)
 
     # Database connection pool configuration
     db_pool_min_size: int = env("API_DB_POOL_MIN_SIZE:5", convert=int)
@@ -303,6 +335,16 @@ class Config:
     # CF-3: depth of the encrypt producer/consumer queue per streaming write. Peak buffered memory
     # per PUT ≈ chunk_size × this. Exposed so it can move with chunk size (CF-1).
     write_queue_maxsize: int = env("HIPPIUS_WRITE_QUEUE_MAXSIZE:16", convert=int)
+    # WU-2: how many chunks the streaming writer may hold in flight (submitted to the
+    # crypto/hash pools, not yet drained to the write queue) so socket reads overlap
+    # MD5+encrypt of earlier chunks. Each in-flight chunk can pin plaintext AND (once
+    # encrypted) ciphertext, so extra peak memory per PUT ≈ 2 × chunk_size × this, ON
+    # TOP of the write queue above. 1 = no look-ahead (serial-equivalent, still off-loop).
+    write_pipeline_lookahead: int = env("HIPPIUS_WRITE_PIPELINE_LOOKAHEAD:4", convert=int)
+    # Per-connection body buffer uvicorn allows before pausing the transport (see
+    # uvicorn_tuning.raise_receive_high_water). 0 = leave uvicorn's stock 64 KiB.
+    # Peak extra memory ≈ this × concurrent in-flight uploads per worker.
+    uvicorn_high_water_limit: int = env("HIPPIUS_UVICORN_HIGH_WATER_LIMIT:1048576", convert=int)
     # RD-2 / WU-1: worker threads for the dedicated AES-GCM encrypt/decrypt pool (off the event loop).
     crypto_pool_workers: int = env("HIPPIUS_CRYPTO_POOL_WORKERS:4", convert=int)
     # NET-3: keep the expensive mTLS KMS connection warm across sparse/bursty calls.
@@ -370,6 +412,85 @@ class Config:
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
     object_cache_fallback_dir: str = env("HIPPIUS_OBJECT_CACHE_FALLBACK_DIR:", convert=str)
+    # Copy a pool-served chunk onto this node's local NVMe so the next read of it comes off
+    # flash (~6 ms/chunk) instead of CephFS (~40 ms). OFF by default and deliberately so: a
+    # promoted copy is only reclaimable by a drain-agent evictor running on the same node, so
+    # enabling it where no evictor runs would fill the disk with copies nothing owns.
+    object_cache_promote_on_read: bool = env(
+        "HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ:false", convert=lambda x: x.lower() == "true"
+    )
+    # Free-space floor below which a read stops promoting onto local flash. Promotion is the
+    # only unthrottled writer to the ingest SSD and it shares that mount with ingest — on an
+    # ingest node HIPPIUS_OBJECT_CACHE_DIR is the drain agent's CEPHOR_SSD_ROOT — so warming
+    # the cache must yield to accepting writes.
+    #
+    # 0.175 is not arbitrary: it has to sit strictly INSIDE the drain evictor's hysteresis
+    # band, between its reserve (150 permille) and its target (reserve + headroom = 200
+    # permille). Equal to the target it chatters; above the target it deadlocks, because the
+    # evictor only frees back to its target and could never restore enough for promotion to
+    # resume. See FreeSpaceGate and test_promotion_pressure_guard.py.
+    promote_min_free_ratio: float = env("HIPPIUS_PROMOTE_MIN_FREE_RATIO:0.175", convert=float)
+    # Read a chunk from the peer node that holds it on flash (~6 ms + ~1 ms network) before
+    # falling through to the CephFS pool (~40 ms). Resolved per PART: only ~2% of multi-part
+    # objects have every part on one node, so there is no single node to route a request to.
+    # OFF by default; needs NODE_NAME + POD_IP so peers can find each other.
+    peer_fetch_enabled: bool = env("HIPPIUS_PEER_FETCH_ENABLED:false", convert=lambda x: x.lower() == "true")
+    # How long a pod's published peer address stays valid. The TTL IS the liveness signal, so
+    # it must exceed the refresh interval comfortably or a live pod flickers out of the map.
+    peer_registry_ttl_seconds: int = env("HIPPIUS_PEER_REGISTRY_TTL_SECONDS:90", convert=int)
+    peer_registry_refresh_seconds: int = env("HIPPIUS_PEER_REGISTRY_REFRESH_SECONDS:30", convert=int)
+    # Bound on a peer read. A slow peer must lose to the pool quickly rather than adding its
+    # latency on top of the pool read that follows.
+    # The fallback costs ~40 ms (a CephFS pool read), so this is a loss-cut, not a deadline: a
+    # peer that has not answered in 0.5s is already an order of magnitude worse than giving up,
+    # and waiting the old 2.0s meant paying 50x the fallback before then ALSO paying the
+    # fallback. Generous against a ~7 ms healthy peer read.
+    peer_fetch_timeout_seconds: float = env("HIPPIUS_PEER_FETCH_TIMEOUT_SECONDS:0.5", convert=float)
+    # An OVERALL bound on one peer fetch, connect included. httpx has no such thing: its
+    # `Timeout` carries connect/read/write/pool only, and `read` bounds the gap BETWEEN body
+    # pieces — so under the value above alone, a peer sending one piece every 0.4s holds the
+    # connection and a growing buffer with no limit at all.
+    # Deliberately NOT the same value: 0.5s of silence is a dead peer, but 0.5s to deliver a
+    # whole 4 MiB chunk is a peer doing its job, so reusing the loss-cut as a deadline would
+    # abort healthy large-chunk fetches. This is a backstop against a peer that never finishes,
+    # not a second loss-cut.
+    peer_fetch_deadline_seconds: float = env("HIPPIUS_PEER_FETCH_DEADLINE_SECONDS:2.0", convert=float)
+    # Per-peer fanout: concurrent fetches this pod will have in flight to any ONE peer, and
+    # concurrent peer requests this pod will SERVE. Both are needed — the client cap bounds
+    # what one pod sends, but five pods each within their own cap still add up at the peer,
+    # so the serving side sheds with 503 to protect its own ingest.
+    # Must be >= http_stream_prefetch_chunks. Every chunk of one PART resolves to the same
+    # peer, so a cap below the prefetch depth makes a single reader shed its own window to the
+    # pool and book it as `client_cap` contention that does not exist. `effective_max_inflight`
+    # enforces that floor at wiring time, so a stale value degrades to a warning, not a
+    # silently halved peer tier.
+    peer_fetch_max_inflight: int = env("HIPPIUS_PEER_FETCH_MAX_INFLIGHT:16", convert=int)
+    peer_serve_max_inflight: int = env("HIPPIUS_PEER_SERVE_MAX_INFLIGHT:16", convert=int)
+    # SERVE this node's flash to peers. Deliberately its own flag rather than a rider on
+    # peer_fetch_enabled, which governs what this pod READS. Coupling them is how the serve
+    # route came to be mounted on every api pod while the flag said the feature was off — and
+    # the (since-deleted) `ip_whitelist` never bounded it, because the pre-merge gateway was
+    # a pod on that same network proxying arbitrary paths from the internet. So this flag has
+    # to gate the mount, not just the behaviour.
+    #
+    # `x.lower() == "true"` and not `convert=bool`: `bool("false")` is True — and `env` runs
+    # the converter on the ":false" default too, so `convert=bool` makes the flag DEFAULT-ON
+    # and impossible to turn off. The exact inversion this flag exists to prevent.
+    peer_serve_enabled: bool = env("HIPPIUS_PEER_SERVE_ENABLED:false", convert=lambda x: x.lower() == "true")
+    # hostNetwork trial: with `hostNetwork: true` the pod's POD_IP IS the node address
+    # (192.168.x), so peer registrations land outside the pod-network allow-list in
+    # cache/peers.py and the peer tier silently goes dark. This flag admits the node
+    # network as peer addresses. Only sound where exactly one api pod owns :8000 per
+    # node (the hostNetwork DaemonSet) — the SNAT ambiguity that justified excluding
+    # 192.168.x does not exist there, and peer requests still authenticate via the
+    # shared-secret header either way. Default off; set by the staging overlay only.
+    peer_allow_node_network: bool = env("HIPPIUS_PEER_ALLOW_NODE_NETWORK:false", convert=lambda x: x.lower() == "true")
+    # Shared secret every peer presents on /internal/parts. It is sufficient BECAUSE the gateway
+    # strips all inbound x-hippius-* headers before forwarding, so no client can supply it; the
+    # pod network on its own is not a boundary. Empty means the route is not mounted AT ALL —
+    # there must be no configuration meaning "serving, authentication off", since that state is
+    # indistinguishable from the defect. repr=False so a stray str(config) cannot leak it.
+    internal_peer_secret: str = env("HIPPIUS_INTERNAL_PEER_SECRET:", convert=str, repr=False)
     # 24h since last WRITE — the read path no longer bumps timestamps (read
     # recency lives in fs_cache_inventory.last_access_at), so this gates on
     # time since the part landed, not since it was last streamed.

@@ -31,6 +31,10 @@ def _now_ts() -> float:
     return float(time.time())
 
 
+async def _single_piece(data: bytes) -> AsyncGenerator[bytes, None]:
+    yield data
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
@@ -306,15 +310,20 @@ async def migrate_one(
             async for chunk in gen:
                 buf.extend(chunk)
 
-            # Upload part into new version
-            await writer.mpu_upload_part(
+            # Upload part into new version. The streaming path stages chunks under
+            # attempt-private names and publishes them as a set — same write discipline as
+            # live traffic. max_size_bytes=0 disables the per-part cap: these bytes are an
+            # existing part being re-encrypted, so a config cap must not fail the migration.
+            await writer.mpu_upload_part_stream(
                 upload_id=str(upload_id),
                 object_id=object_id,
                 object_version=int(new_version),
                 bucket_name=bucket_name,
+                bucket_id=str(bucket_id),
                 account_address=address,
                 part_number=int(part_number),
-                body_bytes=bytes(buf),
+                body_iter=_single_piece(bytes(buf)),
+                max_size_bytes=0,
             )
 
             # Soft change detection: md5 + append_version + last_modified

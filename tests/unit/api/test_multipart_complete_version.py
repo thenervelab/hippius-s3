@@ -54,7 +54,11 @@ class _FakeDb:
 
 def _request() -> Any:
     return SimpleNamespace(
-        state=SimpleNamespace(account=SimpleNamespace(main_account="acct-main", id="sub-1"), seed_phrase="seed"),
+        state=SimpleNamespace(
+            account=SimpleNamespace(main_account="acct-main", id="sub-1"),
+            main_account_id="acct-main",
+            seed_phrase="seed",
+        ),
         headers={"Host": "h"},
         app=SimpleNamespace(state=SimpleNamespace(postgres_pool=object(), redis_client=object(), fs_store=object())),
     )
@@ -518,11 +522,10 @@ async def test_complete_success_path_location_comes_from_the_host_header(monkeyp
     success read Host, and no test looked at either.
 
     What this value IS in production is a separate problem, deliberately not asserted here.
-    The gateway deletes Host and X-Forwarded-Host before forwarding
-    (gateway/services/forward_service.py), so the API reads GATEWAY_BACKEND_URL's authority
-    and hands clients `http://api:8000/...` — the internal service name. Correcting that
-    needs the gateway to pass a public-host header through; this test is where the change
-    will surface.
+    Pre-merge the gateway deleted Host before forwarding, so the API read the internal
+    service authority and handed clients `http://api:8000/...`. Post-merge the app faces
+    clients directly and reads the Host they actually sent — the historical wrong value is
+    gone, and this test is where any future proxy re-introducing a Host rewrite will surface.
     """
     _patch_common(monkeypatch)
     completed: dict[str, Any] = {"ok": False}

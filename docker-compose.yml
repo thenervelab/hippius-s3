@@ -1,4 +1,8 @@
 services:
+  # The base image is where `pip install -e .` runs — every app image below is FROM it and only
+  # COPYs source. So a new dependency in pyproject.toml does NOT reach a container until the base
+  # is rebuilt: build this service, then `BASE_IMAGE=hippius-s3-base:latest docker compose build`.
+  # Without that the app images layer onto the published base and the new import fails at runtime.
   base:
     image: hippius-s3-base:latest
     profiles:
@@ -7,53 +11,13 @@ services:
       context: .
       dockerfile: Dockerfile.base
 
-  gateway:
-    build:
-      context: .
-      dockerfile: gateway/Dockerfile
-    ports:
-      - "${HOST_BIND_IP:-127.0.0.1}:8080:8080"
-    env_file:
-      - .env.defaults
-      - .env
-    depends_on:
-      api:
-        condition: service_healthy
-      arion-uploader:
-        condition: service_healthy
-      arion-downloader:
-        condition: service_healthy
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-accounts:
-        condition: service_healthy
-      redis-rate-limiting:
-        condition: service_healthy
-      redis-acl:
-        condition: service_healthy
-    volumes:
-      - .:/app
-    restart: unless-stopped
-    environment:
-      - PYTHONUNBUFFERED=1
-      - GATEWAY_BACKEND_URL=http://api:8000
-      - GATEWAY_PORT=8080
-      - HIPPIUS_BYPASS_CREDIT_CHECK=false
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
-      interval: 60s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    networks:
-      - hippius_net
-
   api:
     build:
       context: .
-    # No external ports - only accessible via proxy on internal network
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:8080:8000"
     env_file:
       - .env.defaults
       - .env
@@ -80,7 +44,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 60s
       timeout: 5s
       retries: 5
@@ -245,6 +209,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     env_file:
       - .env.defaults
       - .env
@@ -266,11 +232,20 @@ services:
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
       - /var/lib/hippius/kms:/kms_certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "exit 0"]
-      interval: 5s
-      timeout: 3s
+      test:
+        [
+          "CMD-SHELL",
+          "python -c 'from hippius_s3.config import get_config; get_config()'",
+        ]
+      # start_interval probes every 2s while the container is starting, so `up --wait` learns
+      # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
+      # to 30s: this spawns a python interpreter and imports the config each time (~0.3s), and at
+      # 5s across four workers that was ~24% of a core burning continuously for no added signal.
+      interval: 30s
+      start_interval: 2s
+      timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     networks:
       - hippius_net
 
@@ -278,6 +253,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     env_file:
       - .env.defaults
       - .env
@@ -289,11 +266,20 @@ services:
       redis-queues:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD-SHELL", "exit 0" ]
-      interval: 5s
-      timeout: 3s
+      test:
+        [
+          "CMD-SHELL",
+          "python -c 'from hippius_s3.config import get_config; get_config()'",
+        ]
+      # start_interval probes every 2s while the container is starting, so `up --wait` learns
+      # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
+      # to 30s: this spawns a python interpreter and imports the config each time (~0.3s), and at
+      # 5s across four workers that was ~24% of a core burning continuously for no added signal.
+      interval: 30s
+      start_interval: 2s
+      timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     deploy:
       replicas: 1
     restart: unless-stopped
@@ -308,6 +294,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     env_file:
       - .env.defaults
       - .env
@@ -319,11 +307,20 @@ services:
       redis-queues:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD-SHELL", "exit 0" ]
-      interval: 5s
-      timeout: 3s
+      test:
+        [
+          "CMD-SHELL",
+          "python -c 'from hippius_s3.config import get_config; get_config()'",
+        ]
+      # start_interval probes every 2s while the container is starting, so `up --wait` learns
+      # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
+      # to 30s: this spawns a python interpreter and imports the config each time (~0.3s), and at
+      # 5s across four workers that was ~24% of a core burning continuously for no added signal.
+      interval: 30s
+      start_interval: 2s
+      timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     deploy:
       replicas: 1
     restart: unless-stopped
@@ -338,6 +335,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     env_file:
       - .env.defaults
       - .env
@@ -360,11 +359,20 @@ services:
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
       - /var/lib/hippius/kms:/kms_certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "exit 0"]
-      interval: 5s
-      timeout: 3s
+      test:
+        [
+          "CMD-SHELL",
+          "python -c 'from hippius_s3.config import get_config; get_config()'",
+        ]
+      # start_interval probes every 2s while the container is starting, so `up --wait` learns
+      # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
+      # to 30s: this spawns a python interpreter and imports the config each time (~0.3s), and at
+      # 5s across four workers that was ~24% of a core burning continuously for no added signal.
+      interval: 30s
+      start_interval: 2s
+      timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     networks:
       - hippius_net
 
@@ -372,6 +380,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     env_file:
       - .env.defaults
       - .env
@@ -396,6 +406,8 @@ services:
     build:
       context: .
       dockerfile: workers/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     depends_on:
       redis-accounts:
         condition: service_healthy

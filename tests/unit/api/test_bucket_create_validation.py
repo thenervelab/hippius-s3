@@ -48,6 +48,7 @@ def bucket_app() -> Any:
             delete=True,
             has_credits=True,
         )
+        request.state.main_account_id = "test-main-account"
         return await call_next(request)
 
     app.dependency_overrides[get_db_pool] = _make_mock_pool
@@ -83,6 +84,7 @@ async def test_create_bucket_allows_own_ss58_address() -> None:
             delete=True,
             has_credits=True,
         )
+        request.state.main_account_id = ss58_bucket
         return await call_next(request)
 
     app.dependency_overrides[get_db_pool] = _make_mock_pool
@@ -124,6 +126,7 @@ def _app_with_identity(main_account: str) -> tuple[FastAPI, Any]:
             delete=True,
             has_credits=True,
         )
+        request.state.main_account_id = main_account
         return await call_next(request)
 
     app.dependency_overrides[get_db_pool] = lambda: mock_pool

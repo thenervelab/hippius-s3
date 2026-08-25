@@ -136,9 +136,7 @@ async def test_rd5_batches_existence_and_skips_cached(mock_metrics: Any, mock_co
 @pytest.mark.asyncio
 @patch("hippius_s3.workers.downloader.get_config")
 @patch("hippius_s3.workers.downloader.get_metrics_collector")
-async def test_rd1_resolves_identifier_via_one_batch_query(
-    mock_metrics: Any, mock_config: Any, fs_store: Any
-) -> None:
+async def test_rd1_resolves_identifier_via_one_batch_query(mock_metrics: Any, mock_config: Any, fs_store: Any) -> None:
     mock_config.return_value = _config()
     mock_metrics.return_value = MagicMock()
 

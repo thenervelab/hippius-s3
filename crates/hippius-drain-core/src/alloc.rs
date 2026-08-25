@@ -17,10 +17,24 @@ use std::time::Duration;
 /// One node's self-reported state — the input to allocation for that node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeObservation {
-    /// How full the node's SSD is (drives weight and the reservation floor).
+    /// The node's drain urgency — the water-fill weight and the reservation-floor gate.
+    ///
+    /// Asymmetric by design, and only until the fleet is fully rolled: an *agent* fills this
+    /// with the raw SSD fullness it measured (a fact it can always report), while the
+    /// allocator's wire boundary ([`NodeStateJson::into_observation`]) replaces it with
+    /// [`DiskPressure::from_drain_demand`] whenever the reporting agent is new enough to send
+    /// [`free`](Self::free)/[`cache`](Self::cache). Raw fullness is the conservative fallback
+    /// for a not-yet-rolled agent, and stops being reachable once every agent reports
+    /// residency.
     pub pressure: DiskPressure,
     /// Bytes currently waiting to drain. Zero backlog means zero demand.
     pub backlog: Bytes,
+    /// Free bytes on the node's SSD.
+    pub free: Bytes,
+    /// Retained, already-`replicated` bytes held on the SSD to serve reads. Evictable on
+    /// demand, so this counts toward ingest headroom rather than against it — the distinction
+    /// that keeps a full read cache from reading as a drain emergency.
+    pub cache: Bytes,
     /// The fastest the node can push to Ceph locally (its demand cap).
     pub max_drain_rate: ByteRate,
     /// The node's observed Ceph write p99 latency (feeds the saturation signal).
@@ -101,6 +115,12 @@ pub struct AllocConfig {
     pub critical_pressure: DiskPressure,
     /// The guaranteed per-node floor for critical-pressure nodes.
     pub reservation_floor: ByteRate,
+    /// Free-space floor the evictor holds when the drain is keeping up, in permille of disk.
+    pub base_reserve_permille: u16,
+    /// Free-space floor when the drain is fully stalled. Raising the reserve is what buys
+    /// ingest runway: a throttled drain means backlog grows, and freeing cache EARLY is the
+    /// only lever that keeps `fs_cache_pressure` from refusing PUTs later.
+    pub max_reserve_permille: u16,
 }
 
 /// The carried AIMD state between ticks.
@@ -130,6 +150,21 @@ pub struct Allocation {
     pub node: NodeId,
     /// The write rate the node may use this tick.
     pub budget: ByteRate,
+    /// The free-space floor the node's evictor should hold, in permille of its disk.
+    ///
+    /// The allocator sets this because it is the only component that knows *why* a node is
+    /// not draining: it sees the fleet-wide Ceph ceiling and this node's budget against its
+    /// demand. The evictor alone can only react once free space has already fallen, which on
+    /// a stalled drain is too late to avoid 503s.
+    ///
+    /// **This value steers a threshold in another language.** The agent derives the api's
+    /// read-through promote floor from whatever reserve is in force
+    /// (`hippius-drain-agent`'s `published_promote_floor`) and publishes it on the queues Redis
+    /// for `hippius_s3/promote_floor.py` to consume, so raising this reserve also raises the
+    /// free-space level at which the api stops warming that node's cache — by design, since
+    /// this reserve rises precisely when the drain is in trouble. Widening the range this can
+    /// take is therefore a change to the api's read path too, not only to eviction.
+    pub reserve_permille: u16,
 }
 
 /// The result of an allocation tick.
@@ -151,12 +186,50 @@ pub struct AllocationPlan {
 #[must_use]
 pub fn allocate(fleet: &FleetView, ceiling: CephCeiling, prev: BudgetController, config: &AllocConfig) -> AllocationPlan {
     let (controller, capacity) = next_capacity(fleet, ceiling, prev, config);
-    let (allocations, feasible) = distribute(fleet, capacity, config);
+    let (allocations, feasible) = distribute(fleet, capacity, config, ceph_severity_permille(ceiling));
     AllocationPlan {
         controller,
         allocations,
         feasible,
     }
+}
+
+/// How far the fleet's Ceph ceiling is from healthy, in permille.
+///
+/// `Critical` is total: the pool accepts no writes at all, so every node buffers on SSD and
+/// backlog grows at the full ingest rate. `NearFull` is treated as half-severity — the drain
+/// still moves, just slower.
+fn ceph_severity_permille(ceiling: CephCeiling) -> u32 {
+    match ceiling {
+        CephCeiling::Open(_) => 0,
+        CephCeiling::NearFull(_) => 500,
+        CephCeiling::Critical => 1_000,
+    }
+}
+
+/// The free-space floor for one node, in permille of its disk.
+///
+/// Interpolates between `base_reserve_permille` and `max_reserve_permille` on the WORSE of two
+/// severities, because either alone is enough to starve the drain:
+///
+/// - the fleet's Ceph ceiling — a `Critical` pool stalls every node at once;
+/// - this node's own shortfall, `(demand - budget) / demand` — the water-fill may leave one
+///   node short while its peers are satisfied, and that node is the one accumulating backlog.
+///
+/// A node with no demand has no shortfall (0/0 is 0, not "totally starved"), so a caught-up
+/// node never evicts beyond the base floor.
+fn reserve_permille(demand: u64, budget: u64, ceph_permille: u32, config: &AllocConfig) -> u16 {
+    let shortfall_permille = if demand == 0 {
+        0
+    } else {
+        let short = demand.saturating_sub(budget);
+        u32::try_from(u128::from(short) * 1_000 / u128::from(demand)).unwrap_or(1_000)
+    };
+    let severity = ceph_permille.max(shortfall_permille).min(1_000);
+    let base = u32::from(config.base_reserve_permille);
+    let ceiling = u32::from(config.max_reserve_permille).max(base);
+    let span = ceiling - base;
+    u16::try_from(base + span * severity / 1_000).unwrap_or(config.max_reserve_permille)
 }
 
 /// A node's working state during distribution.
@@ -177,7 +250,7 @@ struct Entry {
 ///
 /// Returns `(allocations_in_id_order, feasible)`. `feasible` is `false` when the
 /// reservations alone exceed capacity (they are then scaled down proportionally).
-fn distribute(fleet: &FleetView, capacity: ByteRate, config: &AllocConfig) -> (Vec<Allocation>, bool) {
+fn distribute(fleet: &FleetView, capacity: ByteRate, config: &AllocConfig, ceph_permille: u32) -> (Vec<Allocation>, bool) {
     let cap = capacity.get();
     let critical = config.critical_pressure;
     let floor = config.reservation_floor.get();
@@ -225,7 +298,7 @@ fn distribute(fleet: &FleetView, capacity: ByteRate, config: &AllocConfig) -> (V
             entry.filled = entry.filled.saturating_add(give);
             remaining -= give;
         }
-        return (to_allocations(entries), false);
+        return (to_allocations(entries, config, ceph_permille), false);
     }
 
     for entry in &mut entries {
@@ -275,13 +348,14 @@ fn distribute(fleet: &FleetView, capacity: ByteRate, config: &AllocConfig) -> (V
         remaining -= give;
     }
 
-    (to_allocations(entries), true)
+    (to_allocations(entries, config, ceph_permille), true)
 }
 
-fn to_allocations(entries: Vec<Entry>) -> Vec<Allocation> {
+fn to_allocations(entries: Vec<Entry>, config: &AllocConfig, ceph_permille: u32) -> Vec<Allocation> {
     entries
         .into_iter()
         .map(|e| Allocation {
+            reserve_permille: reserve_permille(e.demand, e.filled, ceph_permille, config),
             node: e.node,
             budget: ByteRate::new(e.filled),
         })
@@ -303,12 +377,16 @@ fn next_capacity(fleet: &FleetView, ceiling: CephCeiling, prev: BudgetController
     let back_off = latency_saturated || !matches!(ceiling, CephCeiling::Open(_));
 
     let prev_total = prev.total.get();
-    let new_total = if back_off {
-        let decreased = u64::try_from(u128::from(prev_total) * u128::from(config.decrease_permille) / 1000).unwrap_or(prev_total);
-        decreased.max(config.min_total.get())
+    let evolved = if back_off {
+        u64::try_from(u128::from(prev_total) * u128::from(config.decrease_permille) / 1000).unwrap_or(prev_total)
     } else {
-        prev_total.saturating_add(config.additive_increase.get()).min(config.max_total.get())
+        prev_total.saturating_add(config.additive_increase.get())
     };
+    // Both arms land in the same band. Clamping only the arm that moves toward each
+    // bound leaves a carried estimate that started outside the band stuck there: a
+    // `prev` above `max_total` (an operator lowering the ceiling between ticks) would
+    // back off only geometrically instead of being capped on the first tick.
+    let new_total = evolved.max(config.min_total.get()).min(config.max_total.get());
 
     let capacity = new_total.min(ceiling.budget().get());
     (BudgetController::new(ByteRate::new(new_total)), ByteRate::new(capacity))
@@ -335,7 +413,113 @@ mod tests {
             max_error_bps: 100,
             critical_pressure: DiskPressure::try_from(9_000).unwrap(),
             reservation_floor: ByteRate::new(50_000),
+            base_reserve_permille: 150,
+            max_reserve_permille: 400,
         }
+    }
+
+    // ------------------------------------------------ eviction reserve (Phase 4)
+
+    #[test]
+    fn a_healthy_fleet_that_gets_its_demand_keeps_the_base_reserve() {
+        // Nothing is starved and Ceph is open, so backlog is being cleared as fast as it
+        // arrives. There is no reason to give up cached reads for headroom nobody needs.
+        let fleet = fleet_of(&[node("a", 1_000, 1_000, 10_000), node("b", 1_000, 1_000, 10_000)]);
+        let plan = allocate(
+            &fleet,
+            CephCeiling::Open(ByteRate::new(1_000_000)),
+            BudgetController::new(ByteRate::new(1_000_000)),
+            &config(),
+        );
+
+        for allocation in &plan.allocations {
+            assert_eq!(allocation.reserve_permille, 150, "base reserve for {}", allocation.node);
+        }
+    }
+
+    #[test]
+    fn a_critical_ceph_ceiling_raises_the_reserve_to_buy_ingest_runway() {
+        // Ceph cannot accept writes, so the fleet buffers on SSD: backlog now grows at the
+        // full ingest rate and free space is the scarce resource. Freeing cache EARLY is what
+        // buys runway before fs_cache_pressure starts refusing PUTs. Holding more cache here
+        // — the intuition that Ceph pressure means "keep more locally" — would consume the
+        // very space the incoming backlog needs.
+        //
+        // Note both terms saturate here (a Critical ceiling zeroes capacity, so the node is
+        // also fully starved); the Ceph term on its own is pinned by the NearFull case above.
+        let fleet = fleet_of(&[node("a", 1_000, 1_000, 10_000)]);
+        let plan = allocate(&fleet, CephCeiling::Critical, BudgetController::new(ByteRate::new(1_000_000)), &config());
+
+        assert_eq!(plan.allocations[0].reserve_permille, 400, "a stalled drain evicts hardest");
+    }
+
+    #[test]
+    fn a_near_full_pool_raises_the_reserve_even_on_a_fully_satisfied_node() {
+        // Isolates the CEPH term from the shortfall term. Capacity here comfortably exceeds
+        // demand, so this node gets everything it asks for and its shortfall is zero — any
+        // reserve above the base can therefore only have come from the pool being NearFull.
+        //
+        // Without this case the Critical test below proves nothing about the Ceph term: a
+        // Critical ceiling zeroes capacity, so the shortfall term alone would drive the
+        // reserve to max and an inverted Ceph sign would still pass.
+        let fleet = fleet_of(&[node("a", 1_000, 1_000, 10_000)]);
+        let plan = allocate(
+            &fleet,
+            CephCeiling::NearFull(ByteRate::new(1_000_000)),
+            BudgetController::new(ByteRate::new(1_000_000)),
+            &config(),
+        );
+
+        assert_eq!(plan.allocations[0].budget.get(), 10_000, "the node got its full demand");
+        assert_eq!(
+            plan.allocations[0].reserve_permille, 275,
+            "half severity: base 150 + half of the 250 span",
+        );
+    }
+
+    #[test]
+    fn a_starved_node_reserves_more_than_a_satisfied_peer_in_the_same_tick() {
+        // Same tick, same healthy Ceph, equal weights: "small" wants only 1 KB/s and gets all
+        // of it, while "big" wants 1 MB/s and is capped by fleet capacity. Ceph is fine and the
+        // fleet-wide severity is zero, so the ONLY thing separating them is each node's own
+        // shortfall — which is exactly why the reserve is per-node rather than a fleet
+        // constant. Both pressures are below critical_pressure so the reservation floor stays
+        // out of it; tripping that lands in the infeasible path and allocates by a different
+        // rule entirely.
+        let fleet = fleet_of(&[node("big", 8_000, 1_000, 1_000_000), node("small", 8_000, 1_000, 1_000)]);
+        let plan = allocate(
+            &fleet,
+            CephCeiling::Open(ByteRate::new(20_000)),
+            BudgetController::new(ByteRate::new(20_000)),
+            &config(),
+        );
+
+        let big = plan.allocations.iter().find(|a| a.node.as_str() == "big").unwrap();
+        let small = plan.allocations.iter().find(|a| a.node.as_str() == "small").unwrap();
+        assert_eq!(small.budget.get(), 1_000, "the small node got everything it asked for");
+        assert_eq!(small.reserve_permille, 150, "so it keeps the base reserve");
+        assert!(
+            big.reserve_permille > small.reserve_permille,
+            "the node left short must reserve more: big {} vs small {}",
+            big.reserve_permille,
+            small.reserve_permille,
+        );
+    }
+
+    #[test]
+    fn a_caught_up_node_never_reserves_above_the_base() {
+        // Zero backlog means zero demand, so this node is not short of anything — a shortfall
+        // computed as (demand - budget) / demand must not read 0/0 as "totally starved" and
+        // evict a healthy node's cache for nothing.
+        let fleet = fleet_of(&[node("idle", 100, 0, 10_000)]);
+        let plan = allocate(
+            &fleet,
+            CephCeiling::Open(ByteRate::new(1_000_000)),
+            BudgetController::new(ByteRate::new(1_000_000)),
+            &config(),
+        );
+
+        assert_eq!(plan.allocations[0].reserve_permille, 150);
     }
 
     fn node(id: &str, pressure_bps: u16, backlog: u64, max_rate: u64) -> (NodeId, NodeObservation) {
@@ -344,6 +528,8 @@ mod tests {
             NodeObservation {
                 pressure: DiskPressure::try_from(pressure_bps).unwrap(),
                 backlog: Bytes::new(backlog),
+                free: Bytes::ZERO,
+                cache: Bytes::ZERO,
                 max_drain_rate: ByteRate::new(max_rate),
                 observed_p99: Duration::from_millis(10),
                 error_bps: 0,
@@ -370,6 +556,8 @@ mod tests {
             NodeObservation {
                 pressure: DiskPressure::try_from(3_000).unwrap(),
                 backlog: Bytes::new(backlog),
+                free: Bytes::ZERO,
+                cache: Bytes::ZERO,
                 max_drain_rate: ByteRate::new(1_000_000_000),
                 observed_p99: p99,
                 error_bps: 0,
@@ -418,6 +606,50 @@ mod tests {
             plan.controller.total().get() >= min_total.get(),
             "the carried AIMD estimate keeps its floor so the fleet resumes promptly when the ceiling reopens",
         );
+    }
+
+    #[test]
+    fn the_first_tick_starts_from_initial_total_not_the_floor() {
+        // A fresh leader carries `initial_total` into its first tick, so a deployment that
+        // starts high (500 MB/s over a 250 MB/s floor) must ramp from there. Reading the
+        // start as "the floor" would cost the whole ramp — at 50 MB/s per tick, ~5 ticks —
+        // every time leadership moves.
+        let cfg = AllocConfig {
+            min_total: ByteRate::new(250_000_000),
+            additive_increase: ByteRate::new(50_000_000),
+            ..config()
+        };
+        let fleet = fleet_of(&[node("a", 5_000, 10_000_000_000, 1_000_000_000)]);
+        let plan = allocate(
+            &fleet,
+            CephCeiling::Open(ByteRate::new(1_000_000_000)),
+            BudgetController::new(ByteRate::new(500_000_000)),
+            &cfg,
+        );
+        assert_eq!(
+            plan.controller.total().get(),
+            550_000_000,
+            "a healthy first tick increases the initial estimate, it does not snap to the floor",
+        );
+    }
+
+    #[test]
+    fn a_critical_ceiling_zeroes_capacity_even_with_a_floor_far_above_it() {
+        // The floor bounds the ESTIMATE, never the distributed capacity: a pool that
+        // accepts no writes must hand out nothing however high the AIMD floor is tuned.
+        // The estimate still keeps its floor so the fleet resumes at rate — not from
+        // scratch — the moment the ceiling reopens.
+        let min_total = ByteRate::new(250_000_000);
+        let cfg = AllocConfig { min_total, ..config() };
+        let fleet = fleet_of(&[
+            node("a", 9_500, 10_000_000_000, 1_000_000_000),
+            node("b", 9_500, 10_000_000_000, 1_000_000_000),
+        ]);
+        let plan = allocate(&fleet, CephCeiling::Critical, BudgetController::new(ByteRate::new(1_000_000_000)), &cfg);
+        for allocation in &plan.allocations {
+            assert_eq!(allocation.budget.get(), 0, "node {} must get nothing", allocation.node);
+        }
+        assert!(plan.controller.total().get() >= min_total.get(), "the carried estimate keeps its floor");
     }
 
     #[test]
@@ -668,6 +900,91 @@ mod tests {
             // No node is rationed above its reservation floor.
             for alloc in &plan.allocations {
                 prop_assert!(alloc.budget.get() <= 50_000, "rationing must not exceed the reservation floor");
+            }
+        }
+
+        /// The carried estimate never leaves `[min_total, max_total]`, on either arm.
+        ///
+        /// The back-off arm clamped only the floor, so an estimate that entered the tick
+        /// above `max_total` stayed above it and decayed geometrically instead of being
+        /// capped at once.
+        #[test]
+        fn the_carried_estimate_always_stays_within_its_bounds(
+            prev in 1u64..u64::MAX,
+            specs in prop::collection::vec((0u64..20_000_000, 0u16..=10_000), 1..6),
+            p99_ms in 0u64..5_000,
+            band in 0u8..3,
+        ) {
+            let cfg = config();
+            let nodes: Vec<_> = specs.iter().enumerate()
+                .map(|(i, &(backlog, pressure))| {
+                    let (id, mut obs) = node(&format!("n{i}"), pressure, backlog, 5_000_000);
+                    obs.observed_p99 = Duration::from_millis(p99_ms);
+                    (id, obs)
+                }).collect();
+            let ceiling = match band {
+                0 => CephCeiling::Open(ByteRate::new(1_000_000_000)),
+                1 => CephCeiling::NearFull(ByteRate::new(10_000_000)),
+                _ => CephCeiling::Critical,
+            };
+            let plan = allocate(&fleet_of(&nodes), ceiling, BudgetController::new(ByteRate::new(prev)), &cfg);
+            let total = plan.controller.total().get();
+            prop_assert!(total >= cfg.min_total.get(), "estimate {total} below the floor {}", cfg.min_total.get());
+            prop_assert!(total <= cfg.max_total.get(), "estimate {total} above the ceiling {}", cfg.max_total.get());
+        }
+
+        /// The ceiling bounds the distributed total whatever the AIMD floor is tuned to.
+        ///
+        /// Generalizes the 2026-07-24 regression above (which pins one floor/rate pair) over
+        /// arbitrary floors and bands: the floor is a property of the ESTIMATE, and must never
+        /// leak into the capacity a near-full or critical pool allows.
+        #[test]
+        fn a_ceiling_always_bounds_the_distributed_total_whatever_the_floor(
+            floor in 1u64..=1_000_000_000,
+            prev in 1u64..2_000_000_000,
+            rate in 1u64..1_000_000_000,
+            backlogs in prop::collection::vec(0u64..20_000_000_000, 1..6),
+            band in 0u8..3,
+        ) {
+            let cfg = AllocConfig { min_total: ByteRate::new(floor), max_total: ByteRate::new(1_000_000_000), ..config() };
+            let nodes: Vec<_> = backlogs.iter().enumerate()
+                .map(|(i, &backlog)| node(&format!("n{i}"), 5_000, backlog, 1_000_000_000)).collect();
+            let ceiling = match band {
+                0 => CephCeiling::Open(ByteRate::new(rate)),
+                1 => CephCeiling::NearFull(ByteRate::new(rate)),
+                _ => CephCeiling::Critical,
+            };
+            let plan = allocate(&fleet_of(&nodes), ceiling, BudgetController::new(ByteRate::new(prev)), &cfg);
+            let distributed: u64 = plan.allocations.iter().map(|a| a.budget.get()).sum();
+            prop_assert!(
+                distributed <= ceiling.budget().get(),
+                "distributed {distributed} exceeds the ceiling {} (floor {floor})", ceiling.budget().get(),
+            );
+        }
+
+        /// A fleet saturated on every tick converges to exactly `min_total` and stays there.
+        ///
+        /// Documents the absorbing state: multiplicative decrease has no lower stop but the
+        /// floor, so a permanently-saturated fleet ends up writing `min_total` forever. That
+        /// makes the floor the operating rate under sustained saturation — the reason it is
+        /// tuned above the drain's collapse threshold rather than left at a safe-looking
+        /// small value.
+        #[test]
+        fn a_fleet_saturated_on_every_tick_converges_to_the_floor_and_stays(
+            prev in 1u64..1_000_000_000,
+        ) {
+            let cfg = AllocConfig { min_total: ByteRate::new(50_000_000), ..config() };
+            let fleet = fleet_of(&[node_p99("a", Duration::from_secs(30), 10_000_000_000)]);
+            let mut controller = BudgetController::new(ByteRate::new(prev));
+            let mut totals = Vec::new();
+            for _ in 0..50 {
+                controller = allocate(&fleet, CephCeiling::Open(ByteRate::new(1_000_000_000)), controller, &cfg).controller;
+                totals.push(controller.total().get());
+            }
+            // 20% off per tick closes a <=20x gap to the floor in ~14 ticks, so the tail of a
+            // 50-tick run must be pinned — not merely trending down.
+            for total in &totals[40..] {
+                prop_assert_eq!(*total, cfg.min_total.get(), "saturated ticks must settle at the floor exactly");
             }
         }
 

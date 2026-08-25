@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import os
 import secrets
@@ -8,6 +9,7 @@ from typing import AsyncGenerator
 from typing import Callable
 from typing import Generator
 from typing import Iterator
+from typing import NoReturn
 
 import asyncpg
 import boto3
@@ -18,7 +20,7 @@ from botocore.config import Config
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.services.acl_service import BucketLookup
 from tests.e2e.conftest import is_real_aws
 
 
@@ -26,7 +28,49 @@ _project_root = Path(__file__).parents[2]
 dotenv.load_dotenv(_project_root / ".env.defaults", override=True)
 dotenv.load_dotenv(_project_root / ".env.test-local", override=True)
 os.environ["HIPPIUS_BYPASS_CREDIT_CHECK"] = "true"
-os.environ["ENABLE_BANHAMMER"] = "false"
+
+# One table per migration system, so "reachable but unmigrated" is caught as loudly as
+# "unreachable": `objects` comes from dbmate, `cephor_replication_status` from the drain's own
+# sqlx migrations, which in prod only the drain applies and which CI has to apply itself.
+_REQUIRED_TABLES = ("objects", "cephor_replication_status")
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """In CI, prove Postgres is usable BEFORE any test can quietly skip past it.
+
+    Every SQL test in this directory skips when its connection fails, and a skip is not a
+    failure — which is how this whole tier reported green while executing nothing before the
+    postgres service was added. Fixing the workflow does not fix that property: the day the
+    service fails to start, or a migration step is dropped, the tier silently returns to
+    green-by-skip and nobody is told.
+
+    Asserting it once here, rather than converting thirteen individual skip sites, keeps the
+    per-test behaviour right on a laptop (skip, with a hint) while making the CI regression
+    impossible to miss. A reachable-but-unmigrated database is checked too, because it passes
+    every one of those skip guards and then fails each test on a missing relation, which reads
+    as thirteen unrelated bugs rather than one absent migration step.
+    """
+    if not os.environ.get("CI"):
+        return
+
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        pytest.exit("CI is set but DATABASE_URL is not: the integration tier would skip silently", returncode=1)
+
+    async def _check() -> list[str]:
+        conn = await asyncpg.connect(dsn=dsn)
+        try:
+            return [t for t in _REQUIRED_TABLES if not await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", t)]
+        finally:
+            await conn.close()
+
+    try:
+        missing = asyncio.run(_check())
+    except (OSError, asyncpg.PostgresError) as exc:
+        pytest.exit(f"CI is set but Postgres is unreachable on DATABASE_URL: {exc}", returncode=1)
+
+    if missing:
+        pytest.exit(f"CI is set but Postgres is not migrated: missing table(s) {missing}", returncode=1)
 
 
 @pytest.fixture(autouse=True)
@@ -101,7 +145,7 @@ def _mock_access_key_auth(
     """
     from nacl.secret import SecretBox
 
-    from gateway.config import get_config
+    from hippius_s3.config import get_config
     from hippius_s3.services.hippius_api_service import TokenAuthResponse
 
     key_hex = get_config().hippius_secret_decryption_material
@@ -120,7 +164,7 @@ def _mock_access_key_auth(
             nonce=base64.b64encode(b"\x00" * 24).decode(),
         )
 
-    monkeypatch.setattr("gateway.middlewares.access_key_auth.cached_auth", _fake_cached_auth)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.access_key_auth.cached_auth", _fake_cached_auth)
 
 
 @pytest.fixture
@@ -259,6 +303,17 @@ async def gateway_db_pool() -> AsyncGenerator[Any, None]:
     mock_pool.fetchrow = AsyncMock(return_value=None)
     mock_pool.fetch = AsyncMock(return_value=[])
     mock_pool.execute = AsyncMock()
+    # Post-merge the request continues into the real S3 handlers (nothing forwards
+    # anymore), which `await pool.acquire()` and query for the bucket. An
+    # empty-answering connection makes those requests bottom out at NoSuchBucket /
+    # NoSuchKey 404s, which is the range these signature-acceptance tests assert.
+    mock_conn = MagicMock()
+    mock_conn.fetchrow = AsyncMock(return_value=None)
+    mock_conn.fetch = AsyncMock(return_value=[])
+    mock_conn.fetchval = AsyncMock(return_value=None)
+    mock_conn.execute = AsyncMock()
+    mock_pool.acquire = AsyncMock(return_value=mock_conn)
+    mock_pool.release = AsyncMock()
     yield mock_pool
 
 
@@ -293,28 +348,21 @@ async def gateway_app(
     from unittest.mock import AsyncMock
     from unittest.mock import MagicMock
 
-    from gateway.main import factory
+    from hippius_s3.main import factory
 
     app = factory()
 
+    # ASGITransport does not run the lifespan; provide the state the middleware
+    # chain touches. Handler-level state (fs_store, obj_cache, ...) is deliberately
+    # absent — these tests exercise auth/middleware behavior, and requests bottom
+    # out at DB-backed 404s before reaching storage.
+    from hippius_s3.config import get_config
+
+    app.state.config = get_config()
     app.state.postgres_pool = gateway_db_pool
     app.state.redis_client = gateway_redis_clients["redis"]
-    app.state.redis_accounts = gateway_redis_clients["redis_accounts"]
+    app.state.redis_accounts_client = gateway_redis_clients["redis_accounts"]
     app.state.redis_rate_limiting = gateway_redis_clients["redis_rate_limiting"]
-
-    from gateway.config import get_config
-    from gateway.services.forward_service import ForwardService
-
-    config = get_config()
-    app.state.forward_service = ForwardService(config.backend_url)
-
-    mock_rate_limit_service = MagicMock()
-    mock_rate_limit_service.check_rate_limit = AsyncMock(return_value=True)
-    app.state.rate_limit_service = mock_rate_limit_service
-
-    mock_banhammer_service = MagicMock()
-    mock_banhammer_service.is_banned = AsyncMock(return_value=False)
-    app.state.banhammer_service = mock_banhammer_service
 
     mock_acl_service = MagicMock()
     mock_acl_service.check_permission = AsyncMock(return_value=True)
@@ -330,9 +378,6 @@ async def gateway_app(
     app.state.sub_token_scope_repo = mock_scope_repo
 
     yield app
-
-    if hasattr(app.state, "forward_service"):
-        await app.state.forward_service.close()
 
 
 @pytest_asyncio.fixture
@@ -343,84 +388,30 @@ async def gateway_client(gateway_app: Any) -> AsyncGenerator[AsyncClient, None]:
         yield client
 
 
-@pytest_asyncio.fixture
-async def gateway_app_no_auth(
-    gateway_db_pool: asyncpg.Pool, gateway_redis_clients: dict[str, Any]
-) -> AsyncGenerator[Any, None]:
-    """Create a gateway app without authentication for forwarding tests."""
-    from unittest.mock import AsyncMock
-    from unittest.mock import MagicMock
+def _no_postgres(reason: str) -> NoReturn:
+    """Skip locally, FAIL in CI.
 
-    from fastapi import FastAPI
-    from fastapi import Request
-
-    app = FastAPI()
-
-    app.state.postgres_pool = gateway_db_pool
-    app.state.redis_client = gateway_redis_clients["redis"]
-    app.state.redis_accounts = gateway_redis_clients["redis_accounts"]
-    app.state.redis_rate_limiting = gateway_redis_clients["redis_rate_limiting"]
-
-    from gateway.config import get_config
-    from gateway.services.forward_service import ForwardService
-
-    config = get_config()
-    app.state.forward_service = ForwardService(config.backend_url)
-
-    mock_rate_limit_service = MagicMock()
-    mock_rate_limit_service.check_rate_limit = AsyncMock(return_value=True)
-    app.state.rate_limit_service = mock_rate_limit_service
-
-    mock_banhammer_service = MagicMock()
-    mock_banhammer_service.is_banned = AsyncMock(return_value=False)
-    app.state.banhammer_service = mock_banhammer_service
-
-    mock_acl_service = MagicMock()
-    mock_acl_service.check_permission = AsyncMock(return_value=True)
-    mock_acl_service.get_bucket_owner = AsyncMock(return_value="test-owner-id")
-    mock_acl_service.get_bucket_id = AsyncMock(side_effect=lambda b: b)
-    mock_acl_service.get_bucket_owner_and_id = AsyncMock(
-        return_value=BucketLookup(owner_id="test-owner-id", bucket_id="test-bucket-id", is_cache_warm=False)
-    )
-    app.state.acl_service = mock_acl_service
-
-    mock_scope_repo = MagicMock()
-    mock_scope_repo.get = AsyncMock(return_value=None)
-    app.state.sub_token_scope_repo = mock_scope_repo
-
-    @app.get("/health")
-    async def health() -> dict:
-        return {"status": "healthy", "service": "gateway"}
-
-    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH"])
-    async def forward_all(request: Request, path: str) -> Any:
-        forward_service = request.app.state.forward_service
-        return await forward_service.forward_request(request)
-
-    yield app
-
-    if hasattr(app.state, "forward_service"):
-        await app.state.forward_service.close()
-
-
-@pytest_asyncio.fixture
-async def gateway_client_no_auth(gateway_app_no_auth: Any) -> AsyncGenerator[AsyncClient, None]:
-    """Create an async test client without authentication."""
-    transport = ASGITransport(app=gateway_app_no_auth)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
+    Skipping is right on a laptop with no database running. In CI it is how this whole tier
+    reported green while executing nothing: every SQL test skipped on an unreachable DSN, and a
+    skip is not a failure, so the job passed. That is the state this workflow change exists to
+    end — and it would come back silently the first time the postgres service failed to start,
+    which is precisely when someone needs to be told.
+    """
+    if os.environ.get("CI"):
+        pytest.fail(f"{reason} (CI is set, so this is a failure rather than a skip)")
+    pytest.skip(reason)
 
 
 @pytest_asyncio.fixture
 async def pg_conn() -> AsyncGenerator[asyncpg.Connection, None]:
-    """A live Postgres connection on DATABASE_URL; skips the test if none is reachable."""
+    """A live Postgres connection on DATABASE_URL; skips the test if none is reachable (fails in CI)."""
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
-        pytest.skip("DATABASE_URL not set; skipping live-schema check")
+        _no_postgres("DATABASE_URL not set; skipping live-schema check")
     try:
         conn = await asyncpg.connect(dsn=dsn)
     except (OSError, asyncpg.PostgresError) as exc:
-        pytest.skip(f"Postgres unreachable on DATABASE_URL: {exc}")
+        _no_postgres(f"Postgres unreachable on DATABASE_URL: {exc}")
     try:
         yield conn
     finally:

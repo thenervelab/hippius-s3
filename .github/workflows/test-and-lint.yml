@@ -41,14 +41,14 @@ jobs:
 
       - name: Lint (ruff check)
         run: |
-          ruff check hippius_s3 gateway || (
+          ruff check hippius_s3 || (
             echo "=== Ruff settings ===" && ruff check --show-settings | sed -n '1,200p' && exit 1
           )
 
       - name: Format (ruff format --check)
         run: |
-          ruff format --check hippius_s3 gateway || (
-            echo "=== Ruff format DIFF (all) ===" && ruff format --diff hippius_s3 gateway | sed -n '1,400p' || true
+          ruff format --check hippius_s3 || (
+            echo "=== Ruff format DIFF (all) ===" && ruff format --diff hippius_s3 | sed -n '1,400p' || true
             exit 1
           )
 
@@ -80,7 +80,7 @@ jobs:
       - name: Type check with ty
         run: |
           source .venv/bin/activate
-          ty check hippius_s3 gateway
+          ty check hippius_s3
 
   dep-audit:
     name: Dependency Audit (pip-audit)
@@ -115,7 +115,33 @@ jobs:
   unit-integration:
     name: Unit & Integration Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    services:
+      # Without this, every real-Postgres test in tests/integration self-skipped: the pg_conn
+      # fixture skips when nothing is reachable, and each test_*_sql.py that opens its own
+      # asyncpg connection skips on the resulting OSError. The whole SQL tier reported green
+      # while executing nothing.
+      #
+      # postgres:17 matches the `rust` job below rather than prod's PG 15, so both jobs
+      # exercise one server version; none of these tests depend on version-specific behavior.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          # The database name is load-bearing: tests/integration/conftest.py loads
+          # .env.test-local with override=True, so the tests connect to
+          # postgres:postgres@localhost:5432/hippius regardless of what this job exports.
+          POSTGRES_DB: hippius
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 12
+    env:
+      # Exported for the migration step, which reads DATABASE_URL directly. The tests
+      # themselves get the identical DSN from .env.test-local (see POSTGRES_DB above).
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/hippius?sslmode=disable
     steps:
       - uses: actions/checkout@v4
 
@@ -136,10 +162,42 @@ jobs:
       # The retry-mover tests spawn a throwaway redis-server because fakeredis cannot run Lua,
       # and they self-skip when the binary is absent. The runner image does not ship it, so
       # without this the atomic-claim regression guard silently never executes in CI.
-      - name: Install redis-server
+      # psql applies the drain crate's migrations below.
+      - name: Install redis-server and postgresql-client
         run: |
-          sudo apt-get update
-          sudo apt-get install -y redis-server
+          # azure.archive.ubuntu.com periodically hangs mid-fetch on GH-hosted runners
+          # (2026-08-19: three consecutive runs died to the 10-min job timeout INSIDE
+          # `apt-get update`, pytest never started). Bound every fetch and retry, so a
+          # dead mirror costs a bounded retry instead of the whole job.
+          APT_OPTS="-o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=3"
+          for i in 1 2 3; do
+            timeout 180 sudo apt-get update $APT_OPTS && break
+            echo "apt-get update attempt $i timed out or failed; retrying"
+          done
+          timeout 300 sudo apt-get install -y $APT_OPTS redis-server postgresql-client
+
+      # hippius_s3.scripts.migrate shells out to dbmate, which the runner image does not ship
+      # (the app image installs it in the Dockerfile).
+      - name: Install dbmate 2.35.0
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/dbmate" \
+            https://github.com/amacneil/dbmate/releases/download/v2.35.0/dbmate-linux-amd64
+          chmod +x "$RUNNER_TEMP/dbmate"
+          sudo mv "$RUNNER_TEMP/dbmate" /usr/local/bin/dbmate
+
+      # Two independent migration systems own this one database, and the SQL tier needs both:
+      # dbmate owns the app schema (hippius_s3/sql/migrations), while the drain crate owns the
+      # cephor_* tables. In prod the drain's own sqlx applies the latter, so nothing else here
+      # would create them. A reachable-but-unmigrated Postgres is worse than none at all — the
+      # skip guards pass and every query then fails on a missing relation.
+      - name: Apply database migrations
+        run: |
+          source .venv/bin/activate
+          python -m hippius_s3.scripts.migrate
+          for migration in crates/hippius-drain-core/migrations/*.sql; do
+            echo "applying $migration"
+            psql -v ON_ERROR_STOP=1 --single-transaction -q "$DATABASE_URL" -f "$migration"
+          done
 
       - name: Run unit tests
         run: |
@@ -167,6 +225,9 @@ jobs:
       DOCKER_BUILDKIT: "1"
       COMPOSE_DOCKER_CLI_BUILD: "1"
       HIPPIUS_KEY: ${{ secrets.HIPPIUS_KEY }}
+      # Job-wide, not per-step: conftest's `docker compose up --build` rebuilds too, so both the
+      # explicit build step and the pytest run must resolve the same locally-built base.
+      BASE_IMAGE: hippius-s3-base:latest
     steps:
       - uses: actions/checkout@v4
 
@@ -199,6 +260,9 @@ jobs:
         run: |
           if [ -f .env.example ]; then cp .env.example .env; else touch .env; fi
 
+      # BASE_IMAGE (job env) points the app images at the base we just built from THIS commit's
+      # pyproject.toml. Without it they layer onto the published base and any dependency added in
+      # the PR is missing at runtime — the api container then fails to import and goes unhealthy.
       - name: Build Docker images
         run: |
           docker compose --profile build-base -f docker-compose.yml -f docker-compose.e2e.yml build base

@@ -10,6 +10,9 @@ from fastapi import Response
 
 from hippius_s3 import dependencies
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.acl_endpoints import get_bucket_acl
+from hippius_s3.api.s3.acl_endpoints import invalid_canned_acl_response
+from hippius_s3.api.s3.acl_endpoints import put_bucket_acl
 from hippius_s3.api.s3.buckets.bucket_create_endpoint import handle_create_bucket
 from hippius_s3.api.s3.buckets.bucket_delete_endpoint import handle_delete_bucket
 from hippius_s3.api.s3.buckets.bucket_head_endpoint import handle_head_bucket
@@ -43,14 +46,16 @@ async def get_bucket(
     request: Request,
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
+    if "acl" in request.query_params:
+        return await get_bucket_acl(bucket_name, request)
     if "location" in request.query_params:
         return await handle_get_bucket_location(bucket_name)
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
-            return await tags_get_bucket_tags(bucket_name, conn, request.state.account.main_account)
+            return await tags_get_bucket_tags(bucket_name, conn, request.state.main_account_id)
     if "lifecycle" in request.query_params:
         async with pool.acquire() as conn:
-            return await handle_get_bucket_lifecycle(bucket_name, conn, request.state.account.main_account)
+            return await handle_get_bucket_lifecycle(bucket_name, conn, request.state.main_account_id)
     if "uploads" in request.query_params:
         from hippius_s3.api.s3.multipart import list_multipart_uploads
 
@@ -58,7 +63,7 @@ async def get_bucket(
             return await list_multipart_uploads(bucket_name, request, conn)
     if "policy" in request.query_params:
         async with pool.acquire() as conn:
-            return await policy_get_bucket_policy(bucket_name, conn, request.state.account.main_account)
+            return await policy_get_bucket_policy(bucket_name, conn, request.state.main_account_id)
     ctx = get_request_context(request)
     qp = request.query_params
     return await handle_list_objects(
@@ -80,6 +85,10 @@ async def create_or_modify_bucket(
     request: Request,
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
+    if "acl" in request.query_params:
+        return await put_bucket_acl(bucket_name, request)
+    if (invalid := invalid_canned_acl_response(request.headers.get("x-amz-acl"))) is not None:
+        return invalid
     # Delegate to the new comprehensive handler (supports create/tagging/lifecycle/policy)
     async with pool.acquire() as conn:
         return await handle_create_bucket(bucket_name, request, conn)
@@ -94,7 +103,16 @@ async def delete_bucket_tags_route(
 ) -> Response:
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
-            return await tags_delete_bucket_tags(bucket_name, conn, request.state.account.main_account)
+            return await tags_delete_bucket_tags(bucket_name, conn, request.state.main_account_id)
+    # DeleteBucket takes no subresource. Treating every unrecognised one as a bucket delete
+    # meant an ordinary DeleteBucketPolicy / DeleteBucketCors call destroyed the bucket, and
+    # `?acl` arrived graded WRITE_ACP rather than WRITE.
+    if request.query_params:
+        return errors.s3_error_response(
+            "NotImplemented",
+            "The specified operation is not supported.",
+            status_code=501,
+        )
     async with pool.acquire() as conn:
         return await handle_delete_bucket(bucket_name, request, conn, redis_client)
 

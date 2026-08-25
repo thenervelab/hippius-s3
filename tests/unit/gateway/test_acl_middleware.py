@@ -6,12 +6,11 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.acl import acl_middleware
-from gateway.middlewares.acl import get_required_permission
-from gateway.middlewares.acl import parse_s3_path
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.middlewares.acl import get_required_permission
+from hippius_s3.gateway.middlewares.acl import parse_s3_path
+from hippius_s3.gateway.services.acl_service import BucketLookup
 from hippius_s3.models.acl import Permission
-
 from tests.unit.gateway._suspension_fakes import install_no_suspension_state
 
 
@@ -389,3 +388,72 @@ class TestACLMiddleware:
         assert b"<Code>AccessDenied</Code>" in response.content
         assert b"<Message>Access Denied</Message>" in response.content
         assert b"</Error>" in response.content
+
+
+class TestCreateBucketRequiresIdentity:
+    """CreateBucket bypasses the ACL check, which is correct — there is no bucket to authorise
+    against yet. But "nothing to authorise against" is not "no identity required": without this
+    guard the branch admitted a caller with no account_id at all, and the row downstream was
+    stamped with whatever the caller's id resolved to. AWS requires SigV4 on CreateBucket for the
+    same reason — a bucket always has a real owner.
+
+    Three other layers already stop this (auth_orchestrator 403s anonymous non-GET/HEAD,
+    input_validation rejects reserved names, bucket_create_endpoint refuses a sentinel owner).
+    This is the earliest point at which the request is identifiably anonymous.
+    """
+
+    @pytest.fixture
+    def mock_acl_service(self) -> Any:
+        service = AsyncMock()
+        service.check_permission = AsyncMock(return_value=True)
+        # CreateBucket means the bucket does not exist yet.
+        service.get_bucket_owner_and_id = AsyncMock(return_value=None)
+        return service
+
+    @pytest.fixture
+    def acl_app(self, mock_acl_service: Any) -> Any:
+        app = FastAPI()
+        app.state.acl_service = mock_acl_service
+        install_no_suspension_state(app)
+
+        @app.put("/{bucket}")
+        async def create_bucket(bucket: str) -> dict[str, str]:
+            return {"bucket": bucket}
+
+        app.middleware("http")(acl_middleware)
+        return app
+
+    @pytest.mark.asyncio
+    async def test_anonymous_create_bucket_is_denied(self, acl_app: Any, mock_acl_service: Any) -> None:
+        async with AsyncClient(transport=ASGITransport(app=acl_app), base_url="http://test") as client:
+            response = await client.put("/brand-new-bucket")
+
+        assert response.status_code == 403
+        assert b"<Code>AccessDenied</Code>" in response.content
+
+    @pytest.mark.asyncio
+    async def test_sentinel_account_id_create_bucket_is_denied(self, acl_app: Any, mock_acl_service: Any) -> None:
+        async def _stamp_anonymous(request: Any, call_next: Any) -> Any:
+            request.state.account_id = "anonymous"
+            return await call_next(request)
+
+        acl_app.middleware("http")(_stamp_anonymous)
+
+        async with AsyncClient(transport=ASGITransport(app=acl_app), base_url="http://test") as client:
+            response = await client.put("/brand-new-bucket")
+
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_authenticated_create_bucket_still_passes(self, acl_app: Any, mock_acl_service: Any) -> None:
+        async def _stamp_account(request: Any, call_next: Any) -> Any:
+            request.state.account_id = "5EvT2ccmmY6t3q1U3PXwjzwFBjE2KzvWdC6mMsCvBbiBDs55"
+            return await call_next(request)
+
+        acl_app.middleware("http")(_stamp_account)
+
+        async with AsyncClient(transport=ASGITransport(app=acl_app), base_url="http://test") as client:
+            response = await client.put("/brand-new-bucket")
+
+        assert response.status_code == 200
+        mock_acl_service.check_permission.assert_not_called()

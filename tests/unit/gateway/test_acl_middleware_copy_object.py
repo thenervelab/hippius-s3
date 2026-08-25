@@ -25,13 +25,12 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.acl import _parse_copy_source_bucket
-from gateway.middlewares.acl import acl_middleware
-from gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.middlewares.acl import _parse_copy_source_bucket
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.services.acl_service import BucketLookup
 from hippius_s3.models.sub_token import BucketScope
 from hippius_s3.models.sub_token import Permission
 from hippius_s3.models.sub_token import SubTokenScope
-
 from tests.unit.gateway._suspension_fakes import install_no_suspension_state
 
 
@@ -216,11 +215,16 @@ async def test_copy_object_nonexistent_source_falls_through_to_backend() -> None
 
 
 @pytest.mark.asyncio
-async def test_copy_object_with_malformed_copy_source_header_does_not_block() -> None:
-    """Malformed/empty x-amz-copy-source: no source check is performed.
+async def test_copy_object_with_an_arn_copy_source_is_authorised_as_a_literal_bucket() -> None:
+    """The ARN form is not special-cased — it is authorised as the name the handlers will use.
 
-    The backend will reject the malformed header itself; the middleware
-    shouldn't 403 on un-parseable headers (would mask the real S3 error)."""
+    This test previously asserted the opposite (200, "the backend will reject it itself"). That
+    contract was the bug: neither handler recognises the ARN form, both read it as a literal
+    bucket name, so skipping the check here left the source unauthorised while the handler went
+    on to resolve it. Failing open whenever THIS parser disagrees with the handler's parser is
+    precisely the split-view class. The middleware now authorises whatever the handler will act
+    on, so an ARN source is a permission check against a bucket that does not exist -> 403.
+    """
     scope = _scope(Permission.object_read_write, BucketScope.specific, ["dest-id"])
     app = _make_app(
         scope=scope,
@@ -229,6 +233,19 @@ async def test_copy_object_with_malformed_copy_source_header_does_not_block() ->
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.put("/dest-bucket/dest-key", headers={"x-amz-copy-source": "arn:aws:s3:::other/key"})
     assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_copy_source_with_no_slash_is_refused() -> None:
+    """A header naming no key at all cannot be authorised, so it must not be waved through."""
+    scope = _scope(Permission.object_read_write, BucketScope.specific, ["dest-id"])
+    app = _make_app(
+        scope=scope,
+        bucket_owner_lookup={"dest-bucket": ("alice", "dest-id")},
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.put("/dest-bucket/dest-key", headers={"x-amz-copy-source": "just-a-bucket"})
+    assert r.status_code == 403
 
 
 @pytest.mark.asyncio

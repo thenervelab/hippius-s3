@@ -10,7 +10,7 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.input_validation import input_validation_middleware
+from hippius_s3.gateway.middlewares.input_validation import input_validation_middleware
 
 
 @pytest.fixture
@@ -268,15 +268,19 @@ async def test_non_reserved_names_pass(validation_app: Any, name: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reserved_check_uses_raw_path_not_url_path() -> None:
-    """The reserved check must read the same decoded path every other security-relevant
-    middleware reads. request.url.path is built with urlsplit, which truncates at '#', so
-    `PUT /docs%23x` would look like the bare reserved name `docs` through that lens."""
-    from gateway.utils.paths import first_path_segment
+async def test_reserved_check_uses_the_path_the_api_will_receive() -> None:
+    """The reserved check must read the same path every other security-relevant middleware reads,
+    and that path is the one the api routes on.
+
+    `PUT /docs%23x` really does arrive at the api as `PUT /docs` — httpx truncates the target at the
+    `#` — so judging it as the bucket `docs#x` was judging a request that is never sent. Both
+    spellings are refused, but only this one is refused for the true reason: `docs` is reserved.
+    """
+    from hippius_s3.gateway.utils.paths import first_path_segment
 
     request = MagicMock()
     request.scope = {"raw_path": b"/docs%23x"}
-    assert first_path_segment(request) == "docs#x"
+    assert first_path_segment(request) == "docs"
 
 
 @pytest.mark.asyncio

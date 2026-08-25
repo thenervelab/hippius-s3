@@ -12,10 +12,9 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway import config as gateway_config
-from gateway.middlewares.acl import acl_middleware
-from gateway.services.acl_service import BucketLookup
-
+from hippius_s3 import config as gateway_config
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.services.acl_service import BucketLookup
 from tests.unit.gateway._suspension_fakes import install_no_suspension_state
 
 
@@ -23,9 +22,9 @@ from tests.unit.gateway._suspension_fakes import install_no_suspension_state
 def _ats_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """Enable ATS so the anonymous_read_allowed probe runs."""
     monkeypatch.setenv("ATS_CACHE_ENDPOINT", "http://ats.local:8080")
-    gateway_config._config = None
+    gateway_config.reset_config()
     yield
-    gateway_config._config = None
+    gateway_config.reset_config()
 
 
 def _build_app(
@@ -164,7 +163,7 @@ async def test_authenticated_check_permission_called_twice() -> None:
 async def test_probe_skipped_when_ats_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """When ATS is off, the anon-read probe is skipped to save a Redis round-trip."""
     monkeypatch.setenv("ATS_CACHE_ENDPOINT", "")
-    gateway_config._config = None
+    gateway_config.reset_config()
     service = _make_service(primary_permits=True, anon_permits=True)
     app = _build_app(service, account_id="alice")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

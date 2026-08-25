@@ -31,8 +31,8 @@ async def metrics_middleware(
     object_key = None
 
     if hasattr(request.state, "account"):
-        main_account = getattr(request.state.account, "main_account", None)
-        subaccount_id = getattr(request.state.account, "id", None)
+        main_account = getattr(request.state, "main_account_id", None)
+        subaccount_id = getattr(request.state, "account_id", None)
 
     bucket_name = request.path_params.get("bucket_name")
     object_key = request.path_params.get("object_key")
@@ -46,20 +46,8 @@ async def metrics_middleware(
 
     span = trace.get_current_span()
     if span.is_recording():
-        if hasattr(request.state, "gateway_time_ms"):
-            gateway_time = request.state.gateway_time_ms
-            span.set_attributes(
-                {
-                    "timing.gateway_ms": gateway_time,
-                    "timing.api_ms": api_time_ms,
-                    "timing.total_ms": gateway_time + api_time_ms,
-                }
-            )
-            response.headers["X-Hippius-Gateway-Time-Ms"] = str(round(gateway_time, 2))
-            response.headers["X-Hippius-API-Time-Ms"] = str(round(api_time_ms, 2))
-        else:
-            span.set_attribute("timing.api_ms", api_time_ms)
-            response.headers["X-Hippius-API-Time-Ms"] = str(round(api_time_ms, 2))
+        span.set_attribute("timing.api_ms", api_time_ms)
+        response.headers["X-Hippius-API-Time-Ms"] = str(round(api_time_ms, 2))
 
     endpoint_name = "unknown"
     try:

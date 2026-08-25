@@ -237,3 +237,23 @@ Notes:
   - `x-hippius-source`: `cache` or `pipeline` (diagnostic; indicates serving source)
   - `X-Hippius-Arion-File-Hash`: Arion backend file hash or `pending`
   - `x-amz-meta-append-version`: current append version (when applicable)
+
+## Known divergences from AWS S3
+
+- **Object keys may not contain `?` or `#`.** AWS permits both. Requests naming such a key are
+  refused with `400 InvalidURI` rather than accepted.
+
+  This is a deliberate divergence, not an omission. The gateway forwards by interpolating the
+  decoded request path into a URL string, which the HTTP client then re-parses — and both
+  characters are delimiters there. A request for `report?v1.txt` was therefore already being
+  truncated at the `?` before it reached the API: a GET returned the object named `report`, and a
+  PUT wrote to it. Two keys differing only after the delimiter collapsed onto one object, with a
+  200 on both and nothing in the logs.
+
+  So the practical change is the error, not the access: these keys were never addressable over
+  the S3 path. `CopyObject` (which takes the source from the `x-amz-copy-source` header) and
+  batch `DeleteObjects` (which takes keys from the request body) do not go through path parsing
+  and still reach such an object if one exists.
+
+  `hippius_s3/scripts/report_delimiter_keys.py` reports any live keys containing either
+  character.

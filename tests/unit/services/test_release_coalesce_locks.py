@@ -26,9 +26,7 @@ class _RecordingRedis:
 @pytest.mark.asyncio
 async def test_release_cads_each_part_on_the_ray_token() -> None:
     redis = _RecordingRedis()
-    await _release_coalesce_locks(
-        redis, object_id="obj-1", object_version=3, part_numbers={1, 2}, ray_token="ray-9"
-    )
+    await _release_coalesce_locks(redis, object_id="obj-1", object_version=3, part_numbers={1, 2}, ray_token="ray-9")
 
     assert len(redis.evals) == 2
     keys = {e[2] for e in redis.evals}
@@ -49,6 +47,4 @@ async def test_release_is_best_effort_on_redis_error() -> None:
             raise RuntimeError("redis down")
 
     # Must not raise — a failed release just lets the TTL expire.
-    await _release_coalesce_locks(
-        _ErrRedis(), object_id="obj", object_version=1, part_numbers={1}, ray_token="t"
-    )
+    await _release_coalesce_locks(_ErrRedis(), object_id="obj", object_version=1, part_numbers={1}, ray_token="t")

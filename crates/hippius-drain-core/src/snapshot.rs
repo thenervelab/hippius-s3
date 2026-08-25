@@ -68,6 +68,49 @@ impl LatencyWindow {
     }
 }
 
+/// What one B-2 divergence check concluded about a re-landed part. Exactly one counter moves
+/// per checked part, so the variants sum to the number of announcements that named an already-
+/// `replicated` part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelandOutcome {
+    /// The SSD content still matched the digest recorded at commit.
+    Unchanged,
+    /// The content had changed (or could not be verified), so the part went back to `pending`.
+    Redriven,
+    /// The part could not be read off SSD, so nothing was decided. Fail-safe but blind.
+    Unreadable,
+    /// The part's SSD directory was GONE at check time (`NotFound`) — the lost-race signature,
+    /// distinct from [`Unreadable`](Self::Unreadable)'s flaky-disk shape. An announcement fires
+    /// only when a part was just written, so its files being absent moments later means
+    /// something unlinked them in between — the evictor or the reclaimer. If the rewrite had
+    /// diverged, its only copy is destroyed and the pool permanently serves the superseded
+    /// bytes; nothing after this point can tell, which is why the variant exists.
+    Vanished,
+}
+
+/// Which worker performed an SSD walk.
+///
+/// A closed enum, not a string: it becomes a metric label, and two values fixed in code cannot
+/// become a cardinality problem the way a caller-supplied name could.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanWorker {
+    /// The reconciler — the discovery walk, on the short poll.
+    Reconcile,
+    /// The reclaim worker — the debris walk, on the long poll.
+    Reclaim,
+}
+
+impl ScanWorker {
+    /// The metric label for this worker.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reconcile => "reconcile",
+            Self::Reclaim => "reclaim",
+        }
+    }
+}
+
 /// A point-in-time view of the agent's drain activity, for metrics.
 ///
 /// Plain monotonic counters the runtime accumulates; the observability layer
@@ -89,6 +132,56 @@ pub struct AgentSnapshot {
     pub deferred: u64,
     /// Chunks the reconciler recovered after a dropped `chunk_landed` trigger.
     pub reconciler_recovered: u64,
+    /// Parts visited by the RECONCILER's walk, summed across passes.
+    ///
+    /// The signal that F1 has returned. The walks are O(everything on disk), and retention took
+    /// that from "the undrained backlog" to "this node's entire replicated shard" — 2.28 M parts
+    /// on prod — without anything reporting the change.
+    ///
+    /// Split per worker rather than summed, because the two answer different questions and run
+    /// on cadences three orders of magnitude apart. A merged counter is readable only while the
+    /// reconciler's short poll dominates it — and lengthening that poll is precisely the
+    /// follow-up this metric exists to gate, after which a merged total could not say which
+    /// walk any residual cost belonged to.
+    pub reconcile_scan_parts: u64,
+    /// How long the reconciler's last walk took, in milliseconds. Watched against ITS poll
+    /// interval: a scan approaching its own period means the worker never stops walking.
+    pub reconcile_scan_ms: u64,
+    /// Parts visited by the RECLAIMER's walk, summed across passes.
+    pub reclaim_scan_parts: u64,
+    /// How long the reclaimer's last walk took, in milliseconds.
+    pub reclaim_scan_ms: u64,
+    /// Parts recorded from the api's landed-part announcements — the fast discovery path.
+    /// Read together with `reconciler_recovered`: this climbing while that stays near zero is
+    /// what says the announcement path is carrying discovery. Both near zero means ingest
+    /// stopped, not that the fast path is working.
+    pub landed_recorded: u64,
+    /// Announcements dropped as unparseable. Must stay at zero; nonzero means the api and the
+    /// agent disagree about the wire contract, in which case every message is being lost and
+    /// discovery has silently fallen back to the reconciler's walk.
+    pub landed_dropped: u64,
+    /// Announcements naming an already-`replicated` part whose SSD content still matched the
+    /// digest recorded at commit — a duplicate announcement, or a backstop racing the fast
+    /// path. Benign; counted so `reland_redriven` can be read as a rate against it.
+    pub reland_unchanged: u64,
+    /// Committed parts returned to `pending` because their SSD content no longer matched what
+    /// the drain copied (B-2). **Nonzero is a real integrity event, not routine work**: an
+    /// object was rewritten after its part drained, so until the re-drive completes the pool —
+    /// and anything promoted from it — holds superseded bytes that AEAD-verify cleanly. Expect
+    /// zero; a sustained rate means a client is re-uploading parts, which is legal S3 but
+    /// worth knowing about.
+    pub reland_redriven: u64,
+    /// Divergence checks abandoned because the part could not be read back off SSD. Fail-safe
+    /// (nothing is re-driven), but it means the check did NOT happen, so a genuine divergence
+    /// on such a part stays undetected. Should be ~zero; a rise points at local-disk trouble.
+    pub reland_unreadable: u64,
+    /// Divergence checks that found the part's SSD directory ABSENT (`NotFound`) — the
+    /// lost-race signature, split out of `reland_unreadable` because the responses differ
+    /// completely. An announced part was just written, so its files vanishing before the check
+    /// means the evictor or reclaimer unlinked it in between; if that rewrite had diverged, the
+    /// client's acknowledged bytes are destroyed and the pool serves the superseded ones with
+    /// no error anywhere. **Nonzero is a possible-data-loss event**, not disk trouble.
+    pub reland_vanished: u64,
     /// `failed` (broken/abandoned-upload) SSD parts the reclaim worker unlinked — the
     /// SSD-ingest tier's eviction throughput, distinct from the drain's `CephFS` work.
     pub reclaimed: u64,
@@ -158,7 +251,33 @@ pub struct SnapshotCell {
     failed: AtomicU64,
     deferred: AtomicU64,
     reconciler_recovered: AtomicU64,
+    reconcile_scan_parts: AtomicU64,
+    reconcile_scan_ms: AtomicU64,
+    reclaim_scan_parts: AtomicU64,
+    reclaim_scan_ms: AtomicU64,
+    landed_recorded: AtomicU64,
+    landed_dropped: AtomicU64,
+    reland_unchanged: AtomicU64,
+    reland_redriven: AtomicU64,
+    reland_unreadable: AtomicU64,
+    reland_vanished: AtomicU64,
     reclaimed: AtomicU64,
+    /// Resident parts the read-tier evictor unlinked, and the bytes they freed. Separate from
+    /// `reclaimed` (debris the reclaim worker removed) because the two answer different
+    /// questions: reclaim rising means junk is accumulating, eviction rising means the cache
+    /// is under space pressure and is giving up warm data.
+    evicted: AtomicU64,
+    evicted_bytes: AtomicU64,
+    /// Worklist entries the evictor REFUSED because they were not `replicated`. The durability
+    /// invariant, and the reason it is a counter rather than a log line: "has this ever been
+    /// non-zero" has to be answerable by an alert rule, not by grepping.
+    evict_blocked_unreplicated: AtomicU64,
+    /// Candidates the evictor SKIPPED because the unlink itself failed. Not alertable on its own
+    /// — `starved` already covers a page that freed nothing — but it is what separates
+    /// starved-because-removals-are-failing (a disk, permissions, or racing-promotion fault) from
+    /// starved-because-the-cursor-is-empty (genuine backlog). The two need opposite responses.
+    evict_remove_failed: AtomicU64,
+    reclaim_remove_failed: AtomicU64,
     /// Aborted-reclaim counter mirroring `reclaimed`: bumped once per reclaim cycle that failed
     /// its object-backing read (`ReclaimError::Backing`). Monotonic, `Relaxed` — a stat counter
     /// with no cross-counter ordering dependency (axiom `rust_quality_92`). See
@@ -169,9 +288,22 @@ pub struct SnapshotCell {
     written_off_servable: AtomicU64,
     /// Current SSD backlog (undrained bytes) — a LEVEL, not a monotonic counter, so it
     /// has its own atomic (set, not accumulated) rather than living in [`AgentSnapshot`].
-    /// The heartbeat worker writes it (`usage.used_bytes`) each tick; the metrics layer
-    /// reads it as a gauge. Kept off the wait-free `load` path so a scrape never blocks.
+    /// The heartbeat worker writes it (from `Store::node_backlog_bytes`) each tick; the
+    /// metrics layer reads it as a gauge. Kept off the wait-free `load` path so a scrape
+    /// never blocks.
     backlog_bytes: AtomicU64,
+    /// Bytes this node holds RESIDENT on SSD to serve reads (`Store::node_cache_bytes`). A
+    /// gauge on the same tick as the backlog. Distinct from it precisely because the
+    /// allocator must not read warm cache as drain demand.
+    cache_bytes: AtomicU64,
+    /// Free bytes on the ingest SSD. The third leg of backlog/cache/free: without it a
+    /// dashboard cannot tell "cache grew" from "the disk filled".
+    free_bytes: AtomicU64,
+    /// The allocator's published free-space floor for this node, in permille of disk, plus
+    /// one so that 0 can mean "nothing published". A bare 0 would be ambiguous with a
+    /// legitimate reserve of 0 (the eviction kill-switch), and reading that as "no floor" on
+    /// a node whose allocator simply had not written yet would stop it evicting entirely.
+    allocated_reserve_permille_plus_one: AtomicU64,
     /// Count of this node's undrained replication rows (`pending` + `draining`) — a LEVEL like
     /// `backlog_bytes`, set each heartbeat from `Store::node_undrained_count`. This is the C8
     /// wedge signal, kept SEPARATE from `backlog_bytes` on purpose: the byte sum joins `parts`
@@ -191,6 +323,14 @@ pub struct SnapshotCell {
     /// a leak can fill the disk without any drain demand. bps not f64 so the gauge stays a
     /// plain atomic; the metrics layer scales it to a 0..1 fraction.
     disk_pressure_bps: AtomicU64,
+    /// Whether the ingest SSD looks like it is shared with a writer the agent cannot see, plus
+    /// one so that 0 can mean "not measured yet" — the same encoding, and for the same reason,
+    /// as `allocated_reserve_permille_plus_one`. Every free-space gate in the system (the
+    /// evictor's reserve, the api's promote floor, its `fs_cache_pressure` 503) assumes the
+    /// bytes this agent accounts for are most of what is on the disk; a bare 0 would report
+    /// that assumption as VERIFIED on a node that has never managed to check it, which is the
+    /// blind spot this flag exists to close.
+    shared_filesystem_plus_one: AtomicU64,
     /// Count of parts currently held `corrupt` on this node — a LEVEL, set each cycle by the
     /// re-drive pass from `Store::count_corrupt_parts`. A nonzero value is a live object whose
     /// pool copy is corrupt, kept alive only by its SSD source: a durability incident (R4), so
@@ -230,6 +370,42 @@ impl SnapshotCell {
         self.reconciler_recovered.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Records one SSD walk against the worker that performed it.
+    ///
+    /// Attributed rather than summed: the two walkers run on cadences three orders of magnitude
+    /// apart, and the point of the announcement path is to lengthen the reconciler's poll — at
+    /// which point a merged counter could no longer say which walk any residual cost was.
+    ///
+    /// Both halves matter per worker: the count says how big the tree got, the duration says
+    /// whether that worker's walk still fits inside its own poll interval.
+    pub fn record_scan(&self, worker: ScanWorker, parts: u64, duration: Duration) {
+        let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let (count, last) = match worker {
+            ScanWorker::Reconcile => (&self.reconcile_scan_parts, &self.reconcile_scan_ms),
+            ScanWorker::Reclaim => (&self.reclaim_scan_parts, &self.reclaim_scan_ms),
+        };
+        count.fetch_add(parts, Ordering::Relaxed);
+        last.store(millis, Ordering::Relaxed);
+    }
+
+    /// Records one landed-announcement batch: `recorded` parts written, `dropped` unparseable.
+    pub fn record_landed(&self, recorded: u64, dropped: u64) {
+        self.landed_recorded.fetch_add(recorded, Ordering::Relaxed);
+        self.landed_dropped.fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Records the outcome of one re-landing divergence check (B-2): exactly one of the
+    /// counters moves per checked part.
+    pub fn record_reland(&self, outcome: RelandOutcome) {
+        let counter = match outcome {
+            RelandOutcome::Unchanged => &self.reland_unchanged,
+            RelandOutcome::Redriven => &self.reland_redriven,
+            RelandOutcome::Unreadable => &self.reland_unreadable,
+            RelandOutcome::Vanished => &self.reland_vanished,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Adds `n` to the SSD-reclaim total (terminal parts the reclaim worker unlinked).
     pub fn record_reclaimed(&self, n: u64) {
         self.reclaimed.fetch_add(n, Ordering::Relaxed);
@@ -247,6 +423,107 @@ impl SnapshotCell {
     /// [`AgentSnapshot::throttled`].
     pub fn record_throttled(&self, n: u64) {
         self.throttled.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Adds one eviction pass's outcome to the read-tier eviction totals.
+    pub fn record_evicted(&self, parts: u64, bytes: u64) {
+        self.evicted.fetch_add(parts, Ordering::Relaxed);
+        self.evicted_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The cumulative count of parts the evictor unlinked (`drain_ssd_evicted_total`).
+    #[must_use]
+    pub fn evicted(&self) -> u64 {
+        self.evicted.load(Ordering::Relaxed)
+    }
+
+    /// The cumulative bytes the evictor freed (`drain_ssd_evicted_bytes_total`).
+    #[must_use]
+    pub fn evicted_bytes(&self) -> u64 {
+        self.evicted_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records eviction candidates refused for not being `replicated`. Must stay at zero.
+    pub fn record_evict_blocked_unreplicated(&self, n: u64) {
+        self.evict_blocked_unreplicated.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Cumulative refused-candidate count (`drain_ssd_evict_blocked_unreplicated_total`).
+    #[must_use]
+    pub fn evict_blocked_unreplicated(&self) -> u64 {
+        self.evict_blocked_unreplicated.load(Ordering::Relaxed)
+    }
+
+    /// Records eviction candidates skipped because their unlink failed.
+    pub fn record_evict_remove_failed(&self, n: u64) {
+        self.evict_remove_failed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Cumulative skipped-on-unlink-failure count (`drain_ssd_evict_remove_failed_total`).
+    #[must_use]
+    pub fn evict_remove_failed(&self) -> u64 {
+        self.evict_remove_failed.load(Ordering::Relaxed)
+    }
+
+    /// Records `failed`-part reclaim candidates skipped because their unlink failed.
+    ///
+    /// Separate from the evictor's counter because the two answer different questions: the
+    /// evictor's worklist re-offers a skipped part on the next pass with no lasting consequence,
+    /// while this worklist is `WHERE reclaimed_at IS NULL` with no offset — a part that never
+    /// unlinks is never marked, so it sits at the head of every later page. `remove_failed` at or
+    /// near the candidate count with `reclaimed` flat is a pinned cursor, and since the residency
+    /// guard those rows also stop being GC-able.
+    pub fn record_reclaim_remove_failed(&self, n: u64) {
+        self.reclaim_remove_failed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Cumulative reclaim skipped-on-unlink-failure count
+    /// (`drain_ssd_reclaim_remove_failed_total`).
+    #[must_use]
+    pub fn reclaim_remove_failed(&self) -> u64 {
+        self.reclaim_remove_failed.load(Ordering::Relaxed)
+    }
+
+    /// Records free bytes on the ingest SSD. A gauge: `store`, not add.
+    pub fn record_free_bytes(&self, bytes: u64) {
+        self.free_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The last-recorded free space (`drain_ssd_free_bytes`).
+    #[must_use]
+    pub fn free_bytes(&self) -> u64 {
+        self.free_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records the bytes currently resident on SSD as read cache. A gauge: `store`, not add.
+    pub fn record_cache_bytes(&self, bytes: u64) {
+        self.cache_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The last-recorded resident cache size (the `drain_ssd_cache_bytes` gauge).
+    #[must_use]
+    pub fn cache_bytes(&self) -> u64 {
+        self.cache_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Records the allocator's published free-space floor for this node (permille of disk).
+    pub fn record_allocated_reserve_permille(&self, permille: u16) {
+        self.allocated_reserve_permille_plus_one.store(u64::from(permille) + 1, Ordering::Relaxed);
+    }
+
+    /// Clears the published floor, so the evictor falls back to its configured one. Used when
+    /// the allocation key expires or the leader predates per-node reserves.
+    pub fn clear_allocated_reserve_permille(&self) {
+        self.allocated_reserve_permille_plus_one.store(0, Ordering::Relaxed);
+    }
+
+    /// The allocator's published floor, or `None` when nothing has been published.
+    #[must_use]
+    pub fn allocated_reserve_permille(&self) -> Option<u16> {
+        match self.allocated_reserve_permille_plus_one.load(Ordering::Relaxed) {
+            0 => None,
+            raw => u16::try_from(raw - 1).ok(),
+        }
     }
 
     /// Records the current SSD backlog (undrained bytes). A gauge: `store`, not add.
@@ -318,6 +595,24 @@ impl SnapshotCell {
         u16::try_from(self.disk_pressure_bps.load(Ordering::Relaxed).min(10_000)).unwrap_or(10_000)
     }
 
+    /// Records whether the ingest SSD appears to be shared with a writer this agent cannot
+    /// account for. A gauge: `store`, not add — and only ever written from a tick that actually
+    /// MEASURED both sides, so a tick that could not measure leaves the last verdict standing.
+    pub fn record_shared_filesystem(&self, shared: bool) {
+        self.shared_filesystem_plus_one.store(u64::from(shared) + 1, Ordering::Relaxed);
+    }
+
+    /// The last shared-disk verdict, or `None` if the check has not run successfully yet
+    /// (the `drain_ssd_shared_filesystem` gauge source). `None` is deliberately NOT `Some(false)`:
+    /// an unmeasured disk is an open question, not a clean one.
+    #[must_use]
+    pub fn shared_filesystem(&self) -> Option<bool> {
+        match self.shared_filesystem_plus_one.load(Ordering::Relaxed) {
+            0 => None,
+            raw => Some(raw > 1),
+        }
+    }
+
     /// Records the current count of parts held `corrupt` on this node. A gauge: `store`, not
     /// add. The re-drive pass writes it each cycle from `Store::count_corrupt_parts`.
     pub fn record_corrupt(&self, count: u64) {
@@ -354,6 +649,16 @@ impl SnapshotCell {
             failed: self.failed.load(Ordering::Relaxed),
             deferred: self.deferred.load(Ordering::Relaxed),
             reconciler_recovered: self.reconciler_recovered.load(Ordering::Relaxed),
+            reconcile_scan_parts: self.reconcile_scan_parts.load(Ordering::Relaxed),
+            reconcile_scan_ms: self.reconcile_scan_ms.load(Ordering::Relaxed),
+            reclaim_scan_parts: self.reclaim_scan_parts.load(Ordering::Relaxed),
+            reclaim_scan_ms: self.reclaim_scan_ms.load(Ordering::Relaxed),
+            landed_recorded: self.landed_recorded.load(Ordering::Relaxed),
+            landed_dropped: self.landed_dropped.load(Ordering::Relaxed),
+            reland_unchanged: self.reland_unchanged.load(Ordering::Relaxed),
+            reland_redriven: self.reland_redriven.load(Ordering::Relaxed),
+            reland_unreadable: self.reland_unreadable.load(Ordering::Relaxed),
+            reland_vanished: self.reland_vanished.load(Ordering::Relaxed),
             reclaimed: self.reclaimed.load(Ordering::Relaxed),
             reclaim_backing_errors: self.reclaim_backing_errors.load(Ordering::Relaxed),
             throttled: self.throttled.load(Ordering::Relaxed),
@@ -366,7 +671,7 @@ impl SnapshotCell {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{AgentSnapshot, SnapshotCell};
+    use super::{AgentSnapshot, RelandOutcome, ScanWorker, SnapshotCell};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -448,6 +753,24 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_filesystem_verdict_distinguishes_unmeasured_from_clean() {
+        // B-5: every free-space gate in the workstream assumes the agent's accounted bytes are
+        // most of what is on the disk. A two-state flag would report an agent that has never
+        // checked as "verified clean" — the exact blind spot — so the unmeasured state is a
+        // third value the metrics layer declines to publish at all.
+        let cell = SnapshotCell::new();
+        assert_eq!(cell.shared_filesystem(), None, "a fresh cell has not measured the disk");
+        cell.record_shared_filesystem(true);
+        assert_eq!(cell.shared_filesystem(), Some(true));
+        cell.record_shared_filesystem(false);
+        assert_eq!(
+            cell.shared_filesystem(),
+            Some(false),
+            "a co-tenant leaving clears the verdict: this is a live measurement, not an incident latch"
+        );
+    }
+
+    #[test]
     fn oldest_pending_age_is_a_settable_gauge_not_a_counter() {
         // Task F starvation signal: the age of this node's oldest `pending` row, a LEVEL
         // set each heartbeat from Store::node_oldest_pending_age_secs — so a later record
@@ -497,6 +820,35 @@ mod tests {
     }
 
     #[test]
+    fn each_reland_outcome_moves_exactly_its_own_counter() {
+        // The four arms feed the B-2 alerting split — `reland_vanished` in particular is the
+        // "possible destruction of acknowledged bytes" alarm. A transposed match arm would
+        // silence that alarm while every behavioural test stayed green, so the mapping is
+        // pinned as a bijection: per outcome, its counter reads 1 and the other three read 0.
+        type Project = fn(&AgentSnapshot) -> [u64; 4];
+        let cases: [(RelandOutcome, Project); 4] = [
+            (RelandOutcome::Unchanged, |s| {
+                [s.reland_unchanged, s.reland_redriven, s.reland_unreadable, s.reland_vanished]
+            }),
+            (RelandOutcome::Redriven, |s| {
+                [s.reland_redriven, s.reland_unchanged, s.reland_unreadable, s.reland_vanished]
+            }),
+            (RelandOutcome::Unreadable, |s| {
+                [s.reland_unreadable, s.reland_unchanged, s.reland_redriven, s.reland_vanished]
+            }),
+            (RelandOutcome::Vanished, |s| {
+                [s.reland_vanished, s.reland_unchanged, s.reland_redriven, s.reland_unreadable]
+            }),
+        ];
+        for (outcome, project) in cases {
+            let cell = SnapshotCell::new();
+            cell.record_reland(outcome);
+            let [own, other_a, other_b, other_c] = project(&cell.load());
+            assert_eq!((own, other_a, other_b, other_c), (1, 0, 0, 0), "outcome {outcome:?}");
+        }
+    }
+
+    #[test]
     fn records_accumulate_per_counter() {
         let cell = SnapshotCell::new();
         cell.record_drained(3);
@@ -512,6 +864,16 @@ mod tests {
                 failed: 1,
                 deferred: 0,
                 reconciler_recovered: 4,
+                reconcile_scan_parts: 0,
+                reconcile_scan_ms: 0,
+                reclaim_scan_parts: 0,
+                reclaim_scan_ms: 0,
+                landed_recorded: 0,
+                landed_dropped: 0,
+                reland_unchanged: 0,
+                reland_redriven: 0,
+                reland_unreadable: 0,
+                reland_vanished: 0,
                 reclaimed: 6,
                 reclaim_backing_errors: 0,
                 throttled: 9,
@@ -519,6 +881,40 @@ mod tests {
                 written_off_servable: 0,
             },
         );
+    }
+
+    #[test]
+    fn scan_parts_accumulate_across_walks_while_the_duration_is_the_latest() {
+        // Both SSD walkers record here, so the count must be a fleet total across passes — that
+        // is what a rate against the poll interval is derived from. The duration is deliberately
+        // NOT summed: it is compared against one poll interval to answer "is this worker walking
+        // continuously", and a running total could not answer that.
+        let cell = SnapshotCell::new();
+        cell.record_scan(ScanWorker::Reconcile, 2_000_000, Duration::from_millis(400));
+        cell.record_scan(ScanWorker::Reconcile, 280_000, Duration::from_millis(90));
+        cell.record_scan(ScanWorker::Reclaim, 5_000, Duration::from_millis(7));
+
+        let snap = cell.load();
+        assert_eq!(snap.reconcile_scan_parts, 2_280_000, "walk cost accumulates per worker");
+        assert_eq!(snap.reconcile_scan_ms, 90, "the duration is that worker's most recent walk, not a sum");
+        // Attribution is the point: the reclaimer's cheap hourly walk must not be buried in the
+        // reconciler's total, or lengthening the reconcile poll leaves the residual unexplained.
+        assert_eq!(snap.reclaim_scan_parts, 5_000);
+        assert_eq!(snap.reclaim_scan_ms, 7);
+    }
+
+    #[test]
+    fn landed_records_split_recorded_from_dropped() {
+        // The pair that says which discovery path is carrying the work. `dropped` must stay at
+        // zero: nonzero means the api and the agent disagree about the message shape, so every
+        // announcement is discarded and discovery has silently reverted to the walk.
+        let cell = SnapshotCell::new();
+        cell.record_landed(7, 0);
+        cell.record_landed(3, 2);
+
+        let snap = cell.load();
+        assert_eq!(snap.landed_recorded, 10);
+        assert_eq!(snap.landed_dropped, 2);
     }
 
     #[test]
@@ -578,6 +974,16 @@ mod tests {
             failed: u64::MAX,
             deferred: 0,
             reconciler_recovered: 0,
+            reconcile_scan_parts: 0,
+            reconcile_scan_ms: 0,
+            reclaim_scan_parts: 0,
+            reclaim_scan_ms: 0,
+            landed_recorded: 0,
+            landed_dropped: 0,
+            reland_unchanged: 0,
+            reland_redriven: 0,
+            reland_unreadable: 0,
+            reland_vanished: 0,
             reclaimed: 0,
             reclaim_backing_errors: 0,
             throttled: 0,
@@ -594,6 +1000,16 @@ mod tests {
             failed: 3,
             deferred: 0,
             reconciler_recovered: 0,
+            reconcile_scan_parts: 0,
+            reconcile_scan_ms: 0,
+            reclaim_scan_parts: 0,
+            reclaim_scan_ms: 0,
+            landed_recorded: 0,
+            landed_dropped: 0,
+            reland_unchanged: 0,
+            reland_redriven: 0,
+            reland_unreadable: 0,
+            reland_vanished: 0,
             reclaimed: 0,
             reclaim_backing_errors: 0,
             throttled: 0,

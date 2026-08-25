@@ -18,7 +18,7 @@ self-enqueues at PUT; uploads complete e2e via the drain.
 | `drain-allocator-deployment.yaml` | The singleton (leader-elected) drain budget allocator. |
 
 Untouched / still on ceph: `gateway`, `arion-uploader/downloader/unpinner`, `janitor`, the
-`s3-backup` stack (`backup`/`hydrator`/`cleanup`), the shared configmap, `object-cache-pvc`.
+auxiliary worker stack, the shared configmap, `object-cache-pvc`.
 
 ## Storage: hostPath, self-provisioning (no manual node prep)
 

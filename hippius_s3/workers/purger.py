@@ -8,9 +8,9 @@ from typing import Any
 
 from redis.exceptions import RedisError
 
-from gateway.services.sub_token_scope_cache import scope_cache_key
 from hippius_s3.config import Config
 from hippius_s3.config import get_config
+from hippius_s3.gateway.services.sub_token_scope_cache import scope_cache_key
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request

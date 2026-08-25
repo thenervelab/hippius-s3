@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 async def handle_head_bucket(bucket_name: str, request: Request, db: Any) -> Response:
     """Check if a bucket exists using S3 protocol (HEAD /{bucket_name})."""
     try:
-        main_account_id = request.state.account.main_account
+        main_account_id = request.state.main_account_id
         await db.fetchrow(
             get_query("get_or_create_user_by_main_account"),
             main_account_id,

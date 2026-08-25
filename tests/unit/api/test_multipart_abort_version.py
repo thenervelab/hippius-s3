@@ -58,7 +58,9 @@ class _FakeDb:
 def _fake_request(upload_id: str, *, fs_delete: Any, redis: Any) -> Any:
     return SimpleNamespace(
         query_params={"uploadId": upload_id},
-        app=SimpleNamespace(state=SimpleNamespace(redis_client=redis, fs_store=SimpleNamespace(delete_object=fs_delete))),
+        app=SimpleNamespace(
+            state=SimpleNamespace(redis_client=redis, fs_store=SimpleNamespace(delete_object=fs_delete))
+        ),
     )
 
 

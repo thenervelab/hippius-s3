@@ -25,7 +25,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # (manifest, workload name) for every workload that serves client HTTP traffic.
 SERVING_WORKLOADS = [
     ("k8s/base/api-deployment.yaml", "api"),
-    ("k8s/base/gateway-deployment.yaml", "gateway"),
     ("k8s/production/api-local-deployments-production.yaml", "api-local"),
     ("k8s/staging/api-local-deployments-staging.yaml", "api-local"),
 ]

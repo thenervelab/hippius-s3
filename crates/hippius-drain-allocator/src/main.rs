@@ -99,17 +99,7 @@ async fn main() -> Result<(), StartupError> {
 async fn run_with_ceiling_source(coord: &Coordinator, config: &AllocatorConfig, metrics: &AllocatorMetrics) -> Result<(), StartupError> {
     #[cfg(feature = "http")]
     if let Some(url) = config.ceph_mgr_metrics_url.clone() {
-        // The decay floor is the AIMD floor: while the probe is blind, the fleet
-        // backs off toward the same conservative rate the allocator never drops below.
-        let probe = hippius_drain_allocator::probe::CephProbe::new(hippius_drain_allocator::probe::ProbeSettings {
-            url: url.clone(),
-            ceiling_rate: config.ceph_ceiling,
-            nearfull_rate: config.ceph_nearfull_rate,
-            floor: config.alloc.min_total,
-            thresholds: config.ceph_thresholds,
-            timeout: config.ceph_probe_timeout,
-            pools: config.ceph_pools.clone(),
-        })?;
+        let probe = hippius_drain_allocator::probe::CephProbe::new(config.probe_settings(url.clone()))?;
         tracing::info!(
             mgr_url = %url,
             pools = config.ceph_pools.join(","),

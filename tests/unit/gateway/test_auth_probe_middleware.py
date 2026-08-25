@@ -1,6 +1,7 @@
 """Tests for auth_probe_middleware — short-circuits ATS authproxy subrequests with 200 OK
 when the request carries X-Hippius-Auth-Probe = <shared secret>."""
 
+import dataclasses
 from typing import Any
 from typing import Generator
 
@@ -11,10 +12,10 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.config import GatewayConfig
-from gateway.middlewares import auth_probe as auth_probe_mod
-from gateway.middlewares.auth_probe import AUTH_PROBE_HEADER
-from gateway.middlewares.auth_probe import auth_probe_middleware
+from hippius_s3.config import get_config
+from hippius_s3.gateway.middlewares import auth_probe as auth_probe_mod
+from hippius_s3.gateway.middlewares.auth_probe import AUTH_PROBE_HEADER
+from hippius_s3.gateway.middlewares.auth_probe import auth_probe_middleware
 
 
 TEST_SECRET = "fake-test-probe-secret-not-real"
@@ -24,7 +25,7 @@ TEST_SECRET = "fake-test-probe-secret-not-real"
 def configured_secret(monkeypatch: pytest.MonkeyPatch) -> Generator[str, None, None]:
     """Force the middleware's get_config() to return a config with the test secret.
     Patching the cached singleton avoids any os.environ-vs-cache races."""
-    cfg = GatewayConfig(auth_probe_secret=TEST_SECRET)
+    cfg = dataclasses.replace(get_config(), auth_probe_secret=TEST_SECRET)
     monkeypatch.setattr(auth_probe_mod, "get_config", lambda: cfg)
     yield TEST_SECRET
 
@@ -32,7 +33,7 @@ def configured_secret(monkeypatch: pytest.MonkeyPatch) -> Generator[str, None, N
 @pytest.fixture  # type: ignore[misc]
 def empty_secret(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     """get_config().auth_probe_secret == "" → middleware disabled (fail-closed)."""
-    cfg = GatewayConfig(auth_probe_secret="")
+    cfg = dataclasses.replace(get_config(), auth_probe_secret="")
     monkeypatch.setattr(auth_probe_mod, "get_config", lambda: cfg)
     yield
 

@@ -22,6 +22,7 @@ def _fake_request() -> Any:
     return SimpleNamespace(
         state=SimpleNamespace(
             account=SimpleNamespace(main_account="acct-main", id="sub-1"),
+            main_account_id="acct-main",
             ray_id="ray-1",
         ),
         app=SimpleNamespace(state=SimpleNamespace(fs_store=SimpleNamespace(), obj_cache=SimpleNamespace())),

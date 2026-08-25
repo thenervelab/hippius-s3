@@ -57,7 +57,7 @@ async def handle_put_object(
     redis_client: Any,
 ) -> Response:
     try:
-        main_account_id = request.state.account.main_account
+        main_account_id = request.state.main_account_id
 
         # Detect S4 append semantics via metadata (header-only, no DB).
         meta_append = request.headers.get("x-amz-meta-append", "").lower() == "true"
@@ -165,7 +165,7 @@ async def handle_put_object(
                 bucket_name=bucket_name,
                 object_id=candidate_object_id,
                 object_key=object_key,
-                account_address=request.state.account.main_account,
+                account_address=request.state.main_account_id,
                 content_type=content_type,
                 metadata=metadata,
                 storage_version=config.target_storage_version,
@@ -198,7 +198,7 @@ async def handle_put_object(
                     request.app.state.postgres_pool,
                     object_id=str(put_res.object_id),
                     object_version=int(put_res.object_version),
-                    address=request.state.account.main_account,
+                    address=request.state.main_account_id,
                 )
             except Exception:
                 # B4: the version was made serveable (size/md5 written) BEFORE the drain address

@@ -25,10 +25,10 @@ from dataclasses import field
 
 import pytest
 
-from gateway.services.sub_token_scope import bucket_in_scope
-from gateway.services.sub_token_scope import evaluate
-from gateway.services.sub_token_scope import permission_allows
-from gateway.services.sub_token_scope import required_op
+from hippius_s3.gateway.services.sub_token_scope import bucket_in_scope
+from hippius_s3.gateway.services.sub_token_scope import evaluate
+from hippius_s3.gateway.services.sub_token_scope import permission_allows
+from hippius_s3.gateway.services.sub_token_scope import required_op
 from hippius_s3.models.sub_token import BucketScope
 from hippius_s3.models.sub_token import Op
 from hippius_s3.models.sub_token import Permission

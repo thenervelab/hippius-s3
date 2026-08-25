@@ -16,15 +16,17 @@
 //! gracefully — a tick in flight finishes before the worker exits (axiom
 //! `rust_quality_129_async_graceful_shutdown`).
 
-use crate::disk::disk_usage;
+use crate::disk::{DiskUsage, disk_usage};
+use crate::landed::LandedQueue;
 use crate::localfs::{LocalFs, LocalSsd};
 use crate::readiness::ReadinessTracker;
 use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
-    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, NodeId, NodeObservation,
-    PartReplicationStore, ReclaimError, ReclaimGraces, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate,
-    jittered, reclaim_ssd, reconcile_parts,
+    BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, EvictionPass, EvictionTarget,
+    FailedGrace, NodeId, NodeObservation, OrphanGrace, PartDigest, PartKey, PartReplicationStore, ReclaimError, ReclaimGraces, RelandOutcome,
+    ReplicationState, ScanWorker, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, evict_to_target,
+    jittered, observed_part_digest, reclaim_failed, reclaim_ssd, reconcile_parts, reland_read_outcome, verdict_for_reland,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -87,6 +89,20 @@ pub struct RuntimeConfig {
     pub reconcile_poll: Duration,
     /// How often the reclaim worker scans the SSD for `failed` (abandoned-upload) parts.
     pub reclaim_poll: Duration,
+    /// R4 corrupt re-drive cadence. Separate from `reclaim_poll` because it is the only
+    /// disposition on that path with no grace: the interval is a single-copy exposure window.
+    pub redrive_poll: Duration,
+    /// How often the DB-driven `failed`-part reclaim runs. Independent of the reclaim WALK:
+    /// decoupling debris cleanup from the walk is the point, so the walk can be rare.
+    pub failed_reclaim_poll: Duration,
+    /// How often the landed-part announcement queue is drained. Short: this is the discovery
+    /// latency for a freshly-written part, the role the 15 s reconciler walk used to fill, and
+    /// an empty queue costs one `RPOP`.
+    pub landed_poll: Duration,
+    /// How often the read-tier evictor checks the ingest disk's free space.
+    pub evict_poll: Duration,
+    /// The free-space floor the evictor maintains, and how far past it to free.
+    pub evict_policy: EvictionPolicy,
     /// How often the enqueue sweep publishes the backend upload for `replicated` parts whose
     /// address was not finalized at drain time (an in-flight MPU). Short, since a completed
     /// MPU's parts should publish promptly — but off the read path, so seconds is fine.
@@ -97,10 +113,6 @@ pub struct RuntimeConfig {
     /// How long a no-DB-backing part (its object hard-deleted) is kept before the orphan
     /// reclaim unlinks it. Keyed on the part's FS `meta.json` age, so set generously.
     pub orphan_reclaim_grace: Duration,
-    /// How long a `replicated` part may linger on SSD before the reclaim re-drives the drain's
-    /// own unlink (a crash-orphan between the `mark_replicated` commit and the unlink). Keyed
-    /// on the row's `updated_at`.
-    pub replicated_reclaim_grace: Duration,
     /// How long workers get to finish an in-flight tick after cancellation
     /// before the supervisor force-aborts them.
     pub grace: Duration,
@@ -157,6 +169,11 @@ pub struct RateControl {
     pub half_life: Duration,
     /// How often to re-pull the allocation.
     pub poll: Duration,
+    /// Where the pulled per-node eviction reserve is published for the evictor to read.
+    /// Shared rather than passed directly because the two workers run on independent polls:
+    /// the allocation pull is the only thing that learns the reserve, and the evictor is the
+    /// only thing that acts on it.
+    pub snapshot: Arc<SnapshotCell>,
 }
 
 /// The drain worker's shared dependencies, bundled so the worker fn stays within
@@ -227,11 +244,36 @@ async fn run_drain<E: UploadEnqueuer>(token: CancellationToken, period: Duration
 /// contributes zero: a wedged node's byte-backlog can read 0 while undrained rows remain, which
 /// readiness would misread as idle. On a query error, KEEP the last-recorded value rather than
 /// zeroing it (a transient blip must not read as "drained"); the next tick refreshes it.
-async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotCell) {
-    match store.node_backlog_bytes(node.as_str()).await {
-        Ok(bytes) => snapshot.record_backlog(bytes),
-        Err(err) => tracing::warn!(error = %err, "backlog query failed; keeping the last value"),
-    }
+///
+/// Returns the bytes this node accounts for on its ingest disk THIS tick — its undrained backlog
+/// plus its evictable read cache, which are disjoint by construction (backlog is
+/// `pending`/`draining`, cache is `replicated`) — or `None` if either read failed, so a blind
+/// tick cannot be mistaken for a small honest total by [`check_shared_disk`].
+async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotCell) -> Option<u64> {
+    let backlog = match store.node_backlog_bytes(node.as_str()).await {
+        Ok(bytes) => {
+            snapshot.record_backlog(bytes);
+            Some(bytes)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "backlog query failed; keeping the last value");
+            None
+        }
+    };
+    // NOTE: the heartbeat reads the retained backlog back off the snapshot rather than
+    // taking it from the `Ok` arm here, so a failed query reuses the last good value
+    // instead of reporting a zero backlog — which the allocator would read as "idle" and
+    // strip of demand, stalling the very node whose DB read is struggling.
+    let cache = match store.node_cache_bytes(node.as_str()).await {
+        Ok(bytes) => {
+            snapshot.record_cache_bytes(bytes);
+            Some(bytes)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "cache-bytes query failed; keeping the last value");
+            None
+        }
+    };
     match store.node_undrained_count(node.as_str()).await {
         Ok(count) => snapshot.record_undrained_count(count),
         Err(err) => tracing::warn!(error = %err, "undrained-count query failed; keeping the last value"),
@@ -243,6 +285,321 @@ async fn record_drain_signals(store: &Store, node: &NodeId, snapshot: &SnapshotC
     match store.node_oldest_pending_age_secs(node.as_str()).await {
         Ok(secs) => snapshot.record_oldest_pending_age_secs(secs),
         Err(err) => tracing::warn!(error = %err, "oldest-pending-age query failed; keeping the last value"),
+    }
+    backlog.zip(cache).map(|(backlog, cache)| backlog.saturating_add(cache))
+}
+
+/// The share of the ingest disk's USED bytes the agent must be able to account for before the
+/// disk reads as its own. Deliberately lax — a co-tenant has to be dominating the disk, not
+/// merely present, because prod may legitimately host small ones and the point of this check is
+/// to catch the case where the free-space gates are measuring somebody else's writes.
+const ACCOUNTED_SHARE_MIN_PERMILLE: u64 = 500;
+
+/// How much of the disk must be in use before the comparison means anything, in permille. A
+/// fresh node's cache is cold, so its accounted bytes are a rounding error next to a fixed
+/// filesystem footprint: without this floor every new node flags on its first heartbeats and the
+/// alert is trained away long before it catches a real co-tenant.
+const JUDGEABLE_USED_MIN_PERMILLE: u64 = 10;
+
+/// The two measurements behind a shared-disk report, carried back so the caller's log names both:
+/// "the gap is this wide" is actionable in a way "there is a gap" is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedDiskReport {
+    /// Bytes the agent can account for: its evictable read cache plus its undrained backlog.
+    accounted_bytes: u64,
+    /// Bytes in use on the mount, from `statvfs`.
+    used_bytes: u64,
+}
+
+/// Compares what the agent accounts for against what the disk says is used, records the verdict
+/// on `snapshot`, and returns the measurements when this tick is the TRANSITION into "shared".
+///
+/// Every free-space gate in this system — the evictor's reserve, the promote floor the api reads,
+/// its `fs_cache_pressure` 503 — treats free space as a function of what this agent stores. On a
+/// disk it does not own, all three are measuring a co-tenant's writes and nothing says so. This
+/// does not refuse to run on such a node (prod may legitimately have small co-tenants, and a
+/// guard that turns a measurement into an outage is worse than the blind spot it closes); it
+/// makes the condition alertable.
+///
+/// Returns `None` — leaving the last verdict standing — whenever the comparison cannot be made:
+/// a failed accounting read (`accounted` is `None`) or a disk too empty to judge. A guard that
+/// cannot measure must not issue a clean bill of health, so an unmeasurable tick neither reports
+/// nor clears.
+fn check_shared_disk(snapshot: &SnapshotCell, accounted: Option<u64>, usage: DiskUsage) -> Option<SharedDiskReport> {
+    let accounted_bytes = accounted?;
+    // Saturating: some filesystems report more available blocks than total (reserved blocks),
+    // and an underflow here would invent a multi-exabyte "used" that flags every node.
+    let used_bytes = usage.total_bytes.saturating_sub(usage.free_bytes);
+    // Multiply rather than divide on both comparisons: no rounding, and no divide-by-zero to
+    // special-case. The explicit zero is not redundant with the floor — it is the degenerate
+    // mount `used_fraction` already handles, where total is 0 too and every ratio comparison
+    // reads false, so without it a disk that measured as nothing would record as verified-clean.
+    if used_bytes == 0 || u128::from(used_bytes) * 1_000 < u128::from(usage.total_bytes) * u128::from(JUDGEABLE_USED_MIN_PERMILLE) {
+        return None;
+    }
+    let shared = u128::from(accounted_bytes) * 1_000 < u128::from(used_bytes) * u128::from(ACCOUNTED_SHARE_MIN_PERMILLE);
+    // Read before write: the report is the TRANSITION, not the state. The heartbeat ticks every
+    // 10s, so reporting the state would be 8,640 ERRORs a day per node — the gauge is what
+    // carries a standing condition. Clearing is not latched either: a live measurement that
+    // cannot go back to clean is one an operator can never use to confirm a fix.
+    let newly_shared = shared && snapshot.shared_filesystem() != Some(true);
+    snapshot.record_shared_filesystem(shared);
+    newly_shared.then_some(SharedDiskReport { accounted_bytes, used_bytes })
+}
+
+/// How aggressively this node keeps free space on its ingest SSD.
+///
+/// Expressed as percentages of disk size rather than absolute bytes so a single fleet-wide
+/// setting stays correct on nodes whose ingest disks differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvictionPolicy {
+    /// Free-space floor, in permille of the disk. Eviction arms below this. Must sit
+    /// comfortably above the api's `fs_cache_pressure` 503 threshold (80 permille free): the
+    /// evictor has to be reclaiming well before ingest starts refusing writes, not racing it.
+    /// Zero disables eviction entirely — the operator kill-switch.
+    ///
+    /// Permille, not percent, so this shares units with the allocator's per-node reserve and
+    /// the two can be swapped without a lossy conversion.
+    pub reserve_permille: u16,
+    /// How far past the floor to free once armed, in permille of the disk. Without this the
+    /// evictor re-arms on nearly every cycle and pins the disk at the threshold.
+    pub headroom_permille: u16,
+    /// Rows fetched per worklist query. **Not** the pass budget — see [`EvictionPass`]. Prod's
+    /// part sizes are bimodal (measured p50 686 bytes against a 408 KB shard mean), so a part
+    /// count says almost nothing about bytes freed; the pass pages until the byte goal is met.
+    pub batch: u32,
+    /// Wall-clock ceiling on one pass, so eviction cannot monopolise the disk the drain is also
+    /// writing to. Whatever is left over resumes on the next poll.
+    pub max_pass: Duration,
+}
+
+/// Resolves a policy against a probed disk into the concrete byte target for one pass.
+///
+/// Split out from [`evict_once`] so the permille arithmetic — the part that silently
+/// misbehaves if it rounds or overflows — is unit-testable without a disk or a database.
+fn eviction_target(usage: DiskUsage, policy: EvictionPolicy, allocated_reserve_permille: Option<u16>) -> EvictionTarget {
+    // u128 intermediates: total_bytes is multi-terabyte and a permille multiply would be
+    // within a factor of 1000 of overflowing u64 on a large enough disk.
+    let permille_of_disk = |permille: u16| -> u64 { u64::try_from(u128::from(usage.total_bytes) * u128::from(permille) / 1_000).unwrap_or(u64::MAX) };
+    let reserve = resolved_reserve_permille(policy, allocated_reserve_permille);
+    EvictionTarget {
+        free: usage.free_bytes,
+        reserve: permille_of_disk(reserve),
+        headroom: permille_of_disk(policy.headroom_permille),
+    }
+}
+
+/// The free-space floor below which the api must stop promoting chunks onto this disk, in
+/// permille — the MIDPOINT of the evictor's hysteresis band.
+///
+/// Read-through promotion (`hippius_s3/cache/dual_fs_store.py`) is the only unthrottled writer
+/// on the ingest SSD, so it has to back off before the evictor is even armed. Where inside the
+/// band it backs off is not a free choice:
+///
+/// - at or below the RESERVE, promotion is racing an armed evictor for the same bytes;
+/// - at the TARGET (`reserve + headroom`), it chatters — the evictor stops the instant it
+///   reaches the target, so promotion would be live only in the moment a pass completes;
+/// - ABOVE the target it deadlocks permanently: the evictor never frees past its target, so a
+///   floor above that point can never be restored and the read tier stops warming for good.
+///
+/// The midpoint is the only choice with a margin on both sides, and it is derived from the
+/// reserve actually in force rather than from a constant, which is the entire point: the
+/// allocator raises the reserve to 400 permille on a stalled node and the floor must ride up
+/// with it. Integer halving biases the floor toward the reserve, which is the safe direction.
+fn promote_floor_permille(reserve_permille: u16, headroom_permille: u16) -> u16 {
+    reserve_permille.saturating_add(headroom_permille / 2)
+}
+
+/// The reserve this pass will actually hold: the allocator's per-node value when it has
+/// published one, else the node's configured floor.
+///
+/// Extracted so [`eviction_target`] and [`published_promote_floor`] cannot drift — publishing a
+/// floor derived from a different reserve than the evictor is enforcing is exactly the class of
+/// bug this whole change removes.
+fn resolved_reserve_permille(policy: EvictionPolicy, allocated_reserve_permille: Option<u16>) -> u16 {
+    // The allocator's reserve wins when present: it is the only component that can see WHY a
+    // node is not draining (the fleet Ceph ceiling, and this node's budget against its demand),
+    // so it can raise the floor BEFORE free space falls rather than after — which on a stalled
+    // drain is the difference between evicting early and 503ing. Absent, the node keeps its own
+    // configured floor rather than dropping to none.
+    allocated_reserve_permille.unwrap_or(policy.reserve_permille)
+}
+
+/// The promote floor to publish for this pass, or `None` when this evictor forms no band a
+/// floor could live inside.
+///
+/// `None` covers the two degenerate policies: a zero reserve (the operator's eviction
+/// kill-switch — with retention on, NOTHING then frees the disk, so any floor we published
+/// would be a threshold no eviction can restore) and a headroom too small to leave room
+/// between the reserve and the target. Publishing nothing lets the key lapse, and the api
+/// reads an absent key as "signal unavailable" and falls back to its own static floor — which
+/// is the honest answer when there is no live control loop to track.
+fn published_promote_floor(policy: EvictionPolicy, allocated_reserve_permille: Option<u16>) -> Option<u16> {
+    let reserve = resolved_reserve_permille(policy, allocated_reserve_permille);
+    let floor = promote_floor_permille(reserve, policy.headroom_permille);
+    let target = reserve.saturating_add(policy.headroom_permille);
+    (reserve > 0 && reserve < floor && floor < target).then_some(floor)
+}
+
+/// Publishes this node's resolved promote floor so the api's read-through promotion can gate on
+/// the band the evictor is ACTUALLY holding rather than on a mirrored constant.
+///
+/// Carries the same [`NodeId`] the heartbeat is keyed by, so the api — which reads
+/// `cephor:promote_floor:{NODE_NAME}` and gets its `NODE_NAME` from the same `spec.nodeName`
+/// field — is guaranteed to read its own node's floor and not a peer's.
+#[derive(Debug, Clone)]
+struct PromoteFloorPublisher {
+    coord: Arc<Coordinator>,
+    node: NodeId,
+}
+
+impl PromoteFloorPublisher {
+    /// Best-effort publish. `None` means this evictor forms no band worth advertising, so the
+    /// key is left to lapse; an error is logged and dropped. Neither may fail the eviction pass
+    /// that produced the floor — eviction is the only thing freeing the ingest SSD, and a
+    /// missing floor merely returns the api to its static default.
+    async fn publish(&self, floor_permille: Option<u16>) {
+        let Some(floor_permille) = floor_permille else {
+            return;
+        };
+        if let Err(err) = self.coord.publish_promote_floor(&self.node, floor_permille).await {
+            tracing::warn!(error = %err, floor_permille, "publishing the promote floor failed; the api falls back to its static floor once the key lapses");
+        }
+    }
+}
+
+/// One eviction pass: probe the ingest disk and, if free space is under the reserve, evict
+/// least-recently-used resident parts until it is back over the floor.
+///
+/// With retention on, this is the ONLY thing that frees the ingest SSD, so a persistent
+/// failure here ends in `fs_cache_pressure` 503ing PUTs. Errors are logged and retried on the
+/// next poll rather than propagated (a failed pass must not kill the agent), but `starved`
+/// and `skipped_unreplicated` are surfaced loudly because neither is self-correcting.
+async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, policy: EvictionPolicy, floor: Option<&PromoteFloorPublisher>) {
+    let root = ssd.root().to_path_buf();
+    // statvfs blocks — same rule as the heartbeat probe (axiom r4r_ch10_01).
+    let usage = match tokio::task::spawn_blocking(move || disk_usage(&root)).await {
+        Ok(Ok(usage)) => usage,
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "eviction disk probe failed");
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "eviction disk probe task panicked");
+            return;
+        }
+    };
+
+    // None means the allocator has not published a reserve for this node (pre-Phase-4
+    // leader, expired allocation key, or a malformed value); the static floor then applies.
+    // Read ONCE: the target the evictor enforces and the floor the api is told to respect must
+    // come from the same reserve, and a second read of the atomic could land on a fresh
+    // allocation and publish a floor for a band this pass is not holding.
+    let allocated_reserve = snapshot.allocated_reserve_permille();
+    let target = eviction_target(usage, policy, allocated_reserve);
+    // Publish before the pass, not after: the pass can run for its whole wall-clock budget, and
+    // the floor describes the band the evictor is holding, not the outcome of any one pass.
+    if let Some(publisher) = floor {
+        publisher.publish(published_promote_floor(policy, allocated_reserve)).await;
+    }
+    let pass = EvictionPass {
+        page: policy.batch,
+        max_duration: policy.max_pass,
+    };
+    match evict_to_target(store, ssd, ssd, &SystemClock, target, pass).await {
+        Ok(report) => {
+            snapshot.record_evicted(report.evicted, report.freed_bytes);
+            snapshot.record_evict_blocked_unreplicated(report.skipped_unreplicated);
+            snapshot.record_evict_remove_failed(report.remove_failed);
+            if report.evicted > 0 {
+                tracing::info!(
+                    evicted = report.evicted,
+                    freed_bytes = report.freed_bytes,
+                    pages = report.pages,
+                    free_bytes = usage.free_bytes,
+                    "evicted resident SSD parts to restore the free-space floor"
+                );
+            }
+            // Ran out of the pass's wall clock with work still queued. Routine and
+            // self-correcting — the next poll resumes the cursor — so INFO. Keeping this
+            // OUT of `starved` is the point: a large deficit takes many passes by design,
+            // and reporting that as starvation is what made the ERROR meaningless.
+            if report.budget_exhausted {
+                tracing::info!(
+                    evicted = report.evicted,
+                    pages = report.pages,
+                    free_bytes = usage.free_bytes,
+                    "eviction pass hit its time budget; resuming next poll"
+                );
+            }
+            // Eviction could not reach its target: the disk is filling with something it
+            // cannot reclaim (undrained backlog, reclaimer-owned debris, or a foreign writer).
+            // Left alone this ends in 503s on PUT, and no amount of retrying fixes it.
+            //
+            // `remove_failed` rides along because it is the discriminator: non-zero means the
+            // removals themselves are failing (disk, permissions, or the api renaming a promoted
+            // chunk into the directory being removed), which is a different fault from an empty
+            // cursor and wants a different response.
+            if report.starved {
+                tracing::error!(
+                    free_bytes = usage.free_bytes,
+                    deficit = target.deficit(),
+                    evicted = report.evicted,
+                    remove_failed = report.remove_failed,
+                    remove_failed_kind = ?report.remove_failed_kind,
+                    "eviction ran out of resident parts before restoring the free-space floor"
+                );
+            }
+            // Removals failed but the pass still met its target, so nothing is starving yet. Worth
+            // a line rather than only a counter: this is the early form of the fault that used to
+            // abort the whole pass, and it is cheap to catch before it becomes starvation. Guarded
+            // on `!starved` so the ERROR above stays the single report when both are true.
+            if report.remove_failed > 0 && !report.starved {
+                tracing::warn!(
+                    remove_failed = report.remove_failed,
+                    remove_failed_kind = ?report.remove_failed_kind,
+                    evicted = report.evicted,
+                    "eviction skipped parts whose unlink failed; the free-space floor was still restored"
+                );
+            }
+            // The eviction invariant broke: the worklist offered a part whose only durable
+            // copy may be the SSD one. Refused, but the query and the invariant have diverged.
+            if report.skipped_unreplicated > 0 {
+                tracing::error!(
+                    skipped_unreplicated = report.skipped_unreplicated,
+                    "eviction worklist offered non-replicated parts — refused; worklist and invariant have diverged"
+                );
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "eviction pass failed; retrying next poll"),
+    }
+}
+
+/// Builds this node's heartbeat observation from the disk probe and the refreshed snapshot.
+///
+/// The agent reports FACTS; the allocator derives urgency from them at its wire boundary.
+///
+/// `backlog` is the DB-sourced undrained-byte sum the snapshot carries, NOT raw SSD occupancy.
+/// Occupancy was only ever a valid proxy because the drain unlinked each part the instant it
+/// replicated. It already overcounts by the A21/orphan leak, and once replicated parts are
+/// retained to serve reads it would count the entire read cache as drain demand — handing a
+/// caught-up node a reservation floor and driving Ceph writes for work that does not exist.
+///
+/// `cache` is zero until retention ships: nothing is deliberately held on the SSD yet, so every
+/// resident byte is still backlog or debris. `pressure` carries the raw fullness, which the
+/// allocator uses only as the fallback urgency when it is too old to read the residency fields.
+///
+/// Split out from [`heartbeat_once`] so this mapping is unit-testable: the caller needs a live
+/// Coordinator (Redis) and Store (Postgres), while the mapping itself is pure.
+fn node_observation(usage: DiskUsage, snapshot: &SnapshotCell, max_drain_rate: ByteRate) -> NodeObservation {
+    NodeObservation {
+        pressure: usage.pressure,
+        backlog: Bytes::new(snapshot.backlog()),
+        free: Bytes::new(usage.free_bytes),
+        cache: Bytes::new(snapshot.cache_bytes()),
+        max_drain_rate,
+        observed_p99: snapshot.p99(),
+        error_bps: snapshot.load().error_bps(),
     }
 }
 
@@ -270,20 +627,23 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node
     // (blocking) statvfs probe already produced it — the metrics layer reads it wait-free
     // off the exporter thread and must never run statvfs itself.
     snapshot.record_disk_pressure(usage.pressure.bps());
+    snapshot.record_free_bytes(usage.free_bytes);
 
-    record_drain_signals(store, node, snapshot).await;
+    let accounted = record_drain_signals(store, node, snapshot).await;
+    // Both inputs are already in hand on this tick — the statvfs probe above and the accounting
+    // reads just made — so the shared-disk check costs nothing beyond the comparison, and it
+    // re-runs every heartbeat rather than once at startup: a co-tenant can arrive at any time,
+    // and a boot-time answer would be stale for the life of the pod.
+    if let Some(report) = check_shared_disk(snapshot, accounted, usage) {
+        tracing::error!(
+            accounted_bytes = report.accounted_bytes,
+            used_bytes = report.used_bytes,
+            total_bytes = usage.total_bytes,
+            "ingest disk holds far more than this agent accounts for — every free-space gate (eviction reserve, promote floor, fs_cache_pressure) is measuring a writer the drain cannot see"
+        );
+    }
 
-    // The allocator observation keeps SSD occupancy as its demand weight (a leak-inflated
-    // value is a conservative over-demand, not a safety issue; refining it is coordination
-    // work). Pressure is the allocator weight; error rate is from the drain counters; p99
-    // stays neutral until per-drain timing is wired.
-    let observation = NodeObservation {
-        pressure: usage.pressure,
-        backlog: Bytes::new(usage.used_bytes),
-        max_drain_rate,
-        observed_p99: snapshot.p99(),
-        error_bps: snapshot.load().error_bps(),
-    };
+    let observation = node_observation(usage, snapshot, max_drain_rate);
     if let Err(err) = coord.upsert_node_state(node, &observation).await {
         tracing::warn!(error = %err, "heartbeat upsert failed");
     }
@@ -297,10 +657,17 @@ async fn heartbeat_once(ssd: &LocalSsd, store: &Store, coord: &Coordinator, node
 /// is ever removed without a successful status read (fail-safe). The store is both the
 /// replication log and the object-backing log for the reclaim.
 async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, graces: ReclaimGraces) {
+    let started = Instant::now();
     match reclaim_ssd(ssd, ssd, store, store, graces).await {
         Ok(report) => {
-            // All three dispositions free SSD bytes, so the reclaimed gauge counts their sum.
-            snapshot.record_reclaimed(report.reclaimed + report.reclaimed_orphan + report.reclaimed_replicated);
+            // The walk's cost, from the pass that just paid it. `scanned` is every part on this
+            // node's SSD — which retention grew from the undrained backlog to the whole
+            // replicated shard, with nothing reporting the change until now.
+            snapshot.record_scan(ScanWorker::Reclaim, report.scanned, started.elapsed());
+            // Both debris dispositions free SSD bytes, so the reclaimed gauge counts their sum.
+            // Retained `replicated` parts are NOT counted here — they are cache, not reclaimed
+            // debris, and the evictor reports their reclamation separately.
+            snapshot.record_reclaimed(report.reclaimed + report.reclaimed_orphan);
             if report.reclaimed > 0 {
                 // Aggregate, not per-part: an abandoned MPU reclaims many parts at once,
                 // so a per-part line would spam.
@@ -312,19 +679,13 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
                     "reclaimed no-DB-backing (deleted-object) SSD orphans"
                 );
             }
-            if report.reclaimed_replicated > 0 {
-                tracing::info!(
-                    reclaimed_replicated = report.reclaimed_replicated,
-                    "reclaimed replicated crash-orphan SSD parts — re-drove the drain's skipped unlink"
-                );
-            }
-            // Replicated parts still on SSD but within the reclaim grace: a just-committed part
-            // whose happy-path unlink may not have run yet. Transient and self-clearing — aged
-            // ones are reclaimed above — so this is DEBUG, not the old un-reclaimable-leak WARN.
+            // Retained `replicated` parts: the read tier, and on a healthy node the bulk of the
+            // scan. Expected and unremarkable, so DEBUG — the evictor, not this worker, decides
+            // when any of them go, and `drain_ssd_cache_bytes` is where their size is tracked.
             if report.skipped_replicated > 0 {
                 tracing::debug!(
-                    skipped_replicated = report.skipped_replicated,
-                    "replicated parts on SSD within grace — reclaimed once they age past it"
+                    retained = report.skipped_replicated,
+                    "replicated parts retained on SSD as the read tier (evictor-owned)"
                 );
             }
             // Parts held this cycle because their live object's pool copy is corrupt (R4): a
@@ -355,7 +716,10 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
         Err(err) => tracing::warn!(error = ?err, "ssd reclaim cycle failed; will retry next poll"),
     }
 
-    match ssd.sweep_orphan_tmp(graces.failed).await {
+    // Staged chunks get the orphan grace, not the failed one: they are held for the whole of a
+    // live UploadPart by design, so the millisecond-scale write-temp window would reap a running
+    // upload's own data.
+    match ssd.sweep_orphan_tmp(graces.failed, graces.orphan).await {
         Ok(0) => {}
         Ok(removed) => tracing::info!(removed, "swept orphan SSD write-temps"),
         Err(err) => tracing::warn!(error = %err, "orphan-temp sweep failed; will retry next poll"),
@@ -364,7 +728,7 @@ async fn reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, gr
     // Reuses the failed-part grace as the "untouched for long enough" gate: both answer the
     // same question — has anything written here recently — and a second knob for the same
     // property is a knob that gets set inconsistently.
-    match ssd.sweep_empty_shells(graces.failed).await {
+    match ssd.sweep_empty_shells(graces.failed.get()).await {
         Ok(0) => {}
         Ok(removed) => tracing::info!(removed, "swept empty SSD object/version shells"),
         Err(err) => tracing::warn!(error = %err, "empty-shell sweep failed; will retry next poll"),
@@ -389,6 +753,189 @@ async fn redrive_corrupt_once(store: &Store, snapshot: &SnapshotCell, max_attemp
         Ok(0) => {}
         Ok(redriven) => tracing::warn!(redriven, "re-drove corrupt-live parts (corrupt pool copy; re-copying from SSD source)"),
         Err(err) => tracing::warn!(error = %err, "corrupt re-drive failed; will retry next poll"),
+    }
+}
+
+/// Aged `failed` parts adjudicated per DB-driven reclaim pass. Bounded so one pass is a small
+/// indexed query plus one batched servability read, never a sweep of a pathological backlog.
+const FAILED_RECLAIM_BATCH: u32 = 512;
+
+/// One DB-driven `failed`-reclaim pass: unlink this node's aged abandoned-upload debris.
+///
+/// The walk used to find these by scanning every part on the SSD and asking the database about
+/// each one — work proportional to the whole tree (2.28 M parts on prod after retention) to find
+/// a population that is tiny and directly queryable (22,123 `failed` rows fleet-wide). This asks
+/// for them instead, which is why the walk's cadence could drop to hourly without leaving debris
+/// on the disk for an hour.
+///
+/// Errors log and retry next poll. Every failure mode here removes NOTHING: the worklist read,
+/// the servability read, and the unlink each abort the pass rather than proceeding on a
+/// half-answered question.
+async fn failed_reclaim_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, grace: Duration) {
+    match reclaim_failed(store, store, ssd, grace, FAILED_RECLAIM_BATCH).await {
+        Ok(report) => {
+            snapshot.record_reclaimed(report.reclaimed);
+            if report.reclaimed > 0 {
+                tracing::info!(reclaimed = report.reclaimed, "reclaimed broken/abandoned-upload SSD parts");
+            }
+            // R4: the part is a live object's last good source because its pool copy is corrupt.
+            // Same signal the walk's `skipped_corrupt` carries — a standing nonzero value across
+            // cycles is the incident, not a single pass.
+            if report.held_servable > 0 {
+                tracing::warn!(
+                    held_servable = report.held_servable,
+                    "corrupt-live SSD parts held (pool copy corrupt) — last good source preserved (R4)"
+                );
+            }
+            // A skipped removal is no longer fatal to the pass, so it has to be visible here or
+            // it is invisible everywhere. The shape that needs a human is `remove_failed` at or
+            // near `candidates` with `reclaimed` flat across cycles: the worklist has no offset,
+            // so the same page is being re-offered and this node's failed debris — which the
+            // residency guard also keeps un-GC-able — is not being reclaimed at all.
+            snapshot.record_reclaim_remove_failed(report.remove_failed);
+            if report.remove_failed > 0 {
+                tracing::warn!(
+                    remove_failed = report.remove_failed,
+                    candidates = report.candidates,
+                    reclaimed = report.reclaimed,
+                    kind = ?report.remove_failed_kind,
+                    "failed-part reclaim skipped un-removable parts; cursor is pinned if this persists with reclaimed=0"
+                );
+            }
+        }
+        // A backing-read abort leaves every candidate unjudged, so the pass removed nothing and
+        // this GC is DISABLED rather than merely slow — the same distinction the walk draws.
+        Err(ReclaimError::Backing(err)) => {
+            snapshot.record_reclaim_backing_error();
+            tracing::error!(error = %err, "failed-part reclaim disabled: object-backing read failed; removed nothing");
+        }
+        Err(err) => tracing::warn!(error = ?err, "failed-part reclaim pass failed; will retry next poll"),
+    }
+}
+
+/// Announcements drained per landed-queue poll. Generous: the work per message is one
+/// idempotent UPSERT, and a burst (a large multipart upload completing) should be absorbed in
+/// one tick rather than trickled at the poll rate, which is what a small batch would do.
+const LANDED_POP_BATCH: usize = 512;
+
+/// One landed-queue pass: record every part the api announced since the last tick, and re-drive
+/// any part the announcement reveals was rewritten after it drained.
+///
+/// This is the fast discovery path that replaces the reconciler's whole-disk walk. Discovery
+/// itself stays thin — pop, record, count — because everything that makes discovery *correct*
+/// still lives in the reconciler, which remains as the backstop for any announcement that was
+/// never delivered.
+///
+/// The announcement is ALSO the only observable signal that a committed part changed on disk
+/// (B-2): the api announces only from `WriteThroughPartsWriter.write_meta`, so an announcement
+/// naming an already-`replicated` part means that part was written again. Those parts are
+/// collected during the record loop and checked AFTER the discovery tally is published, so a
+/// slow content hash never delays discovery of the batch it shares a tick with.
+///
+/// Failures are logged and dropped rather than retried in-tick: a Redis error leaves the
+/// entries queued for the next poll, and a `record_landed_part` error leaves the part for the
+/// reconciler. Neither can lose the part, because the disk is the source of truth in both cases.
+async fn landed_once(queue: &LandedQueue, store: &Store, ssd: &LocalSsd, snapshot: &SnapshotCell) {
+    let (parts, dropped) = match queue.pop(LANDED_POP_BATCH).await {
+        Ok(batch) => batch,
+        Err(err) => {
+            tracing::warn!(error = %err, "landed-queue read failed; entries stay queued for the next poll");
+            return;
+        }
+    };
+    if parts.is_empty() && dropped == 0 {
+        return;
+    }
+    let mut recorded = 0u64;
+    let mut relanded: Vec<(&PartKey, Option<PartDigest>)> = Vec::new();
+    for part in &parts {
+        // Idempotent, and the same call the reconciler makes — so an announcement racing the
+        // backstop is a no-op rather than a conflict.
+        match store.record_landed_part(part).await {
+            Ok(outcome) => {
+                recorded += 1;
+                if outcome.state == ReplicationState::Replicated {
+                    relanded.push((part, outcome.digest));
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "recording an announced part failed; the reconciler will recover it"),
+        }
+    }
+    snapshot.record_landed(recorded, dropped);
+    if dropped > 0 {
+        // The api and this agent disagree about the message shape, so EVERY announcement is
+        // being lost and discovery has silently fallen back to the reconciler's walk — the
+        // thing this path exists to avoid. Loud, because nothing else would show it.
+        tracing::error!(dropped, "landed announcements were unparseable; the api/agent wire contract has diverged");
+    }
+    if recorded > 0 {
+        tracing::debug!(recorded, "recorded announced parts");
+    }
+    for (part, stored) in relanded {
+        check_reland(store, ssd, part, stored.as_ref(), snapshot).await;
+    }
+}
+
+/// Decides whether one re-landed part's pool copy is stale, and re-drives it if so.
+///
+/// Thin by construction: the policy is [`verdict_for_reland`] in `hippius-drain-core`, which is
+/// unit-tested against in-memory fakes, because everything here needs a live Postgres and a real
+/// disk and so has no local coverage. All this adds is the I/O and the disposition of each arm.
+///
+/// A read failure decides NOTHING (the part keeps its `replicated` row). That is fail-safe in
+/// the direction that matters — re-driving on a flaky disk would re-copy the shard — but it is
+/// blind, not safe: a real divergence on an unreadable part goes undetected, which is what
+/// `reland_unreadable` exists to say. `NotFound` is split out of that lump
+/// ([`reland_read_outcome`]): an announced part was just written, so its directory being absent
+/// at check time means an eviction/reclaim unlinked it in between — and if the rewrite had
+/// diverged, the client's acknowledged bytes are destroyed while the pool serves the superseded
+/// ones. That is a possible-data-loss signature, logged at ERROR, not a disk warning.
+async fn check_reland(store: &Store, ssd: &LocalSsd, part: &PartKey, stored: Option<&PartDigest>, snapshot: &SnapshotCell) {
+    let observed = match observed_part_digest(ssd, part).await {
+        Ok(digest) => digest,
+        Err(err) => {
+            let outcome = reland_read_outcome(err.kind());
+            snapshot.record_reland(outcome);
+            match outcome {
+                RelandOutcome::Vanished => tracing::error!(
+                    part = %part.relative_dir().display(),
+                    error = %err,
+                    unverifiable = stored.is_none(),
+                    "a re-landed part's SSD copy is GONE before its divergence check — if the rewrite diverged, the pool now permanently serves superseded bytes"
+                ),
+                RelandOutcome::Unchanged | RelandOutcome::Redriven | RelandOutcome::Unreadable => tracing::warn!(
+                    part = %part.relative_dir().display(),
+                    error = %err,
+                    "could not hash a re-landed part; its pool copy is unverified"
+                ),
+            }
+            return;
+        }
+    };
+    let verdict = verdict_for_reland(ReplicationState::Replicated, stored, &observed);
+    if !verdict.redrives() {
+        snapshot.record_reland(RelandOutcome::Unchanged);
+        return;
+    }
+    match store.redrive_diverged_part(part, &observed).await {
+        // Zero rows means the row moved on between the read and the write (another agent
+        // re-drove it, or a reaper flipped it terminal). Not counted as a re-drive: the guard
+        // did its job, and double-counting would make the integrity signal read high.
+        Ok(false) => tracing::debug!(part = %part.relative_dir().display(), "a re-landed part was already re-driven"),
+        Ok(true) => {
+            snapshot.record_reland(RelandOutcome::Redriven);
+            // WARN, not INFO: until the re-drive completes, the pool — and every node that
+            // promoted from it — serves bytes that decrypt and AEAD-verify cleanly but are the
+            // wrong ones, since the retry preserves the DEK, the AAD and the chunk index.
+            tracing::warn!(
+                part = %part.relative_dir().display(),
+                unverifiable = stored.is_none(),
+                "a committed part was rewritten on SSD; re-driving the stale pool copy",
+            );
+        }
+        Err(err) => {
+            tracing::error!(part = %part.relative_dir().display(), error = %err, "re-driving a diverged part failed; its pool copy stays stale");
+        }
     }
 }
 
@@ -472,6 +1019,7 @@ fn pull_action(pull: &Result<Option<StoredAllocation>, CoordError>) -> PullActio
 /// `load_allocation` runs *unlocked*; only the synchronous `set_rate` takes the lock.
 async fn run_alloc(token: CancellationToken, coord: Arc<Coordinator>, rate_control: RateControl, clock: Arc<dyn Clock>) {
     let RateControl {
+        snapshot,
         enforcer,
         node,
         floor,
@@ -489,6 +1037,17 @@ async fn run_alloc(token: CancellationToken, coord: Arc<Coordinator>, rate_contr
         let pull = coord.load_allocation(&node).await;
         if let Err(err) = &pull {
             tracing::warn!(error = %err, "allocation pull failed; decaying toward the floor");
+        }
+        // The eviction reserve rides along with the budget, and follows the same liveness
+        // rule: an allocation that is present carries a floor, and one that has expired takes
+        // its floor with it. Leaving a stale floor in place after the allocator went silent
+        // would have the evictor acting on a Ceph picture that may be minutes out of date.
+        match &pull {
+            Ok(Some(allocation)) => match allocation.reserve_permille {
+                Some(permille) => snapshot.record_allocated_reserve_permille(permille),
+                None => snapshot.clear_allocated_reserve_permille(),
+            },
+            Ok(None) | Err(_) => snapshot.clear_allocated_reserve_permille(),
         }
         match pull_action(&pull) {
             PullAction::Adopt(budget) => {
@@ -543,6 +1102,10 @@ pub struct AgentRuntime<E: UploadEnqueuer> {
     /// Opt-in readiness file the heartbeat worker touches only while the drain is progressing
     /// (C8), for the k8s `readinessProbe`. `None` writes no file.
     readiness_path: Option<Arc<PathBuf>>,
+    /// Opt-in landed-part announcement queue. `None` (tests, and any deployment whose api does
+    /// not publish yet) leaves the reconciler as the sole discovery path — i.e. today's
+    /// behaviour — so the two sides roll independently.
+    landed: Option<LandedQueue>,
 }
 
 impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
@@ -563,6 +1126,7 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             clock: Arc::new(SystemClock),
             liveness_path: None,
             readiness_path: None,
+            landed: None,
         }
     }
 
@@ -620,6 +1184,15 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         self
     }
 
+    /// Enables the landed-announcement worker, so a part the api just wrote is discovered by
+    /// one `RPOP` rather than by the reconciler's walk of the whole SSD tree. Without it the
+    /// reconciler remains the sole trigger, which is exactly the pre-announcement behaviour.
+    #[must_use]
+    pub fn with_landed_queue(mut self, queue: LandedQueue) -> Self {
+        self.landed = Some(queue);
+        self
+    }
+
     /// A handle to the runtime's live drain counters. Grab it before [`run`](Self::run)
     /// (which consumes the runtime) to read metrics while the workers publish.
     #[must_use]
@@ -658,8 +1231,16 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
             run_periodic(token, reconcile_poll, move || {
                 let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
                 async move {
+                    let started = Instant::now();
                     match reconcile_parts(ssd.as_ref(), store.as_ref()).await {
-                        Ok(report) => snapshot.record_reconciled(report.recovered),
+                        Ok(report) => {
+                            // The reconciler's walk is the expensive one: it runs on the
+                            // shortest poll of any worker, and `scanned` is every part on the
+                            // disk. Recording it is what makes the landed-announcement path's
+                            // benefit visible — and what would show F1 returning.
+                            snapshot.record_scan(ScanWorker::Reconcile, report.scanned, started.elapsed());
+                            snapshot.record_reconciled(report.recovered);
+                        }
                         Err(err) => tracing::warn!(error = %err, "reconcile cycle failed"),
                     }
                 }
@@ -672,23 +1253,102 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
         let (ssd, store, snapshot) = (Arc::clone(&self.ssd), Arc::clone(&self.store), Arc::clone(&self.snapshot));
         let reclaim_poll = self.config.reclaim_poll;
         let reclaim_graces = ReclaimGraces {
-            failed: self.config.reclaim_grace,
-            orphan: self.config.orphan_reclaim_grace,
-            replicated: self.config.replicated_reclaim_grace,
+            failed: FailedGrace(self.config.reclaim_grace),
+            orphan: OrphanGrace(self.config.orphan_reclaim_grace),
         };
-        let redrive_max_attempts = self.config.redrive_max_attempts;
         supervisor.spawn(WorkerName::new("ssd_reclaim"), move |token| {
             run_periodic(token, reclaim_poll, move || {
                 let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
                 async move {
                     reclaim_once(&ssd, &store, &snapshot, reclaim_graces).await;
-                    // R4 re-drive: reset bounded `corrupt` parts to `pending` for a fresh copy,
-                    // then publish the held-corrupt gauge. Same cadence as reclaim (both are the
-                    // node-local SSD lifecycle); errors log and retry next poll (fail-safe).
+                }
+            })
+        });
+
+        // R4 re-drive on its OWN poll, no longer folded into the reclaim walk above.
+        //
+        // It was sharing that loop on the reasoning that both are "the node-local SSD lifecycle",
+        // which is true but hides the thing that matters: every other disposition the reclaim
+        // worker owns is grace-gated at an hour or more, so its poll interval is a cost knob. A
+        // `corrupt` part is not. It is a LIVE object whose pool copy is bad and whose SSD copy is
+        // the last good source, and the re-drive is what gets a fresh pool copy made — so for
+        // this one call the poll interval IS the single-copy exposure window.
+        //
+        // Retention made the reclaim walk proportional to the node's whole replicated shard,
+        // which is a good reason to run it hourly and NOT a reason to leave an R4 part on one
+        // copy for an hour. Splitting them lets each answer to its own clock; it also keeps the
+        // `drain-corrupt-live-parts` alert's `for:` window calibrated against a cadence that no
+        // longer moves when the walk's does.
+        let (store, snapshot) = (Arc::clone(&self.store), Arc::clone(&self.snapshot));
+        let redrive_poll = self.config.redrive_poll;
+        let redrive_max_attempts = self.config.redrive_max_attempts;
+        supervisor.spawn(WorkerName::new("redrive_corrupt"), move |token| {
+            run_periodic(token, redrive_poll, move || {
+                let (store, snapshot) = (Arc::clone(&store), Arc::clone(&snapshot));
+                async move {
                     redrive_corrupt_once(&store, &snapshot, redrive_max_attempts).await;
                 }
             })
         });
+
+        // Read-tier evictor: with the drain retaining its replicated parts, this is the ONLY
+        // worker that frees the ingest SSD. It runs on its own poll (not folded into
+        // ssd_reclaim) because the two answer to different clocks — reclaim chases debris that
+        // accrues slowly, eviction chases a free-space floor that a burst of ingest can breach
+        // in minutes.
+        let (ssd, store, snapshot) = (Arc::clone(&self.ssd), Arc::clone(&self.store), Arc::clone(&self.snapshot));
+        let evict_poll = self.config.evict_poll;
+        let evict_policy = self.config.evict_policy;
+        // The evictor also publishes the floor the api must stop promoting below. It needs the
+        // coordinator (for Redis) and the node identity (to key the value); both already exist
+        // for the heartbeat, so a node that reports itself to the allocator also steers the api,
+        // and one that does not (tests, drain-only e2e) leaves the api on its static floor.
+        let promote_floor = self
+            .coord
+            .as_ref()
+            .zip(self.heartbeat.as_ref())
+            .map(|(coord, heartbeat)| PromoteFloorPublisher {
+                coord: Arc::clone(coord),
+                node: heartbeat.node.clone(),
+            });
+        supervisor.spawn(WorkerName::new("ssd_evict"), move |token| {
+            run_periodic(token, evict_poll, move || {
+                let (ssd, store, snapshot, promote_floor) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot), promote_floor.clone());
+                async move { evict_once(&ssd, &store, &snapshot, evict_policy, promote_floor.as_ref()).await }
+            })
+        });
+
+        // Failed-part reclaim worker: unlink aged abandoned-upload debris, found by an indexed
+        // query rather than by walking the disk. Separate from the reclaim WALK above and on its
+        // own poll deliberately — decoupling debris cleanup from the walk is what let the walk
+        // drop to hourly without leaving debris around for an hour.
+        let (ssd, store, snapshot) = (Arc::clone(&self.ssd), Arc::clone(&self.store), Arc::clone(&self.snapshot));
+        let failed_reclaim_poll = self.config.failed_reclaim_poll;
+        let failed_grace = self.config.reclaim_grace;
+        supervisor.spawn(WorkerName::new("failed_reclaim"), move |token| {
+            run_periodic(token, failed_reclaim_poll, move || {
+                let (ssd, store, snapshot) = (Arc::clone(&ssd), Arc::clone(&store), Arc::clone(&snapshot));
+                async move { failed_reclaim_once(&ssd, &store, &snapshot, failed_grace).await }
+            })
+        });
+
+        // Landed-announcement worker (opt-in): record parts the api says it just wrote, so
+        // discovery costs one RPOP instead of a walk of the node's entire replicated shard
+        // (2.28 M parts on prod). Without a queue configured the agent behaves exactly as
+        // before — the reconciler is still the sole trigger — which is what makes the api-side
+        // publish and this consumer independently deployable in either order.
+        if let Some(queue) = self.landed.as_ref() {
+            // The SSD handle is here for the B-2 divergence check, which re-hashes a part the
+            // announcement reveals was rewritten after it drained.
+            let (queue, store, ssd, snapshot) = (queue.clone(), Arc::clone(&self.store), Arc::clone(&self.ssd), Arc::clone(&self.snapshot));
+            let landed_poll = self.config.landed_poll;
+            supervisor.spawn(WorkerName::new("landed"), move |token| {
+                run_periodic(token, landed_poll, move || {
+                    let (queue, store, ssd, snapshot) = (queue.clone(), Arc::clone(&store), Arc::clone(&ssd), Arc::clone(&snapshot));
+                    async move { landed_once(&queue, &store, &ssd, &snapshot).await }
+                })
+            });
+        }
 
         // Enqueue-sweep worker: publish the backend upload for `replicated` parts whose
         // address was NULL at drain time (an in-flight MPU) — the decoupled counterpart to the
@@ -790,13 +1450,20 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
-    use super::{AgentRuntime, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, default_enforcer, pull_action, record_drain_signals};
+    use super::{
+        AgentRuntime, DiskUsage, EvictionPolicy, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, SharedDiskReport, check_shared_disk,
+        default_enforcer, eviction_target, node_observation, promote_floor_permille, published_promote_floor, pull_action, record_drain_signals,
+    };
     use crate::localfs::{LocalFs, LocalSsd};
     use crate::supervisor::ShutdownTrigger;
     use core::str::FromStr;
+    use hippius_drain_core::DiskPressure;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
     use hippius_drain_core::{
-        Allocation, ByteRate, Bytes, Clock, CoordError, Coordinator, NodeId, ObjectId, PartKey, PartNumber, PartReplicationStore, ReclaimGraces,
-        ReplicationState, SnapshotCell, Store, StoredAllocation, TestClock, UploadEnqueuer, Version,
+        Allocation, ByteRate, Bytes, Clock, CoordError, Coordinator, FailedGrace, NodeId, ObjectId, OrphanGrace, PartKey, PartNumber,
+        PartReplicationStore, ReclaimGraces, ReplicationState, ResidentLog, SnapshotCell, Store, StoredAllocation, TestClock, UploadEnqueuer,
+        Version,
     };
 
     /// A coordinator on the test Redis under a per-test prefix, or `None` to skip the
@@ -836,6 +1503,7 @@ mod tests {
         let allocation = StoredAllocation {
             budget: ByteRate::new(500_000),
             epoch: 7,
+            reserve_permille: None,
         };
         assert_eq!(pull_action(&Ok(Some(allocation))), PullAction::Adopt(ByteRate::new(500_000)));
     }
@@ -898,6 +1566,372 @@ mod tests {
         assert!(
             !tracker.observe(0, snapshot.undrained_count(), t0 + Duration::from_mins(2)),
             "undrained rows + no progress past the stall -> NotReady (keying on the 0-byte backlog would stay Ready)"
+        );
+    }
+
+    #[test]
+    fn the_eviction_target_is_a_percentage_of_the_disk_not_an_absolute_size() {
+        // Reserve and headroom are percentages so one setting is correct on ingest disks of
+        // different sizes: 15%/5% of a 4000 GiB disk must resolve to 600 GiB / 200 GiB, not to
+        // whatever byte count happened to suit the node it was first tuned on. They are taken
+        // against TOTAL size, not against free space — a floor measured against what is left
+        // would move every time the disk filled.
+        let usage = DiskUsage {
+            pressure: DiskPressure::try_from(9_000).unwrap(),
+            free_bytes: 400 * GIB,
+            total_bytes: 4000 * GIB,
+        };
+        let policy = EvictionPolicy {
+            reserve_permille: 150,
+            headroom_permille: 50,
+            batch: 128,
+            max_pass: Duration::from_secs(10),
+        };
+
+        let target = eviction_target(usage, policy, None);
+
+        assert_eq!(target.free, 400 * GIB);
+        assert_eq!(target.reserve, 600 * GIB, "150 permille of 4000 GiB");
+        assert_eq!(target.headroom, 200 * GIB, "50 permille of 4000 GiB");
+        assert!(target.deficit() > 0, "400 GiB free is under a 15% reserve, so eviction arms");
+    }
+
+    #[test]
+    fn an_allocator_reserve_overrides_the_static_floor() {
+        // Phase 4: the allocator raises the floor when it knows the drain is throttled — it
+        // sees the fleet Ceph ceiling and this node's budget against its demand, neither of
+        // which the evictor can observe. Reacting only once free space has already fallen is
+        // too late on a stalled drain.
+        let usage = DiskUsage {
+            pressure: DiskPressure::try_from(5_000).unwrap(),
+            free_bytes: 400 * GIB,
+            total_bytes: 4000 * GIB,
+        };
+        let policy = EvictionPolicy {
+            reserve_permille: 150,
+            headroom_permille: 50,
+            batch: 128,
+            max_pass: Duration::from_secs(10),
+        };
+
+        let target = eviction_target(usage, policy, Some(400));
+
+        assert_eq!(target.reserve, 1600 * GIB, "40% of 4000 GiB, not the configured 15%");
+    }
+
+    #[test]
+    fn no_allocator_reserve_falls_back_to_the_static_floor() {
+        // A pre-Phase-4 leader, an expired allocation key, or a malformed value: the node
+        // keeps evicting on its own configured floor rather than dropping to no floor at all.
+        let usage = DiskUsage {
+            pressure: DiskPressure::try_from(5_000).unwrap(),
+            free_bytes: 400 * GIB,
+            total_bytes: 4000 * GIB,
+        };
+        let policy = EvictionPolicy {
+            reserve_permille: 150,
+            headroom_permille: 50,
+            batch: 128,
+            max_pass: Duration::from_secs(10),
+        };
+
+        assert_eq!(eviction_target(usage, policy, None).reserve, 600 * GIB);
+    }
+
+    #[test]
+    fn a_zero_reserve_policy_disables_eviction_entirely() {
+        // The operator kill-switch. With retention on, the evictor is the only thing freeing
+        // the ingest SSD, so being able to turn it off has to be a deliberate, obvious
+        // setting rather than an emergent effect of some percentage rounding to nothing.
+        let usage = DiskUsage {
+            pressure: DiskPressure::FULL,
+            free_bytes: 0,
+            total_bytes: 4000 * GIB,
+        };
+        let policy = EvictionPolicy {
+            reserve_permille: 0,
+            headroom_permille: 50,
+            batch: 128,
+            max_pass: Duration::from_secs(10),
+        };
+
+        assert_eq!(eviction_target(usage, policy, None).deficit(), 0, "a zero reserve never arms");
+    }
+
+    /// A probed disk for the shared-filesystem tests. `pressure` is fixed because the check
+    /// reads `total_bytes`/`free_bytes` directly — it must not depend on a derived fraction.
+    fn disk(total_bytes: u64, free_bytes: u64) -> DiskUsage {
+        DiskUsage {
+            pressure: DiskPressure::try_from(5_000).unwrap(),
+            free_bytes,
+            total_bytes,
+        }
+    }
+
+    /// The eviction policy the fleet ships: 15% reserve, 5% headroom.
+    fn shipped_policy() -> EvictionPolicy {
+        EvictionPolicy {
+            reserve_permille: 150,
+            headroom_permille: 50,
+            batch: 128,
+            max_pass: Duration::from_secs(10),
+        }
+    }
+
+    #[test]
+    fn a_disk_mostly_used_by_a_writer_the_agent_cannot_account_for_reads_as_shared() {
+        // B-5: the evictor's reserve, the api's promote floor and its fs_cache_pressure 503 all
+        // read free space as if this agent's cache were what fills the disk. On staging's shared
+        // /dev/md3 that is false, and nothing said so — which makes every free-space gate in the
+        // workstream unvalidatable on the environment validating it.
+        let snapshot = SnapshotCell::new();
+
+        let report = check_shared_disk(&snapshot, Some(100 * GIB), disk(4000 * GIB, 3000 * GIB));
+
+        assert_eq!(
+            report,
+            Some(SharedDiskReport {
+                accounted_bytes: 100 * GIB,
+                used_bytes: 1000 * GIB,
+            }),
+            "both numbers ride along so the operator sees the size of the gap, not just its existence"
+        );
+        assert_eq!(snapshot.shared_filesystem(), Some(true), "and the gauge carries it as a standing signal");
+    }
+
+    #[test]
+    fn a_disk_the_agent_accounts_for_reads_as_owned() {
+        // The prod shape: a dedicated ingest NVMe whose used bytes are this agent's parts, give
+        // or take filesystem overhead and debris. Nothing to report.
+        let snapshot = SnapshotCell::new();
+
+        let report = check_shared_disk(&snapshot, Some(900 * GIB), disk(4000 * GIB, 3000 * GIB));
+
+        assert_eq!(report, None, "90% accounted is the agent's own disk");
+        assert_eq!(snapshot.shared_filesystem(), Some(false));
+    }
+
+    #[test]
+    fn an_unreadable_accounting_moves_the_verdict_in_neither_direction() {
+        // A transient PG blip is the only source of a `None` accounting, and it must not be read
+        // as "zero bytes accounted for": that would manufacture a shared-disk alarm out of a
+        // measurement never taken. Nor may it clear a standing one. Both directions are asserted
+        // because only one of them is the obvious failure.
+        let snapshot = SnapshotCell::new();
+        let probe = disk(4000 * GIB, 3000 * GIB);
+
+        check_shared_disk(&snapshot, Some(900 * GIB), probe);
+        assert_eq!(check_shared_disk(&snapshot, None, probe), None, "a blind tick reports nothing");
+        assert_eq!(snapshot.shared_filesystem(), Some(false), "an unread accounting is not a zero accounting");
+
+        check_shared_disk(&snapshot, Some(100 * GIB), probe);
+        assert_eq!(check_shared_disk(&snapshot, None, probe), None);
+        assert_eq!(snapshot.shared_filesystem(), Some(true), "and it does not clear a live alarm either");
+    }
+
+    #[test]
+    fn an_unreadable_accounting_on_a_never_measured_node_stays_unmeasured() {
+        // The same rule from the other side: with no prior verdict, a blind tick must leave the
+        // gauge UNPUBLISHED rather than recording a false `false`.
+        let snapshot = SnapshotCell::new();
+
+        assert_eq!(check_shared_disk(&snapshot, None, disk(4000 * GIB, 3000 * GIB)), None);
+        assert_eq!(snapshot.shared_filesystem(), None, "never measured is not the same as clean");
+    }
+
+    #[test]
+    fn an_empty_or_barely_used_disk_is_not_judged() {
+        // A fresh node's cache is cold, so its accounted bytes are a rounding error next to a
+        // fixed filesystem footprint — every new node would flag on its first heartbeats and the
+        // alert would be trained away before it ever caught a real co-tenant. Under 1% of the
+        // disk there is nothing to judge, and an entirely empty one divides by nothing.
+        let snapshot = SnapshotCell::new();
+
+        assert_eq!(check_shared_disk(&snapshot, Some(0), disk(4000 * GIB, 4000 * GIB)), None, "0 used bytes");
+        assert_eq!(
+            check_shared_disk(&snapshot, Some(0), disk(4000 * GIB, 3999 * GIB)),
+            None,
+            "1 GiB used of 4000 GiB is below the judgement floor"
+        );
+        assert_eq!(snapshot.shared_filesystem(), None, "an unjudged disk publishes no verdict either way");
+    }
+
+    #[test]
+    fn a_mount_that_measures_as_nothing_is_not_judged_clean() {
+        // The degenerate zero-block mount `used_fraction` already treats as full. Every ratio
+        // comparison against it reads false, so it would otherwise sail through as "the agent
+        // accounts for all of it" — a verified-clean verdict derived from no measurement at all.
+        let snapshot = SnapshotCell::new();
+
+        assert_eq!(check_shared_disk(&snapshot, Some(0), disk(0, 0)), None);
+        assert_eq!(snapshot.shared_filesystem(), None);
+    }
+
+    #[test]
+    fn a_mount_reporting_more_free_than_total_is_not_judged() {
+        // Reserved blocks make some filesystems report `available` above the total the same
+        // statvfs call returns. Saturating the subtraction keeps that a non-judgement rather
+        // than an underflow into a multi-exabyte "used".
+        let snapshot = SnapshotCell::new();
+
+        assert_eq!(check_shared_disk(&snapshot, Some(GIB), disk(100 * GIB, 200 * GIB)), None);
+        assert_eq!(snapshot.shared_filesystem(), None);
+    }
+
+    #[test]
+    fn a_standing_shared_disk_is_reported_once_per_transition_not_once_per_tick() {
+        // The heartbeat ticks every 10s; an ERROR per tick is 8,640 lines a day per node, which
+        // is how a real signal becomes noise. The gauge is the standing signal — the log marks
+        // the edges, so a co-tenant arriving, leaving, and returning is all still visible.
+        let snapshot = SnapshotCell::new();
+        let shared = disk(4000 * GIB, 3000 * GIB);
+
+        assert!(check_shared_disk(&snapshot, Some(100 * GIB), shared).is_some(), "first sighting reports");
+        assert_eq!(
+            check_shared_disk(&snapshot, Some(100 * GIB), shared),
+            None,
+            "the same condition does not re-report"
+        );
+        assert_eq!(check_shared_disk(&snapshot, Some(900 * GIB), shared), None, "clearing is not an ERROR");
+        assert_eq!(snapshot.shared_filesystem(), Some(false));
+        assert!(
+            check_shared_disk(&snapshot, Some(100 * GIB), shared).is_some(),
+            "but a return is reported again"
+        );
+    }
+
+    #[test]
+    fn the_promote_floor_is_the_midpoint_of_the_band_at_every_reserve() {
+        // The midpoint is the only point that neither chatters nor deadlocks, and it must be
+        // derived from whatever reserve is in force — not from the 150 the code was written
+        // against. At the allocator's ceiling the floor is 425 permille, which is the whole
+        // point: on a stalled node promotion stops long before the evictor is armed.
+        assert_eq!(promote_floor_permille(150, 50), 175, "the shipped band's midpoint");
+        assert_eq!(
+            promote_floor_permille(400, 50),
+            425,
+            "an allocator-raised reserve raises the floor with it"
+        );
+    }
+
+    #[test]
+    fn every_reserve_the_allocator_can_publish_yields_a_floor_strictly_inside_the_band() {
+        // THE invariant, stated in the language that owns the constants. `validate_promotion_band`
+        // asserted this once at startup against a hardcoded 150 while the allocator was free to
+        // publish anything in 150..=400 (base_reserve_permille..max_reserve_permille in
+        // hippius-drain-allocator's AllocConfig) — so it inverted for every reserve >= 175 and
+        // said nothing. Exhaustive over the shipped range rather than sampled: 251 values is
+        // cheaper than a proptest run and proves the property outright.
+        for reserve in 150_u16..=400 {
+            let floor = published_promote_floor(
+                EvictionPolicy {
+                    reserve_permille: reserve,
+                    ..shipped_policy()
+                },
+                None,
+            )
+            .expect("a live band publishes a floor");
+            assert!(
+                reserve < floor && floor < reserve + 50,
+                "reserve {reserve} must yield a floor strictly inside ({reserve}, {}), got {floor}",
+                reserve + 50
+            );
+        }
+    }
+
+    #[test]
+    fn the_published_floor_follows_the_allocated_reserve_not_the_configured_one() {
+        // The bug in one assertion: the evictor obeys the allocator's per-node reserve, so the
+        // floor the api consumes has to be resolved from the SAME value. Publishing the static
+        // one would re-create the mirror this change exists to delete.
+        assert_eq!(
+            published_promote_floor(shipped_policy(), None),
+            Some(175),
+            "no allocation: the node's own configured reserve"
+        );
+        assert_eq!(
+            published_promote_floor(shipped_policy(), Some(400)),
+            Some(425),
+            "an allocated reserve wins over the configured one, exactly as eviction_target resolves it"
+        );
+    }
+
+    #[test]
+    fn an_evictor_that_forms_no_band_publishes_nothing_and_leaves_the_api_on_its_static_floor() {
+        // A zero reserve is the operator's eviction kill-switch, and a zero headroom leaves an
+        // empty band. In both cases there is no live control loop for a floor to sit inside, so
+        // publishing a derived number would hand the api a threshold nothing can restore.
+        // Publishing NOTHING lets the key lapse, which the api reads as "signal unavailable".
+        assert_eq!(
+            published_promote_floor(
+                EvictionPolicy {
+                    reserve_permille: 0,
+                    ..shipped_policy()
+                },
+                None
+            ),
+            None,
+            "eviction disabled: nothing frees the disk, so no floor is honest"
+        );
+        assert_eq!(
+            published_promote_floor(
+                EvictionPolicy {
+                    headroom_permille: 0,
+                    ..shipped_policy()
+                },
+                None
+            ),
+            None,
+            "a zero headroom leaves no room between the reserve and the target"
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_published_floor_is_always_strictly_inside_the_band_it_was_derived_from(
+            reserve in 1_u16..=1_000,
+            headroom in 0_u16..=1_000,
+            allocated in proptest::option::of(1_u16..=1_000),
+        ) {
+            let policy = EvictionPolicy { reserve_permille: reserve, headroom_permille: headroom, ..shipped_policy() };
+            if let Some(floor) = published_promote_floor(policy, allocated) {
+                let resolved = allocated.unwrap_or(reserve);
+                proptest::prop_assert!(
+                    resolved < floor && floor < resolved + headroom,
+                    "floor {floor} escaped the band ({resolved}, {})",
+                    resolved + headroom
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_heartbeat_reports_the_db_backlog_not_disk_occupancy() {
+        // The Phase 1 wiring, pinned. A node whose SSD is nearly full but has only 4 MiB of
+        // genuinely undrained work must bid as a 4 MiB node. Sourcing this from occupancy
+        // instead — as it did before — overstates demand by everything else on the disk: the
+        // A21/orphan leak today, and the entire retained read cache once retention ships.
+        let snapshot = SnapshotCell::new();
+        snapshot.record_backlog(4 * 1024 * 1024);
+        let usage = DiskUsage {
+            pressure: DiskPressure::try_from(9_500).unwrap(),
+            free_bytes: 100 * 1024 * 1024,
+            total_bytes: 1024 * 1024 * 1024,
+        };
+
+        let observation = node_observation(usage, &snapshot, ByteRate::new(5_000_000));
+
+        assert_eq!(
+            observation.backlog,
+            Bytes::new(4 * 1024 * 1024),
+            "backlog is the DB sum the snapshot carries, never disk occupancy"
+        );
+        assert_eq!(observation.free, Bytes::new(100 * 1024 * 1024));
+        assert_eq!(observation.cache, Bytes::ZERO, "nothing is retained until Phase 2 ships");
+        assert_eq!(
+            observation.pressure,
+            DiskPressure::try_from(9_500).unwrap(),
+            "raw fullness rides along as the fallback urgency for a pre-residency allocator"
         );
     }
 
@@ -1003,6 +2037,7 @@ mod tests {
                 &[Allocation {
                     node: node.clone(),
                     budget: ByteRate::new(750_000),
+                    reserve_permille: 150,
                 }],
             )
             .await
@@ -1020,11 +2055,20 @@ mod tests {
                 reconcile_poll: Duration::from_mins(1),
                 enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
+                redrive_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
-                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
+                evict_poll: Duration::from_secs(30),
+                evict_policy: EvictionPolicy {
+                    reserve_permille: 150,
+                    headroom_permille: 50,
+                    batch: 512,
+                    max_pass: Duration::from_secs(10),
+                },
                 redrive_max_attempts: 3,
             },
         )
@@ -1035,6 +2079,7 @@ mod tests {
             floor: ByteRate::new(1_000),
             half_life: Duration::from_secs(30),
             poll: Duration::from_millis(20),
+            snapshot: Arc::new(SnapshotCell::new()),
         });
 
         let shutdown = CancellationToken::new();
@@ -1078,7 +2123,17 @@ mod tests {
         let floor = ByteRate::new(1_000);
 
         // alloc_ttl is 1s (above), so this budget key expires ~1s after the write.
-        coord.write_allocations(1, &[Allocation { node: node.clone(), budget }]).await.unwrap();
+        coord
+            .write_allocations(
+                1,
+                &[Allocation {
+                    node: node.clone(),
+                    budget,
+                    reserve_permille: 150,
+                }],
+            )
+            .await
+            .unwrap();
 
         let enforcer = Arc::new(Mutex::new(default_enforcer(ByteRate::new(0), Bytes::new(1 << 20), 4)));
         // Keep the concrete handle (for `advance`) and a trait-object clone (for the
@@ -1095,11 +2150,20 @@ mod tests {
                 reconcile_poll: Duration::from_mins(1),
                 enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
+                redrive_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
-                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
+                evict_poll: Duration::from_secs(30),
+                evict_policy: EvictionPolicy {
+                    reserve_permille: 150,
+                    headroom_permille: 50,
+                    batch: 512,
+                    max_pass: Duration::from_secs(10),
+                },
                 redrive_max_attempts: 3,
             },
         )
@@ -1110,6 +2174,7 @@ mod tests {
             floor,
             half_life: Duration::from_secs(1),
             poll: Duration::from_millis(10),
+            snapshot: Arc::new(SnapshotCell::new()),
         })
         .with_clock(clock_source);
 
@@ -1172,10 +2237,36 @@ mod tests {
         let coord = Arc::new(coord);
         let ssd_dir = tempfile::tempdir().unwrap();
         let pool_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::from_pool(pool));
+        let store = Arc::new(Store::from_pool(pool.clone()));
         let node = NodeId::from_str("node-hb").unwrap();
         // A distinctive capability so the asserted row is unambiguously ours.
         let rate = ByteRate::new(7_000_000);
+
+        // Seed real undrained work for this node, because the heartbeat's backlog is now the
+        // DB sum of pending/draining part bytes rather than raw SSD occupancy. This assertion
+        // used to pass by accident: `statvfs` on a tempdir reports the HOST filesystem's used
+        // bytes, so the CI runner's own disk satisfied `backlog > 0` while the node had no
+        // work at all. Seeding keeps the assertion meaningful instead of weakening it.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS parts (object_id uuid NOT NULL, object_version bigint NOT NULL, \
+             part_number bigint NOT NULL, size_bytes bigint, upload_id uuid)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cephor_replication_status (object_id, version, part_number, status, node_id) \
+             VALUES ($1, 1, 1, 'pending', 'node-hb')",
+        )
+        .bind(UUID)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO parts (object_id, object_version, part_number, size_bytes) VALUES ($1::uuid, 1, 1, 4096)")
+            .bind(UUID)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let runtime = AgentRuntime::new(
             Arc::new(LocalFs::new(pool_dir.path())),
@@ -1188,11 +2279,20 @@ mod tests {
                 reconcile_poll: Duration::from_mins(1),
                 enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
+                redrive_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
-                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
+                evict_poll: Duration::from_secs(30),
+                evict_policy: EvictionPolicy {
+                    reserve_permille: 150,
+                    headroom_permille: 50,
+                    batch: 512,
+                    max_pass: Duration::from_secs(10),
+                },
                 redrive_max_attempts: 3,
             },
         )
@@ -1254,11 +2354,20 @@ mod tests {
                 reconcile_poll: Duration::from_millis(20),
                 enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
+                redrive_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
-                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
+                evict_poll: Duration::from_secs(30),
+                evict_policy: EvictionPolicy {
+                    reserve_permille: 150,
+                    headroom_permille: 50,
+                    batch: 512,
+                    max_pass: Duration::from_secs(10),
+                },
                 redrive_max_attempts: 3,
             },
         );
@@ -1303,11 +2412,20 @@ mod tests {
                 reconcile_poll: Duration::from_millis(50),
                 enqueue_poll: Duration::from_mins(1),
                 reclaim_poll: Duration::from_mins(1),
+                redrive_poll: Duration::from_mins(1),
                 reclaim_grace: Duration::from_hours(1),
                 orphan_reclaim_grace: Duration::from_hours(24),
-                replicated_reclaim_grace: Duration::from_hours(1),
                 grace: Duration::from_secs(5),
                 drain_concurrency: 4,
+                landed_poll: Duration::from_secs(1),
+                failed_reclaim_poll: Duration::from_mins(5),
+                evict_poll: Duration::from_secs(30),
+                evict_policy: EvictionPolicy {
+                    reserve_permille: 150,
+                    headroom_permille: 50,
+                    batch: 512,
+                    max_pass: Duration::from_secs(10),
+                },
                 redrive_max_attempts: 3,
             },
         );
@@ -1368,9 +2486,8 @@ mod tests {
             &store,
             &snapshot,
             ReclaimGraces {
-                failed: Duration::from_secs(1),
-                orphan: Duration::from_secs(1),
-                replicated: Duration::from_hours(24),
+                failed: FailedGrace(Duration::from_secs(1)),
+                orphan: OrphanGrace(Duration::from_secs(1)),
             },
         )
         .await;
@@ -1392,12 +2509,117 @@ mod tests {
         );
     }
 
+    /// Marks `part` replicated and records it resident on this node — the state the drain
+    /// leaves behind now that it retains its SSD copy.
+    ///
+    /// Done in SQL because `PartVerified` is unforgeable outside drain-core, which is the point
+    /// of that seal; `mark_replicated` / `mark_resident` are covered by the store's own tests.
+    async fn seed_resident(store: &Store, pool: &PgPool, part: &PartKey, size_bytes: u64) {
+        sqlx::query(
+            "UPDATE cephor_replication_status SET status = 'replicated' \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .execute(pool)
+        .await
+        .unwrap();
+        store.record_resident(part, size_bytes).await.unwrap();
+    }
+
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
-    async fn reclaim_once_evicts_an_aged_replicated_crash_orphan(pool: PgPool) {
-        // The ssd-leak fix end-to-end through reclaim_once against real Postgres: a `replicated`
-        // part still on SSD past the replicated grace is a drain crash-orphan (the drain committed
-        // mark_replicated but crashed before its own unlink). It is evicted, counted, and its
-        // replication row is left intact — the pool copy remains authoritative.
+    async fn evict_once_reclaims_a_resident_part_when_the_disk_is_under_its_floor(pool: PgPool) {
+        // The whole eviction path end-to-end against real Postgres and a real directory:
+        // statvfs -> target -> worklist -> unlink -> mark evicted. A reserve of 100% is
+        // unsatisfiable by construction, so the pass is guaranteed to arm regardless of how
+        // full the test machine's disk happens to be.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let snapshot = SnapshotCell::new();
+
+        let resident = part_at(5, 1);
+        seed_ssd_dir(ssd_dir.path(), &resident);
+        store.record_landed_part(&resident).await.unwrap();
+        seed_resident(&store, &pool, &resident, 20).await;
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        super::evict_once(
+            &ssd,
+            &store,
+            &snapshot,
+            EvictionPolicy {
+                reserve_permille: 1_000,
+                headroom_permille: 0,
+                batch: 512,
+                max_pass: Duration::from_secs(10),
+            },
+            None,
+        )
+        .await;
+
+        assert!(
+            !ssd_dir.path().join(resident.relative_dir()).exists(),
+            "the resident part was evicted to restore the floor",
+        );
+        assert_eq!(snapshot.evicted(), 1);
+        assert!(
+            store.evictable_parts(10).await.unwrap().is_empty(),
+            "an evicted part is marked, so the next pass does not re-offer a part that is gone",
+        );
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &resident).await.unwrap(),
+            Some(ReplicationState::Replicated),
+            "eviction drops the SSD copy only; the pool copy stays authoritative",
+        );
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn evict_once_never_touches_an_undrained_part(pool: PgPool) {
+        // The invariant that makes retention safe, proven through the real worklist rather
+        // than a fake: a `pending` part's SSD copy is the ONLY durable copy in existence.
+        // Even with an unsatisfiable reserve — maximum possible pressure to free something —
+        // it must survive, because losing it is data loss, not a cache miss.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let snapshot = SnapshotCell::new();
+
+        let undrained = part_at(7, 1);
+        seed_ssd_dir(ssd_dir.path(), &undrained);
+        store.record_landed_part(&undrained).await.unwrap();
+        // Resident on this node, but still `pending` — the shape the worklist must refuse.
+        // This is not hypothetical: redrive_corrupt_parts produces exactly it.
+        store.record_resident(&undrained, 20).await.unwrap();
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        super::evict_once(
+            &ssd,
+            &store,
+            &snapshot,
+            EvictionPolicy {
+                reserve_permille: 1_000,
+                headroom_permille: 0,
+                batch: 512,
+                max_pass: Duration::from_secs(10),
+            },
+            None,
+        )
+        .await;
+
+        assert!(
+            ssd_dir.path().join(undrained.relative_dir()).exists(),
+            "an undrained part is the only durable copy — eviction must never take it",
+        );
+        assert_eq!(snapshot.evicted(), 0);
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn reclaim_once_retains_a_replicated_part_however_aged(pool: PgPool) {
+        // End-to-end against real Postgres: a `replicated` part on SSD is the node's READ TIER,
+        // and no amount of age makes this worker take it. It used to — before retention, a
+        // lingering replicated part could only be a crash between the commit and the drain's own
+        // unlink. Now it is the steady state, and reclaiming it on age would discard hot cache
+        // from a disk with terabytes free. Only the evictor may remove it, on a free-space policy.
         let ssd_dir = tempfile::tempdir().unwrap();
         let store = Store::from_pool(pool.clone());
         let snapshot = SnapshotCell::new();
@@ -1408,28 +2630,27 @@ mod tests {
         force_terminal_2h(&pool, &orphan, "replicated").await;
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        // Short replicated grace so the 2h-aged crash-orphan is past the window.
+        // Graces short enough that any age-based arm would fire — proving retention is
+        // unconditional rather than merely not-yet-due.
         super::reclaim_once(
             &ssd,
             &store,
             &snapshot,
             ReclaimGraces {
-                failed: Duration::from_secs(1),
-                orphan: Duration::from_secs(1),
-                replicated: Duration::from_secs(1),
+                failed: FailedGrace(Duration::from_secs(1)),
+                orphan: OrphanGrace(Duration::from_secs(1)),
             },
         )
         .await;
 
         assert!(
-            !ssd_dir.path().join(orphan.relative_dir()).exists(),
-            "the aged replicated crash-orphan was evicted from the SSD",
+            ssd_dir.path().join(orphan.relative_dir()).exists(),
+            "a 2h-aged replicated part is retained, not reclaimed",
         );
-        assert_eq!(snapshot.load().reclaimed, 1, "the replicated crash-orphan counts toward reclaimed");
+        assert_eq!(snapshot.load().reclaimed, 0, "retained cache is not reclaimed debris");
         assert_eq!(
             <Store as PartReplicationStore>::status(&store, &orphan).await.unwrap(),
             Some(ReplicationState::Replicated),
-            "reclaim only unlinks the SSD copy; the replicated row is left intact",
         );
     }
 
@@ -1447,22 +2668,30 @@ mod tests {
         std::fs::create_dir_all(&part_dir).unwrap();
         let orphan = part_dir.join("chunk_0.bin.tmp.0badf00d0badf00d");
         std::fs::write(&orphan, b"half-written").unwrap();
+        // A live UploadPart's staged chunk, in the same dir. It is what makes the two graces
+        // DISTINGUISHABLE here: with both set to ZERO this test passed whichever way round
+        // reclaim_once handed them to the sweep, so a transposition that reaps a running
+        // multi-GB upload at the (minutes-scale) failed grace was invisible. The types now
+        // reject a swap at compile time; this keeps the wiring pinned if they ever go away.
+        let staged = part_dir.join("chunk_0.bin.staged.0123456789abcdef");
+        std::fs::write(&staged, b"in flight").unwrap();
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        // Zero grace so the just-written temp is past the (no-)window.
+        // Zero FAILED grace so the just-written temp is past its (no-)window; a long ORPHAN
+        // grace so the staged chunk is inside its own.
         super::reclaim_once(
             &ssd,
             &store,
             &snapshot,
             ReclaimGraces {
-                failed: Duration::ZERO,
-                orphan: Duration::ZERO,
-                replicated: Duration::from_hours(24),
+                failed: FailedGrace(Duration::ZERO),
+                orphan: OrphanGrace(Duration::from_hours(24)),
             },
         )
         .await;
 
         assert!(!orphan.exists(), "reclaim_once swept the orphan temp");
+        assert!(staged.exists(), "a live upload's staged chunk is NOT on the write-temp grace");
         assert_eq!(snapshot.load().reclaimed, 0, "no failed part -> nothing reclaimed, only the temp swept");
     }
 
@@ -1495,9 +2724,8 @@ mod tests {
             &store,
             &snapshot,
             ReclaimGraces {
-                failed: Duration::from_secs(1),
-                orphan: Duration::from_hours(1),
-                replicated: Duration::from_hours(24),
+                failed: FailedGrace(Duration::from_secs(1)),
+                orphan: OrphanGrace(Duration::from_hours(1)),
             },
         )
         .await;
@@ -1537,9 +2765,8 @@ mod tests {
             &store,
             &snapshot,
             ReclaimGraces {
-                failed: Duration::from_secs(1),
-                orphan: Duration::from_secs(1),
-                replicated: Duration::from_hours(24),
+                failed: FailedGrace(Duration::from_secs(1)),
+                orphan: OrphanGrace(Duration::from_secs(1)),
             },
         )
         .await;
@@ -1575,9 +2802,8 @@ mod tests {
             &store,
             &snapshot,
             ReclaimGraces {
-                failed: Duration::from_secs(1),
-                orphan: Duration::from_secs(1),
-                replicated: Duration::from_hours(24),
+                failed: FailedGrace(Duration::from_secs(1)),
+                orphan: OrphanGrace(Duration::from_secs(1)),
             },
         )
         .await;

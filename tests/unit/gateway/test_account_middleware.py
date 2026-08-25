@@ -1,6 +1,5 @@
 """Unit tests for account middleware bypass mode and account ID derivation."""
 
-import hashlib
 from typing import Any
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -18,17 +17,17 @@ from tests.unit.mocks.mock_arion_service import MockArionService
 
 @pytest.fixture  # type: ignore[misc]
 def mock_config_bypass() -> Any:
-    """Mock config with bypass_credit_check enabled."""
+    """Mock config with enable_bypass_credit_check enabled."""
     config = MagicMock()
-    config.bypass_credit_check = True
+    config.enable_bypass_credit_check = True
     return config
 
 
 @pytest.fixture  # type: ignore[misc]
 def mock_config_no_bypass() -> Any:
-    """Mock config with bypass_credit_check disabled."""
+    """Mock config with enable_bypass_credit_check disabled."""
     config = MagicMock()
-    config.bypass_credit_check = False
+    config.enable_bypass_credit_check = False
     config.substrate_url = "ws://localhost:9944"
     config.can_upload_cache_ttl_seconds = 10
     config.can_upload_transient_retries = 2
@@ -39,9 +38,9 @@ def mock_config_no_bypass() -> Any:
 @pytest.fixture  # type: ignore[misc]
 def account_app_bypass(mock_config_bypass: Any, monkeypatch: Any) -> Any:
     """FastAPI app with account middleware in bypass mode."""
-    from gateway.middlewares.account import account_middleware
+    from hippius_s3.gateway.middlewares.account import account_middleware
 
-    monkeypatch.setattr("gateway.middlewares.account.config", mock_config_bypass)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.account.config", mock_config_bypass)
 
     app = FastAPI()
 
@@ -59,9 +58,9 @@ def account_app_bypass(mock_config_bypass: Any, monkeypatch: Any) -> Any:
 @pytest.mark.asyncio
 async def test_bypass_mode_no_auth_returns_anonymous(mock_config_bypass: Any, monkeypatch: Any) -> None:
     """Test that requests without authentication get anonymous account ID."""
-    from gateway.middlewares.account import account_middleware
+    from hippius_s3.gateway.middlewares.account import account_middleware
 
-    monkeypatch.setattr("gateway.middlewares.account.config", mock_config_bypass)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.account.config", mock_config_bypass)
 
     app = FastAPI()
 
@@ -93,9 +92,9 @@ def _make_can_upload_app(
     monkeypatch: Any,
 ) -> FastAPI:
     """Build a FastAPI app wired with account middleware, mock arion, and mock account fetching."""
-    from gateway.middlewares.account import account_middleware
+    from hippius_s3.gateway.middlewares.account import account_middleware
 
-    monkeypatch.setattr("gateway.middlewares.account.config", mock_config)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.account.config", mock_config)
 
     account = HippiusAccount(
         id="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
@@ -109,7 +108,7 @@ def _make_can_upload_app(
         return account
 
     monkeypatch.setattr(
-        "gateway.middlewares.account.fetch_account_by_main_address",
+        "hippius_s3.gateway.middlewares.account.fetch_account_by_main_address",
         mock_fetch_account_by_main_address,
     )
 
@@ -117,7 +116,7 @@ def _make_can_upload_app(
     mock_redis_accounts = AsyncMock()
     mock_redis_accounts.get = AsyncMock(return_value=None)
     mock_redis_accounts.set = AsyncMock()
-    app.state.redis_accounts = mock_redis_accounts
+    app.state.redis_accounts_client = mock_redis_accounts
     app.state.arion_client = mock_arion
 
     @app.api_route("/test-bucket/test-key", methods=["GET", "PUT", "POST", "DELETE", "HEAD"])
@@ -272,9 +271,9 @@ async def test_can_upload_genuine_denial_stays_402_and_is_not_retried(
 async def test_can_upload_skipped_in_bypass_mode(mock_config_bypass: Any, monkeypatch: Any) -> None:
     mock_arion = MockArionService(allow_upload=False, upload_error="should not be called")
 
-    from gateway.middlewares.account import account_middleware
+    from hippius_s3.gateway.middlewares.account import account_middleware
 
-    monkeypatch.setattr("gateway.middlewares.account.config", mock_config_bypass)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.account.config", mock_config_bypass)
 
     app = FastAPI()
     app.state.arion_client = mock_arion
@@ -310,9 +309,9 @@ def _make_can_upload_app_with_redis(
     monkeypatch: Any,
 ) -> FastAPI:
     """Build a FastAPI app with explicit control over the redis_accounts mock."""
-    from gateway.middlewares.account import account_middleware
+    from hippius_s3.gateway.middlewares.account import account_middleware
 
-    monkeypatch.setattr("gateway.middlewares.account.config", mock_config)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.account.config", mock_config)
 
     account = HippiusAccount(
         id="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
@@ -326,12 +325,12 @@ def _make_can_upload_app_with_redis(
         return account
 
     monkeypatch.setattr(
-        "gateway.middlewares.account.fetch_account_by_main_address",
+        "hippius_s3.gateway.middlewares.account.fetch_account_by_main_address",
         mock_fetch_account_by_main_address,
     )
 
     app = FastAPI()
-    app.state.redis_accounts = mock_redis_accounts
+    app.state.redis_accounts_client = mock_redis_accounts
     app.state.arion_client = mock_arion
 
     @app.api_route("/test-bucket/test-key", methods=["GET", "PUT", "POST", "DELETE", "HEAD"])
@@ -461,9 +460,9 @@ async def test_can_upload_cache_key_is_per_account(mock_config_no_bypass: Any, m
 async def test_gw4_get_skips_account_fetch_but_put_fetches(mock_config_no_bypass: Any, monkeypatch: Any) -> None:
     """GW-4: access-key GET/HEAD carry no credit gate and the API ignores the credit fields, so the
     redis-accounts fetch is skipped on reads; mutating methods still fetch and gate."""
-    from gateway.middlewares import account as account_mod
+    from hippius_s3.gateway.middlewares import account as account_mod
 
-    monkeypatch.setattr("gateway.middlewares.account.config", mock_config_no_bypass)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.account.config", mock_config_no_bypass)
     addr = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
     calls = {"n": 0}
 
@@ -471,11 +470,11 @@ async def test_gw4_get_skips_account_fetch_but_put_fetches(mock_config_no_bypass
         calls["n"] += 1
         return HippiusAccount(id=addr, main_account=addr, has_credits=True, upload=True, delete=True)
 
-    monkeypatch.setattr("gateway.middlewares.account.fetch_account_by_main_address", spy_fetch)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.account.fetch_account_by_main_address", spy_fetch)
     monkeypatch.setattr(account_mod, "_check_can_upload", AsyncMock(return_value=None))
 
     app = FastAPI()
-    app.state.redis_accounts = AsyncMock()
+    app.state.redis_accounts_client = AsyncMock()
 
     @app.api_route("/b/k", methods=["GET", "PUT"])
     async def ep(request: Request) -> dict[str, str]:

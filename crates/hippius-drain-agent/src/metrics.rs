@@ -7,7 +7,9 @@
 //! [`SnapshotCell`] / [`Enforcer`], so a metric scrape never measures anything itself.
 
 use hippius_drain_core::Enforcer;
+use hippius_drain_core::ScanWorker;
 use hippius_drain_core::SnapshotCell;
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::MetricExporter;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
@@ -71,6 +73,229 @@ fn build_provider(service_name: &'static str) -> Option<SdkMeterProvider> {
     Some(provider)
 }
 
+/// Registers the SSD read-tier instruments: how much is resident, and how fast the evictor is
+/// giving it back.
+///
+/// Split out of [`init`] to keep it under the 100-line limit, and because these three read as
+/// one story: `cache_bytes` climbing while `evicted_total` stays flat is a node heading for
+/// `fs_cache_pressure` 503s.
+fn register_ssd_tier_instruments(meter: &opentelemetry::metrics::Meter, snapshot: &Arc<SnapshotCell>, instruments: &mut Vec<Box<dyn std::any::Any>>) {
+    // Resident read-tier size (gauge): bytes this node holds on SSD to serve reads. The
+    // counterpart to the backlog gauge, and deliberately separate from it — the allocator
+    // counts this toward ingest headroom, not against it, so conflating the two is what would
+    // make a warm cache read as a drain emergency. Also the direct answer to "is the read tier
+    // actually filling up", which was the whole point of retaining parts.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_ssd_cache_bytes")
+            .with_callback(move |observer| observer.observe(snap.cache_bytes(), &[]))
+            .build(),
+    ));
+
+    // Eviction throughput (monotonic counters): parts and bytes the read-tier evictor
+    // reclaimed. With retention on, the evictor is the ONLY worker freeing the ingest SSD, so
+    // this staying flat while cache_bytes climbs toward the disk size is the tell that ingest
+    // is heading for fs_cache_pressure 503s.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_evicted_total")
+            .with_callback(move |observer| observer.observe(snap.evicted(), &[]))
+            .build(),
+    ));
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_evicted_bytes_total")
+            .with_callback(move |observer| observer.observe(snap.evicted_bytes(), &[]))
+            .build(),
+    ));
+
+    // The eviction durability invariant, as a counter so an alert can assert it stays at zero.
+    // Non-zero means the worklist offered a part whose SSD copy may be the only durable one —
+    // refused, but the query and the invariant have diverged.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_evict_blocked_unreplicated_total")
+            .with_callback(move |observer| observer.observe(snap.evict_blocked_unreplicated(), &[]))
+            .build(),
+    ));
+
+    // Candidates skipped because the unlink failed. Deliberately NOT its own alert: it is the
+    // discriminator to read ALONGSIDE the existing starvation alert, separating "removals are
+    // failing" from "the cursor is empty". Rising while evicted_total stays flat is the shape
+    // that used to abort every pass silently.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_evict_remove_failed_total")
+            .with_callback(move |observer| observer.observe(snap.evict_remove_failed(), &[]))
+            .build(),
+    ));
+
+    // The same discriminator for the `failed`-part reclaim, which needs it MORE than the evictor
+    // does. The evictor's worklist re-offers a skipped part next pass and the existing starvation
+    // alert covers a whole page failing; this worklist is `WHERE reclaimed_at IS NULL` with no
+    // offset, so a part that never unlinks is never marked and pins the head of every later page.
+    // Rising while the reclaim's removals stay flat means this node's failed debris is not being
+    // collected at all — and since the residency guard, those rows also stop being GC-able.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_ssd_reclaim_remove_failed_total")
+            .with_callback(move |observer| observer.observe(snap.reclaim_remove_failed(), &[]))
+            .build(),
+    ));
+
+    // Whether this node's ingest disk is shared with a writer the drain cannot account for (1)
+    // or is its own (0). The precondition for reading ANY of the three gauges above as a
+    // statement about the drain: on a shared mount the eviction reserve, the promote floor and
+    // the api's fs_cache_pressure 503 are all responding to a co-tenant's bytes. Staging's
+    // /dev/md3 is exactly that, which is what made the free-space work unvalidatable there.
+    //
+    // Observed only once measured: a node that has never completed the check publishes NO data
+    // point rather than a `0`, because a `0` here is a verified clean bill of health and an
+    // absent series is an open question. Alert on `== 1`, and on the series' absence separately.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_ssd_shared_filesystem")
+            .with_callback(move |observer| {
+                if let Some(shared) = snap.shared_filesystem() {
+                    observer.observe(u64::from(shared), &[]);
+                }
+            })
+            .build(),
+    ));
+
+    // Free space: the third leg of backlog/cache/free. Without it a dashboard cannot separate
+    // "the read cache grew" from "the disk is filling with backlog".
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_ssd_free_bytes")
+            .with_callback(move |observer| observer.observe(snap.free_bytes(), &[]))
+            .build(),
+    ));
+}
+
+/// Registers how a part gets DISCOVERED: what the SSD walks cost, and how much of the work the
+/// api's announcements are taking off them.
+///
+/// Split out of [`init`] for the 100-line limit, and because the four read as one story: a
+/// healthy fleet has `landed_recorded` climbing while `reconciler_recovered` sits near zero and
+/// `scan_parts_total` grows only at the reclaimer's slow cadence. Any other shape means
+/// discovery has fallen back to walking the disk.
+fn register_discovery_instruments(
+    meter: &opentelemetry::metrics::Meter,
+    snapshot: &Arc<SnapshotCell>,
+    instruments: &mut Vec<Box<dyn std::any::Any>>,
+) {
+    // What the SSD walks actually cost. Retention grew their input from "the undrained backlog"
+    // to "this node's whole replicated shard" — 2.28 M parts measured on prod 2026-08-07 — and
+    // nothing reported that, which is how the cost stayed invisible until it was looked for.
+    //
+    // Labelled per worker rather than summed. The two walk on cadences three orders of magnitude
+    // apart, so a merged total is dominated by the reconciler's short poll — and lengthening
+    // that poll is exactly the follow-up these metrics gate, after which a sum could not say
+    // which walk any residual cost belonged to. `ScanWorker` is a closed enum, so the label
+    // cannot grow past two values.
+    let reconcile = [KeyValue::new("worker", ScanWorker::Reconcile.as_str())];
+    let reclaim = [KeyValue::new("worker", ScanWorker::Reclaim.as_str())];
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_scan_parts_total")
+            .with_callback(move |observer| {
+                let s = snap.load();
+                observer.observe(s.reconcile_scan_parts, &reconcile);
+                observer.observe(s.reclaim_scan_parts, &reclaim);
+            })
+            .build(),
+    ));
+    // Watched against each worker's OWN poll interval: a walk approaching its period means that
+    // worker never stops walking, which is the state that must not be reached again.
+    let reconcile = [KeyValue::new("worker", ScanWorker::Reconcile.as_str())];
+    let reclaim = [KeyValue::new("worker", ScanWorker::Reclaim.as_str())];
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_scan_duration_ms")
+            .with_callback(move |observer| {
+                let s = snap.load();
+                observer.observe(s.reconcile_scan_ms, &reconcile);
+                observer.observe(s.reclaim_scan_ms, &reclaim);
+            })
+            .build(),
+    ));
+
+    // Discovery path split. `landed_recorded` climbing while `reconciler_recovered` stays near
+    // zero is what says the api's announcements are carrying discovery and the reconciler's
+    // whole-disk walk is genuinely idle. Both near zero means ingest stopped — NOT that the
+    // fast path is working — which is why the pair has to be read together.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_landed_recorded_total")
+            .with_callback(move |observer| observer.observe(snap.load().landed_recorded, &[]))
+            .build(),
+    ));
+    // Must stay at zero. Nonzero means the api and this agent disagree about the message shape,
+    // so every announcement is being discarded and discovery has silently reverted to the walk.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_landed_dropped_total")
+            .with_callback(move |observer| observer.observe(snap.load().landed_dropped, &[]))
+            .build(),
+    ));
+
+    // B-2. **Alert on any increase.** A nonzero rate means a client rewrote a part AFTER it
+    // drained, so until the re-drive completes the pool — and every node that promoted from it —
+    // serves bytes that decrypt and AEAD-verify cleanly but are the superseded ones. Legal S3,
+    // and rare, but it is the only visible trace of a silent-wrong-plaintext window.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reland_redriven_total")
+            .with_callback(move |observer| observer.observe(snap.load().reland_redriven, &[]))
+            .build(),
+    ));
+    // The benign denominator: re-announcements whose content still matched. Carries no alert on
+    // its own; it is what makes the counter above readable as a rate rather than a raw count.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reland_unchanged_total")
+            .with_callback(move |observer| observer.observe(snap.load().reland_unchanged, &[]))
+            .build(),
+    ));
+    // Checks that could not run because the part would not read back off SSD. Fail-safe (nothing
+    // is re-driven) but BLIND: a genuine divergence on such a part goes undetected, so a sustained
+    // rate means the detector is partly off, not that there is nothing to detect.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reland_unreadable_total")
+            .with_callback(move |observer| observer.observe(snap.load().reland_unreadable, &[]))
+            .build(),
+    ));
+    // Checks that found the part's SSD directory ABSENT — the evict-vs-reland lost-race
+    // signature, split out of `unreadable` because the responses differ completely. **Alert on
+    // any increase**: an announced part was just written, so its files vanishing before the
+    // check means an eviction/reclaim unlinked the only copy of a possible rewrite, and the
+    // pool may now permanently serve the superseded bytes with no error anywhere else.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_reland_vanished_total")
+            .with_callback(move |observer| observer.observe(snap.load().reland_vanished, &[]))
+            .build(),
+    ));
+}
+
 /// Builds the meter provider and registers the agent's metrics, or returns `None` when
 /// monitoring is disabled or the exporter cannot be built. `enforcer` is `None` for an
 /// ungated drain (no breaker to observe).
@@ -102,6 +327,10 @@ pub fn init(service_name: &'static str, snapshot: &Arc<SnapshotCell>, enforcer: 
             .with_callback(move |observer| observer.observe(snap.backlog(), &[]))
             .build(),
     ));
+
+    register_ssd_tier_instruments(&meter, snapshot, &mut instruments);
+
+    register_discovery_instruments(&meter, snapshot, &mut instruments);
 
     // Reclaim throughput: terminal SSD parts the reclaim worker unlinked (monotonic counter).
     // The SSD-ingest tier's eviction rate — distinct from the drain's CephFS throughput — so a

@@ -54,7 +54,7 @@ If you're new here, read [CLAUDE.md](CLAUDE.md) first for the architectural map.
                                                                 │ Hippius chain (pub) │
                                                                 └─────────────────────┘
 
-* rate-limit + banhammer middleware currently not wired (gateway/main.py:94)
+* rate-limit + banhammer middleware were removed in the gateway/api merge PR (never wired; recover from git if revived)
 ```
 
 For detail: [CLAUDE.md section 3](CLAUDE.md) (request lifecycle).
@@ -82,9 +82,9 @@ If it is ever revisited, recover from `be8c76a^` (= fc2068f), the last commit th
 Recurring audit finding: "`gateway/services/sub_token_scope.py` imports a nonexistent `TokenAcl` and is wired nowhere." Both halves are false.
 
 - There is no `TokenAcl` symbol anywhere in the repo (`rg TokenAcl` hits only prose). The module imports `BucketScope`, `Op`, `Permission`, `SubTokenScope` from [hippius_s3/models/sub_token.py](hippius_s3/models/sub_token.py) — all real.
-- It is on the live ACL path: [gateway/middlewares/acl.py:9-14](gateway/middlewares/acl.py) imports it and the sub-token branch at [acl.py:164](gateway/middlewares/acl.py) calls `evaluate` at [acl.py:190](gateway/middlewares/acl.py), backed by the `sub_token_scopes` table and its cache.
+- It is on the live ACL path: [hippius_s3/gateway/middlewares/acl.py:9-14](hippius_s3/gateway/middlewares/acl.py) imports it and the sub-token branch at [acl.py:164](hippius_s3/gateway/middlewares/acl.py) calls `evaluate` at [acl.py:190](hippius_s3/gateway/middlewares/acl.py), backed by the `sub_token_scopes` table and its cache.
 
-The claim propagates from [gateway/CLAUDE.md:75,82](gateway/CLAUDE.md) and [gateway/services/CLAUDE.md:53-68](gateway/services/CLAUDE.md), which are auto-loaded into every agent session — which is why it resurfaces every audit. **Fixing those two files is the actual fix**; correcting this backlog only stops the symptom.
+The claim propagates from [hippius_s3/gateway/CLAUDE.md:75,82](hippius_s3/gateway/CLAUDE.md) and [hippius_s3/gateway/services/CLAUDE.md:53-68](hippius_s3/gateway/services/CLAUDE.md), which are auto-loaded into every agent session — which is why it resurfaces every audit. **Fixing those two files is the actual fix**; correcting this backlog only stops the symptom.
 
 ---
 
@@ -102,15 +102,15 @@ The claim propagates from [gateway/CLAUDE.md:75,82](gateway/CLAUDE.md) and [gate
 
 **Proposed hardening** (short-term):
 
-1. **Return 503 + `Retry-After` instead of letting the socket idle-close.** In [gateway/services/forward_service.py:67](gateway/services/forward_service.py), the upstream httpx call uses `Timeout(300.0, connect=10.0)`. If the upstream API is stuck waiting on Arion, we need an earlier watchdog that emits a proper response instead of hitting uvicorn's transport timeout. Specifically: wrap the streaming pipe in a per-operation deadline (e.g. 45s for PUT) and, on deadline, return a synthesized 503 with `Retry-After: 30`. AWS SDKs retry 503 by default.
+1. **Return 503 + `Retry-After` instead of letting the socket idle-close.** In [hippius_s3/gateway/services/forward_service.py:67](hippius_s3/gateway/services/forward_service.py), the upstream httpx call uses `Timeout(300.0, connect=10.0)`. If the upstream API is stuck waiting on Arion, we need an earlier watchdog that emits a proper response instead of hitting uvicorn's transport timeout. Specifically: wrap the streaming pipe in a per-operation deadline (e.g. 45s for PUT) and, on deadline, return a synthesized 503 with `Retry-After: 30`. AWS SDKs retry 503 by default.
 2. **Add a write-backpressure signal.** Export a gauge on `/metrics` (or a small `/health?component=write` endpoint) that reports the current p95 Arion upload latency — something a small-object sync tool or the status page can poll before hammering. This is the "expose a status-page `PUT success rate p1m`" item in the postmortem.
-3. **Gateway worker-pool saturation counter.** Postmortem H2: if all httpx workers are stuck on a slow upstream, incoming PUTs queue and then drop silently. Today [gateway/services/forward_service.py:62](gateway/services/forward_service.py) uses `max_connections=100, max_keepalive_connections=20`. Add `queued_requests` / `active_connections` gauges so we can graph saturation next to PUT p99.
+3. **Gateway worker-pool saturation counter.** Postmortem H2: if all httpx workers are stuck on a slow upstream, incoming PUTs queue and then drop silently. Today [hippius_s3/gateway/services/forward_service.py:62](hippius_s3/gateway/services/forward_service.py) uses `max_connections=100, max_keepalive_connections=20`. Add `queued_requests` / `active_connections` gauges so we can graph saturation next to PUT p99.
 
 **Longer-term ideas** (open for discussion):
 - Small-object fast-path: commit FS cache + DB row + queue, return 200 before Arion acks. Durability tradeoff; needs Radu's call.
 - ~~Per-backend circuit breaker~~ — decided against, see [section 2](#2-settled-decisions--not-open-work).
 
-Anchors to touch: [gateway/services/forward_service.py](gateway/services/forward_service.py), [hippius_s3/services/arion_service.py](hippius_s3/services/arion_service.py), [hippius_s3/monitoring.py](hippius_s3/monitoring.py), [gateway/main.py:94](gateway/main.py) (currently-disabled rate limit — may tie in).
+Anchors to touch: [hippius_s3/gateway/services/forward_service.py](hippius_s3/gateway/services/forward_service.py), [hippius_s3/services/arion_service.py](hippius_s3/services/arion_service.py), [hippius_s3/monitoring.py](hippius_s3/monitoring.py), [hippius_s3/gateway/main.py:94](hippius_s3/gateway/main.py) (currently-disabled rate limit — may tie in).
 
 ### P0 — Broken v5 `object_versions` rows (NULL envelope)
 
@@ -141,8 +141,9 @@ Anchors to touch: [gateway/services/forward_service.py](gateway/services/forward
 **Status (2026-07-17)**: fixed. The second write is gone — `put_simple_stream_full` and
 `mpu_upload_part_stream` write each chunk exactly once (guarded by
 `tests/unit/test_put_simple_stream_full.py`), and `RedisObjectPartsCache.set_chunks` had zero
-production callers and has been deleted. `WriteThroughPartsWriter.write_chunks` writes via
-`fs_store.set_chunk` only.
+production callers and has been deleted. `WriteThroughPartsWriter.write_chunks` was deleted with
+the last non-streaming write path; the streaming consumers call `fs_store.set_chunk` /
+`stage_chunk` directly.
 
 **Follow-up (minor cleanup)**: `WriteThroughPartsWriter.__init__` still accepts a `redis_cache`
 param that is stored but never read (`hippius_s3/writer/write_through_writer.py:17-26`). Drop it and
@@ -151,7 +152,7 @@ consider renaming the class to `FSPartsWriter`.
 
 ### P1 — Accepted SSD leak from the UploadPart cleanup-race fix (unbounded until ov-row cleanup lands)
 
-**Context**: branch `fix/upload-part-cleanup-race` stopped failure-path cleanups from deleting shared FS part data — a duplicate UploadPart's loser used to destroy the winner's *published* chunks (drain then wrote the part off as unrecoverable). The fix deletes nothing on failure and enforces the exact chunk set at publish time instead ([hippius_s3/writer/object_writer.py:893](hippius_s3/writer/object_writer.py), [hippius_s3/cache/fs_store.py:359 `trim_chunks_from`](hippius_s3/cache/fs_store.py)).
+**Context**: branch `fix/upload-part-cleanup-race` stopped failure-path cleanups from deleting shared FS part data — a duplicate UploadPart's loser used to destroy the winner's *published* chunks (drain then wrote the part off as unrecoverable). The fix deletes nothing on failure and enforces the exact chunk set at publish time instead — `fs_store.publish_part` promotes the attempt's staged set and runs `_trim_chunk_tail` before writing meta ([hippius_s3/cache/fs_store.py:383](hippius_s3/cache/fs_store.py); the standalone `trim_chunks_from` was folded into it).
 
 **The accepted cost** — two leak shapes now accumulate on SSD:
 
@@ -192,7 +193,7 @@ Fast-path copy: rewraps the DEK under the destination's AAD, copies `chunk_backe
 
 ### P2 — Gateway → API streaming hop
 
-**What**: Every request streams through `gateway → forward_service → httpx → api`. Client body is read once via `request.stream()`, forwarded via `httpx.AsyncClient.stream()`, and the API response is re-streamed to the client via `StreamingResponse`. No buffering. ([gateway/services/forward_service.py:113-170](gateway/services/forward_service.py)).
+**What**: Every request streams through `gateway → forward_service → httpx → api`. Client body is read once via `request.stream()`, forwarded via `httpx.AsyncClient.stream()`, and the API response is re-streamed to the client via `StreamingResponse`. No buffering. ([hippius_s3/gateway/services/forward_service.py:113-170](hippius_s3/gateway/services/forward_service.py)).
 
 **Cost**: per-byte NIC traversal doubles (client→gw + gw→api), and tail latency doubles for any request where the API is slow. On large GETs this is meaningful. Keep-alive pool is shared (100 connections, 20 keepalive).
 
@@ -231,15 +232,44 @@ Two concurrent PUTs to the same (bucket, key) today both fetch the existing obje
 
 **Proposed**: always pass `uuid.uuid4()` as the candidate, let the DB override on conflict. Removes the read-before-write and simplifies the endpoint. Low risk.
 
-### P2 — Rate limiting and banhammer disabled at gateway
+### P1 — Path normalization: one view, set once
 
-**File**: [gateway/main.py:94](gateway/main.py) logs `"Rate limiting and banhammer disabled"`. The middleware modules exist ([gateway/middlewares/rate_limit.py](gateway/middlewares/rate_limit.py), [gateway/middlewares/banhammer.py](gateway/middlewares/banhammer.py)) but are not registered in the middleware chain. Reasons unknown from code alone — maybe performance, maybe maturity.
+**Seam**: [hippius_s3/gateway/main.py:231](hippius_s3/gateway/main.py) (the `# TODO:` line next to `ray_id_middleware`, second-outermost).
 
-**Ask Radu**: is this intentional for now, or should we re-enable? If enabling, verify `redis-rate-limiting` and `redis-acl` capacity/perf at current RPS.
+The gateway judges paths in two views and the api receives a third-party rewrite of one of them. `ForwardService` interpolates the decoded `scope["path"]` into a URL *string* ([forward_service.py:135](hippius_s3/gateway/services/forward_service.py)) and hands it to httpx, which then **collapses `.`/`..`** and **truncates at the first `#`/`?`** before the request goes out; the api's uvicorn then **decodes percent-escapes a second time**. So "the path" is ambiguous at every layer, and each layer that picks the wrong view is deciding about a request that is never sent.
+
+This has now failed three separate times, each fixed in isolation:
+
+1. **2026-08-03 (prod)** — `auth_router` matched exempt paths with `startswith()`, so bucket `docs2` skipped authentication entirely and landed as an anonymous-owned bucket.
+2. **PR #401** — `/anybucket/../internal/parts/...` passed `input_validation`'s first-segment denylist and reached the api as `/internal/parts/...`, because the denylist judged the uncollapsed path. Fixed by introducing `forwarded_path`.
+3. **PR #401 (later)** — `/internal%23x/parts/1` and `/internal%3Fx/parts/1` passed the same denylist and arrived as `GET /internal`, because `forwarded_path` modelled only dot segments and not the `#`/`?` truncation. Fixed by truncating. Separately, `auth_router`/`acl`/`account`/`frontend_hmac` were still judging the uncollapsed path — a candidate auth bypass (`GET /docs/../anybucket/key` skipped auth AND had ACL evaluated against the ownerless `docs` bucket).
+
+Each fix was correct and each left the *class* open, because the invariant lives in no single place: it is re-asserted by every caller that remembers to ask the right question. `gateway/utils/paths.py::routing_path` is now the one right answer, but nothing forces a new middleware to use it — and a plausible-sounding alternative (`request.url.path`) is one attribute access away.
+
+**Proposed**: rewrite `scope["path"]` to `routing_path(request)` once, in a middleware at the seam above, and let every downstream layer read `request.url.path` freely — because it would then already BE the forwarded view. `ForwardService` keeps interpolating `scope["path"]`, which is now idempotent under httpx's rewrites (dot segments already collapsed, nothing after a `#`/`?` left to truncate), so the gateway and the api agree by construction rather than by discipline.
+
+Deliberately not done as part of #401: it changes the path every middleware sees, so it needs its own PR with e2e coverage of the exempt routes, the `/user/` HMAC arm, presigned-URL canonicalization (**note**: `sigv4.py` must keep signing over `raw_path` — the client signed what it sent, not what we forward), and the ATS cache-key/purge paths.
+
+**Still judging `request.url.path` today** (each is the same class; none is known-exploitable, listed so the sweep is mechanical rather than archaeological):
+
+| File | Decision | Consequence of the wrong view |
+|---|---|---|
+| [cache_control.py:64](hippius_s3/gateway/middlewares/cache_control.py) | ATS cache key (bucket/key) | Cache key disagrees with the object served — stale or cross-key hits |
+| [ats_purge.py:31](hippius_s3/gateway/middlewares/ats_purge.py) | Which key to invalidate on write | A write invalidates the wrong key; readers keep the stale copy |
+| [rate_limit.py:66-70](hippius_s3/gateway/middlewares/rate_limit.py) | `skip_paths`, `/user/` skip | Rate limiting dodgeable via `/health/../bucket/key` |
+| [read_only.py:21](hippius_s3/gateway/middlewares/read_only.py) | `ALWAYS_ALLOWED_PATHS` | Exact-match only, so it fails safe — writes stay blocked |
+| [audit_log.py:19](hippius_s3/gateway/middlewares/audit_log.py), [tracing.py:22](hippius_s3/gateway/middlewares/tracing.py) | Log/span attributes | Observability only: audit lines name a path the api never saw |
+
+**Also worth one query before the next release**: the new `%`-in-first-segment rejection ([input_validation.py](hippius_s3/gateway/middlewares/input_validation.py)) makes any pre-existing bucket whose name contains `%` unreachable. Such a name cannot be created through the gateway (`BUCKET_NAME_PATTERN` refuses it), but confirm none exists: `SELECT bucket_name FROM buckets WHERE bucket_name LIKE '%\%%' ESCAPE '\';`
+
+### P2 — Rate limiting and banhammer (REMOVED 2026-08)
+
+Both middleware modules were deleted in the gateway/api merge PR: they were never registered (the old `gateway/main.py` held only a commented-out banhammer registration) and their config lived on the deleted `GatewayConfig`. If the features are revived, recover the modules from git history and register them in `hippius_s3/main.py`; the unban endpoint in `hippius_s3/api/user.py` still clears `hippius_banhammer:*` Redis keys.
+
 
 ### P2 — Seed phrase auth failure messages
 
-**File**: [gateway/middlewares/sigv4.py](gateway/middlewares/sigv4.py). Base64 decode failures on the seed phrase return a bare 403 InvalidAccessKeyId with no diagnostic. Users who've fat-fingered their access key see no hint. Minor UX win to return `"Malformed seed encoding"` in non-prod.
+**File**: [hippius_s3/gateway/middlewares/sigv4.py](hippius_s3/gateway/middlewares/sigv4.py). Base64 decode failures on the seed phrase return a bare 403 InvalidAccessKeyId with no diagnostic. Users who've fat-fingered their access key see no hint. Minor UX win to return `"Malformed seed encoding"` in non-prod.
 
 ---
 
@@ -310,8 +340,8 @@ During any future change to the cache layout (not planned right now, but e.g. if
 
 Checklist derived from the 2026-04-21 postmortem. Each item is a small-medium PR.
 
-1. **503 + Retry-After on upstream timeout in forward_service.** Today the gateway closes the connection after ~300s if the upstream API never responds ([forward_service.py:61](gateway/services/forward_service.py)). A deadline of ~45s with a synthesized 503 response would let AWS SDKs retry. Make the deadline configurable per-method (PUT tighter than GET).
-2. **Surface Retry-After from internal API to client.** If the API itself returns 503 with Retry-After (e.g. `fs_cache_pressure_middleware` already does), the gateway must forward that header unmodified. Verify in [forward_service.py:130-146](gateway/services/forward_service.py).
+1. **503 + Retry-After on upstream timeout in forward_service.** Today the gateway closes the connection after ~300s if the upstream API never responds ([forward_service.py:61](hippius_s3/gateway/services/forward_service.py)). A deadline of ~45s with a synthesized 503 response would let AWS SDKs retry. Make the deadline configurable per-method (PUT tighter than GET).
+2. **Surface Retry-After from internal API to client.** If the API itself returns 503 with Retry-After (e.g. `fs_cache_pressure_middleware` already does), the gateway must forward that header unmodified. Verify in [forward_service.py:130-146](hippius_s3/gateway/services/forward_service.py).
 3. **Small-object fast-path** (postmortem §6 long-term). Return 200 after FS write + queue, before Arion ack. Durability tradeoff; needs Radu's decision.
 4. **Status-page PUT success gauge**. Expose p1m PUT success rate on `/metrics` and ship a Cachet component for it. The postmortem explicitly calls this out as a user-facing need.
 5. **DLQ retry ergonomics**. The DLQ exists ([hippius_s3/dlq/base.py](hippius_s3/dlq/base.py)) and `scripts/dlq_requeue.py` works, but there's no dashboard panel for DLQ depth per-backend. Add one.

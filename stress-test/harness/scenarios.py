@@ -488,3 +488,135 @@ def durability_reverify(client, cfg: Config, ledger: Ledger, report: Report,
         metrics={"total": len(items), "ok": ok, "corrupt": len(mismatches), "missing": len(missing),
                  "authoritative": authoritative},
     ))
+
+
+def ssd_fill_pressure(client, cfg: Config, ledger: Ledger, report: Report, buckets: dict,
+                      probe, fill_bytes: int, obj_bytes: int, workers: int) -> None:
+    """Write a caller-specified volume at the ingest SSD and observe what the drain/evictor do.
+
+    **The volume is a parameter, never a computation.** This scenario deliberately does not look at
+    free space and decide how much to write. The disk it targets is shared with other tenants, so a
+    self-sizing fill would be a script that decides on its own to consume someone else's headroom —
+    and the number that makes eviction arm is a property of the cluster on the day, not of the test.
+    The operator reads the disk (`ssd_disk_report.sh`), decides, and passes `--fill-gb`.
+
+    What it asserts vs merely observes:
+      - PASS/FAIL on the durability invariant only: `drain_ssd_evict_blocked_unreplicated_total`
+        must stay 0. That is the one property with a ratified threshold — the evictor may never be
+        offered a part whose SSD copy is the only durable one.
+      - OBSERVED for everything else (free space moved, bytes evicted, whether `starved` fired).
+        There is no ratified "eviction is fast enough" threshold yet, and inventing one here would
+        turn a measurement into a gate that has never been calibrated.
+
+    Read the result against `cache_bytes`, not `free_bytes`. On a shared filesystem the evictor can
+    only ever reclaim what this system owns; a deficit larger than `cache_bytes` is unmeetable by
+    construction and `starved` is then the correct outcome, not a bug.
+    """
+    if fill_bytes <= 0:
+        report.add(Result(
+            name="ssd-fill-pressure", invariant="B (eviction under real disk pressure)",
+            passed=True, skipped=True,
+            detail="not requested — pass --fill-gb N to run it",
+            criteria="operator-specified fill volume reaches the ingest SSD",
+        ))
+        return
+
+    before = probe.ssd_usage() if probe else []
+    blocked_before = probe.prom_scalar(
+        'sum(drain_ssd_evict_blocked_unreplicated_total{service_namespace="%s"})' % cfg.namespace) if probe else None
+    evicted_before = probe.prom_scalar(
+        'sum(drain_ssd_evicted_bytes_total{service_namespace="%s"})' % cfg.namespace) if probe else None
+
+    for r in before:
+        print(f"    before: {r['node']} free={r.get('free_bytes',0)/1e9:.1f}G "
+              f"({r.get('free_ratio',0):.1%}) cache={r.get('cache_bytes',0)/1e9:.2f}G")
+
+    b = _bucket(cfg, "ssdfill")
+    s3util.ensure_bucket(client, b)
+    buckets["ssdfill"] = b
+
+    n = max(1, fill_bytes // obj_bytes)
+    print(f"    writing {n} x {obj_bytes/1e6:.0f}MB = {n*obj_bytes/1e9:.1f}GB with {workers} workers")
+    written = 0
+    errors = 0
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = []
+        for i in range(n):
+            key = f"fill/obj-{i:05d}"
+
+            def task(k=key, idx=i):
+                body = s3util.random_body(obj_bytes, seed=f"{b}-{idx}".encode())
+                outcome, _ = _put_with_503_retry(client, b, k, body)
+                if outcome in ("ok", "slowdown-then-ok"):
+                    ledger.record(b, k, s3util.md5_hex(body), len(body), False)
+                    return len(body)
+                return 0
+            futs.append(ex.submit(task))
+        for f in concurrent.futures.as_completed(futs):
+            try:
+                got = f.result()
+            except Exception:  # noqa: BLE001 — one failed PUT must not abort the fill
+                got = 0
+            if got:
+                written += got
+            else:
+                errors += 1
+    wall = time.time() - t0
+
+    # Give the evictor at least one poll (CEPHOR_EVICT_POLL_SECS, 30s on staging) plus slack, or a
+    # pass that was always going to arm reads as "never armed".
+    settle = 90
+    print(f"    wrote {written/1e9:.1f}GB in {wall:.0f}s ({written/1e6/max(wall,1):.0f} MB/s); "
+          f"settling {settle}s for the evictor")
+    time.sleep(settle)
+
+    after = probe.ssd_usage() if probe else []
+    blocked_after = probe.prom_scalar(
+        'sum(drain_ssd_evict_blocked_unreplicated_total{service_namespace="%s"})' % cfg.namespace) if probe else None
+    evicted_after = probe.prom_scalar(
+        'sum(drain_ssd_evicted_bytes_total{service_namespace="%s"})' % cfg.namespace) if probe else None
+
+    for r in after:
+        print(f"    after:  {r['node']} free={r.get('free_bytes',0)/1e9:.1f}G "
+              f"({r.get('free_ratio',0):.1%}) cache={r.get('cache_bytes',0)/1e9:.2f}G")
+
+    by_node = {r["node"]: r for r in before}
+    deltas = []
+    for r in after:
+        prev = by_node.get(r["node"], {})
+        deltas.append(
+            f"{r['node']}: free {prev.get('free_ratio',0):.1%}->{r.get('free_ratio',0):.1%}, "
+            f"cache {prev.get('cache_bytes',0)/1e9:.2f}->{r.get('cache_bytes',0)/1e9:.2f}G")
+
+    evicted_delta = (evicted_after - evicted_before) if (evicted_after is not None and evicted_before is not None) else None
+
+    report.add(Result(
+        name="ssd-fill-observed", invariant="B/A (eviction + promotion under real pressure)",
+        passed=True, observed=True,
+        detail=f"wrote {written/1e9:.1f}GB ({errors} failed PUTs) in {wall:.0f}s; "
+               + "; ".join(deltas)
+               + (f"; evicted {evicted_delta/1e9:.2f}GB" if evicted_delta is not None else "; evicted n/a"),
+        criteria="free space and evicted bytes move as the operator-chosen fill lands (no ratified threshold)",
+        metrics={"written_bytes": written, "failed_puts": errors,
+                 "evicted_bytes_delta": evicted_delta if evicted_delta is not None else -1},
+    ))
+
+    # The one real gate. Unknown (no Prometheus) must not read as pass.
+    if blocked_after is None:
+        report.add(Result(
+            name="ssd-fill-durability-invariant", invariant="eviction durability invariant",
+            passed=True, skipped=True,
+            detail="Prometheus unavailable — evict_blocked_unreplicated not readable",
+            criteria="drain_ssd_evict_blocked_unreplicated_total stays 0 across the fill",
+        ))
+        return
+    rose = (blocked_after - (blocked_before or 0)) > 0
+    report.add(Result(
+        name="ssd-fill-durability-invariant", invariant="eviction durability invariant",
+        passed=not rose,
+        detail=f"evict_blocked_unreplicated {blocked_before} -> {blocked_after}",
+        criteria="drain_ssd_evict_blocked_unreplicated_total stays 0 across the fill "
+                 "(the evictor was never offered a part whose SSD copy is the only durable one)",
+        metrics={"blocked_before": blocked_before or 0, "blocked_after": blocked_after},
+    ))

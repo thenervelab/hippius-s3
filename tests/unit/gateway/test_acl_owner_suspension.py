@@ -13,10 +13,10 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.acl import acl_middleware
-from gateway.services.acl_service import BucketLookup
-from gateway.services.suspension import MODE_FULL
-from gateway.services.suspension import MODE_READ_ONLY
+from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.gateway.services.acl_service import BucketLookup
+from hippius_s3.gateway.services.suspension import MODE_FULL
+from hippius_s3.gateway.services.suspension import MODE_READ_ONLY
 
 
 OWNER = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"

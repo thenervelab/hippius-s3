@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.middlewares.admin_hmac import verify_admin_hmac_middleware
+from hippius_s3.gateway.middlewares.admin_hmac import verify_admin_hmac_middleware
 
 
 SECRET = "unit-test-admin-secret"
@@ -22,7 +22,7 @@ def _signature(secret: str, method: str, path: str, query: str = "") -> str:
 
 @pytest.fixture  # type: ignore[misc]
 def admin_app(monkeypatch: pytest.MonkeyPatch) -> Any:
-    from gateway.middlewares import admin_hmac as ah
+    from hippius_s3.gateway.middlewares import admin_hmac as ah
 
     monkeypatch.setattr(ah.config, "admin_hmac_secret", SECRET)
 
@@ -113,7 +113,7 @@ async def test_query_string_is_part_of_signed_message(admin_app: Any) -> None:
 @pytest.mark.asyncio
 async def test_empty_secret_fail_closes(admin_app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """Unset secret must disable the admin API entirely, even for a ''-signed request."""
-    from gateway.middlewares import admin_hmac as ah
+    from hippius_s3.gateway.middlewares import admin_hmac as ah
 
     monkeypatch.setattr(ah.config, "admin_hmac_secret", "")
 

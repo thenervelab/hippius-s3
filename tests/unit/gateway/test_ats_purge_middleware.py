@@ -9,16 +9,16 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway import config as gateway_config
-from gateway.middlewares.ats_purge import ats_purge_middleware
+from hippius_s3 import config as gateway_config
+from hippius_s3.gateway.middlewares.ats_purge import ats_purge_middleware
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
 def _ats_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ATS_CACHE_ENDPOINT", "http://ats.local:8080")
-    gateway_config._config = None
+    gateway_config.reset_config()
     yield
-    gateway_config._config = None
+    gateway_config.reset_config()
 
 
 @pytest.fixture  # type: ignore[misc]
@@ -28,7 +28,7 @@ def captured_purges(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     def fake_schedule_purge(host: str, key: str) -> None:
         calls.append((host, key))
 
-    monkeypatch.setattr("gateway.middlewares.ats_purge.schedule_purge", fake_schedule_purge)
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.ats_purge.schedule_purge", fake_schedule_purge)
     return calls
 
 
@@ -219,7 +219,7 @@ async def test_purge_host_honors_env_override(
     """A staging gateway sets ATS_PURGE_HOST to its own public host so it purges
     the staging pool, not prod (the cache boxes serve both)."""
     monkeypatch.setenv("ATS_PURGE_HOST", "s3-staging.hippius.com")
-    gateway_config._config = None
+    gateway_config.reset_config()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://anything") as client:
         r = await client.put("/mybucket/k", content=b"x")
     assert r.status_code == 200
@@ -232,7 +232,7 @@ async def test_middleware_is_noop_when_endpoint_unset(
 ) -> None:
     """Early-return path: no PURGE scheduled when ATS_CACHE_ENDPOINT is empty."""
     monkeypatch.setenv("ATS_CACHE_ENDPOINT", "")
-    gateway_config._config = None
+    gateway_config.reset_config()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://s3.hippius.com") as client:
         r = await client.put("/mybucket/k", content=b"x")
     assert r.status_code == 200

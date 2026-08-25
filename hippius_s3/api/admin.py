@@ -37,10 +37,10 @@ from pydantic import BaseModel
 from pydantic import Field
 from redis.exceptions import RedisError
 
-from gateway.services.suspension import SUSPENSION_CACHE_TTL_SECONDS
-from gateway.services.suspension import suspension_cache_key
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.dependencies import get_postgres
+from hippius_s3.gateway.services.suspension import SUSPENSION_CACHE_TTL_SECONDS
+from hippius_s3.gateway.services.suspension import suspension_cache_key
 from hippius_s3.models.sub_token import SS58_PATTERN
 from hippius_s3.utils import get_query
 

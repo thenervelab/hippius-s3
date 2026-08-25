@@ -74,6 +74,7 @@ async def test_single_subscription_serves_out_of_order_chunks() -> None:
         return fs.get((pn, ci))
 
     async with notifier.stream_subscription(OBJ, 1, fetch_fn=fetch) as sub:
+
         async def land() -> None:
             await asyncio.sleep(0.01)
             fs[(0, 1)] = b"chunk-one"
@@ -123,6 +124,7 @@ async def test_periodic_recheck_resolves_missed_wakeup(monkeypatch: Any) -> None
         return fs.get((pn, ci))
 
     async with notifier.stream_subscription(OBJ, 1, fetch_fn=fetch) as sub:
+
         async def land_silently() -> None:
             await asyncio.sleep(0.05)
             fs[(0, 0)] = b"no-notify"  # deliberately never inject a message
@@ -148,6 +150,7 @@ async def test_transient_miss_after_notify_retries() -> None:
         return b"eventually" if calls["n"] >= 4 else None
 
     async with notifier.stream_subscription(OBJ, 1, fetch_fn=fetch) as sub:
+
         async def notify() -> None:
             await asyncio.sleep(0.01)
             redis.pubsubs[0].inject(_channel(0, 0))

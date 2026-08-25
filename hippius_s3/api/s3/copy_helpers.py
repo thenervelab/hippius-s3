@@ -20,6 +20,7 @@ from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.services.object_reader import stream_object
 from hippius_s3.storage_version import require_supported_storage_version
+from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
 
@@ -99,6 +100,41 @@ def parse_object_metadata(raw_meta: Any) -> dict[str, Any]:
             return {}
 
     return {}
+
+
+async def handle_same_bucket_copy(
+    db: Any,
+    *,
+    dest_bucket_id: str,
+    dest_key: str,
+    src_obj_row: Any,
+    copy_created_at: datetime,
+) -> Response | None:
+    """Second S3 name on src object_id. DEK/AAD/chunks are not rewritten.
+
+    Returns None when dest is a live primary of a different object (stream).
+    """
+    src_id = str(src_obj_row["object_id"])
+    etag = str(src_obj_row.get("md5_hash") or "")
+    live = await db.fetchrow(
+        get_query("get_live_object_id_by_key"),
+        dest_bucket_id,
+        dest_key,
+    )
+    if live is not None:
+        if str(live["object_id"]) == src_id:
+            return build_copy_success_response(etag, copy_created_at)
+        return None
+
+    inserted = await db.fetchrow(
+        get_query("insert_object_name"),
+        dest_bucket_id,
+        dest_key,
+        src_id,
+    )
+    if inserted is None:
+        return None
+    return build_copy_success_response(etag, copy_created_at)
 
 
 def is_multipart_object(obj_row: Any) -> bool:
@@ -209,7 +245,7 @@ async def handle_streaming_copy(
             "ray_id": getattr(request.state, "ray_id", None),
         },
         rng=None,
-        address=request.state.account.main_account,
+        address=request.state.main_account_id,
         bound_first_chunk=True,  # A2: fail fast (503) if the source is still draining, before writing the destination
     )
 
@@ -220,7 +256,7 @@ async def handle_streaming_copy(
         bucket_name=dest_bucket["bucket_name"],
         object_id=object_id,
         object_key=object_key,
-        account_address=request.state.account.main_account,
+        account_address=request.state.main_account_id,
         content_type=content_type,
         metadata=metadata,
         storage_version=config.target_storage_version,
@@ -235,7 +271,7 @@ async def handle_streaming_copy(
             pool,
             object_id=str(put_res.object_id),
             object_version=int(put_res.object_version),
-            address=request.state.account.main_account,
+            address=request.state.main_account_id,
         )
     except Exception:
         # B4: put_simple_stream_full already made the version serveable (size/md5 written). If the

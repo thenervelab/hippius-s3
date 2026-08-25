@@ -71,7 +71,7 @@ class _FakeDb:
 def _fake_request() -> Any:
     return SimpleNamespace(
         headers={"Content-Type": "application/octet-stream"},
-        state=SimpleNamespace(account=SimpleNamespace(main_account="acct-1")),
+        state=SimpleNamespace(account=SimpleNamespace(main_account="acct-1"), main_account_id="acct-1"),
     )
 
 

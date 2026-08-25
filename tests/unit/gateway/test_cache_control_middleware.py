@@ -1,5 +1,6 @@
 """Tests for cache_control_middleware — Cache-Control header injection by method/status/ACL."""
 
+import dataclasses
 from typing import Any
 
 import pytest
@@ -9,20 +10,20 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from gateway.config import GatewayConfig
-from gateway.middlewares import cache_control as cache_control_mod
-from gateway.middlewares.cache_control import PRIVATE_CACHE_CONTROL
-from gateway.middlewares.cache_control import PUBLIC_CACHE_CONTROL
-from gateway.middlewares.cache_control import VISIBILITY_HEADER
-from gateway.middlewares.cache_control import WARM_PUBLIC_CACHE_CONTROL
-from gateway.middlewares.cache_control import cache_control_middleware
+from hippius_s3.config import get_config
+from hippius_s3.gateway.middlewares import cache_control as cache_control_mod
+from hippius_s3.gateway.middlewares.cache_control import PRIVATE_CACHE_CONTROL
+from hippius_s3.gateway.middlewares.cache_control import PUBLIC_CACHE_CONTROL
+from hippius_s3.gateway.middlewares.cache_control import VISIBILITY_HEADER
+from hippius_s3.gateway.middlewares.cache_control import WARM_PUBLIC_CACHE_CONTROL
+from hippius_s3.gateway.middlewares.cache_control import cache_control_middleware
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
 def ats_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     """All warm-* tests assume ATS is in front (which gates the warm-private
     branch). Tests that need ATS unset opt out by re-patching themselves."""
-    cfg = GatewayConfig(ats_cache_endpoints=["http://ats.test"])
+    cfg = dataclasses.replace(get_config(), ats_cache_endpoints=["http://ats.test"])
     monkeypatch.setattr(cache_control_mod, "get_config", lambda: cfg)
 
 
@@ -451,7 +452,7 @@ async def test_warm_private_falls_back_to_private_when_ats_not_configured(
     """Defense-in-depth: warm-private relies on ATS header_rewrite to demote
     Cache-Control on egress. If ATS isn't configured, emitting `public,max-age=30d`
     would leak private bodies into client / browser caches. Fall back to no-store."""
-    cfg = GatewayConfig(ats_cache_endpoints=[])
+    cfg = dataclasses.replace(get_config(), ats_cache_endpoints=[])
     monkeypatch.setattr(cache_control_mod, "get_config", lambda: cfg)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.get(

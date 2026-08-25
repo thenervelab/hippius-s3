@@ -8,12 +8,12 @@ from httpx import ASGITransport
 from httpx import AsyncClient
 from starlette.requests import Request as StarletteRequest
 
-from gateway.middlewares.sigv4 import canonical_path_from_scope
+from hippius_s3.gateway.middlewares.sigv4 import canonical_path_from_scope
 
 
 @pytest.fixture  # type: ignore[misc]
 def auth_router_app() -> Any:
-    from gateway.middlewares.auth_router import auth_router_middleware
+    from hippius_s3.gateway.middlewares.auth_router import auth_router_middleware
 
     app = FastAPI()
 

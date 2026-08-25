@@ -84,10 +84,43 @@ spec:
             # above the stability threshold and the p99 target above the real per-part copy
             # time lets the AIMD ramp back up (validated live: budget 0.5 -> 100 MB/s, drain
             # resumed). See drainer-optimisations.md.
+            # 2026-08-06: the SAME latch recurred at the RAISED floor. A bulk ingest into one
+            # bucket pushed p99 over target, the AIMD floored, and it could not climb back:
+            # measured live, the five per-node budgets summed to EXACTLY 50,000,000 (the floor)
+            # with observed_p99 17.9-28.4s against the 8s target, for 70+ minutes.
+            # Why 50 MB/s is still inside the trap: the budget is split per-node and then across
+            # CEPHOR_DRAIN_CONCURRENCY=16 in-flight part copies. 50 MB/s -> 10 MB/s/node ->
+            # 0.6 MB/s per stream; a p99 part (3.7 MB; p50 is 320 kB) then needs ~6s of transfer
+            # alone, and with queueing lands at the observed 18-28s. p99 > target on EVERY tick,
+            # so the additive-increase branch is unreachable and the floor is absorbing.
+            # The latency signal therefore measures the throttle's own delay, which is what makes
+            # the low state self-sustaining — there are two stable equilibria and load knocks the
+            # fleet from the high one into the low one, permanently.
+            # 250 MB/s -> 50 MB/s/node -> 3.1 MB/s/stream -> p99 part ~1.2s, comfortably under
+            # the 8s target, so ticks read healthy and the AIMD ramps to the ceiling by itself.
+            # This does NOT weaken the near-full protection: allocate() applies the ceiling AFTER
+            # the floor (`capacity = new_total.min(ceiling.budget())`, alloc.rs), so a NearFull
+            # ceiling still clamps the fleet to CEPHOR_CEPH_NEARFULL_RATE_BPS and Critical still
+            # yields a zero budget, regardless of how high min_total is set.
             - name: CEPHOR_ALLOC_MIN_TOTAL_BPS
-              value: "50000000"    # 50 MB/s floor (was 1 MB/s) — above the collapse threshold
+              value: "250000000"   # 250 MB/s floor (was 50 MB/s) — above the 16-way-split collapse threshold
             - name: CEPHOR_ALLOC_TARGET_P99_MS
               value: "8000"        # 8s (was 2s) — headroom over per-part copy under load
+            # initial_total defaults to min_total (config.rs), so before this was set every
+            # allocator restart began at the floor — i.e. restarting to clear a latch restarted
+            # INTO it. Pinned at the per-node ceiling (5 x 100 MB/s) so a fresh leader starts at
+            # full rate and backs off only if Ceph actually pushes back.
+            - name: CEPHOR_ALLOC_INITIAL_TOTAL_BPS
+              value: "500000000"   # 500 MB/s — start at the top, not at the floor
+            # Keep 95% per back-off tick instead of 80%. At 800 a four-tick blip (20s) cuts the
+            # budget to 41% of its estimate; at 950 the same blip leaves 81%, so a transient Ceph
+            # stall no longer dumps the fleet toward the floor before the next healthy tick.
+            - name: CEPHOR_ALLOC_DECREASE_PERMILLE
+              value: "950"
+            # 10 MB/s/tick at a 5s tick needs ~4 minutes to climb from the floor to the ceiling;
+            # every second of that is un-drained parts that cross-node GETs cannot read yet.
+            - name: CEPHOR_ALLOC_ADDITIVE_INCREASE_BPS
+              value: "50000000"    # 50 MB/s per healthy tick — ~25s floor-to-ceiling
             # Live ceph-mgr ceiling probe — ENABLED. The allocator reads the real Ceph
             # pool capacity ceiling from the rook-ceph mgr Prometheus endpoint instead of
             # its static fallback ceiling. Cross-namespace reach to rook-ceph confirmed.
@@ -110,6 +143,9 @@ spec:
             # is the actual pool protection, and the janitor's pool-gated eviction has
             # outpaced a 50 MB/s drain all day. Must stay <= CEPHOR_CEPH_CEILING_BPS
             # (config-enforced) and should move WITH the ceph watermarks if retuned.
+            # This is ALSO the rate the fleet decays to while the mgr scrape is failing:
+            # a blind probe cannot tell an open pool from a full one, so raising this
+            # loosens the blind fail-safe as well as the known-near-full cap.
             - name: CEPHOR_CEPH_NEARFULL_RATE_BPS
               value: "50000000"
           resources:
