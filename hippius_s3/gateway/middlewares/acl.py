@@ -14,6 +14,7 @@ from hippius_s3.gateway.services.sub_token_scope import permission_allows
 from hippius_s3.gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
 from hippius_s3.gateway.services.suspension import get_account_suspension
 from hippius_s3.gateway.services.suspension import suspension_blocks
+from hippius_s3.gateway.utils.accounts import is_sentinel_account_id
 from hippius_s3.gateway.utils.errors import s3_error_response
 from hippius_s3.gateway.utils.paths import routing_path
 from hippius_s3.models.acl import Permission
@@ -283,6 +284,16 @@ async def acl_middleware(
 
     is_create_bucket = request.method == "PUT" and key is None and len(query_params) == 0
     if is_create_bucket:
+        # Bypassing the ACL check here is correct — the bucket does not exist, so there is nothing
+        # to authorise against. But "nothing to authorise against" is not "no identity required",
+        # and a bucket stamped with a sentinel owner is owned by nobody in a way the ACL layer
+        # reads as owned by anybody. AWS requires SigV4 on CreateBucket for the same reason: a
+        # bucket always has a real owner. auth_orchestrator and bucket_create_endpoint already
+        # refuse this; this is the earliest layer that can see it.
+        if is_sentinel_account_id(account_id):
+            logger.info(f"Rejecting unauthenticated CreateBucket for bucket: {bucket}")
+            return _access_denied()
+
         # AWS S3 default: BucketOwnerEnforced enabled, ACLs disabled (since April 2023)
         x_amz_acl = request.headers.get("x-amz-acl")
         if x_amz_acl:
