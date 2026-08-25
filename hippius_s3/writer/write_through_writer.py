@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from hippius_s3.cache.peers import get_active_registry
 from hippius_s3.cache.read_recency import get_read_recency_recorder
 from hippius_s3.writer.landed import get_landed_publisher
 
@@ -71,6 +72,13 @@ class WriteThroughPartsWriter:
         recorder = get_read_recency_recorder()
         if recorder is not None:
             await recorder(object_id, int(object_version), int(part_number))
+        # Stamp the ingest node in Redis BEFORE the drain announcement. A GET that lands on
+        # another api-local in the window before drain claims `cephor_replication_status` has
+        # no postgres owner; this hint is what lets it peer-fetch instead of waiting for the
+        # pool copy (Harbor blob-commit GET of startedat, 5-9s cross-pod).
+        registry = get_active_registry()
+        if registry is not None:
+            await registry.remember_part(object_id, int(object_version), int(part_number))
         # Announce to this node's drain agent, strictly AFTER meta lands. Meta is the readiness
         # gate: a part is only complete once it exists, so announcing earlier could have the
         # drain claim a part whose chunks are still being written. The hook lives on the writer
@@ -124,6 +132,9 @@ class WriteThroughPartsWriter:
         recorder = get_read_recency_recorder()
         if recorder is not None:
             await recorder(object_id, int(object_version), int(part_number))
+        registry = get_active_registry()
+        if registry is not None:
+            await registry.remember_part(object_id, int(object_version), int(part_number))
         publisher = get_landed_publisher()
         if publisher is not None:
             await publisher.publish(object_id, int(object_version), int(part_number))

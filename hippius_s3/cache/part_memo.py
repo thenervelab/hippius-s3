@@ -45,11 +45,19 @@ class PartMemo(Generic[K, V]):
             return None
         return value
 
-    def put(self, key: K, value: V, now: Optional[float] = None) -> None:
+    def put(
+        self,
+        key: K,
+        value: V,
+        now: Optional[float] = None,
+        *,
+        ttl_seconds: Optional[float] = None,
+    ) -> None:
         stamp = now if now is not None else time.monotonic()
+        ttl = self._ttl if ttl_seconds is None else ttl_seconds
         if len(self._entries) >= self._max and key not in self._entries:
             # dicts preserve insertion order, so the first key is the oldest inserted. An
             # approximate LRU is enough: over-evicting costs a repeated lookup, never
             # correctness, because every caller can recompute what it lost.
             self._entries.pop(next(iter(self._entries)), None)
-        self._entries[key] = (stamp + self._ttl, value)
+        self._entries[key] = (stamp + ttl, value)

@@ -21,6 +21,7 @@ from hippius_s3.cache.peers import PEER_PORT
 from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
 from hippius_s3.cache.peers import effective_max_inflight
+from hippius_s3.cache.peers import fresh_part_key
 from hippius_s3.cache.peers import peer_key
 
 
@@ -90,6 +91,33 @@ class FakePool:
         class _Ctx:
             async def __aenter__(self) -> FakeConn:
                 return conn
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _Ctx()
+
+
+class ScriptedPool:
+    """Returns fetchrow results in order. Owner miss then sizes, for the fresh-part path."""
+
+    def __init__(self, rows: list[Optional[dict[str, Any]]]) -> None:
+        self._rows = list(rows)
+        self.queries: list[tuple[Any, ...]] = []
+
+    def acquire(self) -> Any:
+        pool = self
+
+        class _Conn:
+            async def fetchrow(self, _sql: str, *args: Any) -> Optional[dict[str, Any]]:
+                pool.queries.append(args)
+                if not pool._rows:
+                    return None
+                return pool._rows.pop(0)
+
+        class _Ctx:
+            async def __aenter__(self) -> _Conn:
+                return _Conn()
 
             async def __aexit__(self, *_: Any) -> None:
                 return None
@@ -227,6 +255,19 @@ async def test_no_peer_holds_the_part_so_the_pool_is_used() -> None:
     fetcher = PeerChunkFetcher(FakePool(None), registry, "node-a", FakeHttp(200, b"x"), auth_secret=SECRET)
 
     assert await fetcher(OBJ, 1, 3, 2) is None
+
+
+@pytest.mark.asyncio
+async def test_pool_only_chunks_of_one_part_share_the_negative_memo() -> None:
+    """A miss is still per-PART: eight chunks must not issue eight postgres lookups."""
+    registry = PeerRegistry(FakeRedis(), "node-a", SELF_URL, 90)
+    pool = FakePool(None)
+    fetcher = PeerChunkFetcher(pool, registry, "node-a", FakeHttp(200, b"x"), auth_secret=SECRET)
+
+    for chunk in range(8):
+        assert await fetcher(OBJ, 1, 3, chunk) is None
+
+    assert len(pool.conn.queries) == 1, f"8 chunks issued {len(pool.conn.queries)} owner lookups"
 
 
 @pytest.mark.asyncio
@@ -924,3 +965,81 @@ async def test_a_timed_out_peer_is_not_retried_for_every_chunk_of_the_part() -> 
         assert await fetcher(OBJ, 1, 3, chunk) is None
 
     assert len(http.urls) == 1, f"a timed-out peer was retried {len(http.urls)} times"
+
+
+# ------------------------------------------------- fresh-part hint (read-after-write)
+
+
+@pytest.mark.asyncio
+async def test_remember_part_is_visible_to_the_other_node() -> None:
+    redis = FakeRedis()
+    writer = PeerRegistry(redis, "node-b", PEER_URL, 90)
+    reader = PeerRegistry(redis, "node-a", SELF_URL, 90)
+
+    await writer.remember_part(OBJ, 1, 3)
+
+    assert redis.store[fresh_part_key(OBJ, 1, 3)] == "node-b"
+    assert redis.ttls[fresh_part_key(OBJ, 1, 3)] == 60
+    assert await reader.lookup_fresh_part(OBJ, 1, 3) == "node-b"
+    assert await writer.lookup_fresh_part(OBJ, 1, 3) is None, "the ingest node does not fetch itself"
+
+
+@pytest.mark.asyncio
+async def test_remember_part_never_raises() -> None:
+    redis = FakeRedis()
+    redis.fail = True
+    await PeerRegistry(redis, "node-b", PEER_URL, 90).remember_part(OBJ, 1, 3)
+
+
+@pytest.mark.asyncio
+async def test_a_just_written_part_is_fetched_from_the_ingest_node_before_drain_claims() -> None:
+    """Harbor blob-commit GETs startedat on the other api-local before drain has claimed.
+
+    Postgres resolve is empty. The fresh-part Redis hint is what finds the ingest node
+    instead of waiting 5-9s for the pool copy.
+    """
+    redis = FakeRedis()
+    writer = PeerRegistry(redis, "node-b", PEER_URL, 90)
+    await writer.register()
+    await writer.remember_part(OBJ, 1, 3)
+    reader = PeerRegistry(redis, "node-a", SELF_URL, 90)
+    body = b"peer-bytes"
+    pool = ScriptedPool(
+        [
+            None,
+            {"chunk_indexes": [0], "cipher_sizes": [len(body)]},
+        ]
+    )
+    http = FakeHttp(200, body)
+    fetcher = PeerChunkFetcher(pool, reader, "node-a", http, auth_secret=SECRET)
+
+    assert await fetcher(OBJ, 1, 3, 0) == body
+    assert http.urls == [f"{PEER_URL}/internal/parts/{OBJ}/1/3/chunks/0"]
+    assert len(pool.queries) == 2, "owner miss, then sizes for the redis-hinted ingest node"
+
+
+@pytest.mark.asyncio
+async def test_a_negative_owner_memo_expires_so_a_late_drain_claim_is_seen(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 30s negative memo made wait_for_chunk ignore a drain claim that landed 1s later."""
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr("hippius_s3.cache.part_memo.time.monotonic", lambda: clock["t"])
+
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", PEER_URL, 90).register()
+    registry = PeerRegistry(redis, "node-a", SELF_URL, 90)
+    pool = FakePool(None)
+    http = FakeHttp(200, b"peer-bytes")
+    fetcher = PeerChunkFetcher(pool, registry, "node-a", http, auth_secret=SECRET)
+
+    assert await fetcher(OBJ, 1, 3, 0) is None
+    assert len(pool.conn.queries) == 1
+    assert http.urls == []
+
+    pool.conn._row = residency_row()
+    clock["t"] = 1_000.1
+    assert await fetcher(OBJ, 1, 3, 0) is None, "still inside the short negative TTL"
+    assert len(pool.conn.queries) == 1
+
+    clock["t"] = 1_000.3
+    assert await fetcher(OBJ, 1, 3, 0) == b"peer-bytes"
+    assert len(pool.conn.queries) == 2, "the late claim was re-resolved after the negative TTL"
