@@ -39,6 +39,7 @@ from hippius_s3.cache.peers import PEER_PORT
 from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
 from hippius_s3.cache.peers import effective_max_inflight
+from hippius_s3.cache.peers import set_active_registry
 from hippius_s3.cache.read_recency import initialize_read_recency_recorder
 from hippius_s3.cache.replication_probe import create_replication_suspect_probe
 from hippius_s3.cache.residency import create_residency_recorder
@@ -229,6 +230,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 deadline_seconds=config.peer_fetch_deadline_seconds,
             )
             logger.info("Peer chunk fetch enabled for node %s", node_name)
+            set_active_registry(app.state.peer_registry)
             if not config.internal_peer_secret:
                 # Fetching is on but there is no secret to present, so every peer refuses with a
                 # 404 and every read falls to the pool. That degradation is invisible from the

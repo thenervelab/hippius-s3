@@ -123,6 +123,23 @@ def _is_peer_address(url: str) -> bool:
 _OWNER_MEMO_TTL_SECONDS = 30.0
 _OWNER_MEMO_ENTRIES = 50_000
 
+# A miss ("no peer holds this") used to share the 30s owner TTL. Harbor's S3 driver GETs the
+# 20-byte `startedat` object on blob commit, often on a different api-local than the PUT, ~600ms
+# later — before the drain agent has claimed `cephor_replication_status`. The first miss was
+# then reused for the whole of `wait_for_chunk`, so the GET sat 5-9s waiting for the pool copy
+# while the bytes sat on the ingest node's NVMe. A short negative TTL lets a late claim or the
+# fresh-part Redis hint be seen on the next poll without re-querying postgres per chunk of a
+# pool-only part (the positive TTL still covers that).
+_NEGATIVE_OWNER_MEMO_TTL_SECONDS = 0.25
+
+# Ingest node of a part that has been written but not yet claimed by drain. The api must not
+# INSERT into `cephor_replication_status` (that table is the drain's). This hint is what lets a
+# wrong-node GET in that window peer-fetch instead of tailing replication.
+_FRESH_PART_KEY_PREFIX = "hippius:fresh-part:"
+_FRESH_PART_TTL_SECONDS = 60
+
+_active_registry: Optional[PeerRegistry] = None
+
 # Concurrent peer fetches this pod will have in flight to any ONE peer node.
 #
 # Owl selects a peer subject to per-peer fanout and bandwidth constraints, and the reason is
@@ -194,6 +211,23 @@ def _record_shed(reason: PeerShedReason) -> None:
 
 def peer_key(node_name: str) -> str:
     return f"{_PEER_KEY_PREFIX}{node_name}"
+
+
+def fresh_part_key(object_id: str, object_version: int, part_number: int) -> str:
+    return f"{_FRESH_PART_KEY_PREFIX}{object_id}:{int(object_version)}:{int(part_number)}"
+
+
+def set_active_registry(registry: Optional[PeerRegistry]) -> None:
+    """Install the process-wide registry so the write path can stamp a fresh-part owner.
+
+    `None` (workers, tests, fetch-disabled api) makes `remember_part` a no-op.
+    """
+    global _active_registry
+    _active_registry = registry
+
+
+def get_active_registry() -> Optional[PeerRegistry]:
+    return _active_registry
 
 
 class PeerRegistry:
@@ -270,6 +304,47 @@ class PeerRegistry:
             return None
         return url
 
+    async def remember_part(self, object_id: str, object_version: int, part_number: int) -> None:
+        """Record that THIS node just ingested the part. Best-effort; never raises.
+
+        Drain has not claimed `cephor_replication_status` yet, so postgres resolve is empty.
+        A GET that lands on another api-local in that window uses `lookup_fresh_part` to find
+        us instead of waiting for the pool copy.
+        """
+        try:
+            await self._redis.set(
+                fresh_part_key(object_id, object_version, part_number),
+                self._node_name,
+                ex=_FRESH_PART_TTL_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 - a missed hint costs pool latency, not the PUT
+            logger.debug(
+                "fresh-part remember failed for %s v%s part %s: %s",
+                object_id,
+                object_version,
+                part_number,
+                exc,
+            )
+
+    async def lookup_fresh_part(self, object_id: str, object_version: int, part_number: int) -> Optional[str]:
+        """The ingest node of a not-yet-claimed part, or None.
+
+        Excludes this node: the local tier already missed, so fetching ourselves is wasted.
+        """
+        try:
+            raw = await self._redis.get(fresh_part_key(object_id, object_version, part_number))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("fresh-part lookup failed for %s: %s", object_id, exc)
+            return None
+        if not raw:
+            return None
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode()
+        node = str(raw)
+        if not node or node == self._node_name:
+            return None
+        return node
+
 
 class PeerChunkFetcher:
     """Fetches a chunk from whichever peer node currently holds the part on flash."""
@@ -295,8 +370,9 @@ class PeerChunkFetcher:
         self._deadline = deadline_seconds
         # Caches the resolved base URL and the part's per-chunk ciphertext sizes, so the one
         # query that yields both is paid once per part rather than once per chunk. A `None`
-        # result is cached too — "no peer has this" is just as per-part, and re-asking for every
-        # chunk of a pool-only part is the common cold-read case.
+        # result is cached too — "no peer has this" is just as per-part — but only for
+        # `_NEGATIVE_OWNER_MEMO_TTL_SECONDS`, so a just-written part whose drain claim (or
+        # fresh-part Redis hint) lands during `wait_for_chunk` is seen on the next poll.
         #
         # The sizes are kept ONLY when a peer actually resolved. They are the expensive half of
         # the entry (one int per chunk, so ~1280 for a 5 GiB part), and a pool-only part — the
@@ -398,6 +474,30 @@ class PeerChunkFetcher:
         sizes = row["cipher_sizes"] or []
         return str(row["node_id"]), {int(i): int(s) for i, s in zip(indexes, sizes, strict=False)}
 
+    async def _chunk_sizes(self, object_id: str, object_version: int, part_number: int) -> dict[int, int]:
+        """Ciphertext size of each chunk. Used when the owner came from the fresh-part hint."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    array_agg(pc.chunk_index ORDER BY pc.chunk_index) AS chunk_indexes,
+                    array_agg(pc.cipher_size_bytes ORDER BY pc.chunk_index) AS cipher_sizes
+                FROM parts p
+                JOIN part_chunks pc ON pc.part_id = p.part_id
+                WHERE p.object_id = $1::uuid
+                  AND p.object_version = $2
+                  AND p.part_number = $3
+                """,
+                str(object_id),
+                int(object_version),
+                int(part_number),
+            )
+        if row is None:
+            return {}
+        indexes = row["chunk_indexes"] or []
+        sizes = row["cipher_sizes"] or []
+        return {int(i): int(s) for i, s in zip(indexes, sizes, strict=False)}
+
     async def __call__(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
     ) -> Optional[bytes]:
@@ -413,15 +513,28 @@ class PeerChunkFetcher:
             base, sizes = cached
         else:
             owner, sizes = await self._resolve_part(object_id, object_version, part_number)
+            if owner is None:
+                owner = await self._registry.lookup_fresh_part(object_id, object_version, part_number)
+                if owner is not None:
+                    sizes = await self._chunk_sizes(object_id, object_version, part_number)
             base = await self._registry.resolve(owner) if owner is not None else None
             if base is None:
                 # No peer to fetch from, so the sizes are dead weight in a memo bounded by
                 # entries rather than by bytes. Dropping them keeps a pool-only part's entry as
                 # cheap as it was before the size check existed.
                 sizes = {}
-            # Paired with the base so a cached "no peer" (None) is distinguishable from a cache
-            # miss — otherwise every pool-only part would re-query on every chunk.
-            self._owner_url.put(part_key, (base, sizes))
+                # Short TTL: a just-written part becomes resolvable once drain claims or the
+                # fresh-part hint lands. A 30s negative memo made Harbor blob-commit GETs wait
+                # out drain-to-pool (5-9s) instead of the next 1s wait_for_chunk poll.
+                self._owner_url.put(
+                    part_key,
+                    (base, sizes),
+                    ttl_seconds=_NEGATIVE_OWNER_MEMO_TTL_SECONDS,
+                )
+            else:
+                # Paired with the base so a cached "no peer" (None) is distinguishable from a
+                # cache miss — otherwise every pool-only part would re-query on every chunk.
+                self._owner_url.put(part_key, (base, sizes))
         if base is None:
             return None
 
