@@ -249,12 +249,18 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             # workers are arion-* (the prior "uploader"/"downloader"/"unpinner" names
             # matched no service, so those logs were always empty). Include the drain
             # stack so the drain-direct upload path is diagnosable.
+            # Keep in step with docker-compose.yml — a worker whose log is not dumped here is a
+            # worker whose crash nobody sees. `purger`, `janitor` and `account-cacher` were all
+            # missing, which is how the unpinner's env crash-loop survived unnoticed. Pinned by
+            # tests/unit/test_compose_e2e_worker_env.py.
             for svc in [
                 "api",
-                "gateway",
                 "arion-downloader",
                 "arion-uploader",
                 "arion-unpinner",
+                "purger",
+                "janitor",
+                "account-cacher",
                 "drain-agent",
                 "drain-allocator",
             ]:
