@@ -5,9 +5,14 @@
 --   The effects of a data-modifying CTE are only visible via its RETURNING output.
 -- - Therefore, we allocate the next version number inside the `ON CONFLICT DO UPDATE` itself, and then
 --   insert `object_versions` using the returned `current_object_version`.
-WITH upserted AS (
+WITH dropped AS (
+  DELETE FROM object_names
+  WHERE bucket_id = $2 AND object_key = $3
+  RETURNING object_id
+), upserted AS (
   INSERT INTO objects (object_id, bucket_id, object_key, created_at, current_object_version)
-  VALUES ($1, $2, $3, $8, 1)
+  SELECT $1, $2, $3, $8, 1
+  FROM (SELECT COUNT(*) FROM dropped) AS _
   ON CONFLICT (bucket_id, object_key)
   DO UPDATE SET
     object_key = EXCLUDED.object_key,

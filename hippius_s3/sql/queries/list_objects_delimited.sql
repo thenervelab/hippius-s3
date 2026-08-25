@@ -32,11 +32,15 @@ walk AS (
                 FROM objects o
                 WHERE o.bucket_id = p.bucket_id
                   AND o.deleted_at IS NULL
+                  AND (p.prefix IS NULL OR o.object_key LIKE p.prefix || '%')
+                  AND ($3::text IS NULL OR o.object_key >= $3::text)
                 UNION ALL
                 SELECT n.object_key, o.object_id, o.current_object_version
                 FROM object_names n
                 JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
                 WHERE n.bucket_id = p.bucket_id
+                  AND (p.prefix IS NULL OR n.object_key LIKE p.prefix || '%')
+                  AND ($3::text IS NULL OR n.object_key >= $3::text)
             ) k
             WHERE (p.prefix IS NULL OR k.object_key LIKE p.prefix || '%')
               AND ($3::text IS NULL OR k.object_key >= $3::text)
@@ -84,11 +88,15 @@ walk AS (
                 FROM objects o
                 WHERE o.bucket_id = p.bucket_id
                   AND o.deleted_at IS NULL
+                  AND (p.prefix IS NULL OR o.object_key LIKE p.prefix || '%')
+                  AND o.object_key >= w.next_boundary
                 UNION ALL
                 SELECT n.object_key, o.object_id, o.current_object_version
                 FROM object_names n
                 JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
                 WHERE n.bucket_id = p.bucket_id
+                  AND (p.prefix IS NULL OR n.object_key LIKE p.prefix || '%')
+                  AND n.object_key >= w.next_boundary
             ) k
             WHERE (p.prefix IS NULL OR k.object_key LIKE p.prefix || '%')
               AND k.object_key >= w.next_boundary

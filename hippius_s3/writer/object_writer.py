@@ -1019,7 +1019,7 @@ class ObjectWriter:
             """
             SELECT o.object_id, o.current_object_version AS cov
             FROM objects o
-            WHERE o.bucket_id = $1 AND o.object_key = $2
+            WHERE o.object_id = resolve_object_id($1::uuid, $2)
             """,
             bucket_id,
             object_key,

@@ -13,11 +13,13 @@ FROM (
     FROM objects o
     WHERE o.bucket_id = $1
       AND o.deleted_at IS NULL
+      AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
     UNION ALL
     SELECT o.object_id, n.bucket_id, n.object_key, o.current_object_version, n.created_at
     FROM object_names n
     JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
     WHERE n.bucket_id = $1
+      AND ($2::text IS NULL OR n.object_key LIKE $2::text || '%')
 ) o
 JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
 JOIN buckets b ON o.bucket_id = b.bucket_id

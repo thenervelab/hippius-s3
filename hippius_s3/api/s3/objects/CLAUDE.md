@@ -60,7 +60,7 @@ Since the writer trusts the DB-returned object_id ([object_writer.py:222-227](..
 
 [copy_object_endpoint.py](copy_object_endpoint.py) branches:
 
-- **Same bucket** → extra name on the source `object_id` (`object_names` + `handle_same_bucket_copy`). Ciphertext AAD binds `bucket_id`+`object_id`, so CopyObject cannot allocate a new id. Harbor blob commit is Copy + Delete of `_uploads/…` → `blobs/sha256/…`; Delete of the primary name promotes the alias. Do not re-enable [../../../services/copy_service_v5.py `execute_v5_fast_path_copy`](../../../services/copy_service_v5.py) — CID reuse onto a new `object_id` is not decryptable.
+- **Same bucket** → extra name on the source `object_id` (`object_names` + `handle_same_bucket_copy`). Does not rewrap the DEK, does not rewrite chunks. v5 AAD is `bucket_id`+`object_id`; a new id cannot decrypt. Harbor blob commit is Copy + Delete of `_uploads/…` → `blobs/sha256/…`; Delete of the primary promotes the alias. Do not re-enable [../../../services/copy_service_v5.py `execute_v5_fast_path_copy`](../../../services/copy_service_v5.py).
 - Dest is already a live primary of a *different* object, or **cross-bucket** → **streaming fallback** via `handle_streaming_copy` in [../copy_helpers.py](../copy_helpers.py). Full decrypt + re-encrypt.
 
 See [todo.md](../../../../todo.md) P1.

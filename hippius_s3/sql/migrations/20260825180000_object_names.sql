@@ -1,12 +1,6 @@
 -- migrate:up
---
--- Second S3 names for one object_id. Ciphertext AAD binds bucket_id+object_id, so a
--- same-bucket CopyObject cannot allocate a new object_id (the disabled v5 CID-reuse
--- path). Harbor's blob commit is CopyObject + DeleteObject of _uploads/... ->
--- blobs/sha256/...; an alias makes that metadata-only.
---
--- objects.object_key remains the primary name. object_names holds extra keys.
--- resolve_object_id prefers the primary name when both would match (they should not).
+-- Extra S3 keys for one object_id. v5 AAD binds bucket_id+object_id, so CopyObject
+-- cannot mint a new id.
 
 CREATE TABLE IF NOT EXISTS object_names (
     bucket_id uuid NOT NULL REFERENCES buckets (bucket_id) ON DELETE CASCADE,

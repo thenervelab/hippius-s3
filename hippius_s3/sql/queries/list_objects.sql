@@ -21,11 +21,17 @@ FROM (
     FROM objects o
     WHERE o.bucket_id = $1
       AND o.deleted_at IS NULL
+      AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
+      AND ($3::text IS NULL OR o.object_key >= $3::text)
+      AND ($5::text IS NULL OR o.object_key < $5::text COLLATE "C")
     UNION ALL
     SELECT o.object_id, n.object_key, n.created_at, o.current_object_version, n.bucket_id
     FROM object_names n
     JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
     WHERE n.bucket_id = $1
+      AND ($2::text IS NULL OR n.object_key LIKE $2::text || '%')
+      AND ($3::text IS NULL OR n.object_key >= $3::text)
+      AND ($5::text IS NULL OR n.object_key < $5::text COLLATE "C")
 ) o,
      LATERAL (
          -- Skip incomplete multipart placeholders (InitiateMultipartUpload without Complete)

@@ -21,13 +21,14 @@ class ACLRepository:
 
     async def _get_object_id(self, bucket_name: str, object_key: str) -> Optional[str]:
         query = """
-        SELECT o.object_id
-        FROM objects o
-        JOIN buckets b ON o.bucket_id = b.bucket_id
-        WHERE b.bucket_name = $1 AND o.object_key = $2 AND b.deleted_at IS NULL
+        SELECT resolve_object_id(b.bucket_id, $2) AS object_id
+        FROM buckets b
+        WHERE b.bucket_name = $1 AND b.deleted_at IS NULL
         """
         row = await self.db.fetchrow(query, bucket_name, object_key)
-        return str(row["object_id"]) if row else None
+        if row is None or row["object_id"] is None:
+            return None
+        return str(row["object_id"])
 
     async def get_bucket_acl_by_id(self, bucket_id: str) -> Optional[ACL]:
         query = """
@@ -114,7 +115,9 @@ class ACLRepository:
         FROM object_acls oa
         JOIN objects o ON oa.object_id = o.object_id
         JOIN buckets b ON o.bucket_id = b.bucket_id
-        WHERE b.bucket_name = $1 AND o.object_key = $2 AND b.deleted_at IS NULL
+        WHERE b.bucket_name = $1
+          AND b.deleted_at IS NULL
+          AND o.object_id = resolve_object_id(b.bucket_id, $2)
         """
         row = await self.db.fetchrow(query, bucket_name, object_key)
         if not row:
@@ -201,9 +204,10 @@ class ACLRepository:
     async def object_exists(self, bucket_name: str, object_key: str) -> bool:
         """Check if an object exists in the database."""
         query = """
-        SELECT 1 FROM objects o
-        JOIN buckets b ON o.bucket_id = b.bucket_id
-        WHERE b.bucket_name = $1 AND o.object_key = $2 AND b.deleted_at IS NULL
+        SELECT 1 FROM buckets b
+        WHERE b.bucket_name = $1
+          AND b.deleted_at IS NULL
+          AND resolve_object_id(b.bucket_id, $2) IS NOT NULL
         LIMIT 1
         """
         row = await self.db.fetchrow(query, bucket_name, object_key)

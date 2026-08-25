@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import asyncpg
 from fastapi import Request
 from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
@@ -111,9 +112,26 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
 
             try:
                 kind = await drop_s3_name(db, str(bucket_id), key)
+            except asyncpg.UniqueViolationError:
+                logger.exception("drop_s3_name name conflict for key %s", key)
+                errors_list.append(
+                    {
+                        "Key": key,
+                        "Code": "InternalError",
+                        "Message": "Name conflict while deleting",
+                    }
+                )
+                continue
             except Exception:
                 logger.exception("drop_s3_name failed for key %s", key)
-                kind = "last"
+                errors_list.append(
+                    {
+                        "Key": key,
+                        "Code": "InternalError",
+                        "Message": "Delete failed",
+                    }
+                )
+                continue
 
             if kind in {"alias", "promoted"}:
                 deleted_keys.append(key)

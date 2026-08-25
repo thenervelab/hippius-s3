@@ -17,7 +17,7 @@ Logical objects. Points at `current_object_version` for the serve-able row. `obj
 
 ### `object_names`
 
-Extra S3 keys for the same `object_id` (same-bucket CopyObject). Ciphertext AAD binds `bucket_id`+`object_id`, so CopyObject cannot mint a new id. `resolve_object_id(bucket_id, key)` prefers `objects.object_key` then this table. Delete of the primary name promotes one alias.
+Extra S3 keys for the same `object_id` (same-bucket CopyObject). Ciphertext AAD binds `bucket_id`+`object_id`, so CopyObject cannot mint a new id. `resolve_object_id(bucket_id, key)` prefers `objects.object_key` then this table. Delete of the primary name promotes one alias (`promote_object_name` relocates a soft-deleted occupant of dest). Triggers reject a live primary and an alias sharing a key.
 
 ### `object_versions`
 

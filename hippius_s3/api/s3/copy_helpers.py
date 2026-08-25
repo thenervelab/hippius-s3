@@ -110,12 +110,12 @@ async def handle_same_bucket_copy(
     src_obj_row: Any,
     copy_created_at: datetime,
 ) -> Response | None:
-    """Metadata CopyObject: extra name on the source object_id.
+    """Second S3 name on src object_id. DEK/AAD/chunks are not rewritten.
 
-    Returns None when dest is a live primary of a different object (overwrite
-    needs the streaming path). Same-bucket Harbor Move always hits this.
+    Returns None when dest is a live primary of a different object (stream).
     """
     src_id = str(src_obj_row["object_id"])
+    etag = str(src_obj_row.get("md5_hash") or "")
     live = await db.fetchrow(
         get_query("get_live_object_id_by_key"),
         dest_bucket_id,
@@ -123,18 +123,17 @@ async def handle_same_bucket_copy(
     )
     if live is not None:
         if str(live["object_id"]) == src_id:
-            etag = str(src_obj_row.get("md5_hash") or "")
             return build_copy_success_response(etag, copy_created_at)
         return None
 
-    await db.fetchrow(
+    inserted = await db.fetchrow(
         get_query("insert_object_name"),
         dest_bucket_id,
         dest_key,
         src_id,
     )
-    logger.info("CopyObject using object_names alias (same-bucket, no byte copy)")
-    etag = str(src_obj_row.get("md5_hash") or "")
+    if inserted is None:
+        return None
     return build_copy_success_response(etag, copy_created_at)
 
 
