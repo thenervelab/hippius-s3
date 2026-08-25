@@ -447,6 +447,7 @@ class ObjectWriter:
             chunk_size=chunk_size,
             num_chunks=int(num_chunks),
             plain_size=int(total_size),
+            cipher_sizes=list(chunk_cipher_sizes),
         )
 
         # TAIL scope: finalize the version (size/md5 makes it serveable), create the upload row,
@@ -830,6 +831,7 @@ class ObjectWriter:
                 chunk_size=chunk_size,
                 num_chunks=int(next_chunk_index),
                 plain_size=int(total_size),
+                cipher_sizes=list(chunk_cipher_sizes),
             )
             published = True
         finally:
