@@ -11,3 +11,8 @@ data:
   # #279's code lands. Flip to "false" to disable before this promotes to prod if the
   # staging trial regresses (see the lost fast-fail-503 caveat in the #279 review).
   HIPPIUS_STREAM_SINGLE_SUBSCRIPTION: "true"
+  # Harbor unique 1 GiB (2026-08-25): 4 workers left 16 concurrent 64 MiB digest
+  # PUTs sharing 8 event loops; mpu_part stream sat idle 8-10s. 8 workers made
+  # stream max 863ms. Pool 8 keeps 8*8*2 pods = 128 under staging PG 200.
+  UVICORN_WORKERS: "8"
+  API_DB_POOL_MAX_SIZE: "8"

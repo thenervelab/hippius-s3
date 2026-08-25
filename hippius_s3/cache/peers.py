@@ -217,6 +217,35 @@ def fresh_part_key(object_id: str, object_version: int, part_number: int) -> str
     return f"{_FRESH_PART_KEY_PREFIX}{object_id}:{int(object_version)}:{int(part_number)}"
 
 
+def encode_fresh_part(node_name: str, cipher_sizes: list[int] | None) -> str:
+    """Redis payload: JSON with per-chunk cipher sizes, or the legacy bare node name.
+
+    The GET of a just-written object (Harbor `startedat`) lands on the other api-local
+    before postgres `part_chunks` is visible — replica lag, or write_meta before the
+    tail transaction. Without sizes in the hint, the fetcher sheds `unknown_size` and
+    a 30s positive memo then waits out drain-to-pool (~14s).
+    """
+    if not cipher_sizes:
+        return node_name
+    return json.dumps(
+        {"n": node_name, "s": [int(s) for s in cipher_sizes]},
+        separators=(",", ":"),
+    )
+
+
+def decode_fresh_part(raw: str) -> tuple[str, dict[int, int]]:
+    """`(node_name, {chunk_index: cipher_size})`. A bare node name is the #448 payload."""
+    if not raw.startswith("{"):
+        return raw, {}
+    try:
+        payload = json.loads(raw)
+        node = str(payload["n"])
+        sizes = payload.get("s") or []
+    except (ValueError, KeyError, TypeError):
+        return raw, {}
+    return node, {i: int(s) for i, s in enumerate(sizes)}
+
+
 def set_active_registry(registry: Optional[PeerRegistry]) -> None:
     """Install the process-wide registry so the write path can stamp a fresh-part owner.
 
@@ -304,17 +333,24 @@ class PeerRegistry:
             return None
         return url
 
-    async def remember_part(self, object_id: str, object_version: int, part_number: int) -> None:
+    async def remember_part(
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        cipher_sizes: list[int] | None = None,
+    ) -> None:
         """Record that THIS node just ingested the part. Best-effort; never raises.
 
         Drain has not claimed `cephor_replication_status` yet, so postgres resolve is empty.
         A GET that lands on another api-local in that window uses `lookup_fresh_part` to find
-        us instead of waiting for the pool copy.
+        us instead of waiting for the pool copy. `cipher_sizes` (index = chunk_index) lets
+        that GET skip postgres `part_chunks`, which is not yet visible in the same window.
         """
         try:
             await self._redis.set(
                 fresh_part_key(object_id, object_version, part_number),
-                self._node_name,
+                encode_fresh_part(self._node_name, cipher_sizes),
                 ex=_FRESH_PART_TTL_SECONDS,
             )
         except Exception as exc:  # noqa: BLE001 - a missed hint costs pool latency, not the PUT
@@ -326,10 +362,13 @@ class PeerRegistry:
                 exc,
             )
 
-    async def lookup_fresh_part(self, object_id: str, object_version: int, part_number: int) -> Optional[str]:
-        """The ingest node of a not-yet-claimed part, or None.
+    async def lookup_fresh_part(
+        self, object_id: str, object_version: int, part_number: int
+    ) -> Optional[tuple[str, dict[int, int]]]:
+        """`(ingest_node, cipher_sizes)` of a not-yet-claimed part, or None.
 
         Excludes this node: the local tier already missed, so fetching ourselves is wasted.
+        `cipher_sizes` is empty when the writer stored the legacy bare node name.
         """
         try:
             raw = await self._redis.get(fresh_part_key(object_id, object_version, part_number))
@@ -340,10 +379,10 @@ class PeerRegistry:
             return None
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode()
-        node = str(raw)
+        node, sizes = decode_fresh_part(str(raw))
         if not node or node == self._node_name:
             return None
-        return node
+        return node, sizes
 
 
 class PeerChunkFetcher:
@@ -498,6 +537,21 @@ class PeerChunkFetcher:
         sizes = row["cipher_sizes"] or []
         return {int(i): int(s) for i, s in zip(indexes, sizes, strict=False)}
 
+    async def _uncached_owner(
+        self, object_id: str, object_version: int, part_number: int
+    ) -> tuple[Optional[str], dict[int, int], bool]:
+        """Who holds the part, its cipher sizes, and whether that came from the Redis hint."""
+        owner, sizes = await self._resolve_part(object_id, object_version, part_number)
+        if owner is not None:
+            return owner, sizes, False
+        hinted = await self._registry.lookup_fresh_part(object_id, object_version, part_number)
+        if hinted is None:
+            return None, {}, False
+        node, hinted_sizes = hinted
+        if not hinted_sizes:
+            hinted_sizes = await self._chunk_sizes(object_id, object_version, part_number)
+        return node, hinted_sizes, True
+
     async def __call__(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
     ) -> Optional[bytes]:
@@ -509,32 +563,25 @@ class PeerChunkFetcher:
         """
         part_key = (str(object_id), int(object_version), int(part_number))
         cached = self._owner_url.get(part_key)
+        from_fresh_hint = False
         if cached is not None:
             base, sizes = cached
         else:
-            owner, sizes = await self._resolve_part(object_id, object_version, part_number)
-            if owner is None:
-                owner = await self._registry.lookup_fresh_part(object_id, object_version, part_number)
-                if owner is not None:
-                    sizes = await self._chunk_sizes(object_id, object_version, part_number)
+            owner, sizes, from_fresh_hint = await self._uncached_owner(object_id, object_version, part_number)
             base = await self._registry.resolve(owner) if owner is not None else None
-            if base is None:
-                # No peer to fetch from, so the sizes are dead weight in a memo bounded by
-                # entries rather than by bytes. Dropping them keeps a pool-only part's entry as
-                # cheap as it was before the size check existed.
-                sizes = {}
-                # Short TTL: a just-written part becomes resolvable once drain claims or the
-                # fresh-part hint lands. A 30s negative memo made Harbor blob-commit GETs wait
-                # out drain-to-pool (5-9s) instead of the next 1s wait_for_chunk poll.
+            if base is None or not sizes:
+                # No peer, or we found the ingest node but not per-chunk sizes (postgres
+                # replica lag / write_meta before the tail txn). A 30s positive memo of
+                # empty sizes made Harbor startedat GETs wait out drain-to-pool (~14s).
                 self._owner_url.put(
                     part_key,
-                    (base, sizes),
+                    (None, {}),
                     ttl_seconds=_NEGATIVE_OWNER_MEMO_TTL_SECONDS,
                 )
-            else:
-                # Paired with the base so a cached "no peer" (None) is distinguishable from a
-                # cache miss — otherwise every pool-only part would re-query on every chunk.
-                self._owner_url.put(part_key, (base, sizes))
+                return None
+            # Paired with the base so a cached "no peer" (None) is distinguishable from a
+            # cache miss — otherwise every pool-only part would re-query on every chunk.
+            self._owner_url.put(part_key, (base, sizes))
         if base is None:
             return None
 
@@ -590,7 +637,11 @@ class PeerChunkFetcher:
             # A deadline expiry is poisoned on the same grounds: a peer that drips is as useless
             # as one that refuses, and paying the full deadline once per chunk is the worst of
             # both tiers.
-            self._owner_url.put(part_key, (None, {}))
+            #
+            # Fresh-hinted parts are the exception: the peer SSD is the ONLY copy until drain
+            # replicates. A 30s poison there made Harbor startedat wait ~14s for the pool.
+            poison_ttl = _NEGATIVE_OWNER_MEMO_TTL_SECONDS if from_fresh_hint else None
+            self._owner_url.put(part_key, (None, {}), ttl_seconds=poison_ttl)
             logger.debug("peer fetch to %s failed, falling through to the pool: %s", base, exc)
             return None
 
