@@ -13,6 +13,7 @@ from opentelemetry import trace
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.common import apply_response_overrides
+from hippius_s3.api.s3.common import body_blake3_headers
 from hippius_s3.api.s3.common import if_none_match_matches
 from hippius_s3.api.s3.common import parse_response_overrides
 from hippius_s3.repositories.objects import ObjectRepository
@@ -254,16 +255,10 @@ async def handle_head_object(
         # A DIFFERENT value from the header above, deliberately, and the two must not be conflated:
         #   X-Hippius-Arion-File-Hash  chunk_backend.backend_identifier — Arion's id for the first
         #                              ENCRYPTED chunk. Says where the bytes live on the backend.
-        #   X-Hippius-Body-Blake3      BLAKE3 of the PLAINTEXT, computed in flight on the write
-        #                              path. Says what the object contains, and is what ListObjects
-        #                              surfaces in Owner.ID.
-        # Scope differs by upload path and is not derivable from the header alone: a simple PUT
-        # digests the whole body, a multipart digests only the first HIPPIUS_CHUNK_SIZE_BYTES of
-        # part 1, and an S4 append leaves the value describing the pre-append content. Treat it as
-        # an identifier for display, not as something to verify bytes against.
-        body_blake3 = row.get("body_blake3")
-        if body_blake3:
-            headers["X-Hippius-Body-Blake3"] = body_blake3
+        #   X-Hippius-Body-Blake3      BLAKE3 of the PLAINTEXT. Says what the object contains, and
+        #                              is what ListObjects surfaces in Owner.ID.
+        # The paired -Scope header states which bytes the digest covers; see body_blake3_headers.
+        headers.update(body_blake3_headers(row))
 
         # Append version header if present. HD-3: the download query's outer SELECT now returns
         # append_version, so no fallback JOIN is needed.

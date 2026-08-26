@@ -49,8 +49,18 @@ DIGEST_QUERIES = [
 async def seeded() -> AsyncGenerator[tuple[asyncpg.Connection, dict], None]:
     try:
         conn = await asyncpg.connect(_DB_URL)
-    except Exception as exc:  # noqa: BLE001 - integration tier skips when PG is absent
+    except OSError as exc:  # only an unreachable server is a legitimate skip
         pytest.skip(f"postgres unavailable: {exc}")
+
+    # A reachable-but-unmigrated database is NOT a skip. Skipping there reports "7 passed,
+    # 6 skipped" — a green run in which every DB assertion silently vanished, which is the same
+    # false-green that let the crash-looping e2e workers go unnoticed for months. Fail loudly.
+    if not await conn.fetchval(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'object_versions' AND column_name = 'body_blake3'"
+    ):
+        await conn.close()
+        pytest.fail("object_versions.body_blake3 is missing — run `python -m hippius_s3.scripts.migrate`")
 
     tx = conn.transaction()
     await tx.start()
