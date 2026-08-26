@@ -596,9 +596,16 @@ class FileSystemPartsStore:
     ) -> list[bool]:
         """Batch existence check for many chunks (stat-based, no Redis).
 
-        Groups checks by part_number so we only check meta.json once per part
-        instead of once per chunk. For a part with 100 chunks this is 1 meta
-        stat + 100 chunk stats instead of 100 meta stats + 100 chunk stats.
+        One directory scan per distinct part, not one stat per chunk. A single
+        `os.scandir` returns every `chunk_<i>.bin` in the part, so membership is a
+        set lookup — for a part with N chunks this is 1 readdir instead of N stats.
+        On the CephFS pool tier each stat is a serial MDS round trip, so the old
+        per-chunk sweep made read TTFB O(total_chunks) × MDS-latency: a single-part
+        5 GB object (~1250 chunks) took ~10-20s of pure stat before the first byte.
+        The scan preserves the exact semantics — a chunk counts as present iff the
+        part's `meta.json` exists AND its file is on disk (see `chunk_exists`), which
+        keeps the download-in-progress case correct (the downloader writes meta
+        eagerly, so meta-present does not imply all chunks present).
 
         Args:
             object_id: Object UUID
@@ -611,20 +618,39 @@ class FileSystemPartsStore:
         if not checks:
             return []
 
+        def _present_indices(part_dir: Path) -> set[int] | None:
+            """Chunk indices on disk for a complete part, or None if the part is not complete.
+
+            None = no `meta.json` (part not published / not yet known) → every chunk is absent.
+            A set = meta present; membership reflects the actual `chunk_<i>.bin` files, so a
+            chunk mid-download (meta written eagerly, file not yet landed) is correctly absent.
+            """
+            try:
+                entries = list(os.scandir(part_dir))
+            except FileNotFoundError:
+                return None
+            names = {e.name for e in entries}
+            if "meta.json" not in names:
+                return None
+            present: set[int] = set()
+            for name in names:
+                if not (name.startswith("chunk_") and name.endswith(".bin")):
+                    continue
+                try:
+                    present.add(int(name[len("chunk_") : -len(".bin")]))
+                except ValueError:
+                    continue  # .tmp / .staged files — not a published chunk
+            return present
+
         def _check_all() -> list[bool]:
-            meta_cache: dict[int, bool] = {}
+            scanned: dict[int, set[int] | None] = {}
             results: list[bool] = []
             for part_number, chunk_index in checks:
-                # Resolve meta presence once per distinct part
-                if part_number not in meta_cache:
+                if part_number not in scanned:
                     part_dir = Path(self.part_path(object_id, object_version, part_number))
-                    meta_cache[part_number] = self._meta_file(part_dir).exists()
-                if not meta_cache[part_number]:
-                    results.append(False)
-                    continue
-                part_dir = Path(self.part_path(object_id, object_version, part_number))
-                chunk_path = self._chunk_file(part_dir, chunk_index)
-                results.append(chunk_path.exists())
+                    scanned[part_number] = _present_indices(part_dir)
+                present = scanned[part_number]
+                results.append(present is not None and chunk_index in present)
             return results
 
         return await asyncio.to_thread(_check_all)

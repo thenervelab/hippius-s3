@@ -90,3 +90,66 @@ async def test_batch_missing_chunk_file_with_meta_present(tmp_path):
 
     result = await cache.chunks_exist_batch(OBJ, 1, [(1, 0), (1, 1), (1, 2), (1, 3), (1, 4)])
     assert result == [True, False, True, False, False]
+
+
+@pytest.mark.asyncio
+async def test_batch_ignores_staged_and_tmp_files(tmp_path):
+    """The scan must count only published `chunk_<i>.bin`, never .tmp/.staged siblings.
+
+    The write path leaves `chunk_<i>.bin.staged.<attempt>` and `<f>.tmp.<uuid>` files around;
+    a directory scan sees them, so the index parser must reject anything that isn't exactly
+    `chunk_<int>.bin` — otherwise a half-written chunk would read as present.
+    """
+    cache, fs = _make_cache(tmp_path)
+    await fs.set_meta(OBJ, 1, 1, chunk_size=4, num_chunks=3, size_bytes=12)
+    await fs.set_chunk(OBJ, 1, 1, 0, b"aaaa")
+    part_dir = Path(fs.part_path(OBJ, 1, 1))
+    # Sibling files that must NOT be parsed as chunk 1 or chunk 2.
+    (part_dir / "chunk_1.bin.staged.3").write_bytes(b"bbbb")
+    (part_dir / "chunk_2.bin.tmp.abcd").write_bytes(b"cccc")
+
+    result = await cache.chunks_exist_batch(OBJ, 1, [(1, 0), (1, 1), (1, 2)])
+    assert result == [True, False, False]
+
+
+@pytest.mark.asyncio
+async def test_batch_large_single_part_all_present(tmp_path):
+    """A single part with many chunks resolves in one scan — the TTFB-anomaly shape.
+
+    A 5 GB single-part object is ~1250 chunks in one part dir; this is the case the old
+    per-chunk stat loop turned into ~1250 serial stats. One scandir must return them all.
+    """
+    cache, fs = _make_cache(tmp_path)
+    n = 400
+    for i in range(n):
+        await fs.set_chunk(OBJ, 1, 1, i, b"x")
+    await fs.set_meta(OBJ, 1, 1, chunk_size=1, num_chunks=n, size_bytes=n)
+
+    checks = [(1, i) for i in range(n)]
+    result = await cache.chunks_exist_batch(OBJ, 1, checks)
+    assert result == [True] * n
+
+
+@pytest.mark.asyncio
+async def test_batch_scans_each_part_once(tmp_path, monkeypatch):
+    """One scandir per distinct part, regardless of how many chunks are checked in it."""
+    import hippius_s3.cache.fs_store as fs_mod
+
+    cache, fs = _make_cache(tmp_path)
+    await _prepare_part(fs, part_number=1, num_chunks=5)
+    await _prepare_part(fs, part_number=2, num_chunks=5)
+
+    calls: list[str] = []
+    real_scandir = fs_mod.os.scandir
+
+    def counting_scandir(path):
+        calls.append(str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(fs_mod.os, "scandir", counting_scandir)
+
+    checks = [(1, i) for i in range(5)] + [(2, i) for i in range(5)]
+    result = await cache.chunks_exist_batch(OBJ, 1, checks)
+    assert result == [True] * 10
+    # 10 chunk checks across 2 parts must cost exactly 2 directory scans, not 10.
+    assert len(calls) == 2, f"expected 2 scandir calls (one per part), got {len(calls)}"
