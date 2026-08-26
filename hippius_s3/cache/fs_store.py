@@ -9,6 +9,7 @@ they write them here (not to Redis) for the streamer to read.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import fcntl
 import json
@@ -38,7 +39,13 @@ logger = logging.getLogger(__name__)
 #
 # Sizing it here is also what makes the bound PROCESS-wide. A per-request semaphore only bounds one
 # request: N concurrent multi-part GETs would still demand N x limit threads. max_workers is the
-# real ceiling on how many metadata ops this process can have in flight against a shared MDS.
+# real ceiling on how many metadata ops this process has in flight at once.
+#
+# That ceiling is about THIS PROCESS, not about the storage tier. Measured from an api-local pod,
+# cold readdir p50 against the pool is flat from 1-way to 64-way concurrency and one client
+# sustained several times the whole cluster's baseline metadata rate without moving p90 — and this
+# method does not change how much metadata work is done, only when. Size it for how many threads a
+# stalled tier may park here, not for what the MDS can take.
 # Module-level rather than per-instance on purpose: DualFileSystemPartsStore holds two of these
 # stores (local primary + pool fallback) and both inherit this method, so per-instance pools would
 # quietly double the ceiling.
@@ -71,6 +78,18 @@ def _scan_pool() -> ThreadPoolExecutor:
         _SCAN_POOL_SIZE = max(1, int(get_config().fs_store_scan_concurrency))
         _SCAN_POOL = ThreadPoolExecutor(max_workers=_SCAN_POOL_SIZE, thread_name_prefix="fs-scan")
     return _SCAN_POOL
+
+
+@atexit.register
+def _shutdown_scan_pool() -> None:
+    """Release the pool without waiting. Mirrors crypto_pool's registration, for the same reason.
+
+    `concurrent.futures.thread._python_exit` JOINS every worker at interpreter exit, so without
+    this a readdir hung on a stalled mount blocks the process AFTER uvicorn has finished draining
+    — past the point UVICORN_GRACEFUL_TIMEOUT can help, and into the kubelet's SIGKILL.
+    """
+    if _SCAN_POOL is not None:
+        _SCAN_POOL.shutdown(wait=False)
 
 
 def _reset_scan_pool_for_tests() -> None:
@@ -726,29 +745,40 @@ class FileSystemPartsStore:
         loop = asyncio.get_running_loop()
         pool = _scan_pool()
 
-        # TWO bounds, and they do different jobs — neither alone is enough.
-        #
-        # The pool's max_workers caps what this PROCESS puts on the MDS at once. The semaphore caps
-        # what ONE REQUEST may have queued in it. Without the semaphore, `gather` submits every part
-        # immediately and the pool's queue is unbounded FIFO with no fairness: a 2000-part GET puts
-        # 2000 jobs in front of the single job belonging to a 4 KB object that arrives a moment
-        # later, so the small read waits out ~2000/max_workers readdirs. Measured on a local FS that
-        # turned a 0.13 ms neighbour read into 143 ms; at the pool tier's 6.3 ms readdir it is worth
-        # ~0.8 s, and ~4 s for a 10,000-part object. That is the very latency this method exists to
-        # remove, moved onto whoever reads alongside a large object.
-        sem = asyncio.Semaphore(_scan_pool_size())
+        if len(distinct_parts) == 1:
+            # 93% of production GETs are a single part. One scan needs neither the gather nor the
+            # semaphore, and taking exactly one worker keeps it out of the fan-out's way.
+            only = distinct_parts[0]
+            scanned = {only: await loop.run_in_executor(pool, _scan, only)}
+        else:
+            # TWO bounds doing different jobs. max_workers caps what this PROCESS puts on the
+            # storage tier; the semaphore caps how much of that one REQUEST may hold.
+            #
+            # The second is about FAULT ISOLATION, not metadata-server tolerance. Measured from an
+            # api-local pod against the pool tier, cold readdir p50 is flat from 1-way to 64-way
+            # concurrency (26.6ms -> 20.7ms) and a single client sustained 1817/s against a cluster
+            # baseline of 236-764/s — and the total metadata work is unchanged by this method
+            # anyway, only its distribution in time. The MDS is not the constraint.
+            #
+            # What matters is that a request whose scans hang on a stalled tier holds those workers
+            # for the duration. At the full pool width, ONE such request owns every worker and
+            # blocks presence checks for objects sitting entirely on healthy local flash — the
+            # local tier and the pool tier share this executor. A quarter keeps ~79% of the cold
+            # win (78 parts: 2075ms serial -> 532ms at 4-wide vs 133ms at 16-wide) for a quarter of
+            # the blast radius, and gives up ~7ms on a warm read, which is the common case.
+            sem = asyncio.Semaphore(max(1, _scan_pool_size() // 4))
 
-        async def _scan_bounded(part_number: int) -> set[int] | None:
-            async with sem:
-                return await loop.run_in_executor(pool, _scan, part_number)
+            async def _scan_bounded(part_number: int) -> set[int] | None:
+                async with sem:
+                    return await loop.run_in_executor(pool, _scan, part_number)
 
-        scanned = dict(
-            zip(
-                distinct_parts,
-                await asyncio.gather(*(_scan_bounded(pn) for pn in distinct_parts)),
-                strict=True,
+            scanned = dict(
+                zip(
+                    distinct_parts,
+                    await asyncio.gather(*(_scan_bounded(pn) for pn in distinct_parts)),
+                    strict=True,
+                )
             )
-        )
 
         results: list[bool] = []
         for part_number, chunk_index in checks:

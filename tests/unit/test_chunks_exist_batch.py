@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 from pathlib import Path
 
@@ -325,3 +326,62 @@ class TestScanPoolBounds:
         monkeypatch.setattr(fs_mod.os, "scandir", counting)
         assert await cache.chunks_exist_batch(OBJ, 1, [(1, i) for i in range(50)]) == [True] * 50
         assert len(calls) == 1
+
+
+class TestStalledTierIsolation:
+    """A request stalled on one tier must not block reads that never needed that tier.
+
+    Structural, not timing-based: the stalled scans are held on an Event and only released after
+    the assertion, so this fails deterministically rather than flakily if the per-request cap is
+    ever widened back to the full pool.
+
+    The scenario is the real one. `DualFileSystemPartsStore`'s primary (node-local flash) and
+    fallback (shared pool) share this executor, so a multipart read whose fallback wave hangs on a
+    stalled mount holds workers that a completely healthy local-tier read still needs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_multipart_scan_leaves_workers_for_a_healthy_read(self, tmp_path, monkeypatch):
+        import asyncio
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        import hippius_s3.cache.fs_store as fs_mod
+
+        workers, stalled_parts = 8, 8  # a request big enough to want the whole pool
+        cache, fs = _make_cache(tmp_path)
+        for p in range(1, stalled_parts + 1):
+            await _prepare_part(fs, part_number=p, num_chunks=1)
+        healthy_part = stalled_parts + 1
+        await _prepare_part(fs, part_number=healthy_part, num_chunks=1)
+
+        release = threading.Event()
+        real_scandir = fs_mod.os.scandir
+
+        def stall_the_big_parts(path):
+            if not str(path).endswith(f"part_{healthy_part}"):
+                release.wait(timeout=10)  # the stalled tier
+            return real_scandir(path)
+
+        monkeypatch.setattr(fs_mod.os, "scandir", stall_the_big_parts)
+        fs_mod._reset_scan_pool_for_tests()
+        fs_mod._SCAN_POOL = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="fs-scan-test")
+        fs_mod._SCAN_POOL_SIZE = workers
+        try:
+            stalled = asyncio.create_task(
+                cache.chunks_exist_batch(OBJ, 1, [(p, 0) for p in range(1, stalled_parts + 1)])
+            )
+            await asyncio.sleep(0.05)  # let it claim its share
+
+            # The healthy read touches one part that is NOT stalled. With a per-request cap below
+            # the pool width there is a free worker for it; at full width there is not.
+            healthy = await asyncio.wait_for(
+                cache.chunks_exist_batch(OBJ, 1, [(healthy_part, 0)]),
+                timeout=2.0,
+            )
+            assert healthy == [True]
+        finally:
+            release.set()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(stalled, timeout=5)
+            fs_mod._reset_scan_pool_for_tests()
