@@ -107,13 +107,24 @@ data:
   OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: "cumulative"
   HIPPIUS_OBJECT_CACHE_FALLBACK_DIR: ""
   # Part-directory scans in flight per api process, for the read path's chunk-presence check.
-  # Surfaced here for the same reason as HIPPIUS_JANITOR_WALK_CONCURRENCY: it presses on the
-  # shared CephFS MDS, and this repo manifest-manages that class of knob rather than leaving it
-  # to a code default (see the janitor block in workers-deployments.yaml).
-  # CAUTION: unlike the janitor's single walker, this one is per uvicorn worker across the whole
-  # api fleet, so the fleet-wide ceiling is this x workers x pods. 16 is carried over from the
-  # janitor's measured-safe crawl and is NOT yet validated at that multiplicity — raise only
-  # while watching MDS req/s and read latency.
-  HIPPIUS_FS_STORE_SCAN_CONCURRENCY: "16"
+  # Surfaced here for the same reason as HIPPIUS_JANITOR_WALK_CONCURRENCY: it touches the shared
+  # CephFS MDS, and this repo manifest-manages that class of knob rather than leaving it to a
+  # code default (see the janitor block in workers-deployments.yaml).
+  #
+  # 64 is the top of the range measured from an api-local pod: cold readdir p50 held flat from
+  # 1-way to 64-way (26.6ms -> 20.7ms) while throughput scaled 38/s -> 1817/s, against a cluster
+  # baseline of 236-764 MDS reqs/s and an MDS with no CPU limit idling at 0.45 cores. Note the
+  # method does not change how much metadata work happens, only when — so this governs burst
+  # shape, not offered load.
+  # What a scan actually consumes, measured on an api-local pod: 24 KiB of thread RSS, and one
+  # file descriptor held only for the readdir. At 64 that is ~1.5 MiB per worker against 0.82 GiB
+  # of process RSS, 64 of 1048576 fds, and 256 of 309015 pids — none of those is the limit. (The
+  # pod's memory.current reads ~85% of its 8 GiB, but that is almost all reclaimable page cache
+  # from chunk IO; resident process memory is under a gigabyte.)
+  # CAUTION: unlike the janitor's single walker this is per uvicorn worker, so the fleet ceiling
+  # is this x workers x pods (64 x 4 x 5 = 1280). That multiplicity is above anything measured;
+  # a single request is separately capped at a quarter of the pool, but if MDS req/s or read
+  # latency move after this ships, this is the first number to walk back.
+  HIPPIUS_FS_STORE_SCAN_CONCURRENCY: "64"
   SENTRY_DSN: ""
   SENTRY_TRACES_SAMPLE_RATE: "0.1"
