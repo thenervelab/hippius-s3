@@ -596,16 +596,22 @@ class FileSystemPartsStore:
     ) -> list[bool]:
         """Batch existence check for many chunks (stat-based, no Redis).
 
-        One directory scan per distinct part, not one stat per chunk. A single
-        `os.scandir` returns every `chunk_<i>.bin` in the part, so membership is a
-        set lookup — for a part with N chunks this is 1 readdir instead of N stats.
-        On the CephFS pool tier each stat is a serial MDS round trip, so the old
-        per-chunk sweep made read TTFB O(total_chunks) × MDS-latency: a single-part
-        5 GB object (~1250 chunks) took ~10-20s of pure stat before the first byte.
-        The scan preserves the exact semantics — a chunk counts as present iff the
-        part's `meta.json` exists AND its file is on disk (see `chunk_exists`), which
-        keeps the download-in-progress case correct (the downloader writes meta
-        eagerly, so meta-present does not imply all chunks present).
+        One directory scan per distinct part, not one stat per chunk, and the parts are
+        scanned CONCURRENTLY. A single `os.scandir` returns every `chunk_<i>.bin` in the
+        part, so membership is a set lookup — for a part with N chunks this is 1 readdir
+        instead of N stats.
+
+        Both halves matter because on the CephFS pool tier every metadata op is a serial
+        MDS round trip (measured on prod: 6.3ms median, 15ms p90). This check gates TTFB,
+        so a serial per-chunk sweep made it O(total_chunks) × MDS-latency — ~1250 stats
+        ≈ 10s before the first byte on a 5 GB object. Scanning per-part alone leaves
+        O(parts) serial round trips, which is still ~0.5s for a 78-part multipart object;
+        fanning the scans out bounds it at roughly ceil(parts / concurrency) round trips.
+
+        Semantics are unchanged by either half: a chunk counts as present iff the part's
+        `meta.json` exists AND its file is on disk (see `chunk_exists`). That keeps the
+        download-in-progress case correct — the downloader writes meta eagerly, so
+        meta-present does not imply all chunks present.
 
         Args:
             object_id: Object UUID
@@ -642,18 +648,45 @@ class FileSystemPartsStore:
                     continue  # .tmp / .staged files — not a published chunk
             return present
 
-        def _check_all() -> list[bool]:
-            scanned: dict[int, set[int] | None] = {}
-            results: list[bool] = []
-            for part_number, chunk_index in checks:
-                if part_number not in scanned:
-                    part_dir = Path(self.part_path(object_id, object_version, part_number))
-                    scanned[part_number] = _present_indices(part_dir)
-                present = scanned[part_number]
-                results.append(present is not None and chunk_index in present)
-            return results
+        def _scan(part_number: int) -> set[int] | None:
+            return _present_indices(Path(self.part_path(object_id, object_version, part_number)))
 
-        return await asyncio.to_thread(_check_all)
+        # dict.fromkeys: distinct part numbers, first-seen order (deterministic scan order).
+        distinct_parts = list(dict.fromkeys(int(pn) for pn, _ in checks))
+
+        if len(distinct_parts) == 1:
+            # Single-part objects are the common case and gain nothing from a fan-out; keep
+            # them on one thread hop rather than paying gather + semaphore setup.
+            only = distinct_parts[0]
+            scanned = {only: await asyncio.to_thread(_scan, only)}
+        else:
+            # Deferred import: the cache package is imported from config's own dependency
+            # graph, so a module-level import here is circular (same reason object_parts.py
+            # defers it).
+            from hippius_s3.config import get_config
+
+            limit = max(1, int(get_config().fs_store_scan_concurrency))
+            sem = asyncio.Semaphore(limit)
+
+            async def _scan_bounded(part_number: int) -> set[int] | None:
+                # Bounded so a many-part object cannot fan thousands of concurrent readdirs
+                # at the MDS — the failure mode that would trade our latency win for theirs.
+                async with sem:
+                    return await asyncio.to_thread(_scan, part_number)
+
+            scanned = dict(
+                zip(
+                    distinct_parts,
+                    await asyncio.gather(*(_scan_bounded(pn) for pn in distinct_parts)),
+                    strict=True,
+                )
+            )
+
+        results: list[bool] = []
+        for part_number, chunk_index in checks:
+            present = scanned[int(part_number)]
+            results.append(present is not None and chunk_index in present)
+        return results
 
     async def touch_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> None:
         """Update atime/mtime of a chunk to mark it as recently accessed.

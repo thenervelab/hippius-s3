@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -153,3 +154,93 @@ async def test_batch_scans_each_part_once(tmp_path, monkeypatch):
     assert result == [True] * 10
     # 10 chunk checks across 2 parts must cost exactly 2 directory scans, not 10.
     assert len(calls) == 2, f"expected 2 scandir calls (one per part), got {len(calls)}"
+
+
+class TestParallelPartScans:
+    """Parts are scanned concurrently, but the result must stay positionally exact.
+
+    The scans are fanned out, so they complete out of order. Everything below pins the
+    properties that fan-out can break: ordering, the per-part scan count, the bound on
+    concurrency, and the single-part fast path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_result_order_survives_out_of_order_completion(self, tmp_path, monkeypatch):
+        """Interleaved parts + deliberately inverted scan latency must not reorder results."""
+        import hippius_s3.cache.fs_store as fs_mod
+
+        cache, fs = _make_cache(tmp_path)
+        # part 1 present, part 2 absent, part 3 present -> a distinctive expected pattern
+        await _prepare_part(fs, part_number=1, num_chunks=2)
+        await _prepare_part(fs, part_number=3, num_chunks=2)
+
+        real_scandir = fs_mod.os.scandir
+
+        def slow_for_low_parts(path):
+            # Make the FIRST-listed part the SLOWEST, so completion order inverts scan order.
+            if str(path).endswith("part_1"):
+                time.sleep(0.05)
+            return real_scandir(path)
+
+        monkeypatch.setattr(fs_mod.os, "scandir", slow_for_low_parts)
+
+        checks = [(1, 0), (2, 0), (3, 0), (1, 1), (3, 1), (2, 1)]
+        result = await cache.chunks_exist_batch(OBJ, 1, checks)
+        assert result == [True, False, True, True, True, False]
+
+    @pytest.mark.asyncio
+    async def test_single_part_takes_the_fast_path(self, tmp_path, monkeypatch):
+        """One distinct part must not pay gather/semaphore setup — still exactly one scan."""
+        import hippius_s3.cache.fs_store as fs_mod
+
+        cache, fs = _make_cache(tmp_path)
+        await _prepare_part(fs, part_number=1, num_chunks=50)
+
+        calls: list[str] = []
+        real_scandir = fs_mod.os.scandir
+
+        def counting(path):
+            calls.append(str(path))
+            return real_scandir(path)
+
+        monkeypatch.setattr(fs_mod.os, "scandir", counting)
+
+        result = await cache.chunks_exist_batch(OBJ, 1, [(1, i) for i in range(50)])
+        assert result == [True] * 50
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_scans_run_concurrently_and_stay_bounded(self, tmp_path, monkeypatch):
+        """Concurrency is real (>1 in flight) and never exceeds the configured limit."""
+        import threading
+
+        import hippius_s3.cache.fs_store as fs_mod
+        from hippius_s3.config import get_config
+
+        limit = int(get_config().fs_store_scan_concurrency)
+        cache, fs = _make_cache(tmp_path)
+        nparts = limit + 6
+        for p in range(1, nparts + 1):
+            await _prepare_part(fs, part_number=p, num_chunks=1)
+
+        lock = threading.Lock()
+        state = {"live": 0, "peak": 0}
+        real_scandir = fs_mod.os.scandir
+
+        def tracking(path):
+            with lock:
+                state["live"] += 1
+                state["peak"] = max(state["peak"], state["live"])
+            try:
+                time.sleep(0.02)  # hold the slot so overlap is observable
+                return real_scandir(path)
+            finally:
+                with lock:
+                    state["live"] -= 1
+
+        monkeypatch.setattr(fs_mod.os, "scandir", tracking)
+
+        result = await cache.chunks_exist_batch(OBJ, 1, [(p, 0) for p in range(1, nparts + 1)])
+        assert result == [True] * nparts
+        assert state["peak"] > 1, "scans did not run concurrently"
+        assert state["peak"] <= limit, f"concurrency {state['peak']} exceeded limit {limit}"

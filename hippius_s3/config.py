@@ -412,6 +412,12 @@ class Config:
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
     object_cache_fallback_dir: str = env("HIPPIUS_OBJECT_CACHE_FALLBACK_DIR:", convert=str)
+    # How many part directories `chunks_exist_batch` scans at once. That check gates read TTFB
+    # and, on the pool tier, every readdir is an MDS round trip (~6 ms), so scanning a
+    # multi-part object serially costs O(parts) x 6 ms before the first byte. Tunable rather
+    # than fixed because the ceiling is the MDS's tolerance, not ours: raising it shortens our
+    # TTFB and lengthens theirs, and the right split is an operational call under load.
+    fs_store_scan_concurrency: int = env("HIPPIUS_FS_STORE_SCAN_CONCURRENCY:16", convert=int)
     # Copy a pool-served chunk onto this node's local NVMe so the next read of it comes off
     # flash (~6 ms/chunk) instead of CephFS (~40 ms). OFF by default and deliberately so: a
     # promoted copy is only reclaimable by a drain-agent evictor running on the same node, so
