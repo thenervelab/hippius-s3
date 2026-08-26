@@ -60,6 +60,8 @@ WHERE o.bucket_id = $1
   -- LS-2: explicit exclusive upper bound so the (bucket_id, object_key) index range is bounded on
   -- both ends even under a generic prepared plan (a sparse prefix no longer scans to partition end).
   AND ($5::text IS NULL OR o.object_key < $5::text COLLATE "C")
+  -- No o.deleted_at here: the derived table above does not project it, and BOTH union arms
+  -- already filter it (the objects arm directly, the object_names arm through its join).
   -- The key vanishes from the listing when its newest version is a delete marker. This must sit
   -- OUTSIDE the LATERAL: filtering markers inside it would make the subquery fall through to the
   -- previous content version and list a deleted key as though it were still there.
@@ -67,9 +69,6 @@ WHERE o.bucket_id = $1
   -- A delete marker hides EVERY name of the object, primary and alias alike, because the marker
   -- lives on the shared object_id. That is intended: a marker is the object being deleted, whereas
   -- deleting one alias only drops that name (see drop_s3_name).
-  --
-  -- An outer o.deleted_at check is no longer needed: the derived table above applies it to both
-  -- the primary-name and alias branches.
   AND NOT ov.is_delete_marker
 -- DB is C-collation; an explicit COLLATE here would defeat the (bucket_id, object_key) index ordered scan.
 ORDER BY o.object_key

@@ -1021,6 +1021,9 @@ class ObjectWriter:
             """
             SELECT o.object_id, o.current_object_version AS cov
             FROM objects o
+            -- resolve_object_id already filters o.deleted_at IS NULL on both its arms (the
+            -- primary objects.object_key and the object_names alias table), so this covers the
+            -- soft-deleted-object case too.
             WHERE o.object_id = resolve_object_id($1::uuid, $2)
             """,
             bucket_id,

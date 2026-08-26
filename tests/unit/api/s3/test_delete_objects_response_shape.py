@@ -121,6 +121,7 @@ async def test_created_marker_reports_delete_marker_version_id(
 
 @pytest.mark.asyncio
 async def test_removed_version_reports_version_id_only(wiring: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    wiring["bucket"]["versioning_status"] = "Enabled"
     from fastapi import Response
 
     async def _del_version(*_a: Any, **_kw: Any) -> Response:
@@ -138,6 +139,7 @@ async def test_removed_version_reports_version_id_only(wiring: dict[str, Any], m
 
 @pytest.mark.asyncio
 async def test_removed_marker_reports_both_ids(wiring: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    wiring["bucket"]["versioning_status"] = "Enabled"
     from fastapi import Response
 
     async def _del_version(*_a: Any, **_kw: Any) -> Response:
@@ -256,6 +258,10 @@ async def test_bulk_versioned_delete_refusal_is_reported_as_an_error(
     the version was gone while nothing had been touched.
     """
     from fastapi import Response
+
+    # Versioning must be on, or the earlier "versionId on an unversioned bucket" guard answers
+    # first and delete_object_version is never reached.
+    wiring["bucket"]["versioning_status"] = "Enabled"
 
     async def _refuse(*_a: Any, **_kw: Any) -> Response:
         return Response(status_code=501)

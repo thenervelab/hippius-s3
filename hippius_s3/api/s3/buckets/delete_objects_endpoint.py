@@ -129,6 +129,20 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                 )
                 continue
 
+            # Version ids are only addressable on a versioning-enabled bucket — see the same guard
+            # in handle_delete_object. This is the path that matters most: the standard prune loop
+            # is list-versions then DeleteObjects with each VersionId, so an unversioned bucket
+            # would walk its whole retained overwrite history resurrecting each prior version.
+            if version_id is not None and not versioning_enabled:
+                errors_list.append(
+                    {
+                        "Key": key,
+                        "Code": "NoSuchVersion",
+                        "Message": "The specified version does not exist; versioning is not enabled on this bucket",
+                    }
+                )
+                continue
+
             # Per-key isolation: one bad key must yield one <Error> entry, not fail the whole
             # 1000-key batch.
             try:

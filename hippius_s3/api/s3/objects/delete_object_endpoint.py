@@ -215,20 +215,19 @@ async def handle_delete_object(
                     Key=object_key,
                     VersionId=str(version_id),
                 )
+            # Deliberately BEFORE drop_s3_name, which mutates: a versioned DELETE names one
+            # version of the object, not one of the S3 names pointing at it, so it must not drop
+            # or promote a name as a side effect.
             with tracer.start_as_current_span(
                 "delete_object.delete_version",
                 attributes={"object_version": version_id},
             ):
                 return await delete_object_version(bucket_id, object_key, version_id, request, db)
 
-        # Drop the NAME before considering the object. A same-bucket CopyObject attaches a second
-        # key to one object_id (the v5 AAD binds the id, so a copy cannot mint a new one), and
-        # deleting one of those keys must remove only that name — the ciphertext still belongs to
-        # the other. This has to precede the delete-marker branch too: a marker lives on the shared
-        # object_id, so inserting one would hide the object under EVERY name, not just the one the
-        # client asked to delete.
-        #
-        # "last" means this was the only name, so the object itself is now deletable below.
+        # Same-bucket CopyObject makes extra names for one object_id. "alias"/"promoted" mean the
+        # ciphertext is still reachable under another name, so there is nothing to tombstone or
+        # unpin — and on a versioning-enabled bucket a delete marker would wrongly hide every name.
+        # Only "last" falls through to the real delete below.
         kind = await drop_s3_name(db, str(bucket_id), object_key)
         if kind in {"alias", "promoted"}:
             return Response(status_code=204)
