@@ -168,6 +168,7 @@ def test_versioned_delete_removes_only_that_version(
     bucket = unique_bucket_name("versioning-onedel")
     cleanup_buckets(bucket)
     boto3_client.create_bucket(Bucket=bucket)
+    _enable(boto3_client, bucket)
 
     key = "doc.txt"
     for body in (b"one", b"two", b"three"):
@@ -195,6 +196,7 @@ def test_deleting_current_version_exposes_previous(
     bucket = unique_bucket_name("versioning-rollback")
     cleanup_buckets(bucket)
     boto3_client.create_bucket(Bucket=bucket)
+    _enable(boto3_client, bucket)
 
     key = "doc.txt"
     boto3_client.put_object(Bucket=bucket, Key=key, Body=b"one")
@@ -235,3 +237,34 @@ def test_copy_from_source_version_id_restores_old_version(
     assert boto3_client.get_object(Bucket=bucket, Key="restored.txt")["Body"].read() == b"ORIGINAL"
     # AWS reports which source version was read, so a restore flow can confirm what it got.
     assert copied["ResponseMetadata"]["HTTPHeaders"].get("x-amz-copy-source-version-id") == "1"
+
+
+@pytest.mark.local
+def test_versioned_delete_is_refused_on_an_unversioned_bucket(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    """The strongest form of the original regression.
+
+    Prod used to ignore the versionId here and soft-delete the WHOLE object, every version with it.
+    An unversioned bucket has no addressable versions in S3 — but it does still retain superseded
+    ones internally, so honouring the id would repoint the object back onto content the user
+    believes they overwrote. Refusing destroys nothing, which is the only safe answer.
+    """
+    bucket = unique_bucket_name("versioning-unversioned-del")
+    cleanup_buckets(bucket)
+    boto3_client.create_bucket(Bucket=bucket)
+
+    key = "doc.txt"
+    for body in (b"one", b"two", b"three"):
+        boto3_client.put_object(Bucket=bucket, Key=key, Body=body)
+
+    with pytest.raises(ClientError) as exc:
+        boto3_client.delete_object(Bucket=bucket, Key=key, VersionId="1")
+    assert exc.value.response["Error"]["Code"] == "NoSuchVersion"
+
+    # Nothing was touched: the object and its current content are intact.
+    assert boto3_client.get_object(Bucket=bucket, Key=key)["Body"].read() == b"three"
+    assert _keys(boto3_client, bucket) == [key]
