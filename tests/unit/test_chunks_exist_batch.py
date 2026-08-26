@@ -244,3 +244,25 @@ class TestParallelPartScans:
         assert result == [True] * nparts
         assert state["peak"] > 1, "scans did not run concurrently"
         assert state["peak"] <= limit, f"concurrency {state['peak']} exceeded limit {limit}"
+
+
+@pytest.mark.parametrize(
+    "bogus",
+    ["chunk_007.bin", "chunk_+1.bin", "chunk_ 1.bin", "chunk_١.bin", "chunk_-1.bin"],
+)
+@pytest.mark.asyncio
+async def test_noncanonical_chunk_names_are_not_treated_as_chunks(tmp_path, bogus):
+    """Presence must be defined by the exact filename, not by what `int()` tolerates.
+
+    The old code stat'd the exact path `chunk_<i>.bin`, so an oddly-spelled sibling could never
+    register. `int()` accepts leading zeros, signs, whitespace and non-ASCII digits, so without a
+    round-trip check `chunk_007.bin` would read as index 7. The writer never emits these, but the
+    equivalence should hold by construction rather than by argument.
+    """
+    cache, fs = _make_cache(tmp_path)
+    await fs.set_meta(OBJ, 1, 1, chunk_size=4, num_chunks=8, size_bytes=32)
+    part_dir = Path(fs.part_path(OBJ, 1, 1))
+    (part_dir / bogus).write_bytes(b"xxxx")
+
+    # Index 1 and 7 must both still read as absent — only the canonical name counts.
+    assert await cache.chunks_exist_batch(OBJ, 1, [(1, 1), (1, 7)]) == [False, False]

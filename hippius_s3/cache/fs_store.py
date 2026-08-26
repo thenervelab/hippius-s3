@@ -643,9 +643,17 @@ class FileSystemPartsStore:
                 if not (name.startswith("chunk_") and name.endswith(".bin")):
                     continue
                 try:
-                    present.add(int(name[len("chunk_") : -len(".bin")]))
+                    index = int(name[len("chunk_") : -len(".bin")])
                 except ValueError:
                     continue  # .tmp / .staged files — not a published chunk
+                # Round-trip so membership is exactly the old per-chunk `chunk_<i>.bin` stat.
+                # `int()` is far more permissive than the writer: it accepts leading zeros, a
+                # sign, surrounding whitespace and non-ASCII digits, so `chunk_007.bin` would
+                # otherwise register as index 7. The writer only ever emits the canonical form,
+                # so this is unreachable today — it is here to keep "present" defined by the
+                # exact filename rather than by whatever `int()` happens to tolerate.
+                if name == f"chunk_{index}.bin":
+                    present.add(index)
             return present
 
         def _scan(part_number: int) -> set[int] | None:
