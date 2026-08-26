@@ -9,6 +9,7 @@ they write them here (not to Redis) for the streamer to read.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import fcntl
 import json
@@ -16,6 +17,7 @@ import logging
 import os
 import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from typing import AsyncIterator
@@ -27,6 +29,77 @@ from hippius_s3.cache.access_tracker import get_access_tracker
 
 
 logger = logging.getLogger(__name__)
+
+# Part-directory scans run here, NOT on asyncio's default executor. Two reasons, both precedent:
+# crypto_pool keeps AES off the default pool because that pool "already carries FS md5 offload and
+# blocking FS work" and must not be starved — and the default pool is exactly where `get_chunk`,
+# `set_chunk` and `set_meta` do their blocking IO, so a fan-out of presence scans landing there
+# would stall the chunk reads those same requests are about to make. The janitor's parallel walk
+# reaches for a dedicated `janitor-walk` pool for the same reason.
+#
+# Sizing it here is also what makes the bound PROCESS-wide. A per-request semaphore only bounds one
+# request: N concurrent multi-part GETs would still demand N x limit threads. max_workers is the
+# real ceiling on how many metadata ops this process has in flight at once.
+#
+# That ceiling is about THIS PROCESS, not about the storage tier. Measured from an api-local pod,
+# cold readdir p50 against the pool is flat from 1-way to 64-way concurrency and one client
+# sustained several times the whole cluster's baseline metadata rate without moving p90 — and this
+# method does not change how much metadata work is done, only when. Size it for how many threads a
+# stalled tier may park here, not for what the MDS can take.
+# Module-level rather than per-instance on purpose: DualFileSystemPartsStore holds two of these
+# stores (local primary + pool fallback) and both inherit this method, so per-instance pools would
+# quietly double the ceiling.
+_SCAN_POOL: ThreadPoolExecutor | None = None
+_SCAN_POOL_SIZE = 0
+
+
+def _scan_pool_size() -> int:
+    """Worker count of the scan pool; also the per-request in-flight cap. Pool-creating."""
+    _scan_pool()
+    return _SCAN_POOL_SIZE
+
+
+def _scan_pool() -> ThreadPoolExecutor:
+    """The process-wide part-scan pool, created on first use (config isn't loaded at import).
+
+    Deliberately unlocked. The only caller is an `async def`, so this runs on the event loop
+    thread and there is no `await` between the check and the assignment — a single loop cannot
+    interleave two initialisers, and uvicorn's workers are separate processes with their own
+    module state. Even if two ever did race, `ThreadPoolExecutor` spawns threads lazily on first
+    submit, so the losing instance holds no threads and is simply collected. A lock here would
+    defend an unreachable race at the cost of a synchronisation primitive on the read path.
+    """
+    global _SCAN_POOL, _SCAN_POOL_SIZE
+    if _SCAN_POOL is None:
+        # Deferred import: config imports the cache package, so a module-level import here is
+        # circular (same reason object_parts.py defers it).
+        from hippius_s3.config import get_config
+
+        _SCAN_POOL_SIZE = max(1, int(get_config().fs_store_scan_concurrency))
+        _SCAN_POOL = ThreadPoolExecutor(max_workers=_SCAN_POOL_SIZE, thread_name_prefix="fs-scan")
+    return _SCAN_POOL
+
+
+@atexit.register
+def _shutdown_scan_pool() -> None:
+    """Release the pool without waiting. Mirrors crypto_pool's registration, for the same reason.
+
+    `concurrent.futures.thread._python_exit` JOINS every worker at interpreter exit, so without
+    this a readdir hung on a stalled mount blocks the process AFTER uvicorn has finished draining
+    — past the point UVICORN_GRACEFUL_TIMEOUT can help, and into the kubelet's SIGKILL.
+    """
+    if _SCAN_POOL is not None:
+        _SCAN_POOL.shutdown(wait=False)
+
+
+def _reset_scan_pool_for_tests() -> None:
+    """Drop the memoised pool so a test can re-read the concurrency config. Tests only."""
+    global _SCAN_POOL, _SCAN_POOL_SIZE
+    if _SCAN_POOL is not None:
+        _SCAN_POOL.shutdown(wait=False)
+    _SCAN_POOL = None
+    _SCAN_POOL_SIZE = 0
+
 
 # Marks a chunk file as belonging to ONE in-flight upload attempt and not yet published.
 #
@@ -632,10 +705,18 @@ class FileSystemPartsStore:
             chunk mid-download (meta written eagerly, file not yet landed) is correctly absent.
             """
             try:
-                entries = list(os.scandir(part_dir))
-            except FileNotFoundError:
+                with os.scandir(part_dir) as entries:
+                    names = {entry.name for entry in entries}
+            except (FileNotFoundError, NotADirectoryError):
+                # ENOENT/ENOTDIR only — "there is no such part directory", which is genuinely
+                # absent. Everything else (EACCES, EIO, ESTALE) is left to raise, matching the
+                # `Path.exists()` this replaced: on the 3.11 runtime that ships, its ignore-list
+                # is ENOENT/ENOTDIR/EBADF/ELOOP, so EACCES and ESTALE already propagated. Do not
+                # widen this to a bare `OSError` — reporting a genuinely unreadable part as absent
+                # sends the caller down the pipeline branch to re-fetch and re-write the same
+                # broken directory, which retries forever and reads as a cold miss on every
+                # dashboard.
                 return None
-            names = {e.name for e in entries}
             if "meta.json" not in names:
                 return None
             present: set[int] = set()
@@ -661,26 +742,35 @@ class FileSystemPartsStore:
 
         # dict.fromkeys: distinct part numbers, first-seen order (deterministic scan order).
         distinct_parts = list(dict.fromkeys(int(pn) for pn, _ in checks))
+        loop = asyncio.get_running_loop()
+        pool = _scan_pool()
 
         if len(distinct_parts) == 1:
-            # Single-part objects are the common case and gain nothing from a fan-out; keep
-            # them on one thread hop rather than paying gather + semaphore setup.
+            # 93% of production GETs are a single part. One scan needs neither the gather nor the
+            # semaphore, and taking exactly one worker keeps it out of the fan-out's way.
             only = distinct_parts[0]
-            scanned = {only: await asyncio.to_thread(_scan, only)}
+            scanned = {only: await loop.run_in_executor(pool, _scan, only)}
         else:
-            # Deferred import: the cache package is imported from config's own dependency
-            # graph, so a module-level import here is circular (same reason object_parts.py
-            # defers it).
-            from hippius_s3.config import get_config
-
-            limit = max(1, int(get_config().fs_store_scan_concurrency))
-            sem = asyncio.Semaphore(limit)
+            # TWO bounds doing different jobs. max_workers caps what this PROCESS puts on the
+            # storage tier; the semaphore caps how much of that one REQUEST may hold.
+            #
+            # The second is about FAULT ISOLATION, not metadata-server tolerance. Measured from an
+            # api-local pod against the pool tier, cold readdir p50 is flat from 1-way to 64-way
+            # concurrency (26.6ms -> 20.7ms) and a single client sustained 1817/s against a cluster
+            # baseline of 236-764/s — and the total metadata work is unchanged by this method
+            # anyway, only its distribution in time. The MDS is not the constraint.
+            #
+            # What matters is that a request whose scans hang on a stalled tier holds those workers
+            # for the duration. At the full pool width, ONE such request owns every worker and
+            # blocks presence checks for objects sitting entirely on healthy local flash — the
+            # local tier and the pool tier share this executor. A quarter keeps ~79% of the cold
+            # win (78 parts: 2075ms serial -> 532ms at 4-wide vs 133ms at 16-wide) for a quarter of
+            # the blast radius, and gives up ~7ms on a warm read, which is the common case.
+            sem = asyncio.Semaphore(max(1, _scan_pool_size() // 4))
 
             async def _scan_bounded(part_number: int) -> set[int] | None:
-                # Bounded so a many-part object cannot fan thousands of concurrent readdirs
-                # at the MDS — the failure mode that would trade our latency win for theirs.
                 async with sem:
-                    return await asyncio.to_thread(_scan, part_number)
+                    return await loop.run_in_executor(pool, _scan, part_number)
 
             scanned = dict(
                 zip(
@@ -693,7 +783,10 @@ class FileSystemPartsStore:
         results: list[bool] = []
         for part_number, chunk_index in checks:
             present = scanned[int(part_number)]
-            results.append(present is not None and chunk_index in present)
+            # int() on BOTH halves: the old form reached the chunk through `_chunk_file`, which
+            # coerced the index, so a caller passing a str index kept working. Set membership
+            # would not, and would fail as a silent permanent miss rather than an error.
+            results.append(present is not None and int(chunk_index) in present)
         return results
 
     async def touch_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> None:
