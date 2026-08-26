@@ -251,6 +251,20 @@ async def handle_head_object(
             )
         headers["X-Hippius-Arion-File-Hash"] = arion_hash or "pending"
 
+        # A DIFFERENT value from the header above, deliberately, and the two must not be conflated:
+        #   X-Hippius-Arion-File-Hash  chunk_backend.backend_identifier — Arion's id for the first
+        #                              ENCRYPTED chunk. Says where the bytes live on the backend.
+        #   X-Hippius-Body-Blake3      BLAKE3 of the PLAINTEXT, computed in flight on the write
+        #                              path. Says what the object contains, and is what ListObjects
+        #                              surfaces in Owner.ID.
+        # Scope differs by upload path and is not derivable from the header alone: a simple PUT
+        # digests the whole body, a multipart digests only the first HIPPIUS_CHUNK_SIZE_BYTES of
+        # part 1, and an S4 append leaves the value describing the pre-append content. Treat it as
+        # an identifier for display, not as something to verify bytes against.
+        body_blake3 = row.get("body_blake3")
+        if body_blake3:
+            headers["X-Hippius-Body-Blake3"] = body_blake3
+
         # Append version header if present. HD-3: the download query's outer SELECT now returns
         # append_version, so no fallback JOIN is needed.
         with tracer.start_as_current_span("head_object.fetch_append_version") as span:

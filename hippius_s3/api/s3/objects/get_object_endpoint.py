@@ -371,6 +371,12 @@ async def handle_get_object(
         if response.status_code in (200, 206):
             object_version = int(object_info.get("object_version") or 1)
             response.headers["x-amz-version-id"] = str(object_version)
+            # HEAD must not advertise metadata GET withholds — S3 clients treat the two header sets
+            # as interchangeable, and a divergence here is the same trap that made ListObjects and
+            # ListObjectVersions disagree. See head_object_endpoint for what this value covers.
+            body_blake3 = object_info.get("body_blake3")
+            if body_blake3:
+                response.headers["X-Hippius-Body-Blake3"] = body_blake3
             apply_response_overrides(response.headers, response_overrides)
 
             bytes_transferred = int(object_info["size_bytes"])

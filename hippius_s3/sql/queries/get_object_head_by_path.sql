@@ -17,6 +17,7 @@ WITH object_info AS (
         ov.metadata,
         o.created_at,
         ov.md5_hash,
+        ov.body_blake3,
         ov.append_version,
         b.bucket_name,
         ov.object_version AS object_version
@@ -47,6 +48,7 @@ SELECT
     oi.metadata,
     oi.created_at,
     oi.md5_hash,
+    oi.body_blake3,
     oi.append_version,
     oi.bucket_name,
     oi.object_version,
