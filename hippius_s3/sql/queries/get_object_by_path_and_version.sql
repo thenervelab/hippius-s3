@@ -25,6 +25,12 @@ JOIN object_versions ov
  AND ov.deleted_at IS NULL
 JOIN buckets b ON o.bucket_id = b.bucket_id
 LEFT JOIN cids c ON ov.cid_id = c.id
-WHERE o.bucket_id = $1 AND o.object_key = $2 AND o.deleted_at IS NULL
+-- resolve_object_id, not a direct object_key match, exactly as the unversioned sibling
+-- get_object_by_path.sql does. Same-bucket CopyObject cannot mint a new object_id (v5 AAD binds
+-- bucket_id+object_id), so it attaches an extra name in object_names instead. Matching
+-- objects.object_key therefore misses every copied key. Both branches of the CopySource lookup in
+-- multipart.py must agree: without this, `x-amz-copy-source` on a copied key succeeded, and the
+-- same source with ?versionId= returned NoSuchVersion.
+WHERE o.bucket_id = $1 AND o.object_id = resolve_object_id($1::uuid, $2) AND o.deleted_at IS NULL
   AND b.deleted_at IS NULL
 ORDER BY o.created_at DESC LIMIT 1
