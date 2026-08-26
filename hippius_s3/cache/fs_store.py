@@ -596,9 +596,22 @@ class FileSystemPartsStore:
     ) -> list[bool]:
         """Batch existence check for many chunks (stat-based, no Redis).
 
-        Groups checks by part_number so we only check meta.json once per part
-        instead of once per chunk. For a part with 100 chunks this is 1 meta
-        stat + 100 chunk stats instead of 100 meta stats + 100 chunk stats.
+        One directory scan per distinct part, not one stat per chunk, and the parts are
+        scanned CONCURRENTLY. A single `os.scandir` returns every `chunk_<i>.bin` in the
+        part, so membership is a set lookup — for a part with N chunks this is 1 readdir
+        instead of N stats.
+
+        Both halves matter because on the CephFS pool tier every metadata op is a serial
+        MDS round trip (measured on prod: 6.3ms median, 15ms p90). This check gates TTFB,
+        so a serial per-chunk sweep made it O(total_chunks) × MDS-latency — ~1250 stats
+        ≈ 10s before the first byte on a 5 GB object. Scanning per-part alone leaves
+        O(parts) serial round trips, which is still ~0.5s for a 78-part multipart object;
+        fanning the scans out bounds it at roughly ceil(parts / concurrency) round trips.
+
+        Semantics are unchanged by either half: a chunk counts as present iff the part's
+        `meta.json` exists AND its file is on disk (see `chunk_exists`). That keeps the
+        download-in-progress case correct — the downloader writes meta eagerly, so
+        meta-present does not imply all chunks present.
 
         Args:
             object_id: Object UUID
@@ -611,23 +624,77 @@ class FileSystemPartsStore:
         if not checks:
             return []
 
-        def _check_all() -> list[bool]:
-            meta_cache: dict[int, bool] = {}
-            results: list[bool] = []
-            for part_number, chunk_index in checks:
-                # Resolve meta presence once per distinct part
-                if part_number not in meta_cache:
-                    part_dir = Path(self.part_path(object_id, object_version, part_number))
-                    meta_cache[part_number] = self._meta_file(part_dir).exists()
-                if not meta_cache[part_number]:
-                    results.append(False)
-                    continue
-                part_dir = Path(self.part_path(object_id, object_version, part_number))
-                chunk_path = self._chunk_file(part_dir, chunk_index)
-                results.append(chunk_path.exists())
-            return results
+        def _present_indices(part_dir: Path) -> set[int] | None:
+            """Chunk indices on disk for a complete part, or None if the part is not complete.
 
-        return await asyncio.to_thread(_check_all)
+            None = no `meta.json` (part not published / not yet known) → every chunk is absent.
+            A set = meta present; membership reflects the actual `chunk_<i>.bin` files, so a
+            chunk mid-download (meta written eagerly, file not yet landed) is correctly absent.
+            """
+            try:
+                entries = list(os.scandir(part_dir))
+            except FileNotFoundError:
+                return None
+            names = {e.name for e in entries}
+            if "meta.json" not in names:
+                return None
+            present: set[int] = set()
+            for name in names:
+                if not (name.startswith("chunk_") and name.endswith(".bin")):
+                    continue
+                try:
+                    index = int(name[len("chunk_") : -len(".bin")])
+                except ValueError:
+                    continue  # .tmp / .staged files — not a published chunk
+                # Round-trip so membership is exactly the old per-chunk `chunk_<i>.bin` stat.
+                # `int()` is far more permissive than the writer: it accepts leading zeros, a
+                # sign, surrounding whitespace and non-ASCII digits, so `chunk_007.bin` would
+                # otherwise register as index 7. The writer only ever emits the canonical form,
+                # so this is unreachable today — it is here to keep "present" defined by the
+                # exact filename rather than by whatever `int()` happens to tolerate.
+                if name == f"chunk_{index}.bin":
+                    present.add(index)
+            return present
+
+        def _scan(part_number: int) -> set[int] | None:
+            return _present_indices(Path(self.part_path(object_id, object_version, part_number)))
+
+        # dict.fromkeys: distinct part numbers, first-seen order (deterministic scan order).
+        distinct_parts = list(dict.fromkeys(int(pn) for pn, _ in checks))
+
+        if len(distinct_parts) == 1:
+            # Single-part objects are the common case and gain nothing from a fan-out; keep
+            # them on one thread hop rather than paying gather + semaphore setup.
+            only = distinct_parts[0]
+            scanned = {only: await asyncio.to_thread(_scan, only)}
+        else:
+            # Deferred import: the cache package is imported from config's own dependency
+            # graph, so a module-level import here is circular (same reason object_parts.py
+            # defers it).
+            from hippius_s3.config import get_config
+
+            limit = max(1, int(get_config().fs_store_scan_concurrency))
+            sem = asyncio.Semaphore(limit)
+
+            async def _scan_bounded(part_number: int) -> set[int] | None:
+                # Bounded so a many-part object cannot fan thousands of concurrent readdirs
+                # at the MDS — the failure mode that would trade our latency win for theirs.
+                async with sem:
+                    return await asyncio.to_thread(_scan, part_number)
+
+            scanned = dict(
+                zip(
+                    distinct_parts,
+                    await asyncio.gather(*(_scan_bounded(pn) for pn in distinct_parts)),
+                    strict=True,
+                )
+            )
+
+        results: list[bool] = []
+        for part_number, chunk_index in checks:
+            present = scanned[int(part_number)]
+            results.append(present is not None and chunk_index in present)
+        return results
 
     async def touch_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> None:
         """Update atime/mtime of a chunk to mark it as recently accessed.
