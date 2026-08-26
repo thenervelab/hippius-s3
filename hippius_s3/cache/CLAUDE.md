@@ -101,8 +101,9 @@ and would delete it mid-upload. A SIGKILL'd attempt's leftovers are swept by the
 orphan sweep at its 24h grace; readers and the drain's completeness gate never count staged names.
 
 - Every file is written atomically: unique tmp name → `os.replace` ([fs_store.py:92, 123-131](fs_store.py)). Two workers writing the same chunk path each use their own tmp — last rename wins, content is deterministic, no corruption.
-- **`meta.json` is the readiness gate**: `get_chunk` returns None unless `meta.json` exists AND the specific chunk file exists ([fs_store.py:168-173](fs_store.py)). `chunks_exist_batch` same.
+- **`meta.json` is the readiness gate**: `get_chunk` returns None unless `meta.json` exists AND the specific chunk file exists ([fs_store.py:168-173](fs_store.py)). `chunks_exist_batch` same — and it must stay a two-part test, because the two writers below mean different things by `meta.json`: meta alone would report a downloader's in-flight chunks as present and break partial-range fills.
 - Uploaders write meta **last** (after all chunks). Downloaders write meta **first** (eager from DB parts row) so partial-range fills become readable as chunks land.
+- **The read path parses the part directory listing.** `chunks_exist_batch` answers per part with one `os.scandir` rather than a stat per chunk: on the pool tier every stat is an MDS round trip (~6ms), so the per-chunk form made read TTFB O(total_chunks) and cost 10-20s before the first byte of a 5 GB object. Two consequences before you change anything on disk: the staged/tmp naming above is now a **read-path correctness dependency** (any name parsing as `chunk_<i>.bin` counts as published, which is why the parser round-trips the index back through the filename), and scans run on a dedicated `fs-scan` pool sized by `HIPPIUS_FS_STORE_SCAN_CONCURRENCY` — off asyncio's default executor so a fan-out cannot starve the `get_chunk`/`set_chunk` IO living there, with a per-request cap so one large object cannot queue ahead of everyone else.
 
 ## Atomicity on CephFS / NVMe
 

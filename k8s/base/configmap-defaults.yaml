@@ -106,5 +106,14 @@ data:
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
   OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: "cumulative"
   HIPPIUS_OBJECT_CACHE_FALLBACK_DIR: ""
+  # Part-directory scans in flight per api process, for the read path's chunk-presence check.
+  # Surfaced here for the same reason as HIPPIUS_JANITOR_WALK_CONCURRENCY: it presses on the
+  # shared CephFS MDS, and this repo manifest-manages that class of knob rather than leaving it
+  # to a code default (see the janitor block in workers-deployments.yaml).
+  # CAUTION: unlike the janitor's single walker, this one is per uvicorn worker across the whole
+  # api fleet, so the fleet-wide ceiling is this x workers x pods. 16 is carried over from the
+  # janitor's measured-safe crawl and is NOT yet validated at that multiplicity — raise only
+  # while watching MDS req/s and read latency.
+  HIPPIUS_FS_STORE_SCAN_CONCURRENCY: "16"
   SENTRY_DSN: ""
   SENTRY_TRACES_SAMPLE_RATE: "0.1"
