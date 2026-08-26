@@ -49,6 +49,31 @@ class TestAccessControlSubresources:
         """`?acl&policy` must still be graded as an access-control write, not fall through."""
         assert get_required_permission("PUT", {"acl": "", "policy": ""}, has_key=False) == Permission.WRITE_ACP
 
+    @pytest.mark.parametrize("method", ["PUT", "POST", "DELETE"])
+    def test_versioning_writes_demand_write_acp(self, method: str) -> None:
+        """WRITE means "may create objects". It must not be enough to turn versioning on.
+
+        AWS has no ACL grant that confers s3:PutBucketVersioning at all — bucket ACLs only express
+        READ / WRITE / READ_ACP / WRITE_ACP / FULL_CONTROL — so anything short of an ACL-admin
+        grade over-permits. Enabling is also irreversible here (Suspended is a 501) and rewrites
+        DELETE semantics for every key in the bucket.
+        """
+        assert get_required_permission(method, {"versioning": ""}, has_key=False) == Permission.WRITE_ACP
+
+    @pytest.mark.parametrize("method", ["GET", "HEAD"])
+    def test_versioning_reads_demand_read_acp(self, method: str) -> None:
+        assert get_required_permission(method, {"versioning": ""}, has_key=False) == Permission.READ_ACP
+
+    def test_versioning_is_not_a_create_bucket_shape(self) -> None:
+        """The vulnerability, pinned directly.
+
+        While `versioning` was absent from BUCKET_PUT_SUBRESOURCES this returned True, so the ACL
+        middleware took its CreateBucket branch — which deliberately bypasses the permission check
+        because a bucket being created has nothing to authorise against — and PutBucketVersioning
+        ran ungated on an EXISTING bucket.
+        """
+        assert is_create_bucket_shape("PUT", None, {"versioning": ""}) is False
+
     def test_unknown_method_still_raises(self) -> None:
         with pytest.raises(ValueError):
             get_required_permission("PATCH", {}, has_key=False)
@@ -87,15 +112,34 @@ class TestCreateBucketShapeMatchesTheRouter:
         assert is_create_bucket_shape("PUT", None, {"x": "1"}) is True
 
     def test_subresource_set_covers_every_branch_the_put_router_dispatches(self) -> None:
-        """Pins the two lists together. If the router grows a subresource and this set does not,
-        that param becomes a create here and something else there — the bug this closes."""
-        source = __import__("inspect").getsource(buckets_router.create_or_modify_bucket)
+        """Pins the two lists together, in the direction that actually catches the bug.
+
+        The previous version of this test derived its candidates FROM `BUCKET_PUT_SUBRESOURCES`
+        (`{n for n in BUCKET_PUT_SUBRESOURCES if f'"{n}"' in source}`) and then asserted that set
+        equalled `BUCKET_PUT_SUBRESOURCES` — which it does by construction unless a set member is
+        missing from the router. It could never see a param the ROUTER dispatches that the set
+        omits, and that is the failure it was written for: `?versioning` shipped with a router
+        branch and no entry here, so `PUT /b?versioning` was graded a CreateBucket by the ACL
+        middleware, took the create bypass, and reached PutBucketVersioning with no permission
+        check at all.
+
+        So: parse the names out of the SOURCE and require the set to cover them.
+        """
+        import inspect
+        import re
+
         from hippius_s3.api.s3.buckets import bucket_create_endpoint
 
-        source += __import__("inspect").getsource(bucket_create_endpoint.handle_create_bucket)
-        dispatched = {name for name in BUCKET_PUT_SUBRESOURCES if f'"{name}"' in source}
-        assert dispatched == set(BUCKET_PUT_SUBRESOURCES), (
-            f"router dispatches on {dispatched}, BUCKET_PUT_SUBRESOURCES is {set(BUCKET_PUT_SUBRESOURCES)}"
+        source = inspect.getsource(buckets_router.create_or_modify_bucket)
+        source += inspect.getsource(bucket_create_endpoint.handle_create_bucket)
+        dispatched = set(re.findall(r'"([A-Za-z][\w-]*)"\s+in\s+request\.query_params', source))
+        assert dispatched, "found no subresource branches — the extraction regex has gone stale"
+        missing = dispatched - set(BUCKET_PUT_SUBRESOURCES)
+        assert not missing, (
+            f"the bucket PUT router dispatches on {sorted(missing)} but BUCKET_PUT_SUBRESOURCES "
+            f"({sorted(BUCKET_PUT_SUBRESOURCES)}) omits it. Such a param is classified as "
+            f"CreateBucket by the ACL middleware, which BYPASSES the permission check, while the "
+            f"router sends it to a real subresource handler. Add it to the set."
         )
 
 

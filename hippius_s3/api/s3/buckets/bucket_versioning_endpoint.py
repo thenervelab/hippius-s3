@@ -7,6 +7,7 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common.req import expected_bucket_owner_mismatch
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.utils import get_query
 from hippius_s3.xml_helpers import add_subelement
@@ -34,10 +35,15 @@ def _no_such_bucket(bucket_name: str) -> Response:
     )
 
 
-async def handle_get_bucket_versioning(bucket_name: str, db: Any, main_account_id: str) -> Response:
+async def handle_get_bucket_versioning(
+    bucket_name: str, db: Any, main_account_id: str, request: Request | None = None
+) -> Response:
     bucket = await BucketRepository(db).get_by_name_and_owner(bucket_name, main_account_id)
     if not bucket:
         return _no_such_bucket(bucket_name)
+
+    if request is not None and (denied := expected_bucket_owner_mismatch(request, bucket["main_account_id"])):
+        return denied
 
     root = create_element("VersioningConfiguration", xmlns=S3_NS)
     # AWS omits <Status> entirely for a bucket that never enabled versioning; boto3 surfaces that
@@ -54,9 +60,20 @@ async def handle_get_bucket_versioning(bucket_name: str, db: Any, main_account_i
 
 
 async def handle_put_bucket_versioning(bucket_name: str, request: Request, db: Any) -> Response:
+    # NB: `main_account_id` is the STORAGE-ATTRIBUTION account — the bucket owner as resolved by the
+    # ACL middleware, falling back to the caller (see api/middlewares/request_context.py). So this
+    # lookup RESOLVES the bucket; it is not an ownership test, and cannot be used as one: for an
+    # existing bucket it compares the owner against itself and always matches. Authorization for
+    # this operation is the ACL middleware's WRITE_ACP grade — which is exactly what was missing
+    # while `versioning` was absent from BUCKET_PUT_SUBRESOURCES and the request took the
+    # CreateBucket bypass. Deliberately NOT tightened to the caller: a WRITE_ACP grantee who is not
+    # the owner is legitimate delegation, and the ACL layer is the right place to decide that.
     bucket = await BucketRepository(db).get_by_name_and_owner(bucket_name, request.state.main_account_id)
     if not bucket:
         return _no_such_bucket(bucket_name)
+
+    if denied := expected_bucket_owner_mismatch(request, bucket["main_account_id"]):
+        return denied
 
     body = await request.body()
     if not body:

@@ -3,6 +3,32 @@ from __future__ import annotations
 from typing import Tuple
 
 from fastapi import Request
+from fastapi import Response
+
+from hippius_s3.api.s3 import errors
+
+
+def expected_bucket_owner_mismatch(request: Request, actual_owner: str | None) -> Response | None:
+    """Enforce ``x-amz-expected-bucket-owner``; return an error Response when it does not match.
+
+    AWS's guard against bucket-name confusion: the caller states which account it believes owns the
+    bucket, and S3 fails the request with 403 rather than operating on a bucket that was deleted and
+    re-created, or whose name was claimed by someone else, since the last time the caller looked.
+    Ignoring the header is worse than not supporting it — a client that sends it believes it is
+    protected, so a silent no-op turns a deliberate safety check into a false sense of one.
+
+    Absent header means "no expectation", which is the default for every existing caller.
+    """
+    expected = request.headers.get("x-amz-expected-bucket-owner")
+    if not expected:
+        return None
+    if actual_owner is not None and expected == actual_owner:
+        return None
+    return errors.s3_error_response(
+        "AccessDenied",
+        "The bucket is owned by a different account than the one specified in x-amz-expected-bucket-owner.",
+        status_code=403,
+    )
 
 
 def parse_read_mode(request: Request) -> str:

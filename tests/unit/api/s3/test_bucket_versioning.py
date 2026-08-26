@@ -198,3 +198,69 @@ async def test_put_versioning_enabled_is_idempotent() -> None:
 
     assert resp.status_code == 200
     assert db.executed[0][1] == ("bkt-1", "Enabled")
+
+
+# --- x-amz-expected-bucket-owner ----------------------------------------------------------
+#
+# AWS's guard against bucket-name confusion: the caller asserts which account it believes owns the
+# bucket and S3 returns 403 if that is wrong, so an operation cannot land on a bucket that was
+# deleted and re-created, or whose name was claimed by someone else, since the caller last looked.
+# We accepted the header and ignored it, which is worse than not supporting it — a client that
+# sends it believes it is protected.
+
+
+def _request_with_owner_header(expected: str | None, body: bytes = b"") -> Any:
+    req = _request(body)
+    headers = {"Host": "h"}
+    if expected is not None:
+        headers["x-amz-expected-bucket-owner"] = expected
+    req.headers = headers
+    return req
+
+
+@pytest.mark.asyncio
+async def test_put_versioning_rejects_mismatched_expected_bucket_owner() -> None:
+    db = _FakeDb(bucket=_bucket())
+    resp = await mod.handle_put_bucket_versioning("b", _request_with_owner_header("someone-else", _cfg("Enabled")), db)
+
+    assert resp.status_code == 403
+    assert b"AccessDenied" in resp.body
+    # The write must not have happened — a 403 that still mutates is the whole failure mode.
+    assert db.executed == []
+
+
+@pytest.mark.asyncio
+async def test_put_versioning_allows_matching_expected_bucket_owner() -> None:
+    db = _FakeDb(bucket=_bucket())
+    resp = await mod.handle_put_bucket_versioning("b", _request_with_owner_header("acct-main", _cfg("Enabled")), db)
+
+    assert resp.status_code == 200
+    assert db.executed[0][1] == ("bkt-1", "Enabled")
+
+
+@pytest.mark.asyncio
+async def test_put_versioning_without_the_header_is_unchanged() -> None:
+    """Absent header means "no expectation" — every existing caller must keep working."""
+    db = _FakeDb(bucket=_bucket())
+    resp = await mod.handle_put_bucket_versioning("b", _request_with_owner_header(None, _cfg("Enabled")), db)
+
+    assert resp.status_code == 200
+    assert db.executed[0][1] == ("bkt-1", "Enabled")
+
+
+@pytest.mark.asyncio
+async def test_get_versioning_rejects_mismatched_expected_bucket_owner() -> None:
+    db = _FakeDb(bucket=_bucket("Enabled"))
+    resp = await mod.handle_get_bucket_versioning("b", db, "acct-main", _request_with_owner_header("someone-else"))
+
+    assert resp.status_code == 403
+    assert b"AccessDenied" in resp.body
+
+
+@pytest.mark.asyncio
+async def test_get_versioning_allows_matching_expected_bucket_owner() -> None:
+    db = _FakeDb(bucket=_bucket("Enabled"))
+    resp = await mod.handle_get_bucket_versioning("b", db, "acct-main", _request_with_owner_header("acct-main"))
+
+    assert resp.status_code == 200
+    assert b"Enabled" in resp.body

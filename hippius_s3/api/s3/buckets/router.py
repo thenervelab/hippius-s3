@@ -69,7 +69,7 @@ async def get_bucket(
             return await policy_get_bucket_policy(bucket_name, conn, request.state.main_account_id)
     if "versioning" in request.query_params:
         async with pool.acquire() as conn:
-            return await handle_get_bucket_versioning(bucket_name, conn, request.state.main_account_id)
+            return await handle_get_bucket_versioning(bucket_name, conn, request.state.main_account_id, request)
     ctx = get_request_context(request)
     qp = request.query_params
     if "versions" in request.query_params:
