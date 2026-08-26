@@ -197,3 +197,47 @@ async def test_reap_leaves_the_version_row_as_a_tombstone(conn: asyncpg.Connecti
         version,
     )
     assert int(surviving) == 1, "the object_versions row must survive as a tombstone"
+
+
+async def _is_candidate(conn: asyncpg.Connection, object_id: uuid.UUID) -> bool:
+    """Whether the finder returns this version AT ALL, ready or not — distinct from `_is_ready`,
+    which asserts candidacy and reports only the readiness flag."""
+    rows = await conn.fetch(get_query("find_versions_ready_for_reap"), 100, _EPOCH, _NIL_UUID, 0)
+    return any(r["object_id"] == object_id for r in rows)
+
+
+async def test_an_already_reaped_tombstone_stops_being_a_candidate(conn: asyncpg.Connection) -> None:
+    """The `EXISTS (parts)` predicate, verified by RE-RUNNING the finder after a reap.
+
+    Nothing marks a reaped version as reaped — the object_versions tombstone is kept on purpose, so
+    the only thing distinguishing "already reclaimed" from "still to do" is whether any `parts` rows
+    remain. Without the predicate every tombstone the system has ever produced re-qualifies as
+    `ready` on every lap, the guarded DELETE runs again for a guaranteed `DELETE 0`, and the ring
+    grows monotonically with every versioned DELETE ever performed. Prod holds one object with
+    646,993 versions, so that tail pushes reclamation of NEWLY deleted versions out by a full lap.
+
+    The existing coverage stops at the first reap; this is the second lap.
+    """
+    object_id, version = await _seed(conn, deleted_hours_ago=2, backend_rows=[True])
+
+    assert await _is_candidate(conn, object_id) is True, "precondition: it starts out reapable"
+    assert await _reap(conn, object_id, version) is True
+    assert await _parts_remaining(conn, object_id) == 0
+
+    assert await _is_candidate(conn, object_id) is False, (
+        "an already-reaped tombstone must drop out of the finder, or the ring never stops growing"
+    )
+
+
+async def test_a_version_with_no_parts_is_never_a_candidate(conn: asyncpg.Connection) -> None:
+    """The same predicate seen from the delete-marker side: a marker is a zero-size version with no
+    parts and nothing to reclaim, so it must never enter the ring in the first place."""
+    object_id = uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO object_versions(object_id, object_version, deleted_at) VALUES($1,$2,$3)",
+        object_id,
+        1,
+        datetime.now(timezone.utc) - timedelta(hours=2),
+    )
+
+    assert await _is_candidate(conn, object_id) is False
