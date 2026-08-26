@@ -19,6 +19,11 @@ from hippius_s3.xml_helpers import create_element
 from hippius_s3.xml_helpers import to_xml_bytes
 
 
+# Above any real object_version (a bigint), so the key-marker's same-key branch admits every
+# version of the resume key. See the delimiter-collapse cursor jump in _collect_page.
+_VERSION_MARKER_SENTINEL = 2**63 - 1
+
+
 logger = logging.getLogger(__name__)
 
 S3_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
@@ -229,7 +234,14 @@ async def _collect_page(
                 entries.append(("prefix", common_prefix))
                 # Skip the whole collapsed group in one index descent on the next batch.
                 cursor_key = _prefix_resume(common_prefix)
-                cursor_version = None
+                # _prefix_resume yields an INCLUSIVE boundary (list_objects.sql resumes on `>=`),
+                # but this query's key marker is exclusive on the key when no version marker is
+                # given — AWS KeyMarker semantics. Pairing the two drops a key whose name IS the
+                # resume string: delimiter='/' turns "v1/" into "v10", so a real key "v10" is
+                # skipped and IsTruncated still reports false. The sentinel selects the SQL's
+                # same-key branch (`object_version <= $4`), which admits every version of that key
+                # while later keys still come through the `object_key > $3` branch.
+                cursor_version = _VERSION_MARKER_SENTINEL
                 continue
 
             entries.append(("marker" if row["is_delete_marker"] else "version", row))

@@ -139,8 +139,17 @@ def wiring(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     return {"enqueued": enqueued, "bucket": bucket}
 
 
-def _unpinned_versions(enqueued: list[Any]) -> list[int]:
-    return sorted(int(p.object_version) for p in enqueued if p.object_version is not None)
+def _unpinned_versions(enqueued: list[Any]) -> list[Any]:
+    """Every unpin scope enqueued, INCLUDING None.
+
+    None means "every version of this object" — the widest, most destructive scope there is. This
+    helper used to filter it out, which made an all-versions unpin indistinguishable from no unpin
+    at all, so no assertion here could tell those two apart.
+    """
+    return sorted(
+        (None if p.object_version is None else int(p.object_version) for p in enqueued),
+        key=lambda v: (v is not None, v),
+    )
 
 
 # --- The regression this whole change exists for ------------------------------------------
@@ -153,6 +162,7 @@ async def test_versioned_delete_removes_only_that_version(wiring: dict[str, Any]
     Prod previously ignored the versionId and soft-deleted the whole object, taking every
     version with it. Guard that: `soft_delete_object` must not be reached.
     """
+    wiring["bucket"]["versioning_status"] = "Enabled"
     db = _FakeDb(
         versions=[{"object_version": 1}, {"object_version": 2}, {"object_version": 3}],
         current=3,
@@ -168,6 +178,7 @@ async def test_versioned_delete_removes_only_that_version(wiring: dict[str, Any]
 
 @pytest.mark.asyncio
 async def test_versioned_delete_of_current_rolls_pointer_back(wiring: dict[str, Any]) -> None:
+    wiring["bucket"]["versioning_status"] = "Enabled"
     db = _FakeDb(versions=[{"object_version": 1}, {"object_version": 2}], current=2)
     resp = await mod.handle_delete_object("b", "k", _request("2"), db, None)
 
@@ -179,17 +190,19 @@ async def test_versioned_delete_of_current_rolls_pointer_back(wiring: dict[str, 
 
 @pytest.mark.asyncio
 async def test_versioned_delete_of_only_version_soft_deletes_object(wiring: dict[str, Any]) -> None:
+    wiring["bucket"]["versioning_status"] = "Enabled"
     db = _FakeDb(versions=[{"object_version": 1}], current=1)
     resp = await mod.handle_delete_object("b", "k", _request("1"), db, None)
 
     assert resp.status_code == 204
-    # Nothing left to point at, so the object itself goes.
+    # Nothing left to point at, so the object itself goes — and the unpin widens to match.
     assert "soft_delete_object" in db.names()
-    assert _unpinned_versions(wiring["enqueued"]) == [1]
+    assert _unpinned_versions(wiring["enqueued"]) == [None]
 
 
 @pytest.mark.asyncio
 async def test_versioned_delete_of_marker_is_an_undelete(wiring: dict[str, Any]) -> None:
+    wiring["bucket"]["versioning_status"] = "Enabled"
     db = _FakeDb(
         versions=[{"object_version": 1}, {"object_version": 2, "is_delete_marker": True}],
         current=2,
@@ -206,6 +219,7 @@ async def test_versioned_delete_of_marker_is_an_undelete(wiring: dict[str, Any])
 
 @pytest.mark.asyncio
 async def test_versioned_delete_unknown_version_is_idempotent(wiring: dict[str, Any]) -> None:
+    wiring["bucket"]["versioning_status"] = "Enabled"
     db = _FakeDb(versions=[{"object_version": 1}], current=1)
     resp = await mod.handle_delete_object("b", "k", _request("99"), db, None)
 
@@ -215,7 +229,23 @@ async def test_versioned_delete_unknown_version_is_idempotent(wiring: dict[str, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad", ["abc", "0", "-1", "1.5"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "abc",
+        "0",
+        "-1",
+        "1.5",
+        # Bare int() accepted every one of these, each resolving to a DIFFERENT version than
+        # the caller named: underscore grouping ("1_0" -> 10), a sign, surrounding whitespace,
+        # and non-ASCII decimal digits (covered in test_parse_version_id.py).
+        "1_0",
+        "+3",
+        " 2",
+        # Parsed fine, then overflowed asyncpg's int8 encoder at bind time -> 500 instead of 400.
+        "9" * 25,
+    ],
+)
 async def test_invalid_version_id_rejected(wiring: dict[str, Any], bad: str) -> None:
     db = _FakeDb(versions=[{"object_version": 1}], current=1)
     resp = await mod.handle_delete_object("b", "k", _request(bad), db, None)
@@ -290,3 +320,75 @@ async def test_missing_bucket_returns_404(wiring: dict[str, Any], monkeypatch: p
 
     assert resp.status_code == 404
     assert b"NoSuchBucket" in resp.body
+
+
+# --- Version ids are only addressable on a versioning-enabled bucket ------------------------
+
+
+@pytest.mark.asyncio
+async def test_versioned_delete_on_unversioned_bucket_is_refused(wiring: dict[str, Any]) -> None:
+    """The dangerous case: an unversioned bucket still RETAINS superseded versions.
+
+    Deleting the current version by id would repoint current_object_version back onto the row the
+    user overwrote, resurrecting content they believe they replaced — and both `PutObject` and
+    `ListObjectVersions` hand out the integer id needed to do it. Refuse; destroy nothing.
+    """
+    wiring["bucket"]["versioning_status"] = None
+    db = _FakeDb(versions=[{"object_version": 1}, {"object_version": 2}], current=2)
+
+    resp = await mod.handle_delete_object("b", "k", _request("2"), db, None)
+
+    assert resp.status_code == 404
+    assert b"NoSuchVersion" in resp.body
+    # Nothing mutated: no tombstone, no repoint, no whole-object delete, no unpin.
+    assert db.names() == []
+    assert wiring["enqueued"] == []
+    assert db.current == 2
+
+
+@pytest.mark.asyncio
+async def test_simple_delete_on_unversioned_bucket_still_works(wiring: dict[str, Any]) -> None:
+    """The refusal above must not leak into the no-versionId path."""
+    wiring["bucket"]["versioning_status"] = None
+    db = _FakeDb(versions=[{"object_version": 1}], current=1)
+
+    resp = await mod.handle_delete_object("b", "k", _request(), db, None)
+
+    assert resp.status_code == 204
+    assert "soft_delete_object" in db.names()
+    # Whole-object delete unpins EVERY version, not just current.
+    assert _unpinned_versions(wiring["enqueued"]) == [None]
+
+
+@pytest.mark.asyncio
+async def test_whole_object_fallback_unpins_every_version(wiring: dict[str, Any]) -> None:
+    """Deleting the last live version falls back to the whole-object delete.
+
+    The unpin must widen to match. Leaving it version-scoped re-opens the wedge this PR exists to
+    fix: hard_delete_object's readiness gate waits on ALL versions, so any sibling still holding
+    live chunk_backend rows keeps the object un-hard-deletable forever.
+    """
+    wiring["bucket"]["versioning_status"] = "Enabled"
+    db = _FakeDb(versions=[{"object_version": 1}], current=1)
+
+    resp = await mod.handle_delete_object("b", "k", _request("1"), db, None)
+
+    assert resp.status_code == 204
+    assert "soft_delete_object" in db.names()
+    assert _unpinned_versions(wiring["enqueued"]) == [None]
+
+
+@pytest.mark.asyncio
+async def test_versioned_delete_that_repoints_stays_version_scoped(wiring: dict[str, Any]) -> None:
+    """Converse of the above: when a predecessor survives, the unpin must NOT widen to None.
+
+    A None here would destroy the sibling versions that are still live and readable.
+    """
+    wiring["bucket"]["versioning_status"] = "Enabled"
+    db = _FakeDb(versions=[{"object_version": 1}, {"object_version": 2}], current=2)
+
+    resp = await mod.handle_delete_object("b", "k", _request("2"), db, None)
+
+    assert resp.status_code == 204
+    assert "soft_delete_object" not in db.names()
+    assert _unpinned_versions(wiring["enqueued"]) == [2]

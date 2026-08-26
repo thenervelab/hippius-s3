@@ -99,12 +99,14 @@ async def delete_object_version(
         if not deleted:
             return Response(status_code=204)
 
+        whole_object_deleted = False
         if was_current:
             # Removing the current version exposes the next-newest one. With nothing left to point
             # at, the object itself goes — the pre-existing whole-object soft-delete path.
             repointed = await db.fetchrow(get_query("repoint_current_version_after_delete"), object_id, version_id)
             if not repointed:
                 await db.fetchrow(get_query("soft_delete_object"), bucket_id, object_key)
+                whole_object_deleted = True
 
     # A delete marker holds no data, so there is nothing to unpin. Must run AFTER the pointer
     # moves: get_chunk_backend_identifiers refuses to unpin the current version of a live object.
@@ -112,7 +114,13 @@ async def delete_object_version(
         await enqueue_object_unpin(
             db,
             object_id=object_id,
-            object_version=version_id,
+            # Falling back to the whole-object delete means every remaining version is now
+            # unreachable, so scope the unpin the same way that path does. Leaving it version-scoped
+            # re-opens the wedge this PR exists to fix: hard_delete_object's readiness gate waits on
+            # ALL versions, so any sibling still holding live chunk_backend rows — an out-of-band
+            # migration row above current, or one whose earlier unpin went to the DLQ — would keep
+            # the object un-hard-deletable forever.
+            object_version=None if whole_object_deleted else version_id,
             address=request.state.main_account_id,
             ray_id=getattr(request.state, "ray_id", None),
         )
@@ -173,6 +181,20 @@ async def handle_delete_object(
             set_span_attributes(span, {"bucket_id": str(bucket_id)})
 
         if version_id is not None:
+            # Version ids are only addressable on a versioning-enabled bucket. An unversioned
+            # bucket still RETAINS superseded versions (~25 TB of them in prod), and deleting one
+            # by id would repoint current_object_version back onto the row the user overwrote —
+            # resurrecting content they believe they replaced. Refuse instead: destroying nothing
+            # is the only safe answer, and AWS has no addressable version here either.
+            if bucket["versioning_status"] != "Enabled":
+                return errors.s3_error_response(
+                    "NoSuchVersion",
+                    "The specified version does not exist; versioning is not enabled on this bucket",
+                    status_code=404,
+                    BucketName=bucket_name,
+                    Key=object_key,
+                    VersionId=str(version_id),
+                )
             with tracer.start_as_current_span(
                 "delete_object.delete_version",
                 attributes={"object_version": version_id},

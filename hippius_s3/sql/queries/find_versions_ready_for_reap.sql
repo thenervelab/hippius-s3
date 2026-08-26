@@ -26,12 +26,26 @@
 --
 -- Parameters: $1 = batch size, $2 = cursor deleted_at, $3 = cursor object_id, $4 = cursor object_version
 WITH candidates AS MATERIALIZED (
-    SELECT object_id, object_version, deleted_at
-    FROM object_versions
-    WHERE deleted_at IS NOT NULL
-      AND deleted_at < now() - INTERVAL '1 hour'  -- grace period
-      AND (deleted_at, object_id, object_version) > ($2, $3, $4)  -- keyset ring cursor
-    ORDER BY deleted_at, object_id, object_version
+    SELECT ov.object_id, ov.object_version, ov.deleted_at
+    FROM object_versions ov
+    WHERE ov.deleted_at IS NOT NULL
+      AND ov.deleted_at < now() - INTERVAL '1 hour'  -- grace period
+      AND (ov.deleted_at, ov.object_id, ov.object_version) > ($2, $3, $4)  -- keyset ring cursor
+      -- Only versions that still have something to reap. reap_deleted_version_parts deliberately
+      -- KEEPS the object_versions row as a tombstone (version numbers must stay monotonic, or a
+      -- re-minted number collides with stale FS cache under v<version>/ and lets a queued unpin
+      -- target live data). Nothing marks that row as reaped, so without this predicate every
+      -- already-reaped tombstone re-qualifies as `ready` on every lap and the guarded DELETE runs
+      -- again for a guaranteed `DELETE 0`. The ring would then grow monotonically with every
+      -- versioned DELETE the system ever performs — prod holds one object with 646,993 versions —
+      -- pushing reclamation latency for NEWLY deleted versions out by a full lap. Also naturally
+      -- excludes delete markers, which have no parts and nothing to reclaim.
+      AND EXISTS (
+          SELECT 1 FROM parts p
+          WHERE p.object_id = ov.object_id
+            AND p.object_version = ov.object_version
+      )
+    ORDER BY ov.deleted_at, ov.object_id, ov.object_version
     LIMIT $1
 )
 SELECT

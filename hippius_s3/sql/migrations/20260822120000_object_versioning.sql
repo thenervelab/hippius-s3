@@ -11,7 +11,15 @@
 
 -- A long-running reader can otherwise queue behind these ALTERs and make them wait while they hold
 -- ACCESS EXCLUSIVE, stalling the whole data plane. Failing fast and retrying the deploy is better.
-SET lock_timeout = '3s';
+--
+-- SET LOCAL, not SET: dbmate applies every pending migration over ONE connection, and a plain SET
+-- is session-scoped, so it would survive this COMMIT and still be in force for the CREATE INDEX
+-- CONCURRENTLY in 20260822120001. That build's wait-for-older-snapshots phases take
+-- VirtualXactLock through the lock manager and ARE lock_timeout-sensitive, so any transaction
+-- older than 3s would abort it — leaving an INVALID index that `IF NOT EXISTS` then silently skips
+-- on retry while marking the migration applied. The reap sweep would seq-scan ~146M rows forever
+-- with nothing in the logs to explain it. SET LOCAL reverts at COMMIT.
+SET LOCAL lock_timeout = '3s';
 
 -- Bucket-level versioning state. NULL means "never enabled", which is every bucket that exists
 -- today — so all existing buckets keep their current behaviour and only opt in explicitly.

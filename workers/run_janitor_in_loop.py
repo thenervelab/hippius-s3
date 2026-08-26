@@ -2214,9 +2214,7 @@ async def reap_deleted_object_versions(pool: asyncpg.Pool) -> int:
                     continue
                 reaped += 1
             except Exception as e:
-                logger.warning(
-                    f"Failed to reap object_version {row['object_id']}:{row['object_version']}: {e}"
-                )
+                logger.warning(f"Failed to reap object_version {row['object_id']}:{row['object_version']}: {e}")
 
         last = rows[-1]
         await set_janitor_state(

@@ -1019,7 +1019,7 @@ class ObjectWriter:
             """
             SELECT o.object_id, o.current_object_version AS cov
             FROM objects o
-            WHERE o.bucket_id = $1 AND o.object_key = $2
+            WHERE o.bucket_id = $1 AND o.object_key = $2 AND o.deleted_at IS NULL
             """,
             bucket_id,
             object_key,
@@ -1035,11 +1035,17 @@ class ObjectWriter:
         upload_id = None
 
         async with self.pool.acquire() as conn, conn.transaction():
+            # deleted_at IS NULL: a versioned DELETE can tombstone this version between the
+            # unlocked read of current_object_version above and this lock. Appending onto a
+            # tombstone returns 200 for bytes no read path will ever serve (every resolver filters
+            # deleted_at), and the fresh chunk_backend rows it writes permanently fail the reaper's
+            # "no live backend copy" gate — so the version, its parts and its FS bytes leak forever
+            # while the DELETE's unpin destroys the rest of it.
             locked = await conn.fetchrow(
                 """
                 SELECT append_version
                   FROM object_versions
-                 WHERE object_id = $1 AND object_version = $2
+                 WHERE object_id = $1 AND object_version = $2 AND deleted_at IS NULL
                  FOR UPDATE
                 """,
                 object_id,
