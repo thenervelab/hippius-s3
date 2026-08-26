@@ -581,7 +581,14 @@ async def upload_part(
             request.state.main_account_id,
             datetime.now(timezone.utc),
         )
-        source_bucket = await pool.fetchrow(get_query("get_bucket_by_name"), source_bucket_name)
+        # Owner-scoped, matching CopyObject (copy_helpers.resolve_copy_resources). A name-only
+        # lookup here resolved a source bucket belonging to ANY account, and the ACL layer only
+        # ever authorised the destination — so the pair amounted to a cross-tenant read.
+        source_bucket = await pool.fetchrow(
+            get_query("get_bucket_by_name_and_owner"),
+            source_bucket_name,
+            request.state.main_account_id,
+        )
         if not source_bucket:
             return s3_error_response("NoSuchBucket", f"Bucket {source_bucket_name} does not exist", status_code=404)
 

@@ -10,6 +10,7 @@ from opentelemetry import trace
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.common import parse_version_id
+from hippius_s3.api.s3.object_names import drop_s3_name
 from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.config import get_config
 from hippius_s3.db_retry import retry_on_object_version_conflict
@@ -195,11 +196,22 @@ async def handle_delete_object(
                     Key=object_key,
                     VersionId=str(version_id),
                 )
+            # Deliberately BEFORE drop_s3_name, which mutates: a versioned DELETE names one
+            # version of the object, not one of the S3 names pointing at it, so it must not drop
+            # or promote a name as a side effect.
             with tracer.start_as_current_span(
                 "delete_object.delete_version",
                 attributes={"object_version": version_id},
             ):
                 return await delete_object_version(bucket_id, object_key, version_id, request, db)
+
+        # Same-bucket CopyObject makes extra names for one object_id. "alias"/"promoted" mean the
+        # ciphertext is still reachable under another name, so there is nothing to tombstone or
+        # unpin — and on a versioning-enabled bucket a delete marker would wrongly hide every name.
+        # Only "last" falls through to the real delete below.
+        kind = await drop_s3_name(db, str(bucket_id), object_key)
+        if kind in {"alias", "promoted"}:
+            return Response(status_code=204)
 
         if bucket["versioning_status"] == "Enabled":
             with tracer.start_as_current_span("delete_object.insert_delete_marker"):

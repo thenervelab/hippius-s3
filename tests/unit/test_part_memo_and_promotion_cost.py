@@ -66,6 +66,17 @@ def test_the_memo_forgets_after_its_ttl() -> None:
     assert memo.get("part", now=1_061.0) is None, "expired, so the caller re-derives it"
 
 
+def test_a_put_can_override_ttl_per_entry() -> None:
+    """Negative owner lookups need a shorter TTL than a resolved peer, without a second memo."""
+    memo: PartMemo[str, str] = PartMemo(ttl_seconds=60.0, max_entries=10)
+    memo.put("miss", "none", now=1_000.0, ttl_seconds=0.25)
+    memo.put("hit", "node-b", now=1_000.0)
+
+    assert memo.get("miss", now=1_000.2) == "none"
+    assert memo.get("miss", now=1_000.26) is None
+    assert memo.get("hit", now=1_030.0) == "node-b"
+
+
 def test_the_memo_is_bounded() -> None:
     """A long-lived api pod serving a large working set must not grow this without limit."""
     memo: PartMemo[int, int] = PartMemo(ttl_seconds=60.0, max_entries=3)

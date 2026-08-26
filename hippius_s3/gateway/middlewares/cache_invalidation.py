@@ -9,6 +9,7 @@ from fastapi import Response
 
 from hippius_s3.gateway.repositories.cached_acl_repository import CachedACLRepository
 from hippius_s3.gateway.services.acl_service import ACLService
+from hippius_s3.gateway.utils.paths import collapse_dot_segments
 from hippius_s3.gateway.utils.paths import decoded_path
 
 
@@ -47,7 +48,13 @@ async def cache_invalidation_middleware(
     if not (_is_successful_bucket_delete(request, response) or _is_successful_bucket_create(request, response)):
         return response
 
-    bucket_name = _bucket_from_path(decoded_path(request))
+    # Dot-segments collapsed, but NOT truncated at `#`. Both halves are load-bearing:
+    # `_bucket_from_path` returns None for any path with an inner slash, so an uncollapsed
+    # `PUT /loot/.` created the bucket while skipping this purge and leaving the stale
+    # name->owner entry this middleware exists to evict; and `routing_path` truncates at
+    # `#`, which would purge `legacy` instead of a legacy bucket actually named
+    # `legacy#bucket`, leaving the real entry hot.
+    bucket_name = _bucket_from_path(collapse_dot_segments(decoded_path(request)))
     if not bucket_name:
         return response
 

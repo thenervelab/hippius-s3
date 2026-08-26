@@ -14,7 +14,12 @@ import json
 
 import pytest
 
+from hippius_s3.cache import peers
 from hippius_s3.cache import read_recency
+from hippius_s3.cache.peers import PeerRegistry
+from hippius_s3.cache.peers import encode_fresh_part
+from hippius_s3.cache.peers import fresh_part_key
+from hippius_s3.cache.peers import set_active_registry
 from hippius_s3.writer import landed
 from hippius_s3.writer.landed import LandedPartPublisher
 from hippius_s3.writer.landed import get_landed_publisher
@@ -80,6 +85,7 @@ def _reset_singleton():
     yield
     landed._publisher = None
     read_recency._recorder = None
+    peers._active_registry = None
 
 
 def test_the_queue_key_matches_the_agents(monkeypatch) -> None:
@@ -163,6 +169,44 @@ async def test_write_meta_announces_strictly_after_the_readiness_gate() -> None:
     await writer.write_meta(OBJ, 1, 1, chunk_size=4, num_chunks=1, plain_size=4)
 
     assert order == ["meta", "announce"], "the announcement must follow the readiness gate"
+
+
+@pytest.mark.asyncio
+async def test_write_meta_stamps_the_ingest_node_after_meta_before_announce() -> None:
+    """Wrong-node GETs in the pre-claim window need this hint; it must not precede meta.json."""
+    order: list[str] = []
+
+    class RecordingStore:
+        async def set_meta(self, *_a, **_kw) -> None:
+            order.append("meta")
+
+    class RecordingPublisher:
+        async def publish(self, *_a) -> None:
+            order.append("announce")
+
+    class RecordingRedis:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def set(self, key: str, value: str, ex: int | None = None) -> None:
+            order.append("remember")
+            self.store[key] = value
+
+        async def get(self, key: str) -> str | None:
+            return self.store.get(key)
+
+    redis = RecordingRedis()
+    set_active_registry(PeerRegistry(redis, "node-b", "http://10.42.2.9:8000", 90))
+    landed._publisher = RecordingPublisher()
+    writer = WriteThroughPartsWriter(RecordingStore(), None, ttl_seconds=60)
+
+    await writer.write_meta(OBJ, 1, 1, chunk_size=4, num_chunks=1, plain_size=4)
+
+    assert order == ["meta", "remember", "announce"]
+    assert redis.store[fresh_part_key(OBJ, 1, 1)] == "node-b"
+
+    await writer.write_meta(OBJ, 1, 2, chunk_size=4, num_chunks=1, plain_size=4, cipher_sizes=[36])
+    assert redis.store[fresh_part_key(OBJ, 1, 2)] == encode_fresh_part("node-b", [36])
 
 
 @pytest.mark.asyncio

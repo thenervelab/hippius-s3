@@ -4,11 +4,13 @@ import logging
 from typing import Any
 from typing import NamedTuple
 
+import asyncpg
 from fastapi import Request
 from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.object_names import drop_s3_name
 from hippius_s3.api.s3.objects.delete_object_endpoint import delete_object_version
 from hippius_s3.api.s3.objects.delete_object_endpoint import enqueue_object_unpin
 from hippius_s3.api.s3.objects.delete_object_endpoint import insert_delete_marker
@@ -127,6 +129,20 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                 )
                 continue
 
+            # Version ids are only addressable on a versioning-enabled bucket — see the same guard
+            # in handle_delete_object. This is the path that matters most: the standard prune loop
+            # is list-versions then DeleteObjects with each VersionId, so an unversioned bucket
+            # would walk its whole retained overwrite history resurrecting each prior version.
+            if version_id is not None and not versioning_enabled:
+                errors_list.append(
+                    {
+                        "Key": key,
+                        "Code": "NoSuchVersion",
+                        "Message": "The specified version does not exist; versioning is not enabled on this bucket",
+                    }
+                )
+                continue
+
             # Per-key isolation: one bad key must yield one <Error> entry, not fail the whole
             # 1000-key batch. The plain soft-delete below already worked this way.
             try:
@@ -162,6 +178,36 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                         delete_marker_version_id=resp.headers.get("x-amz-version-id"),
                     )
                 )
+                continue
+
+            try:
+                kind = await drop_s3_name(db, str(bucket_id), key)
+            except asyncpg.UniqueViolationError:
+                logger.exception("drop_s3_name name conflict for key %s", key)
+                errors_list.append(
+                    {
+                        "Key": key,
+                        "Code": "InternalError",
+                        "Message": "Name conflict while deleting",
+                    }
+                )
+                continue
+            except Exception:
+                logger.exception("drop_s3_name failed for key %s", key)
+                errors_list.append(
+                    {
+                        "Key": key,
+                        "Code": "InternalError",
+                        "Message": "Delete failed",
+                    }
+                )
+                continue
+
+            if kind in {"alias", "promoted"}:
+                # deleted_keys holds _DeletedEntry since this PR reshaped the response; appending a
+                # bare str here (as the pre-merge code did) renders an entry with no <Key> at all.
+                # An alias drop is not a version deletion, so both id fields stay absent.
+                deleted_keys.append(_DeletedEntry(key=key, version_id=None, delete_marker_version_id=None))
                 continue
 
             # Soft-delete the object

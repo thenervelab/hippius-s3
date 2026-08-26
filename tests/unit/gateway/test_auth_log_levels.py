@@ -185,3 +185,71 @@ async def test_sigv4_missing_payload_hash_logs_warning(caplog: pytest.LogCapture
     assert matched, "expected the missing-payload-hash rejection to be logged"
     assert all(r.levelname == "WARNING" for r in matched)
     assert not any(r.levelname == "ERROR" for r in matched)
+
+
+@pytest.mark.asyncio
+async def test_missing_payload_hash_returns_400_not_500(caplog: pytest.LogCaptureFixture) -> None:
+    """The whole point of this fix: an AuthParsingError out of signature verification is a
+    malformed-client-request (4xx), and must not fall through to the generic 500 handler.
+
+    Before, the only handler catching it was `except Exception -> 500 InternalError`, so a
+    client that forgot x-amz-content-sha256 got a server error and an ERROR-level log line.
+    """
+    caplog.set_level(logging.DEBUG, logger="hippius_s3.gateway.services.auth_orchestrator")
+    request = make_request(method="PUT")
+    logger = logging.getLogger("hippius_s3.gateway.services.auth_orchestrator")
+
+    with patch(
+        "hippius_s3.gateway.services.auth_orchestrator.verify_access_key_signature",
+        new_callable=AsyncMock,
+        side_effect=AuthParsingError("Missing payload hash header"),
+    ):
+        result = await _authenticate_access_key_header(request, "hip_some_key_12345", logger)
+
+    assert result.is_valid is False
+    assert result.error_response is not None
+    assert result.error_response.status_code == 400
+    body = bytes(result.error_response.body)
+    assert b"MissingSecurityHeader" in body
+    assert b"x-amz-content-sha256" in body
+    assert b"InternalError" not in body
+
+
+@pytest.mark.asyncio
+async def test_missing_payload_hash_logs_warning_not_error_at_the_orchestrator(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Same rejection at the orchestrator boundary is a client 4xx, so WARNING, never ERROR —
+    a matching guarantee to the low-level test above, at the layer that sets the status code."""
+    caplog.set_level(logging.DEBUG, logger="hippius_s3.gateway.services.auth_orchestrator")
+    request = make_request(method="PUT")
+    logger = logging.getLogger("hippius_s3.gateway.services.auth_orchestrator")
+
+    with patch(
+        "hippius_s3.gateway.services.auth_orchestrator.verify_access_key_signature",
+        new_callable=AsyncMock,
+        side_effect=AuthParsingError("Missing payload hash header"),
+    ):
+        await _authenticate_access_key_header(request, "hip_some_key_12345", logger)
+
+    assert not any(r.levelname == "ERROR" for r in caplog.records)
+    assert not _records(caplog, "Unexpected auth error"), "must not reach the generic 500 handler"
+
+
+@pytest.mark.asyncio
+async def test_signature_mismatch_is_still_403_not_400(caplog: pytest.LogCaptureFixture) -> None:
+    """Guard the boundary the other way: a genuine signature mismatch stays a 403, so the new
+    AuthParsingError branch must not swallow the AccessKeyAuthError path."""
+    request = make_request(method="PUT")
+    logger = logging.getLogger("hippius_s3.gateway.services.auth_orchestrator")
+
+    with patch(
+        "hippius_s3.gateway.services.auth_orchestrator.verify_access_key_signature",
+        new_callable=AsyncMock,
+        side_effect=AccessKeyAuthError("Signature mismatch"),
+    ):
+        result = await _authenticate_access_key_header(request, "hip_some_key_12345", logger)
+
+    assert result.error_response is not None
+    assert result.error_response.status_code == 403
+    assert b"SignatureDoesNotMatch" in bytes(result.error_response.body)

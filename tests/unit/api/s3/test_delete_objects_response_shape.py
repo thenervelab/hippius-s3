@@ -113,6 +113,7 @@ async def test_created_marker_reports_delete_marker_version_id(
 
 @pytest.mark.asyncio
 async def test_removed_version_reports_version_id_only(wiring: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    wiring["bucket"]["versioning_status"] = "Enabled"
     from fastapi import Response
 
     async def _del_version(*_a: Any, **_kw: Any) -> Response:
@@ -130,6 +131,7 @@ async def test_removed_version_reports_version_id_only(wiring: dict[str, Any], m
 
 @pytest.mark.asyncio
 async def test_removed_marker_reports_both_ids(wiring: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    wiring["bucket"]["versioning_status"] = "Enabled"
     from fastapi import Response
 
     async def _del_version(*_a: Any, **_kw: Any) -> Response:
