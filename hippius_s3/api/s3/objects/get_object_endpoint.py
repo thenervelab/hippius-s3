@@ -15,6 +15,7 @@ from opentelemetry import trace
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.common import apply_response_overrides
+from hippius_s3.api.s3.common import body_blake3_headers
 from hippius_s3.api.s3.common import if_none_match_matches
 from hippius_s3.api.s3.common import parse_range
 from hippius_s3.api.s3.common import parse_read_mode
@@ -397,6 +398,12 @@ async def handle_get_object(
         if response.status_code in (200, 206):
             object_version = int(object_info.get("object_version") or 1)
             response.headers["x-amz-version-id"] = str(object_version)
+            # Same pair HEAD emits: S3 clients treat HEAD and GET headers as interchangeable, so a
+            # HEAD advertising metadata GET withholds is the divergence that had ListObjects and
+            # ListObjectVersions disagreeing about the same key. Both omit these on a 304, which is
+            # consistent between the two and matches how an ETag-only 304 behaves.
+            for _hdr, _val in body_blake3_headers(object_info).items():
+                response.headers[_hdr] = _val
             apply_response_overrides(response.headers, response_overrides)
 
             bytes_transferred = int(object_info["size_bytes"])

@@ -239,13 +239,21 @@ services:
         ]
       # start_interval probes every 2s while the container is starting, so `up --wait` learns
       # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
-      # to 30s: this spawns a python interpreter and imports the config each time (~0.3s), and at
-      # 5s across four workers that was ~24% of a core burning continuously for no added signal.
+      # to 30s: this spawns a python interpreter and imports the config each time, and at 5s
+      # across four workers that was ~24% of a core burning continuously for no added signal.
+      #
+      # timeout is 45s, not the 10s this shipped with, because the probe's cost is wildly
+      # arch-dependent. It imports the whole config module chain: ~0.3s on a native x86 runner,
+      # but 8-10s idle and 38-60s under startup contention when the amd64 image runs under qemu
+      # on an arm64 Mac. At 10s that flapped straight to `unhealthy` and `up --wait` failed, so
+      # the local e2e stack was unusable on Apple Silicon while CI stayed green. Detection of a
+      # genuinely wedged worker is correspondingly slower; that is the right trade against
+      # breaking every arm64 developer.
       interval: 30s
       start_interval: 2s
-      timeout: 10s
+      timeout: 45s
       retries: 3
-      start_period: 15s
+      start_period: 30s
     networks:
       - hippius_net
 
@@ -273,13 +281,21 @@ services:
         ]
       # start_interval probes every 2s while the container is starting, so `up --wait` learns
       # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
-      # to 30s: this spawns a python interpreter and imports the config each time (~0.3s), and at
-      # 5s across four workers that was ~24% of a core burning continuously for no added signal.
+      # to 30s: this spawns a python interpreter and imports the config each time, and at 5s
+      # across four workers that was ~24% of a core burning continuously for no added signal.
+      #
+      # timeout is 45s, not the 10s this shipped with, because the probe's cost is wildly
+      # arch-dependent. It imports the whole config module chain: ~0.3s on a native x86 runner,
+      # but 8-10s idle and 38-60s under startup contention when the amd64 image runs under qemu
+      # on an arm64 Mac. At 10s that flapped straight to `unhealthy` and `up --wait` failed, so
+      # the local e2e stack was unusable on Apple Silicon while CI stayed green. Detection of a
+      # genuinely wedged worker is correspondingly slower; that is the right trade against
+      # breaking every arm64 developer.
       interval: 30s
       start_interval: 2s
-      timeout: 10s
+      timeout: 45s
       retries: 3
-      start_period: 15s
+      start_period: 30s
     deploy:
       replicas: 1
     restart: unless-stopped
@@ -314,13 +330,21 @@ services:
         ]
       # start_interval probes every 2s while the container is starting, so `up --wait` learns
       # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
-      # to 30s: this spawns a python interpreter and imports the config each time (~0.3s), and at
-      # 5s across four workers that was ~24% of a core burning continuously for no added signal.
+      # to 30s: this spawns a python interpreter and imports the config each time, and at 5s
+      # across four workers that was ~24% of a core burning continuously for no added signal.
+      #
+      # timeout is 45s, not the 10s this shipped with, because the probe's cost is wildly
+      # arch-dependent. It imports the whole config module chain: ~0.3s on a native x86 runner,
+      # but 8-10s idle and 38-60s under startup contention when the amd64 image runs under qemu
+      # on an arm64 Mac. At 10s that flapped straight to `unhealthy` and `up --wait` failed, so
+      # the local e2e stack was unusable on Apple Silicon while CI stayed green. Detection of a
+      # genuinely wedged worker is correspondingly slower; that is the right trade against
+      # breaking every arm64 developer.
       interval: 30s
       start_interval: 2s
-      timeout: 10s
+      timeout: 45s
       retries: 3
-      start_period: 15s
+      start_period: 30s
     deploy:
       replicas: 1
     restart: unless-stopped
@@ -366,13 +390,21 @@ services:
         ]
       # start_interval probes every 2s while the container is starting, so `up --wait` learns
       # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
-      # to 30s: this spawns a python interpreter and imports the config each time (~0.3s), and at
-      # 5s across four workers that was ~24% of a core burning continuously for no added signal.
+      # to 30s: this spawns a python interpreter and imports the config each time, and at 5s
+      # across four workers that was ~24% of a core burning continuously for no added signal.
+      #
+      # timeout is 45s, not the 10s this shipped with, because the probe's cost is wildly
+      # arch-dependent. It imports the whole config module chain: ~0.3s on a native x86 runner,
+      # but 8-10s idle and 38-60s under startup contention when the amd64 image runs under qemu
+      # on an arm64 Mac. At 10s that flapped straight to `unhealthy` and `up --wait` failed, so
+      # the local e2e stack was unusable on Apple Silicon while CI stayed green. Detection of a
+      # genuinely wedged worker is correspondingly slower; that is the right trade against
+      # breaking every arm64 developer.
       interval: 30s
       start_interval: 2s
-      timeout: 10s
+      timeout: 45s
       retries: 3
-      start_period: 15s
+      start_period: 30s
     networks:
       - hippius_net
 

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
+from typing import Any
+from typing import Mapping
 from typing import Protocol
 
 from starlette.datastructures import QueryParams
@@ -8,6 +11,43 @@ from starlette.datastructures import QueryParams
 
 class _HeadersLike(Protocol):
     def __setitem__(self, key: str, value: str, /) -> None: ...
+
+
+_BLAKE3_HEX = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+def body_blake3_headers(info: Mapping[str, Any]) -> dict[str, str]:
+    """The plaintext-BLAKE3 headers for an object version, or {} when there is nothing to say.
+
+    Always emits the SCOPE alongside the digest, because the digest does not cover the same bytes
+    on every upload path and nothing in the value itself reveals which:
+
+      full         simple PUT — the digest covers the whole body.
+      first-chunk  multipart — only chunk 0 of part 1 (HIPPIUS_CHUNK_SIZE_BYTES, 4 MiB default)
+                   was hashed; see object_writer.mpu_upload_part_stream.
+      prefix       the object was appended to (S4). Append materialises its delta as a new part on
+                   the SAME version and never rehashes, so the stored digest still describes only
+                   the bytes that were there before — a leading prefix of what Content-Length now
+                   reports. This is the dangerous case: the value is stale but non-NULL, so
+                   without the qualifier it would look like a current whole-body digest.
+
+    Without this, `X-Hippius-Body-Blake3` reads as "BLAKE3 of the body I just gave you" and a
+    client verifying a multipart or appended object gets a guaranteed mismatch. AWS has the same
+    problem and solves it the same way (`x-amz-checksum-type: FULL_OBJECT | COMPOSITE`).
+
+    The digest is validated rather than trusted: the column is plain `text` with no CHECK, and a
+    value carrying CRLF or non-latin-1 would turn a GET into a 500 at header-encoding time.
+    """
+    digest = info.get("body_blake3")
+    if not isinstance(digest, str) or not _BLAKE3_HEX.match(digest):
+        return {}
+    if int(info.get("append_version") or 0):
+        scope = "prefix"
+    elif info.get("multipart"):
+        scope = "first-chunk"
+    else:
+        scope = "full"
+    return {"X-Hippius-Body-Blake3": digest, "X-Hippius-Body-Blake3-Scope": scope}
 
 
 RESPONSE_OVERRIDE_PARAMS: dict[str, str] = {

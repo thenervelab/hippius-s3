@@ -13,6 +13,7 @@ from opentelemetry import trace
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.common import apply_response_overrides
+from hippius_s3.api.s3.common import body_blake3_headers
 from hippius_s3.api.s3.common import if_none_match_matches
 from hippius_s3.api.s3.common import parse_response_overrides
 from hippius_s3.api.s3.common import parse_version_id
@@ -258,6 +259,14 @@ async def handle_head_object(
                 0,  # chunk_index (0-based)
             )
         headers["X-Hippius-Arion-File-Hash"] = arion_hash or "pending"
+
+        # A DIFFERENT value from the header above, deliberately, and the two must not be conflated:
+        #   X-Hippius-Arion-File-Hash  chunk_backend.backend_identifier — Arion's id for the first
+        #                              ENCRYPTED chunk. Says where the bytes live on the backend.
+        #   X-Hippius-Body-Blake3      BLAKE3 of the PLAINTEXT. Says what the object contains, and
+        #                              is what ListObjects surfaces in Owner.ID.
+        # The paired -Scope header states which bytes the digest covers; see body_blake3_headers.
+        headers.update(body_blake3_headers(row))
 
         # Append version header if present. HD-3: the download query's outer SELECT now returns
         # append_version, so no fallback JOIN is needed.

@@ -36,6 +36,12 @@ DIGEST_QUERIES = [
     "list_objects_delimited",
     "console_list_objects",
     "get_recent_uploads_for_account",
+    # The object surfaces: HEAD/GET emit X-Hippius-Body-Blake3 from these. HEAD picks the light
+    # query for a plain request and the versioned one for ?versionId, so both must carry it or the
+    # header silently disappears on one path only.
+    "get_object_head_by_path",
+    "get_object_for_download_with_permissions",
+    "get_object_for_download_with_permissions_by_version",
 ]
 
 
@@ -43,8 +49,18 @@ DIGEST_QUERIES = [
 async def seeded() -> AsyncGenerator[tuple[asyncpg.Connection, dict], None]:
     try:
         conn = await asyncpg.connect(_DB_URL)
-    except Exception as exc:  # noqa: BLE001 - integration tier skips when PG is absent
+    except OSError as exc:  # only an unreachable server is a legitimate skip
         pytest.skip(f"postgres unavailable: {exc}")
+
+    # A reachable-but-unmigrated database is NOT a skip. Skipping there reports "7 passed,
+    # 6 skipped" — a green run in which every DB assertion silently vanished, which is the same
+    # false-green that let the crash-looping e2e workers go unnoticed for months. Fail loudly.
+    if not await conn.fetchval(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'object_versions' AND column_name = 'body_blake3'"
+    ):
+        await conn.close()
+        pytest.fail("object_versions.body_blake3 is missing — run `python -m hippius_s3.scripts.migrate`")
 
     tx = conn.transaction()
     await tx.start()
@@ -132,3 +148,59 @@ async def test_the_digest_is_invisible_to_the_unpin_worklist(seeded: tuple[async
         ids["object_id"],
     )
     assert cids == [], "a plaintext digest must never be collectable as a CID to unpin"
+
+
+async def test_head_and_download_queries_expose_the_digest(seeded: tuple[asyncpg.Connection, dict]) -> None:
+    """The three object queries HEAD and GET resolve through must all return it."""
+    conn, ids = seeded
+    head = await conn.fetchrow(get_query("get_object_head_by_path"), ids["name"], "k/digest.bin")
+    assert head is not None and head["body_blake3"] == DIGEST
+
+    plain = await conn.fetchrow(get_query("get_object_for_download_with_permissions"), ids["name"], "k/digest.bin")
+    assert plain is not None and plain["body_blake3"] == DIGEST
+
+    versioned = await conn.fetchrow(
+        get_query("get_object_for_download_with_permissions_by_version"), ids["name"], "k/digest.bin", 1
+    )
+    assert versioned is not None and versioned["body_blake3"] == DIGEST
+
+
+async def test_the_two_head_hashes_are_different_things(seeded: tuple[asyncpg.Connection, dict]) -> None:
+    """X-Hippius-Arion-File-Hash and X-Hippius-Body-Blake3 must never be conflated.
+
+    The first is chunk_backend.backend_identifier — Arion's id for the first ENCRYPTED chunk, i.e.
+    where the bytes live. The second is BLAKE3 of the PLAINTEXT, i.e. what the object contains.
+    They are sourced from different tables and are not derivable from one another; a refactor that
+    collapses them would silently start reporting storage location as content identity.
+    """
+    conn, ids = seeded
+    arion_identifier = "a" * 64
+    part_id, upload_id = uuid.uuid4(), uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO multipart_uploads (upload_id, bucket_id, object_key, is_completed, initiated_at) "
+        "VALUES ($1, $2, 'k/digest.bin', TRUE, now())",
+        upload_id,
+        ids["bucket_id"],
+    )
+    await conn.execute(
+        "INSERT INTO parts (part_id, upload_id, object_id, object_version, part_number, size_bytes, etag, uploaded_at) "
+        "VALUES ($1, $2, $3, 1, 1, 123, 'deadbeef', now())",
+        part_id,
+        upload_id,
+        ids["object_id"],
+    )
+    # chunk_backend.chunk_id references part_chunks.id, a bigserial — take it from RETURNING.
+    chunk_id = await conn.fetchval(
+        "INSERT INTO part_chunks (part_id, chunk_index, cipher_size_bytes) VALUES ($1, 0, 139) RETURNING id",
+        part_id,
+    )
+    await conn.execute(
+        "INSERT INTO chunk_backend (chunk_id, backend, backend_identifier) VALUES ($1, 'arion', $2)",
+        chunk_id,
+        arion_identifier,
+    )
+
+    head = await conn.fetchrow(get_query("get_object_head_by_path"), ids["name"], "k/digest.bin")
+    assert head["arion_file_hash"] == arion_identifier, "storage-location header comes from chunk_backend"
+    assert head["body_blake3"] == DIGEST, "content header comes from object_versions"
+    assert head["arion_file_hash"] != head["body_blake3"], "these are two different identifiers"
