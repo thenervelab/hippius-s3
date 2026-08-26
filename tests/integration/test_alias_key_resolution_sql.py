@@ -163,3 +163,68 @@ async def test_delete_marker_insert_deliberately_does_not_resolve_aliases(
 
     minted = await conn.fetchrow(get_query("insert_delete_marker"), ids["bucket_id"], PRIMARY_KEY)
     assert minted is not None and minted["object_version"] == 3
+
+
+@pytest.mark.asyncio
+async def test_list_object_versions_returns_copied_keys(
+    aliased: tuple[asyncpg.Connection, dict],
+) -> None:
+    """ListObjectVersions must list a copied key, exactly as ListObjects already does.
+
+    The two listings sourced their keys differently: list_objects.sql UNIONs `objects` with
+    `object_names`, list_object_versions.sql read `objects` alone. So a key created by same-bucket
+    CopyObject appeared in one listing and not the other, in the same bucket — and a client
+    enumerating versions to prune old ones never saw the copies at all. Caught on staging before
+    release: HEAD of the copied key returned 200 while ListObjectVersions returned nothing for it.
+    """
+    conn, ids = aliased
+    rows = await conn.fetch(
+        get_query("list_object_versions"), ids["bucket_id"], None, None, None, 1000, None, False
+    )
+    keys = {r["object_key"] for r in rows}
+    assert PRIMARY_KEY in keys, "the primary key must still be listed"
+    assert ALIAS_KEY in keys, "the copied key is invisible to ListObjectVersions"
+
+    # Both names describe the same object, so both carry its full version history.
+    alias_versions = sorted(r["object_version"] for r in rows if r["object_key"] == ALIAS_KEY)
+    assert alias_versions == [1, 2], f"copied key should list both versions, got {alias_versions}"
+
+
+@pytest.mark.asyncio
+async def test_list_object_versions_agrees_with_list_objects_on_which_keys_exist(
+    aliased: tuple[asyncpg.Connection, dict],
+) -> None:
+    """The invariant the bug broke: one bucket, two listings, the same set of keys."""
+    conn, ids = aliased
+    ver = await conn.fetch(
+        get_query("list_object_versions"), ids["bucket_id"], None, None, None, 1000, None, False
+    )
+    plain = await conn.fetch(get_query("list_objects"), ids["bucket_id"], None, None, 1000, None)
+    assert {r["object_key"] for r in ver} == {r["object_key"] for r in plain}
+
+
+@pytest.mark.asyncio
+async def test_list_object_versions_prefix_and_paging_still_bound_the_alias_arm(
+    aliased: tuple[asyncpg.Connection, dict],
+) -> None:
+    """The prefix/marker bounds are repeated inside both UNION arms — they must still filter.
+
+    If the alias arm dropped them it would return every copied key in the bucket regardless of
+    prefix, and lose its index range at the same time.
+    """
+    conn, ids = aliased
+    only_copies = await conn.fetch(
+        get_query("list_object_versions"), ids["bucket_id"], "copies/", None, None, 1000, None, False
+    )
+    assert {r["object_key"] for r in only_copies} == {ALIAS_KEY}
+
+    only_orig = await conn.fetch(
+        get_query("list_object_versions"), ids["bucket_id"], "orig/", None, None, 1000, None, False
+    )
+    assert {r["object_key"] for r in only_orig} == {PRIMARY_KEY}
+
+    # key-marker is exclusive: resuming at the alias key must not re-emit it.
+    after_alias = await conn.fetch(
+        get_query("list_object_versions"), ids["bucket_id"], None, ALIAS_KEY, None, 1000, None, False
+    )
+    assert ALIAS_KEY not in {r["object_key"] for r in after_alias}

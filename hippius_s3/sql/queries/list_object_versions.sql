@@ -16,6 +16,19 @@
 -- not a reserved multipart placeholder" rule. A delete marker is zero-size with no md5, so it
 -- would fail the serveable half — it has to be admitted explicitly or markers would be invisible.
 --
+-- KEYS COME FROM TWO PLACES, assembled exactly as list_objects.sql assembles them. Same-bucket
+-- CopyObject cannot mint a new object_id (the v5 AAD binds bucket_id+object_id), so it attaches a
+-- second name in `object_names` against the same id. Sourcing keys from `objects` alone made every
+-- copied key invisible here while ListObjects still returned it: the two listings disagreed about
+-- which keys exist in one bucket, and a client enumerating versions to prune never saw the copies.
+-- The prefix and marker bounds are repeated INSIDE both arms, not only outside, so each arm keeps
+-- its own bounded (bucket_id, object_key) index range — see the LS-2 note below for why that costs
+-- an order of magnitude if lost.
+--
+-- A delete marker lives on the shared object_id, so it lists under every name of the object,
+-- primary and alias alike. That matches what the read and list paths already do: the marker is the
+-- OBJECT being deleted, so it hides — and here, describes — all of its names.
+--
 -- Parameters:
 --   $1: bucket_id (uuid)
 --   $2: prefix (text, optional)
@@ -32,10 +45,27 @@ SELECT o.object_key,
        ov.body_blake3,
        COALESCE(ov.last_modified, ov.created_at) AS last_modified,
        o.current_object_version
-FROM objects o
+FROM (
+    SELECT o.object_id, o.object_key, o.current_object_version, o.bucket_id
+    FROM objects o
+    WHERE o.bucket_id = $1
+      AND o.deleted_at IS NULL
+      AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
+      AND ($3::text IS NULL OR o.object_key >= $3::text)
+      AND ($6::text IS NULL OR o.object_key < $6::text COLLATE "C")
+    UNION ALL
+    SELECT o.object_id, n.object_key, o.current_object_version, n.bucket_id
+    FROM object_names n
+    JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
+    WHERE n.bucket_id = $1
+      AND ($2::text IS NULL OR n.object_key LIKE $2::text || '%')
+      AND ($3::text IS NULL OR n.object_key >= $3::text)
+      AND ($6::text IS NULL OR n.object_key < $6::text COLLATE "C")
+) o
 JOIN object_versions ov ON ov.object_id = o.object_id
 WHERE o.bucket_id = $1
-  AND o.deleted_at IS NULL
+  -- No o.deleted_at here: the derived table does not project it, and BOTH arms already filter it
+  -- (the objects arm directly, the object_names arm through its join).
   AND ov.deleted_at IS NULL
   AND ov.object_version <= o.current_object_version
   AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
