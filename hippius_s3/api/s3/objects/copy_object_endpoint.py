@@ -55,7 +55,12 @@ async def handle_copy_object(
         src_obj_row = source_object
         src_multipart = is_multipart_object(src_obj_row)
 
-        if str(source_bucket["bucket_id"]) == str(dest_bucket["bucket_id"]):
+        # A copy pinned to a source version can never be an alias. An alias is a second name on the
+        # object_id, so it shows whatever that object's CURRENT version is — for a versioned copy
+        # that is the wrong content immediately (the caller asked for an older version), and it
+        # would keep tracking the source afterwards, which no copy should do. Fall through to the
+        # real byte copy, which snapshots the version that was asked for.
+        if source_version_id is None and str(source_bucket["bucket_id"]) == str(dest_bucket["bucket_id"]):
             aliased = await handle_same_bucket_copy(
                 pool,
                 dest_bucket_id=str(dest_bucket["bucket_id"]),
