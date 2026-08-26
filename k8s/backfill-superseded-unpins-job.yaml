@@ -1,0 +1,67 @@
+# Drain the backlog of superseded object versions that were never unpinned.
+#
+# Until the versioned-delete fix, object DELETE enqueued an unpin for current_object_version only,
+# so every superseded version of a deleted object kept live chunk_backend rows forever — which also
+# wedged the object's hard-delete, since its readiness gate waits on ALL versions being unpinned.
+# Deploying the fix stops new ones accruing; it does not drain what is already there.
+#
+# DEFAULTS TO A DRY RUN. It reports object/version counts and reclaimable bytes and enqueues
+# nothing. To actually enqueue, add --apply to the args below.
+#
+# IMPORTANT: namespace below is hardcoded. Edit between staging and prod runs.
+# Run with:   kubectl create -f k8s/backfill-superseded-unpins-job.yaml
+# Re-run:     kubectl -n <namespace> delete job backfill-superseded-unpins \
+#               && kubectl create -f k8s/backfill-superseded-unpins-job.yaml
+# Inspect:    kubectl -n <namespace> logs job/backfill-superseded-unpins --follow
+#
+# Before applying on prod, run the dry run first and sanity-check the totals against the numbers in
+# object-versions.md (~70k objects, ~5.6 TB). A wildly different figure means something else changed
+# and the run should be reviewed, not started.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backfill-superseded-unpins
+  namespace: hippius-s3-staging
+  labels:
+    app: backfill-superseded-unpins
+    mode: dryrun
+spec:
+  backoffLimit: 0
+  # Long enough for a full scan; the script is keyset-paged and resumes from the start if killed.
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: backfill-superseded-unpins
+        mode: dryrun
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backfill
+          image: hippius-s3:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: hippius-s3-secrets
+            - configMapRef:
+                name: hippius-s3-config
+          command:
+            - python
+            - -m
+            - hippius_s3.scripts.backfill_superseded_version_unpins
+          args:
+            - --dry-run
+            # Only touch objects soft-deleted at least this long ago, so an unpin still in flight
+            # from the normal delete path can land first.
+            - --older-than-hours=24
+            # Paces enqueues so a large backlog cannot flood redis-queues the way the 1.29M-entry
+            # unpin overrun did. Only has an effect with --apply.
+            - --sleep-ms=50
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

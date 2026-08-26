@@ -12,6 +12,10 @@ SELECT o.object_id, o.bucket_id, o.object_key,
        ov.enc_chunk_size_bytes,
        ov.kek_id,
        ov.wrapped_dek,
+       -- Projected because the version-resolution subquery below now ADMITS delete markers (it
+       -- has to — otherwise resolution falls through to the previous content version and serves
+       -- deleted data). Callers that copy or serve these bytes must reject a marker explicitly.
+       ov.is_delete_marker,
        b.bucket_name
 FROM objects o
 JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = (
@@ -20,7 +24,11 @@ JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = (
     FROM object_versions v
     WHERE v.object_id = o.object_id
       AND v.object_version <= o.current_object_version
-      AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+      AND v.deleted_at IS NULL
+      -- A delete marker is zero-size with no md5, so it fails the serveable half of this
+      -- predicate. Admit it explicitly, or resolution silently falls back to the previous
+      -- content version and serves deleted data.
+      AND (v.is_delete_marker OR v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
     ORDER BY v.object_version DESC
     LIMIT 1
 )

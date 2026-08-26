@@ -25,7 +25,9 @@ WITH object_info AS (
         ov.enc_suite_id,
         ov.enc_chunk_size_bytes,
         ov.kek_id,
-        ov.wrapped_dek
+        ov.wrapped_dek,
+        ov.is_delete_marker,
+        COALESCE(ov.last_modified, ov.created_at) AS version_last_modified
     FROM objects o
     JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = (
         -- Prefer current_object_version, but skip incomplete multipart placeholders
@@ -35,7 +37,11 @@ WITH object_info AS (
         FROM object_versions v
         WHERE v.object_id = o.object_id
           AND v.object_version <= o.current_object_version
-          AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+          AND v.deleted_at IS NULL
+          -- A delete marker is zero-size with no md5, so it fails the serveable half of this
+          -- predicate. Admit it explicitly, or resolution silently falls back to the previous
+          -- content version and serves deleted data.
+          AND (v.is_delete_marker OR v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
         ORDER BY v.object_version DESC
         LIMIT 1
     )
@@ -83,6 +89,8 @@ SELECT
     oi.enc_chunk_size_bytes,
     oi.kek_id,
     oi.wrapped_dek,
+    oi.is_delete_marker,
+    oi.version_last_modified,
     (
         SELECT mu.upload_id
         FROM multipart_uploads mu

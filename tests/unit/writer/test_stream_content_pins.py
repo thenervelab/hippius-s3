@@ -64,7 +64,6 @@ def _persisted_blake3(writer: ObjectWriter) -> str | None:
     return None
 
 
-
 @pytest.fixture
 def rig(tmp_path: Any, monkeypatch: Any):
     """ObjectWriter with a known DEK, small chunks, and captured part-placeholder args."""
@@ -112,7 +111,9 @@ async def _put(writer: ObjectWriter, bucket_id: str, *pieces: bytes) -> Any:
     )
 
 
-def _reassemble(fs_store: FileSystemPartsStore, bucket_id: str, object_id: str, num_chunks: int) -> tuple[bytes, list[int]]:
+def _reassemble(
+    fs_store: FileSystemPartsStore, bucket_id: str, object_id: str, num_chunks: int
+) -> tuple[bytes, list[int]]:
     """Decrypt every stored chunk with the known DEK and the exact AAD binding."""
     adapter = CryptoService.get_adapter(SUITE)
     plain = b""
@@ -157,7 +158,9 @@ async def test_etag_is_md5_and_chunks_decrypt_back(rig: Any, name: str) -> None:
     # chunk_cipher_sizes recorded for the DB must match the real ciphertexts, index-ordered.
     assert captured["placeholder"]["chunk_cipher_sizes"] == ct_sizes
 
-    assert _meta_file(fs_store, res.object_id, 1).exists(), "meta.json is the part-complete signal and must exist after success"
+    assert _meta_file(fs_store, res.object_id, 1).exists(), (
+        "meta.json is the part-complete signal and must exist after success"
+    )
 
 
 @pytest.mark.asyncio

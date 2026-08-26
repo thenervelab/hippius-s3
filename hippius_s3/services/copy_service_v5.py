@@ -74,7 +74,7 @@ async def execute_v5_fast_path_copy(
         dest_object_version,
     )
 
-    return build_copy_success_response(md5_hash, copy_created_at)
+    return build_copy_success_response(md5_hash, copy_created_at, int(dest_object_version))
 
 
 async def create_destination_objects(

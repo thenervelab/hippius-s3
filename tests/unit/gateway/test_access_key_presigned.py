@@ -70,7 +70,9 @@ async def test_presigned_url_expired_short_circuits_before_api_call() -> None:
     mock_cached_auth = AsyncMock()
 
     with patch("hippius_s3.gateway.middlewares.access_key_auth.cached_auth", mock_cached_auth):
-        with patch("hippius_s3.gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret") as mock_decrypt:
+        with patch(
+            "hippius_s3.gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"
+        ) as mock_decrypt:
             with patch(
                 "hippius_s3.gateway.middlewares.access_key_auth.create_canonical_request",
                 new_callable=AsyncMock,
@@ -187,14 +189,18 @@ async def test_canonical_query_for_presigned_excludes_signature() -> None:
         return "canonical"
 
     with patch(
-        "hippius_s3.gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
+        "hippius_s3.gateway.middlewares.access_key_auth.cached_auth",
+        new_callable=AsyncMock,
+        return_value=mock_token_response,
     ):
         with patch("hippius_s3.gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with patch(
                 "hippius_s3.gateway.middlewares.access_key_auth.create_canonical_request",
                 new=fake_create_canonical_request,
             ):
-                with patch("hippius_s3.gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
+                with patch(
+                    "hippius_s3.gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"
+                ):
                     token_auth = await verify_access_key_presigned_url(request, access_key, mock_redis)
 
     assert token_auth.access_key == access_key
@@ -256,14 +262,18 @@ async def test_presigned_url_uses_raw_path_for_canonical_path() -> None:
         return "canonical"
 
     with patch(
-        "hippius_s3.gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=mock_token_response
+        "hippius_s3.gateway.middlewares.access_key_auth.cached_auth",
+        new_callable=AsyncMock,
+        return_value=mock_token_response,
     ):
         with patch("hippius_s3.gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with patch(
                 "hippius_s3.gateway.middlewares.access_key_auth.create_canonical_request",
                 new=fake_create_canonical_request,
             ):
-                with patch("hippius_s3.gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"):
+                with patch(
+                    "hippius_s3.gateway.middlewares.access_key_auth.calculate_signature", return_value="deadbeef"
+                ):
                     token_auth = await verify_access_key_presigned_url(request, access_key, mock_redis)
 
     assert token_auth.access_key == access_key

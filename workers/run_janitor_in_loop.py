@@ -2148,6 +2148,94 @@ def _load_hard_delete_cursor(state: dict[str, Any] | None) -> tuple[datetime, st
         return _HARD_DELETE_CURSOR_START
 
 
+_REAP_CURSOR_START: tuple[datetime, str, int] = (_HARD_DELETE_EPOCH, _HARD_DELETE_NIL_UUID, 0)
+
+
+def _load_version_reap_cursor(state: dict[str, Any] | None) -> tuple[datetime, str, int]:
+    """Ring cursor for the version reaper, same contract as _load_hard_delete_cursor plus the
+    version number — a single object can have many soft-deleted versions, so (deleted_at, object_id)
+    alone is not unique. A corrupt cursor restarts the ring, never crashes the phase."""
+    if not state:
+        return _REAP_CURSOR_START
+    try:
+        return (
+            datetime.fromisoformat(state["deleted_at"]),
+            str(state["object_id"]),
+            int(state["object_version"]),
+        )
+    except (TypeError, ValueError, KeyError):
+        return _REAP_CURSOR_START
+
+
+async def reap_deleted_object_versions(pool: asyncpg.Pool) -> int:
+    """Reclaim the `parts` rows of versions left behind by a versioned DELETE, once their backend
+    copies are confirmed gone.
+
+    A versioned DELETE cannot drop those rows itself: the unpinner resolves backend identifiers at
+    processing time by joining parts/part_chunks/chunk_backend, so deleting them in the request
+    handler would strand the queued unpin and leak the backend copy. The endpoint marks
+    object_versions.deleted_at instead (making the version invisible to every read), and this sweep
+    finishes the job.
+
+    The object_versions row itself is deliberately KEPT as a tombstone so version numbers stay
+    monotonic — see reap_deleted_version_parts.sql. It goes away with the object's hard-delete.
+
+    Same ring discipline as gc_soft_deleted_objects: reap only the ready rows, but advance the
+    cursor over the whole slice so an unready head cannot block everything behind it."""
+    async with pool.acquire() as db:
+        cursor = _load_version_reap_cursor(await get_janitor_state(db, "version_reap_cursor"))
+        rows = await db.fetch(
+            get_query("find_versions_ready_for_reap"),
+            config.janitor_hard_delete_batch,
+            *cursor,
+        )
+        if not rows:
+            await set_janitor_state(db, "version_reap_cursor", {})  # ring wrap: restart at the head
+            logger.info("Version-reap cycle: scanned=0 ready=0 reaped=0 wrapped=True")
+            return 0
+
+        ready = sum(1 for r in rows if r["ready"])
+        reaped = 0
+        skipped = 0
+        for row in rows:
+            if not row["ready"]:
+                continue  # cursor still advances past it below — no head-of-line block
+            try:
+                # Guarded delete re-verifies readiness atomically (mirrors the finder), so a
+                # version whose lagging upload landed between the find and here is left untouched.
+                # "DELETE 0" => skipped, not reaped.
+                tag = await db.execute(
+                    get_query("reap_deleted_version_parts"),
+                    row["object_id"],
+                    row["object_version"],
+                )
+                if tag == "DELETE 0":
+                    skipped += 1
+                    continue
+                reaped += 1
+            except Exception as e:
+                logger.warning(f"Failed to reap object_version {row['object_id']}:{row['object_version']}: {e}")
+
+        last = rows[-1]
+        await set_janitor_state(
+            db,
+            "version_reap_cursor",
+            {
+                "deleted_at": last["deleted_at"].isoformat(),
+                "object_id": str(last["object_id"]),
+                "object_version": int(last["object_version"]),
+            },
+        )
+        logger.info(
+            "Version-reap cycle: scanned=%d ready=%d reaped=%d skipped=%d wrapped=False",
+            len(rows),
+            ready,
+            reaped,
+            skipped,
+        )
+    return reaped
+
+
 async def gc_soft_deleted_objects(pool: asyncpg.Pool) -> int:
     """Hard-delete soft-deleted objects whose backends have confirmed unpin, walking a durable keyset
     RING so a permanently-unready head (e.g. a never-replicated CopyObject destination) can no longer
@@ -2361,6 +2449,7 @@ async def run_janitor_loop():
             gc_count = 0
             tmp_count = 0
             hard_deleted = 0
+            versions_reaped = 0
             sql_evicted = 0
 
             # Phase (SQL EVICT): keyset-cursored discovery over fs_cache_inventory evicts only the
@@ -2407,12 +2496,21 @@ async def run_janitor_loop():
             except Exception as e:
                 logger.error(f"Hard delete error: {e}", exc_info=True)
 
+            # Phase E: reap individual object_versions rows left by a versioned DELETE, once their
+            # backend copies are confirmed gone. Same batch cap and ring cursor as Phase D.
+            try:
+                _janitor_phase = 2  # soft_deleted
+                versions_reaped = await reap_deleted_object_versions(db_pool)
+            except Exception as e:
+                logger.error(f"Version reap error: {e}", exc_info=True)
+
             _walk_shard += 1  # advance the shard for next cycle
 
             logger.info(
                 f"Janitor cycle complete: shard={walk_shard}/{shards} publish_sweep={publish_sweep} "
                 f"sql_evicted={sql_evicted} stale={stale_count} abandoned={abandoned_count} gc={gc_count} "
-                f"tmp={tmp_count} hard_deleted={hard_deleted} sentinel_violations={sentinel_violations} "
+                f"tmp={tmp_count} hard_deleted={hard_deleted} versions_reaped={versions_reaped} "
+                f"sentinel_violations={sentinel_violations} "
                 f"aged_orphans={aged_orphans}"
             )
 

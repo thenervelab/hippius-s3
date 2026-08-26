@@ -126,14 +126,20 @@ async def test_presigned_expired_signature_mismatch_logs_warning(caplog: pytest.
     token_response.encrypted_secret = "enc"
     token_response.nonce = "nonce"
 
-    with patch("hippius_s3.gateway.middlewares.access_key_auth.cached_auth", new_callable=AsyncMock, return_value=token_response):
+    with patch(
+        "hippius_s3.gateway.middlewares.access_key_auth.cached_auth",
+        new_callable=AsyncMock,
+        return_value=token_response,
+    ):
         with patch("hippius_s3.gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"):
             with patch(
                 "hippius_s3.gateway.middlewares.access_key_auth.create_canonical_request",
                 new_callable=AsyncMock,
                 return_value="canonical",
             ):
-                with patch("hippius_s3.gateway.middlewares.access_key_auth.calculate_signature", return_value="serversidesig"):
+                with patch(
+                    "hippius_s3.gateway.middlewares.access_key_auth.calculate_signature", return_value="serversidesig"
+                ):
                     with pytest.raises(AccessKeyAuthError):
                         await verify_access_key_presigned_url(request, access_key, AsyncMock())
 

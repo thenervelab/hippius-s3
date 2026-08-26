@@ -268,9 +268,7 @@ class TestSentinelOwnerNeverGrants:
             )
 
     @pytest.mark.asyncio
-    async def test_sentinel_caller_denied_on_a_properly_owned_bucket(
-        self, acl_service: Any, mock_db_pool: Any
-    ) -> None:
+    async def test_sentinel_caller_denied_on_a_properly_owned_bucket(self, acl_service: Any, mock_db_pool: Any) -> None:
         owner_id = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
         acl = await acl_service.canned_acl_to_acl("private", owner_id)
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=acl)
