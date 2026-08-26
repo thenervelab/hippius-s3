@@ -143,3 +143,73 @@ async def test_soft_deleted_version_is_unreachable(conn: asyncpg.Connection) -> 
         _KEY,
     )
     assert await _resolve(conn, 3) is None
+
+
+# ---------------------------------------------------------------------------------------------
+# The UNVERSIONED resolvers, over the same three row shapes.
+#
+# These pick the NEWEST admitted version rather than an explicit one, and they are the hot path:
+# get_object_for_download_with_permissions serves every GET that does not name a versionId.
+#
+# They carry the identical marker-admission predicate, and until now nothing executed it. Verified
+# by mutation on 2026-08-26: deleting `v.is_delete_marker OR` from that query left all 295
+# integration tests passing, while the query silently resolved past the marker to version 1 and
+# served content the client had deleted. That is the single worst outcome in this whole feature,
+# and it was invisible.
+#
+# The fixture's current_object_version is 3 (the marker), so "resolves to the marker" is the
+# correct answer for all three. Falling through to version 1 is the bug.
+# ---------------------------------------------------------------------------------------------
+
+
+_BY_NAME_QUERIES = [
+    "get_object_for_download_with_permissions",
+    "get_object_head_by_path",
+]
+
+
+@pytest.mark.parametrize("query_name", _BY_NAME_QUERIES)
+async def test_unversioned_resolver_stops_at_the_delete_marker(conn: asyncpg.Connection, query_name: str) -> None:
+    """Must resolve TO the marker, never past it.
+
+    Resolving past it returns version 1's bytes for a key the client deleted — a silent read of
+    deleted data on the hottest query in the system.
+    """
+    row = await conn.fetchrow(get_query(query_name), _BUCKET, _KEY)
+    assert row is not None, "the marker itself must resolve; rejecting it is the endpoint's job"
+    assert row["is_delete_marker"] is True, "resolved PAST the delete marker — serving deleted data"
+    assert (row["size_bytes"] or 0) == 0
+
+
+async def test_unversioned_get_object_by_path_stops_at_the_delete_marker(conn: asyncpg.Connection) -> None:
+    """Same rule, but this one is keyed on bucket_id rather than bucket_name."""
+    bucket_id = await conn.fetchval("SELECT bucket_id FROM buckets WHERE bucket_name = $1", _BUCKET)
+    row = await conn.fetchrow(get_query("get_object_by_path"), bucket_id, _KEY)
+    assert row is not None
+    assert row["is_delete_marker"] is True, "resolved PAST the delete marker — serving deleted data"
+
+
+@pytest.mark.parametrize("query_name", _BY_NAME_QUERIES)
+async def test_unversioned_resolver_skips_a_reserved_placeholder(conn: asyncpg.Connection, query_name: str) -> None:
+    """With the marker soft-deleted, version 2 is a reserved MPU placeholder and must be skipped —
+    resolution falls to version 1, the newest COMPLETED version, not to the 0-byte placeholder."""
+    await conn.execute(
+        "UPDATE object_versions SET deleted_at = now() WHERE object_version = 3 AND object_id ="
+        " (SELECT object_id FROM objects WHERE object_key = $1)",
+        _KEY,
+    )
+    row = await conn.fetchrow(get_query(query_name), _BUCKET, _KEY)
+    assert row is not None
+    assert row["object_version"] == 1, "a reserved MPU placeholder must never be served"
+    assert row["is_delete_marker"] is False
+
+
+@pytest.mark.parametrize("query_name", _BY_NAME_QUERIES)
+async def test_unversioned_resolver_ignores_soft_deleted_versions(conn: asyncpg.Connection, query_name: str) -> None:
+    """Every version tombstoned: the key resolves to nothing at all, rather than to a dead row."""
+    await conn.execute(
+        "UPDATE object_versions SET deleted_at = now() WHERE object_id ="
+        " (SELECT object_id FROM objects WHERE object_key = $1)",
+        _KEY,
+    )
+    assert await conn.fetchrow(get_query(query_name), _BUCKET, _KEY) is None
