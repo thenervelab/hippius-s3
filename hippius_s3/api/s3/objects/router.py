@@ -13,6 +13,7 @@ from hippius_s3.api.s3.acl_endpoints import get_object_acl
 from hippius_s3.api.s3.acl_endpoints import invalid_canned_acl_response
 from hippius_s3.api.s3.acl_endpoints import materialize_canned_object_acl
 from hippius_s3.api.s3.acl_endpoints import put_object_acl
+from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.api.s3.multipart import abort_multipart_upload
 from hippius_s3.api.s3.multipart import list_parts_internal
 from hippius_s3.api.s3.multipart import upload_part
@@ -30,6 +31,32 @@ from hippius_s3.db_pool import acquire_with_timeout
 
 router = APIRouter()
 config = get_config()
+
+
+def _reject_version_id(request: Request, object_key: str, subresource: str) -> Response | None:
+    """501 when ?versionId is combined with ?acl or ?tagging, instead of silently ignoring it.
+
+    In AWS both subresources are per-version. Here they are not: tags live in
+    object_versions.metadata and the handlers resolve the CURRENT version, so a versionId in the
+    query string had no effect on which row was read or written. A read returned the current
+    version's tags labelled as an old version's, and — the reason this is a 501 rather than a
+    documentation note — `PUT ?tagging&versionId=N` wrote the tags onto the LIVE version and
+    answered 200. That is the same silent-write-to-the-wrong-version shape as the
+    `DELETE ?versionId` data-loss bug this branch exists to fix.
+
+    Rejecting is the honest answer until tags and ACLs are stored per version. It is
+    unconditional: whether the bucket has versioning enabled makes no difference to the fact that
+    we cannot honour the parameter.
+    """
+    if "versionId" not in request.query_params:
+        return None
+    return s3_error_response(
+        "NotImplemented",
+        f"versionId is not supported on ?{subresource}: tags and ACLs are only addressable on the current version",
+        status_code=501,
+        Key=object_key,
+        VersionId=request.query_params["versionId"],
+    )
 
 
 @router.head("/{bucket_name}/{object_key:path}", status_code=200)
@@ -52,8 +79,12 @@ async def get_object(
 ) -> Response:
     # Handle query variants by delegation
     if "acl" in request.query_params:
+        if (rejected := _reject_version_id(request, object_key, "acl")) is not None:
+            return rejected
         return await get_object_acl(bucket_name, object_key, request)
     if "tagging" in request.query_params:
+        if (rejected := _reject_version_id(request, object_key, "tagging")) is not None:
+            return rejected
         async with pool.acquire() as conn:
             return await tags_get_object_tags(bucket_name, object_key, conn, request.state.main_account_id)
     if "uploadId" in request.query_params:
@@ -72,6 +103,8 @@ async def put_object(
     redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
     if "acl" in request.query_params:
+        if (rejected := _reject_version_id(request, object_key, "acl")) is not None:
+            return rejected
         return await put_object_acl(bucket_name, object_key, request)
     # Write-path ACL extras (formerly wrapped around every object PUT by the ?acl
     # dispatcher): reject an unknown canned ACL before the write, materialize the
@@ -85,6 +118,8 @@ async def put_object(
     if upload_id and part_number:
         response = await upload_part(request, pool)
     elif "tagging" in request.query_params:
+        if (rejected := _reject_version_id(request, object_key, "tagging")) is not None:
+            return rejected
         async with pool.acquire() as conn:
             response = await tags_set_object_tags(bucket_name, object_key, request, conn, request.state.main_account_id)
     elif request.headers.get("x-amz-copy-source"):
@@ -109,6 +144,8 @@ async def delete_object(
         async with pool.acquire() as conn:
             return await abort_multipart_upload(bucket_name, object_key, request, conn)
     if "tagging" in request.query_params:
+        if (rejected := _reject_version_id(request, object_key, "tagging")) is not None:
+            return rejected
         async with pool.acquire() as conn:
             return await tags_delete_object_tags(bucket_name, object_key, conn, request.state.main_account_id)
     # Bound the acquire: the delete handler holds this connection across the
