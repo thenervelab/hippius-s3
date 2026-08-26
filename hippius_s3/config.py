@@ -412,12 +412,18 @@ class Config:
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
     object_cache_fallback_dir: str = env("HIPPIUS_OBJECT_CACHE_FALLBACK_DIR:", convert=str)
-    # How many part directories `chunks_exist_batch` scans at once. That check gates read TTFB
-    # and, on the pool tier, every readdir is an MDS round trip (~6 ms), so scanning a
-    # multi-part object serially costs O(parts) x 6 ms before the first byte. Tunable rather
-    # than fixed because the ceiling is the MDS's tolerance, not ours: raising it shortens our
-    # TTFB and lengthens theirs, and the right split is an operational call under load.
-    fs_store_scan_concurrency: int = env("HIPPIUS_FS_STORE_SCAN_CONCURRENCY:16", convert=int)
+    # Worker count of the dedicated `fs-scan` pool: how many part directories this process may
+    # scan at once for `chunks_exist_batch`, which gates read TTFB. On the pool tier a cold
+    # readdir is ~27 ms, so scanning a multi-part object serially costs O(parts) x 27 ms before
+    # the first byte — 78 parts is ~2.1 s.
+    #
+    # 64 is the top of the range measured from an api-local pod, where cold p50 stayed flat from
+    # 1-way to 64-way (26.6 ms -> 20.7 ms) while throughput scaled 38/s -> 1817/s. Sized for
+    # fault isolation rather than metadata-server tolerance: this method does not change how much
+    # metadata work happens, only when, and a single request is separately capped at a quarter of
+    # this (see chunks_exist_batch) so one read stalled on a slow tier cannot hold the whole pool.
+    # Threads are spawned on demand, so this is a ceiling and not an allocation.
+    fs_store_scan_concurrency: int = env("HIPPIUS_FS_STORE_SCAN_CONCURRENCY:64", convert=int)
     # Copy a pool-served chunk onto this node's local NVMe so the next read of it comes off
     # flash (~6 ms/chunk) instead of CephFS (~40 ms). OFF by default and deliberately so: a
     # promoted copy is only reclaimable by a drain-agent evictor running on the same node, so
