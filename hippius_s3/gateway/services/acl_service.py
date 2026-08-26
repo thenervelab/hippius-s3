@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from redis.exceptions import RedisError
 
 from hippius_s3.gateway.repositories.cached_acl_repository import CachedACLRepository
+from hippius_s3.gateway.utils.accounts import is_sentinel_account_id
 from hippius_s3.models.acl import ACL
 from hippius_s3.models.acl import Grant
 from hippius_s3.models.acl import GranteeType
@@ -94,12 +95,16 @@ class ACLService:
         if grant.grantee.type == GranteeType.ACCESS_KEY:
             return grant.grantee.id == access_key
         if grant.grantee.type == GranteeType.CANONICAL_USER:
+            # Same sentinel trap as the owner match in check_permission: a grant row naming
+            # "anonymous" as a canonical user would be satisfied by every anonymous caller.
+            if is_sentinel_account_id(account_id):
+                return False
             return grant.grantee.id == account_id
         if grant.grantee.type == GranteeType.GROUP:
             if grant.grantee.uri == WellKnownGroups.ALL_USERS:
                 return True
             if grant.grantee.uri == WellKnownGroups.AUTHENTICATED_USERS:
-                return account_id is not None and account_id != "anonymous"
+                return not is_sentinel_account_id(account_id)
         return False
 
     def _permission_implies(self, granted: Permission, required: Permission) -> bool:
@@ -189,7 +194,13 @@ class ACLService:
             for g in acl.grants
         ]
 
-        if account_id and acl.owner.id == account_id:
+        # The owner match is the only check that grants FULL_CONTROL without a stored grant, and
+        # `acl.owner.id` comes straight from `buckets.main_account_id`. Unauthenticated callers
+        # carry the same sentinel id, so a legacy ownerless row (the routes that produced them
+        # were closed in 3880fbec) would match here and grant on a bucket with no public flag and
+        # no ACL row anywhere. Exclude the sentinel on both sides: nobody is the owner of a bucket
+        # nobody owns.
+        if account_id and not is_sentinel_account_id(account_id) and acl.owner.id == account_id:
             logger.info(
                 f"ACL check: account={account_id}, access_key={access_key or 'None'}, bucket={bucket}, "
                 f"key={key or 'None'}, required_perm={permission.value}, owner={acl.owner.id}, "

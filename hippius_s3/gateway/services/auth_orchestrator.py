@@ -261,6 +261,20 @@ async def _authenticate_access_key_header(request: Request, credential: str, log
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
         )
+    except AuthParsingError as e:
+        # A SigV4 header request that omits x-amz-content-sha256 cannot have its canonical
+        # request built (sigv4.create_canonical_request), so this is a malformed client request,
+        # not a server fault — it must be a 4xx, not the 500 the generic handler below produced.
+        # Signature MISMATCHES are AccessKeyAuthError (caught above, 403); the only
+        # AuthParsingError that reaches here is the missing/unbuildable payload-hash header.
+        logger.warning(f"Malformed signed request: {e}")
+        return AuthResult(
+            error_response=s3_error_response(
+                code="MissingSecurityHeader",
+                message="Your request is missing the required header x-amz-content-sha256.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        )
     except Exception as e:
         logger.exception(f"Unexpected auth error: {e}")
         return AuthResult(

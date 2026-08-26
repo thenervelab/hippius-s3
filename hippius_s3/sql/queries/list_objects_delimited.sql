@@ -26,29 +26,44 @@ walk AS (
     FROM p
     CROSS JOIN LATERAL (
         SELECT (
-            SELECT o.object_key
-            FROM objects o
-            WHERE o.bucket_id = p.bucket_id
-              AND o.deleted_at IS NULL
-              AND (p.prefix IS NULL OR o.object_key LIKE p.prefix || '%')
-              AND ($3::text IS NULL OR o.object_key >= $3::text)
+            SELECT k.object_key
+            FROM (
+                SELECT o.object_key, o.object_id, o.current_object_version
+                FROM objects o
+                WHERE o.bucket_id = p.bucket_id
+                  AND o.deleted_at IS NULL
+                  AND (p.prefix IS NULL OR o.object_key LIKE p.prefix || '%')
+                  AND ($3::text IS NULL OR o.object_key >= $3::text)
+                UNION ALL
+                SELECT n.object_key, o.object_id, o.current_object_version
+                FROM object_names n
+                JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
+                WHERE n.bucket_id = p.bucket_id
+                  AND (p.prefix IS NULL OR n.object_key LIKE p.prefix || '%')
+                  AND ($3::text IS NULL OR n.object_key >= $3::text)
+            ) k
+            WHERE (p.prefix IS NULL OR k.object_key LIKE p.prefix || '%')
+              AND ($3::text IS NULL OR k.object_key >= $3::text)
               -- The key is listed only when its NEWEST admitted version is real content. A delete
               -- marker is zero-size with no md5, so it fails the "serveable" half of the predicate
               -- and has to be admitted explicitly — otherwise resolution falls through to the
               -- previous content version and lists a deleted key as though it were still there.
               -- NULL (no admitted version at all) coalesces to TRUE so the key is skipped, which
               -- preserves the EXISTS semantics this replaced.
+              --
+              -- Applied to the union of primary names and aliases: a marker lives on the shared
+              -- object_id, so it hides every name of the object at once.
               AND NOT COALESCE((
                   SELECT v.is_delete_marker
                   FROM object_versions v
-                  WHERE v.object_id = o.object_id
-                    AND v.object_version <= o.current_object_version
+                  WHERE v.object_id = k.object_id
+                    AND v.object_version <= k.current_object_version
                     AND v.deleted_at IS NULL
                     AND (v.is_delete_marker OR v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
                   ORDER BY v.object_version DESC
                   LIMIT 1
               ), TRUE)
-            ORDER BY o.object_key
+            ORDER BY k.object_key
             LIMIT 1
         ) AS object_key
     ) s
@@ -80,29 +95,44 @@ walk AS (
     CROSS JOIN p
     CROSS JOIN LATERAL (
         SELECT (
-            SELECT o.object_key
-            FROM objects o
-            WHERE o.bucket_id = p.bucket_id
-              AND o.deleted_at IS NULL
-              AND (p.prefix IS NULL OR o.object_key LIKE p.prefix || '%')
-              AND o.object_key >= w.next_boundary
+            SELECT k.object_key
+            FROM (
+                SELECT o.object_key, o.object_id, o.current_object_version
+                FROM objects o
+                WHERE o.bucket_id = p.bucket_id
+                  AND o.deleted_at IS NULL
+                  AND (p.prefix IS NULL OR o.object_key LIKE p.prefix || '%')
+                  AND o.object_key >= w.next_boundary
+                UNION ALL
+                SELECT n.object_key, o.object_id, o.current_object_version
+                FROM object_names n
+                JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
+                WHERE n.bucket_id = p.bucket_id
+                  AND (p.prefix IS NULL OR n.object_key LIKE p.prefix || '%')
+                  AND n.object_key >= w.next_boundary
+            ) k
+            WHERE (p.prefix IS NULL OR k.object_key LIKE p.prefix || '%')
+              AND k.object_key >= w.next_boundary
               -- The key is listed only when its NEWEST admitted version is real content. A delete
               -- marker is zero-size with no md5, so it fails the "serveable" half of the predicate
               -- and has to be admitted explicitly — otherwise resolution falls through to the
               -- previous content version and lists a deleted key as though it were still there.
               -- NULL (no admitted version at all) coalesces to TRUE so the key is skipped, which
               -- preserves the EXISTS semantics this replaced.
+              --
+              -- Applied to the union of primary names and aliases: a marker lives on the shared
+              -- object_id, so it hides every name of the object at once.
               AND NOT COALESCE((
                   SELECT v.is_delete_marker
                   FROM object_versions v
-                  WHERE v.object_id = o.object_id
-                    AND v.object_version <= o.current_object_version
+                  WHERE v.object_id = k.object_id
+                    AND v.object_version <= k.current_object_version
                     AND v.deleted_at IS NULL
                     AND (v.is_delete_marker OR v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
                   ORDER BY v.object_version DESC
                   LIMIT 1
               ), TRUE)
-            ORDER BY o.object_key
+            ORDER BY k.object_key
             LIMIT 1
         ) AS object_key
     ) s
@@ -152,7 +182,7 @@ LEFT JOIN LATERAL (
     ) ov
     WHERE o.bucket_id = (SELECT bucket_id FROM p)
       AND o.deleted_at IS NULL
-      AND o.object_key = w.object_key
+      AND o.object_id = resolve_object_id((SELECT bucket_id FROM p), w.object_key)
 ) m ON NOT w.is_prefix
 WHERE NOT w.suppressed
 ORDER BY w.kept

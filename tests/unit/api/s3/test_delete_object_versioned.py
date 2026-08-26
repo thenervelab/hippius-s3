@@ -17,10 +17,12 @@ class _FakeDb:
         versions: list[dict[str, Any]],
         current: int,
         object_id: str = "obj-1",
+        alias_count: int = 0,
     ) -> None:
         self.versions = {int(v["object_version"]): v for v in versions}
         self.current = current
         self.object_id = object_id
+        self.alias_count = alias_count
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
 
     def _record(self, query: str, args: tuple[Any, ...]) -> None:
@@ -45,6 +47,7 @@ class _FakeDb:
                 "current_object_version": self.current,
                 "object_version": row["object_version"] if row else None,
                 "is_delete_marker": bool(row.get("is_delete_marker", False)) if row else False,
+                "alias_count": self.alias_count,
             }
         if query == "soft_delete_object_version":
             v = int(args[1])
@@ -131,12 +134,24 @@ def wiring(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     async def _enqueue(payload: Any = None, **_kw: Any) -> None:
         enqueued.append(payload)
 
+    # drop_s3_name removes ONE S3 name and reports what that meant for the object:
+    #   alias    - the key was only an extra name; the object survives untouched
+    #   promoted - the key was the primary name and an alias took its place; object survives
+    #   last     - that was the only name, so the caller may now delete the object itself
+    # Default "last" keeps the single-name case, which is every pre-alias test in this file.
+    name_drop = {"kind": "last", "calls": []}
+
+    async def _drop_s3_name(_db: Any, bucket_id: str, object_key: str) -> str:
+        name_drop["calls"].append((bucket_id, object_key))
+        return name_drop["kind"]
+
     monkeypatch.setattr(mod, "UserRepository", _FakeUserRepo)
     monkeypatch.setattr(mod, "BucketRepository", _FakeBucketRepo)
     monkeypatch.setattr(mod, "resolve_object_backends", _resolve_backends)
     monkeypatch.setattr(mod, "enqueue_unpin_request", _enqueue)
+    monkeypatch.setattr(mod, "drop_s3_name", _drop_s3_name)
 
-    return {"enqueued": enqueued, "bucket": bucket}
+    return {"enqueued": enqueued, "bucket": bucket, "name_drop": name_drop}
 
 
 def _unpinned_versions(enqueued: list[Any]) -> list[Any]:
@@ -392,3 +407,137 @@ async def test_versioned_delete_that_repoints_stays_version_scoped(wiring: dict[
     assert resp.status_code == 204
     assert "soft_delete_object" not in db.names()
     assert _unpinned_versions(wiring["enqueued"]) == [2]
+
+
+# --- Aliases × versioning ------------------------------------------------------------------
+#
+# A same-bucket CopyObject attaches a SECOND S3 key to one object_id (the v5 AAD binds the id, so
+# a copy cannot mint a new one). Versions therefore hang off the object, not off the name, and the
+# two features meet head-on: a delete marker and a version delete both act on the shared object,
+# while an S3 client believes it is acting on one key.
+
+
+@pytest.mark.asyncio
+async def test_deleting_an_alias_only_drops_that_name(wiring: dict[str, Any]) -> None:
+    """The other key still publishes this ciphertext, so nothing may be destroyed."""
+    wiring["name_drop"]["kind"] = "alias"
+    db = _FakeDb(versions=[{"object_version": 1}], current=1)
+
+    resp = await mod.handle_delete_object("b", "k", _request(), db, None)
+
+    assert resp.status_code == 204
+    assert "soft_delete_object" not in db.names()
+    assert wiring["enqueued"] == [], "unpinning here would destroy the other key's data"
+
+
+@pytest.mark.asyncio
+async def test_promoting_an_alias_leaves_the_object_intact(wiring: dict[str, Any]) -> None:
+    """The primary name went away but an alias took its place — the object is still published."""
+    wiring["name_drop"]["kind"] = "promoted"
+    db = _FakeDb(versions=[{"object_version": 1}], current=1)
+
+    resp = await mod.handle_delete_object("b", "k", _request(), db, None)
+
+    assert resp.status_code == 204
+    assert "soft_delete_object" not in db.names()
+    assert wiring["enqueued"] == []
+
+
+@pytest.mark.asyncio
+async def test_deleting_an_alias_does_not_insert_a_delete_marker(wiring: dict[str, Any]) -> None:
+    """THE interaction guard.
+
+    A marker lives on the shared object_id, so inserting one would hide the object under EVERY
+    name — the client asked to delete one key and would silently lose the other. Dropping the name
+    has to come first.
+    """
+    wiring["bucket"]["versioning_status"] = "Enabled"
+    wiring["name_drop"]["kind"] = "alias"
+    db = _FakeDb(versions=[{"object_version": 1}], current=1)
+
+    resp = await mod.handle_delete_object("b", "k", _request(), db, None)
+
+    assert resp.status_code == 204
+    assert "insert_delete_marker" not in db.names()
+    assert resp.headers.get("x-amz-delete-marker") is None
+    assert wiring["enqueued"] == []
+
+
+@pytest.mark.asyncio
+async def test_last_name_on_a_versioned_bucket_still_inserts_a_marker(wiring: dict[str, Any]) -> None:
+    """With no alias left, the object really is being deleted — normal marker semantics apply."""
+    wiring["bucket"]["versioning_status"] = "Enabled"
+    wiring["name_drop"]["kind"] = "last"
+    db = _FakeDb(versions=[{"object_version": 1}], current=1)
+
+    resp = await mod.handle_delete_object("b", "k", _request(), db, None)
+
+    assert resp.status_code == 204
+    assert "insert_delete_marker" in db.names()
+    assert resp.headers.get("x-amz-delete-marker") == "true"
+
+
+@pytest.mark.asyncio
+async def test_the_name_is_dropped_before_the_object_is_considered(wiring: dict[str, Any]) -> None:
+    """Ordering is the whole fix: name first, object second."""
+    wiring["bucket"]["versioning_status"] = "Enabled"
+    wiring["name_drop"]["kind"] = "last"
+    db = _FakeDb(versions=[{"object_version": 1}], current=1)
+
+    await mod.handle_delete_object("b", "k", _request(), db, None)
+
+    assert wiring["name_drop"]["calls"] == [("bkt-1", "k")]
+    # drop_s3_name is not a fake-db query, so its effect is visible only through the ordering of
+    # what followed: the marker insert must not have happened before it returned "last".
+    assert db.names().index("insert_delete_marker") >= 0
+
+
+@pytest.mark.asyncio
+async def test_versioned_delete_refused_when_another_name_shares_the_object(
+    wiring: dict[str, Any],
+) -> None:
+    """Versions belong to the object_id, so deleting one would remove content published under the
+    other key. S3 says those keys are independent objects, so there is no correct version to
+    delete — refusing is the only non-destructive answer."""
+    wiring["bucket"]["versioning_status"] = "Enabled"
+    db = _FakeDb(
+        versions=[{"object_version": 1}, {"object_version": 2}],
+        current=2,
+        alias_count=1,
+    )
+
+    resp = await mod.handle_delete_object("b", "k", _request("1"), db, None)
+
+    assert resp.status_code == 501
+    assert b"NotImplemented" in resp.body
+    assert "soft_delete_object_version" not in db.names(), "nothing may be destroyed"
+    assert wiring["enqueued"] == []
+    assert db.current == 2
+
+
+@pytest.mark.asyncio
+async def test_versioned_delete_proceeds_when_the_object_has_one_name(wiring: dict[str, Any]) -> None:
+    """The guard is scoped to aliased objects; the ordinary case is unaffected."""
+    wiring["bucket"]["versioning_status"] = "Enabled"
+    db = _FakeDb(
+        versions=[{"object_version": 1}, {"object_version": 2}],
+        current=2,
+        alias_count=0,
+    )
+
+    resp = await mod.handle_delete_object("b", "k", _request("1"), db, None)
+
+    assert resp.status_code == 204
+    assert db.args_for("soft_delete_object_version") == [("obj-1", 1)]
+    assert _unpinned_versions(wiring["enqueued"]) == [1]
+
+
+@pytest.mark.asyncio
+async def test_versioned_delete_never_drops_a_name(wiring: dict[str, Any]) -> None:
+    """A versionId delete is about a version, not a key — the name must survive it."""
+    wiring["bucket"]["versioning_status"] = "Enabled"
+    db = _FakeDb(versions=[{"object_version": 1}, {"object_version": 2}], current=2)
+
+    await mod.handle_delete_object("b", "k", _request("1"), db, None)
+
+    assert wiring["name_drop"]["calls"] == []

@@ -108,9 +108,7 @@ async def conn() -> AsyncGenerator[asyncpg.Connection, None]:
 
 
 async def _resolve(conn: asyncpg.Connection, version: int):
-    return await conn.fetchrow(
-        get_query("get_object_for_download_with_permissions_by_version"), _BUCKET, _KEY, version
-    )
+    return await conn.fetchrow(get_query("get_object_for_download_with_permissions_by_version"), _BUCKET, _KEY, version)
 
 
 async def test_completed_version_resolves(conn: asyncpg.Connection) -> None:

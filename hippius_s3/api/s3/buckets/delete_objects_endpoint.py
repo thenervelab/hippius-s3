@@ -4,11 +4,13 @@ import logging
 from typing import Any
 from typing import NamedTuple
 
+import asyncpg
 from fastapi import Request
 from fastapi import Response
 from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.object_names import drop_s3_name
 from hippius_s3.api.s3.objects.delete_object_endpoint import delete_object_version
 from hippius_s3.api.s3.objects.delete_object_endpoint import enqueue_object_unpin
 from hippius_s3.api.s3.objects.delete_object_endpoint import insert_delete_marker
@@ -128,67 +130,77 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                 continue
 
             # Per-key isolation: one bad key must yield one <Error> entry, not fail the whole
-            # 1000-key batch. The plain soft-delete below already worked this way.
+            # 1000-key batch.
             try:
                 if version_id is not None:
                     resp = await delete_object_version(bucket_id, key, version_id, request, db)
-                elif versioning_enabled:
+                    if resp.status_code >= 300:
+                        # A refusal (e.g. the object is published under more than one key) must be
+                        # reported per key. Reporting it under <Deleted> would tell the client the
+                        # version is gone when nothing was touched.
+                        errors_list.append(
+                            {
+                                "Key": key,
+                                "Code": "NotImplemented" if resp.status_code == 501 else "InternalError",
+                                "Message": "Could not delete this version",
+                            }
+                        )
+                        continue
+                    removed_a_marker = resp.headers.get("x-amz-delete-marker") == "true"
+                    deleted_keys.append(
+                        _DeletedEntry(
+                            key=key,
+                            version_id=str(version_id),
+                            # Removing a marker reports the SAME id in both fields, per AWS.
+                            delete_marker_version_id=str(version_id) if removed_a_marker else None,
+                        )
+                    )
+                    continue
+
+                # Drop the NAME first, exactly as the single-object path does: a same-bucket
+                # CopyObject attaches a second key to one object_id, so deleting one of those keys
+                # must remove only that name. This must precede the delete-marker branch — a marker
+                # lives on the shared object_id and would hide the object under EVERY name.
+                kind = await drop_s3_name(db, str(bucket_id), key)
+                if kind in {"alias", "promoted"}:
+                    deleted_keys.append(_DeletedEntry(key=key, version_id=None, delete_marker_version_id=None))
+                    continue
+
+                if versioning_enabled:
                     resp = await insert_delete_marker(bucket_id, key, db)
+                    deleted_keys.append(
+                        _DeletedEntry(
+                            key=key,
+                            # A created marker reports only DeleteMarkerVersionId — AWS emits no
+                            # VersionId here, and clients read the marker's id from that field to
+                            # undo the delete later.
+                            version_id=None,
+                            delete_marker_version_id=resp.headers.get("x-amz-version-id"),
+                        )
+                    )
+                    continue
+
+                deleted = await db.fetchrow(get_query("soft_delete_object"), bucket_id, key)
+                if deleted:
+                    # NULL version = every version — see enqueue_object_unpin for why the fan-out
+                    # is deferred to the unpinner rather than expanded here (this loop runs up to
+                    # 1000 times per request). Safe because we only get here on "last": no other
+                    # name points at this object_id.
+                    await enqueue_object_unpin(
+                        db,
+                        object_id=str(deleted["object_id"]),
+                        object_version=None,
+                        address=request.state.main_account_id,
+                        ray_id=ray_id,
+                    )
+                # S3 semantics: even if not found, include as Deleted (unless Quiet)
+                deleted_keys.append(_DeletedEntry(key=key, version_id=None, delete_marker_version_id=None))
+            except asyncpg.UniqueViolationError:
+                logger.exception("drop_s3_name name conflict for key %s", key)
+                errors_list.append({"Key": key, "Code": "InternalError", "Message": "Name conflict while deleting"})
             except Exception:
                 logger.exception("Delete failed for key %s", key)
                 errors_list.append({"Key": key, "Code": "InternalError", "Message": "Failed to delete"})
-                continue
-
-            if version_id is not None:
-                removed_a_marker = resp.headers.get("x-amz-delete-marker") == "true"
-                deleted_keys.append(
-                    _DeletedEntry(
-                        key=key,
-                        version_id=str(version_id),
-                        # Removing a marker reports the SAME id in both fields, per AWS.
-                        delete_marker_version_id=str(version_id) if removed_a_marker else None,
-                    )
-                )
-                continue
-
-            if versioning_enabled:
-                deleted_keys.append(
-                    _DeletedEntry(
-                        key=key,
-                        # A created marker reports only DeleteMarkerVersionId — AWS emits no
-                        # VersionId here, and clients read the marker's id from that field to
-                        # undo the delete later.
-                        version_id=None,
-                        delete_marker_version_id=resp.headers.get("x-amz-version-id"),
-                    )
-                )
-                continue
-
-            # Soft-delete the object
-            try:
-                deleted = await db.fetchrow(
-                    get_query("soft_delete_object"),
-                    bucket_id,
-                    key,
-                )
-            except Exception:
-                logger.exception("Soft-delete query failed for key %s", key)
-                deleted = None
-
-            if deleted:
-                # NULL version = every version — see enqueue_object_unpin for why the fan-out is
-                # deferred to the unpinner rather than expanded here (this loop runs up to 1000
-                # times per request).
-                await enqueue_object_unpin(
-                    db,
-                    object_id=str(deleted["object_id"]),
-                    object_version=None,
-                    address=request.state.main_account_id,
-                    ray_id=ray_id,
-                )
-
-            # S3 semantics: even if not found, include as Deleted (unless Quiet)
-            deleted_keys.append(_DeletedEntry(key=key, version_id=None, delete_marker_version_id=None))
 
         # Build XML response
         resp_root = ET.Element(

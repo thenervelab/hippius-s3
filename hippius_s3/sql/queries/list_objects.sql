@@ -16,7 +16,23 @@ SELECT o.object_id,
        ov.status,
        ov.multipart,
        ov.body_blake3
-FROM objects o,
+FROM (
+    SELECT o.object_id, o.object_key, o.created_at, o.current_object_version, o.bucket_id
+    FROM objects o
+    WHERE o.bucket_id = $1
+      AND o.deleted_at IS NULL
+      AND ($2::text IS NULL OR o.object_key LIKE $2::text || '%')
+      AND ($3::text IS NULL OR o.object_key >= $3::text)
+      AND ($5::text IS NULL OR o.object_key < $5::text COLLATE "C")
+    UNION ALL
+    SELECT o.object_id, n.object_key, n.created_at, o.current_object_version, n.bucket_id
+    FROM object_names n
+    JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
+    WHERE n.bucket_id = $1
+      AND ($2::text IS NULL OR n.object_key LIKE $2::text || '%')
+      AND ($3::text IS NULL OR n.object_key >= $3::text)
+      AND ($5::text IS NULL OR n.object_key < $5::text COLLATE "C")
+) o,
      LATERAL (
          -- Skip incomplete multipart placeholders (InitiateMultipartUpload without Complete)
          SELECT v.object_version,
@@ -44,10 +60,16 @@ WHERE o.bucket_id = $1
   -- LS-2: explicit exclusive upper bound so the (bucket_id, object_key) index range is bounded on
   -- both ends even under a generic prepared plan (a sparse prefix no longer scans to partition end).
   AND ($5::text IS NULL OR o.object_key < $5::text COLLATE "C")
-  AND o.deleted_at IS NULL
   -- The key vanishes from the listing when its newest version is a delete marker. This must sit
   -- OUTSIDE the LATERAL: filtering markers inside it would make the subquery fall through to the
   -- previous content version and list a deleted key as though it were still there.
+  --
+  -- A delete marker hides EVERY name of the object, primary and alias alike, because the marker
+  -- lives on the shared object_id. That is intended: a marker is the object being deleted, whereas
+  -- deleting one alias only drops that name (see drop_s3_name).
+  --
+  -- An outer o.deleted_at check is no longer needed: the derived table above applies it to both
+  -- the primary-name and alias branches.
   AND NOT ov.is_delete_marker
 -- DB is C-collation; an explicit COLLATE here would defeat the (bucket_id, object_key) index ordered scan.
 ORDER BY o.object_key

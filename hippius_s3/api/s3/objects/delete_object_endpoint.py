@@ -10,6 +10,7 @@ from opentelemetry import trace
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.common import parse_version_id
+from hippius_s3.api.s3.object_names import drop_s3_name
 from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.config import get_config
 from hippius_s3.db_retry import retry_on_object_version_conflict
@@ -94,6 +95,25 @@ async def delete_object_version(
         object_id = str(row["object_id"])
         is_delete_marker = bool(row["is_delete_marker"])
         was_current = int(row["current_object_version"]) == version_id
+
+        # A same-bucket CopyObject attaches a second S3 key to ONE object_id — the v5 AAD binds the
+        # id, so a copy cannot mint a new one. Versions therefore belong to the object, not to the
+        # name, and destroying one would remove content still published under the other key. S3
+        # semantics say those keys are independent objects, so there is no correct version to
+        # delete here; splitting them means a real re-encrypting copy, which is exactly what the
+        # alias exists to avoid.
+        #
+        # Refusing is the only non-destructive answer. Checked inside the row lock taken above, so
+        # an alias cannot appear between here and the delete.
+        if int(row["alias_count"] or 0) > 0:
+            return errors.s3_error_response(
+                "NotImplemented",
+                "This object is published under more than one key; deleting a single version of it "
+                "is not supported. Delete the other key first, or delete the object without a versionId.",
+                status_code=501,
+                Key=object_key,
+                VersionId=str(version_id),
+            )
 
         deleted = await db.fetchrow(get_query("soft_delete_object_version"), object_id, version_id)
         if not deleted:
@@ -200,6 +220,18 @@ async def handle_delete_object(
                 attributes={"object_version": version_id},
             ):
                 return await delete_object_version(bucket_id, object_key, version_id, request, db)
+
+        # Drop the NAME before considering the object. A same-bucket CopyObject attaches a second
+        # key to one object_id (the v5 AAD binds the id, so a copy cannot mint a new one), and
+        # deleting one of those keys must remove only that name — the ciphertext still belongs to
+        # the other. This has to precede the delete-marker branch too: a marker lives on the shared
+        # object_id, so inserting one would hide the object under EVERY name, not just the one the
+        # client asked to delete.
+        #
+        # "last" means this was the only name, so the object itself is now deletable below.
+        kind = await drop_s3_name(db, str(bucket_id), object_key)
+        if kind in {"alias", "promoted"}:
+            return Response(status_code=204)
 
         if bucket["versioning_status"] == "Enabled":
             with tracer.start_as_current_span("delete_object.insert_delete_marker"):

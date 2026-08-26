@@ -6,6 +6,23 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 
+from hippius_s3.gateway.utils.paths import routing_path
+
+
+def _strip_trailing_slashes(raw: bytes) -> bytes:
+    """Strip trailing slashes from an UNDECODED path, in both spellings.
+
+    `rstrip(b"/")` only sees the literal byte, so a slash sent as `%2F` survived it.
+    """
+    while raw:
+        if raw.endswith(b"/"):
+            raw = raw[:-1]
+        elif raw[-3:].lower() == b"%2f":
+            raw = raw[:-3]
+        else:
+            break
+    return raw
+
 
 async def trailing_slash_normalizer(
     request: Request,
@@ -27,16 +44,19 @@ async def trailing_slash_normalizer(
       path the router will actually serve. Leaving it stale made `PUT /bucket/` parse as
       bucket + EMPTY key: `key is None` was False, so `is_create_bucket` never fired and
       the sub-token branch fell through to `call_next` with no scope check at all.
+
+    The invariant this must leave behind is `routing_path(request) == scope["path"]` — the
+    two views the security layers and the router respectively judge. `scope["path"]` is
+    therefore derived FROM the recomputed routing view rather than stripped independently;
+    stripping each side on its own is what let the two disagree for a `%2F`-spelled slash.
     """
     path = request.url.path
     if path != "/" and path.endswith("/"):
-        request.scope["path"] = path.rstrip("/")
-
         raw = request.scope.get("raw_path")
         if raw is not None:
-            stripped = raw.rstrip(b"/")
-            request.scope["raw_path"] = stripped or b"/"
+            request.scope["raw_path"] = _strip_trailing_slashes(raw) or b"/"
 
         request.scope.pop("_hippius_routing_path", None)
+        request.scope["path"] = routing_path(request) if raw is not None else path.rstrip("/")
 
     return await call_next(request)

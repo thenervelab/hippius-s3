@@ -127,6 +127,15 @@ async def delete_bucket_tags_route(
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
             return await tags_delete_bucket_tags(bucket_name, conn, request.state.main_account_id)
+    # DeleteBucket takes no subresource. Treating every unrecognised one as a bucket delete
+    # meant an ordinary DeleteBucketPolicy / DeleteBucketCors call destroyed the bucket, and
+    # `?acl` arrived graded WRITE_ACP rather than WRITE.
+    if request.query_params:
+        return errors.s3_error_response(
+            "NotImplemented",
+            "The specified operation is not supported.",
+            status_code=501,
+        )
     async with pool.acquire() as conn:
         return await handle_delete_bucket(bucket_name, request, conn, redis_client)
 

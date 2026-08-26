@@ -11,18 +11,21 @@ from .dsn import DEFAULT_DSN
 
 
 def get_object_id_and_version(bucket_name: str, object_key: str, *, dsn: str = DEFAULT_DSN) -> tuple[str, int]:
-    """Fetch (object_id, current_object_version) for a (bucket_name, object_key)."""
+    """Fetch (object_id, current_object_version) for a live primary or alias key.
+
+    Same-bucket CopyObject dest keys live in ``object_names``, not
+    ``objects.object_key``. ``resolve_object_id`` matches GET/HEAD.
+    """
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """
                 SELECT o.object_id, o.current_object_version
-                FROM objects o
-                JOIN buckets b ON b.bucket_id = o.bucket_id
-                WHERE b.bucket_name = %s AND o.object_key = %s
-                ORDER BY o.created_at DESC
+                FROM buckets b
+                JOIN objects o ON o.object_id = resolve_object_id(b.bucket_id, %s)
+                WHERE b.bucket_name = %s
                 LIMIT 1
                 """,
-            (bucket_name, object_key),
+            (object_key, bucket_name),
         )
         row = cur.fetchone()
         if not row:
@@ -50,11 +53,11 @@ def get_object_cids(
         cur.execute(
             """
             SELECT o.object_id, o.current_object_version, b.main_account_id
-            FROM objects o
-            JOIN buckets b ON b.bucket_id = o.bucket_id
-            WHERE b.bucket_name = %s AND o.object_key = %s
+            FROM buckets b
+            JOIN objects o ON o.object_id = resolve_object_id(b.bucket_id, %s)
+            WHERE b.bucket_name = %s
             """,
-            (bucket_name, object_key),
+            (object_key, bucket_name),
         )
         row = cur.fetchone()
         if not row:
@@ -296,7 +299,7 @@ def wait_for_parts_cids(
                     JOIN parts p ON p.object_id = o.object_id AND p.object_version = o.current_object_version
                     JOIN part_chunks pc ON pc.part_id = p.part_id
                     WHERE b.bucket_name = %s
-                      AND o.object_key = %s
+                      AND o.object_id = resolve_object_id(b.bucket_id, %s)
                       AND o.deleted_at IS NULL
                 ),
                 per_part AS (
@@ -375,11 +378,11 @@ def make_all_object_parts_pending(
         cur.execute(
             """
             SELECT o.object_id
-            FROM objects o
-            JOIN buckets b ON b.bucket_id = o.bucket_id
-            WHERE b.bucket_name = %s AND o.object_key = %s
+            FROM buckets b
+            JOIN objects o ON o.object_id = resolve_object_id(b.bucket_id, %s)
+            WHERE b.bucket_name = %s
             """,
-            (bucket_name, object_key),
+            (object_key, bucket_name),
         )
         row = cur.fetchone()
         if not row:

@@ -56,8 +56,7 @@ async def seeded() -> AsyncGenerator[tuple[asyncpg.Connection, dict], None]:
 
     await conn.execute("INSERT INTO users (main_account_id, created_at) VALUES ($1, now())", account)
     await conn.execute(
-        "INSERT INTO buckets (bucket_id, bucket_name, main_account_id, created_at) "
-        "VALUES ($1, $2, $3, now())",
+        "INSERT INTO buckets (bucket_id, bucket_name, main_account_id, created_at) VALUES ($1, $2, $3, now())",
         bucket_id,
         bucket_name,
         account,

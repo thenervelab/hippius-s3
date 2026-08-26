@@ -74,10 +74,18 @@ def wiring(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     async def _noop_unpin(*_a: Any, **_kw: Any) -> None: ...
 
+    # See the fixture in test_delete_object_versioned.py for what the three kinds mean.
+    name_drop = {"kind": "last", "calls": []}
+
+    async def _drop_s3_name(_db: Any, bucket_id: str, object_key: str) -> str:
+        name_drop["calls"].append((bucket_id, object_key))
+        return name_drop["kind"]
+
     monkeypatch.setattr(mod, "UserRepository", _FakeUserRepo)
     monkeypatch.setattr(mod, "BucketRepository", _FakeBucketRepo)
     monkeypatch.setattr(mod, "enqueue_object_unpin", _noop_unpin)
-    return {"bucket": bucket}
+    monkeypatch.setattr(mod, "drop_s3_name", _drop_s3_name)
+    return {"bucket": bucket, "name_drop": name_drop}
 
 
 def _deleted_entries(body: bytes) -> list[dict[str, str]]:
@@ -200,3 +208,63 @@ def test_version_resolving_queries_project_is_delete_marker(query_name: str) -> 
     assert any(p.endswith("is_delete_marker") for p in projections), (
         f"{query_name}.sql resolves versions but never projects is_delete_marker"
     )
+
+
+# --- Aliases in a bulk delete --------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_of_an_alias_reports_deleted_without_destroying(
+    wiring: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The key goes away, the object does not — so no marker and no VersionId to report."""
+    wiring["name_drop"]["kind"] = "alias"
+
+    resp = await mod.handle_delete_objects("b", _request(_body([("k", None)])), _FakeDb(), None)
+
+    assert _deleted_entries(resp.body) == [{"Key": "k"}]
+    assert wiring["name_drop"]["calls"] == [("bkt-1", "k")]
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_of_an_alias_on_a_versioned_bucket_makes_no_marker(
+    wiring: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same interaction guard as the single-object path: a marker would hide every name."""
+    wiring["bucket"]["versioning_status"] = "Enabled"
+    wiring["name_drop"]["kind"] = "alias"
+
+    async def _marker(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("must not insert a delete marker for an alias")
+
+    monkeypatch.setattr(mod, "insert_delete_marker", _marker)
+
+    resp = await mod.handle_delete_objects("b", _request(_body([("k", None)])), _FakeDb(), None)
+
+    entry = _deleted_entries(resp.body)[0]
+    assert "DeleteMarker" not in entry
+
+
+@pytest.mark.asyncio
+async def test_bulk_versioned_delete_refusal_is_reported_as_an_error(
+    wiring: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal must not be dressed up as a successful delete.
+
+    delete_object_version answers 501 when the object is published under more than one key. The
+    batch loop previously appended a <Deleted> entry regardless of status, so the client was told
+    the version was gone while nothing had been touched.
+    """
+    from fastapi import Response
+
+    async def _refuse(*_a: Any, **_kw: Any) -> Response:
+        return Response(status_code=501)
+
+    monkeypatch.setattr(mod, "delete_object_version", _refuse)
+
+    resp = await mod.handle_delete_objects("b", _request(_body([("k", "2")])), _FakeDb(), None)
+
+    assert _deleted_entries(resp.body) == []
+    root = ET.fromstring(resp.body)
+    errors = [{ET.QName(c).localname: (c.text or "") for c in e} for e in root.xpath("./*[local-name()='Error']")]
+    assert errors == [{"Key": "k", "Code": "NotImplemented", "Message": "Could not delete this version"}]
