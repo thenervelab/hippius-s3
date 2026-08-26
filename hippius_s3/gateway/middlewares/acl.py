@@ -107,7 +107,7 @@ def parse_s3_path(path: str) -> tuple[str | None, str | None]:
 # shape, so `PUT /nonexistent?<name>` skips the CreateBucket guards (the sentinel-account check)
 # and still lands on handle_create_bucket. The two lists move together, in that order, and
 # test_subresource_set_covers_every_branch_the_put_router_dispatches pins them.
-BUCKET_PUT_SUBRESOURCES = frozenset({"acl", "tagging", "lifecycle", "policy", "cors", "versioning"})
+BUCKET_PUT_SUBRESOURCES = frozenset({"acl", "tagging", "lifecycle", "policy", "cors", "versioning", "object-lock"})
 
 
 def is_create_bucket_shape(method: str, key: str | None, query_params: dict) -> bool:
@@ -149,6 +149,19 @@ def get_required_permission(
     # upload turn versioning on. Enabling it is also irreversible here (Suspended is a 501), and it
     # changes DELETE semantics for every key in the bucket, so it belongs with the other _ACP ops.
     if "versioning" in query_params:
+        return Permission.READ_ACP if method in ("GET", "HEAD") else Permission.WRITE_ACP
+
+    # Object Lock is a WORM control: turning it on makes objects undeletable for the duration of a
+    # retention period, so mis-grading it is a durability/ransom problem, not just a config leak.
+    # AWS gates the bucket configuration behind s3:PutBucketObjectLockConfiguration and the
+    # per-object surface behind s3:PutObjectRetention / s3:PutObjectLegalHold — all distinct from
+    # s3:PutObject, i.e. "may upload" must never imply "may set retention".
+    #
+    # `retention` / `legal-hold` are Tier 2 and answered 501 by object_lock_guard today. They are
+    # graded here anyway so the gate is already correct when that surface lands, rather than
+    # defaulting to WRITE the moment a handler appears — which is exactly how ?versioning shipped
+    # ungated.
+    if "object-lock" in query_params or "retention" in query_params or "legal-hold" in query_params:
         return Permission.READ_ACP if method in ("GET", "HEAD") else Permission.WRITE_ACP
 
     if "uploads" in query_params or "uploadId" in query_params:

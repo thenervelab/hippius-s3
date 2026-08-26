@@ -74,6 +74,28 @@ class TestAccessControlSubresources:
         """
         assert is_create_bucket_shape("PUT", None, {"versioning": ""}) is False
 
+    @pytest.mark.parametrize("method", ["PUT", "POST", "DELETE"])
+    def test_object_lock_writes_demand_write_acp(self, method: str) -> None:
+        """Object Lock is WORM. "May upload" must never imply "may make objects undeletable"."""
+        assert get_required_permission(method, {"object-lock": ""}, has_key=False) == Permission.WRITE_ACP
+
+    @pytest.mark.parametrize("method", ["GET", "HEAD"])
+    def test_object_lock_reads_demand_read_acp(self, method: str) -> None:
+        assert get_required_permission(method, {"object-lock": ""}, has_key=False) == Permission.READ_ACP
+
+    @pytest.mark.parametrize("subresource", ["retention", "legal-hold"])
+    def test_per_object_worm_subresources_demand_acp(self, subresource: str) -> None:
+        """Tier 2 today (object_lock_guard answers 501), graded now so the gate is already correct
+        when a handler lands — defaulting to WRITE at that moment is how ?versioning shipped
+        ungated."""
+        assert get_required_permission("PUT", {subresource: ""}, has_key=True) == Permission.WRITE_ACP
+        assert get_required_permission("GET", {subresource: ""}, has_key=True) == Permission.READ_ACP
+
+    def test_object_lock_is_not_a_create_bucket_shape(self) -> None:
+        """`PUT /b?object-lock` reaches a real persisting handler, so it must not take the
+        CreateBucket bypass — the same coupling that ?versioning missed."""
+        assert is_create_bucket_shape("PUT", None, {"object-lock": ""}) is False
+
     def test_unknown_method_still_raises(self) -> None:
         with pytest.raises(ValueError):
             get_required_permission("PATCH", {}, has_key=False)
