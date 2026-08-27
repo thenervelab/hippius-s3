@@ -141,6 +141,29 @@ spec:
               value: /var/lib/hippius/local_object_cache
             - name: HIPPIUS_OBJECT_CACHE_FALLBACK_DIR
               value: /var/lib/hippius/object_cache
+            # Peer tier: read a chunk from the node holding it on flash before falling back to
+            # the pool. Prod is pod-networked, so unlike the staging overlay it needs neither
+            # HIPPIUS_PEER_ALLOW_NODE_NETWORK nor a UVICORN_HOST override.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # fetch = what this pod reads from peers; serve = what it hands out. Serve also
+            # requires HIPPIUS_INTERNAL_PEER_SECRET, already present in hippius-s3-secrets.
+            - name: HIPPIUS_PEER_FETCH_ENABLED
+              value: "true"
+            - name: HIPPIUS_PEER_SERVE_ENABLED
+              value: "true"
+            # Warm local flash from remote reads. Requires a drain-agent evictor on the node
+            # to reclaim promoted copies; prod runs drain-agent on every node.
+            - name: HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ
+              value: "true"
+            # Client cap must be >= HTTP_STREAM_PREFETCH_CHUNKS (16) or a reader sheds its own
+            # prefetch window. Serve cap sheds with 503 so peers cannot crowd out local ingest.
+            - name: HIPPIUS_PEER_FETCH_MAX_INFLIGHT
+              value: "16"
+            - name: HIPPIUS_PEER_SERVE_MAX_INFLIGHT
+              value: "16"
           volumeMounts:
             - name: local-ingest
               mountPath: /var/lib/hippius/local_object_cache

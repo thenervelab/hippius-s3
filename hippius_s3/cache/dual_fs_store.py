@@ -378,6 +378,13 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
             )
         return removed
 
+    # These lookups walk local -> pool and stop; only `get_chunk` consults the peer. That is
+    # deliberate. They gate whether the read path enqueues a repair, and the two ways of being
+    # wrong are not symmetric: a false "missing" costs a redundant background fetch, because
+    # `wait_for_chunk` calls `get_chunk` first and the peer still serves the bytes; a false
+    # "present" suppresses the repair and stalls the stream when that peer does not have it.
+    # Pinned by tests/unit/test_dual_store_lookup_tiers.py.
+
     async def get_meta(self, object_id: str, object_version: int, part_number: int) -> Optional[dict]:
         result = await super().get_meta(object_id, object_version, part_number)
         if result is not None:
