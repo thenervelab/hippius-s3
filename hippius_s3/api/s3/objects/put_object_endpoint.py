@@ -243,6 +243,7 @@ async def handle_put_object(
             headers={
                 "ETag": f'"{put_res.etag}"',
                 "x-amz-meta-append-version": "0",
+                "x-amz-version-id": str(int(put_res.object_version)),
             },
         )
 

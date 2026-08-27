@@ -22,6 +22,7 @@ FROM (
       AND ($2::text IS NULL OR n.object_key LIKE $2::text || '%')
 ) o
 JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = o.current_object_version
+ AND NOT ov.is_delete_marker
 JOIN buckets b ON o.bucket_id = b.bucket_id
 LEFT JOIN cids c ON ov.cid_id = c.id
 WHERE o.bucket_id = $1

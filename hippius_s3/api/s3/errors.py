@@ -36,6 +36,11 @@ class S3Error(Exception):
         super().__init__(message)
 
 
+def _latin1_safe(value: str) -> str:
+    """Coerce a header value into something latin-1 can encode, losing only unencodable chars."""
+    return value.encode("latin-1", errors="replace").decode("latin-1")
+
+
 def s3_error_response(
     code: str,
     message: str,
@@ -97,7 +102,12 @@ def s3_error_response(
         "Content-Length": str(len(xml_content)),
         # Help SDKs parse error type/message even when they don't parse XML body
         "x-amz-error-code": code,
-        "x-amz-error-message": message,
+        # Header values are latin-1 on the wire, but `message` routinely carries client input —
+        # an object key, a bucket name, a version id. A key like "日本語.txt" or an emoji would
+        # raise UnicodeEncodeError while starlette serialised the response, turning a clean 404
+        # into a 500 from the error path itself. The XML body is UTF-8 and carries the message
+        # in full; this header is a convenience duplicate, so degrade it rather than fail.
+        "x-amz-error-message": _latin1_safe(message),
     }
 
     if extra_headers:

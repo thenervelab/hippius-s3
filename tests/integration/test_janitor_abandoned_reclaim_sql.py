@@ -219,7 +219,9 @@ async def test_servable_version_with_one_failed_part_is_protected(conn):
     await _seed_version(conn, oid, 1, address="5Fowner", size_bytes=8_388_608, md5_hash="abc-2")
     await _seed_status(conn, oid, 1, 1, status="replicated")
     await _seed_status(conn, oid, 1, 2, status="failed")
-    assert await janitor.is_terminally_abandoned(conn, oid, 1, 2) is False, "a failed part of a servable version is protected"
+    assert await janitor.is_terminally_abandoned(conn, oid, 1, 2) is False, (
+        "a failed part of a servable version is protected"
+    )
 
 
 # ===================================================== FALSE: missing rows

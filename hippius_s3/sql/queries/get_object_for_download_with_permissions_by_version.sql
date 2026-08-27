@@ -13,6 +13,7 @@ WITH object_info AS (
         ov.metadata,
         o.created_at,
         ov.md5_hash,
+        ov.body_blake3,
         ov.append_version,
         b.bucket_name,
         b.is_public,
@@ -24,9 +25,16 @@ WITH object_info AS (
         ov.enc_suite_id,
         ov.enc_chunk_size_bytes,
         ov.kek_id,
-        ov.wrapped_dek
+        ov.wrapped_dek,
+        ov.is_delete_marker,
+        COALESCE(ov.last_modified, ov.created_at) AS version_last_modified
     FROM objects o
-    JOIN object_versions ov ON ov.object_id = o.object_id AND ov.object_version = $3
+    -- A version soft-deleted by a versioned DELETE is gone as far as reads are concerned, even
+    -- though the row lingers until the janitor confirms its backend copies are unpinned.
+    JOIN object_versions ov
+      ON ov.object_id = o.object_id
+     AND ov.object_version = $3
+     AND ov.deleted_at IS NULL
     JOIN buckets b ON o.bucket_id = b.bucket_id
     LEFT JOIN cids c ON ov.cid_id = c.id
     WHERE b.bucket_name = $1
@@ -40,7 +48,13 @@ WITH object_info AS (
       -- resolver's rule is adopted — its `<= current_object_version` bound is deliberately not,
       -- since pinning a version is how you reach one that is not current. A legitimately empty
       -- object stores the md5 of the empty string, so the md5 disjunct still admits it.
-      AND (ov.size_bytes > 0 OR (ov.md5_hash IS NOT NULL AND ov.md5_hash != ''))
+      --
+      -- A delete marker is ALSO zero-size with no md5, and is indistinguishable from a reserved
+      -- placeholder by that rule — but it must stay reachable, because addressing one by version
+      -- is how a client gets the 405 + x-amz-delete-marker that tells it the version is a marker
+      -- rather than missing. Admitting it explicitly keeps both behaviours: placeholders stay
+      -- unreachable, markers resolve and the handler rejects them.
+      AND (ov.is_delete_marker OR ov.size_bytes > 0 OR (ov.md5_hash IS NOT NULL AND ov.md5_hash != ''))
 ),
 multipart_chunks AS (
     -- CIDs are optional: allow cid_id NULL by falling back to parts.ipfs_cid; may still be NULL
@@ -66,6 +80,7 @@ SELECT
     oi.metadata,
     oi.created_at,
     oi.md5_hash,
+    oi.body_blake3,
     oi.bucket_name,
     oi.simple_cid,
     oi.storage_version,
@@ -78,6 +93,8 @@ SELECT
     oi.enc_chunk_size_bytes,
     oi.kek_id,
     oi.wrapped_dek,
+    oi.is_delete_marker,
+    oi.version_last_modified,
     (
         SELECT mu.upload_id
         FROM multipart_uploads mu

@@ -18,10 +18,20 @@ jobs:
     name: Lint & Format (ruff)
     runs-on: ubuntu-latest
     steps:
+      # No `ref:` override — every job in this workflow must check out the SAME tree, and on a
+      # pull_request that is actions/checkout's default: refs/pull/N/merge, i.e. the PR merged into
+      # its base. That is what actually lands, so it is what CI should judge.
+      #
+      # This job used to pin `pull_request.head.sha` while the other six took the default, so lint
+      # judged the branch and everything else judged the merge. A semantic conflict between a PR and
+      # its base then showed up only in e2e and was unreproducible from the branch — see PR #437,
+      # where a filter added on staging silently swallowed delete markers added on the PR.
+      #
+      # Prefer the default over an explicit `merge_commit_sha`: GitHub computes that field
+      # asynchronously, so it can be stale or null on a fresh push.
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Set up Python 3.12.11

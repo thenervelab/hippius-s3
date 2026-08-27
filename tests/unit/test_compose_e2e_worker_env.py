@@ -93,9 +93,7 @@ def test_no_app_service_keeps_a_placebo_healthcheck(base: dict) -> None:
         for name, body in _app_services(base).items()
         if "exit 0" in " ".join((body.get("healthcheck") or {}).get("test") or [])
     ]
-    assert not placebo, (
-        f"these healthchecks pass unconditionally and cannot detect a dead worker: {sorted(placebo)}"
-    )
+    assert not placebo, f"these healthchecks pass unconditionally and cannot detect a dead worker: {sorted(placebo)}"
 
 
 def test_worker_healthchecks_actually_load_the_config(base: dict) -> None:

@@ -15,7 +15,13 @@ from hippius_s3.config import get_config
 # A row claims envelope encryption (storage_version >= 5) but has no usable envelope. Both halves
 # matter: object_reader.py fails on a missing wrapped_dek even when kek_id is present, which the
 # delete_v4.sql runbook query misses because it keys on kek_id alone.
+#
+# Delete markers are excluded: they legitimately carry no envelope (they hold no bytes) and inherit
+# storage_version from their newest sibling, so they match the shape exactly. Counting them here
+# would not just inflate the report — any remediation built on it would delete markers and
+# RESURRECT the objects they hide.
 _BROKEN_V5 = """ov.storage_version >= 5
+    AND NOT ov.is_delete_marker
     AND (ov.kek_id IS NULL OR ov.wrapped_dek IS NULL)"""
 
 _SINCE_CLAUSE = "\n    AND ov.created_at >= NOW() - ($1::int * INTERVAL '1 day')"

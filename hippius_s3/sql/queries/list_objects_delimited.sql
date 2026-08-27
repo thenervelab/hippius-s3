@@ -44,12 +44,25 @@ walk AS (
             ) k
             WHERE (p.prefix IS NULL OR k.object_key LIKE p.prefix || '%')
               AND ($3::text IS NULL OR k.object_key >= $3::text)
-              AND EXISTS (
-                  SELECT 1 FROM object_versions v
+              -- The key is listed only when its NEWEST admitted version is real content. A delete
+              -- marker is zero-size with no md5, so it fails the "serveable" half of the predicate
+              -- and has to be admitted explicitly — otherwise resolution falls through to the
+              -- previous content version and lists a deleted key as though it were still there.
+              -- NULL (no admitted version at all) coalesces to TRUE so the key is skipped, which
+              -- preserves the EXISTS semantics this replaced.
+              --
+              -- Applied to the union of primary names and aliases: a marker lives on the shared
+              -- object_id, so it hides every name of the object at once.
+              AND NOT COALESCE((
+                  SELECT v.is_delete_marker
+                  FROM object_versions v
                   WHERE v.object_id = k.object_id
                     AND v.object_version <= k.current_object_version
-                    AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
-              )
+                    AND v.deleted_at IS NULL
+                    AND (v.is_delete_marker OR v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+                  ORDER BY v.object_version DESC
+                  LIMIT 1
+              ), TRUE)
             ORDER BY k.object_key
             LIMIT 1
         ) AS object_key
@@ -100,12 +113,25 @@ walk AS (
             ) k
             WHERE (p.prefix IS NULL OR k.object_key LIKE p.prefix || '%')
               AND k.object_key >= w.next_boundary
-              AND EXISTS (
-                  SELECT 1 FROM object_versions v
+              -- The key is listed only when its NEWEST admitted version is real content. A delete
+              -- marker is zero-size with no md5, so it fails the "serveable" half of the predicate
+              -- and has to be admitted explicitly — otherwise resolution falls through to the
+              -- previous content version and lists a deleted key as though it were still there.
+              -- NULL (no admitted version at all) coalesces to TRUE so the key is skipped, which
+              -- preserves the EXISTS semantics this replaced.
+              --
+              -- Applied to the union of primary names and aliases: a marker lives on the shared
+              -- object_id, so it hides every name of the object at once.
+              AND NOT COALESCE((
+                  SELECT v.is_delete_marker
+                  FROM object_versions v
                   WHERE v.object_id = k.object_id
                     AND v.object_version <= k.current_object_version
-                    AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
-              )
+                    AND v.deleted_at IS NULL
+                    AND (v.is_delete_marker OR v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+                  ORDER BY v.object_version DESC
+                  LIMIT 1
+              ), TRUE)
             ORDER BY k.object_key
             LIMIT 1
         ) AS object_key
@@ -146,7 +172,11 @@ LEFT JOIN LATERAL (
         FROM object_versions v
         WHERE v.object_id = o.object_id
           AND v.object_version <= o.current_object_version
-          AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+          AND v.deleted_at IS NULL
+          -- A delete marker is zero-size with no md5, so it fails the serveable half of this
+          -- predicate. Admit it explicitly, or resolution silently falls back to the previous
+          -- content version and serves deleted data.
+          AND (v.is_delete_marker OR v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
         ORDER BY v.object_version DESC
         LIMIT 1
     ) ov

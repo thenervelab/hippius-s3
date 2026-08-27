@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from typing import NamedTuple
 
 import asyncpg
 from fastapi import Request
@@ -10,10 +11,11 @@ from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.object_names import drop_s3_name
-from hippius_s3.backend_routing import resolve_object_backends
+from hippius_s3.api.s3.objects.delete_object_endpoint import delete_object_version
+from hippius_s3.api.s3.objects.delete_object_endpoint import enqueue_object_unpin
+from hippius_s3.api.s3.objects.delete_object_endpoint import insert_delete_marker
+from hippius_s3.api.s3.objects.delete_object_endpoint import parse_version_id_or_error
 from hippius_s3.config import get_config
-from hippius_s3.queue import UnpinChainRequest
-from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.utils import get_query
@@ -22,6 +24,16 @@ from hippius_s3.xml_helpers import parse_untrusted_xml
 
 logger = logging.getLogger(__name__)
 config = get_config()
+
+
+class _DeletedEntry(NamedTuple):
+    """One <Deleted> row. AWS splits the two ids: a version that was removed reports VersionId, a
+    delete marker that was created or removed reports DeleteMarkerVersionId, and removing a marker
+    reports both (with the same value). `DeleteMarker` is emitted iff the second id is set."""
+
+    key: str
+    version_id: str | None
+    delete_marker_version_id: str | None
 
 
 def parse_delete_request(root: Any) -> tuple[bool, list[tuple[str, str]]]:
@@ -54,7 +66,8 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
     - Accepts XML body with up to 1000 <Object><Key>...</Key></Object> entries
     - "Quiet" flag suppresses <Deleted> entries when true
     - Non-existent keys are treated as successfully deleted (idempotent)
-    - Versioning is not supported: keys with VersionId yield per-key <Error NotImplemented>
+    - A per-key VersionId deletes exactly that version; without one, a versioning-enabled bucket
+      gets a delete marker and any other bucket is soft-deleted whole
     """
     try:
         # AuthN/AuthZ context
@@ -97,73 +110,111 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
             )
 
         bucket_id = bucket["bucket_id"]
-        deleted_keys: list[str] = []
+        deleted_keys: list[_DeletedEntry] = []
         errors_list: list[dict[str, str]] = []
 
-        for key, version_id in object_entries:
+        ray_id = getattr(request.state, "ray_id", None)
+        versioning_enabled = bucket.get("versioning_status") == "Enabled"
+
+        for key, raw_version in object_entries:
             if not key:
                 # Skip invalid entries
                 errors_list.append({"Key": "", "Code": "MalformedXML", "Message": "Invalid Delete Object entry"})
                 continue
 
-            if version_id:
-                errors_list.append({"Key": key, "Code": "NotImplemented", "Message": "Versioning not supported"})
+            version_id, invalid = parse_version_id_or_error(raw_version or None)
+            if invalid is not None:
+                errors_list.append(
+                    {"Key": key, "Code": "InvalidArgument", "Message": f"Invalid version ID: {raw_version}"}
+                )
                 continue
 
+            # Version ids are only addressable on a versioning-enabled bucket — see the same guard
+            # in handle_delete_object. This is the path that matters most: the standard prune loop
+            # is list-versions then DeleteObjects with each VersionId, so an unversioned bucket
+            # would walk its whole retained overwrite history resurrecting each prior version.
+            if version_id is not None and not versioning_enabled:
+                errors_list.append(
+                    {
+                        "Key": key,
+                        "Code": "NoSuchVersion",
+                        "Message": "The specified version does not exist; versioning is not enabled on this bucket",
+                    }
+                )
+                continue
+
+            # Per-key isolation: one bad key must yield one <Error> entry, not fail the whole
+            # 1000-key batch.
             try:
+                if version_id is not None:
+                    resp = await delete_object_version(bucket_id, key, version_id, request, db)
+                    if resp.status_code >= 300:
+                        # A refusal (e.g. the object is published under more than one key) must be
+                        # reported per key. Reporting it under <Deleted> would tell the client the
+                        # version is gone when nothing was touched.
+                        errors_list.append(
+                            {
+                                "Key": key,
+                                "Code": "NotImplemented" if resp.status_code == 501 else "InternalError",
+                                "Message": "Could not delete this version",
+                            }
+                        )
+                        continue
+                    removed_a_marker = resp.headers.get("x-amz-delete-marker") == "true"
+                    deleted_keys.append(
+                        _DeletedEntry(
+                            key=key,
+                            version_id=str(version_id),
+                            # Removing a marker reports the SAME id in both fields, per AWS.
+                            delete_marker_version_id=str(version_id) if removed_a_marker else None,
+                        )
+                    )
+                    continue
+
+                # Drop the NAME first, exactly as the single-object path does: a same-bucket
+                # CopyObject attaches a second key to one object_id, so deleting one of those keys
+                # must remove only that name. This must precede the delete-marker branch — a marker
+                # lives on the shared object_id and would hide the object under EVERY name.
                 kind = await drop_s3_name(db, str(bucket_id), key)
+                if kind in {"alias", "promoted"}:
+                    deleted_keys.append(_DeletedEntry(key=key, version_id=None, delete_marker_version_id=None))
+                    continue
+
+                if versioning_enabled:
+                    resp = await insert_delete_marker(bucket_id, key, db)
+                    deleted_keys.append(
+                        _DeletedEntry(
+                            key=key,
+                            # A created marker reports only DeleteMarkerVersionId — AWS emits no
+                            # VersionId here, and clients read the marker's id from that field to
+                            # undo the delete later.
+                            version_id=None,
+                            delete_marker_version_id=resp.headers.get("x-amz-version-id"),
+                        )
+                    )
+                    continue
+
+                deleted = await db.fetchrow(get_query("soft_delete_object"), bucket_id, key)
+                if deleted:
+                    # NULL version = every version — see enqueue_object_unpin for why the fan-out
+                    # is deferred to the unpinner rather than expanded here (this loop runs up to
+                    # 1000 times per request). Safe because we only get here on "last": no other
+                    # name points at this object_id.
+                    await enqueue_object_unpin(
+                        db,
+                        object_id=str(deleted["object_id"]),
+                        object_version=None,
+                        address=request.state.main_account_id,
+                        ray_id=ray_id,
+                    )
+                # S3 semantics: even if not found, include as Deleted (unless Quiet)
+                deleted_keys.append(_DeletedEntry(key=key, version_id=None, delete_marker_version_id=None))
             except asyncpg.UniqueViolationError:
                 logger.exception("drop_s3_name name conflict for key %s", key)
-                errors_list.append(
-                    {
-                        "Key": key,
-                        "Code": "InternalError",
-                        "Message": "Name conflict while deleting",
-                    }
-                )
-                continue
+                errors_list.append({"Key": key, "Code": "InternalError", "Message": "Name conflict while deleting"})
             except Exception:
-                logger.exception("drop_s3_name failed for key %s", key)
-                errors_list.append(
-                    {
-                        "Key": key,
-                        "Code": "InternalError",
-                        "Message": "Delete failed",
-                    }
-                )
-                continue
-
-            if kind in {"alias", "promoted"}:
-                deleted_keys.append(key)
-                continue
-
-            # Soft-delete the object
-            try:
-                deleted = await db.fetchrow(
-                    get_query("soft_delete_object"),
-                    bucket_id,
-                    key,
-                )
-            except Exception:
-                logger.exception("Soft-delete query failed for key %s", key)
-                deleted = None
-
-            if deleted:
-                ray_id = getattr(request.state, "ray_id", None)
-                object_id = str(deleted["object_id"])
-                object_version = int(deleted["current_object_version"])
-                db_backends = await resolve_object_backends(db, object_id, object_version)
-                unpin_payload = UnpinChainRequest(
-                    address=request.state.main_account_id,
-                    object_id=object_id,
-                    object_version=object_version,
-                    ray_id=ray_id,
-                    delete_backends=db_backends if db_backends else None,
-                )
-                await enqueue_unpin_request(payload=unpin_payload)
-
-            # S3 semantics: even if not found, include as Deleted (unless Quiet)
-            deleted_keys.append(key)
+                logger.exception("Delete failed for key %s", key)
+                errors_list.append({"Key": key, "Code": "InternalError", "Message": "Failed to delete"})
 
         # Build XML response
         resp_root = ET.Element(
@@ -172,9 +223,14 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
         )
 
         if not quiet:
-            for key in deleted_keys:
+            for entry in deleted_keys:
                 d = ET.SubElement(resp_root, "Deleted")
-                ET.SubElement(d, "Key").text = key
+                ET.SubElement(d, "Key").text = entry.key
+                if entry.version_id:
+                    ET.SubElement(d, "VersionId").text = entry.version_id
+                if entry.delete_marker_version_id:
+                    ET.SubElement(d, "DeleteMarker").text = "true"
+                    ET.SubElement(d, "DeleteMarkerVersionId").text = entry.delete_marker_version_id
 
         for err in errors_list:
             e = ET.SubElement(resp_root, "Error")

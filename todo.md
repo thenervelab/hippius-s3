@@ -318,6 +318,14 @@ Overwriting an object creates a new `object_version` with a new DEK, a new objec
 
 **Proposed**: on successful `update_object_version_metadata` for a new version (see [hippius_s3/writer/db.py](hippius_s3/writer/db.py)), schedule a targeted `fs_store.delete_object(object_id, object_version=prev_version)` once we've confirmed the new version is serving. Has to wait for any in-flight reads against the old version (check by stat-ing atime recency, or just let janitor handle the wind-down).
 
+This section covers only the **local FS bytes**. The worse half — superseded versions keeping their **backend pins** forever, because object DELETE only ever unpinned `current_object_version` — is fixed by the object-versioning work; see [object-versions.md](object-versions.md). Note the two are independent: the janitor's FS eviction is *gated on* live `chunk_backend` rows, so it never unpins anything.
+
+### 5.1b The "serveable version" predicate is copy-pasted across six queries
+
+`v.deleted_at IS NULL AND (v.is_delete_marker OR v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))`, wrapped in the same `ORDER BY object_version DESC LIMIT 1` resolution, now appears in `get_object_by_path.sql`, `get_object_head_by_path.sql`, `get_object_for_download_with_permissions.sql`, `..._by_version.sql`, `list_objects.sql` and `list_objects_delimited.sql` (×3). The duplication predates the versioning work — `get_query()` loads one bare `.sql` file per query with no include/macro mechanism — but the marker clause made it wider.
+
+**Proposed**: a Postgres view (say `admitted_object_versions`) encapsulating the predicate, referenced from each correlated subquery. No new tooling needed; only the view definition needs a migration. **Verify with `EXPLAIN` before committing** — `list_objects_delimited.sql` was perf-tuned against a specific plan (see the LS-2 comments), and a view that becomes a materialization boundary rather than inlining would undo that. Not worth reopening six hot-path queries for on its own; do it next time the predicate changes.
+
 ### 5.2 Soft-deleted objects linger in cache
 
 `chunk_backend.deleted_at` is set on DELETE but the FS copy stays. The ACL/existence check in the read path (`get_object_for_download_with_permissions`) should filter these out before reaching the streamer, but if any legacy path doesn't filter, a stale GET could 200 on data the user believes they deleted.

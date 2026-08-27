@@ -447,6 +447,7 @@ class ObjectWriter:
             chunk_size=chunk_size,
             num_chunks=int(num_chunks),
             plain_size=int(total_size),
+            cipher_sizes=list(chunk_cipher_sizes),
         )
 
         # TAIL scope: finalize the version (size/md5 makes it serveable), create the upload row,
@@ -830,6 +831,7 @@ class ObjectWriter:
                 chunk_size=chunk_size,
                 num_chunks=int(next_chunk_index),
                 plain_size=int(total_size),
+                cipher_sizes=list(chunk_cipher_sizes),
             )
             published = True
         finally:
@@ -1019,6 +1021,9 @@ class ObjectWriter:
             """
             SELECT o.object_id, o.current_object_version AS cov
             FROM objects o
+            -- resolve_object_id already filters o.deleted_at IS NULL on both its arms (the
+            -- primary objects.object_key and the object_names alias table), so this covers the
+            -- soft-deleted-object case too.
             WHERE o.object_id = resolve_object_id($1::uuid, $2)
             """,
             bucket_id,
@@ -1035,11 +1040,17 @@ class ObjectWriter:
         upload_id = None
 
         async with self.pool.acquire() as conn, conn.transaction():
+            # deleted_at IS NULL: a versioned DELETE can tombstone this version between the
+            # unlocked read of current_object_version above and this lock. Appending onto a
+            # tombstone returns 200 for bytes no read path will ever serve (every resolver filters
+            # deleted_at), and the fresh chunk_backend rows it writes permanently fail the reaper's
+            # "no live backend copy" gate — so the version, its parts and its FS bytes leak forever
+            # while the DELETE's unpin destroys the rest of it.
             locked = await conn.fetchrow(
                 """
                 SELECT append_version
                   FROM object_versions
-                 WHERE object_id = $1 AND object_version = $2
+                 WHERE object_id = $1 AND object_version = $2 AND deleted_at IS NULL
                  FOR UPDATE
                 """,
                 object_id,
@@ -1153,14 +1164,24 @@ class ObjectWriter:
         # write. When K appends share an expected_version, whichever finalizes first bumps it; any
         # loser that hasn't started its write yet is rejected here instead of wasting the full write.
         # The finalize CAS below remains the authoritative guard for writes that fully overlap.
-        precheck = await self.pool.fetchval(
-            "SELECT append_version FROM object_versions WHERE object_id = $1 AND object_version = $2",
+        #
+        # deleted_at IS NULL for the same reason the reservation above filters on it: a versioned
+        # DELETE can tombstone this version at any point in the (long) window between reserving and
+        # finalizing. fetchrow rather than fetchval so "row is gone" is distinguishable from "row has
+        # a NULL append_version" — _append_version_conflict treats None as "not a conflict", so a
+        # tombstone read through fetchval would sail past this check.
+        precheck = await self.pool.fetchrow(
+            "SELECT append_version FROM object_versions "
+            "WHERE object_id = $1 AND object_version = $2 AND deleted_at IS NULL",
             object_id,
             int(cov),
         )
-        if _append_version_conflict(precheck, expected_version):
+        if precheck is None:
             await _delete_part_row()
-            raise AppendPreconditionFailed(int(precheck))
+            raise ObjectNotFound("NoSuchKey")
+        if _append_version_conflict(precheck["append_version"], expected_version):
+            await _delete_part_row()
+            raise AppendPreconditionFailed(int(precheck["append_version"]))
 
         try:
             part_res = await self.mpu_upload_part_stream(
@@ -1195,12 +1216,19 @@ class ObjectWriter:
                            md5_hash,
                            (append_etag_md5s IS NOT NULL AND octet_length(append_etag_md5s) > 0) AS has_etag_md5s
                       FROM object_versions
-                     WHERE object_id = $1 AND object_version = $2
+                     WHERE object_id = $1 AND object_version = $2 AND deleted_at IS NULL
                      FOR UPDATE
                     """,
                     object_id,
                     cov,
                 )
+                # The authoritative guard. A versioned DELETE that tombstoned this version while the
+                # body was streaming either took the row lock first — in which case this returns
+                # nothing — or is still blocked behind this FOR UPDATE and lands after we commit.
+                # Without the filter the append succeeded onto the tombstone: 200 for bytes no
+                # resolver will serve, and fresh chunk_backend rows that permanently fail the
+                # reaper's "no live backend copy" gate, so the parts and their FS bytes leak forever
+                # while the DELETE's unpin destroys everything around them.
                 if not locked:
                     raise ObjectNotFound("NoSuchKey")
                 current_version = int(locked["append_version"])
@@ -1261,6 +1289,7 @@ class ObjectWriter:
                            last_modified  = NOW(),
                            last_append_at = NOW()
                      WHERE object_id = $1 AND object_version = $2 AND append_version = $4
+                       AND deleted_at IS NULL
                     RETURNING append_version, md5_hash
                     """,
                     object_id,
@@ -1271,15 +1300,30 @@ class ObjectWriter:
                     str(part_res.etag),
                 )
                 if not updated:
-                    fresh = await conn.fetchval(
-                        "SELECT append_version FROM object_versions WHERE object_id = $1 AND object_version = $2",
+                    # Two different causes reach here, and they are not the same answer to the
+                    # client: the append_version moved (a genuine CAS loss) or the version was
+                    # tombstoned. Reporting the tombstone as AppendPreconditionFailed tells the
+                    # caller "retry with current version N" about an object that no longer exists.
+                    fresh = await conn.fetchrow(
+                        "SELECT append_version FROM object_versions "
+                        "WHERE object_id = $1 AND object_version = $2 AND deleted_at IS NULL",
                         object_id,
                         cov,
                     )
-                    raise AppendPreconditionFailed(int(fresh or 0))
+                    if fresh is None:
+                        raise ObjectNotFound("NoSuchKey")
+                    raise AppendPreconditionFailed(int(fresh["append_version"]))
                 new_append_version_val = int(updated["append_version"])
                 composite_etag = str(updated.get("md5_hash") or "")
         except AppendPreconditionFailed:
+            await _cleanup_part(num_chunks)
+            await _delete_part_row()
+            raise
+        except ObjectNotFound:
+            # Same cleanup as a CAS failure, and required for the same reason. The version was
+            # tombstoned mid-stream, so the part we just wrote belongs to nothing: without this the
+            # parts row and its FS directory are orphaned by the very filter that stops the bad
+            # write — trading a silent-success bug for a silent leak.
             await _cleanup_part(num_chunks)
             await _delete_part_row()
             raise

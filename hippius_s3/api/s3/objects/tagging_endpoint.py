@@ -37,7 +37,7 @@ async def get_object_tags(
             )
 
         try:
-            object_info = await ObjectRepository(db).get_by_path(bucket["bucket_id"], object_key)
+            object_info = await ObjectRepository(db).get_serveable_by_path(bucket["bucket_id"], object_key)
         except Exception:
             object_info = None
         if not object_info:
@@ -94,7 +94,7 @@ async def set_object_tags(
             )
 
         try:
-            object_info = await ObjectRepository(db).get_by_path(bucket["bucket_id"], object_key)
+            object_info = await ObjectRepository(db).get_serveable_by_path(bucket["bucket_id"], object_key)
         except Exception:
             object_info = None
         if not object_info:
@@ -163,7 +163,7 @@ async def delete_object_tags(
             )
 
         try:
-            object_info = await ObjectRepository(db).get_by_path(bucket["bucket_id"], object_key)
+            object_info = await ObjectRepository(db).get_serveable_by_path(bucket["bucket_id"], object_key)
         except Exception:
             object_info = None
         if not object_info:

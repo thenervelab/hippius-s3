@@ -17,27 +17,27 @@ from hippius_s3.api.s3.copy_helpers import resolve_chunk_size
 
 def test_parse_copy_source_valid():
     result = parse_copy_source("/my-bucket/my/key.txt")
-    assert result == ("my-bucket", "my/key.txt")
+    assert result == ("my-bucket", "my/key.txt", None)
 
 
 def test_parse_copy_source_url_encoded():
     result = parse_copy_source("/bucket/key%20with%20spaces.txt")
-    assert result == ("bucket", "key with spaces.txt")
+    assert result == ("bucket", "key with spaces.txt", None)
 
 
-def test_parse_copy_source_with_query_params():
+def test_parse_copy_source_with_version_id():
     result = parse_copy_source("/bucket/key.txt?versionId=123")
-    assert result == ("bucket", "key.txt")
+    assert result == ("bucket", "key.txt", 123)
 
 
 def test_parse_copy_source_with_leading_slash():
     result = parse_copy_source("/bucket/folder/key.txt")
-    assert result == ("bucket", "folder/key.txt")
+    assert result == ("bucket", "folder/key.txt", None)
 
 
 def test_parse_copy_source_without_leading_slash():
     result = parse_copy_source("bucket/key.txt")
-    assert result == ("bucket", "key.txt")
+    assert result == ("bucket", "key.txt", None)
 
 
 def test_parse_copy_source_missing():
@@ -336,3 +336,28 @@ async def test_streaming_copy_streams_via_app_obj_cache():
             )
 
     assert captured["obj_cache"] is app_obj_cache
+
+
+def test_parse_copy_source_version_id_null_alias():
+    # AWS clients send the literal "null" for objects predating versioning; treat it as "current".
+    result = parse_copy_source("/bucket/key.txt?versionId=null")
+    assert result == ("bucket", "key.txt", None)
+
+
+def test_parse_copy_source_other_query_params_ignored():
+    result = parse_copy_source("/bucket/key.txt?partNumber=2")
+    assert result == ("bucket", "key.txt", None)
+
+
+def test_parse_copy_source_version_id_url_encoded_key_preserved():
+    result = parse_copy_source("/bucket/a%20b.txt?versionId=7")
+    assert result == ("bucket", "a b.txt", 7)
+
+
+def test_parse_copy_source_invalid_version_id_rejected():
+    from hippius_s3.api.s3.errors import S3Error
+
+    for bad in ("abc", "0", "-1", "1.5"):
+        with pytest.raises(S3Error) as exc_info:
+            parse_copy_source(f"/bucket/key.txt?versionId={bad}")
+        assert exc_info.value.code == "InvalidArgument"

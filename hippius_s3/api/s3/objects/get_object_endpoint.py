@@ -15,10 +15,12 @@ from opentelemetry import trace
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.common import apply_response_overrides
+from hippius_s3.api.s3.common import body_blake3_headers
 from hippius_s3.api.s3.common import if_none_match_matches
 from hippius_s3.api.s3.common import parse_range
 from hippius_s3.api.s3.common import parse_read_mode
 from hippius_s3.api.s3.common import parse_response_overrides
+from hippius_s3.api.s3.common import parse_version_id
 from hippius_s3.api.s3.range_utils import parse_range_header
 from hippius_s3.config import get_config
 from hippius_s3.monitoring import get_metrics_collector
@@ -66,19 +68,15 @@ async def handle_get_object(
             async with pool.acquire() as conn:
                 return await list_parts_internal(bucket_name, object_key, request, conn)
 
-    # Parse versionId query parameter
-    version_id = None
-    if "versionId" in request.query_params:
-        try:
-            version_id = int(request.query_params["versionId"])
-            if version_id <= 0:
-                raise ValueError("Version must be positive")
-        except (ValueError, TypeError):
-            return errors.s3_error_response(
-                code="InvalidArgument",
-                message=f"Invalid version ID: {request.query_params.get('versionId')}",
-                status_code=400,
-            )
+    # Parse versionId query parameter ("null" means the current version, per AWS)
+    try:
+        version_id = parse_version_id(request.query_params.get("versionId"))
+    except (ValueError, TypeError):
+        return errors.s3_error_response(
+            code="InvalidArgument",
+            message=f"Invalid version ID: {request.query_params.get('versionId')}",
+            status_code=400,
+        )
 
     # Parse read mode and range
     hdr_mode = parse_read_mode(request)
@@ -213,6 +211,35 @@ async def handle_get_object(
                         "object_version": int(object_info.get("object_version") or 1),
                     },
                 )
+
+        # A delete marker has no bytes. AWS answers a plain GET on one with 404 and an explicit
+        # ?versionId= on one with 405, both carrying x-amz-delete-marker: true.
+        if object_info.get("is_delete_marker"):
+            marker_version = int(object_info.get("object_version") or 1)
+            marker_headers = {
+                "x-amz-delete-marker": "true",
+                "x-amz-version-id": str(marker_version),
+            }
+            if version_id is None:
+                return errors.s3_error_response(
+                    code="NoSuchKey",
+                    message=f"The specified key {object_key} does not exist",
+                    status_code=404,
+                    extra_headers=marker_headers,
+                    Key=object_key,
+                )
+            return errors.s3_error_response(
+                code="MethodNotAllowed",
+                message="The specified method is not allowed against this resource.",
+                status_code=405,
+                extra_headers={
+                    **marker_headers,
+                    # The marker's own timestamp — `created_at` is the key's first PUT.
+                    "Last-Modified": object_info["version_last_modified"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                },
+                Key=object_key,
+                VersionId=str(version_id),
+            )
 
         md5_hash = object_info.get("md5_hash") or ""
         if md5_hash and if_none_match_matches(request.headers.get("if-none-match"), md5_hash):
@@ -371,6 +398,12 @@ async def handle_get_object(
         if response.status_code in (200, 206):
             object_version = int(object_info.get("object_version") or 1)
             response.headers["x-amz-version-id"] = str(object_version)
+            # Same pair HEAD emits: S3 clients treat HEAD and GET headers as interchangeable, so a
+            # HEAD advertising metadata GET withholds is the divergence that had ListObjects and
+            # ListObjectVersions disagreeing about the same key. Both omit these on a 304, which is
+            # consistent between the two and matches how an ETag-only 304 behaves.
+            for _hdr, _val in body_blake3_headers(object_info).items():
+                response.headers[_hdr] = _val
             apply_response_overrides(response.headers, response_overrides)
 
             bytes_transferred = int(object_info["size_bytes"])

@@ -17,6 +17,7 @@ import pytest
 from hippius_s3.cache import peers
 from hippius_s3.cache import read_recency
 from hippius_s3.cache.peers import PeerRegistry
+from hippius_s3.cache.peers import encode_fresh_part
 from hippius_s3.cache.peers import fresh_part_key
 from hippius_s3.cache.peers import set_active_registry
 from hippius_s3.writer import landed
@@ -203,6 +204,9 @@ async def test_write_meta_stamps_the_ingest_node_after_meta_before_announce() ->
 
     assert order == ["meta", "remember", "announce"]
     assert redis.store[fresh_part_key(OBJ, 1, 1)] == "node-b"
+
+    await writer.write_meta(OBJ, 1, 2, chunk_size=4, num_chunks=1, plain_size=4, cipher_sizes=[36])
+    assert redis.store[fresh_part_key(OBJ, 1, 2)] == encode_fresh_part("node-b", [36])
 
 
 @pytest.mark.asyncio

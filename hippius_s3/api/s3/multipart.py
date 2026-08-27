@@ -11,7 +11,6 @@ from collections.abc import AsyncIterator
 from datetime import datetime
 from datetime import timezone
 from typing import Any
-from urllib.parse import unquote
 
 import asyncpg
 from fastapi import APIRouter
@@ -24,7 +23,9 @@ from starlette.requests import ClientDisconnect
 
 from hippius_s3 import dependencies
 from hippius_s3 import utils
+from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.common import format_s3_timestamp
+from hippius_s3.api.s3.copy_helpers import parse_copy_source
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.cache import RedisObjectPartsCache
@@ -554,15 +555,14 @@ async def upload_part(
     # Support UploadPartCopy via x-amz-copy-source
     copy_source = request.headers.get("x-amz-copy-source")
     if copy_source:
-        # Parse source bucket/key (may be /bucket/key or bucket/key, URL-encoded)
-        src = unquote(copy_source.strip())
-        if src.startswith("/"):
-            src = src[1:]
-        if "/" not in src:
-            return s3_error_response(
-                "InvalidArgument", "x-amz-copy-source must be in format /bucket/key", status_code=400
-            )
-        source_bucket_name, source_object_key = src.split("/", 1)
+        # Shared with CopyObject so both honour `?versionId=` on the source. The inline parser this
+        # replaced never stripped a query string, so a versioned UploadPartCopy looked for a key
+        # literally named "key?versionId=N" and 404'd — i.e. version restore silently did not work
+        # for any source large enough to need a multipart copy.
+        try:
+            source_bucket_name, source_object_key, source_version_id = parse_copy_source(copy_source.strip())
+        except errors.S3Error as e:
+            return s3_error_response(e.code, e.message, status_code=e.status_code)
 
         # Optional range header: x-amz-copy-source-range: bytes=start-end
         range_header = request.headers.get("x-amz-copy-source-range")
@@ -592,9 +592,35 @@ async def upload_part(
         if not source_bucket:
             return s3_error_response("NoSuchBucket", f"Bucket {source_bucket_name} does not exist", status_code=404)
 
-        source_obj = await pool.fetchrow(get_query("get_object_by_path"), source_bucket["bucket_id"], source_object_key)
+        if source_version_id is None:
+            source_obj = await pool.fetchrow(
+                get_query("get_object_by_path"), source_bucket["bucket_id"], source_object_key
+            )
+        else:
+            source_obj = await pool.fetchrow(
+                get_query("get_object_by_path_and_version"),
+                source_bucket["bucket_id"],
+                source_object_key,
+                source_version_id,
+            )
+            if not source_obj:
+                return s3_error_response(
+                    "NoSuchVersion",
+                    f"The specified version does not exist: {source_version_id}",
+                    status_code=404,
+                )
         if not source_obj:
             return s3_error_response("NoSuchKey", f"Key {source_object_key} not found", status_code=404)
+        if source_obj["is_delete_marker"]:
+            # No bytes to copy. A marker reached as the CURRENT version just looks deleted (404);
+            # only addressing it explicitly by version is a 405 — same split as GET/CopyObject.
+            if source_version_id is None:
+                return s3_error_response("NoSuchKey", f"Key {source_object_key} not found", status_code=404)
+            return s3_error_response(
+                "MethodNotAllowed",
+                "The specified version is a delete marker and has no content",
+                status_code=405,
+            )
 
         # Read source via reader pipeline to obtain plaintext when needed
         # Read plaintext via reader pipeline (parts → plan → stream decrypt)
@@ -1160,6 +1186,7 @@ async def complete_multipart_upload(
                     "Content-Type": "application/xml; charset=utf-8",
                     "x-amz-request-id": str(uuid.uuid4()),
                     "Content-Length": str(len(xml_content)),
+                    "x-amz-version-id": str(int(multipart_upload.get("current_object_version") or 1)),
                 },
             )
 
@@ -1326,6 +1353,7 @@ async def complete_multipart_upload(
             headers={
                 "Content-Type": "application/xml; charset=utf-8",
                 "Content-Length": str(len(xml_bytes)),
+                "x-amz-version-id": str(object_version),
             },
         )
     except Exception as e:

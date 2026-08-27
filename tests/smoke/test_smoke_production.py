@@ -79,12 +79,16 @@ def test_02_upload_simple_file(production_s3_client, session_tracker, file_gener
         },
     )
 
-    assert "ETag" in response, "Simple 1 MB PUT did not return an ETag — the upload was not accepted/acknowledged by the gateway."
+    assert "ETag" in response, (
+        "Simple 1 MB PUT did not return an ETag — the upload was not accepted/acknowledged by the gateway."
+    )
     assert response["ResponseMetadata"]["HTTPStatusCode"] == 200, (
         f"Simple 1 MB PUT returned HTTP {response['ResponseMetadata']['HTTPStatusCode']} instead of 200 — object upload is failing."
     )
     etag = response["ETag"].strip('"')
-    assert not etag.endswith("-"), "Simple PUT returned a multipart-style ETag (ends with '-') — a single-part upload should have a plain MD5 ETag."
+    assert not etag.endswith("-"), (
+        "Simple PUT returned a multipart-style ETag (ends with '-') — a single-part upload should have a plain MD5 ETag."
+    )
 
     session_tracker.add_file(key=key, file_type="simple", size=size, hash_md5=hash_md5, upload_time=upload_time)
 
@@ -113,7 +117,9 @@ def test_03_upload_multipart_file(production_s3_client, session_tracker, file_ge
         },
     )
 
-    assert "UploadId" in create_response, "CreateMultipartUpload did not return an UploadId — multipart uploads cannot be started."
+    assert "UploadId" in create_response, (
+        "CreateMultipartUpload did not return an UploadId — multipart uploads cannot be started."
+    )
     upload_id = create_response["UploadId"]
 
     part_etags = []
@@ -137,7 +143,9 @@ def test_03_upload_multipart_file(production_s3_client, session_tracker, file_ge
         Bucket=session_tracker.bucket, Key=key, UploadId=upload_id, MultipartUpload={"Parts": part_etags}
     )
 
-    assert "ETag" in complete_response, "CompleteMultipartUpload did not return an ETag — the multipart upload failed to finalize."
+    assert "ETag" in complete_response, (
+        "CompleteMultipartUpload did not return an ETag — the multipart upload failed to finalize."
+    )
     final_etag = complete_response["ETag"].strip('"')
     assert final_etag.endswith(f"-{part_count}"), (
         f"Final multipart ETag {final_etag!r} does not end with '-{part_count}' — the completed object was not assembled from all {part_count} parts."

@@ -41,11 +41,16 @@ FROM (
                 v.md5_hash,
                 v.status,
                 v.multipart,
+                v.is_delete_marker,
                 v.body_blake3
          FROM object_versions v
          WHERE v.object_id = o.object_id
            AND v.object_version <= o.current_object_version
-           AND (v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+           AND v.deleted_at IS NULL
+           -- A delete marker is zero-size with no md5, so it fails the serveable half of this
+           -- predicate. Admit it explicitly, or resolution silently falls back to the previous
+           -- content version and serves deleted data.
+           AND (v.is_delete_marker OR v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
          ORDER BY v.object_version DESC
          LIMIT 1
      ) ov
@@ -55,6 +60,16 @@ WHERE o.bucket_id = $1
   -- LS-2: explicit exclusive upper bound so the (bucket_id, object_key) index range is bounded on
   -- both ends even under a generic prepared plan (a sparse prefix no longer scans to partition end).
   AND ($5::text IS NULL OR o.object_key < $5::text COLLATE "C")
+  -- No o.deleted_at here: the derived table above does not project it, and BOTH union arms
+  -- already filter it (the objects arm directly, the object_names arm through its join).
+  -- The key vanishes from the listing when its newest version is a delete marker. This must sit
+  -- OUTSIDE the LATERAL: filtering markers inside it would make the subquery fall through to the
+  -- previous content version and list a deleted key as though it were still there.
+  --
+  -- A delete marker hides EVERY name of the object, primary and alias alike, because the marker
+  -- lives on the shared object_id. That is intended: a marker is the object being deleted, whereas
+  -- deleting one alias only drops that name (see drop_s3_name).
+  AND NOT ov.is_delete_marker
 -- DB is C-collation; an explicit COLLATE here would defeat the (bucket_id, object_key) index ordered scan.
 ORDER BY o.object_key
 LIMIT $4::int
