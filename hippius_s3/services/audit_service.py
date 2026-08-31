@@ -29,6 +29,8 @@ class AuditLogger:
         content_length: int | str,
         timestamp: float,
         ray_id: str = "no-ray-id",
+        total_time_ms: float | None = None,
+        pre_handler_ms: float | None = None,
     ) -> None:
         if self.should_skip(path, client_ip):
             return
@@ -46,6 +48,14 @@ class AuditLogger:
             "processing_time_ms": round(processing_time_ms, 2),
             "content_length": content_length,
         }
+
+        # Added rather than folded into processing_time_ms: dashboards, alerts and the
+        # /s3-prod-health collector all parse that field, and silently widening what it measures
+        # would move every historical baseline without anyone noticing.
+        if total_time_ms is not None:
+            audit_data["total_time_ms"] = round(total_time_ms, 2)
+        if pre_handler_ms is not None:
+            audit_data["pre_handler_ms"] = round(pre_handler_ms, 2)
 
         if status_code >= 500:
             self.logger.error(f"S3_OPERATION_ERROR: {json.dumps(audit_data)}")
