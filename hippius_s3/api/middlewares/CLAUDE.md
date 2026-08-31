@@ -37,7 +37,7 @@ Threshold is configurable (see [hippius_s3/config.py](../../config.py)); today i
 
 ## [metrics.py](metrics.py) — `metrics_middleware`
 
-OTel counters for `http_requests_total`, duration histogram, account-attributed error counts; stamps `X-Hippius-API-Time-Ms` on responses.
+OTel counters for `http_requests_total`, duration histogram, account-attributed error counts; stamps `X-Hippius-API-Time-Ms` on responses. Also records `http_request_ttfb_seconds`: origin TTFB measured from `gateway_start_time` to the first accepted upload byte (via a `request._receive` wrap) for body-carrying requests, or to response start for everything else. Bucket boundaries for the request histograms are pinned by Views in [hippius_s3/otel_setup.py](../../otel_setup.py) — the SDK defaults are millisecond-scale and unusable for seconds-unit histograms.
 
 ## [tracing.py](tracing.py) — `tracing_middleware`
 

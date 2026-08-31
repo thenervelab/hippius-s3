@@ -12,6 +12,8 @@ from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.instrumentation.redis import RedisInstrumentor
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation
+from opentelemetry.sdk.metrics.view import View
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -20,6 +22,34 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 logger = logging.getLogger(__name__)
 
 _otel_configured_pid: int | None = None
+
+# The SDK's default histogram boundaries are (0, 5, 10, 25, ..., 10000) — designed for values
+# in MILLISECONDS. Our request histograms record SECONDS, so without a View nearly every sample
+# lands in the first two buckets and histogram_quantile() on the Grafana side interpolates almost
+# blind: a p95 read off those panels is mostly bucket-edge arithmetic, not data. These boundaries
+# put the resolution where the latency actually lives.
+#
+# TTFB and the pre-handler chain are sub-second-to-tens-of-seconds; total duration additionally
+# carries body transfer, which on multi-GB uploads runs to minutes, hence the longer tail.
+HTTP_TTFB_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
+HTTP_DURATION_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0)
+
+
+def build_metric_views() -> list[View]:
+    return [
+        View(
+            instrument_name="http_request_duration_seconds",
+            aggregation=ExplicitBucketHistogramAggregation(boundaries=HTTP_DURATION_BUCKETS),
+        ),
+        View(
+            instrument_name="http_request_ttfb_seconds",
+            aggregation=ExplicitBucketHistogramAggregation(boundaries=HTTP_TTFB_BUCKETS),
+        ),
+        View(
+            instrument_name="http_pre_handler_duration_seconds",
+            aggregation=ExplicitBucketHistogramAggregation(boundaries=HTTP_TTFB_BUCKETS),
+        ),
+    ]
 
 
 def build_resource(service_name: str) -> Resource:
@@ -108,7 +138,7 @@ def configure_otel(service_name: str) -> None:
         OTLPMetricExporter(endpoint=endpoint, insecure=True),
         export_interval_millis=10000,
     )
-    meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+    meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader], views=build_metric_views())
     metrics.set_meter_provider(meter_provider)
 
     # Auto-instrument libraries (replaces what opentelemetry-instrument CLI was doing)

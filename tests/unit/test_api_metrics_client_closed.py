@@ -25,6 +25,8 @@ def _request() -> Any:
     request.url.path = "/bucket/key"
     request.headers = {}
     request.state = MagicMock()
+    # A MagicMock invents attributes on access; TTFB arithmetic needs a real absent-or-float here.
+    request.state.gateway_start_time = None
     return request
 
 
