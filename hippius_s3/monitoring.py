@@ -118,6 +118,21 @@ class MetricsCollector:
             name="http_request_duration_seconds", description="HTTP request duration in seconds", unit="s"
         )
 
+        # Time in the middleware chain OUTSIDE the audited window: auth, ACL, account resolution,
+        # input validation, and the BaseHTTPMiddleware wrapping around them.
+        #
+        # Both `http_request_duration_seconds` and the audit log's `processing_time_ms` are measured
+        # from INSIDE the chain — audit sits 18 layers deep — so neither can see the 17 layers above
+        # it, SigV4 verification and the ACL check among them. Measured on prod 2026-08-31 that blind
+        # spot was the same order as everything it wrapped: a ~930 B PUT spent ~247 ms inside the
+        # window and ~261 ms outside it, and a request REJECTED by auth — no handler, no DB, no
+        # disk — still cost 176 ms. This histogram is what makes that half of the request visible.
+        self.http_pre_handler_duration = self.meter.create_histogram(
+            name="http_pre_handler_duration_seconds",
+            description="Request time spent in the middleware chain outside the audited window",
+            unit="s",
+        )
+
         self.http_request_bytes = self.meter.create_counter(
             name="http_request_bytes_total", description="Total bytes in HTTP requests", unit="bytes"
         )
@@ -581,6 +596,15 @@ class MetricsCollector:
         if response_content_length:
             self.http_response_bytes.add(int(response_content_length), attributes={**attributes, "direction": "out"})
 
+    def record_pre_handler_duration(self, method: str, status_code: int, duration: float) -> None:
+        """Record time spent in the middleware chain outside the audited window.
+
+        Labels are method and status only. Deliberately NOT the handler or path: the path carries
+        the object key, and this is recorded for every request including the ones rejected before
+        routing — where no handler name exists to fall back to.
+        """
+        self.http_pre_handler_duration.record(duration, attributes={"method": method, "status_code": str(status_code)})
+
     def record_s3_operation(
         self,
         operation: str,
@@ -920,6 +944,9 @@ class NullMetricsCollector:
         self.http_request_duration = None
 
     def record_http_request(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_pre_handler_duration(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_s3_operation(self, *args: object, **kwargs: object) -> None:
