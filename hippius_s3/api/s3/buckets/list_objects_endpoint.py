@@ -130,15 +130,26 @@ async def handle_list_objects(
     # LS-1: the SQL skip-scan and the Python collapse produce byte-identical pages (proven by the
     # differential test); the flag picks which runs, defaulting to the Python path.
     collect = _collect_page_sql if _sql_rollup_enabled() else _collect_page
-    items, is_truncated, next_cursor = await collect(
-        pool,
-        bucket_id,
-        prefix=prefix,
-        delimiter=delimiter,
-        cursor=cursor,
-        target=effective_max_keys,
-        cp_floor=cp_floor,
-    )
+    # Only reached when the scan produced NOTHING — `_collect_page` returns a short truncated page
+    # whenever it has items, and `_collect_page_sql` is a single fetch with no partial state. An
+    # uncaught asyncio.TimeoutError here became a bare 500: the wrong class entirely, since the
+    # request was well-formed and the server simply could not answer it in time.
+    try:
+        items, is_truncated, next_cursor = await collect(
+            pool,
+            bucket_id,
+            prefix=prefix,
+            delimiter=delimiter,
+            cursor=cursor,
+            target=effective_max_keys,
+            cp_floor=cp_floor,
+        )
+    except TimeoutError:
+        logger.warning(
+            f"ListObjects timed out with no rows collected: bucket={bucket_name} "
+            f"prefix={prefix!r} cursor={cursor!r} max_keys={effective_max_keys}"
+        )
+        return errors.listing_timeout_response()
     contents = [row for kind, row in items if kind == "content"]
     common_prefixes = [payload for kind, payload in items if kind == "prefix"]
 
@@ -279,7 +290,23 @@ async def _collect_page(
     # LS-45: hold one pooled connection for the whole skip-scan instead of acquire/release per batch.
     async with pool.acquire() as conn:
         while True:
-            batch = await conn.fetch(query, bucket_id, prefix, cursor, batch_limit, prefix_upper)
+            # A skip-scan that has already collected items must not throw them away. AWS lets a
+            # listing return FEWER keys than max-keys, so a short truncated page is a valid answer,
+            # and it is a strictly better one than an error: the client keeps the keys it earned and
+            # resumes past them, instead of retrying a scan that just proved too slow from exactly
+            # the same offset. `cursor` is already advanced past the last row consumed by the loop
+            # below — including rows collapsed into a common prefix — so it is precisely the resume
+            # point, the same value the next iteration would have used.
+            #
+            # With no items there is no progress to report and an empty page would read as
+            # end-of-listing, which is a silent truncation of the caller's view of the bucket. Let
+            # it raise; handle_list_objects maps it to a retryable 503.
+            try:
+                batch = await conn.fetch(query, bucket_id, prefix, cursor, batch_limit, prefix_upper)
+            except TimeoutError:
+                if not items:
+                    raise
+                return items, True, cursor
             if not batch:
                 return items, False, None
 

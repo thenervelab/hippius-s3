@@ -135,6 +135,31 @@ def pool_saturation_response(exc: BaseException) -> Response | None:
     return None
 
 
+def listing_timeout_response() -> Response:
+    """A listing that could not return a single row before the statement timeout.
+
+    Deliberately NOT routed through ``pool_saturation_response``: that function refuses to match a
+    bare ``asyncio.TimeoutError`` precisely because it cannot tell a saturated pool from a slow
+    query, and calling a slow query "pool saturation" would be a lie that sends the client straight
+    back into the same contention. This is the other branch — the caller has already established
+    that the query itself timed out — so the label is accurate here.
+
+    503 rather than the 500 this used to be: the request was well-formed and the bucket exists, the
+    server simply could not answer in time. That is a capacity condition, which is the class every
+    SDK already retries with backoff; a 500 is neither retryable by contract nor true.
+
+    The longer Retry-After than the pool-saturation case is the point — a retry that comes straight
+    back re-runs the same scan from the same offset and fails the same way. Callers that CAN make
+    progress never reach here: ``_collect_page`` returns a short truncated page instead.
+    """
+    return s3_error_response(
+        code="SlowDown",
+        message="The listing could not be completed in time. Retry, or request fewer keys with max-keys.",
+        status_code=503,
+        extra_headers={"Retry-After": "10"},
+    )
+
+
 # Stable RuntimeError markers raised by kek_service on a KMS/key failure. TRANSIENT is a brownout
 # (retry helps → 503); UNREADABLE means the object's key material is unusable (retry can't help →
 # 500). We string-match because kek_service raises RuntimeError(<marker>) — same convention the
