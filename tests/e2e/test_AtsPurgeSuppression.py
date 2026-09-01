@@ -101,3 +101,51 @@ def test_recreate_after_delete_still_skips_purge(
     assert int(put["VersionId"]) >= 2, "re-PUT of a deleted key must NOT reuse version 1"
     purges = _wait_for_purge_count(purge_path, baseline + 1)
     assert len(purges) >= baseline + 1, "re-PUT of a previously deleted key must still purge"
+
+
+def _mpu(boto3_client: Any, bucket: str, key: str, marker: bytes) -> str:
+    """Smallest legal MPU: one 5 MiB part (only the LAST part may be under the minimum)."""
+    upload_id = boto3_client.create_multipart_upload(Bucket=bucket, Key=key)["UploadId"]
+    etag = boto3_client.upload_part(
+        Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=1, Body=marker * (5 * 1024 * 1024)
+    )["ETag"]
+    completed = boto3_client.complete_multipart_upload(
+        Bucket=bucket,
+        Key=key,
+        UploadId=upload_id,
+        MultipartUpload={"Parts": [{"ETag": etag, "PartNumber": 1}]},
+    )
+    return str(completed.get("VersionId", ""))
+
+
+def test_mpu_create_skips_purge_mpu_overwrite_fires_it(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    """CompleteMultipartUpload suppression, through the REAL version-resolution path.
+
+    The middleware unit tests drive the created-flag from a test header, so they would keep
+    passing if complete_multipart_upload resolved the wrong version — e.g. by reading
+    objects.current_object_version (which a concurrent write advances) instead of THIS upload's
+    own version from its parts. Only a real MPU exercises that resolution.
+    """
+    bucket_name = unique_bucket_name("ats-purge-mpu")
+    cleanup_buckets(bucket_name)
+    boto3_client.create_bucket(Bucket=bucket_name)
+
+    key = "mpu-purge-flow.bin"
+    purge_path = f"/{bucket_name}/{key}"
+
+    # 1. MPU that CREATES the key -> version 1 -> no purge.
+    version = _mpu(boto3_client, bucket_name, key, b"a")
+    assert version == "1", f"first MPU on a fresh key must allocate version 1, got {version!r}"
+    time.sleep(NO_PURGE_GRACE_S)
+    assert _purges_for(purge_path) == [], "an MPU that created its key must not fire a PURGE"
+
+    # 2. MPU that OVERWRITES it -> version >= 2 -> purge, exactly as before the change.
+    version2 = _mpu(boto3_client, bucket_name, key, b"b")
+    assert int(version2) >= 2, f"second MPU must allocate version >= 2, got {version2!r}"
+    purges = _wait_for_purge_count(purge_path, 1)
+    assert len(purges) >= 1, "an MPU that overwrote an existing key must fire a PURGE"

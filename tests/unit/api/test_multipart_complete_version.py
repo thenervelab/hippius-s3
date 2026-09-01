@@ -601,3 +601,69 @@ async def test_complete_rejects_duplicate_part_numbers(monkeypatch: Any) -> None
     assert resp.status_code == 400
     assert b"InvalidPartOrder" in bytes(resp.body)
     assert called["complete"] is False
+
+
+# --- the edge-cache created-flag ------------------------------------------------------------
+# ats_purge_middleware skips its PURGE fan-out when the handler reports that this write CREATED
+# the key. The middleware's own tests drive that flag from a test header, so they would keep
+# passing if the resolution below regressed. These pin the resolution itself, in the one place
+# where the upload's own version and objects.current_object_version can disagree.
+
+
+@pytest.mark.asyncio
+async def test_complete_sets_created_flag_from_its_own_version_not_the_pointer(monkeypatch: Any) -> None:
+    """Pointer already advanced to v2 by a concurrent write; this upload's parts are at v1.
+
+    The flag must follow the upload's OWN version. Reading the pointer here would be the same
+    class of bug the tests at the top of this file exist for — and it is invisible in the
+    sequential case, where the two agree.
+    """
+    _patch_common(monkeypatch)
+    completed: dict[str, Any] = {"ok": False}
+    _completing_writer(monkeypatch, completed)
+
+    request = _request()
+    db = _FakeDb(current_version=2, upload_version=1)
+    resp = await multipart.complete_multipart_upload("b", "k", "up-1", request, db)
+
+    assert resp.status_code == 200, bytes(resp.body)
+    assert getattr(request.state, "ats_object_created", False) is True
+
+
+@pytest.mark.asyncio
+async def test_complete_does_not_set_created_flag_when_it_overwrote(monkeypatch: Any) -> None:
+    """An MPU whose own version is >= 2 overwrote something, so a cached copy may exist and the
+    purge must still fire. Absent flag -> purge is the fail-safe direction."""
+    _patch_common(monkeypatch)
+    completed: dict[str, Any] = {"ok": False}
+    _completing_writer(monkeypatch, completed)
+
+    request = _request()
+    db = _FakeDb(current_version=2, upload_version=2)
+    resp = await multipart.complete_multipart_upload("b", "k", "up-1", request, db)
+
+    assert resp.status_code == 200, bytes(resp.body)
+    assert getattr(request.state, "ats_object_created", False) is False
+
+
+@pytest.mark.asyncio
+async def test_idempotent_replay_does_not_set_created_flag(monkeypatch: Any) -> None:
+    """A retried CompleteMultipartUpload replays a 200 for an already-completed upload. It must
+    NOT claim to be a creation: by then the object has been serveable (and cacheable) since the
+    first completion, so a retry has to keep purging."""
+    _patch_common(monkeypatch)
+
+    class _CompletedDb(_FakeDb):
+        async def fetchrow(self, query: str, *args: Any) -> Any:
+            if query == "get_multipart_upload":
+                return {"object_id": "obj-1", "is_completed": True, "current_object_version": 1}
+            if query == "get_object_by_path":
+                return {"md5_hash": "m"}
+            return await super().fetchrow(query, *args)
+
+    request = _request()
+    db = _CompletedDb(current_version=1, upload_version=1)
+    resp = await multipart.complete_multipart_upload("b", "k", "up-1", request, db)
+
+    assert resp.status_code == 200
+    assert getattr(request.state, "ats_object_created", False) is False

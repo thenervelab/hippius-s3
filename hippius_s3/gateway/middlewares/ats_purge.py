@@ -56,6 +56,14 @@ async def ats_purge_middleware(
     # (bucket name reused after delete, janitor hard-delete), where a dropped delete-time purge
     # could have left a stale entry. For normal buckets that corner is bounded by max-age=300, the
     # staleness any dropped purge already costs.
+    #
+    # MPU adds one more corner, for the same 300s: a completion can lag arbitrarily far behind the
+    # CreateMultipartUpload that allocated its version, so two uploads racing on a brand-new key
+    # (v1 and v2) can complete out of order. If v2 completes first and a GET caches its body, v1's
+    # later completion still resolves version 1 and skips its purge. Last-writer-wins is already
+    # undefined for concurrent writes to one key, and the entry ages out on the same TTL, so this
+    # is bounded rather than novel — but it is why the skip keys off the version, never off "this
+    # was an MPU".
     is_complete_mpu = method == "POST" and "uploadId" in qs and "partNumber" not in qs
     if (
         (method == "PUT" or is_complete_mpu)

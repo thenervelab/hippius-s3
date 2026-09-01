@@ -20,9 +20,11 @@ import types
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from starlette.requests import Request
 from starlette.responses import Response
 
+from hippius_s3.api.middlewares import metrics as metrics_module
 from hippius_s3.api.middlewares.metrics import metrics_middleware
 
 
@@ -120,20 +122,28 @@ def test_falls_back_to_the_local_clock_when_no_gateway_stamp_exists() -> None:
     assert abs(recorded["ttfb"] - recorded["duration"]) <= 0.020, "with one clock the two must agree"
 
 
-def test_zero_length_body_still_stamps_the_first_byte() -> None:
+def test_zero_length_body_still_stamps_the_first_byte(monkeypatch: Any) -> None:
     """A `Content-Length: 0` PUT arrives as one EMPTY `http.request` message.
 
     Testing the body for truthiness excluded exactly that case, so a zero-byte PUT silently fell
     back to response-start and measured something different from every other PUT on the same panel.
-    The 150 ms of post-body work is what separates the two: if the stamp is lost, ttfb absorbs it.
-    """
-    request = _request(b"", gateway_start_time=time.time())
-    request.scope["method"] = "PUT"
-    recorded = _run(request, pre_body_seconds=0.050, post_body_seconds=0.150)
 
-    assert recorded["duration"] >= 0.180, "duration should cover both halves"
-    assert recorded["ttfb"] < recorded["duration"] - 0.080, "a zero-byte PUT must stamp at body read"
-    assert 0.030 <= recorded["ttfb"] <= 0.130, "ttfb should be ~50 ms of pre-body work"
+    Driven by a FAKE CLOCK rather than sleeps: the assertion is about which timestamp is chosen,
+    and a wall-clock version of it can only be expressed as millisecond margins that a loaded CI
+    runner overshoots (an earlier draft was reproducibly flaky under CPU contention).
+    """
+    ticks = iter([100.0, 100.5, 103.0])  # start_time, first-body-byte, response start
+    monkeypatch.setattr(metrics_module.time, "time", lambda: next(ticks))
+
+    request = _request(b"", gateway_start_time=None)
+    request.scope["method"] = "PUT"
+    request.state.gateway_start_time = 100.0
+    recorded = _run(request, pre_body_seconds=0.0, post_body_seconds=0.0)
+
+    # first-body-byte is at 100.5, response start at 103.0. Stamping the body gives 0.5;
+    # falling back to response start would give 3.0.
+    assert recorded["ttfb"] == pytest.approx(0.5), "a zero-byte PUT must stamp at body read, not response start"
+    assert recorded["duration"] == pytest.approx(3.0)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -180,11 +190,24 @@ def _stack_app(*, layers: int, post_body_seconds: float) -> tuple[Any, dict[str,
     return app, {}
 
 
-def _run_through_stack(body: bytes, *, layers: int = 6, post_body_seconds: float = 0.150) -> dict[str, Any]:
+def _run_through_stack_with_clock(body: bytes, *, layers: int = 6) -> dict[str, Any]:
+    """Drive the real stack against a FAKE clock.
+
+    Wall-clock margins are what made an earlier draft of these flaky: `asyncio.sleep` can only
+    overshoot, and under CPU contention the two sleeps bunch together so `ttfb` drifts toward
+    `duration` — a reproducible spurious failure on a loaded runner. The question these tests ask
+    is "which timestamp did the middleware choose", which a monotonically-stepping clock answers
+    exactly, with no timing at all.
+
+    Steps of 1.0 make the two candidates unmistakable: the first-body-byte stamp is the SECOND
+    tick, response start the third, so a working wrap yields 1.0 and a broken one 2.0.
+    """
     from httpx import ASGITransport
     from httpx import AsyncClient
 
-    app, recorded = _stack_app(layers=layers, post_body_seconds=post_body_seconds)
+    app, recorded = _stack_app(layers=layers, post_body_seconds=0.0)
+
+    clock = iter(float(i) for i in range(100))
 
     class _Collector:
         def record_http_request(self, **kwargs: Any) -> None:
@@ -198,7 +221,10 @@ def _run_through_stack(body: bytes, *, layers: int = 6, post_body_seconds: float
             r = await client.put("/bucket/key.bin", content=body)
         assert r.status_code == 200, f"handler did not run: {r.status_code} {r.text[:200]}"
 
-    with patch("hippius_s3.api.middlewares.metrics.get_metrics_collector", lambda: _Collector()):
+    with (
+        patch("hippius_s3.api.middlewares.metrics.get_metrics_collector", lambda: _Collector()),
+        patch.object(metrics_module.time, "time", lambda: next(clock)),
+    ):
         asyncio.run(_go())
 
     assert recorded, "the collector must be fed through the real stack"
@@ -206,20 +232,23 @@ def _run_through_stack(body: bytes, *, layers: int = 6, post_body_seconds: float
 
 
 def test_receive_wrap_survives_the_nested_middleware_stack() -> None:
-    """TTFB must still exclude post-body work when the request passes through many
-    BaseHTTPMiddleware layers, each re-wrapping receive. If that delegation breaks, ttfb collapses
-    into duration — silently, since nothing errors. This is the only test that would catch it."""
-    recorded = _run_through_stack(b"x" * 4096)
+    """TTFB must still stamp at the body read when the request passes through many
+    BaseHTTPMiddleware layers, each re-wrapping receive.
 
-    assert recorded["duration"] >= 0.140, "duration should include the post-body work"
-    assert recorded["ttfb"] < recorded["duration"] - 0.080, (
-        "ttfb absorbed the post-body work: the receive wrap did not survive the middleware stack"
+    With the wrap intact the stamp is the tick taken inside `receive` (start + 1). If the
+    delegation breaks, no body tick is ever taken and TTFB falls back to response start, a
+    strictly later tick — silently, since nothing errors. This is the only test that catches it.
+    """
+    recorded = _run_through_stack_with_clock(b"x" * 4096)
+    assert recorded["ttfb"] == pytest.approx(1.0), (
+        f"expected the body-read tick, got {recorded['ttfb']} — the receive wrap did not survive the stack"
     )
+    assert recorded["duration"] == pytest.approx(2.0)
 
 
 def test_zero_length_body_stamps_through_the_nested_stack() -> None:
-    """The zero-byte case, end to end through the same nesting."""
-    recorded = _run_through_stack(b"")
-
-    assert recorded["duration"] >= 0.140
-    assert recorded["ttfb"] < recorded["duration"] - 0.080, "zero-byte PUT lost its first-byte stamp"
+    """The zero-byte case, end to end through the same nesting: an empty `http.request` is still
+    a body read, so it must take the body tick rather than falling through to response start."""
+    recorded = _run_through_stack_with_clock(b"")
+    assert recorded["ttfb"] == pytest.approx(1.0), "zero-byte PUT lost its first-byte stamp"
+    assert recorded["duration"] == pytest.approx(2.0)
