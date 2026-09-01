@@ -295,11 +295,13 @@ async def test_no_head_acquire_when_user_cached_and_bucket_forwarded(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_created_flag_set_when_version_1(monkeypatch: Any) -> None:
-    """A fresh key (writer allocated version 1) marks request.state.ats_object_created so the
-    gateway's ats_purge middleware skips the PURGE fan-out for creations."""
+@pytest.mark.parametrize("object_version,flag_set", [(1, True), (2, False)])
+async def test_created_flag_tracks_allocated_version(monkeypatch: Any, object_version: int, flag_set: bool) -> None:
+    """Version 1 (fresh objects row) sets request.state.ats_object_created so the gateway's
+    ats_purge middleware skips the creation purge; an overwrite (version >= 2) must leave it
+    unset — absent-flag-means-purge is the fail-safe direction."""
     pool = make_fake_pool(_bucket_present_router)
-    _patch_writer(monkeypatch, {}, object_version=1)
+    _patch_writer(monkeypatch, {}, object_version=object_version)
 
     req = _fake_request({"Content-Type": "text/plain"})
     resp = await handle_put_object(
@@ -310,25 +312,5 @@ async def test_created_flag_set_when_version_1(monkeypatch: Any) -> None:
         redis_client=_FakeRedis(),
     )
     assert resp.status_code == 200
-    assert resp.headers.get("x-amz-version-id") == "1"
-    assert getattr(req.state, "ats_object_created", False) is True
-
-
-@pytest.mark.asyncio
-async def test_created_flag_absent_on_overwrite(monkeypatch: Any) -> None:
-    """An overwrite (version >= 2) must NOT set the created flag — the middleware then purges as
-    before. Absent-flag-means-purge is the fail-safe direction, so this pins the overwrite side."""
-    pool = make_fake_pool(_bucket_present_router)
-    _patch_writer(monkeypatch, {}, object_version=2)
-
-    req = _fake_request({"Content-Type": "text/plain"})
-    resp = await handle_put_object(
-        bucket_name="bkt",
-        object_key="fresh.txt",
-        request=req,
-        pool=pool,
-        redis_client=_FakeRedis(),
-    )
-    assert resp.status_code == 200
-    assert resp.headers.get("x-amz-version-id") == "2"
-    assert getattr(req.state, "ats_object_created", False) is False
+    assert resp.headers.get("x-amz-version-id") == str(object_version)
+    assert getattr(req.state, "ats_object_created", False) is flag_set
