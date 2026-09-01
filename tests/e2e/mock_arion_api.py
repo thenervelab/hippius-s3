@@ -53,6 +53,31 @@ async def reset_download_stats() -> dict:
     return {"status": "reset"}
 
 
+# ATS stand-in: docker-compose.e2e.yml points the api's ATS_CACHE_ENDPOINT here, so the gateway's
+# purge middleware fires its PURGE fan-out at this mock instead of silently no-op'ing on an empty
+# endpoint list. Recording (host, path) makes purge behaviour assertable end-to-end — see
+# test_AtsPurgeSuppression.py. The catch-all is method-scoped to PURGE, so it cannot shadow the
+# GET/POST routes above.
+_purges: list[dict] = []
+
+
+@app.get("/debug/purges")
+async def purge_log() -> list[dict]:
+    return _purges
+
+
+@app.post("/debug/reset_purges")
+async def reset_purges() -> dict:
+    _purges.clear()
+    return {"status": "reset"}
+
+
+@app.api_route("/{purge_path:path}", methods=["PURGE"])
+async def record_purge(purge_path: str, request: Request) -> dict:
+    _purges.append({"host": request.headers.get("host", ""), "path": f"/{purge_path}", "ts": time.time()})
+    return {"status": "purged"}
+
+
 class UploadResult(BaseModel):
     upload_id: str
     file_id: str
