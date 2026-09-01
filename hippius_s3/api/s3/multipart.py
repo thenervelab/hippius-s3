@@ -1346,6 +1346,16 @@ async def complete_multipart_upload(
             bucket_name=bucket_name,
         )
 
+        # Version 1 means the objects row is brand new, so ats_purge_middleware skips its PURGE
+        # fan-out (see its comment for the invariant and the warm-bucket exclusion). object_version
+        # here is THIS upload's own version, resolved from its parts rather than from
+        # objects.current_object_version, so a concurrent PUT that advanced the pointer cannot make
+        # a completion look like a creation. Deliberately not set on the already-completed replay
+        # path above: that returns before any of this, and leaving it unflagged keeps a retry
+        # purging, which is the fail-safe direction.
+        if int(object_version) == 1:
+            request.state.ats_object_created = True
+
         # Return with proper headers
         return Response(
             content=xml_bytes,

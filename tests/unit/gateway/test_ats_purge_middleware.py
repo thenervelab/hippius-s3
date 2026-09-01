@@ -315,11 +315,70 @@ async def test_warm_bucket_creation_still_purges(
 async def test_created_flag_on_delete_is_ignored(
     app_with_create_flag: Any, captured_purges: list[tuple[str, str]]
 ) -> None:
-    """The skip is PUT-scoped: even if a future handler wrongly set the created flag on a DELETE,
-    the delete's purge must still fire."""
+    """The skip covers only the creating verbs: even if a future handler wrongly set the created
+    flag on a DELETE, the delete's purge must still fire."""
     async with AsyncClient(
         transport=ASGITransport(app=app_with_create_flag), base_url="http://s3.hippius.com"
     ) as client:
         r = await client.delete("/mybucket/gone.bin", headers={"x-test-created": "1"})
     assert r.status_code == 200
     assert captured_purges == [("s3.hippius.com", "mybucket/gone.bin")]
+
+
+@pytest.mark.asyncio
+async def test_created_complete_mpu_skips_purge(
+    app_with_create_flag: Any, captured_purges: list[tuple[str, str]]
+) -> None:
+    """A multipart upload that CREATED its key has nothing cached either — the same suppression
+    applies to CompleteMultipartUpload, not just simple PUT."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_create_flag), base_url="http://s3.hippius.com"
+    ) as client:
+        r = await client.post("/mybucket/big/new.bin?uploadId=abc123", headers={"x-test-created": "1"})
+    assert r.status_code == 200
+    assert captured_purges == []
+
+
+@pytest.mark.asyncio
+async def test_complete_mpu_overwrite_still_purges(
+    app_with_create_flag: Any, captured_purges: list[tuple[str, str]]
+) -> None:
+    """An MPU that overwrote an existing key allocates version >= 2, sets no flag, and must keep
+    purging — the fail-safe direction for the new MPU branch."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_create_flag), base_url="http://s3.hippius.com"
+    ) as client:
+        r = await client.post("/mybucket/big/existing.bin?uploadId=abc123")
+    assert r.status_code == 200
+    assert captured_purges == [("s3.hippius.com", "mybucket/big/existing.bin")]
+
+
+@pytest.mark.asyncio
+async def test_warm_bucket_complete_mpu_still_purges(
+    app_with_create_flag: Any, captured_purges: list[tuple[str, str]]
+) -> None:
+    """The warm-bucket exclusion applies to the MPU branch too, for the same 30-day-TTL reason."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_create_flag), base_url="http://s3.hippius.com"
+    ) as client:
+        r = await client.post(
+            "/warmbucket/big/new.bin?uploadId=abc123", headers={"x-test-created": "1", "x-test-warm": "1"}
+        )
+    assert r.status_code == 200
+    assert captured_purges == [("s3.hippius.com", "warmbucket/big/new.bin")]
+
+
+@pytest.mark.asyncio
+async def test_created_flag_on_upload_part_is_ignored(
+    app_with_create_flag: Any, captured_purges: list[tuple[str, str]]
+) -> None:
+    """UploadPart already returns before the flag check (it is invisible until completion). Pinned
+    so the new MPU branch cannot accidentally start treating a part upload as a creation."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_create_flag), base_url="http://s3.hippius.com"
+    ) as client:
+        r = await client.put(
+            "/mybucket/big/obj?uploadId=abc&partNumber=1", content=b"part", headers={"x-test-created": "1"}
+        )
+    assert r.status_code == 200
+    assert captured_purges == []

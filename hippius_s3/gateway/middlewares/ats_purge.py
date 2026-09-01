@@ -49,23 +49,22 @@ async def ats_purge_middleware(
     # (ttfb-report.md).
     #
     # The handler sets the flag only when the write allocated object version 1; absent flag ->
-    # purge, so every unaudited path (overwrite, delete, CompleteMultipartUpload, copy) keeps
-    # today's behaviour. Two deliberate limits: PUT-scoped, so a stray flag can never suppress a
+    # purge, so every unaudited path (overwrite, delete, copy) keeps today's behaviour. Two
+    # deliberate limits: scoped to the two creating verbs, so a stray flag can never suppress a
     # DELETE's purge; and warm buckets never skip — they cache for 30 days on a purge-on-write
     # contract (cache_control.py), and version 1 recurs when the objects row was removed wholesale
     # (bucket name reused after delete, janitor hard-delete), where a dropped delete-time purge
     # could have left a stale entry. For normal buckets that corner is bounded by max-age=300, the
     # staleness any dropped purge already costs.
+    is_complete_mpu = method == "POST" and "uploadId" in qs and "partNumber" not in qs
     if (
-        method == "PUT"
+        (method == "PUT" or is_complete_mpu)
         and getattr(request.state, "ats_object_created", False)
         and not getattr(request.state, "bucket_is_cache_warm", False)
     ):
         return response
 
-    is_complete_mpu = method == "POST" and "uploadId" in qs and "partNumber" not in qs
     if method in ("PUT", "DELETE") or is_complete_mpu:
-        # TODO: CompleteMultipartUpload resolves its version too; wire the same created-flag there.
         schedule_purge(get_config().ats_purge_host, f"{bucket}/{key}")
         # NOTE: x-amz-copy-source is deliberately NOT purged. COPY reads the
         # source; its contents haven't changed. Purging would needlessly cold

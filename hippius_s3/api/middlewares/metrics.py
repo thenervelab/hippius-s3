@@ -33,7 +33,14 @@ async def metrics_middleware(
     async def receive_with_first_byte_stamp() -> Message:
         nonlocal first_body_byte_at
         message = await inner_receive()
-        if first_body_byte_at is None and message["type"] == "http.request" and message.get("body"):
+        # Stamp on the first `http.request`, whether or not it carries bytes. Testing the body for
+        # truthiness reads as equivalent but silently excludes the zero-length body: a
+        # `Content-Length: 0` PUT arrives as exactly one empty `http.request`, so it never stamped
+        # and its TTFB quietly fell back to response start — measuring a different thing from every
+        # other PUT on the same panel. Receiving the message at all is the event: the app asked for
+        # the body and the server handed one over. Servers do not emit an empty leading chunk ahead
+        # of real body bytes, so this does not move the stamp for ordinary uploads.
+        if first_body_byte_at is None and message["type"] == "http.request":
             first_body_byte_at = time.time()
         return message
 

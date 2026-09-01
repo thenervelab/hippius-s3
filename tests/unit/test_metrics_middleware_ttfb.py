@@ -118,3 +118,108 @@ def test_falls_back_to_the_local_clock_when_no_gateway_stamp_exists() -> None:
 
     assert recorded["ttfb"] >= 0.0
     assert abs(recorded["ttfb"] - recorded["duration"]) <= 0.020, "with one clock the two must agree"
+
+
+def test_zero_length_body_still_stamps_the_first_byte() -> None:
+    """A `Content-Length: 0` PUT arrives as one EMPTY `http.request` message.
+
+    Testing the body for truthiness excluded exactly that case, so a zero-byte PUT silently fell
+    back to response-start and measured something different from every other PUT on the same panel.
+    The 150 ms of post-body work is what separates the two: if the stamp is lost, ttfb absorbs it.
+    """
+    request = _request(b"", gateway_start_time=time.time())
+    request.scope["method"] = "PUT"
+    recorded = _run(request, pre_body_seconds=0.050, post_body_seconds=0.150)
+
+    assert recorded["duration"] >= 0.180, "duration should cover both halves"
+    assert recorded["ttfb"] < recorded["duration"] - 0.080, "a zero-byte PUT must stamp at body read"
+    assert 0.030 <= recorded["ttfb"] <= 0.130, "ttfb should be ~50 ms of pre-body work"
+
+
+# ---------------------------------------------------------------------------------------------
+# The wrap has to survive the REAL stack, not just a direct call.
+#
+# In production `metrics_middleware` is one of ~20 BaseHTTPMiddleware layers, and each one wraps
+# the request in its own `_CachedRequest`, delegating `receive` down the chain. The tests above
+# call the middleware directly with a hand-rolled receive, so they would keep passing if that
+# delegation ever broke — from a reordering, or a Starlette upgrade changing `_CachedRequest`.
+# The result would be a TTFB metric that silently degrades into total duration.
+# ---------------------------------------------------------------------------------------------
+
+
+def _stack_app(*, layers: int, post_body_seconds: float) -> tuple[Any, dict[str, Any]]:
+    """A real FastAPI app with `layers` passthrough middlewares on each side of metrics_middleware.
+
+    Annotations here MUST resolve against this module's globals: the file uses
+    `from __future__ import annotations`, so FastAPI reads the handler's parameter types as strings
+    and evaluates them in module scope. A `Request` imported inside this function is invisible
+    there, and FastAPI silently degrades the parameter to a query field (422) instead of injecting
+    the request.
+    """
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    async def passthrough(request: Request, call_next: Any) -> Response:
+        return await call_next(request)
+
+    # Registered on BOTH sides so metrics_middleware sits mid-stack exactly as it does in
+    # production: the handler's body read then travels down through every layer beneath it.
+    for _ in range(layers):
+        app.middleware("http")(passthrough)
+    app.middleware("http")(metrics_middleware)
+    for _ in range(layers):
+        app.middleware("http")(passthrough)
+
+    @app.put("/{bucket_name}/{object_key:path}")
+    async def put_object(bucket_name: str, object_key: str, request: Request) -> Response:
+        body = await request.body()
+        await asyncio.sleep(post_body_seconds)
+        return Response(status_code=200, content=str(len(body)))
+
+    return app, {}
+
+
+def _run_through_stack(body: bytes, *, layers: int = 6, post_body_seconds: float = 0.150) -> dict[str, Any]:
+    from httpx import ASGITransport
+    from httpx import AsyncClient
+
+    app, recorded = _stack_app(layers=layers, post_body_seconds=post_body_seconds)
+
+    class _Collector:
+        def record_http_request(self, **kwargs: Any) -> None:
+            recorded.update(kwargs)
+
+        def record_error(self, **kwargs: Any) -> None:
+            pass
+
+    async def _go() -> None:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://s3.hippius.com") as client:
+            r = await client.put("/bucket/key.bin", content=body)
+        assert r.status_code == 200, f"handler did not run: {r.status_code} {r.text[:200]}"
+
+    with patch("hippius_s3.api.middlewares.metrics.get_metrics_collector", lambda: _Collector()):
+        asyncio.run(_go())
+
+    assert recorded, "the collector must be fed through the real stack"
+    return recorded
+
+
+def test_receive_wrap_survives_the_nested_middleware_stack() -> None:
+    """TTFB must still exclude post-body work when the request passes through many
+    BaseHTTPMiddleware layers, each re-wrapping receive. If that delegation breaks, ttfb collapses
+    into duration — silently, since nothing errors. This is the only test that would catch it."""
+    recorded = _run_through_stack(b"x" * 4096)
+
+    assert recorded["duration"] >= 0.140, "duration should include the post-body work"
+    assert recorded["ttfb"] < recorded["duration"] - 0.080, (
+        "ttfb absorbed the post-body work: the receive wrap did not survive the middleware stack"
+    )
+
+
+def test_zero_length_body_stamps_through_the_nested_stack() -> None:
+    """The zero-byte case, end to end through the same nesting."""
+    recorded = _run_through_stack(b"")
+
+    assert recorded["duration"] >= 0.140
+    assert recorded["ttfb"] < recorded["duration"] - 0.080, "zero-byte PUT lost its first-byte stamp"
