@@ -42,9 +42,17 @@ async def _purge_all(endpoints: list[str], host: str, key: str) -> None:
     await asyncio.gather(*(_purge(ep, host, key) for ep in endpoints), return_exceptions=True)
 
 
+# The event loop holds tasks weakly; without a strong reference here a scheduled purge can be
+# garbage-collected mid-flight and silently never sent (same inflight-set idiom as the unpinner
+# and downloader workers).
+_inflight: set[asyncio.Task] = set()
+
+
 def schedule_purge(host: str, key: str) -> None:
     """Fire-and-forget PURGE against every configured ATS endpoint in parallel. No-op when empty."""
     endpoints = get_config().ats_cache_endpoints
     if not endpoints:
         return
-    asyncio.create_task(_purge_all(endpoints, host, key))
+    task = asyncio.create_task(_purge_all(endpoints, host, key))
+    _inflight.add(task)
+    task.add_done_callback(_inflight.discard)

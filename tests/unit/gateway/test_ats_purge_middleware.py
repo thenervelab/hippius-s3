@@ -250,6 +250,8 @@ def app_with_create_flag(captured_purges: list[tuple[str, str]]) -> Any:
     async def catch_all(request: Request) -> Response:
         if request.headers.get("x-test-created") == "1":
             request.state.ats_object_created = True
+        if request.headers.get("x-test-warm") == "1":
+            request.state.bucket_is_cache_warm = True
         return Response(status_code=200, content=b"ok")
 
     return app
@@ -288,5 +290,36 @@ async def test_delete_still_purges(app_with_create_flag: Any, captured_purges: l
         transport=ASGITransport(app=app_with_create_flag), base_url="http://s3.hippius.com"
     ) as client:
         r = await client.delete("/mybucket/gone.bin")
+    assert r.status_code == 200
+    assert captured_purges == [("s3.hippius.com", "mybucket/gone.bin")]
+
+
+@pytest.mark.asyncio
+async def test_warm_bucket_creation_still_purges(
+    app_with_create_flag: Any, captured_purges: list[tuple[str, str]]
+) -> None:
+    """Warm buckets cache for 30 days on a purge-on-write contract, and version 1 can recur after
+    the objects row is removed wholesale (bucket name reuse, hard delete) — so the creation skip
+    must not apply to them."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_create_flag), base_url="http://s3.hippius.com"
+    ) as client:
+        r = await client.put(
+            "/warmbucket/new.bin", content=b"data", headers={"x-test-created": "1", "x-test-warm": "1"}
+        )
+    assert r.status_code == 200
+    assert captured_purges == [("s3.hippius.com", "warmbucket/new.bin")]
+
+
+@pytest.mark.asyncio
+async def test_created_flag_on_delete_is_ignored(
+    app_with_create_flag: Any, captured_purges: list[tuple[str, str]]
+) -> None:
+    """The skip is PUT-scoped: even if a future handler wrongly set the created flag on a DELETE,
+    the delete's purge must still fire."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_create_flag), base_url="http://s3.hippius.com"
+    ) as client:
+        r = await client.delete("/mybucket/gone.bin", headers={"x-test-created": "1"})
     assert r.status_code == 200
     assert captured_purges == [("s3.hippius.com", "mybucket/gone.bin")]
