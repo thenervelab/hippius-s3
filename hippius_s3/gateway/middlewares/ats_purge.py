@@ -42,23 +42,20 @@ async def ats_purge_middleware(
         # MPU part upload — not visible until CompleteMultipartUpload, skip.
         return response
 
-    # A key that never existed has no cache entry to purge (edges run with negative caching
-    # disabled, so 404s are never stored). Yet purges were fired for every write, and creations
-    # dominate: measured on the EU edge 2026-08-31, PURGE was 24% of ALL requests through ATS
-    # (4,830 of a 20k-request sample), effectively every one answering 404. Beyond the wasted
-    # fan-out, purges take cache-directory write locks per stripe, which is the standing suspect
-    # for the pre-cache-lookup stall every GET pays on that box (ttfb-report.md).
+    # A brand-new key has nothing cached to purge (edges never store 404s — negative caching is
+    # off), yet purges fired for every write and creations dominate: measured on the EU edge
+    # 2026-08-31, PURGE was 24% of ALL requests through ATS, effectively every one answering 404,
+    # and their stripe write locks are the standing suspect for the pre-cache-lookup GET stall
+    # (ttfb-report.md).
     #
-    # The handler sets this flag only when the write allocated object version 1. Absent flag ->
-    # purge, so every unaudited path — overwrite, delete, CompleteMultipartUpload, copy — keeps
-    # today's behaviour, and the check is PUT-scoped so a stray flag can never suppress a DELETE's
-    # purge. Version 1 is NOT an airtight "never existed": when the objects row itself was removed
-    # (bucket deleted and its name reused, janitor hard-delete, ops purge scripts), a re-PUT of the
-    # same path allocates version 1 again, and if the delete-time purge was dropped (fire-and-
-    # forget) a stale entry may survive the skipped purge. For normal buckets that residual is
-    # bounded by PUBLIC_CACHE_CONTROL max-age=300 — the same staleness any dropped purge already
-    # costs. Warm buckets cache for 30 DAYS on an explicit purge-on-write contract
-    # (cache_control.py WARM_PUBLIC_CACHE_CONTROL), so they are excluded from the skip.
+    # The handler sets the flag only when the write allocated object version 1; absent flag ->
+    # purge, so every unaudited path (overwrite, delete, CompleteMultipartUpload, copy) keeps
+    # today's behaviour. Two deliberate limits: PUT-scoped, so a stray flag can never suppress a
+    # DELETE's purge; and warm buckets never skip — they cache for 30 days on a purge-on-write
+    # contract (cache_control.py), and version 1 recurs when the objects row was removed wholesale
+    # (bucket name reused after delete, janitor hard-delete), where a dropped delete-time purge
+    # could have left a stale entry. For normal buckets that corner is bounded by max-age=300, the
+    # staleness any dropped purge already costs.
     if (
         method == "PUT"
         and getattr(request.state, "ats_object_created", False)

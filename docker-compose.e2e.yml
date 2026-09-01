@@ -28,10 +28,9 @@ services:
       # `replicated` row as a `replicated_orphan` and leaves it, which is exactly why
       # the B-2 detection hangs off the announcement rather than the walk.
       - NODE_NAME=e2e-node
-      # mock-arion doubles as the ATS edge for purge assertions: with this set, the
-      # gateway's ats_purge middleware fan-outs PURGE requests here, and the mock's
-      # /debug/purges log makes them observable (test_AtsPurgeSuppression.py). Direct,
-      # not via toxiproxy — purge delivery is fire-and-forget and not under fault test.
+      # mock-arion doubles as the ATS edge: the purge middleware fan-outs PURGEs here
+      # and the mock's /debug/purges log makes them observable (test_AtsPurgeSuppression.py).
+      # Direct, not via toxiproxy — purge delivery is not under fault test.
       - ATS_CACHE_ENDPOINT=http://mock-arion:8002
     depends_on:
       db:
