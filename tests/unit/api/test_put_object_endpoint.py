@@ -65,7 +65,7 @@ def _has_query(pool: Any, needle: str) -> bool:
     return any(needle in (e.get("query") or "") for e in pool.events)
 
 
-def _patch_writer(monkeypatch: Any, captured: dict[str, Any]) -> None:
+def _patch_writer(monkeypatch: Any, captured: dict[str, Any], object_version: int = 1) -> None:
     async def fake_put(self: Any, **kw: Any) -> PutResult:
         captured["bucket_id"] = kw["bucket_id"]
         return PutResult(
@@ -73,7 +73,7 @@ def _patch_writer(monkeypatch: Any, captured: dict[str, Any]) -> None:
             etag="etag",
             size_bytes=3,
             upload_id=str(uuid.uuid4()),
-            object_version=1,
+            object_version=object_version,
         )
 
     async def fake_persist_address(*_a: Any, **_kw: Any) -> None:
@@ -292,3 +292,43 @@ async def test_no_head_acquire_when_user_cached_and_bucket_forwarded(monkeypatch
     # Only is_completed-after-enqueue (1); the head user+bucket acquire and the existing-object
     # pre-check acquire are both gone.
     assert pool.acquire_count == 1
+
+
+@pytest.mark.asyncio
+async def test_created_flag_set_when_version_1(monkeypatch: Any) -> None:
+    """A fresh key (writer allocated version 1) marks request.state.ats_object_created so the
+    gateway's ats_purge middleware skips the PURGE fan-out for creations."""
+    pool = make_fake_pool(_bucket_present_router)
+    _patch_writer(monkeypatch, {}, object_version=1)
+
+    req = _fake_request({"Content-Type": "text/plain"})
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="fresh.txt",
+        request=req,
+        pool=pool,
+        redis_client=_FakeRedis(),
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("x-amz-version-id") == "1"
+    assert getattr(req.state, "ats_object_created", False) is True
+
+
+@pytest.mark.asyncio
+async def test_created_flag_absent_on_overwrite(monkeypatch: Any) -> None:
+    """An overwrite (version >= 2) must NOT set the created flag — the middleware then purges as
+    before. Absent-flag-means-purge is the fail-safe direction, so this pins the overwrite side."""
+    pool = make_fake_pool(_bucket_present_router)
+    _patch_writer(monkeypatch, {}, object_version=2)
+
+    req = _fake_request({"Content-Type": "text/plain"})
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="fresh.txt",
+        request=req,
+        pool=pool,
+        redis_client=_FakeRedis(),
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("x-amz-version-id") == "2"
+    assert getattr(req.state, "ats_object_created", False) is False
