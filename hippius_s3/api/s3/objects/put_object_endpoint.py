@@ -237,6 +237,13 @@ async def handle_put_object(
             bucket_name=bucket_name,
         )
 
+        # Version 1 means the key never existed, so there is no edge cache entry to purge —
+        # ats_purge_middleware skips its PURGE fan-out when this is set. Only reachable on the
+        # simple-PUT path: append returned via handle_append long before this point, and an
+        # overwrite (or a versioned re-PUT of a previously deleted key) allocates version >= 2.
+        if int(put_res.object_version) == 1:
+            request.state.ats_object_created = True
+
         # New or overwrite base object: expose append-version so clients can start append flow without HEAD
         return Response(
             status_code=200,
