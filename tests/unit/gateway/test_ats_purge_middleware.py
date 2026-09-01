@@ -237,3 +237,56 @@ async def test_middleware_is_noop_when_endpoint_unset(
         r = await client.put("/mybucket/k", content=b"x")
     assert r.status_code == 200
     assert captured_purges == []
+
+
+@pytest.fixture  # type: ignore[misc]
+def app_with_create_flag(captured_purges: list[tuple[str, str]]) -> Any:
+    """Handler sets `request.state.ats_object_created` the way put_object_endpoint does on
+    an allocated version 1 — driven here by a test header so each case chooses per request."""
+    app = FastAPI()
+    app.middleware("http")(ats_purge_middleware)
+
+    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+    async def catch_all(request: Request) -> Response:
+        if request.headers.get("x-test-created") == "1":
+            request.state.ats_object_created = True
+        return Response(status_code=200, content=b"ok")
+
+    return app
+
+
+@pytest.mark.asyncio
+async def test_created_object_skips_purge(app_with_create_flag: Any, captured_purges: list[tuple[str, str]]) -> None:
+    """A key that never existed has no cache entry — the purge fan-out must not fire.
+
+    This is the point of the change: creations dominated write traffic, so purges were 24% of
+    all requests through the EU edge while effectively every one 404'd."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_create_flag), base_url="http://s3.hippius.com"
+    ) as client:
+        r = await client.put("/mybucket/newkey.bin", content=b"data", headers={"x-test-created": "1"})
+    assert r.status_code == 200
+    assert captured_purges == []
+
+
+@pytest.mark.asyncio
+async def test_overwrite_still_purges(app_with_create_flag: Any, captured_purges: list[tuple[str, str]]) -> None:
+    """No flag means not audited as a creation — an overwrite CAN leave a stale entry, so the
+    purge must keep firing. Guards against the skip accidentally becoming unconditional."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_create_flag), base_url="http://s3.hippius.com"
+    ) as client:
+        r = await client.put("/mybucket/existing.bin", content=b"data")
+    assert r.status_code == 200
+    assert captured_purges == [("s3.hippius.com", "mybucket/existing.bin")]
+
+
+@pytest.mark.asyncio
+async def test_delete_still_purges(app_with_create_flag: Any, captured_purges: list[tuple[str, str]]) -> None:
+    """DELETE is the other operation that leaves stale entries; the flag never applies to it."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_create_flag), base_url="http://s3.hippius.com"
+    ) as client:
+        r = await client.delete("/mybucket/gone.bin")
+    assert r.status_code == 200
+    assert captured_purges == [("s3.hippius.com", "mybucket/gone.bin")]
