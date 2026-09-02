@@ -59,7 +59,11 @@ def test_put_object_with_incomplete_object_lock_headers_is_rejected(
     """
     bucket_name = unique_bucket_name("ol-put-obj")
     cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name)
+    # Lock-ENABLED, because the property under test is how a lock header is VALIDATED, not whether
+    # the bucket accepts locks at all. On a bucket that never opted in every lock header is refused
+    # up front with InvalidRequest and the completeness check is never reached — that path is
+    # covered by test_lock_headers_refused_on_bucket_without_object_lock below.
+    boto3_client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
 
     def _inject_header(request: AWSRequest, **_: Any) -> None:
         request.headers[header_name] = header_value
@@ -78,6 +82,71 @@ def test_put_object_with_incomplete_object_lock_headers_is_rejected(
     status, code = _error(excinfo.value)
     assert status == 400, f"{header_name} alone should yield 400, got {status} (code={code})"
     assert code == "InvalidArgument"
+
+
+@pytest.mark.parametrize(
+    "headers,label",
+    [
+        ({"x-amz-object-lock-mode": "COMPLIANCE", "x-amz-object-lock-retain-until-date": "2036-01-01T00:00:00Z"},
+         "COMPLIANCE retention"),
+        ({"x-amz-object-lock-mode": "GOVERNANCE", "x-amz-object-lock-retain-until-date": "2036-01-01T00:00:00Z"},
+         "GOVERNANCE retention"),
+        ({"x-amz-object-lock-legal-hold": "ON"}, "legal hold alone"),
+    ],
+)
+def test_lock_headers_refused_on_bucket_without_object_lock(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+    headers: dict[str, str],
+    label: str,
+) -> None:
+    """A bucket that never opted in must REFUSE lock headers, not honour them.
+
+    Honouring them lets a caller holding plain WRITE pin an unreclaimable retention on any bucket
+    they can upload to: COMPLIANCE has no bypass by design, and the SQL gates then hold the
+    unpinner, the reaper, the hard-delete ring and the ops scripts off those bytes for the whole
+    retain-until — up to 3650 days, with no way back even for the bucket owner.
+
+    Refusing rather than silently dropping matters just as much, and is why this asserts the error
+    code and not merely that the object came back unlocked: a client whose retention header was
+    ignored believes its object is protected when it is not.
+    """
+    bucket_name = unique_bucket_name("ol-noopt")
+    cleanup_buckets(bucket_name)
+    boto3_client.create_bucket(Bucket=bucket_name)  # deliberately NOT lock-enabled
+
+    def _inject(request: AWSRequest, **_: Any) -> None:
+        for k, v in headers.items():
+            request.headers[k] = v
+
+    boto3_client.meta.events.register("before-sign.s3.PutObject", _inject)
+    try:
+        with pytest.raises(ClientError) as excinfo:
+            boto3_client.put_object(Bucket=bucket_name, Key="victim", Body=b"hello")
+    finally:
+        boto3_client.meta.events.unregister("before-sign.s3.PutObject", _inject)
+
+    status, code = _error(excinfo.value)
+    assert status == 400, f"{label} accepted on a bucket with no Object Lock config (status {status})"
+    assert code == "InvalidRequest", f"{label} rejected with {code}, expected InvalidRequest"
+
+
+def test_ordinary_upload_to_ordinary_bucket_is_unaffected(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    """The opt-in gate must cost the overwhelmingly common path nothing."""
+    bucket_name = unique_bucket_name("ol-plain")
+    cleanup_buckets(bucket_name)
+    boto3_client.create_bucket(Bucket=bucket_name)
+    boto3_client.put_object(Bucket=bucket_name, Key="plain", Body=b"hello")
+    head = boto3_client.head_object(Bucket=bucket_name, Key="plain")
+    assert "ObjectLockMode" not in head
+    boto3_client.delete_object(Bucket=bucket_name, Key="plain")
 
 
 @pytest.mark.parametrize(
