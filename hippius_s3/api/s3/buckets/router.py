@@ -125,6 +125,28 @@ async def create_or_modify_bucket(
     if "versioning" in request.query_params:
         async with pool.acquire() as conn:
             return await handle_put_bucket_versioning(bucket_name, request, conn)
+    # Retention and legal hold address an object VERSION; on a bucket path they address nothing.
+    # They need an explicit branch for the same reason ?versioning did — anything unmatched here
+    # falls into handle_create_bucket — and the fallthrough is not merely a confusing answer:
+    #
+    #   PUT /new-bucket?retention  with x-amz-acl: public-read  -> 200, PUBLIC bucket created
+    #   PUT /new-bucket            with x-amz-acl: public-read  -> 400 InvalidBucketAclWithObjectOwnership
+    #
+    # Because `retention` is in BUCKET_PUT_SUBRESOURCES, is_create_bucket_shape() reads the request
+    # as "not a CreateBucket", so the ACL middleware skips the CreateBucket branch holding the
+    # sentinel-account check and the x-amz-acl rejection. The request then reaches this router,
+    # matches nothing, and creates the bucket anyway — with both guards already behind it.
+    #
+    # This used to be covered by maybe_object_lock_not_implemented_response returning 501 for these
+    # query params. Tier 2 implemented them at the object level and emptied that set, which quietly
+    # removed the only thing standing in front of this path.
+    if "retention" in request.query_params or "legal-hold" in request.query_params:
+        return errors.s3_error_response(
+            "MethodNotAllowed",
+            "Object Lock retention and legal hold are object-level subresources and cannot be set on a bucket.",
+            status_code=405,
+            BucketName=bucket_name,
+        )
     if (invalid := invalid_canned_acl_response(request.headers.get("x-amz-acl"))) is not None:
         return invalid
     # Delegate to the new comprehensive handler (supports create/tagging/lifecycle/policy)
