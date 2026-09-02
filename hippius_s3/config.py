@@ -296,6 +296,15 @@ class Config:
     # 56666 at pressure 0). Prod carries the same value in k8s/base/workers-deployments.yaml — keep
     # the two in step, and do not "optimise" this downward without re-checking the churn rate.
     fs_cache_hot_retention_seconds: int = env("HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS:14400", convert=int)
+
+    # Object Lock: the maximum retention any single request may set, in days. Load-bearing rather
+    # than a nicety — a COMPLIANCE lock cannot be shortened by anyone, so this is the ONLY bound on
+    # how much unreclaimable storage one account can create, and we carry that storage cost until
+    # it expires. AWS expresses the same bound through the s3:object-lock-remaining-retention-days
+    # bucket-policy condition key, which this codebase has no policy engine for.
+    # Default 10 years: long enough for the ordinary regulatory retentions (SEC 17a-4 is 6),
+    # short enough that a mistake is not effectively permanent.
+    object_lock_max_retention_days: int = env("HIPPIUS_OBJECT_LOCK_MAX_RETENTION_DAYS:3650", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
     object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
     # Downloader behavior (default: no whole-part backfill)

@@ -189,3 +189,37 @@ class TestResponseRendering:
     def test_legal_hold_round_trips(self, on: bool) -> None:
         back, err = parse_legal_hold_body(legal_hold_to_xml(on))
         assert err is None and back is on
+
+
+class TestRetentionHorizonCap:
+    """A COMPLIANCE lock cannot be shortened by anyone, so an unbounded RetainUntilDate lets one
+    request create storage the platform can never reclaim. The cap is the only bound that exists
+    here — there is no bucket-policy condition key to express it — which is why it is enforced at
+    parse time rather than left to operator discipline."""
+
+    def _body(self, years: int) -> bytes:
+        when = datetime.now(timezone.utc) + timedelta(days=365 * years)
+        return (
+            b"<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>"
+            + when.isoformat().replace("+00:00", "Z").encode()
+            + b"</RetainUntilDate></Retention>"
+        )
+
+    def test_within_the_cap_is_accepted(self) -> None:
+        parsed, err = parse_retention_body(self._body(1))
+        assert err is None and parsed is not None
+
+    def test_absurd_horizon_is_refused(self) -> None:
+        """The attack: COMPLIANCE + year 9999 on data the caller may write, unreclaimable forever."""
+        parsed, err = parse_retention_body(self._body(500))
+        assert parsed is None and err is not None and err.status_code == 400
+
+    def test_the_cap_is_configurable(self, monkeypatch: Any) -> None:
+        """Operators must be able to raise it for a genuine long-retention customer without a
+        code change — and lower it, which is the direction that matters after an incident."""
+        from hippius_s3 import config as config_module
+
+        cfg = config_module.get_config()
+        monkeypatch.setattr(cfg, "object_lock_max_retention_days", 30, raising=False)
+        parsed, err = parse_retention_body(self._body(1))
+        assert parsed is None and err is not None, "a 1-year retention passed a 30-day cap"

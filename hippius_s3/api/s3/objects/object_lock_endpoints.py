@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from typing import Any
 from typing import Final
@@ -27,6 +28,7 @@ from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.object_lock_enforcement import COMPLIANCE
 from hippius_s3.api.s3.object_lock_enforcement import GOVERNANCE
 from hippius_s3.api.s3.object_lock_enforcement import may_bypass_governance
+from hippius_s3.config import get_config
 from hippius_s3.utils import get_query
 from hippius_s3.xml_helpers import add_subelement
 from hippius_s3.xml_helpers import create_element
@@ -95,6 +97,18 @@ def parse_retention_body(body: bytes) -> tuple[dict[str, Any] | None, Response |
         # A naive timestamp compared against an aware `now()` raises at enforcement time, which
         # would turn a malformed request into a 500 on the DELETE path much later. Assume UTC.
         parsed = parsed.replace(tzinfo=timezone.utc)
+
+    # Cap the horizon. A COMPLIANCE lock cannot be shortened by anyone, so an unbounded
+    # RetainUntilDate lets one request create storage this platform can never reclaim and must
+    # keep paying for — the team decision on COMPLIANCE mode records this cap as the only bound
+    # that exists, since there is no bucket-policy condition key here to express it.
+    max_days = get_config().object_lock_max_retention_days
+    if parsed > datetime.now(timezone.utc) + timedelta(days=max_days):
+        return None, errors.s3_error_response(
+            "InvalidArgument",
+            f"RetainUntilDate is further than {max_days} days out, the maximum retention this service accepts.",
+            status_code=400,
+        )
     return {"mode": mode, "retain_until": parsed}, None
 
 

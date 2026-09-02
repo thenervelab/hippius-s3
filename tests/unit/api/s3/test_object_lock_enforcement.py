@@ -217,3 +217,39 @@ class TestDeletionRefusalReason:
         it. An unrecognised lock is the one case where guessing wrong destroys data, so refuse."""
         row = _version(mode="WORM", retain_until=FUTURE)
         assert deletion_refusal_reason(row, is_bucket_owner=True, headers={}) is not None
+
+
+class TestSqlGatesEmbedTheCanonicalPredicate:
+    """Every gated query must carry the same lock predicate, spelled the same way.
+
+    asyncpg cannot parameterise a predicate, so each .sql file embeds the text rather than
+    importing it — several hand-synced copies, which is exactly the shape that rots. The
+    integration suite cross-checks the SQL verdict against the Python one, but only for the unpin
+    gate; this pins every other gated query too, cheaply and without a database.
+    """
+
+    GATED_QUERIES = (
+        "get_chunk_backend_identifiers",
+        "find_objects_ready_for_hard_delete",
+        "find_versions_ready_for_reap",
+    )
+
+    @pytest.mark.parametrize("query_name", GATED_QUERIES)
+    def test_query_contains_both_halves_of_the_predicate(self, query_name: str) -> None:
+        from hippius_s3.utils import get_query
+
+        sql = get_query(query_name)
+        # Both protections, independently — a query carrying only the retention half would silently
+        # let a legal-hold-only version be destroyed.
+        assert "object_lock_legal_hold" in sql, f"{query_name} does not check the legal hold"
+        assert "object_lock_retain_until" in sql, f"{query_name} does not check the retention"
+        assert "now()" in sql, f"{query_name} does not compare the retention against the clock"
+
+    @pytest.mark.parametrize("query_name", GATED_QUERIES)
+    def test_predicate_uses_strict_inequality(self, query_name: str) -> None:
+        """`>=` would keep a version locked for an instant past its expiry in SQL while Python
+        released it — the two would disagree exactly at the boundary the unit tests pin."""
+        from hippius_s3.utils import get_query
+
+        sql = get_query(query_name)
+        assert "object_lock_retain_until >= now()" not in sql, f"{query_name} uses >= at the boundary"

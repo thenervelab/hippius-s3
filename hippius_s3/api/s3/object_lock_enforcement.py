@@ -1,9 +1,13 @@
 """Object Lock Tier 2 enforcement: the single definition of "is this version locked".
 
-Every enforcement point — the delete endpoints, the batch delete, the unpin enqueue and the
-hard-delete ring — resolves through `is_version_locked` so there is exactly one place the rule
-lives. The SQL that feeds the workers carries the same predicate; see
-`LOCKED_VERSION_SQL_PREDICATE`.
+WIRED TODAY: the unpin resolution query and the janitor's hard-delete ring, both in SQL, plus the
+ops scripts that issue raw DELETEs. That set is what makes the durability promise real, because it
+holds with no API code running at all.
+
+NOT WIRED YET: the delete endpoints (`DELETE ?versionId` must answer 403; a versionId-less DELETE
+must answer 200 and write a delete marker) and `DeleteObjects`. `deletion_refusal_reason` exists
+for them and is tested, but nothing calls it yet — see `specs/s3-object-lock-tier2-handoff.md` §5
+rows 1-3. Do not read this module as evidence that the API refuses a locked delete; it does not.
 
 Two rules are easy to get wrong and are worth stating up front, because both are load-bearing:
 
@@ -25,9 +29,11 @@ from typing import Any
 from typing import Final
 
 
-# Mirrors is_version_locked for callers that must filter in SQL rather than Python — the workers,
-# where the guarantee has to hold even when no API code runs. Formatted with a table alias so it
-# can be dropped into a join. Keep the two definitions in step; a test asserts they agree.
+# The canonical SQL spelling of is_version_locked, for the workers, where the guarantee has to hold
+# with no API code running. asyncpg cannot parameterise a predicate, so each .sql file embeds this
+# text rather than importing it. That makes several hand-synced copies, which is exactly the shape
+# that rots — so test_sql_gates_embed_the_canonical_predicate asserts every gated query still
+# contains it, and the integration suite cross-checks the SQL verdict against the Python one.
 LOCKED_VERSION_SQL_PREDICATE: Final[str] = (
     "({alias}.object_lock_legal_hold "
     "OR ({alias}.object_lock_retain_until IS NOT NULL AND {alias}.object_lock_retain_until > now()))"

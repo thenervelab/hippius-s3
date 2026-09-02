@@ -300,3 +300,102 @@ class TestSqlAndPythonAgree:
             f"SQL and Python disagree for mode={mode} delta={delta} hold={hold}: "
             f"python={python_says_locked} sql={sql_says_locked}"
         )
+
+
+class TestOpsScriptGates:
+    """The ops scripts issue RAW SQL, so they bypass both query gates entirely.
+
+    A WORM guarantee that holds everywhere except the scripts an operator reaches for during an
+    incident is not a guarantee — and the team decision on COMPLIANCE mode names these paths
+    explicitly. These run the scripts' actual delete statements against real rows.
+    """
+
+    async def test_purge_source_versions_skips_a_locked_version(self, ctx: Ctx) -> None:
+        oid = await _make_object_with_versions(
+            ctx,
+            key="ops1",
+            versions=[{"version": 1, "mode": "COMPLIANCE", "retain_until": datetime.now(timezone.utc) + FUTURE}],
+        )
+        await ctx.conn.execute(
+            """
+            WITH locked AS (
+                SELECT 1 FROM object_versions
+                WHERE object_id = $1 AND object_version = $2
+                  AND (object_lock_legal_hold
+                       OR (object_lock_retain_until IS NOT NULL AND object_lock_retain_until > now()))
+            ), del_parts AS (
+                DELETE FROM parts WHERE object_id = $1 AND object_version = $2
+                  AND NOT EXISTS (SELECT 1 FROM locked) RETURNING 1
+            ), del_ver AS (
+                DELETE FROM object_versions WHERE object_id = $1 AND object_version = $2
+                  AND NOT EXISTS (SELECT 1 FROM locked) RETURNING 1
+            )
+            SELECT 1
+            """,
+            oid,
+            1,
+        )
+        survived = await ctx.conn.fetchval(
+            "SELECT count(*) FROM object_versions WHERE object_id = $1 AND object_version = 1", oid
+        )
+        assert survived == 1, "purge_source_versions destroyed a COMPLIANCE-locked version"
+
+    async def test_delete_legacy_versions_skips_a_locked_version(self, ctx: Ctx) -> None:
+        oid = await _make_object_with_versions(ctx, key="ops2", versions=[{"version": 1, "legal_hold": True}])
+        await ctx.conn.execute(
+            """
+            DELETE FROM object_versions
+             WHERE object_id = $1::uuid AND object_version = $2::bigint
+               AND NOT (object_lock_legal_hold
+                        OR (object_lock_retain_until IS NOT NULL AND object_lock_retain_until > now()))
+            """,
+            oid,
+            1,
+        )
+        survived = await ctx.conn.fetchval(
+            "SELECT count(*) FROM object_versions WHERE object_id = $1 AND object_version = 1", oid
+        )
+        assert survived == 1, "delete_legacy_object_versions destroyed a legal-held version"
+
+    async def test_bulk_object_delete_is_blocked_by_one_locked_version(self, ctx: Ctx) -> None:
+        """Cascades to every version/part/chunk row, so a single locked version protects the object."""
+        oid = await _make_object_with_versions(
+            ctx,
+            key="ops3",
+            versions=[
+                {"version": 1, "mode": "GOVERNANCE", "retain_until": datetime.now(timezone.utc) + FUTURE},
+                {"version": 2},
+            ],
+        )
+        await ctx.conn.execute(
+            """
+            DELETE FROM objects
+             WHERE object_id = ANY($1::uuid[])
+               AND NOT EXISTS (
+                   SELECT 1 FROM object_versions ov
+                   WHERE ov.object_id = objects.object_id
+                     AND (ov.object_lock_legal_hold
+                          OR (ov.object_lock_retain_until IS NOT NULL AND ov.object_lock_retain_until > now()))
+               )
+            """,
+            [oid],
+        )
+        assert await ctx.conn.fetchval("SELECT count(*) FROM objects WHERE object_id = $1", oid) == 1
+
+    async def test_version_reaper_skips_locked_versions(self, ctx: Ctx) -> None:
+        oid = await _make_object_with_versions(
+            ctx,
+            key="ops4",
+            versions=[{"version": 1, "mode": "COMPLIANCE", "retain_until": datetime.now(timezone.utc) + FUTURE}],
+        )
+        await ctx.conn.execute(
+            "UPDATE object_versions SET deleted_at = now() - interval '2 hours' WHERE object_id = $1", oid
+        )
+        rows = await ctx.conn.fetch(
+            get_query("find_versions_ready_for_reap"),
+            1000,
+            datetime(1970, 1, 1, tzinfo=timezone.utc),
+            uuid.UUID(int=0),
+            0,
+        )
+        assert oid not in {r["object_id"] for r in rows}, "the reaper offered up a locked version"
