@@ -100,8 +100,11 @@ def test_bucket_object_lock_subresource_does_not_trigger() -> None:
 def test_per_object_lock_headers_still_501_where_unsupported(header_name: str, header_value: str) -> None:
     """The guard is PER PATH: refused by default, allowed only where the caller honours them.
 
-    CreateMultipartUpload does not yet carry a lock from initiate through to the version that
-    appears at completion, so it keeps the 501 rather than accepting the header and dropping it.
+    Default-deny is the load-bearing half. The write paths that persist a lock opt IN explicitly
+    (PutObject, CopyObject, CreateMultipartUpload); everything else — the read and delete routes,
+    and the bucket routes — still refuses, because a lock header there names nothing that any write
+    could apply, and accepting it would tell the client its object is retained when nothing was
+    written at all.
     """
     resp = maybe_object_lock_not_implemented_response(_make_request(headers={header_name: header_value}))
     _assert_not_implemented(resp)
@@ -116,9 +119,10 @@ def test_per_object_lock_headers_still_501_where_unsupported(header_name: str, h
     ],
 )
 def test_per_object_lock_headers_pass_where_supported(header_name: str, header_value: str) -> None:
-    """PutObject persists them, so it opts in and the guard must let them through — otherwise the
-    implemented feature is unreachable. Pinned in both directions because the opt-in is a single
-    keyword argument at one call site and silently losing it re-breaks PutObject."""
+    """PutObject, CopyObject and CreateMultipartUpload persist them, so they opt in and the guard
+    must let them through — otherwise the implemented feature is unreachable. Pinned in both
+    directions because the opt-in is a single keyword argument per call site, and silently losing
+    it turns a working feature back into a 501 with nothing else failing."""
     resp = maybe_object_lock_not_implemented_response(
         _make_request(headers={header_name: header_value}), object_lock_headers_supported=True
     )
@@ -161,3 +165,38 @@ def test_error_body_has_request_id_and_host_id() -> None:
     root = ET.fromstring(resp.body)
     assert root.findtext("RequestId"), "missing RequestId in error XML"
     assert root.findtext("HostId"), "missing HostId in error XML"
+
+
+def test_every_write_path_that_persists_a_lock_opts_into_the_guard() -> None:
+    """The opt-in is one keyword argument per call site, and losing it fails nothing else.
+
+    `object_lock_headers_supported=True` is what lets a lock header reach a write path that
+    actually persists it. Drop it from a call site and that path silently answers 501 again: the
+    feature disappears, no unit test breaks, and the only symptom is a client being told Object
+    Lock is not implemented. That is the same shape as the regression this PR fixes on the
+    multipart path, so it is asserted against the real source rather than trusted.
+
+    Read/delete and bucket routes are deliberately NOT in this list — a lock header there names
+    nothing a write could apply, so default-deny is correct for them.
+    """
+    import re
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[4]
+    expected = {
+        # file -> how many guard call sites must pass the opt-in EXPLICITLY.
+        # The value may be a literal True or a condition (multipart passes `is_initiate`, because
+        # that handler also serves CompleteMultipartUpload, which cannot apply a lock and so must
+        # keep refusing the headers). What matters is that the keyword is passed at all — omitting
+        # it silently restores the 501.
+        "hippius_s3/api/s3/objects/router.py": 1,  # put_object, which also dispatches CopyObject
+        "hippius_s3/api/s3/multipart.py": 1,  # CreateMultipartUpload
+    }
+    for rel, count in expected.items():
+        source = (repo / rel).read_text()
+        calls = re.findall(r"maybe_object_lock_not_implemented_response\((.*?)\)\n", source, re.S)
+        opted_in = [c for c in calls if "object_lock_headers_supported=" in c]
+        assert len(opted_in) == count, (
+            f"{rel} should have {count} guard call(s) passing object_lock_headers_supported, "
+            f"found {len(opted_in)}. Losing it makes a path that persists locks answer 501 again."
+        )

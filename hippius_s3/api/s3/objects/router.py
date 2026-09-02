@@ -159,8 +159,8 @@ async def put_object(
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
     redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
-    # PutObject persists the per-object lock headers, so the guard must not refuse them here.
-    # Every other entry point still does — see the note on _OBJECT_LOCK_HEADERS.
+    # PutObject and CopyObject (dispatched below) persist the per-object lock headers, so the
+    # guard must not refuse them here. The read/delete routes still do — see _OBJECT_LOCK_HEADERS.
     object_lock_response = maybe_object_lock_not_implemented_response(request, object_lock_headers_supported=True)
     if object_lock_response is not None:
         return object_lock_response

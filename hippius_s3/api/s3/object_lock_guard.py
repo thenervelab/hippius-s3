@@ -40,10 +40,13 @@ _QUERY_SUBRESOURCES: Final[frozenset[str]] = frozenset()
 # it replaces, and is the precise failure Tier 0 exists to prevent.
 # Per-object lock headers, refused on the paths that do NOT yet honour them.
 #
-# PutObject persists them (object_lock_endpoints.lock_for_new_version) and passes
-# object_lock_headers_supported=True. CreateMultipartUpload does NOT: carrying a lock named at
-# initiate through to the version that appears at completion needs the intent stored on
-# multipart_uploads, which is a schema change and its own increment. Until then MPU keeps the 501.
+# PutObject, CopyObject (dispatched from the same PUT route) and CreateMultipartUpload all persist
+# them now and pass object_lock_headers_supported=True. MPU needed no schema change in the end:
+# completion resolves its version from the upload's own parts, so the row reserved at initiate is
+# the one finalised, and the lock can simply be written there.
+#
+# What still refuses them is every read/delete route and the bucket routes, where the headers name
+# nothing a write could apply.
 #
 # A header stops being refused on a path only once that path genuinely honours it. Accepting lock
 # intent and dropping it is worse than the 501 it replaces — the client believes its object is

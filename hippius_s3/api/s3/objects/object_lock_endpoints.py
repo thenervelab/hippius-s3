@@ -368,20 +368,6 @@ def validate_lock_intent(request: Request) -> Response | None:
     return outcome if isinstance(outcome, Response) else None
 
 
-def bucket_default_lock_for_new_version(request: Request) -> tuple[str, datetime] | None:
-    """The bucket's DEFAULT retention, resolved to a concrete date for a version created now.
-
-    Split out of lock_for_new_version for the write paths that do NOT accept per-object lock
-    headers — CompleteMultipartUpload still answers 501 to those — but must still honour the
-    bucket's configured default. Returns None when the bucket has no default, which is the case
-    for every bucket that has not opted in.
-    """
-    config = getattr(request.state, "bucket_object_lock", None)
-    if not bucket_lock_enabled(config):
-        return None
-    return _bucket_default_retention(config)
-
-
 def bucket_lock_enabled(config: Any) -> bool:
     """Whether this bucket opted in to Object Lock at all.
 
