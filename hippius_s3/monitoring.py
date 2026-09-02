@@ -454,15 +454,19 @@ class MetricsCollector:
             unit="1",
         )
 
+        # Legacy names kept alive as aliases of s3_bytes_uploaded/downloaded. The gateway
+        # that used to feed them from the forwarded byte stream is gone (PR #420 merge);
+        # external consumers still query these names, so record_data_transfer mirrors
+        # the s3_bytes_* increments onto them.
         self.gateway_bytes_received = self.meter.create_counter(
             name="gateway_bytes_received_total",
-            description="Total bytes received from clients through the gateway",
+            description="Alias of s3_bytes_uploaded_total (legacy gateway name)",
             unit="bytes",
         )
 
         self.gateway_bytes_sent = self.meter.create_counter(
             name="gateway_bytes_sent_total",
-            description="Total bytes sent to clients through the gateway",
+            description="Alias of s3_bytes_downloaded_total (legacy gateway name)",
             unit="bytes",
         )
 
@@ -651,8 +655,10 @@ class MetricsCollector:
 
         if operation in ["upload", "put_object", "post_object", "upload_part"]:
             self.s3_bytes_uploaded.add(bytes_transferred, attributes=attributes)
+            self.gateway_bytes_received.add(bytes_transferred, attributes=attributes)
         elif operation in ["download", "get_object"]:
             self.s3_bytes_downloaded.add(bytes_transferred, attributes=attributes)
+            self.gateway_bytes_sent.add(bytes_transferred, attributes=attributes)
 
     def record_error(
         self,

@@ -290,3 +290,41 @@ class TestOperationCountedExactlyOnce:
         c.record_data_transfer(operation="get_object", bytes_transferred=10, bucket_name="b")
 
         assert ops.add.call_count == 1, "a data op must count once, not twice"
+
+
+class TestLegacyGatewayByteAliases:
+    """gateway_bytes_{received,sent}_total are aliases of s3_bytes_{uploaded,downloaded}_total.
+
+    The gateway that fed them from the forwarded byte stream was removed in the PR #420
+    merge, which silently emptied the series while external dashboards kept querying the
+    old names. record_data_transfer now mirrors every s3_bytes_* increment onto the legacy
+    counter with the same value and labels.
+    """
+
+    def _collector(self) -> MetricsCollector:
+        c = MetricsCollector(redis_client=MagicMock())
+        c.s3_bytes_uploaded = MagicMock()
+        c.s3_bytes_downloaded = MagicMock()
+        c.gateway_bytes_received = MagicMock()
+        c.gateway_bytes_sent = MagicMock()
+        return c
+
+    def test_upload_mirrors_onto_gateway_bytes_received(self) -> None:
+        c = self._collector()
+        c.record_data_transfer(operation="put_object", bytes_transferred=1234, bucket_name="b")
+
+        c.gateway_bytes_received.add.assert_called_once_with(1234, attributes={"operation": "put_object"})
+        c.gateway_bytes_sent.add.assert_not_called()
+
+    def test_download_mirrors_onto_gateway_bytes_sent(self) -> None:
+        c = self._collector()
+        c.record_data_transfer(operation="get_object", bytes_transferred=99, bucket_name="b")
+
+        c.gateway_bytes_sent.add.assert_called_once_with(99, attributes={"operation": "get_object"})
+        c.gateway_bytes_received.add.assert_not_called()
+
+    def test_alias_and_canonical_receive_identical_increments(self) -> None:
+        c = self._collector()
+        c.record_data_transfer(operation="upload_part", bytes_transferred=5, bucket_name="b")
+
+        assert c.s3_bytes_uploaded.add.call_args == c.gateway_bytes_received.add.call_args
