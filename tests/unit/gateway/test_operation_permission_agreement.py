@@ -14,6 +14,7 @@ Two failure shapes are covered here, both privilege confusion rather than authen
 """
 
 import pytest
+from starlette.datastructures import QueryParams
 
 from hippius_s3.api.s3.buckets import router as buckets_router
 from hippius_s3.gateway.middlewares.acl import BUCKET_PUT_SUBRESOURCES
@@ -206,3 +207,40 @@ class TestDeleteBucketDispatch:
 
         assert called == [], f"?{query} must not reach handle_delete_bucket"
         assert resp.status_code == 501
+
+
+class TestWormSubresourcesCannotTakeTheCreateBypass:
+    """The `?versioning` bug had two halves, and grading was only one of them.
+
+    `?versioning` was graded WRITE_ACP correctly and STILL bypassed the permission check, because
+    `is_create_bucket_shape` did not know the name: an unrecognised param on a keyless PUT is a
+    CreateBucket, and CreateBucket skips the bucket-permission check. Both halves have to name a
+    subresource for it to be gated.
+
+    `?retention` / `?legal-hold` answer 501 today, so nothing is reachable through them — but the
+    grading is already in place for Tier 2, and this pins the other half so the surface cannot land
+    ungated whichever half a future change forgets.
+    """
+
+    @pytest.mark.parametrize("param", ["object-lock", "retention", "legal-hold"])
+    def test_worm_params_are_not_create_shapes(self, param: str) -> None:
+        assert is_create_bucket_shape("PUT", None, {param: ""}) is False, (
+            f"?{param} takes the CreateBucket bypass, so the ACL check never runs on it"
+        )
+
+    @pytest.mark.parametrize("param", ["object-lock", "retention", "legal-hold"])
+    def test_worm_params_demand_acp_on_write(self, param: str) -> None:
+        assert get_required_permission("PUT", {param: ""}, has_key=False) is Permission.WRITE_ACP
+
+    def test_percent_encoded_spellings_cannot_split_the_two_halves(self) -> None:
+        """The ACL middleware and the bucket router must never disagree about what a param IS.
+
+        Both read the same decoded QueryParams, so `%6fbject-lock` and `object%2Dlock` decode to
+        the canonical name on both sides. Pinned because a divergence here — one side seeing the
+        raw spelling, the other the decoded one — recreates the ungated-subresource bug with a
+        param the set cannot list.
+        """
+        for raw in ("%6fbject-lock", "object%2Dlock", "object-lock&acl"):
+            decoded = dict(QueryParams(raw))
+            assert is_create_bucket_shape("PUT", None, decoded) is False, f"{raw} took the bypass"
+            assert "object-lock" in QueryParams(raw), f"{raw} did not decode to the router's name"

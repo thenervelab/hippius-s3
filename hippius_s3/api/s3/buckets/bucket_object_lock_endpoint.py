@@ -31,6 +31,7 @@ from lxml import etree as ET  # ty: ignore[unresolved-import]
 from hippius_s3.api.s3 import errors
 from hippius_s3.repositories.buckets import BucketRepository
 from hippius_s3.utils import get_query
+from hippius_s3.xml_helpers import parse_untrusted_xml
 
 
 logger = logging.getLogger(__name__)
@@ -82,9 +83,14 @@ def _parse_request_xml(body: bytes) -> tuple[dict[str, Any] | None, Response | N
             "The XML you provided was not well-formed or did not validate against our published schema.",
             status_code=400,
         )
+    # parse_untrusted_xml, not ET.fromstring: lxml's default parser expands DTD-declared
+    # entities, so a billion-laughs body inflates in the worker before any validation below
+    # runs. This is the repo's single hardened entry point for client XML (resolve_entities
+    # =False, load_dtd=False, no_network=True, huge_tree=False), already used by
+    # CompleteMultipartUpload. It raises ValueError rather than XMLSyntaxError.
     try:
-        root = ET.fromstring(body)
-    except ET.XMLSyntaxError:
+        root = parse_untrusted_xml(body)
+    except ValueError:
         return None, errors.s3_error_response(
             "MalformedXML",
             "The XML you provided was not well-formed or did not validate against our published schema.",
@@ -210,7 +216,12 @@ async def handle_get_bucket_object_lock(bucket_name: str, db: Any, main_account_
 
 
 async def handle_put_bucket_object_lock(bucket_name: str, request: Request, db: Any) -> Response:
-    main_account_id = request.state.account.main_account
+    # main_account_id, NOT account.main_account: this is the storage-attribution account (the
+    # bucket OWNER, falling back to the caller), which is what every sibling bucket subresource
+    # passes to get_by_name_and_owner. Using the caller's own identity 404s any ACL-delegated
+    # caller — precisely the WRITE_ACP grantee this operation's own permission grading exists to
+    # admit — while ?tagging and ?versioning succeed for them on the same bucket.
+    main_account_id = request.state.main_account_id
     bucket = await BucketRepository(db).get_by_name_and_owner(bucket_name, main_account_id)
     if not bucket:
         return errors.s3_error_response(

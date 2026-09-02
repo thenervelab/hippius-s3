@@ -107,7 +107,19 @@ def parse_s3_path(path: str) -> tuple[str | None, str | None]:
 # shape, so `PUT /nonexistent?<name>` skips the CreateBucket guards (the sentinel-account check)
 # and still lands on handle_create_bucket. The two lists move together, in that order, and
 # test_subresource_set_covers_every_branch_the_put_router_dispatches pins them.
-BUCKET_PUT_SUBRESOURCES = frozenset({"acl", "tagging", "lifecycle", "policy", "cors", "versioning", "object-lock"})
+#
+# `retention` and `legal-hold` are the deliberate exception to that rule, and safe only because
+# maybe_object_lock_not_implemented_response is the FIRST statement in create_or_modify_bucket:
+# they 501 before the create fallthrough, so they can never reach handle_create_bucket with its
+# guards skipped. They are listed because grading them (below) closes only half the gate —
+# is_create_bucket_shape is the other half, and a param missing from THIS set takes the
+# CreateBucket bypass and never reaches the permission check at all. That asymmetry is exactly how
+# ?versioning shipped ungated: it WAS graded, and still bypassed. Listing them now means the Tier 2
+# surface cannot land ungated whichever half a future change forgets, and it stops
+# `PUT /someone-elses-bucket?retention` distinguishing 501-from-403 as a bucket-existence oracle.
+BUCKET_PUT_SUBRESOURCES = frozenset(
+    {"acl", "tagging", "lifecycle", "policy", "cors", "versioning", "object-lock", "retention", "legal-hold"}
+)
 
 
 def is_create_bucket_shape(method: str, key: str | None, query_params: dict) -> bool:

@@ -57,7 +57,7 @@ async def get_bucket(
         return object_lock_response
     if "object-lock" in request.query_params:
         async with pool.acquire() as conn:
-            return await handle_get_bucket_object_lock(bucket_name, conn, request.state.account.main_account)
+            return await handle_get_bucket_object_lock(bucket_name, conn, request.state.main_account_id)
     if "acl" in request.query_params:
         return await get_bucket_acl(bucket_name, request)
     if "location" in request.query_params:
