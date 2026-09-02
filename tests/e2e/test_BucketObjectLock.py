@@ -399,3 +399,51 @@ def test_invalid_configuration_rejected(
         )
     status, _ = _error(excinfo.value)
     assert status == 400
+
+
+def test_refused_lock_header_leaves_no_object_behind(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    """A refused PUT must have no side effect — no new object, and no destroyed old one.
+
+    The lock is applied AFTER the write, because it has to land on a version that exists. The
+    refusal was originally sharing that call site, so a rejected lock header returned 400 for a
+    request whose body had already been committed: an unlocked object appeared at the key, and an
+    overwrite had already destroyed the previous content while the client was told its PUT failed.
+
+    Both halves are asserted, because the overwrite case is the damaging one and it is invisible if
+    you only check that the new key is absent.
+    """
+    bucket_name = unique_bucket_name("ol-noside")
+    cleanup_buckets(bucket_name)
+    boto3_client.create_bucket(Bucket=bucket_name)  # never opted in, so lock headers are refused
+
+    boto3_client.put_object(Bucket=bucket_name, Key="existing", Body=b"ORIGINAL")
+
+    def _inject(request: AWSRequest, **_: Any) -> None:
+        request.headers["x-amz-object-lock-mode"] = "COMPLIANCE"
+        request.headers["x-amz-object-lock-retain-until-date"] = "2036-01-01T00:00:00Z"
+
+    boto3_client.meta.events.register("before-sign.s3.PutObject", _inject)
+    try:
+        with pytest.raises(ClientError):
+            boto3_client.put_object(Bucket=bucket_name, Key="fresh", Body=b"NEW")
+        with pytest.raises(ClientError):
+            boto3_client.put_object(Bucket=bucket_name, Key="existing", Body=b"REPLACED")
+    finally:
+        boto3_client.meta.events.unregister("before-sign.s3.PutObject", _inject)
+
+    with pytest.raises(ClientError) as missing:
+        boto3_client.head_object(Bucket=bucket_name, Key="fresh")
+    assert missing.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404, (
+        "a refused PUT still created an object"
+    )
+
+    body = boto3_client.get_object(Bucket=bucket_name, Key="existing")["Body"].read()
+    assert body == b"ORIGINAL", "a refused overwrite destroyed the existing object"
+
+    # And the bucket is still removable — nothing unreclaimable was created behind the refusal.
+    boto3_client.delete_object(Bucket=bucket_name, Key="existing")

@@ -353,6 +353,21 @@ async def handle_put_object_legal_hold(
     return Response(status_code=200)
 
 
+def validate_lock_intent(request: Request) -> Response | None:
+    """Whatever `lock_for_new_version` would REFUSE, without applying anything.
+
+    Exists so a write path can reject bad lock intent BEFORE it commits an object. The application
+    half has to run after the write — the lock must land on a version that exists — but the refusal
+    half must not: a 4xx returned after the body is committed leaves an unlocked object sitting at
+    the key, and if the PUT was an overwrite it has already destroyed what was there. The client is
+    told its request failed and then finds the old content gone.
+
+    Returns the error Response to send, or None when the request carries nothing objectionable.
+    """
+    outcome = lock_for_new_version(request)
+    return outcome if isinstance(outcome, Response) else None
+
+
 def bucket_default_lock_for_new_version(request: Request) -> tuple[str, datetime] | None:
     """The bucket's DEFAULT retention, resolved to a concrete date for a version created now.
 

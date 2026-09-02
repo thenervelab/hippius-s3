@@ -21,6 +21,7 @@ from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
 from hippius_s3.api.s3.objects.object_lock_endpoints import store_version_lock
+from hippius_s3.api.s3.objects.object_lock_endpoints import validate_lock_intent
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.monitoring import get_metrics_collector
@@ -60,6 +61,21 @@ async def handle_put_object(
 ) -> Response:
     try:
         main_account_id = request.state.main_account_id
+
+        # OBJECT LOCK: validate the lock intent BEFORE reading the body.
+        #
+        # The lock is APPLIED further down, after the write, because it has to land on the version
+        # that actually exists. Validation cannot wait that long: refusing there returns a 4xx for
+        # a request whose object has already been written and committed, so the client is told the
+        # PUT failed while an unlocked object sits at that key — and if the PUT overwrote something,
+        # the previous content is already gone. A 4xx must not leave a side effect.
+        #
+        # Pure header + bucket-config parsing, so running it twice is safe and cheap; the
+        # retain-until for a bucket default is still computed at apply time, from the version's
+        # own creation.
+        lock_rejection = validate_lock_intent(request)
+        if lock_rejection is not None:
+            return lock_rejection
 
         # Detect S4 append semantics via metadata (header-only, no DB).
         meta_append = request.headers.get("x-amz-meta-append", "").lower() == "true"
