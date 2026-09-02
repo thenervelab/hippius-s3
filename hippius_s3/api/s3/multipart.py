@@ -463,7 +463,11 @@ async def initiate_multipart_upload(
             await store_version_lock(
                 db,
                 object_id=object_id,
-                object_version=int(upsert_result["object_version"]),
+                # upsert_object_multipart returns the version as `current_object_version`, matching
+                # the objects row it upserts — not `object_version`. Reading the wrong key raised
+                # KeyError and turned every CreateMultipartUpload into a 500, but ONLY on a bucket
+                # carrying a default retention, because that is the sole path that reaches here.
+                object_version=int(upsert_result["current_object_version"]),
                 mode=lock_mode,
                 retain_until=lock_until,
                 legal_hold=None,

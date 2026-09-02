@@ -315,3 +315,57 @@ def test_tier2_object_lock_requires_versioning(
         )
     _, code = _error(excinfo.value)
     assert code in ("InvalidBucketState", "InvalidRequest")
+
+
+def test_tier2_default_retention_applies_to_multipart_upload(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    """A MULTIPART upload must carry the bucket's default retention, like a simple PUT.
+
+    Two distinct regressions live on this path and neither is visible from a simple PUT:
+
+    1. It silently dropped the default entirely, so every object above the client's multipart
+       threshold (8 MiB for the AWS CLI, i.e. most large objects) landed unprotected in a
+       compliance bucket with a 200 OK — a durability control that quietly covered only small
+       files, while the bucket configuration claimed otherwise.
+    2. Applying it read the reserve row's version under the wrong key, which turned every
+       CreateMultipartUpload into a 500 — but ONLY on a bucket carrying a default retention,
+       since that is the sole path that reaches the lock write. A lock-enabled bucket with no
+       default rule never triggers it, which is exactly why the rest of the suite missed it.
+
+    So this asserts both halves: the upload SUCCEEDS, and it comes back retained.
+    """
+    bucket_name = unique_bucket_name("ret-mpu")
+    cleanup_buckets(bucket_name)
+    boto3_client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    boto3_client.put_object_lock_configuration(
+        Bucket=bucket_name,
+        ObjectLockConfiguration={
+            "ObjectLockEnabled": "Enabled",
+            "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Days": 5}},
+        },
+    )
+
+    # Driven through the low-level MPU API rather than a size threshold, so the test cannot
+    # silently degrade into a simple PUT if a client default changes underneath it.
+    key = "mpu-default-retention"
+    created = boto3_client.create_multipart_upload(Bucket=bucket_name, Key=key)
+    upload_id = created["UploadId"]
+    part = boto3_client.upload_part(
+        Bucket=bucket_name, Key=key, PartNumber=1, UploadId=upload_id, Body=b"x" * (5 * 1024 * 1024)
+    )
+    boto3_client.complete_multipart_upload(
+        Bucket=bucket_name,
+        Key=key,
+        UploadId=upload_id,
+        MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]},
+    )
+
+    head = boto3_client.head_object(Bucket=bucket_name, Key=key)
+    assert head.get("ObjectLockMode") == "GOVERNANCE", (
+        f"multipart upload did not inherit the bucket default retention: {head.get('ObjectLockMode')}"
+    )
+    assert head.get("ObjectLockRetainUntilDate") is not None
