@@ -269,7 +269,7 @@ async def handle_delete_object(
         # fetchrow, not fetchval: the repo's db doubles and pooled connections all implement
         # fetchrow, and this runs on the ordinary delete path.
         locked_row = await db.fetchrow(get_query("count_locked_versions"), bucket_id, object_key)
-        locked_here = int((locked_row or {}).get("locked_count") or 0) if locked_row else 0
+        locked_here = int(locked_row["locked_count"] or 0) if locked_row is not None else 0
         if locked_here > 0:
             logger.info(
                 "Refusing whole-object DELETE of %s/%s: %s live version(s) under Object Lock",

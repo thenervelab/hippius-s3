@@ -152,13 +152,17 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                         # A refusal (e.g. the object is published under more than one key) must be
                         # reported per key. Reporting it under <Deleted> would tell the client the
                         # version is gone when nothing was touched.
-                        errors_list.append(
-                            {
-                                "Key": key,
-                                "Code": "NotImplemented" if resp.status_code == 501 else "InternalError",
-                                "Message": "Could not delete this version",
-                            }
-                        )
+                        # Map the refusal to the code the client can act on. A 403 here is an
+                        # Object Lock refusal — reporting it as InternalError would tell the
+                        # client to retry something that will never succeed until the lock
+                        # expires, and would hide a compliance control behind a server error.
+                        if resp.status_code == 403:
+                            code, message = "AccessDenied", "Access Denied"
+                        elif resp.status_code == 501:
+                            code, message = "NotImplemented", "Could not delete this version"
+                        else:
+                            code, message = "InternalError", "Could not delete this version"
+                        errors_list.append({"Key": key, "Code": code, "Message": message})
                         continue
                     removed_a_marker = resp.headers.get("x-amz-delete-marker") == "true"
                     deleted_keys.append(
@@ -192,6 +196,15 @@ async def handle_delete_objects(bucket_name: str, request: Request, db: Any, red
                             delete_marker_version_id=resp.headers.get("x-amz-version-id"),
                         )
                     )
+                    continue
+
+                # OBJECT LOCK: this branch soft-deletes the WHOLE object, every version with it,
+                # so a locked version would become unreachable. Same guard as the single-object
+                # path — only reachable on an unversioned bucket, where AWS would not have allowed
+                # a lock at all, so failing closed is the answer that cannot lose retained data.
+                locked_row = await db.fetchrow(get_query("count_locked_versions"), bucket_id, key)
+                if locked_row is not None and int(locked_row["locked_count"] or 0) > 0:
+                    errors_list.append({"Key": key, "Code": "AccessDenied", "Message": "Access Denied"})
                     continue
 
                 deleted = await db.fetchrow(get_query("soft_delete_object"), bucket_id, key)
