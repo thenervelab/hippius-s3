@@ -237,6 +237,13 @@ async def handle_put_object(
             bucket_name=bucket_name,
         )
 
+        # Version 1 means the objects row is brand new, so ats_purge_middleware skips its PURGE
+        # fan-out (see its comment for the exact invariant and the warm-bucket exclusion). Only
+        # reachable on the simple-PUT path: append returned via handle_append long before this
+        # point, and an overwrite or soft-deleted re-PUT bumps the surviving row to version >= 2.
+        if int(put_res.object_version) == 1:
+            request.state.ats_object_created = True
+
         # New or overwrite base object: expose append-version so clients can start append flow without HEAD
         return Response(
             status_code=200,
