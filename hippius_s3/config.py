@@ -407,7 +407,7 @@ class Config:
     # requeuable via scripts/dlq_requeue.py; a dropped failure's durable trace is object_versions.status
     # (e.g. 'failed'), and the 50%/90% alerts fire long before the cap so drops shouldn't occur in
     # practice. 0 (or negative) disables the cap.
-    dlq_max_entries: int = env("HIPPIUS_DLQ_MAX_ENTRIES:10000", convert=int)
+    dlq_max_entries: int = env("HIPPIUS_DLQ_MAX_ENTRIES:250000", convert=int)
 
     # Object parts filesystem cache configuration
     object_cache_dir: str = env("HIPPIUS_OBJECT_CACHE_DIR:/var/lib/hippius/object_cache")
