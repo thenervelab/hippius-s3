@@ -11,6 +11,7 @@ from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.common import parse_version_id
 from hippius_s3.api.s3.object_lock_enforcement import deletion_refusal_reason
+from hippius_s3.api.s3.object_lock_enforcement import is_version_locked
 from hippius_s3.api.s3.object_lock_enforcement import request_is_bucket_owner
 from hippius_s3.api.s3.object_names import drop_s3_name
 from hippius_s3.backend_routing import resolve_object_backends
@@ -137,9 +138,25 @@ async def delete_object_version(
                 VersionId=str(version_id),
             )
 
+        # Reaching here while still locked means exactly one thing: a GOVERNANCE retention the
+        # bucket owner overrode with x-amz-bypass-governance-retention. A legal hold and a
+        # COMPLIANCE retention are both refused above, bypass or not.
+        bypassed_lock = is_version_locked(row)
+
         deleted = await db.fetchrow(get_query("soft_delete_object_version"), object_id, version_id)
         if not deleted:
             return Response(status_code=204)
+
+        if bypassed_lock:
+            # The delete is authorised, so the retention must come off the row as well. Otherwise
+            # the version stays "locked" to every SQL gate — which has no concept of a bypass — and
+            # the unpinner, reaper and hard-delete ring all withhold the bytes forever, silently.
+            await db.execute(get_query("clear_version_lock_after_bypass"), object_id, version_id)
+            logger.info(
+                "Cleared GOVERNANCE retention on %s v%s after an authorised bypass delete",
+                object_id,
+                version_id,
+            )
 
         whole_object_deleted = False
         if was_current:

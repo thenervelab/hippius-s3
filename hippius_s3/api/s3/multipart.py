@@ -29,6 +29,8 @@ from hippius_s3.api.s3.copy_helpers import parse_copy_source
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.api.s3.object_lock_guard import maybe_object_lock_not_implemented_response
+from hippius_s3.api.s3.objects.object_lock_endpoints import bucket_default_lock_for_new_version
+from hippius_s3.api.s3.objects.object_lock_endpoints import store_version_lock
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.db_retry import retry_on_object_version_conflict
@@ -441,6 +443,31 @@ async def initiate_multipart_upload(
 
         # Use the returned object_id (will be existing one if conflict occurred)
         object_id = str(upsert_result["object_id"])
+
+        # Apply the bucket's DEFAULT retention to the reserved version.
+        #
+        # Explicit x-amz-object-lock-* headers still 501 on this path (the guard above), so the
+        # only thing to carry here is the bucket default — and without this it was carried
+        # nowhere. Every upload above the client's multipart threshold (8 MiB for the AWS CLI,
+        # i.e. most large objects) landed in a compliance bucket completely unprotected, with a
+        # 200 OK and no signal that the bucket's stated retention had not been applied. A
+        # durability control that silently covers only small files is worse than none, because
+        # the bucket configuration says otherwise.
+        #
+        # Applied at reserve rather than at complete so retain-until runs from the version's
+        # creation, matching the simple-PUT path, and so an upload abandoned mid-flight cannot
+        # leave a live version that never got the lock.
+        default_lock = bucket_default_lock_for_new_version(request)
+        if default_lock is not None:
+            lock_mode, lock_until = default_lock
+            await store_version_lock(
+                db,
+                object_id=object_id,
+                object_version=int(upsert_result["object_version"]),
+                mode=lock_mode,
+                retain_until=lock_until,
+                legal_hold=None,
+            )
 
         # Create the multipart upload in the database with object_id
         await db.fetchrow(
