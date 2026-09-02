@@ -30,4 +30,27 @@ WHERE cb.backend = $1
   AND NOT cb.deleted
   AND cb.backend_identifier IS NOT NULL
   AND (o.deleted_at IS NOT NULL OR p.object_version <> o.current_object_version)
+  -- OBJECT LOCK (Tier 2): never hand the unpinner a version under WORM protection.
+  --
+  -- This is THE enforcement point for the durability promise. Every backend deletion — Arion and
+  -- every backup backend — flows through this query, including the `object_version IS NULL`
+  -- ("all versions of this object") form a versionId-less DELETE enqueues, where the API cannot
+  -- know which versions it is about to destroy. Gating in the API alone would leave the ops
+  -- scripts (nuke_user, purge_buckets, delete_legacy_object_versions) and any future caller able
+  -- to walk straight past it.
+  --
+  -- Retention and legal hold are independent: either one protects the version. Mirrors
+  -- object_lock_enforcement.is_version_locked, and a test asserts the two agree.
+  --
+  -- Deliberately NOT applied to the Ceph/FS cache janitor: evicting a cached chunk removes a
+  -- copy, not the object, and pinning locked objects in NVMe would fill the cache for no
+  -- durability gain.
+  AND NOT EXISTS (
+      SELECT 1
+      FROM object_versions ov
+      WHERE ov.object_id = p.object_id
+        AND ov.object_version = p.object_version
+        AND (ov.object_lock_legal_hold
+             OR (ov.object_lock_retain_until IS NOT NULL AND ov.object_lock_retain_until > now()))
+  )
 ORDER BY cb.chunk_id;

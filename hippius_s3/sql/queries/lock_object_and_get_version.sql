@@ -24,6 +24,11 @@ SELECT o.object_id,
        o.current_object_version,
        ov.object_version,
        ov.is_delete_marker,
+       -- OBJECT LOCK: read inside the same FOR UPDATE row lock as the rest, so a retention or
+       -- legal hold committed concurrently cannot land between the check and the delete.
+       ov.object_lock_mode,
+       ov.object_lock_retain_until,
+       ov.object_lock_legal_hold,
        (SELECT count(*) FROM object_names n WHERE n.object_id = o.object_id)::int AS alias_count
 FROM objects o
 LEFT JOIN object_versions ov

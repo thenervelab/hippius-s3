@@ -33,6 +33,18 @@ WHERE p.object_id = $1
         AND ov.deleted_at IS NOT NULL
         AND ov.deleted_at < now() - INTERVAL '1 hour'
   )
+  -- OBJECT LOCK (Tier 2): re-checked here, not just in the finder, for the same reason the
+  -- readiness conditions are — the reap must be safe against anything that changed between the
+  -- find and this DELETE (a legal hold placed on the version mid-batch, or a caller that never
+  -- consulted the finder at all). Mirrors object_lock_enforcement.LOCKED_VERSION_SQL_PREDICATE.
+  AND NOT EXISTS (
+      SELECT 1
+      FROM object_versions ov
+      WHERE ov.object_id = $1
+        AND ov.object_version = $2
+        AND (ov.object_lock_legal_hold
+             OR (ov.object_lock_retain_until IS NOT NULL AND ov.object_lock_retain_until > now()))
+  )
   AND NOT EXISTS (
       SELECT 1
       FROM parts p2

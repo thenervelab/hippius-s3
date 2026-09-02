@@ -19,6 +19,9 @@ from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.extensions.append import handle_append
+from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
+from hippius_s3.api.s3.objects.object_lock_endpoints import store_version_lock
+from hippius_s3.api.s3.objects.object_lock_endpoints import validate_lock_intent
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.monitoring import get_metrics_collector
@@ -58,6 +61,21 @@ async def handle_put_object(
 ) -> Response:
     try:
         main_account_id = request.state.main_account_id
+
+        # OBJECT LOCK: validate the lock intent BEFORE reading the body.
+        #
+        # The lock is APPLIED further down, after the write, because it has to land on the version
+        # that actually exists. Validation cannot wait that long: refusing there returns a 4xx for
+        # a request whose object has already been written and committed, so the client is told the
+        # PUT failed while an unlocked object sits at that key — and if the PUT overwrote something,
+        # the previous content is already gone. A 4xx must not leave a side effect.
+        #
+        # Pure header + bucket-config parsing, so running it twice is safe and cheap; the
+        # retain-until for a bucket default is still computed at apply time, from the version's
+        # own creation.
+        lock_rejection = validate_lock_intent(request)
+        if lock_rejection is not None:
+            return lock_rejection
 
         # Detect S4 append semantics via metadata (header-only, no DB).
         meta_append = request.headers.get("x-amz-meta-append", "").lower() == "true"
@@ -183,6 +201,26 @@ async def handle_put_object(
                 },
             )
 
+        # OBJECT LOCK: apply the version's lock before anything can delete it. Explicit
+        # x-amz-object-lock-* headers win over the bucket's default retention, per AWS; a bucket
+        # default is a duration, so its retain-until is computed from this version's creation.
+        # Applied AFTER the write so it lands on the version that actually exists, and before the
+        # response, so a client that got a 200 knows the lock is real.
+        lock_intent = lock_for_new_version(request)
+        if isinstance(lock_intent, Response):
+            return lock_intent
+        if lock_intent is not None:
+            lock_mode, lock_until, lock_hold = lock_intent
+            async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
+                await store_version_lock(
+                    conn,
+                    object_id=str(put_res.object_id),
+                    object_version=int(put_res.object_version),
+                    mode=lock_mode,
+                    retain_until=lock_until,
+                    legal_hold=lock_hold,
+                )
+
         logger.info(f"PUT {bucket_name}/{object_key}: size={put_res.size_bytes}, md5={put_res.etag}")
 
         # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It
@@ -236,6 +274,13 @@ async def handle_put_object(
             bytes_transferred=int(put_res.size_bytes),
             bucket_name=bucket_name,
         )
+
+        # Version 1 means the objects row is brand new, so ats_purge_middleware skips its PURGE
+        # fan-out (see its comment for the exact invariant and the warm-bucket exclusion). Only
+        # reachable on the simple-PUT path: append returned via handle_append long before this
+        # point, and an overwrite or soft-deleted re-PUT bumps the surviving row to version >= 2.
+        if int(put_res.object_version) == 1:
+            request.state.ats_object_created = True
 
         # New or overwrite base object: expose append-version so clients can start append flow without HEAD
         return Response(

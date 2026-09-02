@@ -249,8 +249,8 @@ groups:
           severity: high
 
       # DLQs live on redis-queues (2GB, noeviction) — a full DLQ fails ALL writes pipeline-wide.
-      # Thresholds are LITERALS for the default HIPPIUS_DLQ_MAX_ENTRIES=10000 (warn at 50%, page at 90%).
-      # If you change the cap, update 5000/9000 below in lockstep — otherwise the ratios drift.
+      # Thresholds are LITERALS for the default HIPPIUS_DLQ_MAX_ENTRIES=250000 (warn at 50%, page at 90%).
+      # If you change the cap, update 125000/225000 below in lockstep — otherwise the ratios drift.
       - uid: dlq-near-full-warning
         title: DLQ Filling - 50% of Cap
         condition: C
@@ -284,7 +284,7 @@ groups:
               conditions:
                 - evaluator:
                     params:
-                      - 5000
+                      - 125000
                     type: gt
                   type: query
               refId: C
@@ -292,7 +292,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          summary: 'A DLQ is at {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} entries (warn threshold: 5000 = 50% of cap)'
+          summary: 'A DLQ is at {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} entries (warn threshold: 125000 = 50% of cap)'
           description: 'A dead-letter queue is filling on redis-queues (noeviction). Triage/requeue via scripts/dlq_requeue.py before it hits the cap and drops entries.'
         labels:
           severity: high
@@ -330,7 +330,7 @@ groups:
               conditions:
                 - evaluator:
                     params:
-                      - 9000
+                      - 225000
                     type: gt
                   type: query
               refId: C
@@ -338,7 +338,7 @@ groups:
         execErrState: Error
         for: 5m
         annotations:
-          summary: 'A DLQ is at {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} entries (page threshold: 9000 = 90% of cap)'
+          summary: 'A DLQ is at {{ if $values.B }}{{ printf "%.0f" $values.B.Value }}{{ else }}N/A{{ end }} entries (page threshold: 225000 = 90% of cap)'
           description: 'A dead-letter queue is about to hit its cap and drop new entries. Requeue via scripts/dlq_requeue.py NOW.'
         labels:
           severity: critical
@@ -389,10 +389,10 @@ groups:
         labels:
           severity: critical
 
-      # The three rules above alert on DLQ CAPACITY (50%/90%/at-cap of HIPPIUS_DLQ_MAX_ENTRIES=10000).
+      # The three rules above alert on DLQ CAPACITY (50%/90%/at-cap of HIPPIUS_DLQ_MAX_ENTRIES=250000).
       # Capacity is the wrong signal for an incident: on 2026-07-19 a bad Arion credential put 356 upload
       # requests in the DLQ inside an hour (205 of them "Authentication failed: 401") and nobody was paged,
-      # because 393 total sits three orders of magnitude below 5000. A DLQ that GAINS entries at all means
+      # because 393 total sits three orders of magnitude below the warn threshold (now 125000). A DLQ that GAINS entries at all means
       # uploads are failing permanently RIGHT NOW — depth only says how long we have been ignoring it.
       #
       # delta(), not increase(): hippius_queue_length is a GAUGE. increase() applies counter-reset logic, so

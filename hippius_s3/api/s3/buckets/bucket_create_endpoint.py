@@ -220,6 +220,8 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
 
             # Check for x-amz-acl header
             x_amz_acl = request.headers.get("x-amz-acl")
+            # Object Lock enablement at bucket creation time (Tier 1, no enforcement).
+            object_lock_enabled = request.headers.get("x-amz-bucket-object-lock-enabled", "").strip().lower() == "true"
 
             # Start transaction for atomic bucket + ACL creation
             async with db.transaction():
@@ -232,6 +234,27 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
                     is_public,
                     main_account_id,
                 )
+
+                if object_lock_enabled:
+                    await db.fetchrow(
+                        get_query("update_bucket_object_lock"),
+                        bucket_id,
+                        json.dumps({"enabled": True}),
+                    )
+                    # Object Lock REQUIRES versioning, and AWS turns it on implicitly when a bucket
+                    # is created lock-enabled. Without this the bucket is internally contradictory:
+                    # it reports ObjectLockEnabled while `DELETE ?versionId` answers 404
+                    # NoSuchVersion (version ids are only addressable on a versioned bucket), so a
+                    # locked version could never be addressed — nor refused with the 403 the lock
+                    # exists to produce.
+                    #
+                    # Safe here in a way it would not be on an existing bucket: this one is empty,
+                    # created in this same transaction, so there is no prior data whose delete
+                    # semantics change under it.
+                    await db.execute(get_query("set_bucket_versioning"), bucket_id, "Enabled")
+                    logger.info(
+                        f"Created bucket '{bucket_name}' with Object Lock enabled (versioning enabled implicitly)"
+                    )
 
                 # Create ACL if x-amz-acl header is present
                 if x_amz_acl:

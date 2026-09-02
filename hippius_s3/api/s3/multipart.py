@@ -28,6 +28,10 @@ from hippius_s3.api.s3.common import format_s3_timestamp
 from hippius_s3.api.s3.copy_helpers import parse_copy_source
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.errors import s3_error_response
+from hippius_s3.api.s3.object_lock_guard import maybe_object_lock_not_implemented_response
+from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
+from hippius_s3.api.s3.objects.object_lock_endpoints import store_version_lock
+from hippius_s3.api.s3.objects.object_lock_endpoints import validate_lock_intent
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.config import get_config
 from hippius_s3.db_retry import retry_on_object_version_conflict
@@ -173,6 +177,27 @@ async def handle_post_object(
     1. InitiateMultipartUpload (if ?uploads is in query params)
     2. CompleteMultipartUpload (if ?uploadId=X is in query params)
     """
+    # This handler serves BOTH CreateMultipartUpload (?uploads) and CompleteMultipartUpload
+    # (?uploadId), and only the first can act on lock headers — the lock is fixed at initiate, onto
+    # the version reserved there.
+    #
+    # So the two shapes are treated differently on purpose. Initiate opts out of the 501 and
+    # validates the intent it is about to persist. Complete refuses the headers outright rather
+    # than letting them through: it cannot apply them, and accepting lock intent while dropping it
+    # is the precise failure the guard exists to prevent — the client would be told its object is
+    # retained when nothing was written.
+    is_initiate = "uploads" in request.query_params
+    object_lock_response = maybe_object_lock_not_implemented_response(
+        request, object_lock_headers_supported=is_initiate
+    )
+    if object_lock_response is not None:
+        return object_lock_response
+    if is_initiate:
+        # Refuse malformed or unauthorised lock intent BEFORE any upload is created. Doing it later
+        # would leave an initiated upload (and, at completion, a written object) behind a 4xx.
+        lock_rejection = validate_lock_intent(request)
+        if lock_rejection is not None:
+            return lock_rejection
     logger.info(f"[POST] {bucket_name}/{object_key} - {dict(request.query_params)}")
 
     # Check for uploads parameter (Initiate Multipart Upload)
@@ -437,6 +462,36 @@ async def initiate_multipart_upload(
 
         # Use the returned object_id (will be existing one if conflict occurred)
         object_id = str(upsert_result["object_id"])
+
+        # Apply the lock to the reserved version: explicit x-amz-object-lock-* headers if the
+        # request carried them, else the destination bucket's default retention.
+        #
+        # Storing it HERE is what lets the headers stop returning 501. The guard's comment used to
+        # say carrying lock intent from initiate to completion needed the intent persisted on
+        # multipart_uploads — a schema change. It does not: completion resolves its version from
+        # this upload's own parts (get_multipart_version_by_upload), so the row reserved here IS the
+        # one that gets finalised. The bucket-default fix already relied on that; honouring the
+        # headers is the same mechanism with the precedence rules applied.
+        #
+        # Applied at reserve rather than at complete so retain-until runs from the version's
+        # creation, matching the simple-PUT path, and so an upload abandoned mid-flight cannot
+        # leave a live version that never got the lock.
+        lock_intent = lock_for_new_version(request)
+        assert not isinstance(lock_intent, Response)  # validated before any part was accepted
+        if lock_intent is not None:
+            lock_mode, lock_until, lock_hold = lock_intent
+            await store_version_lock(
+                db,
+                object_id=object_id,
+                # upsert_object_multipart returns the version as `current_object_version`, matching
+                # the objects row it upserts — not `object_version`. Reading the wrong key raised
+                # KeyError and turned every CreateMultipartUpload into a 500, but ONLY on a bucket
+                # carrying a default retention, because that is the sole path that reaches here.
+                object_version=int(upsert_result["current_object_version"]),
+                mode=lock_mode,
+                retain_until=lock_until,
+                legal_hold=lock_hold,
+            )
 
         # Create the multipart upload in the database with object_id
         await db.fetchrow(
@@ -1345,6 +1400,16 @@ async def complete_multipart_upload(
             bytes_transferred=int(complete_res.size_bytes),
             bucket_name=bucket_name,
         )
+
+        # Version 1 means the objects row is brand new, so ats_purge_middleware skips its PURGE
+        # fan-out (see its comment for the invariant and the warm-bucket exclusion). object_version
+        # here is THIS upload's own version, resolved from its parts rather than from
+        # objects.current_object_version, so a concurrent PUT that advanced the pointer cannot make
+        # a completion look like a creation. Deliberately not set on the already-completed replay
+        # path above: that returns before any of this, and leaving it unflagged keeps a retry
+        # purging, which is the fail-safe direction.
+        if int(object_version) == 1:
+            request.state.ats_object_created = True
 
         # Return with proper headers
         return Response(

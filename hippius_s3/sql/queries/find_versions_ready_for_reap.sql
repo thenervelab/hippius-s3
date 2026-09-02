@@ -31,6 +31,13 @@ WITH candidates AS MATERIALIZED (
     WHERE ov.deleted_at IS NOT NULL
       AND ov.deleted_at < now() - INTERVAL '1 hour'  -- grace period
       AND (ov.deleted_at, ov.object_id, ov.object_version) > ($2, $3, $4)  -- keyset ring cursor
+      -- OBJECT LOCK (Tier 2): a locked version is never reapable. This ring is safe today even
+      -- without the check — readiness requires no live chunk_backend row, and the unpin gate keeps
+      -- a locked version's rows from ever being marked deleted — but that leaves the guarantee
+      -- resting entirely on another query's behaviour. The team decision on COMPLIANCE mode names
+      -- this ring explicitly as a path that must honour locks, so it carries its own.
+      AND NOT (ov.object_lock_legal_hold
+               OR (ov.object_lock_retain_until IS NOT NULL AND ov.object_lock_retain_until > now()))
       -- Only versions that still have something to reap. reap_deleted_version_parts deliberately
       -- KEEPS the object_versions row as a tombstone (version numbers must stay monotonic, or a
       -- re-minted number collides with stale FS cache under v<version>/ and lets a queued unpin

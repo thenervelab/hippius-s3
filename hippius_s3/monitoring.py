@@ -14,6 +14,7 @@ from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from redis.asyncio import Redis
 from redis.asyncio.cluster import RedisCluster
 
+from hippius_s3.otel_setup import build_metric_views
 from hippius_s3.otel_setup import build_resource
 
 
@@ -130,6 +131,21 @@ class MetricsCollector:
         self.http_pre_handler_duration = self.meter.create_histogram(
             name="http_pre_handler_duration_seconds",
             description="Request time spent in the middleware chain outside the audited window",
+            unit="s",
+        )
+
+        # Origin TTFB, measured from gateway_start_time (the earliest clock any layer can read,
+        # stamped just inside CORS) to the moment the request stops waiting on us:
+        #   - requests that carry a body (PUT/UploadPart/POST): the first body byte the app reads
+        #     off the wire, i.e. all auth/ACL/DB work that gates accepting the upload;
+        #   - everything else (GET/HEAD/list/delete): response start — which for GetObject already
+        #     includes the first decrypted chunk, since the endpoint peeks it before returning the
+        #     StreamingResponse (A2 bound in object_reader.py).
+        # `http_request_duration_seconds` cannot serve this purpose: on uploads it is dominated by
+        # draining the client's body, so it measures the client's bandwidth, not our latency.
+        self.http_request_ttfb = self.meter.create_histogram(
+            name="http_request_ttfb_seconds",
+            description="Time from request arrival to first accepted upload byte (writes) or response start (reads)",
             unit="s",
         )
 
@@ -438,15 +454,19 @@ class MetricsCollector:
             unit="1",
         )
 
+        # Legacy names kept alive as aliases of s3_bytes_uploaded/downloaded. The gateway
+        # that used to feed them from the forwarded byte stream is gone (PR #420 merge);
+        # external consumers still query these names, so record_data_transfer mirrors
+        # the s3_bytes_* increments onto them.
         self.gateway_bytes_received = self.meter.create_counter(
             name="gateway_bytes_received_total",
-            description="Total bytes received from clients through the gateway",
+            description="Alias of s3_bytes_uploaded_total (legacy gateway name)",
             unit="bytes",
         )
 
         self.gateway_bytes_sent = self.meter.create_counter(
             name="gateway_bytes_sent_total",
-            description="Total bytes sent to clients through the gateway",
+            description="Alias of s3_bytes_downloaded_total (legacy gateway name)",
             unit="bytes",
         )
 
@@ -575,6 +595,7 @@ class MetricsCollector:
         response: Response,
         duration: float,
         handler: Optional[str] = None,
+        ttfb: Optional[float] = None,
     ) -> None:
         # handler falls back to "unknown", never to request.url.path: the path carries
         # the object key, so one caller passing handler=None would mint a series per
@@ -587,6 +608,8 @@ class MetricsCollector:
 
         self.http_requests_total.add(1, attributes=attributes)
         self.http_request_duration.record(duration, attributes=attributes)
+        if ttfb is not None:
+            self.http_request_ttfb.record(ttfb, attributes=attributes)
 
         request_content_length = request.headers.get("content-length")
         if request_content_length:
@@ -632,8 +655,10 @@ class MetricsCollector:
 
         if operation in ["upload", "put_object", "post_object", "upload_part"]:
             self.s3_bytes_uploaded.add(bytes_transferred, attributes=attributes)
+            self.gateway_bytes_received.add(bytes_transferred, attributes=attributes)
         elif operation in ["download", "get_object"]:
             self.s3_bytes_downloaded.add(bytes_transferred, attributes=attributes)
+            self.gateway_bytes_sent.add(bytes_transferred, attributes=attributes)
 
     def record_error(
         self,
@@ -1090,7 +1115,7 @@ def initialize_metrics_collector(
             export_interval_millis=10000,
         )
 
-        provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+        provider = MeterProvider(resource=resource, metric_readers=[metric_reader], views=build_metric_views())
         metrics.set_meter_provider(provider)
         logger.info(f"Monitoring enabled, exporting to {endpoint}")
 

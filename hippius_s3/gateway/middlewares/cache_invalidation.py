@@ -45,7 +45,11 @@ async def cache_invalidation_middleware(
     """
     response = await call_next(request)
 
-    if not (_is_successful_bucket_delete(request, response) or _is_successful_bucket_create(request, response)):
+    if not (
+        _is_successful_bucket_delete(request, response)
+        or _is_successful_bucket_create(request, response)
+        or _is_successful_object_lock_write(request, response)
+    ):
         return response
 
     # Dot-segments collapsed, but NOT truncated at `#`. Both halves are load-bearing:
@@ -79,6 +83,19 @@ def _is_successful_bucket_delete(request: Request, response: Response) -> bool:
         return False
     # DELETE /<bucket>?tagging removes only tags; bucket itself stays.
     return "tagging" not in request.query_params
+
+
+def _is_successful_object_lock_write(request: Request, response: Response) -> bool:
+    """`PUT /<bucket>?object-lock` changes cached bucket META, not just bucket config.
+
+    The cached BucketLookup carries the Object Lock configuration so PutObject can apply a default
+    retention without a second read. Unlike `is_cache_warm`, whose staleness is bounded and
+    harmless, a stale lock config means a default retention a customer just configured is silently
+    NOT applied to uploads for the rest of the TTL — the bucket reports a default while every
+    object it accepts is unprotected. That is a durability control failing quietly, so it is purged
+    on write rather than left to expire.
+    """
+    return request.method == "PUT" and response.status_code == 200 and "object-lock" in request.query_params
 
 
 def _is_successful_bucket_create(request: Request, response: Response) -> bool:

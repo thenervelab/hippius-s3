@@ -7,6 +7,7 @@ from typing import Callable
 from fastapi import Request
 from fastapi import Response
 from opentelemetry import trace
+from starlette.types import Message
 
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.monitoring import enrich_span_with_account_info
@@ -21,9 +22,44 @@ async def metrics_middleware(
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     start_time = time.time()
+
+    # TTFB needs to see the first UPLOAD byte, and only the body path knows when that is: every
+    # downstream body read (handler, streaming writer) awaits this request's `_receive`, so wrapping
+    # it here stamps the moment the app first accepts a byte off the wire. Requests whose body is
+    # never read (GET/HEAD/list, or a PUT rejected before the handler) simply never stamp.
+    first_body_byte_at: float | None = None
+    inner_receive = request._receive
+
+    async def receive_with_first_byte_stamp() -> Message:
+        nonlocal first_body_byte_at
+        message = await inner_receive()
+        # Stamp on the first `http.request`, whether or not it carries bytes. Testing the body for
+        # truthiness reads as equivalent but silently excludes the zero-length body: a
+        # `Content-Length: 0` PUT arrives as exactly one empty `http.request`, so it never stamped
+        # and its TTFB quietly fell back to response start — measuring a different thing from every
+        # other PUT on the same panel. Receiving the message at all is the event: the app asked for
+        # the body and the server handed one over. Servers do not emit an empty leading chunk ahead
+        # of real body bytes, so this does not move the stamp for ordinary uploads.
+        if first_body_byte_at is None and message["type"] == "http.request":
+            first_body_byte_at = time.time()
+        return message
+
+    request._receive = receive_with_first_byte_stamp
+
     response = await call_next(request)
-    duration = time.time() - start_time
+    # BaseHTTPMiddleware resolves call_next at `http.response.start`, before the body streams —
+    # and GetObject peeks its first decrypted chunk before returning (A2 in object_reader.py) —
+    # so for body-less requests this timestamp IS first-byte-ready, not full-transfer.
+    response_started_at = time.time()
+    duration = response_started_at - start_time
     api_time_ms = duration * 1000
+
+    # Baseline on the outermost clock (stamped by ray_id just inside CORS) so the TTFB includes
+    # the auth/ACL chain above this middleware; `start_time` is the honest fallback when a path
+    # skips ray_id. Clamped like pre_handler: a cross-depth clock artifact must not put a negative
+    # sample in the histogram.
+    ttfb_start = getattr(request.state, "gateway_start_time", None) or start_time
+    ttfb = max(0.0, (first_body_byte_at if first_body_byte_at is not None else response_started_at) - ttfb_start)
 
     main_account = None
     subaccount_id = None
@@ -63,6 +99,7 @@ async def metrics_middleware(
         response=response,
         duration=duration,
         handler=endpoint_name,
+        ttfb=ttfb,
     )
 
     # 499 is a client abort (see errors.CLIENT_CLOSED_REQUEST), not a failure we served. Returning

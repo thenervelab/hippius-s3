@@ -196,8 +196,22 @@ async def main_async(args: argparse.Namespace) -> int:
                             )
                         )
             if legacy_only:
+                # OBJECT LOCK: this cascades to every version, part and chunk row of the object,
+                # so one locked version must protect the whole object — the same scoping the
+                # janitor's hard-delete ring uses. Raw SQL bypasses both query gates, hence the
+                # predicate here.
                 r0 = await db.execute(
-                    "DELETE FROM objects WHERE object_id = ANY($1::uuid[])",
+                    """
+                    DELETE FROM objects
+                     WHERE object_id = ANY($1::uuid[])
+                       AND NOT EXISTS (
+                           SELECT 1 FROM object_versions ov
+                           WHERE ov.object_id = objects.object_id
+                             AND (ov.object_lock_legal_hold
+                                  OR (ov.object_lock_retain_until IS NOT NULL
+                                      AND ov.object_lock_retain_until > now()))
+                       )
+                    """,
                     [lr["object_id"] for lr in legacy_only],
                 )
                 with suppress(Exception):
@@ -224,11 +238,18 @@ async def main_async(args: argparse.Namespace) -> int:
                             object_version=int(c.object_version),
                         )
                     )
+            # OBJECT LOCK: this script issues raw SQL and so bypasses both gates that protect the
+            # API and worker paths. A WORM guarantee that holds everywhere except the ops scripts
+            # is not a guarantee, and the team decision on COMPLIANCE mode names this path. Skip
+            # rather than fail, so a bulk cleanup still reclaims everything unlocked.
             await db.execute(
                 """
                 DELETE FROM object_versions
                  WHERE object_id = $1::uuid
                    AND object_version = $2::bigint
+                   AND NOT (object_lock_legal_hold
+                            OR (object_lock_retain_until IS NOT NULL
+                                AND object_lock_retain_until > now()))
                 """,
                 c.object_id,
                 int(c.object_version),

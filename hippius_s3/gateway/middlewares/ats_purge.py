@@ -42,7 +42,36 @@ async def ats_purge_middleware(
         # MPU part upload — not visible until CompleteMultipartUpload, skip.
         return response
 
+    # A brand-new key has nothing cached to purge (edges never store 404s — negative caching is
+    # off), yet purges fired for every write and creations dominate: measured on the EU edge
+    # 2026-08-31, PURGE was 24% of ALL requests through ATS, effectively every one answering 404,
+    # and their stripe write locks are the standing suspect for the pre-cache-lookup GET stall
+    # (ttfb-report.md).
+    #
+    # The handler sets the flag only when the write allocated object version 1; absent flag ->
+    # purge, so every unaudited path (overwrite, delete, copy) keeps today's behaviour. Two
+    # deliberate limits: scoped to the two creating verbs, so a stray flag can never suppress a
+    # DELETE's purge; and warm buckets never skip — they cache for 30 days on a purge-on-write
+    # contract (cache_control.py), and version 1 recurs when the objects row was removed wholesale
+    # (bucket name reused after delete, janitor hard-delete), where a dropped delete-time purge
+    # could have left a stale entry. For normal buckets that corner is bounded by max-age=300, the
+    # staleness any dropped purge already costs.
+    #
+    # MPU adds one more corner, for the same 300s: a completion can lag arbitrarily far behind the
+    # CreateMultipartUpload that allocated its version, so two uploads racing on a brand-new key
+    # (v1 and v2) can complete out of order. If v2 completes first and a GET caches its body, v1's
+    # later completion still resolves version 1 and skips its purge. Last-writer-wins is already
+    # undefined for concurrent writes to one key, and the entry ages out on the same TTL, so this
+    # is bounded rather than novel — but it is why the skip keys off the version, never off "this
+    # was an MPU".
     is_complete_mpu = method == "POST" and "uploadId" in qs and "partNumber" not in qs
+    if (
+        (method == "PUT" or is_complete_mpu)
+        and getattr(request.state, "ats_object_created", False)
+        and not getattr(request.state, "bucket_is_cache_warm", False)
+    ):
+        return response
+
     if method in ("PUT", "DELETE") or is_complete_mpu:
         schedule_purge(get_config().ats_purge_host, f"{bucket}/{key}")
         # NOTE: x-amz-copy-source is deliberately NOT purged. COPY reads the
