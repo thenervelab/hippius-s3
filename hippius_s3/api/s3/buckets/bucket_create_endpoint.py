@@ -241,7 +241,20 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
                         bucket_id,
                         json.dumps({"enabled": True}),
                     )
-                    logger.info(f"Created bucket '{bucket_name}' with Object Lock enabled")
+                    # Object Lock REQUIRES versioning, and AWS turns it on implicitly when a bucket
+                    # is created lock-enabled. Without this the bucket is internally contradictory:
+                    # it reports ObjectLockEnabled while `DELETE ?versionId` answers 404
+                    # NoSuchVersion (version ids are only addressable on a versioned bucket), so a
+                    # locked version could never be addressed — nor refused with the 403 the lock
+                    # exists to produce.
+                    #
+                    # Safe here in a way it would not be on an existing bucket: this one is empty,
+                    # created in this same transaction, so there is no prior data whose delete
+                    # semantics change under it.
+                    await db.execute(get_query("set_bucket_versioning"), bucket_id, "Enabled")
+                    logger.info(
+                        f"Created bucket '{bucket_name}' with Object Lock enabled (versioning enabled implicitly)"
+                    )
 
                 # Create ACL if x-amz-acl header is present
                 if x_amz_acl:

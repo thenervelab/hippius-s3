@@ -429,3 +429,29 @@ def _parse_retain_until(raw: str) -> tuple[datetime | None, Response | None]:
             status_code=400,
         )
     return parsed, None
+
+
+async def lock_response_headers(db: Any, *, object_id: Any, object_version: int) -> dict[str, str]:
+    """The x-amz-object-lock-* headers AWS returns on GET/HEAD of a locked version.
+
+    Without these a client cannot see that its object is protected — and, more concretely, a
+    default retention applied from the bucket configuration is invisible, so the bucket looks
+    configured while every object looks unlocked. Returns an empty dict for an unlocked version,
+    which is the common case and adds no headers.
+    """
+    row = await load_version_lock(db, object_id=str(object_id), object_version=int(object_version))
+    if row is None:
+        return {}
+    headers: dict[str, str] = {}
+    mode = row["object_lock_mode"]
+    retain_until = row["object_lock_retain_until"]
+    if mode and retain_until is not None:
+        headers["x-amz-object-lock-mode"] = str(mode)
+        headers["x-amz-object-lock-retain-until-date"] = (
+            retain_until.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+    # AWS reports the hold as ON/OFF whenever Object Lock applies to the object. Emitted only when
+    # ON: a bare OFF on every object in the account would be noise, and its absence means the same.
+    if row["object_lock_legal_hold"]:
+        headers["x-amz-object-lock-legal-hold"] = "ON"
+    return headers

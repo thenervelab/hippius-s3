@@ -19,9 +19,6 @@ import pytest
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 
-TIER2_REASON = "Tier 2 — legal hold enforcement not implemented; see specs/s3-object-lock.md"
-
-
 def _error(exc: ClientError) -> tuple[int, str]:
     meta = exc.response.get("ResponseMetadata", {})
     status = int(meta.get("HTTPStatusCode", 0))
@@ -34,54 +31,40 @@ def _error(exc: ClientError) -> tuple[int, str]:
 # ---------------------------------------------------------------------------
 
 
-def test_put_object_legal_hold_returns_not_implemented(
+def test_put_and_get_object_legal_hold_round_trip(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
+    """Tier 2 implements these; they used to assert 501."""
     bucket_name = unique_bucket_name("lh-put")
     cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name)
+    boto3_client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
     boto3_client.put_object(Bucket=bucket_name, Key="k", Body=b"x")
 
-    with pytest.raises(ClientError) as excinfo:
-        boto3_client.put_object_legal_hold(
-            Bucket=bucket_name,
-            Key="k",
-            LegalHold={"Status": "ON"},
-        )
+    boto3_client.put_object_legal_hold(Bucket=bucket_name, Key="k", LegalHold={"Status": "ON"})
+    assert boto3_client.get_object_legal_hold(Bucket=bucket_name, Key="k")["LegalHold"]["Status"] == "ON"
 
-    status, code = _error(excinfo.value)
-    assert status == 501, f"expected 501, got {status} (code={code})"
-    assert code == "NotImplemented"
+    boto3_client.put_object_legal_hold(Bucket=bucket_name, Key="k", LegalHold={"Status": "OFF"})
+    assert boto3_client.get_object_legal_hold(Bucket=bucket_name, Key="k")["LegalHold"]["Status"] == "OFF"
 
 
-def test_get_object_legal_hold_returns_not_implemented(
+def test_get_legal_hold_on_object_without_one_reports_off(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
+    """A hold is a boolean, so absence is OFF — unlike retention, which 404s when unset."""
     bucket_name = unique_bucket_name("lh-get")
     cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name)
+    boto3_client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
     boto3_client.put_object(Bucket=bucket_name, Key="k", Body=b"x")
 
-    with pytest.raises(ClientError) as excinfo:
-        boto3_client.get_object_legal_hold(Bucket=bucket_name, Key="k")
-
-    status, code = _error(excinfo.value)
-    assert status == 501
-    assert code == "NotImplemented"
+    assert boto3_client.get_object_legal_hold(Bucket=bucket_name, Key="k")["LegalHold"]["Status"] == "OFF"
 
 
-# ---------------------------------------------------------------------------
-# Tier 2 — xfail until enforcement is implemented
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.xfail(strict=False, reason=TIER2_REASON)
 def test_tier2_legal_hold_blocks_delete(
     docker_services: Any,
     boto3_client: Any,
@@ -105,7 +88,6 @@ def test_tier2_legal_hold_blocks_delete(
     assert status == 403
 
 
-@pytest.mark.xfail(strict=False, reason=TIER2_REASON)
 def test_tier2_legal_hold_blocks_delete_even_after_retention_expires(
     docker_services: Any,
     boto3_client: Any,
@@ -132,7 +114,6 @@ def test_tier2_legal_hold_blocks_delete_even_after_retention_expires(
         boto3_client.delete_object(Bucket=bucket_name, Key="k", VersionId=version_id)
 
 
-@pytest.mark.xfail(strict=False, reason=TIER2_REASON)
 def test_tier2_remove_legal_hold_then_delete_succeeds(
     docker_services: Any,
     boto3_client: Any,
@@ -159,7 +140,6 @@ def test_tier2_remove_legal_hold_then_delete_succeeds(
     boto3_client.delete_object(Bucket=bucket_name, Key="k", VersionId=version_id)
 
 
-@pytest.mark.xfail(strict=False, reason=TIER2_REASON)
 def test_tier2_legal_hold_roundtrip(
     docker_services: Any,
     boto3_client: Any,

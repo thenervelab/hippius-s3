@@ -97,21 +97,37 @@ def test_bucket_object_lock_subresource_does_not_trigger() -> None:
         ("x-amz-object-lock-legal-hold", "ON"),
     ],
 )
-def test_per_object_lock_headers_no_longer_trigger(header_name: str, header_value: str) -> None:
-    """PutObject persists these onto the version it creates, so the guard must let them through.
+def test_per_object_lock_headers_still_501_where_unsupported(header_name: str, header_value: str) -> None:
+    """The guard is PER PATH: refused by default, allowed only where the caller honours them.
 
-    Was a 501 assertion under Tier 0, when the alternative to refusing was silently DROPPING the
-    header and leaving the client believing its object was retained. A header only leaves the
-    guard once the write path genuinely honours it — see object_lock_endpoints.lock_for_new_version
-    and test_put_object_lock_headers.py, which pin that it is actually persisted.
+    CreateMultipartUpload does not yet carry a lock from initiate through to the version that
+    appears at completion, so it keeps the 501 rather than accepting the header and dropping it.
     """
     resp = maybe_object_lock_not_implemented_response(_make_request(headers={header_name: header_value}))
+    _assert_not_implemented(resp)
+
+
+@pytest.mark.parametrize(
+    "header_name,header_value",
+    [
+        ("x-amz-object-lock-mode", "GOVERNANCE"),
+        ("x-amz-object-lock-retain-until-date", "2099-01-01T00:00:00Z"),
+        ("x-amz-object-lock-legal-hold", "ON"),
+    ],
+)
+def test_per_object_lock_headers_pass_where_supported(header_name: str, header_value: str) -> None:
+    """PutObject persists them, so it opts in and the guard must let them through — otherwise the
+    implemented feature is unreachable. Pinned in both directions because the opt-in is a single
+    keyword argument at one call site and silently losing it re-breaks PutObject."""
+    resp = maybe_object_lock_not_implemented_response(
+        _make_request(headers={header_name: header_value}), object_lock_headers_supported=True
+    )
     assert resp is None
 
 
-def test_per_object_lock_header_case_insensitive_no_longer_triggers() -> None:
+def test_per_object_lock_header_case_insensitive_still_501_where_unsupported() -> None:
     resp = maybe_object_lock_not_implemented_response(_make_request(headers={"X-Amz-Object-Lock-Mode": "GOVERNANCE"}))
-    assert resp is None
+    _assert_not_implemented(resp)
 
 
 def test_bucket_object_lock_enabled_header_does_not_trigger() -> None:

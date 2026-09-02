@@ -17,6 +17,7 @@ from hippius_s3.api.s3.common import body_blake3_headers
 from hippius_s3.api.s3.common import if_none_match_matches
 from hippius_s3.api.s3.common import parse_response_overrides
 from hippius_s3.api.s3.common import parse_version_id
+from hippius_s3.api.s3.objects.object_lock_endpoints import lock_response_headers
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.repositories.users import UserRepository
 from hippius_s3.utils import get_query
@@ -244,6 +245,11 @@ async def handle_head_object(
         # Add x-amz-version-id header
         object_version = int(row.get("object_version") or 1)
         headers["x-amz-version-id"] = str(object_version)
+
+        # OBJECT LOCK: report the version's protection, as AWS does. Without this a retention
+        # applied from the BUCKET default is invisible to clients — the bucket reports a default
+        # while every object looks unlocked — and a backup tool cannot confirm immutability.
+        headers.update(await lock_response_headers(db, object_id=row["object_id"], object_version=object_version))
 
         # Add Arion file hash (first chunk of first part). HD-5: the light HEAD query returns it via a
         # LATERAL join, so skip the extra fetchval when present; the versioned path still fetches it.

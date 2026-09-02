@@ -231,6 +231,22 @@ async def handle_put_bucket_object_lock(bucket_name: str, request: Request, db: 
             BucketName=bucket_name,
         )
 
+    # Object Lock works only on a versioned bucket — AWS's hard prerequisite, and a real one here:
+    # locks are per VERSION, and on an unversioned bucket a version id is not even addressable, so
+    # `DELETE ?versionId` answers 404 NoSuchVersion and a locked version could never be refused
+    # with the 403 the lock exists to produce. Accepting the configuration would leave the bucket
+    # reporting protection it cannot enforce.
+    #
+    # Not a concern at CreateBucket, which enables versioning implicitly alongside the lock; this
+    # is the enable-on-existing-bucket path, where the caller has to have done it already.
+    if bucket["versioning_status"] != "Enabled":
+        return errors.s3_error_response(
+            "InvalidBucketState",
+            "Object Lock requires versioning to be enabled on the bucket.",
+            status_code=409,
+            BucketName=bucket_name,
+        )
+
     body = await request.body()
     config, error_response = _parse_request_xml(body)
     if error_response is not None:
