@@ -28,15 +28,54 @@ from hippius_s3.api.s3.objects import copy_object_endpoint as mod
 FUTURE = datetime.now(timezone.utc) + timedelta(days=30)
 
 
-class _Repo:
-    """Stands in for ObjectRepository, returning one destination row."""
+REAL_GET_BY_PATH_COLUMNS = frozenset(
+    {
+        "object_id",
+        "bucket_id",
+        "object_key",
+        "size_bytes",
+        "content_type",
+        "created_at",
+        "metadata",
+        "md5_hash",
+        "append_version",
+        "multipart",
+        "storage_version",
+        "object_version",
+        "encryption_version",
+        "enc_suite_id",
+        "enc_chunk_size_bytes",
+        "kek_id",
+        "wrapped_dek",
+        "is_delete_marker",
+        "bucket_name",
+    }
+)
 
-    row: Any = {"object_id": "obj-dest", "current_object_version": 7}
 
-    def __init__(self, _db: Any) -> None: ...
+def test_the_destination_row_does_not_carry_current_object_version() -> None:
+    """Pins why the lock version comes off the RESPONSE, not off a re-read of the destination.
 
-    async def get_by_path(self, _b: str, _k: str) -> Any:
-        return _Repo.row
+    `get_object_by_path.sql` projects `object_version`. `current_object_version` appears in that
+    file only inside the version-resolution subquery's predicate, so a grep suggests it exists as
+    an output column and it does not. Reading it off the returned Record raises KeyError — which,
+    on the copy path, fires AFTER the destination has been overwritten and made live: the client
+    is told the copy failed while an unprotected copy sits at the key.
+
+    This is the second time that exact confusion has shipped (see
+    test_multipart_reserve_row_contract, where the MPU reserve row DOES call it
+    `current_object_version`). The two rows genuinely disagree, which is what makes it easy to get
+    wrong, so it is asserted against the real SQL rather than remembered.
+    """
+    from pathlib import Path
+
+    sql = (Path(__file__).resolve().parents[4] / "hippius_s3/sql/queries/get_object_by_path.sql").read_text()
+    projection = sql[sql.rindex("SELECT") : sql.index("FROM", sql.rindex("SELECT"))]
+    assert "object_version" in projection
+    assert "current_object_version" not in projection, (
+        "get_object_by_path now projects current_object_version — the copy path's comment and the "
+        "reserve-row contract test both need revisiting together"
+    )
 
 
 @pytest.fixture
@@ -48,45 +87,50 @@ def captured(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         calls.append(kw)
 
     monkeypatch.setattr(mod, "store_version_lock", _store)
-    monkeypatch.setattr(mod, "ObjectRepository", _Repo)
-    _Repo.row = {"object_id": "obj-dest", "current_object_version": 7}
     return calls
+
+
+def _copied(version_id: str | None = "7", status: int = 200) -> Response:
+    """A copy response shaped like the real one: the version it wrote, reported as a header."""
+    headers = {"x-amz-version-id": version_id} if version_id is not None else {}
+    return Response(status_code=status, headers=headers)
 
 
 @pytest.mark.asyncio
 class TestApplyLockToCopy:
     async def test_no_intent_writes_nothing(self, captured: list[dict[str, Any]]) -> None:
         """The common case: an ordinary copy must not touch the lock columns at all."""
-        resp = Response(status_code=200)
-        out = await mod._apply_lock_to_copy(None, resp, None, "bkt", "k")
-        assert out is resp
+        resp = _copied()
+        assert await mod._apply_lock_to_copy(None, resp, None, "obj-1") is resp
         assert captured == []
 
     @pytest.mark.parametrize("status", [400, 403, 404, 500, 501])
     async def test_a_failed_copy_is_never_locked(self, status: int, captured: list[dict[str, Any]]) -> None:
         """Locking a copy that did not happen would pin a retention onto whatever content the
         destination key already had — including an unrelated object."""
-        await mod._apply_lock_to_copy(None, Response(status_code=status), ("GOVERNANCE", FUTURE, False), "bkt", "k")
+        await mod._apply_lock_to_copy(None, _copied(status=status), ("GOVERNANCE", FUTURE, False), "obj-1")
         assert captured == [], f"a {status} copy still wrote a lock"
 
-    async def test_successful_copy_locks_the_destination_version(self, captured: list[dict[str, Any]]) -> None:
-        await mod._apply_lock_to_copy(None, Response(status_code=200), ("COMPLIANCE", FUTURE, False), "bkt", "k")
+    async def test_lock_lands_on_the_version_the_copy_wrote(self, captured: list[dict[str, Any]]) -> None:
+        """Not on whatever is current afterwards. A concurrent PUT to the same key between the copy
+        and a re-read would otherwise leave this copy unlocked and pin the retention onto the
+        unrelated write — permanently, under COMPLIANCE."""
+        await mod._apply_lock_to_copy(None, _copied("42"), ("COMPLIANCE", FUTURE, False), "obj-1")
         assert len(captured) == 1
-        assert captured[0]["object_id"] == "obj-dest"
-        assert captured[0]["object_version"] == 7
+        assert captured[0]["object_id"] == "obj-1"
+        assert captured[0]["object_version"] == 42
         assert captured[0]["mode"] == "COMPLIANCE"
         assert captured[0]["legal_hold"] is False
 
     async def test_legal_hold_only_intent_is_applied(self, captured: list[dict[str, Any]]) -> None:
-        await mod._apply_lock_to_copy(None, Response(status_code=200), (None, None, True), "bkt", "k")
+        await mod._apply_lock_to_copy(None, _copied(), (None, None, True), "obj-1")
         assert captured[0]["mode"] is None and captured[0]["legal_hold"] is True
 
-    async def test_missing_destination_row_does_not_raise(self, captured: list[dict[str, Any]]) -> None:
-        """Fail loudly in the log, not by 500-ing a copy that already succeeded and was returned."""
-        _Repo.row = None
-        resp = Response(status_code=200)
-        out = await mod._apply_lock_to_copy(None, resp, ("GOVERNANCE", FUTURE, False), "bkt", "k")
-        assert out is resp
+    async def test_a_response_without_a_version_does_not_raise(self, captured: list[dict[str, Any]]) -> None:
+        """Fail loudly in the log, not by 500-ing a copy that already succeeded and was returned.
+        The alias path reports no version, and any future path that forgets to must not crash."""
+        resp = _copied(version_id=None)
+        assert await mod._apply_lock_to_copy(None, resp, ("GOVERNANCE", FUTURE, False), "obj-1") is resp
         assert captured == []
 
 
@@ -124,6 +168,17 @@ class TestAliasDisqualification:
         async def _eligible(**_kw: Any) -> Any:
             return False, None, "forced streaming"
 
+        class _Repo:
+            """Only the columns get_object_by_path actually projects — deliberately NOT
+            `current_object_version`, which the real row does not carry. Inventing it here is what
+            let an earlier version of these tests pass green over a 500 on every locked copy."""
+
+            def __init__(self, _db: Any) -> None: ...
+
+            async def get_by_path(self, _b: str, _k: str) -> Any:
+                return {"object_id": "obj-dest", "object_version": 3, "storage_version": 5}
+
+        monkeypatch.setattr(mod, "ObjectRepository", _Repo)
         monkeypatch.setattr(mod, "resolve_copy_resources", _resolve)
         monkeypatch.setattr(mod, "handle_same_bucket_copy", _alias)
         monkeypatch.setattr(mod, "handle_streaming_copy", _stream)

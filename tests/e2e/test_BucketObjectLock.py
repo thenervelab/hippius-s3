@@ -87,10 +87,14 @@ def test_put_object_with_incomplete_object_lock_headers_is_rejected(
 @pytest.mark.parametrize(
     "headers,label",
     [
-        ({"x-amz-object-lock-mode": "COMPLIANCE", "x-amz-object-lock-retain-until-date": "2036-01-01T00:00:00Z"},
-         "COMPLIANCE retention"),
-        ({"x-amz-object-lock-mode": "GOVERNANCE", "x-amz-object-lock-retain-until-date": "2036-01-01T00:00:00Z"},
-         "GOVERNANCE retention"),
+        (
+            {"x-amz-object-lock-mode": "COMPLIANCE", "x-amz-object-lock-retain-until-date": "2036-01-01T00:00:00Z"},
+            "COMPLIANCE retention",
+        ),
+        (
+            {"x-amz-object-lock-mode": "GOVERNANCE", "x-amz-object-lock-retain-until-date": "2036-01-01T00:00:00Z"},
+            "GOVERNANCE retention",
+        ),
         ({"x-amz-object-lock-legal-hold": "ON"}, "legal hold alone"),
     ],
 )
@@ -157,7 +161,7 @@ def test_ordinary_upload_to_ordinary_bucket_is_unaffected(
         ("x-amz-object-lock-legal-hold", "ON"),
     ],
 )
-def test_create_multipart_upload_with_object_lock_headers_returns_not_implemented(
+def test_create_multipart_upload_lock_headers_need_bucket_opt_in(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
@@ -165,10 +169,22 @@ def test_create_multipart_upload_with_object_lock_headers_returns_not_implemente
     header_name: str,
     header_value: str,
 ) -> None:
-    """CreateMultipartUpload (POST ?uploads) carrying any x-amz-object-lock-* must 501."""
+    """CreateMultipartUpload used to 501 on any lock header; it now honours them.
+
+    This test previously asserted that 501, which was correct while the path dropped the intent —
+    accepting a lock header and silently discarding it is worse than refusing it, because the client
+    then believes its object is retained. The path now persists the lock onto the version it
+    reserves, so the 501 is gone and what remains is the ordinary opt-in rule: a bucket that never
+    enabled Object Lock refuses lock intent with InvalidRequest, exactly as PutObject does.
+
+    Kept parametrised over all three headers so the refusal cannot regress for one of them, and
+    kept on a NON-opted bucket because that is what this case is about. The accepted direction —
+    the headers actually applying on a lock-enabled bucket — is covered in
+    test_ObjectLockCopyAndMpu.py, including that the lock survives to the completed object.
+    """
     bucket_name = unique_bucket_name("ol-cmu")
     cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name)
+    boto3_client.create_bucket(Bucket=bucket_name)  # deliberately NOT lock-enabled
 
     def _inject_header(request: AWSRequest, **_: Any) -> None:
         request.headers[header_name] = header_value
@@ -181,8 +197,8 @@ def test_create_multipart_upload_with_object_lock_headers_returns_not_implemente
         boto3_client.meta.events.unregister("before-sign.s3.CreateMultipartUpload", _inject_header)
 
     status, code = _error(excinfo.value)
-    assert status == 501
-    assert code == "NotImplemented"
+    assert status == 400, f"{header_name} on a non-opted bucket gave {status} (code={code})"
+    assert code == "InvalidRequest"
 
 
 def test_delete_with_bypass_governance_header_is_noop(
@@ -438,9 +454,7 @@ def test_refused_lock_header_leaves_no_object_behind(
 
     with pytest.raises(ClientError) as missing:
         boto3_client.head_object(Bucket=bucket_name, Key="fresh")
-    assert missing.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404, (
-        "a refused PUT still created an object"
-    )
+    assert missing.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404, "a refused PUT still created an object"
 
     body = boto3_client.get_object(Bucket=bucket_name, Key="existing")["Body"].read()
     assert body == b"ORIGINAL", "a refused overwrite destroyed the existing object"

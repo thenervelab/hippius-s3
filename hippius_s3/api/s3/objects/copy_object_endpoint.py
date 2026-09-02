@@ -34,8 +34,7 @@ async def _apply_lock_to_copy(
     pool: asyncpg.Pool,
     response: Response,
     lock_intent: tuple[str | None, datetime | None, bool] | None,
-    dest_bucket_id: str,
-    object_key: str,
+    object_id: str,
 ) -> Response:
     """Persist the destination copy's lock, once the copy itself has succeeded.
 
@@ -45,23 +44,33 @@ async def _apply_lock_to_copy(
     silent variant of the multipart gap, and arguably worse, since copying is often exactly how
     data is moved INTO a locked bucket in the first place.
 
-    Applied after the copy rather than inside each of its three byte-copy paths: the version number
-    is only knowable once the destination row exists, and resolving it here keeps the v5 fast path,
-    the streaming fallback and the multipart fallback on one implementation instead of three.
+    The version comes from the copy's OWN response (`x-amz-version-id`), not from re-reading the
+    destination key. Re-reading is wrong twice over. It resolves whatever is current *now*, so a
+    concurrent PUT to the same key between the copy and the read would leave this copy unlocked
+    while pinning the retention onto the unrelated write — under COMPLIANCE, permanently. And the
+    row `get_by_path` returns projects `object_version`, not `current_object_version`, so reading
+    the latter raised KeyError and 500'd the request *after* the destination had been overwritten
+    and made live: the client is told the copy failed while an unprotected copy sits at the key.
+    Both byte-copy paths already report the version they wrote, so ask them.
     """
     if lock_intent is None or response.status_code != 200:
         return response
 
-    dest = await ObjectRepository(pool).get_by_path(dest_bucket_id, object_key)
-    if dest is None:
-        logger.error("CopyObject: destination row missing after a successful copy; lock NOT applied")
+    raw_version = response.headers.get("x-amz-version-id")
+    if not raw_version:
+        # Every path that reaches here writes a version and reports it. Missing means a copy path
+        # was added that does not, and the object is live and unprotected — loud, not silent.
+        logger.error(
+            "CopyObject: no x-amz-version-id on a successful copy of %s; Object Lock NOT applied",
+            object_id,
+        )
         return response
 
     mode, retain_until, legal_hold = lock_intent
     await store_version_lock(
         pool,
-        object_id=str(dest["object_id"]),
-        object_version=int(dest["current_object_version"]),
+        object_id=object_id,
+        object_version=int(raw_version),
         mode=mode,
         retain_until=retain_until,
         legal_hold=legal_hold,
@@ -162,8 +171,7 @@ async def handle_copy_object(
                     config=config,
                 ),
                 lock_intent,
-                str(dest_bucket["bucket_id"]),
-                object_key,
+                object_id,
             )
 
         eligible, chunk_rows, reason = await should_use_v5_fast_path(
@@ -192,8 +200,7 @@ async def handle_copy_object(
                     config=config,
                 ),
                 lock_intent,
-                str(dest_bucket["bucket_id"]),
-                object_key,
+                object_id,
             )
 
         logger.info(f"CopyObject using streaming fallback: {reason}")
@@ -213,8 +220,7 @@ async def handle_copy_object(
                 config=config,
             ),
             lock_intent,
-            str(dest_bucket["bucket_id"]),
-            object_key,
+            object_id,
         )
     except errors.S3Error as e:
         return errors.s3_error_response(

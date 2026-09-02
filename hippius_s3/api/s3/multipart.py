@@ -177,17 +177,27 @@ async def handle_post_object(
     1. InitiateMultipartUpload (if ?uploads is in query params)
     2. CompleteMultipartUpload (if ?uploadId=X is in query params)
     """
-    # CreateMultipartUpload now honours the per-object lock headers, so it opts out of the 501 that
-    # covers the paths which still do not. CompleteMultipartUpload carries no lock intent of its own
-    # — the lock was fixed at initiate — so passing the flag here is safe for both POST shapes.
-    object_lock_response = maybe_object_lock_not_implemented_response(request, object_lock_headers_supported=True)
+    # This handler serves BOTH CreateMultipartUpload (?uploads) and CompleteMultipartUpload
+    # (?uploadId), and only the first can act on lock headers — the lock is fixed at initiate, onto
+    # the version reserved there.
+    #
+    # So the two shapes are treated differently on purpose. Initiate opts out of the 501 and
+    # validates the intent it is about to persist. Complete refuses the headers outright rather
+    # than letting them through: it cannot apply them, and accepting lock intent while dropping it
+    # is the precise failure the guard exists to prevent — the client would be told its object is
+    # retained when nothing was written.
+    is_initiate = "uploads" in request.query_params
+    object_lock_response = maybe_object_lock_not_implemented_response(
+        request, object_lock_headers_supported=is_initiate
+    )
     if object_lock_response is not None:
         return object_lock_response
-    # Refuse malformed or unauthorised lock intent BEFORE any upload is created. Doing it later
-    # would leave an initiated upload (and, at completion, a written object) behind a 4xx.
-    lock_rejection = validate_lock_intent(request)
-    if lock_rejection is not None:
-        return lock_rejection
+    if is_initiate:
+        # Refuse malformed or unauthorised lock intent BEFORE any upload is created. Doing it later
+        # would leave an initiated upload (and, at completion, a written object) behind a 4xx.
+        lock_rejection = validate_lock_intent(request)
+        if lock_rejection is not None:
+            return lock_rejection
     logger.info(f"[POST] {bucket_name}/{object_key} - {dict(request.query_params)}")
 
     # Check for uploads parameter (Initiate Multipart Upload)

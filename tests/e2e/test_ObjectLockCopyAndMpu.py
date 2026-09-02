@@ -47,9 +47,7 @@ def _drop(client: Any, bucket: str, key: str) -> None:
     """Remove a version that may be under GOVERNANCE, so a test bucket stays cleanable."""
     for v in client.list_object_versions(Bucket=bucket, Prefix=key).get("Versions", []):
         try:
-            client.delete_object(
-                Bucket=bucket, Key=key, VersionId=v["VersionId"], BypassGovernanceRetention=True
-            )
+            client.delete_object(Bucket=bucket, Key=key, VersionId=v["VersionId"], BypassGovernanceRetention=True)
         except ClientError:
             pass
 
@@ -300,8 +298,11 @@ class TestMultipartObjectLock:
         cleanup_buckets(b)
         _locked_bucket(boto3_client, b)
         self._mpu(
-            boto3_client, b, "big",
-            ObjectLockMode="COMPLIANCE", ObjectLockRetainUntilDate=_until(),
+            boto3_client,
+            b,
+            "big",
+            ObjectLockMode="COMPLIANCE",
+            ObjectLockRetainUntilDate=_until(),
         )
         head = boto3_client.head_object(Bucket=b, Key="big")
         assert head.get("ObjectLockMode") == "COMPLIANCE"
@@ -319,9 +320,7 @@ class TestMultipartObjectLock:
         cleanup_buckets(b)
         _locked_bucket(boto3_client, b)
         self._mpu(boto3_client, b, "held", ObjectLockLegalHoldStatus="ON")
-        assert (
-            boto3_client.get_object_legal_hold(Bucket=b, Key="held")["LegalHold"]["Status"] == "ON"
-        )
+        assert boto3_client.get_object_legal_hold(Bucket=b, Key="held")["LegalHold"]["Status"] == "ON"
         boto3_client.put_object_legal_hold(Bucket=b, Key="held", LegalHold={"Status": "OFF"})
 
     def test_multipart_explicit_headers_override_the_bucket_default(
@@ -335,8 +334,11 @@ class TestMultipartObjectLock:
         cleanup_buckets(b)
         _locked_bucket(boto3_client, b, default_days=7)
         self._mpu(
-            boto3_client, b, "ovr",
-            ObjectLockMode="COMPLIANCE", ObjectLockRetainUntilDate=_until(),
+            boto3_client,
+            b,
+            "ovr",
+            ObjectLockMode="COMPLIANCE",
+            ObjectLockRetainUntilDate=_until(),
         )
         assert boto3_client.head_object(Bucket=b, Key="ovr").get("ObjectLockMode") == "COMPLIANCE"
 
@@ -353,8 +355,10 @@ class TestMultipartObjectLock:
         boto3_client.create_bucket(Bucket=b)
         with pytest.raises(ClientError) as excinfo:
             boto3_client.create_multipart_upload(
-                Bucket=b, Key="k",
-                ObjectLockMode="COMPLIANCE", ObjectLockRetainUntilDate=_until(),
+                Bucket=b,
+                Key="k",
+                ObjectLockMode="COMPLIANCE",
+                ObjectLockRetainUntilDate=_until(),
             )
         status, code = _error(excinfo.value)
         assert status == 400 and code == "InvalidRequest"
@@ -416,3 +420,77 @@ class TestMultipartObjectLock:
         self._mpu(boto3_client, b, "plain")
         assert "ObjectLockMode" not in boto3_client.head_object(Bucket=b, Key="plain")
         boto3_client.delete_object(Bucket=b, Key="plain")
+
+    def test_same_bucket_copy_in_a_default_retention_bucket_still_copies_correctly(
+        self,
+        docker_services: Any,
+        boto3_client: Any,
+        unique_bucket_name: Callable[[str], str],
+        cleanup_buckets: Callable[[str], None],
+    ) -> None:
+        """The common production shape, untested until now: a lock-enabled bucket WITH a default
+        rule means every same-bucket copy carries lock intent, so every one loses the alias
+        optimisation and becomes a real byte copy.
+
+        That is intended — an alias has no version of its own to hold a retention — but it is a
+        genuine cost change for Copy+Delete move patterns, and nothing covered either direction.
+        Asserted on the outcome a client can see: the copy has the right bytes, is retained, and
+        did not drag its source into the lock.
+        """
+        b = unique_bucket_name("cp-defalias")
+        cleanup_buckets(b)
+        _locked_bucket(boto3_client, b, default_days=3)
+        boto3_client.put_object(Bucket=b, Key="src.txt", Body=b"payload")
+        boto3_client.copy_object(Bucket=b, Key="dst.txt", CopySource=f"{b}/src.txt")
+
+        assert boto3_client.get_object(Bucket=b, Key="dst.txt")["Body"].read() == b"payload"
+        assert boto3_client.head_object(Bucket=b, Key="dst.txt").get("ObjectLockMode") == "GOVERNANCE"
+        _drop(boto3_client, b, "dst.txt")
+        _drop(boto3_client, b, "src.txt")
+
+    def test_complete_multipart_upload_refuses_lock_headers(
+        self,
+        docker_services: Any,
+        boto3_client: Any,
+        unique_bucket_name: Callable[[str], str],
+        cleanup_buckets: Callable[[str], None],
+    ) -> None:
+        """Complete cannot apply a lock — the lock is fixed at initiate — so it must refuse the
+        headers rather than accept and drop them.
+
+        The POST handler serves both shapes, and opting the whole handler out of the 501 would have
+        made Complete accept lock intent it can never honour: 200 OK, unprotected object, client
+        believing otherwise. That is the exact failure the guard exists to prevent, so the opt-in is
+        conditional on the request being an initiate.
+        """
+        from botocore.awsrequest import AWSRequest
+
+        b = unique_bucket_name("mpu-cmplock")
+        cleanup_buckets(b)
+        _locked_bucket(boto3_client, b)
+        created = boto3_client.create_multipart_upload(Bucket=b, Key="k")
+        part = boto3_client.upload_part(
+            Bucket=b, Key="k", PartNumber=1, UploadId=created["UploadId"], Body=b"x" * (5 * 1024 * 1024)
+        )
+
+        def _inject(request: AWSRequest, **_: Any) -> None:
+            request.headers["x-amz-object-lock-mode"] = "COMPLIANCE"
+            request.headers["x-amz-object-lock-retain-until-date"] = "2036-01-01T00:00:00Z"
+
+        boto3_client.meta.events.register("before-sign.s3.CompleteMultipartUpload", _inject)
+        try:
+            with pytest.raises(ClientError) as excinfo:
+                boto3_client.complete_multipart_upload(
+                    Bucket=b,
+                    Key="k",
+                    UploadId=created["UploadId"],
+                    MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]},
+                )
+        finally:
+            boto3_client.meta.events.unregister("before-sign.s3.CompleteMultipartUpload", _inject)
+
+        status, code = _error(excinfo.value)
+        assert status == 501 and code == "NotImplemented", (
+            f"CompleteMultipartUpload accepted lock headers it cannot apply ({status} {code})"
+        )
+        boto3_client.abort_multipart_upload(Bucket=b, Key="k", UploadId=created["UploadId"])
