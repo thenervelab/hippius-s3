@@ -53,7 +53,12 @@ async def conn() -> AsyncGenerator[asyncpg.Connection, None]:
 
     await c.execute("""
         CREATE TEMP TABLE object_versions(
-            object_id uuid, object_version bigint, deleted_at timestamptz
+            object_id uuid, object_version bigint, deleted_at timestamptz,
+            -- Object Lock Tier 2: the reap queries now carry the lock predicate, so the shadow
+            -- table needs the columns. Defaults mirror the real migration (unlocked), which keeps
+            -- every pre-lock test seeding exactly the unlocked behaviour it always asserted.
+            object_lock_mode text, object_lock_retain_until timestamptz,
+            object_lock_legal_hold boolean NOT NULL DEFAULT false
         ) ON COMMIT PRESERVE ROWS;
         CREATE TEMP TABLE parts(
             part_id uuid PRIMARY KEY, object_id uuid, object_version bigint
