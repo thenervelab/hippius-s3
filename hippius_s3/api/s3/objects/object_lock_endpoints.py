@@ -22,12 +22,14 @@ from datetime import timezone
 from typing import Any
 from typing import Final
 
+from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.object_lock_enforcement import COMPLIANCE
 from hippius_s3.api.s3.object_lock_enforcement import GOVERNANCE
 from hippius_s3.api.s3.object_lock_enforcement import may_bypass_governance
+from hippius_s3.api.s3.object_lock_enforcement import request_is_bucket_owner
 from hippius_s3.config import get_config
 from hippius_s3.utils import get_query
 from hippius_s3.xml_helpers import add_subelement
@@ -222,3 +224,124 @@ async def store_version_lock(
         retain_until,
         legal_hold,
     )
+
+
+async def _resolve_version(
+    db: Any, *, bucket_id: Any, object_key: str, version_id: int | None
+) -> tuple[str, int] | None:
+    """(object_id, object_version) for the addressed version, or the current one. None if absent."""
+    row = await db.fetchrow(get_query("get_object_version_for_lock"), bucket_id, object_key, version_id)
+    if row is None or row["object_version"] is None:
+        return None
+    return str(row["object_id"]), int(row["object_version"])
+
+
+def _no_such_key(object_key: str) -> Response:
+    return errors.s3_error_response("NoSuchKey", "The specified key does not exist.", status_code=404, Key=object_key)
+
+
+async def handle_get_object_retention(bucket_id: Any, object_key: str, version_id: int | None, db: Any) -> Response:
+    resolved = await _resolve_version(db, bucket_id=bucket_id, object_key=object_key, version_id=version_id)
+    if resolved is None:
+        return _no_such_key(object_key)
+    object_id, object_version = resolved
+    row = await load_version_lock(db, object_id=object_id, object_version=object_version)
+    if row is None or row["object_lock_mode"] is None:
+        # AWS's specific code for "the object has no retention", distinct from NoSuchKey.
+        return errors.s3_error_response(
+            "NoSuchObjectLockConfiguration",
+            "The specified object does not have an ObjectLock configuration.",
+            status_code=404,
+            Key=object_key,
+        )
+    return Response(
+        content=retention_to_xml(str(row["object_lock_mode"]), row["object_lock_retain_until"]),
+        media_type="application/xml",
+        status_code=200,
+    )
+
+
+async def handle_put_object_retention(
+    bucket_id: Any, object_key: str, version_id: int | None, request: Request, db: Any, body: bytes
+) -> Response:
+    parsed, error = parse_retention_body(body)
+    if error is not None:
+        return error
+    assert parsed is not None
+
+    resolved = await _resolve_version(db, bucket_id=bucket_id, object_key=object_key, version_id=version_id)
+    if resolved is None:
+        return _no_such_key(object_key)
+    object_id, object_version = resolved
+
+    current = await load_version_lock(db, object_id=object_id, object_version=object_version)
+    if current is None:
+        return _no_such_key(object_key)
+
+    refusal = validate_retention_transition(
+        current_mode=current["object_lock_mode"],
+        current_until=current["object_lock_retain_until"],
+        new_mode=parsed["mode"],
+        new_until=parsed["retain_until"],
+        is_bucket_owner=request_is_bucket_owner(request),
+        headers=request.headers,
+    )
+    if refusal is not None:
+        return refusal
+
+    # legal_hold=None leaves any hold untouched: the two protections are independent and this
+    # endpoint owns only the retention half.
+    await store_version_lock(
+        db,
+        object_id=object_id,
+        object_version=object_version,
+        mode=parsed["mode"],
+        retain_until=parsed["retain_until"],
+        legal_hold=None,
+    )
+    return Response(status_code=200)
+
+
+async def handle_get_object_legal_hold(bucket_id: Any, object_key: str, version_id: int | None, db: Any) -> Response:
+    resolved = await _resolve_version(db, bucket_id=bucket_id, object_key=object_key, version_id=version_id)
+    if resolved is None:
+        return _no_such_key(object_key)
+    object_id, object_version = resolved
+    row = await load_version_lock(db, object_id=object_id, object_version=object_version)
+    if row is None:
+        return _no_such_key(object_key)
+    return Response(
+        content=legal_hold_to_xml(bool(row["object_lock_legal_hold"])),
+        media_type="application/xml",
+        status_code=200,
+    )
+
+
+async def handle_put_object_legal_hold(
+    bucket_id: Any, object_key: str, version_id: int | None, request: Request, db: Any, body: bytes
+) -> Response:
+    on, error = parse_legal_hold_body(body)
+    if error is not None:
+        return error
+
+    resolved = await _resolve_version(db, bucket_id=bucket_id, object_key=object_key, version_id=version_id)
+    if resolved is None:
+        return _no_such_key(object_key)
+    object_id, object_version = resolved
+
+    current = await load_version_lock(db, object_id=object_id, object_version=object_version)
+    if current is None:
+        return _no_such_key(object_key)
+
+    # Retention is passed through unchanged: a legal hold must never clear or alter one. AWS lets
+    # any holder of PutObjectLegalHold remove a hold — there is no bypass and no COMPLIANCE
+    # equivalent here, because a hold has no retention mode.
+    await store_version_lock(
+        db,
+        object_id=object_id,
+        object_version=object_version,
+        mode=current["object_lock_mode"],
+        retain_until=current["object_lock_retain_until"],
+        legal_hold=bool(on),
+    )
+    return Response(status_code=200)

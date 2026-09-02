@@ -67,14 +67,20 @@ def test_unrelated_query_params_pass_through() -> None:
 
 
 @pytest.mark.parametrize("subresource", ["retention", "legal-hold"])
-def test_tier2_query_subresources_trigger_501(subresource: str) -> None:
+def test_tier2_query_subresources_no_longer_trigger(subresource: str) -> None:
+    """Tier 2 implements ?retention and ?legal-hold, so the guard must let them reach the router.
+
+    Was a 501 assertion under Tier 0. Flipping it is the point of the feature — but the guard must
+    only stop trapping a surface once a real handler exists, or the request is silently ignored
+    instead, which is worse than the 501 it replaced.
+    """
     resp = maybe_object_lock_not_implemented_response(_make_request(query={subresource: ""}))
-    _assert_not_implemented(resp)
+    assert resp is None
 
 
-def test_retention_with_version_id_triggers_501() -> None:
+def test_retention_with_version_id_no_longer_triggers() -> None:
     resp = maybe_object_lock_not_implemented_response(_make_request(query={"retention": "", "versionId": "v1"}))
-    _assert_not_implemented(resp)
+    assert resp is None
 
 
 def test_bucket_object_lock_subresource_does_not_trigger() -> None:
@@ -118,7 +124,8 @@ def test_bypass_governance_header_alone_does_not_trigger() -> None:
 
 
 def test_error_body_has_request_id_and_host_id() -> None:
-    resp = maybe_object_lock_not_implemented_response(_make_request(query={"retention": ""}))
+    # Uses a header, since ?retention is implemented now and no longer produces this error.
+    resp = maybe_object_lock_not_implemented_response(_make_request(headers={"x-amz-object-lock-mode": "GOVERNANCE"}))
     _assert_not_implemented(resp)
     root = ET.fromstring(resp.body)
     assert root.findtext("RequestId"), "missing RequestId in error XML"

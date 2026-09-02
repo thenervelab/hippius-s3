@@ -113,3 +113,21 @@ def _get(row: Any, key: str) -> Any:
         return row[key]
     except (KeyError, IndexError, TypeError):
         return None
+
+
+def request_is_bucket_owner(request: Any) -> bool:
+    """Whether the CALLER owns the bucket, which is the permission half of a governance bypass.
+
+    Compares the caller's own identity against the bucket owner the ACL middleware resolved. Do NOT
+    substitute `request.state.main_account_id` for the left-hand side: that is the
+    storage-attribution account, which falls back to the BUCKET OWNER, so comparing it against the
+    owner is a tautology that hands every delegated caller a bypass. The same confusion between
+    those two fields was a finding on the Tier 1 PR.
+
+    Absent state (an internal caller, a test double) reads as "not the owner", so the bypass fails
+    closed.
+    """
+    account = getattr(request.state, "account", None)
+    caller = getattr(account, "main_account", None) if account is not None else None
+    owner = getattr(request.state, "bucket_owner_id", None)
+    return bool(caller) and bool(owner) and str(caller) == str(owner)

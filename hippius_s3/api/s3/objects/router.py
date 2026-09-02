@@ -9,10 +9,12 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3 import dependencies
+from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.acl_endpoints import get_object_acl
 from hippius_s3.api.s3.acl_endpoints import invalid_canned_acl_response
 from hippius_s3.api.s3.acl_endpoints import materialize_canned_object_acl
 from hippius_s3.api.s3.acl_endpoints import put_object_acl
+from hippius_s3.api.s3.common import parse_version_id
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.api.s3.multipart import abort_multipart_upload
 from hippius_s3.api.s3.multipart import list_parts_internal
@@ -22,12 +24,18 @@ from hippius_s3.api.s3.objects.copy_object_endpoint import handle_copy_object
 from hippius_s3.api.s3.objects.delete_object_endpoint import handle_delete_object
 from hippius_s3.api.s3.objects.get_object_endpoint import handle_get_object
 from hippius_s3.api.s3.objects.head_object_endpoint import handle_head_object
+from hippius_s3.api.s3.objects.object_lock_endpoints import handle_get_object_legal_hold
+from hippius_s3.api.s3.objects.object_lock_endpoints import handle_get_object_retention
+from hippius_s3.api.s3.objects.object_lock_endpoints import handle_put_object_legal_hold
+from hippius_s3.api.s3.objects.object_lock_endpoints import handle_put_object_retention
 from hippius_s3.api.s3.objects.put_object_endpoint import handle_put_object
 from hippius_s3.api.s3.objects.tagging_endpoint import delete_object_tags as tags_delete_object_tags
 from hippius_s3.api.s3.objects.tagging_endpoint import get_object_tags as tags_get_object_tags
 from hippius_s3.api.s3.objects.tagging_endpoint import set_object_tags as tags_set_object_tags
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
+from hippius_s3.repositories.buckets import BucketRepository
+from hippius_s3.utils import get_request_body
 
 
 router = APIRouter()
@@ -60,6 +68,45 @@ def _reject_version_id(request: Request, object_key: str, subresource: str) -> R
     )
 
 
+async def _dispatch_object_lock(
+    bucket_name: str, object_key: str, request: Request, conn: Any, *, body: bytes | None
+) -> Response:
+    """Route ?retention / ?legal-hold to their handlers, resolving the bucket first.
+
+    The bucket is resolved by NAME AND OWNER via main_account_id — the storage-attribution account
+    — matching every other object subresource. That is the field an ACL-delegated caller resolves
+    to the bucket owner through, so a WRITE_ACP grantee reaches the same bucket the owner does.
+    Do not confuse it with request.state.account.main_account, which is the CALLER and is what
+    request_is_bucket_owner compares for the governance bypass.
+    """
+    bucket = await BucketRepository(conn).get_by_name_and_owner(bucket_name, request.state.main_account_id)
+    if not bucket:
+        return errors.s3_error_response(
+            "NoSuchBucket",
+            f"The specified bucket {bucket_name} does not exist",
+            status_code=404,
+            BucketName=bucket_name,
+        )
+    bucket_id = bucket["bucket_id"]
+
+    raw_version = request.query_params.get("versionId")
+    version_id: int | None = None
+    if raw_version is not None:
+        try:
+            version_id = parse_version_id(raw_version)
+        except (ValueError, TypeError):
+            return errors.s3_error_response("InvalidArgument", f"Invalid version ID: {raw_version}", status_code=400)
+
+    is_retention = "retention" in request.query_params
+    if request.method == "GET":
+        if is_retention:
+            return await handle_get_object_retention(bucket_id, object_key, version_id, conn)
+        return await handle_get_object_legal_hold(bucket_id, object_key, version_id, conn)
+    if is_retention:
+        return await handle_put_object_retention(bucket_id, object_key, version_id, request, conn, body or b"")
+    return await handle_put_object_legal_hold(bucket_id, object_key, version_id, request, conn, body or b"")
+
+
 @router.head("/{bucket_name}/{object_key:path}", status_code=200)
 async def head_object(
     bucket_name: str,
@@ -89,6 +136,9 @@ async def get_object(
         if (rejected := _reject_version_id(request, object_key, "acl")) is not None:
             return rejected
         return await get_object_acl(bucket_name, object_key, request)
+    if "retention" in request.query_params or "legal-hold" in request.query_params:
+        async with pool.acquire() as conn:
+            return await _dispatch_object_lock(bucket_name, object_key, request, conn, body=None)
     if "tagging" in request.query_params:
         if (rejected := _reject_version_id(request, object_key, "tagging")) is not None:
             return rejected
@@ -119,6 +169,12 @@ async def put_object(
     # Write-path ACL extras (formerly wrapped around every object PUT by the ?acl
     # dispatcher): reject an unknown canned ACL before the write, materialize the
     # object ACL after a successful write that carried x-amz-acl.
+    if "retention" in request.query_params or "legal-hold" in request.query_params:
+        async with pool.acquire() as conn:
+            return await _dispatch_object_lock(
+                bucket_name, object_key, request, conn, body=await get_request_body(request)
+            )
+
     x_amz_acl = request.headers.get("x-amz-acl")
     if (invalid := invalid_canned_acl_response(x_amz_acl)) is not None:
         return invalid

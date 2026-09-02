@@ -30,7 +30,13 @@ _NOT_IMPLEMENTED_MESSAGE: Final[str] = (
     "See specs/s3-object-lock.md."
 )
 
-_QUERY_SUBRESOURCES: Final[frozenset[str]] = frozenset({"retention", "legal-hold"})
+# Tier 2 implements ?retention and ?legal-hold, so they no longer trip this guard — the router
+# dispatches them to real handlers. The per-object x-amz-object-lock-* HEADERS on PUT are likewise
+# implemented and removed below. What remains 501 is the surface still genuinely unbuilt.
+_QUERY_SUBRESOURCES: Final[frozenset[str]] = frozenset()
+# STILL 501 until the write path persists them. Emptying this set before PutObject honours the
+# headers would mean silently accepting lock intent and dropping it — a client believing its object
+# is retained when it is not, which is the precise failure Tier 0 exists to prevent.
 _OBJECT_LOCK_HEADERS: Final[frozenset[str]] = frozenset(
     {
         "x-amz-object-lock-mode",
