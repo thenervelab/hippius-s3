@@ -17,6 +17,7 @@ from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.api.s3.multipart import abort_multipart_upload
 from hippius_s3.api.s3.multipart import list_parts_internal
 from hippius_s3.api.s3.multipart import upload_part
+from hippius_s3.api.s3.object_lock_guard import maybe_object_lock_not_implemented_response
 from hippius_s3.api.s3.objects.copy_object_endpoint import handle_copy_object
 from hippius_s3.api.s3.objects.delete_object_endpoint import handle_delete_object
 from hippius_s3.api.s3.objects.get_object_endpoint import handle_get_object
@@ -66,6 +67,9 @@ async def head_object(
     request: Request,
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
 ) -> Response:
+    object_lock_response = maybe_object_lock_not_implemented_response(request)
+    if object_lock_response is not None:
+        return object_lock_response
     return await handle_head_object(bucket_name, object_key, request, pool)
 
 
@@ -77,6 +81,9 @@ async def get_object(
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
     redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
+    object_lock_response = maybe_object_lock_not_implemented_response(request)
+    if object_lock_response is not None:
+        return object_lock_response
     # Handle query variants by delegation
     if "acl" in request.query_params:
         if (rejected := _reject_version_id(request, object_key, "acl")) is not None:
@@ -102,6 +109,9 @@ async def put_object(
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
     redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
+    object_lock_response = maybe_object_lock_not_implemented_response(request)
+    if object_lock_response is not None:
+        return object_lock_response
     if "acl" in request.query_params:
         if (rejected := _reject_version_id(request, object_key, "acl")) is not None:
             return rejected
@@ -140,6 +150,9 @@ async def delete_object(
     pool: asyncpg.Pool = Depends(dependencies.get_db_pool),
     redis_client: Any = Depends(dependencies.get_redis),
 ) -> Response:
+    object_lock_response = maybe_object_lock_not_implemented_response(request)
+    if object_lock_response is not None:
+        return object_lock_response
     if "uploadId" in request.query_params:
         async with pool.acquire() as conn:
             return await abort_multipart_upload(bucket_name, object_key, request, conn)
