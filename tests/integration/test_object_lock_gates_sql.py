@@ -399,3 +399,111 @@ class TestOpsScriptGates:
             0,
         )
         assert oid not in {r["object_id"] for r in rows}, "the reaper offered up a locked version"
+
+
+class TestVersionReapGate:
+    """The janitor's version reap destroys a soft-deleted version's `parts` rows and cascades
+    part_chunks + chunk_backend — the record a WORM hold exists to preserve. The unpinner gate
+    protects it only transitively (live Arion rows fail the no-live-copies check), which breaks
+    for a version whose rows live solely on a backend with its own delete path, or one that never
+    replicated (the 24h zero-row relaxation). So the reap pair carries the predicate itself."""
+
+    async def _soft_delete_version(self, ctx: Ctx, oid: uuid.UUID, version: int, *, hours_ago: int = 25) -> None:
+        await ctx.conn.execute(
+            "UPDATE object_versions SET deleted_at = now() - ($3::text || ' hours')::interval "
+            "WHERE object_id = $1 AND object_version = $2",
+            oid,
+            version,
+            str(hours_ago),
+        )
+
+    async def _soft_delete_backend_rows(self, ctx: Ctx, oid: uuid.UUID, version: int) -> None:
+        await ctx.conn.execute(
+            "UPDATE chunk_backend SET deleted = true WHERE chunk_id IN ("
+            "  SELECT pc.id FROM part_chunks pc JOIN parts p ON p.part_id = pc.part_id "
+            "  WHERE p.object_id = $1 AND p.object_version = $2)",
+            oid,
+            version,
+        )
+
+    async def _reap_candidates(self, ctx: Ctx) -> set[tuple[uuid.UUID, int]]:
+        rows = await ctx.conn.fetch(
+            get_query("find_versions_ready_for_reap"),
+            1000,
+            datetime(1970, 1, 1, tzinfo=timezone.utc),
+            uuid.UUID(int=0),
+            0,
+        )
+        return {(r["object_id"], r["object_version"]) for r in rows if r["ready"]}
+
+    async def _reap(self, ctx: Ctx, oid: uuid.UUID, version: int) -> str:
+        return await ctx.conn.execute(get_query("reap_deleted_version_parts"), oid, version)
+
+    async def test_locked_version_with_all_backend_rows_deleted_is_not_reaped(self, ctx: Ctx) -> None:
+        """The exact scenario the transitive protection misses: every chunk_backend row is already
+        soft-deleted (as an ungated backend delete path would leave them), so without the reap
+        gate the version reads fully ready."""
+        oid = await _make_object_with_versions(
+            ctx,
+            key="reap1",
+            versions=[
+                {"version": 1, "mode": "COMPLIANCE", "retain_until": datetime.now(timezone.utc) + FUTURE},
+                {"version": 2},
+            ],
+            soft_deleted=False,
+        )
+        await self._soft_delete_version(ctx, oid, 1)
+        await self._soft_delete_backend_rows(ctx, oid, 1)
+        assert (oid, 1) not in await self._reap_candidates(ctx)
+        assert await self._reap(ctx, oid, 1) == "DELETE 0"
+        assert await ctx.conn.fetchval("SELECT count(*) FROM parts WHERE object_id = $1 AND object_version = 1", oid), (
+            "the locked version's parts rows must survive"
+        )
+
+    async def test_never_replicated_locked_version_survives_the_aged_relaxation(self, ctx: Ctx) -> None:
+        """Zero chunk_backend rows + >24h old is the aged-relaxation path that bypasses the
+        replication audit entirely — the lock must still hold there."""
+        oid = await _make_object_with_versions(
+            ctx,
+            key="reap2",
+            versions=[{"version": 1, "legal_hold": True}],
+            soft_deleted=False,
+        )
+        await ctx.conn.execute(
+            "DELETE FROM chunk_backend WHERE chunk_id IN ("
+            "  SELECT pc.id FROM part_chunks pc JOIN parts p ON p.part_id = pc.part_id WHERE p.object_id = $1)",
+            oid,
+        )
+        await self._soft_delete_version(ctx, oid, 1)
+        assert (oid, 1) not in await self._reap_candidates(ctx)
+        assert await self._reap(ctx, oid, 1) == "DELETE 0"
+
+    async def test_expired_lock_reaps_normally(self, ctx: Ctx) -> None:
+        """A lock must LAPSE: once retention expires the reap proceeds exactly as before."""
+        oid = await _make_object_with_versions(
+            ctx,
+            key="reap3",
+            versions=[{"version": 1, "mode": "GOVERNANCE", "retain_until": datetime.now(timezone.utc) + PAST}],
+            soft_deleted=False,
+        )
+        await self._soft_delete_version(ctx, oid, 1)
+        await self._soft_delete_backend_rows(ctx, oid, 1)
+        assert (oid, 1) in await self._reap_candidates(ctx)
+        assert await self._reap(ctx, oid, 1) == "DELETE 1"
+
+    async def test_hold_placed_between_find_and_reap_is_still_refused(self, ctx: Ctx) -> None:
+        """The DELETE re-checks the lock atomically, so a hold landing mid-batch wins."""
+        oid = await _make_object_with_versions(
+            ctx,
+            key="reap4",
+            versions=[{"version": 1}],
+            soft_deleted=False,
+        )
+        await self._soft_delete_version(ctx, oid, 1)
+        await self._soft_delete_backend_rows(ctx, oid, 1)
+        assert (oid, 1) in await self._reap_candidates(ctx)
+        await ctx.conn.execute(
+            "UPDATE object_versions SET object_lock_legal_hold = true WHERE object_id = $1 AND object_version = 1",
+            oid,
+        )
+        assert await self._reap(ctx, oid, 1) == "DELETE 0"
