@@ -345,3 +345,87 @@ async def handle_put_object_legal_hold(
         legal_hold=bool(on),
     )
     return Response(status_code=200)
+
+
+def lock_for_new_version(request: Request) -> tuple[str | None, datetime | None, bool] | Response | None:
+    """The lock a freshly-created version should carry: (mode, retain_until, legal_hold).
+
+    Returns None when there is nothing to apply — the overwhelmingly common case, and the one that
+    must cost the write path nothing.
+
+    Precedence follows AWS: explicit per-object `x-amz-object-lock-*` headers OVERRIDE the bucket's
+    default retention. A bucket default is a duration, so the retain-until date is computed from
+    the moment the version is created, per object.
+    """
+    headers = request.headers
+    mode = (headers.get("x-amz-object-lock-mode") or "").strip().upper() or None
+    raw_until = (headers.get("x-amz-object-lock-retain-until-date") or "").strip() or None
+    hold_raw = (headers.get("x-amz-object-lock-legal-hold") or "").strip().upper() or None
+
+    if hold_raw is not None and hold_raw not in {"ON", "OFF"}:
+        return errors.s3_error_response(
+            "InvalidArgument", "x-amz-object-lock-legal-hold must be ON or OFF.", status_code=400
+        )
+    legal_hold = hold_raw == "ON"
+
+    if (mode is None) != (raw_until is None):
+        return errors.s3_error_response(
+            "InvalidArgument",
+            "x-amz-object-lock-mode and x-amz-object-lock-retain-until-date must be supplied together.",
+            status_code=400,
+        )
+
+    if mode is not None:
+        if mode not in _VALID_MODES:
+            return errors.s3_error_response(
+                "InvalidArgument", f"x-amz-object-lock-mode must be one of {sorted(_VALID_MODES)}.", status_code=400
+            )
+        parsed, err = _parse_retain_until(str(raw_until))
+        if err is not None:
+            return err
+        return mode, parsed, legal_hold
+
+    # No explicit retention on the request: fall back to the bucket default, if any.
+    default = _bucket_default_retention(getattr(request.state, "bucket_object_lock", None))
+    if default is None:
+        return (None, None, legal_hold) if legal_hold else None
+    default_mode, until = default
+    return default_mode, until, legal_hold
+
+
+def _bucket_default_retention(config: Any) -> tuple[str, datetime] | None:
+    """Turn Tier 1's stored bucket config into a concrete retain-until for a version created now.
+
+    This is what finally makes the Tier 1 configuration mean something: without it the bucket
+    reports a default retention that is never applied to anything.
+    """
+    if not isinstance(config, dict) or not config.get("enabled"):
+        return None
+    mode = str(config.get("mode") or "").upper()
+    if mode not in _VALID_MODES:
+        return None
+    days = config.get("days")
+    years = config.get("years")
+    if days is None and years is None:
+        return None
+    delta = timedelta(days=int(days)) if days is not None else timedelta(days=365 * int(years))
+    return mode, datetime.now(timezone.utc) + delta
+
+
+def _parse_retain_until(raw: str) -> tuple[datetime | None, Response | None]:
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None, errors.s3_error_response(
+            "InvalidArgument", "x-amz-object-lock-retain-until-date must be ISO-8601.", status_code=400
+        )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    max_days = get_config().object_lock_max_retention_days
+    if parsed > datetime.now(timezone.utc) + timedelta(days=max_days):
+        return None, errors.s3_error_response(
+            "InvalidArgument",
+            f"x-amz-object-lock-retain-until-date is further than {max_days} days out.",
+            status_code=400,
+        )
+    return parsed, None

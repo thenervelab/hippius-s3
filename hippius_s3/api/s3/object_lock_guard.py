@@ -34,16 +34,11 @@ _NOT_IMPLEMENTED_MESSAGE: Final[str] = (
 # dispatches them to real handlers. The per-object x-amz-object-lock-* HEADERS on PUT are likewise
 # implemented and removed below. What remains 501 is the surface still genuinely unbuilt.
 _QUERY_SUBRESOURCES: Final[frozenset[str]] = frozenset()
-# STILL 501 until the write path persists them. Emptying this set before PutObject honours the
-# headers would mean silently accepting lock intent and dropping it — a client believing its object
-# is retained when it is not, which is the precise failure Tier 0 exists to prevent.
-_OBJECT_LOCK_HEADERS: Final[frozenset[str]] = frozenset(
-    {
-        "x-amz-object-lock-mode",
-        "x-amz-object-lock-retain-until-date",
-        "x-amz-object-lock-legal-hold",
-    }
-)
+# Implemented: PutObject now persists these onto the version it creates (see
+# object_lock_endpoints.lock_for_new_version). This set only ever loses a header once the write
+# path genuinely honours it — accepting lock intent and dropping it silently is worse than the 501
+# it replaces, and is the precise failure Tier 0 exists to prevent.
+_OBJECT_LOCK_HEADERS: Final[frozenset[str]] = frozenset()
 
 
 def maybe_object_lock_not_implemented_response(request: Request) -> Response | None:

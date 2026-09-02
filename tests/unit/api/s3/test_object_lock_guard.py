@@ -97,14 +97,21 @@ def test_bucket_object_lock_subresource_does_not_trigger() -> None:
         ("x-amz-object-lock-legal-hold", "ON"),
     ],
 )
-def test_per_object_lock_headers_trigger_501(header_name: str, header_value: str) -> None:
+def test_per_object_lock_headers_no_longer_trigger(header_name: str, header_value: str) -> None:
+    """PutObject persists these onto the version it creates, so the guard must let them through.
+
+    Was a 501 assertion under Tier 0, when the alternative to refusing was silently DROPPING the
+    header and leaving the client believing its object was retained. A header only leaves the
+    guard once the write path genuinely honours it — see object_lock_endpoints.lock_for_new_version
+    and test_put_object_lock_headers.py, which pin that it is actually persisted.
+    """
     resp = maybe_object_lock_not_implemented_response(_make_request(headers={header_name: header_value}))
-    _assert_not_implemented(resp)
+    assert resp is None
 
 
-def test_per_object_lock_header_case_insensitive() -> None:
+def test_per_object_lock_header_case_insensitive_no_longer_triggers() -> None:
     resp = maybe_object_lock_not_implemented_response(_make_request(headers={"X-Amz-Object-Lock-Mode": "GOVERNANCE"}))
-    _assert_not_implemented(resp)
+    assert resp is None
 
 
 def test_bucket_object_lock_enabled_header_does_not_trigger() -> None:
@@ -124,8 +131,16 @@ def test_bypass_governance_header_alone_does_not_trigger() -> None:
 
 
 def test_error_body_has_request_id_and_host_id() -> None:
-    # Uses a header, since ?retention is implemented now and no longer produces this error.
-    resp = maybe_object_lock_not_implemented_response(_make_request(headers={"x-amz-object-lock-mode": "GOVERNANCE"}))
+    """Exercises the error builder directly.
+
+    Tier 2 implements every surface this guard used to trap, so no request reaches it today. The
+    builder is kept and tested because it is where the next genuinely-unimplemented Object Lock
+    surface (Batch Operations, the enable-on-existing-bucket token) gets refused, and an S3 error
+    missing RequestId/HostId breaks SDK error handling.
+    """
+    from hippius_s3.api.s3.object_lock_guard import _not_implemented
+
+    resp = _not_implemented()
     _assert_not_implemented(resp)
     root = ET.fromstring(resp.body)
     assert root.findtext("RequestId"), "missing RequestId in error XML"

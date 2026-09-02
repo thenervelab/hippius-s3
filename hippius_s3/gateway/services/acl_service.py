@@ -1,4 +1,6 @@
+import json
 import logging
+from typing import Any
 
 import asyncpg
 import redis.asyncio as redis
@@ -24,6 +26,26 @@ class BucketLookup(BaseModel):
     owner_id: str
     bucket_id: str
     is_cache_warm: bool
+    # Tier 1's bucket-level Object Lock config, carried here so the PUT path can apply a default
+    # retention without a second bucket read. This lookup is already Redis-cached per bucket name,
+    # so a default-retention bucket costs the write path nothing extra. None = Object Lock is not
+    # configured on this bucket, which is the overwhelmingly common case.
+    object_lock: dict[str, Any] | None = None
+
+
+def _coerce_object_lock(raw: Any) -> dict[str, Any] | None:
+    """asyncpg returns JSONB as a str unless a codec is registered; accept either shape."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
+    return None
 
 
 class ACLService:
@@ -150,7 +172,7 @@ class ACLService:
             return cached
 
         query = (
-            "SELECT main_account_id, bucket_id, is_cache_warm FROM buckets "
+            "SELECT main_account_id, bucket_id, is_cache_warm, object_lock FROM buckets "
             "WHERE bucket_name = $1 AND deleted_at IS NULL"
         )
         row = await self.acl_repo.db.fetchrow(query, bucket)
@@ -160,6 +182,9 @@ class ACLService:
             owner_id=str(row["main_account_id"]),
             bucket_id=str(row["bucket_id"]),
             is_cache_warm=bool(row["is_cache_warm"]),
+            # Tolerant read: a caller selecting a narrower column list must not break the ACL
+            # path, which every request goes through.
+            object_lock=_coerce_object_lock(row["object_lock"] if "object_lock" in row else None),
         )
 
         await self._cache_set_bucket_meta(bucket, lookup)
