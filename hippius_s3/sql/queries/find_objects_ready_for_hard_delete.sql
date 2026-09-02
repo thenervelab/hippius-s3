@@ -44,6 +44,22 @@ WITH candidates AS MATERIALIZED (
     WHERE deleted_at IS NOT NULL
       AND deleted_at < now() - INTERVAL '1 hour'  -- grace period
       AND (deleted_at, object_id) > ($2, $3)      -- keyset ring cursor
+      -- OBJECT LOCK (Tier 2): an object with ANY locked version is not a hard-delete candidate.
+      -- Hard delete drops the object row and cascades its versions, parts and chunk metadata, so
+      -- letting one through would destroy the record of a version we are contractually holding —
+      -- and would strand its backend bytes with nothing left pointing at them. Scoped to the whole
+      -- object rather than per version because the delete is object-granular.
+      --
+      -- Belt to the unpinner's braces: this ring only reaches objects whose chunk_backend rows are
+      -- already `deleted`, which the gate in get_chunk_backend_identifiers prevents for locked
+      -- versions. Both are here so neither is load-bearing alone.
+      AND NOT EXISTS (
+          SELECT 1
+          FROM object_versions ov
+          WHERE ov.object_id = objects.object_id
+            AND (ov.object_lock_legal_hold
+                 OR (ov.object_lock_retain_until IS NOT NULL AND ov.object_lock_retain_until > now()))
+      )
     ORDER BY deleted_at, object_id  -- keyset order; deleted_at range uses idx_objects_deleted
     LIMIT $1
 )
