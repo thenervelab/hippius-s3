@@ -264,6 +264,9 @@ async def handle_get_object_retention(bucket_id: Any, object_key: str, version_i
 async def handle_put_object_retention(
     bucket_id: Any, object_key: str, version_id: int | None, request: Request, db: Any, body: bytes
 ) -> Response:
+    if not bucket_lock_enabled(getattr(request.state, "bucket_object_lock", None)):
+        return bucket_lock_not_enabled_response()
+
     parsed, error = parse_retention_body(body)
     if error is not None:
         return error
@@ -320,6 +323,9 @@ async def handle_get_object_legal_hold(bucket_id: Any, object_key: str, version_
 async def handle_put_object_legal_hold(
     bucket_id: Any, object_key: str, version_id: int | None, request: Request, db: Any, body: bytes
 ) -> Response:
+    if not bucket_lock_enabled(getattr(request.state, "bucket_object_lock", None)):
+        return bucket_lock_not_enabled_response()
+
     on, error = parse_legal_hold_body(body)
     if error is not None:
         return error
@@ -347,6 +353,41 @@ async def handle_put_object_legal_hold(
     return Response(status_code=200)
 
 
+def bucket_default_lock_for_new_version(request: Request) -> tuple[str, datetime] | None:
+    """The bucket's DEFAULT retention, resolved to a concrete date for a version created now.
+
+    Split out of lock_for_new_version for the write paths that do NOT accept per-object lock
+    headers — CompleteMultipartUpload still answers 501 to those — but must still honour the
+    bucket's configured default. Returns None when the bucket has no default, which is the case
+    for every bucket that has not opted in.
+    """
+    config = getattr(request.state, "bucket_object_lock", None)
+    if not bucket_lock_enabled(config):
+        return None
+    return _bucket_default_retention(config)
+
+
+def bucket_lock_enabled(config: Any) -> bool:
+    """Whether this bucket opted in to Object Lock at all.
+
+    The gate for every per-object lock write. Without it a caller holding plain WRITE on any
+    bucket can pin an unreclaimable retention on it: COMPLIANCE has no bypass by design, and the
+    SQL gates then hold the unpinner, the reaper, the hard-delete ring and the ops scripts off
+    those bytes for the full retain-until — up to `object_lock_max_retention_days` (3650). The
+    bucket owner cannot undo it either. So opting a bucket in has to be a deliberate act by
+    someone who can configure the bucket, not a side effect of being able to upload to it.
+    """
+    return bool(isinstance(config, dict) and config.get("enabled"))
+
+
+def bucket_lock_not_enabled_response() -> Response:
+    return errors.s3_error_response(
+        "InvalidRequest",
+        "Bucket is missing Object Lock Configuration",
+        status_code=400,
+    )
+
+
 def lock_for_new_version(request: Request) -> tuple[str | None, datetime | None, bool] | Response | None:
     """The lock a freshly-created version should carry: (mode, retain_until, legal_hold).
 
@@ -367,6 +408,15 @@ def lock_for_new_version(request: Request) -> tuple[str | None, datetime | None,
             "InvalidArgument", "x-amz-object-lock-legal-hold must be ON or OFF.", status_code=400
         )
     legal_hold = hold_raw == "ON"
+
+    # Refuse lock intent on a bucket that never opted in, rather than dropping it. Silently
+    # ignoring these headers would be the failure object_lock_guard exists to prevent (the client
+    # believes the object is retained when it is not); honouring them lets plain WRITE create
+    # storage nobody can reclaim. Checked before parsing so the answer does not depend on whether
+    # the caller also got the date format right.
+    bucket_lock = getattr(request.state, "bucket_object_lock", None)
+    if (mode is not None or raw_until is not None or legal_hold) and not bucket_lock_enabled(bucket_lock):
+        return bucket_lock_not_enabled_response()
 
     if (mode is None) != (raw_until is None):
         return errors.s3_error_response(

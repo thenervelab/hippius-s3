@@ -32,6 +32,86 @@ def _request(headers: dict[str, str] | None = None, *, bucket_lock: dict[str, An
     )
 
 
+# The minimum bucket config that means "this bucket opted in to Object Lock, with no default
+# retention rule". Every explicit-header case needs it: lock headers are refused outright on a
+# bucket that never opted in, so passing them without this tests the refusal, not the parsing.
+LOCK_ENABLED: dict[str, Any] = {"enabled": True}
+
+
+def _enabled(headers: dict[str, str] | None = None) -> Any:
+    return _request(headers, bucket_lock=LOCK_ENABLED)
+
+
+class TestBucketMustHaveOptedIn:
+    """Lock headers on a bucket with no Object Lock configuration are REFUSED, not applied.
+
+    Honouring them would let any caller holding plain WRITE pin an unreclaimable retention on a
+    bucket that never opted in: COMPLIANCE has no bypass by design, and the SQL gates then hold
+    the unpinner, the reaper, the hard-delete ring and the ops scripts off those bytes for the
+    whole retain-until — up to 3650 days. Not even the bucket owner can undo it.
+
+    Refusing rather than silently dropping matters just as much: a client whose retention header
+    was ignored believes its object is protected when it is not.
+    """
+
+    @pytest.mark.parametrize(
+        "headers,why",
+        [
+            (
+                {
+                    "x-amz-object-lock-mode": "COMPLIANCE",
+                    "x-amz-object-lock-retain-until-date": "2036-01-01T00:00:00Z",
+                },
+                "COMPLIANCE retention — the unreclaimable one",
+            ),
+            (
+                {
+                    "x-amz-object-lock-mode": "GOVERNANCE",
+                    "x-amz-object-lock-retain-until-date": "2036-01-01T00:00:00Z",
+                },
+                "GOVERNANCE retention",
+            ),
+            ({"x-amz-object-lock-legal-hold": "ON"}, "legal hold alone is also a lock"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "config,label",
+        [
+            (None, "no config at all"),
+            ({}, "empty config"),
+            ({"enabled": False}, "explicitly not enabled"),
+            ({"enabled": False, "mode": "GOVERNANCE", "days": 30}, "disabled but carrying a stale rule"),
+        ],
+    )
+    def test_lock_headers_are_refused(
+        self, headers: dict[str, str], why: str, config: Any, label: str
+    ) -> None:
+        result = lock_for_new_version(_request(headers, bucket_lock=config))
+        assert isinstance(result, Response), f"{why} accepted on a bucket with {label}"
+        assert result.status_code == 400
+
+    def test_legal_hold_off_is_not_lock_intent(self) -> None:
+        """OFF asserts no protection, so it must not trip the gate on an ordinary bucket."""
+        assert lock_for_new_version(_request({"x-amz-object-lock-legal-hold": "OFF"})) is None
+
+    def test_ordinary_upload_to_an_ordinary_bucket_is_untouched(self) -> None:
+        """The gate must cost the overwhelmingly common path nothing."""
+        assert lock_for_new_version(_request()) is None
+
+    def test_enabled_bucket_still_accepts_the_headers(self) -> None:
+        """The other direction: opting in must actually work."""
+        result = lock_for_new_version(
+            _enabled(
+                {
+                    "x-amz-object-lock-mode": "COMPLIANCE",
+                    "x-amz-object-lock-retain-until-date": "2036-01-01T00:00:00Z",
+                }
+            )
+        )
+        assert not isinstance(result, Response)
+        assert result is not None and result[0] == "COMPLIANCE"
+
+
 class TestExplicitHeaders:
     def test_no_headers_and_no_bucket_default_applies_nothing(self) -> None:
         """The overwhelmingly common case, and the one that must cost the write path nothing."""
@@ -40,7 +120,7 @@ class TestExplicitHeaders:
     def test_mode_and_date_are_persisted(self) -> None:
         until = datetime.now(timezone.utc) + timedelta(days=30)
         result = lock_for_new_version(
-            _request(
+            _enabled(
                 {
                     "x-amz-object-lock-mode": "COMPLIANCE",
                     "x-amz-object-lock-retain-until-date": until.isoformat().replace("+00:00", "Z"),
@@ -56,7 +136,7 @@ class TestExplicitHeaders:
 
     def test_legal_hold_alone_is_a_lock(self) -> None:
         """A hold needs no retention — it is an independent protection."""
-        result = lock_for_new_version(_request({"x-amz-object-lock-legal-hold": "ON"}))
+        result = lock_for_new_version(_enabled({"x-amz-object-lock-legal-hold": "ON"}))
         assert result == (None, None, True)
 
     def test_legal_hold_off_alone_applies_nothing(self) -> None:
@@ -80,14 +160,14 @@ class TestExplicitHeaders:
     )
     def test_malformed_headers_are_rejected_not_ignored(self, headers: dict[str, str], why: str) -> None:
         """Rejection is the point: silently ignoring a malformed lock header is the Tier 0 bug."""
-        result = lock_for_new_version(_request(headers))
+        result = lock_for_new_version(_enabled(headers))
         assert isinstance(result, Response), why
         assert result.status_code == 400
 
     def test_retention_beyond_the_cap_is_rejected(self) -> None:
         far = datetime.now(timezone.utc) + timedelta(days=365 * 500)
         result = lock_for_new_version(
-            _request(
+            _enabled(
                 {
                     "x-amz-object-lock-mode": "COMPLIANCE",
                     "x-amz-object-lock-retain-until-date": far.isoformat().replace("+00:00", "Z"),
