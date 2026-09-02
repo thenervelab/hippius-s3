@@ -17,6 +17,9 @@ from hippius_s3.api.s3.copy_helpers import is_multipart_object
 from hippius_s3.api.s3.copy_helpers import parse_copy_source
 from hippius_s3.api.s3.copy_helpers import resolve_copy_resources
 from hippius_s3.api.s3.copy_helpers import should_use_v5_fast_path
+from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
+from hippius_s3.api.s3.objects.object_lock_endpoints import store_version_lock
+from hippius_s3.api.s3.objects.object_lock_endpoints import validate_lock_intent
 from hippius_s3.config import get_config
 from hippius_s3.repositories.objects import ObjectRepository
 from hippius_s3.services.copy_service_v5 import execute_v5_fast_path_copy
@@ -27,6 +30,45 @@ logger = logging.getLogger(__name__)
 config = get_config()
 
 
+async def _apply_lock_to_copy(
+    pool: asyncpg.Pool,
+    response: Response,
+    lock_intent: tuple[str | None, datetime | None, bool] | None,
+    dest_bucket_id: str,
+    object_key: str,
+) -> Response:
+    """Persist the destination copy's lock, once the copy itself has succeeded.
+
+    A copy creates a new object version, so AWS applies the same rules a PUT does: explicit
+    x-amz-object-lock-* headers, else the destination bucket's default retention. Without this a
+    copy into a compliance bucket landed completely unprotected, with a 200 and no signal — the
+    silent variant of the multipart gap, and arguably worse, since copying is often exactly how
+    data is moved INTO a locked bucket in the first place.
+
+    Applied after the copy rather than inside each of its three byte-copy paths: the version number
+    is only knowable once the destination row exists, and resolving it here keeps the v5 fast path,
+    the streaming fallback and the multipart fallback on one implementation instead of three.
+    """
+    if lock_intent is None or response.status_code != 200:
+        return response
+
+    dest = await ObjectRepository(pool).get_by_path(dest_bucket_id, object_key)
+    if dest is None:
+        logger.error("CopyObject: destination row missing after a successful copy; lock NOT applied")
+        return response
+
+    mode, retain_until, legal_hold = lock_intent
+    await store_version_lock(
+        pool,
+        object_id=str(dest["object_id"]),
+        object_version=int(dest["current_object_version"]),
+        mode=mode,
+        retain_until=retain_until,
+        legal_hold=legal_hold,
+    )
+    return response
+
+
 async def handle_copy_object(
     bucket_name: str,
     object_key: str,
@@ -35,6 +77,15 @@ async def handle_copy_object(
     redis_client: Any,
 ) -> Response:
     try:
+        # Refuse bad lock intent before any bytes move, for the same reason PutObject does: a 4xx
+        # returned after the destination is written leaves an unlocked copy behind, and an
+        # overwriting copy has already destroyed what was there.
+        lock_rejection = validate_lock_intent(request)
+        if lock_rejection is not None:
+            return lock_rejection
+        lock_intent = lock_for_new_version(request)
+        assert not isinstance(lock_intent, Response)  # validate_lock_intent already returned it
+
         source_bucket_name, source_object_key, source_version_id = parse_copy_source(
             request.headers.get("x-amz-copy-source")
         )
@@ -60,7 +111,17 @@ async def handle_copy_object(
         # that is the wrong content immediately (the caller asked for an older version), and it
         # would keep tracking the source afterwards, which no copy should do. Fall through to the
         # real byte copy, which snapshots the version that was asked for.
-        if source_version_id is None and str(source_bucket["bucket_id"]) == str(dest_bucket["bucket_id"]):
+        #
+        # A lock also disqualifies the alias. An alias is a second NAME on one object_id, not a new
+        # version, so there is no separate row to carry the copy's retention — writing one would
+        # apply it to the source as well, locking an object the caller never named. Falling through
+        # to a real byte copy gives the destination its own version, which is the only thing a
+        # per-version lock can attach to.
+        if (
+            lock_intent is None
+            and source_version_id is None
+            and str(source_bucket["bucket_id"]) == str(dest_bucket["bucket_id"])
+        ):
             aliased = await handle_same_bucket_copy(
                 pool,
                 dest_bucket_id=str(dest_bucket["bucket_id"]),
@@ -85,18 +146,24 @@ async def handle_copy_object(
         # crypto binding (bucket/object identifiers).
         if src_multipart:
             logger.info("CopyObject multipart source: forcing streaming fallback")
-            return await handle_streaming_copy(
-                pool=pool,
-                redis_client=redis_client,
-                request=request,
-                source_bucket=source_bucket,
-                dest_bucket=dest_bucket,
-                source_object=source_object,
-                src_obj_row=src_obj_row,
-                object_id=object_id,
-                object_key=object_key,
-                copy_created_at=copy_created_at,
-                config=config,
+            return await _apply_lock_to_copy(
+                pool,
+                await handle_streaming_copy(
+                    pool=pool,
+                    redis_client=redis_client,
+                    request=request,
+                    source_bucket=source_bucket,
+                    dest_bucket=dest_bucket,
+                    source_object=source_object,
+                    src_obj_row=src_obj_row,
+                    object_id=object_id,
+                    object_key=object_key,
+                    copy_created_at=copy_created_at,
+                    config=config,
+                ),
+                lock_intent,
+                str(dest_bucket["bucket_id"]),
+                object_key,
             )
 
         eligible, chunk_rows, reason = await should_use_v5_fast_path(
@@ -110,32 +177,44 @@ async def handle_copy_object(
         if eligible:
             assert chunk_rows is not None
             logger.info("CopyObject using v5 fast path (envelope rewrap + CID reuse)")
-            return await execute_v5_fast_path_copy(
-                db=pool,
+            return await _apply_lock_to_copy(
+                pool,
+                await execute_v5_fast_path_copy(
+                    db=pool,
+                    source_bucket=source_bucket,
+                    dest_bucket=dest_bucket,
+                    source_object=source_object,
+                    src_obj_row=src_obj_row,
+                    object_id=object_id,
+                    object_key=object_key,
+                    chunk_rows=chunk_rows,
+                    copy_created_at=copy_created_at,
+                    config=config,
+                ),
+                lock_intent,
+                str(dest_bucket["bucket_id"]),
+                object_key,
+            )
+
+        logger.info(f"CopyObject using streaming fallback: {reason}")
+        return await _apply_lock_to_copy(
+            pool,
+            await handle_streaming_copy(
+                pool=pool,
+                redis_client=redis_client,
+                request=request,
                 source_bucket=source_bucket,
                 dest_bucket=dest_bucket,
                 source_object=source_object,
                 src_obj_row=src_obj_row,
                 object_id=object_id,
                 object_key=object_key,
-                chunk_rows=chunk_rows,
                 copy_created_at=copy_created_at,
                 config=config,
-            )
-
-        logger.info(f"CopyObject using streaming fallback: {reason}")
-        return await handle_streaming_copy(
-            pool=pool,
-            redis_client=redis_client,
-            request=request,
-            source_bucket=source_bucket,
-            dest_bucket=dest_bucket,
-            source_object=source_object,
-            src_obj_row=src_obj_row,
-            object_id=object_id,
-            object_key=object_key,
-            copy_created_at=copy_created_at,
-            config=config,
+            ),
+            lock_intent,
+            str(dest_bucket["bucket_id"]),
+            object_key,
         )
     except errors.S3Error as e:
         return errors.s3_error_response(

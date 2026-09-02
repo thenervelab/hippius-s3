@@ -10,7 +10,7 @@ multipart.py already uses for the same row twenty lines earlier. Result:
 on every CreateMultipartUpload against a bucket carrying a default retention.
 
 The reason it reached a deployment is the part worth guarding. A lock-enabled bucket with NO
-default rule never reaches that code — `bucket_default_lock_for_new_version` returns None and the
+default rule never reaches that code — `lock_for_new_version` returns None and the
 whole block is skipped — so the unit suite, the e2e suite and every CI job stayed green. It was
 found only by re-running an acceptance probe against the deployed build.
 
