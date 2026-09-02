@@ -20,9 +20,6 @@ import pytest
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
 
-TIER2_REASON = "Tier 2 — Object Lock enforcement not implemented; see specs/s3-object-lock.md"
-
-
 def _error(exc: ClientError) -> tuple[int, str]:
     meta = exc.response.get("ResponseMetadata", {})
     status = int(meta.get("HTTPStatusCode", 0))
@@ -35,81 +32,83 @@ def _error(exc: ClientError) -> tuple[int, str]:
 # ---------------------------------------------------------------------------
 
 
-def test_put_object_retention_returns_not_implemented(
+def test_put_and_get_object_retention_round_trip(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
+    """Tier 2 implements these; they used to assert 501.
+
+    Retention needs a versioned bucket, which is why the bucket is created lock-enabled — that
+    turns versioning on implicitly, exactly as AWS does.
+    """
     bucket_name = unique_bucket_name("ret-put")
     cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name)
+    boto3_client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
     boto3_client.put_object(Bucket=bucket_name, Key="k", Body=b"x")
 
     retain_until = datetime.now(timezone.utc) + timedelta(days=1)
-    with pytest.raises(ClientError) as excinfo:
-        boto3_client.put_object_retention(
-            Bucket=bucket_name,
-            Key="k",
-            Retention={"Mode": "GOVERNANCE", "RetainUntilDate": retain_until},
-        )
+    boto3_client.put_object_retention(
+        Bucket=bucket_name,
+        Key="k",
+        Retention={"Mode": "GOVERNANCE", "RetainUntilDate": retain_until},
+    )
 
-    status, code = _error(excinfo.value)
-    assert status == 501, f"expected 501, got {status} (code={code})"
-    assert code == "NotImplemented"
+    got = boto3_client.get_object_retention(Bucket=bucket_name, Key="k")
+    assert got["Retention"]["Mode"] == "GOVERNANCE"
+    assert abs((got["Retention"]["RetainUntilDate"] - retain_until).total_seconds()) < 2
 
 
-def test_get_object_retention_returns_not_implemented(
+def test_get_object_retention_on_unlocked_object_is_404(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
+    """AWS distinguishes 'no retention on this object' from 'no such key'."""
     bucket_name = unique_bucket_name("ret-get")
     cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name)
+    boto3_client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
     boto3_client.put_object(Bucket=bucket_name, Key="k", Body=b"x")
 
     with pytest.raises(ClientError) as excinfo:
         boto3_client.get_object_retention(Bucket=bucket_name, Key="k")
-
     status, code = _error(excinfo.value)
-    assert status == 501
-    assert code == "NotImplemented"
+    assert status == 404, f"expected 404, got {status} (code={code})"
 
 
-def test_put_object_retention_with_version_id_returns_not_implemented(
+def test_put_object_retention_with_version_id_addresses_that_version(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
 ) -> None:
-    """The retention endpoint must 501 regardless of whether ?versionId is present."""
+    """A retention set on an OLD version must not leak onto the current one — locks are per
+    version, and applying one to the wrong version is both a false lock and a missing one."""
     bucket_name = unique_bucket_name("ret-ver")
     cleanup_buckets(bucket_name)
-    boto3_client.create_bucket(Bucket=bucket_name)
-    boto3_client.put_object(Bucket=bucket_name, Key="k", Body=b"x")
+    boto3_client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    first = boto3_client.put_object(Bucket=bucket_name, Key="k", Body=b"v1")
+    boto3_client.put_object(Bucket=bucket_name, Key="k", Body=b"v2")
 
     retain_until = datetime.now(timezone.utc) + timedelta(days=1)
+    boto3_client.put_object_retention(
+        Bucket=bucket_name,
+        Key="k",
+        VersionId=first["VersionId"],
+        Retention={"Mode": "GOVERNANCE", "RetainUntilDate": retain_until},
+    )
+
+    on_old = boto3_client.get_object_retention(Bucket=bucket_name, Key="k", VersionId=first["VersionId"])
+    assert on_old["Retention"]["Mode"] == "GOVERNANCE"
+
     with pytest.raises(ClientError) as excinfo:
-        boto3_client.put_object_retention(
-            Bucket=bucket_name,
-            Key="k",
-            VersionId="some-version",
-            Retention={"Mode": "GOVERNANCE", "RetainUntilDate": retain_until},
-        )
-
-    status, code = _error(excinfo.value)
-    assert status == 501
-    assert code == "NotImplemented"
+        boto3_client.get_object_retention(Bucket=bucket_name, Key="k")
+    status, _ = _error(excinfo.value)
+    assert status == 404, "the retention leaked onto the current version"
 
 
-# ---------------------------------------------------------------------------
-# Tier 2 — xfail until enforcement is implemented
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.xfail(strict=False, reason=TIER2_REASON)
 def test_tier2_put_with_compliance_then_delete_versioned_refused(
     docker_services: Any,
     boto3_client: Any,
@@ -138,7 +137,6 @@ def test_tier2_put_with_compliance_then_delete_versioned_refused(
     assert code == "AccessDenied"
 
 
-@pytest.mark.xfail(strict=False, reason=TIER2_REASON)
 def test_tier2_governance_bypass_succeeds_with_header(
     docker_services: Any,
     boto3_client: Any,
@@ -167,7 +165,6 @@ def test_tier2_governance_bypass_succeeds_with_header(
     )
 
 
-@pytest.mark.xfail(strict=False, reason=TIER2_REASON)
 def test_tier2_compliance_cannot_be_bypassed(
     docker_services: Any,
     boto3_client: Any,
@@ -199,7 +196,6 @@ def test_tier2_compliance_cannot_be_bypassed(
     assert status == 403
 
 
-@pytest.mark.xfail(strict=False, reason=TIER2_REASON)
 def test_tier2_unversioned_delete_creates_marker_locked_version_remains(
     docker_services: Any,
     boto3_client: Any,
@@ -228,7 +224,6 @@ def test_tier2_unversioned_delete_creates_marker_locked_version_remains(
     assert got["Body"].read() == b"original"
 
 
-@pytest.mark.xfail(strict=False, reason=TIER2_REASON)
 def test_tier2_object_retention_roundtrip(
     docker_services: Any,
     boto3_client: Any,
@@ -251,7 +246,6 @@ def test_tier2_object_retention_roundtrip(
     assert got["Retention"]["Mode"] == "GOVERNANCE"
 
 
-@pytest.mark.xfail(strict=False, reason=TIER2_REASON)
 def test_tier2_default_bucket_retention_applied_on_put(
     docker_services: Any,
     boto3_client: Any,
@@ -276,7 +270,6 @@ def test_tier2_default_bucket_retention_applied_on_put(
     assert head.get("ObjectLockRetainUntilDate") is not None
 
 
-@pytest.mark.xfail(strict=False, reason=TIER2_REASON)
 def test_tier2_object_lock_headers_echoed_on_head_object(
     docker_services: Any,
     boto3_client: Any,
@@ -301,7 +294,6 @@ def test_tier2_object_lock_headers_echoed_on_head_object(
     assert head["ObjectLockRetainUntilDate"] is not None
 
 
-@pytest.mark.xfail(strict=False, reason=TIER2_REASON)
 def test_tier2_object_lock_requires_versioning(
     docker_services: Any,
     boto3_client: Any,

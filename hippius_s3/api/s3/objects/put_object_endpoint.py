@@ -19,6 +19,8 @@ from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.extensions.append import handle_append
+from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
+from hippius_s3.api.s3.objects.object_lock_endpoints import store_version_lock
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.monitoring import get_metrics_collector
@@ -182,6 +184,26 @@ async def handle_put_object(
                     "returned_size_bytes": put_res.size_bytes,
                 },
             )
+
+        # OBJECT LOCK: apply the version's lock before anything can delete it. Explicit
+        # x-amz-object-lock-* headers win over the bucket's default retention, per AWS; a bucket
+        # default is a duration, so its retain-until is computed from this version's creation.
+        # Applied AFTER the write so it lands on the version that actually exists, and before the
+        # response, so a client that got a 200 knows the lock is real.
+        lock_intent = lock_for_new_version(request)
+        if isinstance(lock_intent, Response):
+            return lock_intent
+        if lock_intent is not None:
+            lock_mode, lock_until, lock_hold = lock_intent
+            async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
+                await store_version_lock(
+                    conn,
+                    object_id=str(put_res.object_id),
+                    object_version=int(put_res.object_version),
+                    mode=lock_mode,
+                    retain_until=lock_until,
+                    legal_hold=lock_hold,
+                )
 
         logger.info(f"PUT {bucket_name}/{object_key}: size={put_res.size_bytes}, md5={put_res.etag}")
 

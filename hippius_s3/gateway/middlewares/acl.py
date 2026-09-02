@@ -258,11 +258,15 @@ async def acl_middleware(
             bucket_owner_id = lookup.owner_id
             bucket_id = lookup.bucket_id
             request.state.bucket_is_cache_warm = lookup.is_cache_warm
+            # Tier 1's Object Lock config, so PutObject can apply a bucket default retention to the
+            # version it creates without a second bucket read on the write path.
+            request.state.bucket_object_lock = lookup.object_lock
             request.state.bucket_owner_id = bucket_owner_id
             # Forwarded to the API so it can skip its own get_bucket_by_name lookup.
             request.state.bucket_id = bucket_id
         else:
             request.state.bucket_is_cache_warm = False
+            request.state.bucket_object_lock = None
 
     # Bucket-owner suspension check (issue #421). The suspension_middleware already
     # covers requests authenticated AS the suspended account, so skip the lookup when the

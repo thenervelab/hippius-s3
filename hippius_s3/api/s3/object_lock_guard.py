@@ -30,7 +30,24 @@ _NOT_IMPLEMENTED_MESSAGE: Final[str] = (
     "See specs/s3-object-lock.md."
 )
 
-_QUERY_SUBRESOURCES: Final[frozenset[str]] = frozenset({"retention", "legal-hold"})
+# Tier 2 implements ?retention and ?legal-hold, so they no longer trip this guard — the router
+# dispatches them to real handlers. The per-object x-amz-object-lock-* HEADERS on PUT are likewise
+# implemented and removed below. What remains 501 is the surface still genuinely unbuilt.
+_QUERY_SUBRESOURCES: Final[frozenset[str]] = frozenset()
+# Implemented: PutObject now persists these onto the version it creates (see
+# object_lock_endpoints.lock_for_new_version). This set only ever loses a header once the write
+# path genuinely honours it — accepting lock intent and dropping it silently is worse than the 501
+# it replaces, and is the precise failure Tier 0 exists to prevent.
+# Per-object lock headers, refused on the paths that do NOT yet honour them.
+#
+# PutObject persists them (object_lock_endpoints.lock_for_new_version) and passes
+# object_lock_headers_supported=True. CreateMultipartUpload does NOT: carrying a lock named at
+# initiate through to the version that appears at completion needs the intent stored on
+# multipart_uploads, which is a schema change and its own increment. Until then MPU keeps the 501.
+#
+# A header stops being refused on a path only once that path genuinely honours it. Accepting lock
+# intent and dropping it is worse than the 501 it replaces — the client believes its object is
+# retained when it is not, which is exactly what this guard exists to prevent.
 _OBJECT_LOCK_HEADERS: Final[frozenset[str]] = frozenset(
     {
         "x-amz-object-lock-mode",
@@ -40,7 +57,9 @@ _OBJECT_LOCK_HEADERS: Final[frozenset[str]] = frozenset(
 )
 
 
-def maybe_object_lock_not_implemented_response(request: Request) -> Response | None:
+def maybe_object_lock_not_implemented_response(
+    request: Request, *, object_lock_headers_supported: bool = False
+) -> Response | None:
     """Return a 501 NotImplemented S3 XML error if the request touches Tier 2 surface.
 
     Detected signals:
@@ -59,9 +78,10 @@ def maybe_object_lock_not_implemented_response(request: Request) -> Response | N
     if any(name in request.query_params for name in _QUERY_SUBRESOURCES):
         return _not_implemented()
 
-    for header in _OBJECT_LOCK_HEADERS:
-        if request.headers.get(header):
-            return _not_implemented()
+    if not object_lock_headers_supported:
+        for header in _OBJECT_LOCK_HEADERS:
+            if request.headers.get(header):
+                return _not_implemented()
 
     return None
 

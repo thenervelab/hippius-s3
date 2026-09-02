@@ -1,0 +1,457 @@
+"""Per-object Object Lock: `?retention` and `?legal-hold` (Tier 2).
+
+These are the operations that let a lock actually be SET. Everything else in Tier 2 — the unpin
+gate, the hard-delete gate, the delete-path 403 — is enforcement of what these write.
+
+Mutation rules, straight from the AWS guide, because they are the whole security model:
+
+- **COMPLIANCE is immutable.** Its mode cannot be changed and its period cannot be shortened, by
+  anyone, including the account root. Only extension is allowed.
+- **GOVERNANCE can be weakened**, but only by a caller holding both the bypass permission and the
+  explicit header. Extending never needs a bypass.
+- **A legal hold** is freely settable and removable by anyone who may write the lock. It is not a
+  retention mode and the governance bypass does not apply to it.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
+from typing import Any
+from typing import Final
+
+from fastapi import Request
+from fastapi import Response
+
+from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.object_lock_enforcement import COMPLIANCE
+from hippius_s3.api.s3.object_lock_enforcement import GOVERNANCE
+from hippius_s3.api.s3.object_lock_enforcement import may_bypass_governance
+from hippius_s3.api.s3.object_lock_enforcement import request_is_bucket_owner
+from hippius_s3.config import get_config
+from hippius_s3.utils import get_query
+from hippius_s3.xml_helpers import add_subelement
+from hippius_s3.xml_helpers import create_element
+from hippius_s3.xml_helpers import parse_untrusted_xml
+from hippius_s3.xml_helpers import to_xml_bytes
+
+
+logger = logging.getLogger(__name__)
+
+_S3_NS: Final[str] = "http://s3.amazonaws.com/doc/2006-03-01/"
+_VALID_MODES: Final[frozenset[str]] = frozenset({GOVERNANCE, COMPLIANCE})
+
+
+def _local(node: Any) -> str:
+    """Tag name without its namespace, so both namespaced and bare bodies parse."""
+    tag = str(node.tag)
+    return tag.rsplit("}", 1)[-1]
+
+
+def _find(root: Any, name: str) -> Any:
+    for child in root:
+        if _local(child) == name:
+            return child
+    return None
+
+
+def _malformed(message: str = "The XML you provided was not well-formed or did not validate.") -> Response:
+    return errors.s3_error_response("MalformedXML", message, status_code=400)
+
+
+def parse_retention_body(body: bytes) -> tuple[dict[str, Any] | None, Response | None]:
+    """Parse `<Retention><Mode/><RetainUntilDate/></Retention>`.
+
+    An EMPTY body is not the same as an absent one: AWS uses an empty `Retention` element to clear
+    a retention, which only GOVERNANCE-with-bypass may do, so it must reach the caller as a
+    parsed intent rather than a parse error.
+    """
+    if not body:
+        return None, _malformed("Request body is required.")
+    try:
+        root = parse_untrusted_xml(body)
+    except ValueError:
+        return None, _malformed()
+    if _local(root) != "Retention":
+        return None, _malformed("Expected a Retention element.")
+
+    mode_node = _find(root, "Mode")
+    date_node = _find(root, "RetainUntilDate")
+    mode = (mode_node.text or "").strip() if mode_node is not None else None
+    raw_date = (date_node.text or "").strip() if date_node is not None else None
+
+    if (mode is None) != (raw_date is None):
+        return None, _malformed("Mode and RetainUntilDate must be supplied together.")
+    if mode is None:
+        return {"mode": None, "retain_until": None}, None  # explicit clear
+    if mode not in _VALID_MODES:
+        return None, _malformed(f"Mode must be one of {sorted(_VALID_MODES)}.")
+
+    try:
+        # AWS emits RFC3339/ISO-8601, commonly with a trailing Z that fromisoformat rejects on
+        # older Pythons; normalise it rather than depending on the interpreter version.
+        parsed = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
+    except ValueError:
+        return None, _malformed("RetainUntilDate must be an ISO-8601 timestamp.")
+    if parsed.tzinfo is None:
+        # A naive timestamp compared against an aware `now()` raises at enforcement time, which
+        # would turn a malformed request into a 500 on the DELETE path much later. Assume UTC.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    # Cap the horizon. A COMPLIANCE lock cannot be shortened by anyone, so an unbounded
+    # RetainUntilDate lets one request create storage this platform can never reclaim and must
+    # keep paying for — the team decision on COMPLIANCE mode records this cap as the only bound
+    # that exists, since there is no bucket-policy condition key here to express it.
+    max_days = get_config().object_lock_max_retention_days
+    if parsed > datetime.now(timezone.utc) + timedelta(days=max_days):
+        return None, errors.s3_error_response(
+            "InvalidArgument",
+            f"RetainUntilDate is further than {max_days} days out, the maximum retention this service accepts.",
+            status_code=400,
+        )
+    return {"mode": mode, "retain_until": parsed}, None
+
+
+def parse_legal_hold_body(body: bytes) -> tuple[bool | None, Response | None]:
+    """Parse `<LegalHold><Status>ON|OFF</Status></LegalHold>`."""
+    if not body:
+        return None, _malformed("Request body is required.")
+    try:
+        root = parse_untrusted_xml(body)
+    except ValueError:
+        return None, _malformed()
+    if _local(root) != "LegalHold":
+        return None, _malformed("Expected a LegalHold element.")
+    status_node = _find(root, "Status")
+    status = (status_node.text or "").strip().upper() if status_node is not None else ""
+    if status not in {"ON", "OFF"}:
+        return None, _malformed("Status must be ON or OFF.")
+    return status == "ON", None
+
+
+def retention_to_xml(mode: str, retain_until: datetime) -> bytes:
+    root = create_element("Retention", xmlns=_S3_NS)
+    add_subelement(root, "Mode", mode)
+    # AWS renders millisecond precision with a Z suffix.
+    add_subelement(root, "RetainUntilDate", retain_until.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"))
+    return to_xml_bytes(root)
+
+
+def legal_hold_to_xml(on: bool) -> bytes:
+    root = create_element("LegalHold", xmlns=_S3_NS)
+    add_subelement(root, "Status", "ON" if on else "OFF")
+    return to_xml_bytes(root)
+
+
+def validate_retention_transition(
+    *,
+    current_mode: str | None,
+    current_until: datetime | None,
+    new_mode: str | None,
+    new_until: datetime | None,
+    is_bucket_owner: bool,
+    headers: Any,
+    now: datetime | None = None,
+) -> Response | None:
+    """Whether this retention change is permitted. Returns an error Response, or None to allow.
+
+    Only reached once the caller is already authorised to write the lock; this is the WORM rule
+    layer on top of that.
+    """
+    now = now or datetime.now(timezone.utc)
+    active = current_until is not None and current_until > now
+
+    if not active:
+        return None  # no live retention: any new one may be set
+
+    if current_mode == COMPLIANCE:
+        # Immutable while live: no mode change, no shortening, no clearing. Extension only.
+        if new_until is None or new_mode != COMPLIANCE:
+            return errors.s3_error_response(
+                "AccessDenied",
+                "A COMPLIANCE-mode retention cannot be removed or changed before it expires.",
+                status_code=403,
+            )
+        if new_until < current_until:
+            return errors.s3_error_response(
+                "AccessDenied",
+                "A COMPLIANCE-mode retention period can be extended but never shortened.",
+                status_code=403,
+            )
+        return None
+
+    if current_mode == GOVERNANCE:
+        weakening = new_until is None or new_until < current_until or new_mode != GOVERNANCE
+        if weakening and not may_bypass_governance(is_bucket_owner=is_bucket_owner, headers=headers):
+            return errors.s3_error_response(
+                "AccessDenied",
+                "Shortening or removing a GOVERNANCE-mode retention requires the bucket owner to "
+                "send x-amz-bypass-governance-retention: true.",
+                status_code=403,
+            )
+        return None
+
+    # A live retention whose mode we do not recognise: refuse rather than let it be overwritten.
+    return errors.s3_error_response(
+        "AccessDenied",
+        "This object version carries an unrecognised retention mode and cannot be modified.",
+        status_code=403,
+    )
+
+
+async def load_version_lock(db: Any, *, object_id: str, object_version: int) -> Any:
+    return await db.fetchrow(get_query("get_object_version_lock"), object_id, object_version)
+
+
+async def store_version_lock(
+    db: Any,
+    *,
+    object_id: str,
+    object_version: int,
+    mode: str | None,
+    retain_until: datetime | None,
+    legal_hold: bool | None,
+) -> None:
+    """Persist lock state. `legal_hold=None` leaves the hold untouched, which is what lets the
+    retention and legal-hold endpoints write independently without clobbering each other."""
+    await db.execute(
+        get_query("set_object_version_lock"),
+        object_id,
+        object_version,
+        mode,
+        retain_until,
+        legal_hold,
+    )
+
+
+async def _resolve_version(
+    db: Any, *, bucket_id: Any, object_key: str, version_id: int | None
+) -> tuple[str, int] | None:
+    """(object_id, object_version) for the addressed version, or the current one. None if absent."""
+    row = await db.fetchrow(get_query("get_object_version_for_lock"), bucket_id, object_key, version_id)
+    if row is None or row["object_version"] is None:
+        return None
+    return str(row["object_id"]), int(row["object_version"])
+
+
+def _no_such_key(object_key: str) -> Response:
+    return errors.s3_error_response("NoSuchKey", "The specified key does not exist.", status_code=404, Key=object_key)
+
+
+async def handle_get_object_retention(bucket_id: Any, object_key: str, version_id: int | None, db: Any) -> Response:
+    resolved = await _resolve_version(db, bucket_id=bucket_id, object_key=object_key, version_id=version_id)
+    if resolved is None:
+        return _no_such_key(object_key)
+    object_id, object_version = resolved
+    row = await load_version_lock(db, object_id=object_id, object_version=object_version)
+    if row is None or row["object_lock_mode"] is None:
+        # AWS's specific code for "the object has no retention", distinct from NoSuchKey.
+        return errors.s3_error_response(
+            "NoSuchObjectLockConfiguration",
+            "The specified object does not have an ObjectLock configuration.",
+            status_code=404,
+            Key=object_key,
+        )
+    return Response(
+        content=retention_to_xml(str(row["object_lock_mode"]), row["object_lock_retain_until"]),
+        media_type="application/xml",
+        status_code=200,
+    )
+
+
+async def handle_put_object_retention(
+    bucket_id: Any, object_key: str, version_id: int | None, request: Request, db: Any, body: bytes
+) -> Response:
+    parsed, error = parse_retention_body(body)
+    if error is not None:
+        return error
+    assert parsed is not None
+
+    resolved = await _resolve_version(db, bucket_id=bucket_id, object_key=object_key, version_id=version_id)
+    if resolved is None:
+        return _no_such_key(object_key)
+    object_id, object_version = resolved
+
+    current = await load_version_lock(db, object_id=object_id, object_version=object_version)
+    if current is None:
+        return _no_such_key(object_key)
+
+    refusal = validate_retention_transition(
+        current_mode=current["object_lock_mode"],
+        current_until=current["object_lock_retain_until"],
+        new_mode=parsed["mode"],
+        new_until=parsed["retain_until"],
+        is_bucket_owner=request_is_bucket_owner(request),
+        headers=request.headers,
+    )
+    if refusal is not None:
+        return refusal
+
+    # legal_hold=None leaves any hold untouched: the two protections are independent and this
+    # endpoint owns only the retention half.
+    await store_version_lock(
+        db,
+        object_id=object_id,
+        object_version=object_version,
+        mode=parsed["mode"],
+        retain_until=parsed["retain_until"],
+        legal_hold=None,
+    )
+    return Response(status_code=200)
+
+
+async def handle_get_object_legal_hold(bucket_id: Any, object_key: str, version_id: int | None, db: Any) -> Response:
+    resolved = await _resolve_version(db, bucket_id=bucket_id, object_key=object_key, version_id=version_id)
+    if resolved is None:
+        return _no_such_key(object_key)
+    object_id, object_version = resolved
+    row = await load_version_lock(db, object_id=object_id, object_version=object_version)
+    if row is None:
+        return _no_such_key(object_key)
+    return Response(
+        content=legal_hold_to_xml(bool(row["object_lock_legal_hold"])),
+        media_type="application/xml",
+        status_code=200,
+    )
+
+
+async def handle_put_object_legal_hold(
+    bucket_id: Any, object_key: str, version_id: int | None, request: Request, db: Any, body: bytes
+) -> Response:
+    on, error = parse_legal_hold_body(body)
+    if error is not None:
+        return error
+
+    resolved = await _resolve_version(db, bucket_id=bucket_id, object_key=object_key, version_id=version_id)
+    if resolved is None:
+        return _no_such_key(object_key)
+    object_id, object_version = resolved
+
+    current = await load_version_lock(db, object_id=object_id, object_version=object_version)
+    if current is None:
+        return _no_such_key(object_key)
+
+    # Retention is passed through unchanged: a legal hold must never clear or alter one. AWS lets
+    # any holder of PutObjectLegalHold remove a hold — there is no bypass and no COMPLIANCE
+    # equivalent here, because a hold has no retention mode.
+    await store_version_lock(
+        db,
+        object_id=object_id,
+        object_version=object_version,
+        mode=current["object_lock_mode"],
+        retain_until=current["object_lock_retain_until"],
+        legal_hold=bool(on),
+    )
+    return Response(status_code=200)
+
+
+def lock_for_new_version(request: Request) -> tuple[str | None, datetime | None, bool] | Response | None:
+    """The lock a freshly-created version should carry: (mode, retain_until, legal_hold).
+
+    Returns None when there is nothing to apply — the overwhelmingly common case, and the one that
+    must cost the write path nothing.
+
+    Precedence follows AWS: explicit per-object `x-amz-object-lock-*` headers OVERRIDE the bucket's
+    default retention. A bucket default is a duration, so the retain-until date is computed from
+    the moment the version is created, per object.
+    """
+    headers = request.headers
+    mode = (headers.get("x-amz-object-lock-mode") or "").strip().upper() or None
+    raw_until = (headers.get("x-amz-object-lock-retain-until-date") or "").strip() or None
+    hold_raw = (headers.get("x-amz-object-lock-legal-hold") or "").strip().upper() or None
+
+    if hold_raw is not None and hold_raw not in {"ON", "OFF"}:
+        return errors.s3_error_response(
+            "InvalidArgument", "x-amz-object-lock-legal-hold must be ON or OFF.", status_code=400
+        )
+    legal_hold = hold_raw == "ON"
+
+    if (mode is None) != (raw_until is None):
+        return errors.s3_error_response(
+            "InvalidArgument",
+            "x-amz-object-lock-mode and x-amz-object-lock-retain-until-date must be supplied together.",
+            status_code=400,
+        )
+
+    if mode is not None:
+        if mode not in _VALID_MODES:
+            return errors.s3_error_response(
+                "InvalidArgument", f"x-amz-object-lock-mode must be one of {sorted(_VALID_MODES)}.", status_code=400
+            )
+        parsed, err = _parse_retain_until(str(raw_until))
+        if err is not None:
+            return err
+        return mode, parsed, legal_hold
+
+    # No explicit retention on the request: fall back to the bucket default, if any.
+    default = _bucket_default_retention(getattr(request.state, "bucket_object_lock", None))
+    if default is None:
+        return (None, None, legal_hold) if legal_hold else None
+    default_mode, until = default
+    return default_mode, until, legal_hold
+
+
+def _bucket_default_retention(config: Any) -> tuple[str, datetime] | None:
+    """Turn Tier 1's stored bucket config into a concrete retain-until for a version created now.
+
+    This is what finally makes the Tier 1 configuration mean something: without it the bucket
+    reports a default retention that is never applied to anything.
+    """
+    if not isinstance(config, dict) or not config.get("enabled"):
+        return None
+    mode = str(config.get("mode") or "").upper()
+    if mode not in _VALID_MODES:
+        return None
+    days = config.get("days")
+    years = config.get("years")
+    if days is None and years is None:
+        return None
+    delta = timedelta(days=int(days)) if days is not None else timedelta(days=365 * int(years))
+    return mode, datetime.now(timezone.utc) + delta
+
+
+def _parse_retain_until(raw: str) -> tuple[datetime | None, Response | None]:
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None, errors.s3_error_response(
+            "InvalidArgument", "x-amz-object-lock-retain-until-date must be ISO-8601.", status_code=400
+        )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    max_days = get_config().object_lock_max_retention_days
+    if parsed > datetime.now(timezone.utc) + timedelta(days=max_days):
+        return None, errors.s3_error_response(
+            "InvalidArgument",
+            f"x-amz-object-lock-retain-until-date is further than {max_days} days out.",
+            status_code=400,
+        )
+    return parsed, None
+
+
+async def lock_response_headers(db: Any, *, object_id: Any, object_version: int) -> dict[str, str]:
+    """The x-amz-object-lock-* headers AWS returns on GET/HEAD of a locked version.
+
+    Without these a client cannot see that its object is protected — and, more concretely, a
+    default retention applied from the bucket configuration is invisible, so the bucket looks
+    configured while every object looks unlocked. Returns an empty dict for an unlocked version,
+    which is the common case and adds no headers.
+    """
+    row = await load_version_lock(db, object_id=str(object_id), object_version=int(object_version))
+    if row is None:
+        return {}
+    headers: dict[str, str] = {}
+    mode = row["object_lock_mode"]
+    retain_until = row["object_lock_retain_until"]
+    if mode and retain_until is not None:
+        headers["x-amz-object-lock-mode"] = str(mode)
+        headers["x-amz-object-lock-retain-until-date"] = (
+            retain_until.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+    # AWS reports the hold as ON/OFF whenever Object Lock applies to the object. Emitted only when
+    # ON: a bare OFF on every object in the account would be noise, and its absence means the same.
+    if row["object_lock_legal_hold"]:
+        headers["x-amz-object-lock-legal-hold"] = "ON"
+    return headers

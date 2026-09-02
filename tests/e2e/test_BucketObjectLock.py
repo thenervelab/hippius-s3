@@ -39,7 +39,7 @@ def _error(exc: ClientError) -> tuple[int, str]:
         ("x-amz-object-lock-legal-hold", "ON"),
     ],
 )
-def test_put_object_with_object_lock_headers_returns_not_implemented(
+def test_put_object_with_incomplete_object_lock_headers_is_rejected(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
@@ -47,8 +47,15 @@ def test_put_object_with_object_lock_headers_returns_not_implemented(
     header_name: str,
     header_value: str,
 ) -> None:
-    """PutObject carrying any x-amz-object-lock-* header must 501 — otherwise the
-    client believes the lock was applied when it was silently ignored.
+    """Tier 2 HONOURS these headers, so the 501 is gone — but each one alone is still incomplete.
+
+    `x-amz-object-lock-mode` and `-retain-until-date` are meaningless apart and must be supplied
+    together, so either alone is a 400. `-legal-hold: ON` alone IS complete and is accepted; it is
+    covered by the round-trip test below rather than here.
+
+    The important property is unchanged from Tier 0: a lock header is never silently ignored. It
+    is now either applied or refused, and refusing with the wrong status is the only regression
+    this test can still catch.
     """
     bucket_name = unique_bucket_name("ol-put-obj")
     cleanup_buckets(bucket_name)
@@ -59,14 +66,18 @@ def test_put_object_with_object_lock_headers_returns_not_implemented(
 
     boto3_client.meta.events.register("before-sign.s3.PutObject", _inject_header)
     try:
+        if header_name == "x-amz-object-lock-legal-hold":
+            # Complete on its own: a hold needs no retention. Must SUCCEED.
+            boto3_client.put_object(Bucket=bucket_name, Key="held-key", Body=b"hello")
+            return
         with pytest.raises(ClientError) as excinfo:
             boto3_client.put_object(Bucket=bucket_name, Key="locked-key", Body=b"hello")
     finally:
         boto3_client.meta.events.unregister("before-sign.s3.PutObject", _inject_header)
 
     status, code = _error(excinfo.value)
-    assert status == 501, f"{header_name} should yield 501, got {status} (code={code})"
-    assert code == "NotImplemented"
+    assert status == 400, f"{header_name} alone should yield 400, got {status} (code={code})"
+    assert code == "InvalidArgument"
 
 
 @pytest.mark.parametrize(

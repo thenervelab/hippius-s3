@@ -10,6 +10,8 @@ from opentelemetry import trace
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.common import parse_version_id
+from hippius_s3.api.s3.object_lock_enforcement import deletion_refusal_reason
+from hippius_s3.api.s3.object_lock_enforcement import request_is_bucket_owner
 from hippius_s3.api.s3.object_names import drop_s3_name
 from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.config import get_config
@@ -95,6 +97,26 @@ async def delete_object_version(
         object_id = str(row["object_id"])
         is_delete_marker = bool(row["is_delete_marker"])
         was_current = int(row["current_object_version"]) == version_id
+
+        # OBJECT LOCK: a permanent delete of a locked version is refused with 403, per AWS. The
+        # check sits inside the FOR UPDATE taken above, so a hold committed concurrently cannot
+        # slip between the read and the delete. Only the ?versionId form is refused — a
+        # versionId-less DELETE writes a delete marker and is always allowed (handled by the
+        # caller), which is the half implementations usually get backwards.
+        refusal = deletion_refusal_reason(
+            row,
+            is_bucket_owner=request_is_bucket_owner(request),
+            headers=request.headers,
+        )
+        if refusal is not None:
+            logger.info("Refusing versioned DELETE of locked object %s v%s: %s", object_id, version_id, refusal)
+            return errors.s3_error_response(
+                "AccessDenied",
+                "Access Denied",
+                status_code=403,
+                Key=object_key,
+                VersionId=str(version_id),
+            )
 
         # A same-bucket CopyObject attaches a second S3 key to ONE object_id — the v5 AAD binds the
         # id, so a copy cannot mint a new one. Versions therefore belong to the object, not to the
@@ -235,6 +257,33 @@ async def handle_delete_object(
         if bucket["versioning_status"] == "Enabled":
             with tracer.start_as_current_span("delete_object.insert_delete_marker"):
                 return await insert_delete_marker(bucket_id, object_key, db)
+
+        # OBJECT LOCK: this branch soft-deletes the WHOLE object, taking every version with it, so
+        # a locked version would become unreachable even though its bytes survive (the unpin gate
+        # keeps those). Refuse instead.
+        #
+        # Only reachable on an UNVERSIONED bucket — the versioning-enabled branch above writes a
+        # delete marker, which is additive and always allowed. AWS requires versioning for Object
+        # Lock, so a lock here means something already went wrong upstream; failing closed is the
+        # answer that cannot lose access to retained data.
+        # fetchrow, not fetchval: the repo's db doubles and pooled connections all implement
+        # fetchrow, and this runs on the ordinary delete path.
+        locked_row = await db.fetchrow(get_query("count_locked_versions"), bucket_id, object_key)
+        locked_here = int(locked_row["locked_count"] or 0) if locked_row is not None else 0
+        if locked_here > 0:
+            logger.info(
+                "Refusing whole-object DELETE of %s/%s: %s live version(s) under Object Lock",
+                bucket_name,
+                object_key,
+                locked_here,
+            )
+            return errors.s3_error_response(
+                "AccessDenied",
+                "Access Denied",
+                status_code=403,
+                BucketName=bucket_name,
+                Key=object_key,
+            )
 
         # HD-78: no existence pre-check — soft_delete_object's RETURNING already distinguishes
         # absent/already-deleted (both → idempotent 204 below), so the pre-check was a wasted read.

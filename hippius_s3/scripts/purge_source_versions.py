@@ -72,13 +72,29 @@ async def main_async(args: argparse.Namespace) -> int:
                                 cid=str(cid),
                             ),
                         )
-                # Delete parts and the object_versions row
+                # Delete parts and the object_versions row.
+                #
+                # OBJECT LOCK: the WHERE clause carries the lock predicate because this script
+                # issues raw SQL and therefore bypasses BOTH gates that protect the API and worker
+                # paths, namely the unpin resolution query and the hard-delete ring. An
+                # ops script is exactly where a WORM guarantee gets quietly broken, and the team
+                # decision on COMPLIANCE mode names this script specifically. Skipping rather than
+                # failing keeps a bulk purge useful: everything unlocked is still reclaimed, and
+                # the count logged below shows what was held back.
                 await db.execute(
                     """
-                    WITH del_parts AS (
-                        DELETE FROM parts WHERE object_id = $1 AND object_version = $2 RETURNING 1
+                    WITH locked AS (
+                        SELECT 1 FROM object_versions
+                        WHERE object_id = $1 AND object_version = $2
+                          AND (object_lock_legal_hold
+                               OR (object_lock_retain_until IS NOT NULL
+                                   AND object_lock_retain_until > now()))
+                    ), del_parts AS (
+                        DELETE FROM parts WHERE object_id = $1 AND object_version = $2
+                          AND NOT EXISTS (SELECT 1 FROM locked) RETURNING 1
                     ), del_ver AS (
-                        DELETE FROM object_versions WHERE object_id = $1 AND object_version = $2 RETURNING 1
+                        DELETE FROM object_versions WHERE object_id = $1 AND object_version = $2
+                          AND NOT EXISTS (SELECT 1 FROM locked) RETURNING 1
                     )
                     SELECT 1
                     """,

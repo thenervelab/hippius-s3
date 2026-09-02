@@ -67,14 +67,20 @@ def test_unrelated_query_params_pass_through() -> None:
 
 
 @pytest.mark.parametrize("subresource", ["retention", "legal-hold"])
-def test_tier2_query_subresources_trigger_501(subresource: str) -> None:
+def test_tier2_query_subresources_no_longer_trigger(subresource: str) -> None:
+    """Tier 2 implements ?retention and ?legal-hold, so the guard must let them reach the router.
+
+    Was a 501 assertion under Tier 0. Flipping it is the point of the feature — but the guard must
+    only stop trapping a surface once a real handler exists, or the request is silently ignored
+    instead, which is worse than the 501 it replaced.
+    """
     resp = maybe_object_lock_not_implemented_response(_make_request(query={subresource: ""}))
-    _assert_not_implemented(resp)
+    assert resp is None
 
 
-def test_retention_with_version_id_triggers_501() -> None:
+def test_retention_with_version_id_no_longer_triggers() -> None:
     resp = maybe_object_lock_not_implemented_response(_make_request(query={"retention": "", "versionId": "v1"}))
-    _assert_not_implemented(resp)
+    assert resp is None
 
 
 def test_bucket_object_lock_subresource_does_not_trigger() -> None:
@@ -91,12 +97,35 @@ def test_bucket_object_lock_subresource_does_not_trigger() -> None:
         ("x-amz-object-lock-legal-hold", "ON"),
     ],
 )
-def test_per_object_lock_headers_trigger_501(header_name: str, header_value: str) -> None:
+def test_per_object_lock_headers_still_501_where_unsupported(header_name: str, header_value: str) -> None:
+    """The guard is PER PATH: refused by default, allowed only where the caller honours them.
+
+    CreateMultipartUpload does not yet carry a lock from initiate through to the version that
+    appears at completion, so it keeps the 501 rather than accepting the header and dropping it.
+    """
     resp = maybe_object_lock_not_implemented_response(_make_request(headers={header_name: header_value}))
     _assert_not_implemented(resp)
 
 
-def test_per_object_lock_header_case_insensitive() -> None:
+@pytest.mark.parametrize(
+    "header_name,header_value",
+    [
+        ("x-amz-object-lock-mode", "GOVERNANCE"),
+        ("x-amz-object-lock-retain-until-date", "2099-01-01T00:00:00Z"),
+        ("x-amz-object-lock-legal-hold", "ON"),
+    ],
+)
+def test_per_object_lock_headers_pass_where_supported(header_name: str, header_value: str) -> None:
+    """PutObject persists them, so it opts in and the guard must let them through — otherwise the
+    implemented feature is unreachable. Pinned in both directions because the opt-in is a single
+    keyword argument at one call site and silently losing it re-breaks PutObject."""
+    resp = maybe_object_lock_not_implemented_response(
+        _make_request(headers={header_name: header_value}), object_lock_headers_supported=True
+    )
+    assert resp is None
+
+
+def test_per_object_lock_header_case_insensitive_still_501_where_unsupported() -> None:
     resp = maybe_object_lock_not_implemented_response(_make_request(headers={"X-Amz-Object-Lock-Mode": "GOVERNANCE"}))
     _assert_not_implemented(resp)
 
@@ -118,7 +147,16 @@ def test_bypass_governance_header_alone_does_not_trigger() -> None:
 
 
 def test_error_body_has_request_id_and_host_id() -> None:
-    resp = maybe_object_lock_not_implemented_response(_make_request(query={"retention": ""}))
+    """Exercises the error builder directly.
+
+    Tier 2 implements every surface this guard used to trap, so no request reaches it today. The
+    builder is kept and tested because it is where the next genuinely-unimplemented Object Lock
+    surface (Batch Operations, the enable-on-existing-bucket token) gets refused, and an S3 error
+    missing RequestId/HostId breaks SDK error handling.
+    """
+    from hippius_s3.api.s3.object_lock_guard import _not_implemented
+
+    resp = _not_implemented()
     _assert_not_implemented(resp)
     root = ET.fromstring(resp.body)
     assert root.findtext("RequestId"), "missing RequestId in error XML"
