@@ -184,7 +184,7 @@ class ACLService:
             is_cache_warm=bool(row["is_cache_warm"]),
             # Tolerant read: a caller selecting a narrower column list must not break the ACL
             # path, which every request goes through.
-            object_lock=_coerce_object_lock(row["object_lock"] if "object_lock" in row else None),
+            object_lock=_coerce_object_lock(row.get("object_lock")),
         )
 
         await self._cache_set_bucket_meta(bucket, lookup)
