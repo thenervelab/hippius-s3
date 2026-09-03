@@ -1,9 +1,17 @@
 # Spec: S3 Object Lock
 
-Status: Tier 0 and Tier 1 implemented. Tier 2 is designed and has contract tests
-(`xfail`), but no implementation yet. Drives compatibility with
-`aws s3api put-object-lock-configuration` and the surrounding Object Lock APIs from the
-AWS S3 surface.
+Status: **fully implemented and in production since 2026-09-02.** Tiers 0-2 are all shipped —
+bucket configuration, per-version retention and legal hold, delete enforcement, and the SQL
+durability gates that make the guarantee hold with no API code running. The Tier 2 contract tests
+that were `xfail` placeholders now pass; the `xfail` markers are gone.
+
+Behaviour is documented for operators in `docs/s3-compatibility.md` (Object Lock section) and for
+users at https://docs.hippius.com/storage/s3/object-lock. Both were verified against production
+rather than derived from this spec, so where they disagree with this document, they are right and
+this one is stale.
+
+Drives compatibility with `aws s3api put-object-lock-configuration` and the surrounding Object Lock
+APIs from the AWS S3 surface.
 
 ---
 
