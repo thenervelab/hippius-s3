@@ -185,3 +185,45 @@ async def test_a_stamp_is_counted_so_the_write_rate_is_visible(monkeypatch) -> N
     failing = ReadRecencyRecorder(FakePool(fail=True), "node-a")
     await failing(OBJ, 1, 9)
     assert seen == ["written", "failed"], "a swallowed failure is still counted, under its own outcome"
+
+
+# ------------------------------------------------------------------------ touch_parts (bulk stamp)
+
+
+@pytest.mark.asyncio
+async def test_touch_parts_issues_one_node_scoped_update_for_all_parts() -> None:
+    """A multi-part read stamps every part in ONE statement, not one round trip per part."""
+    pool = FakePool()
+    await ReadRecencyRecorder(pool, "node-a").touch_parts(OBJ, 3, [1, 2, 3])
+
+    assert len(pool.executed) == 1
+    sql, args = pool.executed[0]
+    assert "last_read_at = now()" in sql
+    assert "node_id = $1" in sql, "the update must be node-scoped"
+    assert "part_number = ANY($4::int[])" in sql
+    assert args == ("node-a", OBJ, 3, [1, 2, 3])
+
+
+@pytest.mark.asyncio
+async def test_touch_parts_sends_only_the_parts_the_memo_has_not_seen() -> None:
+    """The bulk stamp shares the per-chunk sampler's memo, so a part the store just stamped is
+    left out of the array — and once every part is memoised nothing is written at all."""
+    pool = FakePool()
+    recorder = ReadRecencyRecorder(pool, "node-a")
+
+    await recorder(OBJ, 1, 2)
+    await recorder.touch_parts(OBJ, 1, [1, 2, 3])
+    assert len(pool.executed) == 2
+    assert pool.executed[1][1] == ("node-a", OBJ, 1, [1, 3])
+
+    await recorder.touch_parts(OBJ, 1, [1, 2, 3])
+    assert len(pool.executed) == 2, "every part inside the window costs no write"
+
+    # And the bulk stamp memoises for the per-chunk path in turn.
+    await recorder(OBJ, 1, 3)
+    assert len(pool.executed) == 2
+
+
+@pytest.mark.asyncio
+async def test_touch_parts_db_outage_never_reaches_the_caller() -> None:
+    await ReadRecencyRecorder(FakePool(fail=True), "node-a").touch_parts(OBJ, 1, [1, 2])

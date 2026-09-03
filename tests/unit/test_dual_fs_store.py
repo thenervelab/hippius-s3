@@ -254,3 +254,40 @@ async def test_read_local_chunk_serves_a_local_part(tmp_path) -> None:
     await _write_part(dual, part_number=1, chunk=b"on-ssd")
 
     assert await dual.read_local_chunk(OBJ, 1, 1, 0) == b"on-ssd"
+
+
+@pytest.mark.asyncio
+async def test_read_local_chunk_never_consults_the_peer(tmp_path) -> None:
+    """The recency-stamping override must keep the base method's tier rule: primary only.
+
+    A peer that asked another peer would let two nodes bounce a request between them; a
+    peer that read the pool would put a network hop in front of the read the tier avoids.
+    """
+    peer_calls: list[tuple] = []
+
+    async def _peer(*args: object) -> bytes | None:
+        peer_calls.append(args)
+        return b"from-peer"
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), peer_fetch=_peer)
+    await _write_part(dual.fallback, part_number=1, chunk=b"pool-only")
+
+    assert await dual.read_local_chunk(OBJ, 1, 1, 0) is None
+    assert peer_calls == [], "a peer serve must never fan out to another peer"
+
+
+@pytest.mark.asyncio
+async def test_read_local_chunk_stamps_recency_only_on_a_local_hit(tmp_path) -> None:
+    seen: list[tuple] = []
+
+    async def on_local_read(*args: object) -> None:
+        seen.append(args)
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), on_local_read=on_local_read)
+    await _write_part(dual.fallback, part_number=1, chunk=b"pool-only")
+    assert await dual.read_local_chunk(OBJ, 1, 1, 0) is None
+    assert seen == []
+
+    await _write_part(dual, part_number=1, chunk=b"on-ssd")
+    assert await dual.read_local_chunk(OBJ, 1, 1, 0) == b"on-ssd"
+    assert seen == [(OBJ, 1, 1)]

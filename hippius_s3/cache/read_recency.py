@@ -101,6 +101,49 @@ class ReadRecencyRecorder:
                 exc,
             )
 
+    async def touch_parts(self, object_id: str, object_version: int, part_numbers: list[int]) -> None:
+        """Stamp every un-sampled part of one object in a single node-scoped UPDATE.
+
+        For a multi-part read the per-chunk stamp in `get_chunk` only reaches a part when its
+        first chunk streams, which for a long stream can be minutes after the request started —
+        long enough for the evictor to take the tail parts of the very object being read. One
+        statement up front costs one round trip regardless of part count, and shares the memo so
+        the parts the per-chunk path just stamped are not written twice.
+        """
+        oid = str(object_id)
+        version = int(object_version)
+        pending: list[int] = []
+        for part_number in part_numbers:
+            key = (oid, version, int(part_number))
+            if self._recent.get(key) is not None:
+                continue
+            self._recent.put(key, True)
+            pending.append(int(part_number))
+        if not pending:
+            return
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE cephor_ssd_residency SET last_read_at = now()
+                    WHERE node_id = $1 AND object_id = $2 AND version = $3 AND part_number = ANY($4::int[])
+                    """,
+                    self._node_id,
+                    oid,
+                    version,
+                    pending,
+                )
+            _record_write("written")
+        except Exception as exc:  # noqa: BLE001 - a bookkeeping stamp must never fail its caller
+            _record_write("failed")
+            logger.debug(
+                "recording read recency failed for %s v%s parts %s: %s",
+                object_id,
+                object_version,
+                pending,
+                exc,
+            )
+
 
 def create_read_recency_recorder(pool: Optional[asyncpg.Pool], node_id: str) -> Optional[ReadRecencyRecorder]:
     """A recorder, or `None` when this process cannot attribute a read to a node.

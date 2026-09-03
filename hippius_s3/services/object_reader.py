@@ -25,6 +25,7 @@ from fastapi.responses import StreamingResponse
 from hippius_s3.api.s3.common import build_headers
 from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.cache.notifier import ChunkNotReadyError
+from hippius_s3.cache.read_recency import get_read_recency_recorder
 from hippius_s3.config import get_config
 from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import PartChunkSpec
@@ -414,6 +415,17 @@ async def read_response(
         address=address,
         parts=parts,
     )
+    # Stamp every part of a multi-part read as used NOW, while this request still owns `db` (the
+    # recorder uses its own pool, but the module rule stands: no DB work from inside the body).
+    # The per-chunk stamp in the store only reaches a part when its first chunk streams, and on a
+    # long stream that can be minutes later — after the evictor has already ranked the tail parts
+    # of this very object as its coldest. Single-part reads are covered by the per-chunk stamp.
+    plan_parts = sorted(
+        {int(getattr(item, "part_number", 0)) for item in ctx.plan if getattr(item, "part_number", None) is not None}
+    )
+    recorder = get_read_recency_recorder()
+    if recorder is not None and len(plan_parts) > 1:
+        await recorder.touch_parts(str(info["object_id"]), int(ctx.object_version), plan_parts)
     gen = stream_plan(
         obj_cache=obj_cache,
         object_id=info["object_id"],
