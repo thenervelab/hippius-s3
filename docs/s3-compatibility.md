@@ -288,14 +288,6 @@ object, and pinning locked objects in NVMe would fill the cache for no durabilit
 S3 Batch Operations (no retroactive holds), replication of lock state, `POST Object`, and
 suspending versioning on a lock-enabled bucket (`501`, as in AWS).
 
-### Known gap
-
-Under **concurrent multipart uploads to the same key**, `upload_part` resolves the version from the
-live `objects` pointer rather than the upload's own reservation, so interleaved MPUs can land parts
-on a different version than the one carrying the lock — the completed object is then unlocked, with
-a 200. Pre-existing, and unlikely outside deliberately concurrent same-key writes, but it means the
-MPU path's guarantee is not yet airtight. Tracked separately from this matrix.
-
 ## Known divergences from AWS S3
 
 - **Object keys may not contain `?` or `#`.** AWS permits both. Requests naming such a key are
