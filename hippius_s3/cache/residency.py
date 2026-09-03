@@ -59,6 +59,18 @@ def _record_release_failure() -> None:
         pass
 
 
+def _record_drop_failure() -> None:
+    """Count a version drop that failed. Never let observability break an abort."""
+    try:
+        from hippius_s3.monitoring import get_metrics_collector
+
+        collector = get_metrics_collector()
+        if collector is not None:
+            collector.record_residency_drop_failure()
+    except Exception:  # noqa: BLE001 - a metrics failure must not fail an abort
+        pass
+
+
 class ResidencyRecorder:
     """Claims promoted parts for this node so its evictor owns them."""
 
@@ -157,6 +169,41 @@ class ResidencyRecorder:
                 object_version,
                 part_number,
                 size_bytes,
+                exc,
+            )
+
+    async def drop_version(self, object_id: str, object_version: int) -> None:
+        """Forget every part of a version whose directory this node just removed. Best-effort.
+
+        Node-scoped, mirroring the drain's `drop_residency`: the caller unlinked THIS node's
+        copy only, so only this node's rows describe bytes that are gone. A peer's row for the
+        same version still names a real directory on the peer's disk, and deleting it would leave
+        that copy with no owner — exactly the unreclaimable-leak this table exists to prevent.
+        The rows themselves are not dangerous while they linger (the evictor only walks
+        `replicated` parts, and an aborted version is `failed`), but they count toward
+        node_cache_bytes, so the allocator would steer on bytes the disk no longer holds.
+        """
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    DELETE FROM cephor_ssd_residency
+                    WHERE node_id = $1 AND object_id = $2 AND version = $3
+                    """,
+                    self._node_id,
+                    str(object_id),
+                    int(object_version),
+                )
+        except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError) as exc:
+            # Never raises: the directory is already gone and the abort has already succeeded
+            # from the client's point of view. A leftover row is bounded harm — the drain's
+            # failed-part reclaim deletes the version's residency rows fleet-wide when it
+            # reaches them — but until then it is phantom bytes in node_cache_bytes, so count it.
+            _record_drop_failure()
+            logger.warning(
+                "dropping residency rows for %s v%s failed (rows stay accounted until reclaim): %s",
+                object_id,
+                object_version,
                 exc,
             )
 

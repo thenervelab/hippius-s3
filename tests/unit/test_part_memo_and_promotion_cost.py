@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 
+import asyncpg
 import pytest
 
 from hippius_s3.cache.dual_fs_store import DualFileSystemPartsStore
@@ -249,3 +250,34 @@ async def test_the_release_statement_subtracts_the_claimed_bytes_with_a_zero_flo
         f"the release no longer subtracts, or lost its floor: {normalised}"
     )
     assert pool.executed[0] == ("node-a", OBJ, 1, 1, 4096), "the release must target exactly the claimed key"
+
+
+@pytest.mark.asyncio
+async def test_drop_version_deletes_only_this_nodes_rows_for_that_version() -> None:
+    """AbortMultipartUpload removes the version directory from THIS node's SSD, so the rows
+    that must go are this node's and no other's: a peer's row for the same version still names
+    a directory on the peer's disk, and deleting it would leave that copy unowned by the
+    node-scoped evictor. Pinned on the SQL text and the bound parameters because `drop_version`
+    swallows DB errors by design, so a statement Postgres rejects would pass a mocked suite.
+    """
+    pool = FakePool()
+    await ResidencyRecorder(pool, "node-a").drop_version(OBJ, 3)
+
+    normalised = " ".join(pool.statements[0].split())
+    assert normalised.startswith("DELETE FROM cephor_ssd_residency"), normalised
+    assert "node_id = $1" in normalised, "the delete must be node-scoped"
+    assert "object_id = $2" in normalised and "version = $3" in normalised, normalised
+    assert "part_number" not in normalised, "every part of the version goes, not one"
+    assert pool.executed[0] == ("node-a", OBJ, 3)
+
+
+@pytest.mark.asyncio
+async def test_drop_version_never_raises_when_the_db_is_down() -> None:
+    """The directory is already gone when this runs; a DB fault must not turn a completed
+    abort into a 500. The leftover rows are reclaimed later by the drain's failed-part reclaim."""
+
+    class _DownPool:
+        def acquire(self):  # noqa: ANN201 - async context manager double
+            raise asyncpg.InterfaceError("pool is closed")
+
+    await ResidencyRecorder(_DownPool(), "node-a").drop_version(OBJ, 3)

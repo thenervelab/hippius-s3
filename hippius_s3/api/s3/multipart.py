@@ -33,6 +33,7 @@ from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
 from hippius_s3.api.s3.objects.object_lock_endpoints import store_version_lock
 from hippius_s3.api.s3.objects.object_lock_endpoints import validate_lock_intent
 from hippius_s3.cache import RedisObjectPartsCache
+from hippius_s3.cache.peers import get_active_registry
 from hippius_s3.config import get_config
 from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.monitoring import get_metrics_collector
@@ -985,12 +986,14 @@ async def abort_multipart_upload(
         object_version = int(version_row["object_version"]) if version_row else None
 
         # Clean up Redis keys for cached parts (meta + chunks) — only for our own version.
+        part_numbers: list[int] = []
         if object_version is not None:
             parts = await db.fetch(
                 get_query("list_parts_for_version"),
                 object_id,
                 object_version,
             )
+            part_numbers = [int(part["part_number"]) for part in parts]
             if parts:
                 redis_client = request.app.state.redis_client
                 delegate = RedisObjectPartsCache(redis_client)
@@ -1053,6 +1056,20 @@ async def abort_multipart_upload(
         if object_version is not None:
             with contextlib.suppress(Exception):
                 await request.app.state.fs_store.delete_object(str(object_id), int(object_version))
+            # The rmtree above leaves two records pointing at a directory that no longer exists:
+            # this node's cephor_ssd_residency rows (phantom bytes in node_cache_bytes) and the
+            # fresh-part hints (a peer GET routed here for the rest of their TTL). With haproxy
+            # locality hashing the abort lands on the node that ingested the parts, so this is
+            # the common case and both are cleaned here. A pre-cutover upload's parts live on
+            # OTHER nodes; their rows and directories are the drain's failed-part reclaim's
+            # (after CEPHOR_RECLAIM_GRACE_SECS) — the mark above is what makes them eligible.
+            # Both never raise; ordered after the delete so a failure here can never orphan bytes.
+            residency_recorder = getattr(request.app.state, "residency_recorder", None)
+            if residency_recorder is not None:
+                await residency_recorder.drop_version(str(object_id), int(object_version))
+            registry = get_active_registry()
+            if registry is not None:
+                await registry.forget_parts(str(object_id), int(object_version), part_numbers)
 
         # Mark aborted in Redis so listings immediately hide this upload (defensive against read lag)
         with contextlib.suppress(Exception):

@@ -227,6 +227,16 @@ class MetricsCollector:
             unit="1",
         )
 
+        # An aborted MPU's directory was removed from this node's SSD but its residency rows
+        # could not be. Each one is phantom bytes in node_cache_bytes until the drain's
+        # failed-part reclaim deletes them, so a sustained rate means the allocator is steering
+        # on a figure the disk does not hold.
+        self.residency_drop_failures = self.meter.create_counter(
+            name="residency_drop_failures_total",
+            description="Aborted-version residency rows left in place because the delete failed",
+            unit="1",
+        )
+
         # A landed-part announcement the api could not hand to redis-queues. This MUST be
         # alertable rather than a log line, because the announcement is the only trigger for the
         # B-2 divergence check: the reconciler tallies an already-`replicated` part as an orphan
@@ -712,6 +722,10 @@ class MetricsCollector:
         """Count a claim whose compensating decrement failed, leaving phantom bytes accounted."""
         self.residency_release_failures.add(1)
 
+    def record_residency_drop_failure(self) -> None:
+        """Count an aborted version whose residency rows outlived its directory on this node."""
+        self.residency_drop_failures.add(1)
+
     def record_landed_announce_failure(self, outcome: LandedAnnounceOutcome) -> None:
         """Count one announcement that did not reach the queue. `outcome` is a Literal."""
         self.landed_announce_failures.add(1, attributes={"outcome": outcome})
@@ -1002,6 +1016,9 @@ class NullMetricsCollector:
         pass
 
     def record_residency_release_failure(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_residency_drop_failure(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_landed_announce_failure(self, *args: object, **kwargs: object) -> None:
