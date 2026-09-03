@@ -12,12 +12,12 @@ Notes:
 | Action                                          | Supported | Notes                                                       | Endpoint(s)                                   | Test                                                                 |
 | ----------------------------------------------- | --------- | ----------------------------------------------------------- | --------------------------------------------- | -------------------------------------------------------------------- |
 | AbortMultipartUpload                            | ✔         | Aborts upload and cleans up                                 | DELETE /{bucket}/{key}?uploadId=...           | test_AbortMultipartUpload.py                                         |
-| CompleteMultipartUpload                         | ✔         | Computes combined ETag                                      | POST /{bucket}/{key}?uploadId=...             | test_CompleteMultipartUpload.py                                      |
-| CopyObject                                      | ✔         | Via x-amz-copy-source header                                | PUT /{bucket}/{key}                           | test_CopyObject.py, test_CopyObject_CrossBucket.py                   |
+| CompleteMultipartUpload                         | ✔         | Computes combined ETag; 501 on x-amz-object-lock-\* (set at initiate) | POST /{bucket}/{key}?uploadId=...     | test_CompleteMultipartUpload.py, test_ObjectLockCopyAndMpu.py         |
+| CopyObject                                      | ✔         | Via x-amz-copy-source; honours lock headers + dest bucket default | PUT /{bucket}/{key}                     | test_CopyObject.py, test_CopyObject_CrossBucket.py, test_ObjectLockCopyAndMpu.py |
 | CreateBucket                                    | ✔         | Rejects x-amz-acl with InvalidBucketAclWithObjectOwnership; honours x-amz-bucket-object-lock-enabled | PUT /{bucket}                  | test_CreateBucket.py, test_BucketObjectLock.py                       |
 | CreateBucketMetadataConfiguration               |           |                                                             |                                               |                                                                      |
 | CreateBucketMetadataTableConfiguration          |           |                                                             |                                               |                                                                      |
-| CreateMultipartUpload                           | ✔         | Initiate multipart upload                                   | POST /{bucket}/{key}?uploads                  | test_CreateMultipartUpload.py                                        |
+| CreateMultipartUpload                           | ✔         | Honours x-amz-object-lock-\*; lock is fixed on the reserved version | POST /{bucket}/{key}?uploads          | test_CreateMultipartUpload.py, test_ObjectLockCopyAndMpu.py           |
 | CreateSession                                   |           |                                                             |                                               |                                                                      |
 | DeleteBucket                                    | ✔         | 404 if missing; 204 on success; 409 if non-empty            | DELETE /{bucket}                              | test_DeleteBucket.py                                                 |
 | DeleteBucketAnalyticsConfiguration              |           |                                                             |                                               |                                                                      |
@@ -62,17 +62,17 @@ Notes:
 | GetBucketTagging                                | ✔         | XML response                                                | GET /{bucket}?tagging                         | test_BucketTagging.py                                                |
 | GetBucketVersioning                             | ✔         | Returns Status=Enabled; omits Status when never enabled     | GET /{bucket}?versioning                      | test_BucketVersioning.py                                             |
 | GetBucketWebsite                                |           |                                                             |                                               |                                                                      |
-| GetObject                                       | ✔         | Supports Range; If-None-Match (304); S3-like headers        | GET /{bucket}/{key}                           | test_GetObject.py, test_GetObject_Range.py, test_GetObject_Errors.py |
+| GetObject                                       | ✔         | Range; If-None-Match (304); does NOT echo x-amz-object-lock-\* (use HEAD) | GET /{bucket}/{key}             | test_GetObject.py, test_GetObject_Range.py, test_GetObject_Errors.py |
 | GetObjectAcl                                    | ✔         | ACL XML response via gateway                                | GET /{bucket}/{key}?acl                       | test_acl_access_keys_minio.py                                        |
 | GetObjectAttributes                             |           |                                                             |                                               |                                                                      |
-| GetObjectLegalHold                              | 501       | NotImplemented (Tier 0); see specs/s3-object-lock.md         | GET /{bucket}/{key}?legal-hold                | test_ObjectLegalHold.py                                              |
-| GetObjectLockConfiguration                      | ✔         | Tier 1: returns persisted config; 404 ObjectLockConfigurationNotFoundError when unset | GET /{bucket}?object-lock      | test_BucketObjectLock.py                                             |
-| GetObjectRetention                              | 501       | NotImplemented (Tier 0); see specs/s3-object-lock.md         | GET /{bucket}/{key}?retention                 | test_ObjectRetention.py                                              |
+| GetObjectLegalHold                              | ✔         | Per-version hold status; independent of retention           | GET /{bucket}/{key}?legal-hold                | test_ObjectLegalHold.py                                              |
+| GetObjectLockConfiguration                      | ✔         | Returns persisted config; 404 ObjectLockConfigurationNotFoundError when unset | GET /{bucket}?object-lock      | test_BucketObjectLock.py                                             |
+| GetObjectRetention                              | ✔         | Per-version mode + retain-until                             | GET /{bucket}/{key}?retention                 | test_ObjectRetention.py                                              |
 | GetObjectTagging                                | ✔         | XML response                                                | GET /{bucket}/{key}?tagging                   | test_ObjectTagging.py                                                |
 | GetObjectTorrent                                |           |                                                             |                                               |                                                                      |
 | GetPublicAccessBlock                            |           |                                                             |                                               |                                                                      |
 | HeadBucket                                      | ✔         | 200 if exists, 404 if not (empty body)                      | HEAD /{bucket}                                | test_CreateBucket.py                                                 |
-| HeadObject                                      | ✔         | Metadata headers (size, content type, ETag, version); If-None-Match (304) | HEAD /{bucket}/{key}                          | test_HeadObject.py, test_HeadObject_Pending.py                       |
+| HeadObject                                      | ✔         | Metadata headers; If-None-Match (304); echoes x-amz-object-lock-\* | HEAD /{bucket}/{key}                     | test_HeadObject.py, test_HeadObject_Pending.py                       |
 | ListBucketAnalyticsConfigurations               |           |                                                             |                                               |                                                                      |
 | ListBucketIntelligentTieringConfigurations      |           |                                                             |                                               |                                                                      |
 | ListBucketInventoryConfigurations               |           |                                                             |                                               |                                                                      |
@@ -104,11 +104,11 @@ Notes:
 | PutBucketTagging                                | ✔         | XML request                                                 | PUT /{bucket}?tagging                         | test_BucketTagging.py                                                |
 | PutBucketVersioning                             | ✔         | Status=Enabled only; Suspended returns 501                  | PUT /{bucket}?versioning                      | test_BucketVersioning.py                                             |
 | PutBucketWebsite                                |           |                                                             |                                               |                                                                      |
-| PutObject                                       | ✔         | MD5 as ETag; x-amz-meta-\*                                  | PUT /{bucket}/{key}                           | test_PutObject.py, test_PutObject_Metadata.py                        |
+| PutObject                                       | ✔         | MD5 as ETag; x-amz-meta-\*; honours x-amz-object-lock-\*     | PUT /{bucket}/{key}                           | test_PutObject.py, test_PutObject_Metadata.py, test_ObjectRetention.py |
 | PutObjectAcl                                    | ✔         | Supports canned ACLs, grant headers, or ACL XML             | PUT /{bucket}/{key}?acl                       | test_acl_access_keys_minio.py                                        |
-| PutObjectLegalHold                              | 501       | NotImplemented (Tier 0); see specs/s3-object-lock.md         | PUT /{bucket}/{key}?legal-hold                | test_ObjectLegalHold.py                                              |
-| PutObjectLockConfiguration                      | ✔         | Tier 1: persisted, not enforced (no WORM yet); see specs/s3-object-lock.md | PUT /{bucket}?object-lock        | test_BucketObjectLock.py                                             |
-| PutObjectRetention                              | 501       | NotImplemented (Tier 0); see specs/s3-object-lock.md         | PUT /{bucket}/{key}?retention                 | test_ObjectRetention.py                                              |
+| PutObjectLegalHold                              | ✔         | ON/OFF; 400 InvalidRequest if the bucket has no lock config | PUT /{bucket}/{key}?legal-hold                | test_ObjectLegalHold.py                                              |
+| PutObjectLockConfiguration                      | ✔         | Default retention (Days or Years); ENFORCED. 409 InvalidBucketState if unversioned | PUT /{bucket}?object-lock  | test_BucketObjectLock.py                                             |
+| PutObjectRetention                              | ✔         | Extend allowed; shorten/clear refused 403 while live        | PUT /{bucket}/{key}?retention                 | test_ObjectRetention.py                                              |
 | PutObjectTagging                                | ✔         | XML request                                                 | PUT /{bucket}/{key}?tagging                   | test_ObjectTagging.py                                                |
 | PutPublicAccessBlock                            |           |                                                             |                                               |                                                                      |
 | RenameObject                                    |           |                                                             |                                               |                                                                      |
@@ -237,6 +237,64 @@ Notes:
   - `x-hippius-source`: `cache` or `pipeline` (diagnostic; indicates serving source)
   - `X-Hippius-Arion-File-Hash`: Arion backend file hash or `pending`
   - `x-amz-meta-append-version`: current append version (when applicable)
+
+## Object Lock (WORM)
+
+Fully enforced as of 2026-09-02. The behaviours below were verified against production, not
+inferred from the code — the probe output is in the release notes for that train.
+
+**Enforcement is below the API.** The predicate that decides "is this version locked" is embedded in
+`get_chunk_backend_identifiers.sql` (the single chokepoint every backend deletion flows through),
+`find_objects_ready_for_hard_delete.sql` and `find_versions_ready_for_reap.sql`. It therefore holds
+with no API code running, including for the ops scripts (`nuke_user`, `purge_buckets`,
+`delete_legacy_object_versions`). Gating in the handlers alone would have left those able to walk
+straight past it. `hippius_s3/api/s3/object_lock_enforcement.py` is the Python mirror, and a test
+asserts the two agree.
+
+Deliberately NOT gated: the FS/Ceph cache janitor. Evicting a cached chunk removes a copy, not the
+object, and pinning locked objects in NVMe would fill the cache for no durability gain.
+
+### Semantics
+
+| Rule | Behaviour |
+|---|---|
+| Versioning | Hard prerequisite. `CreateBucket --object-lock-enabled-for-bucket` enables it implicitly; `PUT ?object-lock` on an unversioned bucket is `409 InvalidBucketState` |
+| Retention vs legal hold | Independent. Either alone locks the version; an expired retention with a live hold is still locked |
+| `DELETE ?versionId` on a locked version | `403 AccessDenied` |
+| `DELETE` with no versionId | Succeeds, writes a delete marker; the locked version survives beneath it |
+| `DeleteObjects` | Per key. The locked key returns `AccessDenied` under `<Error>`; its neighbours delete normally |
+| Overwrite of a locked key | Allowed — creates a new version |
+| COMPLIANCE | Cannot be shortened, cleared, mode-changed or bypassed by anyone. Extension only |
+| GOVERNANCE bypass | Bucket owner AND `x-amz-bypass-governance-retention: true`. Both halves required |
+| Lock headers on a non-opted bucket | `400 InvalidRequest` — refused, never silently dropped |
+| Retention cap | `HIPPIUS_OBJECT_LOCK_MAX_RETENTION_DAYS`, default 3650 |
+
+### Divergences from AWS
+
+- **Bypass permission is bucket-owner-only.** AWS gates it on the `s3:BypassGovernanceRetention` IAM
+  action. There is no IAM here, and the nearest ACL verb (`WRITE_ACP`) is grantable to another
+  account — accepting it would mean an owner who delegates ACL administration has also delegated
+  "may destroy retained data", which is exactly the authority Object Lock exists to withhold.
+  Owner-only is the conservative reading and can be widened later; the reverse cannot.
+- **`x-amz-bucket-object-lock-token` is not required** to enable Object Lock on an existing bucket.
+  Versioning must already be on. We are more permissive than AWS here, not less.
+- **`GetObject` does not echo `x-amz-object-lock-*`.** `HeadObject` does. AWS returns them on both.
+- **`CompleteMultipartUpload` returns 501 on lock headers.** The lock is fixed at
+  `CreateMultipartUpload`, onto the version reserved there, which is the version completion
+  finalises. Accepting the headers at completion would mean taking intent that cannot be applied.
+
+### Not implemented
+
+S3 Batch Operations (no retroactive holds), replication of lock state, `POST Object`, and
+suspending versioning on a lock-enabled bucket (`501`, as in AWS).
+
+### Known gap
+
+Under **concurrent multipart uploads to the same key**, `upload_part` resolves the version from the
+live `objects` pointer rather than the upload's own reservation, so interleaved MPUs can land parts
+on a different version than the one carrying the lock — the completed object is then unlocked, with
+a 200. Pre-existing, and unlikely outside deliberately concurrent same-key writes, but it means the
+MPU path's guarantee is not yet airtight. Tracked separately from this matrix.
 
 ## Known divergences from AWS S3
 
