@@ -220,7 +220,6 @@ class Probe:
         self.client = client
         self.cfg = cfg
         self.bucket = bucket
-        self.saw_version_ids = False
         self._captured = threading.local()
         client.meta.events.register("after-call.s3", self._after_call)
 
@@ -235,7 +234,6 @@ class Probe:
     def put(self, key: str, body: bytes) -> tuple[str | None, str | None]:
         node, response = self.call("put_object", Key=key, Body=body)
         version_id = response.get("VersionId")
-        self.saw_version_ids = self.saw_version_ids or version_id is not None
         return node, version_id
 
     def get(self, key: str, **kwargs: Any) -> tuple[str | None, bytes]:
@@ -366,13 +364,10 @@ class Probe:
         return evaluate_drill(samples, put_node)
 
     def cleanup(self) -> None:
-        if self.saw_version_ids:
-            listing = self.call("list_object_versions")[1]
-            for entry in [*listing.get("Versions", []), *listing.get("DeleteMarkers", [])]:
-                self.call("delete_object", Key=entry["Key"], VersionId=entry["VersionId"])
-        else:
-            for entry in self.call("list_objects_v2")[1].get("Contents", []):
-                self.call("delete_object", Key=entry["Key"])
+        # The server hands back a VersionId on PUT even on an unversioned bucket, but refuses
+        # DeleteObject with that VersionId there, so always delete by key.
+        for entry in self.call("list_objects_v2")[1].get("Contents", []):
+            self.call("delete_object", Key=entry["Key"])
         self.call("delete_bucket")
 
 

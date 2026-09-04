@@ -55,7 +55,11 @@ class FakeClient:
 
 
 def config(**overrides: Any) -> Any:
-    env = {"HIPPIUS_ROUTING_ENDPOINT": "https://example.invalid", "AWS_ACCESS_KEY_ID": "k", "AWS_SECRET_ACCESS_KEY": "s"}
+    env = {
+        "HIPPIUS_ROUTING_ENDPOINT": "https://example.invalid",
+        "AWS_ACCESS_KEY_ID": "k",
+        "AWS_SECRET_ACCESS_KEY": "s",
+    }
     env.update(overrides)
     return probe.load_config(env)
 
@@ -88,8 +92,17 @@ def test_load_config_defaults_and_missing() -> None:
     assert probe.load_config({}) is None
     assert probe.load_config({"HIPPIUS_ROUTING_ENDPOINT": "https://example.invalid"}) is None
     cfg = config()
-    assert (cfg.region, cfg.keys, cfg.gets, cfg.lists, cfg.keep_bucket, cfg.drill) == ("decentralized", 20, 5, 50, False, False)
-    cfg = config(HIPPIUS_PROBE_KEYS="3", HIPPIUS_PROBE_KEEP_BUCKET="true", HIPPIUS_PROBE_DRILL="1", AWS_DEFAULT_REGION="r")
+    assert (cfg.region, cfg.keys, cfg.gets, cfg.lists, cfg.keep_bucket, cfg.drill) == (
+        "decentralized",
+        20,
+        5,
+        50,
+        False,
+        False,
+    )
+    cfg = config(
+        HIPPIUS_PROBE_KEYS="3", HIPPIUS_PROBE_KEEP_BUCKET="true", HIPPIUS_PROBE_DRILL="1", AWS_DEFAULT_REGION="r"
+    )
     assert (cfg.region, cfg.keys, cfg.keep_bucket, cfg.drill) == ("r", 3, True, True)
 
 
@@ -190,22 +203,21 @@ def test_exit_code_is_one_if_any_check_failed() -> None:
     assert probe.exit_code([]) == 0
 
 
-def test_cleanup_deletes_versions_when_put_reported_version_id() -> None:
-    listing = {"Versions": [{"Key": "k", "VersionId": "1"}], "DeleteMarkers": [{"Key": "k", "VersionId": "2"}]}
-    client = FakeClient(["n1"] * 4, {"list_object_versions": listing})
+def test_cleanup_deletes_by_key_even_when_put_reported_version_id() -> None:
+    # The server returns a VersionId on PUT but rejects DeleteObject with it on an unversioned bucket.
+    client = FakeClient(["n1"] * 4, {"list_objects_v2": {"Contents": [{"Key": "k"}, {"Key": "j"}]}})
     p = probe.Probe(client, config(), "bkt")
-    p.saw_version_ids = True
     p.cleanup()
     assert [(op, kw.get("Key"), kw.get("VersionId")) for op, kw in client.calls] == [
-        ("list_object_versions", None, None),
-        ("delete_object", "k", "1"),
-        ("delete_object", "k", "2"),
+        ("list_objects_v2", None, None),
+        ("delete_object", "k", None),
+        ("delete_object", "j", None),
         ("delete_bucket", None, None),
     ]
 
 
 def test_cleanup_falls_back_to_plain_keys_without_version_ids() -> None:
-    client = FakeClient(["n1"] * 3, {"list_objects_v2": {"Contents": [{"Key": "k"}]}})
+    client = FakeClient(["n1"] * 4, {"list_objects_v2": {"Contents": [{"Key": "k"}]}})
     probe.Probe(client, config(), "bkt").cleanup()
     assert [(op, kw.get("Key")) for op, kw in client.calls] == [
         ("list_objects_v2", None),
