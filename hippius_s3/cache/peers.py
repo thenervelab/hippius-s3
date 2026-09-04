@@ -400,6 +400,27 @@ class PeerRegistry:
                 exc,
             )
 
+    async def forget_parts(self, object_id: str, object_version: int, part_numbers: list[int]) -> None:
+        """Drop the fresh-part hints for parts this node just unlinked. Best-effort; never raises.
+
+        A hint outlives the bytes otherwise: for the rest of its TTL a GET on another node is
+        sent here for a directory that no longer exists, and only then falls to the pool. Keys
+        that already expired, or were never set, are fine — UNLINK ignores them.
+        """
+        if not part_numbers:
+            return
+        keys = [fresh_part_key(object_id, object_version, n) for n in part_numbers]
+        try:
+            await self._redis.unlink(*keys)
+        except Exception as exc:  # noqa: BLE001 - a stale hint costs one peer miss, not the abort
+            logger.debug(
+                "fresh-part forget failed for %s v%s parts %s: %s",
+                object_id,
+                object_version,
+                part_numbers,
+                exc,
+            )
+
     async def lookup_fresh_part(
         self, object_id: str, object_version: int, part_number: int
     ) -> Optional[tuple[str, dict[int, int]]]:

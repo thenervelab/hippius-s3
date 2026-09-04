@@ -108,6 +108,13 @@ WRAPPERS: list[tuple[str, Callable[..., None], tuple[Any, ...], str, dict[str, s
         {},
     ),
     (
+        "hippius_s3/cache/residency.py::_record_drop_failure",
+        residency._record_drop_failure,
+        (),
+        "residency_drop_failures_total",
+        {},
+    ),
+    (
         "hippius_s3/writer/landed.py::_record_announce_failure",
         landed._record_announce_failure,
         ("timeout",),

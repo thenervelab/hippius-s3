@@ -53,6 +53,11 @@ class FakeRedis:
             raise ConnectionError("redis down")
         return self.store.get(key)
 
+    async def unlink(self, *keys: str) -> int:
+        if self.fail:
+            raise ConnectionError("redis down")
+        return sum(1 for k in keys if self.store.pop(k, None) is not None)
+
 
 def residency_row(node_id: str = "node-b", *, chunk_size: int = 10, num_chunks: int = 128) -> dict[str, Any]:
     """One peer-resolution row: who holds the part, and its exact per-chunk ciphertext sizes.
@@ -1002,6 +1007,52 @@ async def test_remember_part_never_raises() -> None:
     redis = FakeRedis()
     redis.fail = True
     await PeerRegistry(redis, "node-b", PEER_URL, 90).remember_part(OBJ, 1, 3)
+
+
+@pytest.mark.asyncio
+async def test_forget_parts_removes_the_hints_so_a_peer_is_not_sent_to_a_deleted_directory() -> None:
+    """AbortMultipartUpload rmtree's the version on the ingest node; a hint that outlived the
+    bytes would route every wrong-node GET here for the rest of its TTL, to 404."""
+    redis = FakeRedis()
+    writer = PeerRegistry(redis, "node-b", PEER_URL, 90)
+    reader = PeerRegistry(redis, "node-a", SELF_URL, 90)
+    await writer.remember_part(OBJ, 1, 1, cipher_sizes=[36])
+    await writer.remember_part(OBJ, 1, 2, cipher_sizes=[36])
+    await writer.remember_part(OBJ, 2, 1, cipher_sizes=[36])
+
+    await writer.forget_parts(OBJ, 1, [1, 2])
+
+    assert await reader.lookup_fresh_part(OBJ, 1, 1) is None
+    assert await reader.lookup_fresh_part(OBJ, 1, 2) is None
+    assert await reader.lookup_fresh_part(OBJ, 2, 1) == ("node-b", {0: 36}), "another version's hint is untouched"
+    assert fresh_part_key(OBJ, 1, 1) not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_forget_parts_takes_part_numbers_in_any_order_with_duplicates() -> None:
+    """The handler hands over whatever it listed, and nothing here sorts or dedupes it. UNLINK
+    is a set operation, so both are fine and every named hint must still go."""
+    redis = FakeRedis()
+    registry = PeerRegistry(redis, "node-b", PEER_URL, 90)
+    for n in (1, 2, 3):
+        await registry.remember_part(OBJ, 1, n, cipher_sizes=[36])
+
+    await registry.forget_parts(OBJ, 1, [3, 1, 3, 2, 1])
+
+    assert not any(fresh_part_key(OBJ, 1, n) in redis.store for n in (1, 2, 3)), redis.store
+
+
+@pytest.mark.asyncio
+async def test_forget_parts_tolerates_hints_that_already_expired_and_a_redis_outage() -> None:
+    """Both are routine on the abort path: the 60s TTL usually beats the client to the abort,
+    and Redis being down must cost a stale hint, never the abort."""
+    redis = FakeRedis()
+    registry = PeerRegistry(redis, "node-b", PEER_URL, 90)
+    await registry.forget_parts(OBJ, 1, [1, 2, 3])
+    await registry.forget_parts(OBJ, 1, [])
+
+    redis.fail = True
+    await registry.forget_parts(OBJ, 1, [1])
 
 
 @pytest.mark.asyncio

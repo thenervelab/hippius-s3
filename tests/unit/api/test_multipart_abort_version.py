@@ -59,7 +59,11 @@ def _fake_request(upload_id: str, *, fs_delete: Any, redis: Any) -> Any:
     return SimpleNamespace(
         query_params={"uploadId": upload_id},
         app=SimpleNamespace(
-            state=SimpleNamespace(redis_client=redis, fs_store=SimpleNamespace(delete_object=fs_delete))
+            state=SimpleNamespace(
+                redis_client=redis,
+                fs_store=SimpleNamespace(delete_object=fs_delete),
+                residency_recorder=None,
+            )
         ),
     )
 
@@ -118,3 +122,211 @@ async def test_abort_with_no_parts_skips_destructive_cleanup(monkeypatch: Any) -
     assert resp.status_code == 204
     assert called["fail"] is False, "must not fail-replicate when the upload has no parts of its own"
     assert called["delete"] is False, "must not delete cache when the upload has no parts of its own"
+
+
+class _FakeDbWithParts(_FakeDb):
+    async def fetch(self, query: str, *args: Any) -> list[Any]:
+        if query == "list_parts_for_version":
+            return [{"part_number": 1}, {"part_number": 2}]
+        return []
+
+
+class _RedisStubWithParts(_RedisStub):
+    async def delete(self, *_: Any) -> None:
+        return None
+
+    async def scan_iter(self, *_: Any, **__: Any) -> Any:
+        for key in ():
+            yield key
+
+
+@pytest.mark.asyncio
+async def test_abort_drops_this_nodes_residency_rows_and_fresh_hints_after_the_local_delete(
+    monkeypatch: Any,
+) -> None:
+    """The local rmtree orphans this node's cephor_ssd_residency rows and the fresh-part hints
+    for the parts it removed. Both must be cleaned for the upload's OWN version, with the part
+    numbers already fetched, and strictly AFTER the delete — a residency drop before the unlink
+    would leave bytes on disk that no evictor owns if the unlink then failed."""
+    monkeypatch.setattr(multipart, "get_query", lambda name: name)
+    order: list[tuple[str, Any]] = []
+
+    async def fake_fail(_db: Any, **_: Any) -> None:
+        order.append(("fail", None))
+
+    async def fake_delete(object_id: str, object_version: int) -> None:
+        order.append(("delete", object_version))
+
+    async def fake_get_meta(*_: Any) -> None:
+        return None
+
+    class _Recorder:
+        async def drop_version(self, object_id: str, object_version: int) -> None:
+            order.append(("drop_version", (object_id, object_version)))
+
+    class _Registry:
+        async def forget_parts(self, object_id: str, object_version: int, part_numbers: list[int]) -> None:
+            order.append(("forget_parts", (object_id, object_version, part_numbers)))
+
+    monkeypatch.setattr(multipart, "fail_version_replication", fake_fail)
+    monkeypatch.setattr(multipart, "get_active_registry", lambda: _Registry())
+
+    request = SimpleNamespace(
+        query_params={"uploadId": "up-1"},
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                redis_client=_RedisStubWithParts(),
+                fs_store=SimpleNamespace(delete_object=fake_delete, get_meta=fake_get_meta),
+                residency_recorder=_Recorder(),
+            )
+        ),
+    )
+    resp = await multipart.abort_multipart_upload(
+        "b", "k", request, _FakeDbWithParts(current_version=2, upload_version=1)
+    )
+
+    assert resp.status_code == 204
+    assert order == [
+        ("fail", None),
+        ("delete", 1),
+        ("drop_version", ("obj-1", 1)),
+        ("forget_parts", ("obj-1", 1, [1, 2])),
+    ], order
+
+
+@pytest.mark.asyncio
+async def test_abort_without_a_residency_recorder_or_registry_still_deletes_locally(monkeypatch: Any) -> None:
+    """Workers, tests and a node without NODE_NAME have neither; the abort must not depend on them."""
+    monkeypatch.setattr(multipart, "get_query", lambda name: name)
+    deleted: dict[str, Any] = {}
+
+    async def fake_fail(_db: Any, **_: Any) -> None:
+        return None
+
+    async def fake_delete(object_id: str, object_version: int) -> None:
+        deleted["version"] = object_version
+
+    monkeypatch.setattr(multipart, "fail_version_replication", fake_fail)
+    monkeypatch.setattr(multipart, "get_active_registry", lambda: None)
+
+    db = _FakeDb(current_version=2, upload_version=1)
+    resp = await multipart.abort_multipart_upload(
+        "b", "k", _fake_request("up-1", fs_delete=fake_delete, redis=_RedisStub()), db
+    )
+
+    assert resp.status_code == 204
+    assert deleted["version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_abort_still_drops_rows_and_hints_when_the_local_delete_raises(monkeypatch: Any) -> None:
+    """`delete_object` swallows its own rmtree failures, so the handler cannot tell a clean unlink
+    from a failed one and must not try: the bytes stay owned by the drain's failed-part reclaim
+    through the replication row either way, and the abort has already committed. The contract
+    from before this cleanup existed — a raising delete is suppressed and the abort answers 204 —
+    holds, and the cleanup that follows it still runs."""
+    monkeypatch.setattr(multipart, "get_query", lambda name: name)
+    order: list[str] = []
+
+    async def fake_fail(_db: Any, **_: Any) -> None:
+        return None
+
+    async def fake_delete(*_: Any) -> None:
+        raise ValueError("bad object id")
+
+    async def fake_get_meta(*_: Any) -> None:
+        return None
+
+    class _Recorder:
+        async def drop_version(self, *_: Any) -> None:
+            order.append("drop_version")
+
+    class _Registry:
+        async def forget_parts(self, *_: Any) -> None:
+            order.append("forget_parts")
+
+    monkeypatch.setattr(multipart, "fail_version_replication", fake_fail)
+    monkeypatch.setattr(multipart, "get_active_registry", lambda: _Registry())
+
+    request = SimpleNamespace(
+        query_params={"uploadId": "up-1"},
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                redis_client=_RedisStubWithParts(),
+                fs_store=SimpleNamespace(delete_object=fake_delete, get_meta=fake_get_meta),
+                residency_recorder=_Recorder(),
+            )
+        ),
+    )
+    resp = await multipart.abort_multipart_upload(
+        "b", "k", request, _FakeDbWithParts(current_version=2, upload_version=1)
+    )
+
+    assert resp.status_code == 204
+    assert order == ["drop_version", "forget_parts"]
+
+
+@pytest.mark.asyncio
+async def test_abort_with_a_version_but_no_parts_rows_drops_residency_and_forgets_nothing(monkeypatch: Any) -> None:
+    """The version lookup and the parts listing are two queries; a concurrent same-upload abort
+    can empty the second. There is still a version directory of our own to drop rows for, and
+    an empty hint list to forget, which must be handed over as `[]`, not skipped or `None`."""
+    monkeypatch.setattr(multipart, "get_query", lambda name: name)
+    calls: dict[str, Any] = {}
+
+    async def fake_fail(_db: Any, **_: Any) -> None:
+        return None
+
+    async def fake_delete(*_: Any) -> None:
+        return None
+
+    class _Recorder:
+        async def drop_version(self, object_id: str, object_version: int) -> None:
+            calls["drop_version"] = (object_id, object_version)
+
+    class _Registry:
+        async def forget_parts(self, object_id: str, object_version: int, part_numbers: list[int]) -> None:
+            calls["forget_parts"] = (object_id, object_version, part_numbers)
+
+    monkeypatch.setattr(multipart, "fail_version_replication", fake_fail)
+    monkeypatch.setattr(multipart, "get_active_registry", lambda: _Registry())
+
+    request = _fake_request("up-1", fs_delete=fake_delete, redis=_RedisStub())
+    request.app.state.residency_recorder = _Recorder()
+    resp = await multipart.abort_multipart_upload("b", "k", request, _FakeDb(current_version=2, upload_version=1))
+
+    assert resp.status_code == 204
+    assert calls["drop_version"] == ("obj-1", 1)
+    assert calls["forget_parts"] == ("obj-1", 1, [])
+
+
+@pytest.mark.asyncio
+async def test_abort_with_no_parts_touches_neither_residency_nor_hints(monkeypatch: Any) -> None:
+    """No version of our own means no directory was deleted, so there is nothing to drop and
+    nothing to forget — and the pointer's version must not be used in their place either."""
+    monkeypatch.setattr(multipart, "get_query", lambda name: name)
+    touched: list[str] = []
+
+    async def fake_fail(_db: Any, **_: Any) -> None:
+        return None
+
+    async def fake_delete(*_: Any) -> None:
+        return None
+
+    class _Recorder:
+        async def drop_version(self, *_: Any) -> None:
+            touched.append("drop_version")
+
+    class _Registry:
+        async def forget_parts(self, *_: Any) -> None:
+            touched.append("forget_parts")
+
+    monkeypatch.setattr(multipart, "fail_version_replication", fake_fail)
+    monkeypatch.setattr(multipart, "get_active_registry", lambda: _Registry())
+
+    request = _fake_request("up-1", fs_delete=fake_delete, redis=_RedisStub())
+    request.app.state.residency_recorder = _Recorder()
+    resp = await multipart.abort_multipart_upload("b", "k", request, _FakeDb(current_version=2, upload_version=None))
+
+    assert resp.status_code == 204
+    assert touched == []

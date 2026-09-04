@@ -144,3 +144,34 @@ def get_object_versioning_info(bucket_name: str, object_key: str, *, dsn: str | 
             "versions": versions,
             "part_counts": part_counts,
         }
+
+
+def get_multipart_upload_version(upload_id: str, *, dsn: str | None = None) -> tuple[str, int]:
+    """`(object_id, object_version)` an in-flight MPU's parts live under, keyed by upload_id.
+
+    Resolved from `parts` rather than `objects.current_object_version` for the same reason the
+    abort handler does (get_multipart_version_by_upload.sql): a concurrent same-key upload
+    advances the pointer. Must be called BEFORE abort — abort cascades the parts rows away.
+    """
+    dsn = dsn or get_main_dsn()
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT object_id, object_version FROM parts WHERE upload_id = %s ORDER BY object_version DESC LIMIT 1",
+            (upload_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError(f"No parts found for upload {upload_id}")
+        return str(row[0]), int(row[1])
+
+
+def count_residency_rows(node_id: str, object_id: str, object_version: int, *, dsn: str | None = None) -> int:
+    """Rows in the drain's per-node SSD ledger for one version on one node."""
+    dsn = dsn or get_main_dsn()
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM cephor_ssd_residency WHERE node_id = %s AND object_id = %s AND version = %s",
+            (node_id, object_id, object_version),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
