@@ -43,8 +43,11 @@ Registered in [hippius_s3/main.py](../main.py). FastAPI's `@app.middleware("http
 response — errors included — with the `NODE_NAME` of the pod that served it, when the env var is
 set. It exists for the locality rollout ([docs/locality-routing.md](../../docs/locality-routing.md)):
 the edge hashes object paths onto nodes, and the header is how a client (or the routing probe)
-checks that a GET landed on the node that took the PUT. It is a node name, not an address, and
-carries no auth meaning.
+checks that a GET landed on the node that took the PUT. For a multipart upload the check differs
+above N (= 200): parts 1..N, Create/ListParts/Complete/Abort and every GET must show the key's
+node, while `UploadPart`/`UploadPartCopy` with `partNumber` > N are hashed on `path#partNumber`
+and are expected to show other nodes. It is a node name, not an address, and carries no auth
+meaning.
 
 **Not wired today**: `rate_limit` and `banhammer`. The modules at [gateway/middlewares/rate_limit.py](middlewares/rate_limit.py) and [gateway/middlewares/banhammer.py](middlewares/banhammer.py) exist but `main.py` doesn't register them — see the log line `"Rate limiting and banhammer disabled"` at [main.py:94](main.py). See [todo.md](../../todo.md) P2.
 

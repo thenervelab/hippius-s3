@@ -172,9 +172,10 @@ async def test_the_factory_refuses_to_promote_without_a_residency_recorder(tmp_p
 async def test_a_peer_holding_the_part_is_tried_before_the_pool(tmp_path) -> None:
     """Peer NVMe beats the pool: ~6 ms + ~1 ms network against ~40 ms per chunk.
 
-    Locality is resolved per PART, not per request — measured on prod 2026-08-06, only 2%
-    of multi-part objects have every part on one node, so routing a whole GET somewhere
-    would leave most parts remote anyway.
+    Locality is resolved per PART, not per request. Under round-robin placement (prod
+    2026-08-06) only 2% of multi-part objects had every part on one node; under the hashed
+    edge a GET lands on the key node with parts 1..N local and parts above N spread across
+    other nodes by design, so the tail is peer-fetched on every read.
     """
     calls: list[tuple[str, int, int, int]] = []
 

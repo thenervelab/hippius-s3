@@ -1058,11 +1058,14 @@ async def abort_multipart_upload(
             # The rmtree above leaves two records pointing at a directory that no longer exists:
             # this node's cephor_ssd_residency rows and the fresh-part hints (a peer GET routed
             # here for the rest of their TTL). With haproxy locality hashing the abort lands on
-            # the node that ingested the parts, so this is the common case and both are cleaned
-            # here. A pre-cutover upload's parts live on OTHER nodes; their rows and directories
-            # are the drain's failed-part reclaim's (after CEPHOR_RECLAIM_GRACE_SECS) — the mark
-            # above is what makes them eligible, and it is also what keeps a lingering row inert
-            # meanwhile: every residency reader joins the replication row on status='replicated'.
+            # the key node, which holds only parts <= the spread threshold (N = 200); parts above
+            # it were hashed on path#partNumber onto other nodes. The rmtree is a no-op for those,
+            # drop_version is node-scoped by design, and forget_parts is node-agnostic (it clears
+            # every listed part number's hint wherever the part landed). The spread parts' rows
+            # and directories are the drain's failed-part reclaim's (after
+            # CEPHOR_RECLAIM_GRACE_SECS) — the mark above is what makes them eligible, and it is
+            # also what keeps a lingering row inert meanwhile: every residency reader joins the
+            # replication row on status='replicated'.
             # Both never raise. Ordered after the delete on purpose: the bytes stay owned by that
             # same reclaim through the replication row, but a ledger that claims a directory the
             # disk does not hold is the one state this table must never describe.

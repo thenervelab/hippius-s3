@@ -98,6 +98,13 @@ recency** (`DualFileSystemPartsStore.read_local_chunk` stamps `_on_local_read`,
 does not look cold to the evictor. The mechanics live with the code they describe; the doc is
 the why.
 
+**Spread parts.** The edge hashes `UploadPart`/`UploadPartCopy` with `partNumber` > N (= 200) on
+`path#partNumber`, so a giant object's tail is spread across nodes by design and a read — which
+lands on the key node — takes the peer tier for those parts on every read. Two things keep that
+bounded: promotion stops at `HIPPIUS_PROMOTE_MAX_PART_NUMBER` (= N), so a read of a giant never
+refills the key node with the tail the spread kept off it, and the tail owners are resolved in
+one batched residency query per stream rather than one lookup per part.
+
 ## Invalidating a chunk that fails AEAD
 
 Promotion copies peer/pool bytes onto local flash, and the local tier is read FIRST — so a bad
