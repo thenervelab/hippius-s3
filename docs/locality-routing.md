@@ -225,6 +225,30 @@ aws --endpoint-url "$ENDPOINT" s3api put-object --bucket b --key k --body f --de
 aws --endpoint-url "$ENDPOINT" s3api get-object --bucket b --key k /dev/null --debug 2>&1 | grep -i x-hippius-node
 ```
 
+**Probe script.** [scripts/locality_probe.py](../scripts/locality_probe.py) runs the checks above
+end to end with boto3 and prints one PASS/FAIL line per check (exit 1 on any FAIL). It creates a
+throwaway `locality-probe-<epoch>` bucket, checks that N single-part keys read back (GET x G, HEAD)
+from their PUT node and reports how the PUT nodes spread, that a 4 x 5 MiB multipart upload
+(Create, UploadPart, ListParts, Complete, GETs) and an aborted one sit on one node, that repeated
+`ListObjectsV2`/`HeadBucket` spread over more than one node, and that Range, `?versionId` and a
+presigned GET of one key all land on its PUT node. Every response's `X-Hippius-Node` is captured
+through a botocore `after-call` hook; a missing header fails the check rather than crashing.
+
+```bash
+source .venv/bin/activate
+HIPPIUS_ROUTING_ENDPOINT="$ENDPOINT" AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+  python scripts/locality_probe.py
+```
+
+Optional env: `AWS_DEFAULT_REGION` (default `decentralized`), `HIPPIUS_PROBE_KEYS` (20),
+`HIPPIUS_PROBE_GETS` (5), `HIPPIUS_PROBE_LISTS` (50), `HIPPIUS_PROBE_KEEP_BUCKET` (leave the
+bucket behind for inspection). Without an endpoint and credentials it prints one line and exits 0.
+`HIPPIUS_PROBE_DRILL=1` adds the misplaced-object drill: it waits for you to drain one node at the
+edge (section "Draining a node" above), PUTs a key while the node is out of the ring, waits for you
+to restore it, then fires 30 concurrent GETs and requires every one to succeed with a TTFB under
+5 s on the same node — the restored hash owner, which is expected to differ from the PUT node.
+That exercises the peer-fetch + promotion path of section 3 under the singleflight of section 4.
+
 A mismatch on a freshly written key means either the rings disagree (check `id`/`weight` on
 every hashing box) or the two requests used different encodings of the key. The server-side
 check is the per-stream tier log the api emits when a body finishes:
