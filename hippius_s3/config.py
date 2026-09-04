@@ -476,6 +476,12 @@ class Config:
     # abort healthy large-chunk fetches. This is a backstop against a peer that never finishes,
     # not a second loss-cut.
     peer_fetch_deadline_seconds: float = env("HIPPIUS_PEER_FETCH_DEADLINE_SECONDS:2.0", convert=float)
+    # How long a read of an UNREPLICATED part (SSD-only until the drain lands it on the pool)
+    # waits for a per-peer slot, or retries a peer's 503, before giving up. A shed on a
+    # replicated part costs one pool read; on an unreplicated one there is no pool copy to
+    # shed to, and the reader sits in `wait_for_chunk` until the chunk timeout instead. 0
+    # restores the shed-always behaviour for every part.
+    peer_fetch_unreplicated_wait_seconds: float = env("HIPPIUS_PEER_FETCH_UNREPLICATED_WAIT_SECONDS:10", convert=float)
     # Per-peer fanout: concurrent fetches this pod will have in flight to any ONE peer, and
     # concurrent peer requests this pod will SERVE. Both are needed — the client cap bounds
     # what one pod sends, but five pods each within their own cap still add up at the peer,

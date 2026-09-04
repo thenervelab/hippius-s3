@@ -47,6 +47,35 @@ the prefetch depth at wiring time, so a stale config degrades to a startup warni
 silently halved peer tier. It does **not** add peer capacity: the semaphore is shared across
 readers on the pod, so under concurrency shedding just moves to the peer's `server_busy`.
 
+**Singleflight.** `PeerChunkFetcher` keys in-flight fetches by `(object_id, version, part,
+chunk)`: N readers of one chunk on a pod share ONE peer fetch, awaited through `asyncio.shield`
+so the reader that started it disconnecting does not cancel it for the rest. Only in-flight
+leaders are held, so memory stays bounded by the per-peer slots (≤ cap × chunk size per peer per
+pod). A failed fetch is not cached — every waiter gets the `None` and takes its own fallback.
+
+**Unreplicated parts wait instead of shedding.** "Shed to the pool" assumes a pool copy. A
+fresh part is on its ingest node's SSD alone until the drain replicates it, so a shed there
+(`client_cap`, or the peer's 503 `server_busy`) falls to nothing and the reader parks in
+`wait_for_chunk` — 25s then a 503 on the first chunk, up to `stream_chunk_timeout_seconds`
+mid-stream. The owner memo therefore carries `unreplicated` (True when the owner came from the
+fresh-part Redis hint or from the `tier_pref = 1` arm of the residency query, i.e. status
+`pending`/`draining`/`corrupt`), and for those parts the fetcher waits for a slot and retries a
+503 with jittered exponential backoff (0.05 × 2ⁿ, capped at 1s) for up to
+`HIPPIUS_PEER_FETCH_UNREPLICATED_WAIT_SECONDS` (default 10; `0` restores shed-always).
+Replicated parts keep the shed behaviour exactly. `locate(...)` exposes `(owner, unreplicated)`
+through the same memo and `build_stream_context` uses it to skip the Arion download for parts
+Arion cannot have yet; `last_owner(...)` is the memo-only read the stream log uses. The serve
+cap is sized `(nodes-1) × per-peer fetch cap` (64 on a 5-node fleet) so a full fetch window
+from every other node fits before the owner sheds.
+
+**Promotion announces itself.** Nothing published a `notify:` for a promoted chunk (only the
+downloader publishes), so a reader that fell through every tier while a sibling reader was
+promoting the same chunk slept out the chunk timeout. `DualFileSystemPartsStore(on_promoted=...)`
+is called after `set_chunk` lands; the api wires it to `obj_cache.notify_chunk`, best-effort.
+A per-stream tier split (`local`/`peer`/`pool` chunk counts) is collected through the
+`_stream_tiers` ContextVar and logged by `read_response` when the body ends, with the memoised
+owner of the first part.
+
 Promotion is gated on free space (`HIPPIUS_PROMOTE_MIN_FREE_RATIO`, default 0.175) because it
 shares the ingest mount with PUTs — `HIPPIUS_OBJECT_CACHE_DIR` is the drain agent's
 `CEPHOR_SSD_ROOT` and the mount `fs_cache_pressure` measures. The floor must sit strictly inside

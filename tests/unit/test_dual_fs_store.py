@@ -9,9 +9,12 @@ pipeline (observed as x-hippius-source=pipeline in the append e2e tests).
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from hippius_s3.cache.dual_fs_store import DualFileSystemPartsStore
+from hippius_s3.cache.dual_fs_store import _stream_tiers
 from hippius_s3.cache.fs_store import FileSystemPartsStore
 
 
@@ -254,3 +257,115 @@ async def test_read_local_chunk_serves_a_local_part(tmp_path) -> None:
     await _write_part(dual, part_number=1, chunk=b"on-ssd")
 
     assert await dual.read_local_chunk(OBJ, 1, 1, 0) == b"on-ssd"
+
+
+@pytest.mark.asyncio
+async def test_the_tier_counter_counts_only_inside_a_stream(tmp_path) -> None:
+    """Outside a stream the ContextVar is unset and reads count into metrics alone."""
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))
+    await _write_part(dual.fallback, part_number=1, chunk=b"pool-only")
+    await _write_part(dual, part_number=2, chunk=b"on-ssd")
+
+    assert _stream_tiers.get() is None
+    assert await dual.get_chunk(OBJ, 1, 1, 0) == b"pool-only"
+    assert _stream_tiers.get() is None, "a read never sets the counter on its own"
+
+    counts: dict[str, int] = {}
+    token = _stream_tiers.set(counts)
+    try:
+        await dual.get_chunk(OBJ, 1, 1, 0)
+        await dual.get_chunk(OBJ, 1, 2, 0)
+        # The streamer fetches from spawned tasks; they inherit the dict by reference.
+        await asyncio.create_task(dual.get_chunk(OBJ, 1, 2, 0))
+    finally:
+        _stream_tiers.reset(token)
+    assert counts == {"pool": 1, "local": 2}
+
+    await dual.get_chunk(OBJ, 1, 2, 0)
+    assert counts == {"pool": 1, "local": 2}, "nothing counts once the stream's counter is gone"
+
+
+@pytest.mark.asyncio
+async def test_a_promoted_chunk_announces_itself(tmp_path) -> None:
+    """A reader parked in wait_for_chunk on this chunk wakes only if something publishes for it.
+
+    The downloader publishes for what it lands; nothing published for a promotion, so a reader
+    that fell to an empty pool while a sibling promoted the chunk slept out the chunk timeout.
+    """
+    announced: list[tuple[str, int, int, int]] = []
+
+    async def _hook(object_id: str, version: int, part_number: int, chunk_index: int) -> None:
+        announced.append((object_id, version, part_number, chunk_index))
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), promote=True, on_promoted=_hook)
+    await _write_part(dual.fallback, part_number=1, chunk=b"pool-only")
+
+    assert await dual.get_chunk(OBJ, 1, 1, 0) == b"pool-only"
+    assert announced == [(OBJ, 1, 1, 0)]
+
+    assert await dual.get_chunk(OBJ, 1, 1, 0) == b"pool-only"
+    assert announced == [(OBJ, 1, 1, 0)], "a local hit promotes nothing and announces nothing"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_promotion_announces_nothing(tmp_path, monkeypatch) -> None:
+    announced: list[object] = []
+
+    async def _hook(*args: object) -> None:
+        announced.append(args)
+
+    async def _boom(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), promote=True, on_promoted=_hook)
+    await _write_part(dual.fallback, part_number=1, chunk=b"pool-only")
+    monkeypatch.setattr(dual, "set_chunk", _boom)
+
+    assert await dual.get_chunk(OBJ, 1, 1, 0) == b"pool-only"
+    assert announced == [], "no copy landed, so there is nothing to wake a waiter for"
+
+
+@pytest.mark.asyncio
+async def test_peer_locate_without_a_fetcher_reports_no_owner(tmp_path) -> None:
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))
+
+    assert await dual.peer_locate(OBJ, 1, 1) == (None, False)
+    assert dual.peer_last_owner(OBJ, 1, 1) is None
+
+
+class _LocatingFetcher:
+    def __init__(self, owner: str | None, unreplicated: bool) -> None:
+        self._owner = owner
+        self._unreplicated = unreplicated
+        self.located: list[tuple[str, int, int]] = []
+
+    async def __call__(self, object_id: str, version: int, part_number: int, chunk_index: int) -> bytes | None:
+        return None
+
+    async def locate(self, object_id: str, version: int, part_number: int) -> tuple[str | None, bool]:
+        self.located.append((object_id, version, part_number))
+        return self._owner, self._unreplicated
+
+    def last_owner(self, object_id: str, version: int, part_number: int) -> str | None:
+        return self._owner
+
+
+@pytest.mark.asyncio
+async def test_peer_locate_passes_through_to_the_fetcher(tmp_path) -> None:
+    fetcher = _LocatingFetcher("node-b", True)
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), peer_fetch=fetcher)
+
+    assert await dual.peer_locate(OBJ, 1, 1) == ("node-b", True)
+    assert fetcher.located == [(OBJ, 1, 1)]
+    assert dual.peer_last_owner(OBJ, 1, 1) == "node-b"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_peer_locate_never_fails_the_read_path(tmp_path) -> None:
+    class _Broken(_LocatingFetcher):
+        async def locate(self, *args: object) -> tuple[str | None, bool]:
+            raise OSError("postgres down")
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), peer_fetch=_Broken("node-b", True))
+
+    assert await dual.peer_locate(OBJ, 1, 1) == (None, False)
