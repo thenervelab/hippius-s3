@@ -49,7 +49,8 @@ ReplicationSuspectFn = Callable[[str, int, int], Awaitable[bool]]
 # part_number, chunk_index). The api wires this to the chunk-ready pub/sub, so a reader that
 # missed every tier and is parked in `wait_for_chunk` wakes as soon as a sibling reader's
 # promotion makes the chunk readable here — nothing else publishes for a promoted chunk.
-# Contract: must never raise; it runs after a read already has its bytes.
+# A fault in it is contained by the store: it runs after a read already has its bytes, and a
+# missed wakeup only costs the waiter its timeout re-check.
 PromotedHook = Callable[[str, int, int, int], Awaitable[None]]
 
 # Per-stream tier counts, set by the read path for the lifetime of one response so the stream
@@ -329,7 +330,17 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         # Outside the try: the hook runs only for a copy that landed, and a hook fault must not
         # read as a failed write and give back a claim the copy is actually using.
         if written and self._on_promoted is not None:
-            await self._on_promoted(object_id, int(object_version), int(part_number), int(chunk_index))
+            try:
+                await self._on_promoted(object_id, int(object_version), int(part_number), int(chunk_index))
+            except Exception as exc:  # noqa: BLE001 - a wakeup is best-effort; the read already has its bytes
+                logger.debug(
+                    "promoted-chunk hook failed for %s v%s part %s chunk %s: %s",
+                    object_id,
+                    object_version,
+                    part_number,
+                    chunk_index,
+                    exc,
+                )
 
     async def invalidate_local_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int

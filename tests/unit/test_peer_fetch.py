@@ -1419,3 +1419,205 @@ async def test_locate_reports_no_owner_for_a_peer_that_is_not_registered() -> No
     fetcher = PeerChunkFetcher(FakePool(unreplicated_row()), registry, "node-a", FakeHttp(200), auth_secret=SECRET)
 
     assert await fetcher.locate(OBJ, 1, 3) == (None, False)
+
+
+# ------------------------------------------------- singleflight: failure, cancellation, cleanup
+
+
+class RaisingPool:
+    """A database that is down: the leader's owner lookup raises before any slot is taken."""
+
+    def acquire(self) -> Any:
+        class _Ctx:
+            async def __aenter__(self) -> Any:
+                raise ConnectionError("postgres down")
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _Ctx()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "http",
+    [FailingHttp(), TimeoutHttp()],
+    ids=["connect-error", "deadline"],
+)
+async def test_a_failed_leader_fetch_gives_every_waiter_none_and_clears_the_key(http: Any) -> None:
+    """A dead or dripping peer fails the ONE fetch; every reader sharing it falls to the pool."""
+    registry = await _registered_peer()
+    fetcher = PeerChunkFetcher(
+        FakePool(residency_row()), registry, "node-a", http, auth_secret=SECRET, deadline_seconds=0.05
+    )
+
+    results = await asyncio.gather(*(fetcher(OBJ, 1, 3, 0) for _ in range(5)))
+
+    assert results == [None] * 5
+    assert fetcher._inflight_chunks == {}, "a failed leader still removes its key"
+    assert getattr(http, "attempts", None) or len(http.urls) == 1, "one upstream attempt for five readers"
+
+
+@pytest.mark.asyncio
+async def test_a_leader_that_raises_propagates_to_every_waiter_and_clears_the_key() -> None:
+    """An exception the fetcher does not classify (the owner lookup itself failing) is not hidden
+    from any reader: each sees it — and the store's guard turns it into a pool read — while the
+    key is still cleared, so the next reader starts a fresh fetch instead of joining a corpse."""
+    registry = await _registered_peer()
+    fetcher = PeerChunkFetcher(RaisingPool(), registry, "node-a", FakeHttp(200), auth_secret=SECRET)  # type: ignore[arg-type]
+
+    results = await asyncio.gather(*(fetcher(OBJ, 1, 3, 0) for _ in range(4)), return_exceptions=True)
+
+    assert all(isinstance(r, ConnectionError) for r in results), results
+    assert fetcher._inflight_chunks == {}
+
+
+@pytest.mark.asyncio
+async def test_a_leader_cancelled_from_outside_is_a_failed_fetch_not_a_cancelled_reader() -> None:
+    """Cancelling the shared task must not look, to a follower, like its own client hanging up.
+
+    `shield` re-raises the leader's cancellation in every waiter, and CancelledError is not an
+    Exception — it would escape the store's peer guard and end N streams. A follower gets None,
+    the key is gone, and the next reader becomes a fresh leader.
+    """
+    registry = await _registered_peer()
+    http = BlockingHttp()
+    fetcher = PeerChunkFetcher(FakePool(residency_row()), registry, "node-a", http, auth_secret=SECRET)
+
+    followers = [asyncio.create_task(fetcher(OBJ, 1, 3, 0)) for _ in range(3)]
+    await asyncio.wait_for(http.started.wait(), timeout=1)
+    key = (OBJ, 1, 3, 0)
+    leader = fetcher._inflight_chunks[key]
+    leader.cancel()
+
+    assert await asyncio.gather(*followers) == [None, None, None]
+    assert key not in fetcher._inflight_chunks
+
+    http.release.set()
+    assert await fetcher(OBJ, 1, 3, 0) == b"peer-bytes", "the next reader leads a fresh fetch"
+    assert http.attempts == 2
+    assert fetcher._inflight_chunks == {}
+
+
+@pytest.mark.asyncio
+async def test_a_leader_cancelled_before_it_ever_ran_does_not_wedge_the_chunk() -> None:
+    """A task cancelled before its first step never reaches `_lead`'s cleanup, so its key would
+    stay in the map forever and every later reader would join a corpse. The map treats such a
+    leader as absent."""
+    registry = await _registered_peer()
+    http = FakeHttp(200, b"x" * 10)
+    fetcher = PeerChunkFetcher(FakePool(residency_row()), registry, "node-a", http, auth_secret=SECRET)
+
+    async def _never() -> Optional[bytes]:
+        return None
+
+    corpse: asyncio.Task[Optional[bytes]] = asyncio.create_task(_never())
+    corpse.cancel()
+    await asyncio.sleep(0)
+    assert corpse.cancelled()
+    fetcher._inflight_chunks[(OBJ, 1, 3, 0)] = corpse
+
+    assert await fetcher(OBJ, 1, 3, 0) == b"x" * 10
+    assert http.urls, "a fresh leader actually fetched"
+    assert fetcher._inflight_chunks == {}
+
+
+@pytest.mark.asyncio
+async def test_a_readers_own_cancellation_still_cancels_it() -> None:
+    """The guard is for the LEADER's cancellation only: a reader whose client disconnects is
+    cancelled exactly as before, and the shared fetch it was waiting on carries on."""
+    registry = await _registered_peer()
+    http = BlockingHttp()
+    fetcher = PeerChunkFetcher(FakePool(residency_row()), registry, "node-a", http, auth_secret=SECRET)
+
+    reader = asyncio.create_task(fetcher(OBJ, 1, 3, 0))
+    await asyncio.wait_for(http.started.wait(), timeout=1)
+    follower = asyncio.create_task(fetcher(OBJ, 1, 3, 0))
+    await asyncio.sleep(0)
+
+    reader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reader
+    assert not fetcher._inflight_chunks[(OBJ, 1, 3, 0)].cancelled(), "the shared fetch survived"
+
+    http.release.set()
+    assert await follower == b"peer-bytes"
+
+
+@pytest.mark.asyncio
+async def test_thirty_followers_survive_the_leaders_disconnect() -> None:
+    registry = await _registered_peer()
+    http = BlockingHttp()
+    fetcher = PeerChunkFetcher(FakePool(residency_row()), registry, "node-a", http, auth_secret=SECRET)
+
+    leader_reader = asyncio.create_task(fetcher(OBJ, 1, 3, 0))
+    await asyncio.wait_for(http.started.wait(), timeout=1)
+    followers = [asyncio.create_task(fetcher(OBJ, 1, 3, 0)) for _ in range(30)]
+    await asyncio.sleep(0)
+
+    leader_reader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader_reader
+
+    http.release.set()
+    assert await asyncio.gather(*followers) == [b"peer-bytes"] * 30
+    assert http.attempts == 1
+    assert fetcher._inflight_chunks == {}
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_slot_wait_leaks_no_slot(monkeypatch) -> None:
+    """The bounded acquire is cancelled on timeout; the slot the holder has must still come back."""
+    monkeypatch.setattr("hippius_s3.cache.peers._record_shed", lambda _reason: None)
+    registry = await _registered_peer()
+    http = BlockingHttp()
+    fetcher = PeerChunkFetcher(
+        FakePool(unreplicated_row()),
+        registry,
+        "node-a",
+        http,
+        max_inflight=1,
+        auth_secret=SECRET,
+        unreplicated_wait_seconds=0.05,
+    )
+
+    holder = asyncio.create_task(fetcher(OBJ, 1, 3, 0))
+    await asyncio.wait_for(http.started.wait(), timeout=1)
+    slots = fetcher._inflight[PEER_URL]
+    assert slots.locked()
+    assert await asyncio.wait_for(fetcher(OBJ, 1, 3, 1), timeout=1) is None
+    assert slots.locked(), "the holder still has the one slot; the timed-out waiter took nothing"
+
+    http.release.set()
+    assert await holder == b"peer-bytes"
+    assert not slots.locked(), "and the holder gave it back"
+    assert await fetcher(OBJ, 1, 3, 2) == b"peer-bytes", "the slot is usable again"
+
+
+@pytest.mark.asyncio
+async def test_every_busy_answer_within_the_budget_is_counted(monkeypatch) -> None:
+    recorded: list[str] = []
+    monkeypatch.setattr("hippius_s3.cache.peers._record_shed", recorded.append)
+    registry = await _registered_peer()
+    http = FakeHttp(503)
+    fetcher = PeerChunkFetcher(
+        FakePool(unreplicated_row()), registry, "node-a", http, auth_secret=SECRET, unreplicated_wait_seconds=0.2
+    )
+
+    assert await fetcher(OBJ, 1, 3, 0) is None
+    assert len(http.urls) >= 2
+    assert recorded == ["server_busy"] * len(http.urls), "one server_busy per attempt, nothing else"
+    assert fetcher.last_owner(OBJ, 1, 3) == "node-b", "a busy peer never poisons the memo"
+
+
+@pytest.mark.asyncio
+async def test_locate_reports_no_owner_while_the_memo_is_poisoned() -> None:
+    """After a dead peer poisons the part, the read path must not skip the Arion download on the
+    strength of an owner it just failed to reach."""
+    registry = await _registered_peer()
+    fetcher = PeerChunkFetcher(FakePool(residency_row()), registry, "node-a", FailingHttp(), auth_secret=SECRET)
+
+    assert await fetcher.locate(OBJ, 1, 3) == ("node-b", False)
+    assert await fetcher(OBJ, 1, 3, 0) is None
+    assert await fetcher.locate(OBJ, 1, 3) == (None, False)
+    assert fetcher.last_owner(OBJ, 1, 3) is None

@@ -1,8 +1,11 @@
 """The peer-resolution query, executed against real Postgres.
 
-`PeerChunkFetcher._resolve_part` answers two questions in one statement: which node holds this
-part on flash, and what the exact ciphertext size of each of its chunks is. The second is what
-lets a peer's 200 be checked before its body is served and promoted onto local flash.
+`PeerChunkFetcher._resolve_part` answers three questions in one statement: which node holds this
+part on flash, what the exact ciphertext size of each of its chunks is, and whether that holder
+is the ONLY copy (the fresh-part arm won, so the pool has nothing to shed to). The second is what
+lets a peer's 200 be checked before its body is served and promoted onto local flash; the third
+is what makes the fetcher wait on a busy peer instead of shedding, so it has to come from the
+SQL — `tier_pref` — and not from a Python-side guess.
 
 **Why this file exists rather than another unit test.** The unit suite drives the fetcher through
 a fake connection that returns a canned row and never looks at the SQL, so a statement Postgres
@@ -48,6 +51,9 @@ PEER = "k8s-v3-node3"
 # sorts BEFORE `PEER`: the residency primary key leads with node_id, so a plan that reads the
 # index would otherwise hand back the long-held copy by luck of the alphabet.
 PROMOTED_PEER = "k8s-v3-node1"
+
+# `(owner, sizes, unreplicated)` for a part no peer serves.
+NO_PEER = (None, {}, False)
 
 
 class _SingleConnPool:
@@ -224,10 +230,11 @@ async def test_the_owner_and_every_chunk_size_come_back_from_one_statement(conn:
     object_id = str(uuid.uuid4())
     await _seed(conn, object_id=object_id, sizes=[4194332, 4194332, 1048604])
 
-    owner, sizes = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+    owner, sizes, unreplicated = await _fetcher(conn)._resolve_part(object_id, 1, 3)
 
     assert owner == PEER
     assert sizes == {0: 4194332, 1: 4194332, 2: 1048604}, "the exact per-chunk sizes, keyed by chunk index"
+    assert unreplicated is False, "a replicated residency owner has a pool copy behind it"
 
 
 async def test_a_short_final_chunk_keeps_its_own_size(conn: asyncpg.Connection) -> None:
@@ -239,7 +246,7 @@ async def test_a_short_final_chunk_keeps_its_own_size(conn: asyncpg.Connection) 
     object_id = str(uuid.uuid4())
     await _seed(conn, object_id=object_id, sizes=[100, 100, 100, 40])
 
-    _, sizes = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+    _, sizes, _ = await _fetcher(conn)._resolve_part(object_id, 1, 3)
 
     assert sizes[3] == 40
     assert sizes[1] == 100
@@ -250,7 +257,7 @@ async def test_a_part_no_other_node_holds_resolves_to_no_peer(conn: asyncpg.Conn
     object_id = str(uuid.uuid4())
     await _seed(conn, object_id=object_id, sizes=[100], resident_on=NODE)
 
-    assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == (None, {})
+    assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == NO_PEER
 
 
 async def test_an_unreplicated_part_with_no_claimant_resolves_to_no_peer(conn: asyncpg.Connection) -> None:
@@ -263,7 +270,7 @@ async def test_an_unreplicated_part_with_no_claimant_resolves_to_no_peer(conn: a
     object_id = str(uuid.uuid4())
     await _seed(conn, object_id=object_id, sizes=[100], status="draining")
 
-    assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == (None, {})
+    assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == NO_PEER
 
 
 async def test_a_fresh_part_resolves_to_its_drain_claimant(conn: asyncpg.Connection) -> None:
@@ -278,10 +285,11 @@ async def test_a_fresh_part_resolves_to_its_drain_claimant(conn: asyncpg.Connect
     object_id = str(uuid.uuid4())
     await _seed(conn, object_id=object_id, sizes=[100, 40], resident_on=None, status="pending", claimed_by=PEER)
 
-    owner, sizes = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+    owner, sizes, unreplicated = await _fetcher(conn)._resolve_part(object_id, 1, 3)
 
     assert owner == PEER
     assert sizes == {0: 100, 1: 40}, "the size check applies to fresh parts exactly as to replicated ones"
+    assert unreplicated is True, "the claimant's SSD is the only copy, so the fetcher must wait rather than shed"
 
 
 async def test_a_fresh_part_claimed_by_this_node_resolves_to_no_peer(conn: asyncpg.Connection) -> None:
@@ -290,7 +298,7 @@ async def test_a_fresh_part_claimed_by_this_node_resolves_to_no_peer(conn: async
     object_id = str(uuid.uuid4())
     await _seed(conn, object_id=object_id, sizes=[100], resident_on=None, status="pending", claimed_by=NODE)
 
-    assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == (None, {})
+    assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == NO_PEER
 
 
 async def test_a_corrupt_part_resolves_to_the_claimant_whose_ssd_is_the_last_good_source(
@@ -302,10 +310,11 @@ async def test_a_corrupt_part_resolves_to_the_claimant_whose_ssd_is_the_last_goo
     object_id = str(uuid.uuid4())
     await _seed(conn, object_id=object_id, sizes=[100], resident_on=None, status="corrupt", claimed_by=PEER)
 
-    owner, sizes = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+    owner, sizes, unreplicated = await _fetcher(conn)._resolve_part(object_id, 1, 3)
 
     assert owner == PEER
     assert sizes == {0: 100}
+    assert unreplicated is True, "the pool copy is the one that failed verification"
 
 
 async def test_a_failed_part_still_resolves_to_no_peer(conn: asyncpg.Connection) -> None:
@@ -316,7 +325,7 @@ async def test_a_failed_part_still_resolves_to_no_peer(conn: asyncpg.Connection)
     object_id = str(uuid.uuid4())
     await _seed(conn, object_id=object_id, sizes=[100], resident_on=None, status="failed", claimed_by=PEER)
 
-    assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == (None, {})
+    assert await _fetcher(conn)._resolve_part(object_id, 1, 3) == NO_PEER
 
 
 async def test_a_redriven_part_resolves_to_the_claimant_not_the_stale_residency(
@@ -343,9 +352,10 @@ async def test_a_redriven_part_resolves_to_the_claimant_not_the_stale_residency(
         claimed_at=datetime(2026, 8, 1, 9, 0, tzinfo=timezone.utc),
     )
 
-    owner, _ = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+    owner, _, unreplicated = await _fetcher(conn)._resolve_part(object_id, 1, 3)
 
     assert owner == PEER, "the claimant's SSD copy is the source during a redrive; stale residency must not win"
+    assert unreplicated is True, "and the pool copy is suspect for the whole redrive, so a shed there has nowhere to go"
 
 
 async def test_a_part_with_no_recorded_chunks_resolves_to_an_owner_but_no_sizes(conn: asyncpg.Connection) -> None:
@@ -363,10 +373,11 @@ async def test_a_part_with_no_recorded_chunks_resolves_to_an_owner_but_no_sizes(
     object_id = str(uuid.uuid4())
     await _seed(conn, object_id=object_id, sizes=[])
 
-    owner, sizes = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+    owner, sizes, unreplicated = await _fetcher(conn)._resolve_part(object_id, 1, 3)
 
     assert owner == PEER
     assert sizes == {}
+    assert unreplicated is False
 
 
 async def test_the_longest_resident_copy_wins_when_several_nodes_hold_the_part(
@@ -395,10 +406,11 @@ async def test_the_longest_resident_copy_wins_when_several_nodes_hold_the_part(
     await _seed(conn, object_id=object_id, sizes=[100], resident_on=PROMOTED_PEER, resident_at=promoted_at)
     await _add_residency(conn, object_id=object_id, node=PEER, resident_at=ingested_at)
 
-    owner, sizes = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+    owner, sizes, unreplicated = await _fetcher(conn)._resolve_part(object_id, 1, 3)
 
     assert owner == PEER, "a copy promoted five days later won over the long-held one"
     assert sizes == {0: 100}, "and the sizes still come back alongside the owner"
+    assert unreplicated is False, "the read tier proper won, whichever copy it picked"
 
 
 async def test_another_parts_chunk_sizes_are_not_mixed_in(conn: asyncpg.Connection) -> None:
@@ -408,8 +420,8 @@ async def test_another_parts_chunk_sizes_are_not_mixed_in(conn: asyncpg.Connecti
     await _seed(conn, object_id=object_id, sizes=[100, 100], part_number=3)
     await _seed(conn, object_id=object_id, sizes=[7], part_number=4)
 
-    _, part_three = await _fetcher(conn)._resolve_part(object_id, 1, 3)
-    _, part_four = await _fetcher(conn)._resolve_part(object_id, 1, 4)
+    _, part_three, _ = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+    _, part_four, _ = await _fetcher(conn)._resolve_part(object_id, 1, 4)
 
     assert part_three == {0: 100, 1: 100}
     assert part_four == {0: 7}

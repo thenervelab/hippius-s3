@@ -52,6 +52,9 @@ chunk)`: N readers of one chunk on a pod share ONE peer fetch, awaited through `
 so the reader that started it disconnecting does not cancel it for the rest. Only in-flight
 leaders are held, so memory stays bounded by the per-peer slots (≤ cap × chunk size per peer per
 pod). A failed fetch is not cached — every waiter gets the `None` and takes its own fallback.
+A leader cancelled from outside (shutdown) is a failed fetch to its followers, never their own
+cancellation: `shield` would otherwise re-raise `CancelledError` — not an `Exception`, so past
+the store's peer guard — in every stream sharing that chunk.
 
 **Unreplicated parts wait instead of shedding.** "Shed to the pool" assumes a pool copy. A
 fresh part is on its ingest node's SSD alone until the drain replicates it, so a shed there

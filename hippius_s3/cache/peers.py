@@ -663,21 +663,28 @@ class PeerChunkFetcher:
         """
         chunk_key = (str(object_id), int(object_version), int(part_number), int(chunk_index))
         leader = self._inflight_chunks.get(chunk_key)
-        if leader is None:
-            leader = asyncio.create_task(self._lead(chunk_key, object_id, object_version, part_number, chunk_index))
+        # A cancelled leader still in the map never ran: it was cancelled before its first step,
+        # so the cleanup in `_lead` never happened. Nobody will fetch on its behalf — start over.
+        if leader is None or leader.cancelled():
+            leader = asyncio.create_task(self._lead(chunk_key))
             self._inflight_chunks[chunk_key] = leader
-        return await asyncio.shield(leader)
-
-    async def _lead(
-        self,
-        chunk_key: tuple[str, int, int, int],
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        chunk_index: int,
-    ) -> Optional[bytes]:
         try:
-            return await self._fetch_one(object_id, object_version, part_number, chunk_index)
+            return await asyncio.shield(leader)
+        except asyncio.CancelledError:
+            # `shield` re-raises the LEADER's cancellation in every waiter, and CancelledError is
+            # not an Exception, so it would escape the store's peer guard and end N streams as if
+            # their own clients had gone. Only this task's own cancellation propagates; a leader
+            # cancelled from outside is one more failed fetch, and its key goes with it.
+            current = asyncio.current_task()
+            if not leader.cancelled() or (current is not None and current.cancelling()):
+                raise
+            if self._inflight_chunks.get(chunk_key) is leader:
+                del self._inflight_chunks[chunk_key]
+            return None
+
+    async def _lead(self, chunk_key: tuple[str, int, int, int]) -> Optional[bytes]:
+        try:
+            return await self._fetch_one(*chunk_key)
         finally:
             # Only the leader that owns this key may remove it; a follower arriving after this
             # point starts a fresh leader, which is the right thing for a chunk that is no

@@ -274,15 +274,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         async def _announce_promoted(object_id: str, object_version: int, part_number: int, chunk_index: int) -> None:
             # A reader that missed every tier is parked in wait_for_chunk on this chunk's pub/sub
             # channel, and promotion is the only writer here that never published to it. Resolved
-            # through app.state at call time because obj_cache is built from the store below.
-            # Best-effort Redis publish: a missed wakeup degrades to the waiter's timeout
-            # re-check, never to a failed read that already has its bytes.
-            try:
-                await app.state.obj_cache.notify_chunk(object_id, object_version, part_number, chunk_index)
-            except Exception as exc:  # noqa: BLE001 - observability must not fail a read
-                logger.debug(
-                    "promoted-chunk notify failed for %s v%s part %s: %s", object_id, object_version, part_number, exc
-                )
+            # through app.state at call time because obj_cache is built from the store below,
+            # which also contains a failed publish so it never fails the read.
+            await app.state.obj_cache.notify_chunk(object_id, object_version, part_number, chunk_index)
 
         app.state.fs_store = create_fs_store(
             config,

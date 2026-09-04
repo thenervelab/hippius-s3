@@ -385,3 +385,76 @@ async def test_a_part_a_peer_holds_replicated_is_still_sent_to_the_downloader(
 
     assert ctx.source == "pipeline"
     mock_enqueue.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@patch("hippius_s3.services.object_reader.get_bucket_kek_bytes", new=AsyncMock(return_value=b"k" * 32))
+@patch("hippius_s3.services.object_reader.unwrap_dek", new=MagicMock(return_value=b"d" * 32))
+@patch("hippius_s3.services.object_reader.CryptoService.is_supported_suite_id", new=MagicMock(return_value=True))
+@patch("hippius_s3.services.object_reader.resolve_object_backends", new=AsyncMock(return_value=["arion"]))
+@patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.build_chunk_plan", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.read_parts_list", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.get_config")
+async def test_an_unreplicated_flag_without_an_owner_never_suppresses_the_downloader(
+    mock_cfg,
+    mock_parts,
+    mock_plan,
+    mock_enqueue,
+    tmp_path,
+):
+    """No reachable owner means nobody serves the part on the way through; the download stays."""
+    from hippius_s3.services.object_reader import build_stream_context
+
+    mock_cfg.return_value = _stub_config()
+    mock_parts.return_value = [{"part_number": 1, "plain_size": 4096, "cid": None}]
+    mock_plan.return_value = _mock_plan(2)
+
+    obj_cache = _tiered_obj_cache(tmp_path, _LocatingFetcher(None, True), [False, False])
+
+    ctx = await build_stream_context(
+        db=_mock_db_pool(),
+        redis=_RedisStub(),
+        obj_cache=obj_cache,
+        info=_info(),
+        rng=None,
+        address="addr",
+    )
+
+    assert ctx.source == "pipeline"
+    mock_enqueue.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@patch("hippius_s3.services.object_reader.get_bucket_kek_bytes", new=AsyncMock(return_value=b"k" * 32))
+@patch("hippius_s3.services.object_reader.unwrap_dek", new=MagicMock(return_value=b"d" * 32))
+@patch("hippius_s3.services.object_reader.CryptoService.is_supported_suite_id", new=MagicMock(return_value=True))
+@patch("hippius_s3.services.object_reader.resolve_object_backends", new=AsyncMock(return_value=["arion"]))
+@patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.build_chunk_plan", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.read_parts_list", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.get_config")
+async def test_a_store_without_a_peer_tier_enqueues_exactly_as_before(
+    mock_cfg,
+    mock_parts,
+    mock_plan,
+    mock_enqueue,
+):
+    """HIPPIUS_PEER_FETCH_ENABLED=false: the facade has no tiered store, and nothing is skipped."""
+    from hippius_s3.services.object_reader import build_stream_context
+
+    mock_cfg.return_value = _stub_config()
+    mock_parts.return_value = [{"part_number": 1, "plain_size": 4096, "cid": None}]
+    mock_plan.return_value = _mock_plan(2)
+
+    ctx = await build_stream_context(
+        db=_mock_db_pool(),
+        redis=_RedisStub(),
+        obj_cache=_mock_obj_cache([False, False]),
+        info=_info(),
+        rng=None,
+        address="addr",
+    )
+
+    assert ctx.source == "pipeline"
+    mock_enqueue.assert_awaited_once()

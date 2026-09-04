@@ -369,3 +369,50 @@ async def test_a_failing_peer_locate_never_fails_the_read_path(tmp_path) -> None
     dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), peer_fetch=_Broken("node-b", True))
 
     assert await dual.peer_locate(OBJ, 1, 1) == (None, False)
+
+
+@pytest.mark.asyncio
+async def test_a_raising_promoted_hook_fails_neither_the_promotion_nor_the_read(tmp_path) -> None:
+    """The hook is a wakeup for OTHER readers; this reader already has its bytes, and the copy
+    that landed stays landed."""
+
+    async def _hook(*args: object) -> None:
+        raise ConnectionError("redis down")
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), promote=True, on_promoted=_hook)
+    await _write_part(dual.fallback, part_number=1, chunk=b"pool-only")
+
+    assert await dual.get_chunk(OBJ, 1, 1, 0) == b"pool-only"
+    assert await FileSystemPartsStore.get_chunk(dual, OBJ, 1, 1, 0) == b"pool-only", (
+        "the promoted copy is on local flash"
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_streams_count_into_their_own_tier_dicts(tmp_path) -> None:
+    """One stream's counter must never see another's reads, however interleaved their fetches are."""
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))
+    await _write_part(dual.fallback, part_number=1, chunk=b"pool-only")
+    await _write_part(dual, part_number=2, chunk=b"on-ssd")
+
+    gate = asyncio.Event()
+
+    async def _stream(counts: dict[str, int], part_number: int, reads: int) -> None:
+        _stream_tiers.set(counts)
+        await gate.wait()
+        # Spawned fetches, as the streamer does it: each inherits this stream's dict by reference.
+        await asyncio.gather(*(asyncio.create_task(dual.get_chunk(OBJ, 1, part_number, 0)) for _ in range(reads)))
+
+    pool_counts: dict[str, int] = {}
+    local_counts: dict[str, int] = {}
+    streams = [
+        asyncio.create_task(_stream(pool_counts, 1, 3)),
+        asyncio.create_task(_stream(local_counts, 2, 5)),
+    ]
+    await asyncio.sleep(0)
+    gate.set()
+    await asyncio.gather(*streams)
+
+    assert pool_counts == {"pool": 3}
+    assert local_counts == {"local": 5}
+    assert _stream_tiers.get() is None, "neither stream's counter leaked into the spawning task"
