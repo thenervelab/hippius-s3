@@ -295,8 +295,9 @@ throwaway `locality-probe-<epoch>` bucket, checks that `HIPPIUS_PROBE_KEYS` sing
 back (GET × `HIPPIUS_PROBE_GETS`, HEAD) from their PUT node and reports how the PUT nodes spread,
 that a 4 x 5 MiB multipart upload (Create, UploadPart, ListParts, Complete, GETs) and an aborted
 one sit on one node, that repeated `ListObjectsV2`/`HeadBucket` spread over more than one node,
-and that Range, `?versionId` and a presigned GET of one key all land on its PUT node. Every response's `X-Hippius-Node` is captured
-through a botocore `after-call` hook; a missing header fails the check rather than crashing.
+and that Range, `?versionId` and a presigned GET of one key all land on its PUT node. Every
+response's `X-Hippius-Node` is captured through a botocore `after-call` hook; a missing header
+fails the check rather than crashing.
 
 ```bash
 source .venv/bin/activate
