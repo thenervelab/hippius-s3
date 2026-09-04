@@ -28,6 +28,9 @@ import asyncio
 import ipaddress
 import json
 import logging
+import random
+import time
+from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -161,6 +164,41 @@ _DEFAULT_MAX_INFLIGHT_PER_PEER = 16
 # things: 0.5s of silence is a dead peer, but 0.5s to deliver a whole 4 MiB chunk is a peer
 # doing its job. Reusing the loss-cut here would abort healthy large-chunk fetches.
 _DEFAULT_DEADLINE_SECONDS = 2.0
+
+# How long a fetch of an UNREPLICATED part waits for a per-peer slot, or retries a peer's 503,
+# before giving up. For a replicated part a shed costs one pool read (~40 ms). For a part the
+# drain has not copied to the pool yet there IS no pool read: the shed falls to a copy that does
+# not exist and the reader blocks in `wait_for_chunk` — 25s then a 503 on the first chunk, up to
+# `stream_chunk_timeout_seconds` mid-stream — because nothing publishes a notify for a chunk the
+# drain lands. Seen on prod as a 5 GB download at 52.8 MB/s. Waiting on the peer is the only
+# path that has the bytes. 0 restores the shed-always behaviour.
+_DEFAULT_UNREPLICATED_WAIT_SECONDS = 10.0
+# Backoff for a peer that answered 503 on an unreplicated part: 0.05 * 2**n, capped, jittered so
+# the readers a serve cap just shed together do not all come back on the same tick.
+_BUSY_BACKOFF_BASE_SECONDS = 0.05
+_BUSY_BACKOFF_CAP_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class PartOwner:
+    """What the per-part memo remembers: where the part is, and whether the pool has it too.
+
+    `base` is None for a memoised "no peer has this". `unreplicated` is True when the owner came
+    from the fresh-part hint or from `cephor_replication_status` in a non-replicated state — the
+    peer's SSD is then the ONLY copy, so a shed there falls to nothing.
+    """
+
+    base: Optional[str]
+    sizes: dict[int, int]
+    node_name: Optional[str]
+    unreplicated: bool
+
+
+_NO_OWNER = PartOwner(None, {}, None, False)
+
+
+class _PeerBusy(Exception):
+    """The peer answered 503: it shed the request to protect its own ingest. Transient."""
 
 
 def effective_max_inflight(configured: int, prefetch_chunks: int) -> int:
@@ -398,6 +436,7 @@ class PeerChunkFetcher:
         auth_secret: str,
         max_inflight: int = _DEFAULT_MAX_INFLIGHT_PER_PEER,
         deadline_seconds: float = _DEFAULT_DEADLINE_SECONDS,
+        unreplicated_wait_seconds: float = _DEFAULT_UNREPLICATED_WAIT_SECONDS,
     ) -> None:
         self._pool = pool
         self._registry = registry
@@ -407,6 +446,7 @@ class PeerChunkFetcher:
         # default would only let a caller build a fetcher that silently never fetches.
         self._auth_secret = auth_secret
         self._deadline = deadline_seconds
+        self._unreplicated_wait = float(unreplicated_wait_seconds)
         # Caches the resolved base URL and the part's per-chunk ciphertext sizes, so the one
         # query that yields both is paid once per part rather than once per chunk. A `None`
         # result is cached too — "no peer has this" is just as per-part — but only for
@@ -416,7 +456,7 @@ class PeerChunkFetcher:
         # The sizes are kept ONLY when a peer actually resolved. They are the expensive half of
         # the entry (one int per chunk, so ~1280 for a 5 GiB part), and a pool-only part — the
         # common case, and the one that would otherwise dominate this memo — never needs them.
-        self._owner_url: PartMemo[tuple[str, int, int], tuple[Optional[str], dict[int, int]]] = PartMemo(
+        self._owner_url: PartMemo[tuple[str, int, int], PartOwner] = PartMemo(
             _OWNER_MEMO_TTL_SECONDS, _OWNER_MEMO_ENTRIES
         )
         self._max_inflight = max_inflight
@@ -424,11 +464,17 @@ class PeerChunkFetcher:
         # THIS pod sends; the serving side has its own limiter, because five pods each within
         # their own cap still add up at the peer.
         self._inflight: dict[str, asyncio.Semaphore] = {}
+        # Singleflight: N readers of one chunk on this pod share ONE peer fetch. Holds only
+        # in-flight leaders (a leader removes its own key as it finishes), so it drains itself,
+        # and memory stays bounded by the per-peer slots — at most `max_inflight` chunks in
+        # flight per peer, each held once however many readers wait on it.
+        self._inflight_chunks: dict[tuple[str, int, int, int], asyncio.Task[Optional[bytes]]] = {}
 
     async def _resolve_part(
         self, object_id: str, object_version: int, part_number: int
-    ) -> tuple[Optional[str], dict[int, int]]:
-        """Who holds the part on flash, and the exact ciphertext size of each of its chunks.
+    ) -> tuple[Optional[str], dict[int, int], bool]:
+        """Who holds the part on flash, the exact ciphertext size of each of its chunks, and
+        whether that holder is UNREPLICATED (the fresh-part arm below won: tier_pref = 1).
 
         Residency — not `cephor_replication_status.node_id` — is the ground truth for "who
         has it on flash right now": the ingest node may have evicted its copy, and a
@@ -456,7 +502,7 @@ class PeerChunkFetcher:
             row = await conn.fetchrow(
                 """
                 WITH owner AS (
-                    SELECT node_id FROM (
+                    SELECT node_id, tier_pref FROM (
                         -- The read tier proper: any node holding a REPLICATED copy on flash.
                         SELECT r.node_id, 0 AS tier_pref, r.resident_at AS ord
                         FROM cephor_ssd_residency r
@@ -491,7 +537,7 @@ class PeerChunkFetcher:
                     ORDER BY tier_pref, ord
                     LIMIT 1
                 )
-                SELECT o.node_id, sizes.chunk_indexes, sizes.cipher_sizes
+                SELECT o.node_id, o.tier_pref, sizes.chunk_indexes, sizes.cipher_sizes
                 FROM owner o
                 LEFT JOIN LATERAL (
                     SELECT
@@ -508,10 +554,16 @@ class PeerChunkFetcher:
                 self._node_name,
             )
         if row is None:
-            return None, {}
+            return None, {}, False
         indexes = row["chunk_indexes"] or []
         sizes = row["cipher_sizes"] or []
-        return str(row["node_id"]), {int(i): int(s) for i, s in zip(indexes, sizes, strict=False)}
+        # Which UNION arm won. Only the fresh-part arm (tier 1) means the pool has no copy yet.
+        unreplicated = int(row.get("tier_pref") or 0) == 1
+        return (
+            str(row["node_id"]),
+            {int(i): int(s) for i, s in zip(indexes, sizes, strict=False)},
+            unreplicated,
+        )
 
     async def _chunk_sizes(self, object_id: str, object_version: int, part_number: int) -> dict[int, int]:
         """Ciphertext size of each chunk. Used when the owner came from the fresh-part hint."""
@@ -540,10 +592,14 @@ class PeerChunkFetcher:
     async def _uncached_owner(
         self, object_id: str, object_version: int, part_number: int
     ) -> tuple[Optional[str], dict[int, int], bool]:
-        """Who holds the part, its cipher sizes, and whether that came from the Redis hint."""
-        owner, sizes = await self._resolve_part(object_id, object_version, part_number)
+        """Who holds the part, its cipher sizes, and whether its SSD copy is the only one.
+
+        The Redis hint exists for the window before the drain has claimed the part, so a hinted
+        owner is unreplicated by construction.
+        """
+        owner, sizes, unreplicated = await self._resolve_part(object_id, object_version, part_number)
         if owner is not None:
-            return owner, sizes, False
+            return owner, sizes, unreplicated
         hinted = await self._registry.lookup_fresh_part(object_id, object_version, part_number)
         if hinted is None:
             return None, {}, False
@@ -551,6 +607,42 @@ class PeerChunkFetcher:
         if not hinted_sizes:
             hinted_sizes = await self._chunk_sizes(object_id, object_version, part_number)
         return node, hinted_sizes, True
+
+    async def _owner(self, object_id: str, object_version: int, part_number: int) -> PartOwner:
+        """The memoised owner of a part, resolving and memoising it on a miss."""
+        part_key = (str(object_id), int(object_version), int(part_number))
+        cached = self._owner_url.get(part_key)
+        if cached is not None:
+            return cached
+        owner, sizes, unreplicated = await self._uncached_owner(object_id, object_version, part_number)
+        base = await self._registry.resolve(owner) if owner is not None else None
+        if base is None or not sizes:
+            # No peer, or we found the ingest node but not per-chunk sizes (postgres
+            # replica lag / write_meta before the tail txn). A 30s positive memo of
+            # empty sizes made Harbor startedat GETs wait out drain-to-pool (~14s).
+            self._owner_url.put(part_key, _NO_OWNER, ttl_seconds=_NEGATIVE_OWNER_MEMO_TTL_SECONDS)
+            return _NO_OWNER
+        # Paired with the base so a cached "no peer" is distinguishable from a cache miss —
+        # otherwise every pool-only part would re-query on every chunk.
+        entry = PartOwner(base, sizes, owner, unreplicated)
+        self._owner_url.put(part_key, entry)
+        return entry
+
+    async def locate(self, object_id: str, object_version: int, part_number: int) -> tuple[Optional[str], bool]:
+        """`(owner node name or None, unreplicated)` for a part, through the memo a fetch uses.
+
+        An owner is reported only when it is actually fetchable (registered, sizes known), so a
+        caller that skips work on the strength of it — the read path skips the Arion download
+        of an unreplicated peer-held part, which Arion cannot have yet — never skips it for a
+        peer this pod could not reach.
+        """
+        owner = await self._owner(object_id, object_version, part_number)
+        return owner.node_name, owner.unreplicated
+
+    def last_owner(self, object_id: str, object_version: int, part_number: int) -> Optional[str]:
+        """The memoised owner node name with no lookup; None when nothing is memoised."""
+        cached = self._owner_url.get((str(object_id), int(object_version), int(part_number)))
+        return None if cached is None else cached.node_name
 
     async def __call__(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int
@@ -560,32 +652,56 @@ class PeerChunkFetcher:
         Returns None rather than raising on every failure path. The caller treats a peer as
         an optimisation over an authoritative pool copy, so "no peer answered" and "the peer
         errored" are the same outcome: read the pool.
+
+        Singleflight per chunk: concurrent readers of one chunk on this pod share one fetch.
+        Before this, N readers of a hot object each fetched every chunk — N x the peer traffic
+        for one object's worth of bytes, and N x the slots, so readers 2..N shed each other to
+        the pool. The shared fetch runs in its own task and every reader awaits it through
+        `shield`, so a reader whose client disconnects mid-fetch does not cancel the fetch the
+        others are waiting on. A failed fetch is not cached: every waiter sees the None and
+        takes its own fallback path.
         """
-        part_key = (str(object_id), int(object_version), int(part_number))
-        cached = self._owner_url.get(part_key)
-        from_fresh_hint = False
-        if cached is not None:
-            base, sizes = cached
-        else:
-            owner, sizes, from_fresh_hint = await self._uncached_owner(object_id, object_version, part_number)
-            base = await self._registry.resolve(owner) if owner is not None else None
-            if base is None or not sizes:
-                # No peer, or we found the ingest node but not per-chunk sizes (postgres
-                # replica lag / write_meta before the tail txn). A 30s positive memo of
-                # empty sizes made Harbor startedat GETs wait out drain-to-pool (~14s).
-                self._owner_url.put(
-                    part_key,
-                    (None, {}),
-                    ttl_seconds=_NEGATIVE_OWNER_MEMO_TTL_SECONDS,
-                )
-                return None
-            # Paired with the base so a cached "no peer" (None) is distinguishable from a
-            # cache miss — otherwise every pool-only part would re-query on every chunk.
-            self._owner_url.put(part_key, (base, sizes))
+        chunk_key = (str(object_id), int(object_version), int(part_number), int(chunk_index))
+        leader = self._inflight_chunks.get(chunk_key)
+        # A cancelled leader still in the map never ran: it was cancelled before its first step,
+        # so the cleanup in `_lead` never happened. Nobody will fetch on its behalf — start over.
+        if leader is None or leader.cancelled():
+            leader = asyncio.create_task(self._lead(chunk_key))
+            self._inflight_chunks[chunk_key] = leader
+        try:
+            return await asyncio.shield(leader)
+        except asyncio.CancelledError:
+            # `shield` re-raises the LEADER's cancellation in every waiter, and CancelledError is
+            # not an Exception, so it would escape the store's peer guard and end N streams as if
+            # their own clients had gone. Only this task's own cancellation propagates; a leader
+            # cancelled from outside is one more failed fetch, and its key goes with it.
+            current = asyncio.current_task()
+            if not leader.cancelled() or (current is not None and current.cancelling()):
+                raise
+            if self._inflight_chunks.get(chunk_key) is leader:
+                del self._inflight_chunks[chunk_key]
+            return None
+
+    async def _lead(self, chunk_key: tuple[str, int, int, int]) -> Optional[bytes]:
+        try:
+            return await self._fetch_one(*chunk_key)
+        finally:
+            # Only the leader that owns this key may remove it; a follower arriving after this
+            # point starts a fresh leader, which is the right thing for a chunk that is no
+            # longer in flight.
+            if self._inflight_chunks.get(chunk_key) is asyncio.current_task():
+                del self._inflight_chunks[chunk_key]
+
+    async def _fetch_one(
+        self, object_id: str, object_version: int, part_number: int, chunk_index: int
+    ) -> Optional[bytes]:
+        """The leader's fetch: resolve the owner, take a slot, read the chunk."""
+        owner = await self._owner(object_id, object_version, part_number)
+        base = owner.base
         if base is None:
             return None
 
-        expected = sizes.get(int(chunk_index))
+        expected = owner.sizes.get(int(chunk_index))
         if expected is None:
             # No recorded size means no way to tell a correct body from a truncated one, and an
             # unverified body gets promoted onto local flash, where it wins the read tier.
@@ -618,14 +734,53 @@ class PeerChunkFetcher:
         # of one part shed its own prefetch window, because every chunk of a part resolves to
         # the same peer. `effective_max_inflight` now floors the cap at the prefetch depth, so
         # that case is gone and a `client_cap` count is trustworthy as a contention signal.
-        if slots.locked():
-            _record_shed("client_cap")
-            return None
-
+        #
+        # None of that holds for an UNREPLICATED part. The pool has no copy to shed to, so a
+        # shed does not cost a ~40 ms pool read — it parks the reader in `wait_for_chunk` for
+        # the whole chunk timeout. Waiting on the slot, and retrying a 503, is strictly better
+        # than that, and is bounded by `unreplicated_wait_seconds`.
         url = f"{base}/internal/parts/{object_id}/{object_version}/{part_number}/chunks/{chunk_index}"
-        try:
+        part_key = (str(object_id), int(object_version), int(part_number))
+        if not owner.unreplicated or self._unreplicated_wait <= 0:
+            if slots.locked():
+                _record_shed("client_cap")
+                return None
             async with slots:
-                return await asyncio.wait_for(self._fetch_verified(url, expected), self._deadline)
+                try:
+                    return await self._attempt(url, expected, part_key, owner)
+                except _PeerBusy:
+                    return None
+
+        deadline = time.monotonic() + self._unreplicated_wait
+        retries = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                await asyncio.wait_for(slots.acquire(), remaining)
+            except asyncio.TimeoutError:
+                _record_shed("client_cap")
+                return None
+            try:
+                return await self._attempt(url, expected, part_key, owner)
+            except _PeerBusy:
+                pass
+            finally:
+                slots.release()
+            backoff = min(_BUSY_BACKOFF_BASE_SECONDS * 2**retries, _BUSY_BACKOFF_CAP_SECONDS)
+            retries += 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(backoff * random.uniform(0.5, 1.0), remaining))
+
+    async def _attempt(
+        self, url: str, expected: int, part_key: tuple[str, int, int], owner: PartOwner
+    ) -> Optional[bytes]:
+        """One bounded fetch. Raises `_PeerBusy` on a 503; every other failure is a None."""
+        try:
+            return await asyncio.wait_for(self._fetch_verified(url, expected), self._deadline)
         except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
             # A registered-but-unreachable peer — a drained or cordoned node whose replacement
             # has not re-registered under the same key — stays resolvable until its TTL lapses.
@@ -640,9 +795,10 @@ class PeerChunkFetcher:
             #
             # Fresh-hinted parts are the exception: the peer SSD is the ONLY copy until drain
             # replicates. A 30s poison there made Harbor startedat wait ~14s for the pool.
-            poison_ttl = _NEGATIVE_OWNER_MEMO_TTL_SECONDS if from_fresh_hint else None
-            self._owner_url.put(part_key, (None, {}), ttl_seconds=poison_ttl)
-            logger.debug("peer fetch to %s failed, falling through to the pool: %s", base, exc)
+            # The same holds for any unreplicated owner, hinted or claimed by the drain.
+            poison_ttl = _NEGATIVE_OWNER_MEMO_TTL_SECONDS if owner.unreplicated else None
+            self._owner_url.put(part_key, _NO_OWNER, ttl_seconds=poison_ttl)
+            logger.debug("peer fetch to %s failed, falling through to the pool: %s", owner.base, exc)
             return None
 
     async def _fetch_verified(self, url: str, expected: int) -> Optional[bytes]:
@@ -665,9 +821,10 @@ class PeerChunkFetcher:
             if response.status_code == 503:
                 # The peer shed this request to protect its own ingest. Transient, so it must
                 # NOT poison the memo the way a connect failure does — that would keep the whole
-                # part on the pool long after a brief spike passed.
+                # part on the pool long after a brief spike passed. Raised rather than returned
+                # so the unreplicated path can tell "busy, retry" from every other None.
                 _record_shed("server_busy")
-                return None
+                raise _PeerBusy()
             if response.status_code == 404:
                 # Routine — the peer evicted the part between the residency read and now — and
                 # counted for exactly that reason. Under an eviction storm this is the entire

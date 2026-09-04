@@ -183,8 +183,11 @@ spec:
             # so the manifest states the intent rather than relying on the correction.
             - name: HIPPIUS_PEER_FETCH_MAX_INFLIGHT
               value: "16"
+            # (nodes-1) x per-peer fetch cap: every other node may have a full fetch window
+            # in flight against this one, and a fresh (unreplicated) part has no pool copy
+            # for a 503-shed reader to fall to.
             - name: HIPPIUS_PEER_SERVE_MAX_INFLIGHT
-              value: "16"
+              value: "64"
             - name: K8S_NAMESPACE
               valueFrom:
                 fieldRef:

@@ -117,3 +117,26 @@ async def test_zero_byte_object_streams_empty_body() -> None:
         )
         assert resp.status_code == 200
         assert await _collect(resp) == b""
+
+
+@pytest.mark.asyncio
+async def test_the_tier_counter_is_cleared_when_the_body_raises_mid_stream() -> None:
+    """The stream-end log runs from a finally, so a mid-stream fault still closes the counter
+    and the fault itself reaches the caller untouched."""
+    from hippius_s3.cache.dual_fs_store import _stream_tiers
+
+    async def _breaks():
+        yield b"first"
+        raise OSError("chunk lost mid-stream")
+
+    cfg = SimpleNamespace(
+        stream_first_chunk_timeout_seconds=5, stream_chunk_timeout_seconds=300, http_stream_prefetch_chunks=0
+    )
+    with _patched(cfg, _breaks):
+        resp = await object_reader.read_response(
+            db=None, redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
+        )
+        assert _stream_tiers.get() is not None, "set for the stream's fetches before the body runs"
+        with pytest.raises(OSError, match="mid-stream"):
+            await _collect(resp)
+    assert _stream_tiers.get() is None

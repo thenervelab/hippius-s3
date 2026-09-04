@@ -24,6 +24,8 @@ from fastapi.responses import StreamingResponse
 
 from hippius_s3.api.s3.common import build_headers
 from hippius_s3.backend_routing import resolve_object_backends
+from hippius_s3.cache.dual_fs_store import DualFileSystemPartsStore
+from hippius_s3.cache.dual_fs_store import _stream_tiers
 from hippius_s3.cache.notifier import ChunkNotReadyError
 from hippius_s3.config import get_config
 from hippius_s3.queue import DownloadChainRequest
@@ -38,6 +40,7 @@ from hippius_s3.reader.types import RangeRequest
 from hippius_s3.services.crypto_service import CryptoService
 from hippius_s3.services.envelope_service import unwrap_dek
 from hippius_s3.services.kek_service import get_bucket_kek_bytes
+from hippius_s3.services.ray_id_service import ray_id_context
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 
@@ -227,6 +230,7 @@ async def _enqueue_missing_downloads(
     exist_results: list[bool],
     address: str,
     cfg: Any,
+    skip_parts: set[int] | None = None,
 ) -> None:
     """Enqueue a DownloadChainRequest for the chunks in `plan` that are missing from the FS cache.
 
@@ -235,10 +239,13 @@ async def _enqueue_missing_downloads(
     read path AND the envelope-race version fallback — the fallback used to return a `pipeline`
     source without enqueuing anything, so a cold read of the fallback version hung on pub/sub until
     the wait timed out.
+
+    `skip_parts` are missing parts a peer holds unreplicated (see `_peer_held_unreplicated_parts`):
+    Arion cannot have them yet, so the download would only come back empty ~1s later.
     """
     indices_by_part: dict[int, set[int]] = {}
     for item, cached in zip(plan, exist_results, strict=True):
-        if not cached:
+        if not cached and int(item.part_number) not in (skip_parts or ()):
             indices_by_part.setdefault(int(item.part_number), set()).add(int(item.chunk_index))
     await _enqueue_download_for_parts(
         db,
@@ -250,6 +257,35 @@ async def _enqueue_missing_downloads(
         address=address,
         cfg=cfg,
     )
+
+
+def _dual_store(obj_cache: Any) -> DualFileSystemPartsStore | None:
+    """The tiered store behind the cache facade, or None where there is no peer/pool tiering."""
+    fs = getattr(obj_cache, "fs", None)
+    return fs if isinstance(fs, DualFileSystemPartsStore) else None
+
+
+async def _peer_held_unreplicated_parts(
+    obj_cache: Any, object_id: str, object_version: int, plan: list[ChunkPlanItem], exist_results: list[bool]
+) -> set[int]:
+    """The missing parts a reachable peer holds on SSD while the pool (and so Arion) has no copy.
+
+    A fresh part lives on its ingest node alone until the drain replicates it, and Arion is
+    uploaded from the pool copy after that — so a DownloadChainRequest for such a part comes back
+    with nothing. The peer tier serves it on the way through `wait_for_chunk` instead. Runs in
+    build_stream_context, where the resolver's Postgres query is still allowed; the answer is
+    memoised per part, so the streamer's own peer fetches pay nothing extra for it.
+    """
+    dual = _dual_store(obj_cache)
+    if dual is None:
+        return set()
+    missing = {int(item.part_number) for item, cached in zip(plan, exist_results, strict=True) if not cached}
+    held: set[int] = set()
+    for pn in sorted(missing):
+        owner, unreplicated = await dual.peer_locate(object_id, object_version, pn)
+        if owner is not None and unreplicated:
+            held.add(pn)
+    return held
 
 
 async def build_stream_context(
@@ -297,6 +333,7 @@ async def build_stream_context(
             exist_results=exist_results,
             address=address,
             cfg=cfg,
+            skip_parts=await _peer_held_unreplicated_parts(obj_cache, info["object_id"], ov, plan, exist_results),
         )
 
     object_version = int(info.get("object_version") or info.get("current_object_version") or 1)
@@ -358,6 +395,9 @@ async def build_stream_context(
                         exist_results=exist_results,
                         address=address,
                         cfg=cfg,
+                        skip_parts=await _peer_held_unreplicated_parts(
+                            obj_cache, info["object_id"], object_version, plan, exist_results
+                        ),
                     )
                 kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
                 aad = f"hippius-dek:{bucket_id}:{info['object_id']}:{object_version}".encode("utf-8")
@@ -438,6 +478,11 @@ async def read_response(
     # permanent failure breaks the stream in minutes instead of hanging the open response ~1h.
     first_timeout = float(cfg.stream_first_chunk_timeout_seconds)
     first_chunk: bytes | None = None
+    # Per-stream tier counts. Set BEFORE the first-chunk peek, in the request's own context, so
+    # every fetch task the streamer spawns — during the peek here and later from the response
+    # body — inherits the same dict by reference and counts into it.
+    tiers: dict[str, int] = {}
+    _stream_tiers.set(tiers)
     try:
         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=first_timeout)
     except StopAsyncIteration:
@@ -464,13 +509,46 @@ async def read_response(
             "Parts not ready: first chunk did not arrive within the initial stream timeout"
         ) from exc
 
+    object_id = str(info["object_id"])
+    ray_id = str(info.get("ray_id") or ray_id_context.get())
+    dual = _dual_store(obj_cache)
+    # Best-effort like the error path above: a malformed plan item must not fail the stream log.
+    first_part = getattr(ctx.plan[0], "part_number", None) if ctx.plan else None
+
     async def _body() -> AsyncGenerator[bytes, None]:
         nonlocal first_chunk
-        if first_chunk is not None:
-            yield first_chunk
-            first_chunk = None  # release the (up to ~4 MiB) first chunk for the rest of the stream
-        async for chunk in gen:
-            yield chunk
+        yielded = 0
+        # try/finally, not try/except: nothing is swallowed. The finally is the one place that
+        # sees a stream end for every reason (complete, client gone, mid-stream fault) and it is
+        # where the per-stream tier split is worth logging. `peer_last_owner` is memo-only — no
+        # DB work from inside the body, per the module note.
+        try:
+            if first_chunk is not None:
+                yielded += len(first_chunk)
+                yield first_chunk
+                first_chunk = None  # release the (up to ~4 MiB) first chunk for the rest of the stream
+            async for chunk in gen:
+                yielded += len(chunk)
+                yield chunk
+        finally:
+            # `set(None)` rather than `reset(token)`: the body runs in whatever task the ASGI
+            # server streams from, which may be a child context of the one the token came from,
+            # and resetting a token in a different context raises. The dict itself is closed over.
+            _stream_tiers.set(None)
+            owner = None
+            if dual is not None and first_part is not None:
+                owner = dual.peer_last_owner(object_id, ctx.object_version, int(first_part))
+            logger.info(
+                "STREAM tiers ray_id=%s object_id=%s v=%s local=%d peer=%d pool=%d bytes=%d owner=%s",
+                ray_id,
+                object_id,
+                ctx.object_version,
+                tiers.get("local", 0),
+                tiers.get("peer", 0),
+                tiers.get("pool", 0),
+                yielded,
+                owner,
+            )
 
     headers = build_headers(
         info,

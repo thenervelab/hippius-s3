@@ -5,6 +5,7 @@ from hippius_s3.fs_pressure import validate_promotion_band
 from .dual_fs_store import DualFileSystemPartsStore
 from .dual_fs_store import LocalReadRecorder
 from .dual_fs_store import PeerFetcher
+from .dual_fs_store import PromotedHook
 from .dual_fs_store import PromotionRecorder
 from .dual_fs_store import PromotionReleaser
 from .dual_fs_store import ReplicationSuspectFn
@@ -22,6 +23,7 @@ def create_fs_store(
     on_local_read: LocalReadRecorder | None = None,
     published_floor: PublishedFloorSource | None = None,
     replication_suspect: ReplicationSuspectFn | None = None,
+    on_promoted: PromotedHook | None = None,
 ) -> FileSystemPartsStore:
     """Build the parts store: dual-tier when a fallback pool is configured, else single.
 
@@ -41,6 +43,10 @@ def create_fs_store(
     `replication_suspect` lets the AEAD-retry path refuse a pool copy a redrive has marked
     stale. `None` (workers — they never stream, so never invalidate) keeps the pool-presence
     gate as the invalidation's only condition.
+
+    `on_promoted` is called after a promoted chunk lands on local flash; the api wires it to
+    the chunk-ready pub/sub so a reader parked in `wait_for_chunk` wakes. `None` means no
+    announcement.
     """
     fallback_dir = getattr(config, "object_cache_fallback_dir", "")
     cache_dir = getattr(config, "object_cache_dir", "")
@@ -71,6 +77,7 @@ def create_fs_store(
             space_gate=space_gate,
             on_local_read=on_local_read,
             replication_suspect=replication_suspect,
+            on_promoted=on_promoted,
         )
     return FileSystemPartsStore(cache_dir)
 

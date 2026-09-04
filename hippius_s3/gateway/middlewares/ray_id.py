@@ -1,3 +1,4 @@
+import os
 import time
 from typing import Awaitable
 from typing import Callable
@@ -22,6 +23,8 @@ async def ray_id_middleware(
     3. Sets request.state.ray_id for use by downstream middlewares
     4. Creates a logger adapter with ray_id for request-scoped logging
     5. Adds X-Hippius-Ray-ID response header for client visibility
+    6. Adds X-Hippius-Node (the k8s node this pod runs on) when NODE_NAME is set, so a
+       slow or failed GET can be tied to the pod that served it without a log search
 
     IMPORTANT: This middleware must be registered second-outermost in gateway/main.py
     (just inside cors_middleware) so it executes near-first — stamping ray_id and
@@ -37,5 +40,8 @@ async def ray_id_middleware(
     response = await call_next(request)
 
     response.headers["X-Hippius-Ray-ID"] = ray_id
+    node_name = os.environ.get("NODE_NAME", "")
+    if node_name:
+        response.headers["X-Hippius-Node"] = node_name
 
     return response
