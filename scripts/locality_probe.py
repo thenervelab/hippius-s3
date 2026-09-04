@@ -27,6 +27,7 @@ SINGLE_PART_BYTES = 64 * 1024
 MPU_PART_BYTES = 5 * 1024 * 1024
 MPU_PARTS = 4
 MPU_GETS = 3
+SPREAD_EXTRA_PARTS = 5
 HEAD_BUCKET_CALLS = 3
 DRILL_GETS = 30
 DRILL_TTFB_LIMIT_SECONDS = 5.0
@@ -44,6 +45,8 @@ class ProbeConfig:
     lists: int
     keep_bucket: bool
     drill: bool
+    spread: bool
+    spread_threshold: int
 
 
 @dataclass
@@ -94,6 +97,8 @@ def load_config(env: Mapping[str, str]) -> ProbeConfig | None:
         lists=int(env.get("HIPPIUS_PROBE_LISTS", "50")),
         keep_bucket=_truthy(env.get("HIPPIUS_PROBE_KEEP_BUCKET", "")),
         drill=_truthy(env.get("HIPPIUS_PROBE_DRILL", "")),
+        spread=_truthy(env.get("HIPPIUS_PROBE_SPREAD", "")),
+        spread_threshold=int(env.get("HIPPIUS_PROBE_SPREAD_THRESHOLD", "200")),
     )
 
 
@@ -156,9 +161,34 @@ def evaluate_spread(name: str, nodes: Sequence[str | None], extra: Sequence[str]
     if missing:
         details.append(f"{missing} responses with {NO_NODE}")
     if len(distinct) <= 1:
-        details.append("expected more than one node for bucket-level calls")
+        details.append("expected more than one node")
     details.extend(extra)
     return CheckResult(name, passed, details)
+
+
+def prefix_sample(threshold: int) -> list[int]:
+    return sorted({pn for pn in (1, 2, threshold - 1, threshold) if 1 <= pn <= threshold})
+
+
+def spread_parts(threshold: int) -> range:
+    return range(threshold + 1, threshold + SPREAD_EXTRA_PARTS + 1)
+
+
+def evaluate_multipart_spread(
+    threshold: int,
+    control: Mapping[str, str | None],
+    part_nodes: Mapping[int, str | None],
+    extra: Sequence[str] = (),
+) -> list[CheckResult]:
+    ops: dict[str, str | None] = {"create": control["create"]}
+    for pn in prefix_sample(threshold):
+        ops[f"part{pn}"] = part_nodes.get(pn)
+    ops["complete"] = control["complete"]
+    ops["get"] = control["get"]
+    prefix = evaluate_colocation(f"multipart prefix co-location (parts <= {threshold})", ops, extra)
+    prefix.passed = prefix.passed and not extra
+    tail = [part_nodes.get(pn) for pn in spread_parts(threshold)]
+    return [prefix, evaluate_spread(f"multipart spread (parts > {threshold})", tail)]
 
 
 def evaluate_drill(samples: Sequence[DrillSample], put_node: str | None) -> CheckResult:
@@ -241,6 +271,14 @@ class Probe:
         with response["Body"] as body:
             return node, body.read()
 
+    def get_md5(self, key: str) -> tuple[str | None, bytes]:
+        node, response = self.call("get_object", Key=key)
+        digest = hashlib.md5()
+        with response["Body"] as body:
+            for chunk in body.iter_chunks(chunk_size=1024 * 1024):
+                digest.update(chunk)
+        return node, digest.digest()
+
     def get_ttfb(self, key: str) -> DrillSample:
         started = time.monotonic()
         node, response = self.call("get_object", Key=key)
@@ -306,6 +344,30 @@ class Probe:
         )
         ops["abort"], _ = self.call("abort_multipart_upload", Key=key, UploadId=upload_id)
         return evaluate_colocation("multipart abort", ops)
+
+    def check_multipart_spread(self) -> list[CheckResult]:
+        key = "mpu/spread.bin"
+        threshold = self.cfg.spread_threshold
+        total = threshold + SPREAD_EXTRA_PARTS
+        print(f"spread: uploading {total} x {MPU_PART_BYTES >> 20} MiB parts", flush=True)
+        control: dict[str, str | None] = {}
+        control["create"], created = self.call("create_multipart_upload", Key=key)
+        upload_id = created["UploadId"]
+        digest = hashlib.md5()
+        part_nodes: dict[int, str | None] = {}
+        parts = []
+        for pn in range(1, total + 1):
+            data = os.urandom(MPU_PART_BYTES)
+            digest.update(data)
+            node, uploaded = self.call("upload_part", Key=key, PartNumber=pn, UploadId=upload_id, Body=data)
+            part_nodes[pn] = node
+            parts.append({"PartNumber": pn, "ETag": uploaded["ETag"]})
+        control["complete"], _ = self.call(
+            "complete_multipart_upload", Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts}
+        )
+        control["get"], body_md5 = self.get_md5(key)
+        extra = [] if body_md5 == digest.digest() else ["get body-mismatch"]
+        return evaluate_multipart_spread(threshold, control, part_nodes, extra)
 
     def check_bucket_spread(self) -> CheckResult:
         list_nodes = [self.call("list_objects_v2")[0] for _ in range(self.cfg.lists)]
@@ -375,20 +437,24 @@ def run(cfg: ProbeConfig, client: Any, bucket: str) -> list[CheckResult]:
     probe = Probe(client, cfg, bucket)
     probe.call("create_bucket")
     print(f"bucket {bucket} on {cfg.endpoint}", flush=True)
-    checks: list[Callable[[], CheckResult]] = [
+    checks: list[Callable[[], CheckResult | list[CheckResult]]] = [
         probe.check_single_part,
         probe.check_multipart,
         probe.check_multipart_abort,
-        probe.check_bucket_spread,
-        probe.check_read_variants,
     ]
+    if cfg.spread:
+        checks.append(probe.check_multipart_spread)
+    checks.extend([probe.check_bucket_spread, probe.check_read_variants])
     if cfg.drill:
         checks.append(probe.check_drill)
     results = []
     for check in checks:
-        result = check()
-        print(result.line(), flush=True)
-        results.append(result)
+        batch = check()
+        if isinstance(batch, CheckResult):
+            batch = [batch]
+        for result in batch:
+            print(result.line(), flush=True)
+            results.append(result)
     if cfg.keep_bucket:
         print(f"keeping bucket {bucket}", flush=True)
     else:

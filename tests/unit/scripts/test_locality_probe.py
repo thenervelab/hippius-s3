@@ -224,3 +224,78 @@ def test_cleanup_falls_back_to_plain_keys_without_version_ids() -> None:
         ("delete_object", "k"),
         ("delete_bucket", None),
     ]
+
+
+class FakeBody:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def __enter__(self) -> FakeBody:
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        return None
+
+    def iter_chunks(self, chunk_size: int) -> Any:
+        for i in range(0, len(self.data), chunk_size):
+            yield self.data[i : i + chunk_size]
+
+
+def test_load_config_spread_options() -> None:
+    cfg = config()
+    assert (cfg.spread, cfg.spread_threshold) == (False, 200)
+    cfg = config(HIPPIUS_PROBE_SPREAD="1", HIPPIUS_PROBE_SPREAD_THRESHOLD="7")
+    assert (cfg.spread, cfg.spread_threshold) == (True, 7)
+
+
+def test_prefix_sample_and_spread_parts_follow_the_threshold() -> None:
+    assert probe.prefix_sample(200) == [1, 2, 199, 200]
+    assert list(probe.spread_parts(200)) == [201, 202, 203, 204, 205]
+    assert probe.prefix_sample(2) == [1, 2]
+    assert list(probe.spread_parts(2)) == [3, 4, 5, 6, 7]
+    assert probe.prefix_sample(1) == [1]
+
+
+def test_multipart_spread_passes_with_local_prefix_and_spread_tail() -> None:
+    control = {"create": "n1", "complete": "n1", "get": "n1"}
+    part_nodes = {1: "n1", 2: "n1", 3: "n1", 4: "n1", 5: "n1", 6: "n2", 7: "n1", 8: "n2", 9: "n2"}
+    prefix, spread = probe.evaluate_multipart_spread(4, control, part_nodes)
+    assert prefix.passed and prefix.name == "multipart prefix co-location (parts <= 4)"
+    assert "7 ops all on n1" in prefix.line()
+    assert spread.passed and spread.name == "multipart spread (parts > 4)"
+    assert "5 calls over 2 nodes: n1=2, n2=3" in spread.line()
+
+
+def test_multipart_spread_flags_stray_prefix_pinned_tail_and_body() -> None:
+    control = {"create": "n1", "complete": "n1", "get": "n1"}
+    part_nodes = {1: "n1", 2: "n1", 3: "n2", 4: "n1", 5: "n1", 6: "n1", 7: "n1", 8: "n1", 9: "n1"}
+    prefix, spread = probe.evaluate_multipart_spread(4, control, part_nodes)
+    assert not prefix.passed and "part3=n2" in prefix.line() and "part1=n1" in prefix.line()
+    assert not spread.passed and "expected more than one node" in spread.line()
+    healthy = dict.fromkeys(range(1, 5), "n1") | {5: "n1", 6: "n2"}
+    bad_body = probe.evaluate_multipart_spread(4, control, healthy, ["get body-mismatch"])[0]
+    assert not bad_body.passed and "get body-mismatch" in bad_body.line()
+    missing = probe.evaluate_multipart_spread(4, control, {1: "n1"})[0]
+    assert not missing.passed and f"part4 -> {probe.NO_NODE}" in missing.line()
+
+
+def test_check_multipart_spread_uploads_threshold_plus_five_parts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(probe, "MPU_PART_BYTES", 16)
+    monkeypatch.setattr(probe.os, "urandom", lambda n: b"\x01" * n)
+    nodes = ["n1", "n1", "n1", "n2", "n1", "n2", "n1", "n2", "n1", "n1"]
+    client = FakeClient(
+        nodes,
+        {
+            "create_multipart_upload": {"UploadId": "u"},
+            "upload_part": {"ETag": '"e"'},
+            "get_object": {"Body": FakeBody(b"\x01" * (16 * 7))},
+        },
+    )
+    p = probe.Probe(client, config(HIPPIUS_PROBE_SPREAD_THRESHOLD="2"), "bkt")
+    prefix, spread = p.check_multipart_spread()
+    assert prefix.passed and spread.passed
+    ops = [(op, kw.get("PartNumber")) for op, kw in client.calls]
+    assert ops[0] == ("create_multipart_upload", None)
+    assert ops[1:8] == [("upload_part", pn) for pn in range(1, 8)]
+    assert ops[8:] == [("complete_multipart_upload", None), ("get_object", None)]
+    assert [x["PartNumber"] for x in client.calls[8][1]["MultipartUpload"]["Parts"]] == list(range(1, 8))

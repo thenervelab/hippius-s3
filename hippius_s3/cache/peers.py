@@ -4,10 +4,13 @@ The drain retains each part on the node that ingested it, so a chunk is usually 
 node's NVMe even when it is not on this one. Reading it from that peer (~6 ms + ~1 ms
 network) beats falling through to the CephFS pool (~40 ms, measured on node1 2026-08-06).
 
-Locality is resolved per PART, never per request: on prod 2026-08-06 only 48 of 2,214
-sampled multi-part object versions (2%) had every part on one node, while 684 (31%) spanned
-all five, because each `UploadPart` is handled by whichever `api-local` pod the round-robin
-Service picks. There is no single node a whole GET could usefully be routed to.
+Locality is resolved per PART, never per request. Under round-robin placement (prod
+2026-08-06) only 48 of 2,214 sampled multi-part object versions (2%) had every part on one
+node, while 684 (31%) spanned all five, because each `UploadPart` went to whichever `api-local`
+pod the Service picked. The edge now hashes a key's requests onto one node and spreads only
+`UploadPart`s with `partNumber` > N (= 200) on `path#partNumber` (docs/locality-routing.md),
+so a GET lands on the key node, finds parts 1..N locally and peer-fetches the tail — per-part
+resolution is what makes the intended spread work, not a workaround for scattered uploads.
 
 Discovery is self-registration through Redis rather than a ConfigMap of node IPs:
 

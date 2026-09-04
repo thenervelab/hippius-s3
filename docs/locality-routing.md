@@ -31,24 +31,56 @@ every `UploadPart` was balanced independently, so before the change only 2 % of 
 on prod had all their parts on one node — there was no single node a whole-object GET could
 usefully be sent to.
 
+The opposite extreme is just as real: an ingest node has roughly 1 TB of free SSD, and a single
+2 TB multipart object that hashed entirely onto one node would fill it and 503 every later PUT
+that hashed there. Placement therefore has two goals — locality for everything a client reads
+whole, and a bound on how much of one object any node must hold.
+
 ## 2. The placement rule at the edge
 
-The edge load balancer (haproxy) classifies each request by its path alone:
+The edge load balancer (haproxy) classifies each request by its path and, for one request class
+only, by one query parameter. The hash key is two-level, with N = 200:
 
-- **Object-level** — the path has a non-empty key after the bucket segment, regex `^/[^/]+/.+`.
-  These are consistent-hashed on the raw path, with the query string stripped
-  (`balance uri path-only`, `hash-type consistent sdbm avalanche`).
-- **Bucket- and service-level** — `/`, `/bucket`, `/bucket/` (ListObjects, `?delete`, `?uploads`
-  listing, acl/policy/location/versioning on a bucket, CreateBucket). These stay round-robin on a
-  sibling backend with identical health checks, timeouts and rate-limit tracking.
+| Request | Hash key | Lands on |
+|---|---|---|
+| Bucket- and service-level: `/`, `/bucket`, `/bucket/` (ListObjects, `?delete`, `?uploads` listing, acl/policy/location/versioning on a bucket, CreateBucket) | none — round-robin on a sibling backend with identical health checks, timeouts and rate-limit tracking | any node |
+| Object-level (`^/[^/]+/.+`), every method and every query string | `path` (query stripped) | the key node |
+| `PUT` UploadPart / UploadPartCopy with `partNumber` > N | `path#partNumber` | a per-part node, spread over the ring |
 
-Because the hash covers the path only, every operation on one key lands on one node: PutObject,
-every UploadPart, Create/Complete/Abort MultipartUpload, ListParts, UploadPartCopy (hashed on the
-destination path), S4 append, GET/HEAD, Range, `?versionId`, presigned URLs and DeleteObject for
-that key. `partNumber`, `uploadId`, `versionId` and the `X-Amz-*` presign parameters all live in the
-query string, so they never move a request off the key's owner — that is the reason for
-`path-only`: hashing the full URI would scatter a multipart upload across nodes again, one node per
-`partNumber`.
+The base is `balance uri path-only` under `hash-type consistent sdbm avalanche`; the third row
+appends the part number to that path before hashing. UploadPartCopy hashes on the destination
+path in both rows.
+
+What that means per operation:
+
+- **Single-part objects and all reads land on the key node.** PutObject, Create/Complete/Abort
+  MultipartUpload, ListParts, S4 append, DeleteObject, and every read — GET/HEAD, Range,
+  `?versionId`, presigned URLs and `?partNumber` reads (the api serves those as whole-object
+  reads, section "Known limitations") — hash on the path alone. `uploadId`, `versionId` and the
+  `X-Amz-*` presign parameters live in the query string and never move a request off the key
+  node.
+- **A multipart object keeps parts 1..N on the key node.** Reads of an object with at most N
+  parts are fully local; with the AWS CLI's default 8 MiB parts that covers objects up to about
+  1.6 GB. The prefix any one node must hold for one object is bounded at
+  N × 512 MiB = 100 GB (`max_multipart_part_size` is the api's per-part ceiling).
+- **Parts above N spread across ingest nodes**, so a 2 TB object no longer fills one node's SSD.
+  A read of a spread object still lands on the key node: it serves the prefix locally and
+  fetches the tail parts through the peer tier (section 3) — the behaviour every multipart
+  object had before the hash. Two api-side bounds keep a giant read cheap for the key node:
+  promote-on-read stops at `HIPPIUS_PROMOTE_MAX_PART_NUMBER` (= N), so a read never refills the
+  key node with the tail the spread was meant to keep off it, and the tail parts' owners are
+  resolved in one batched residency query rather than one lookup per part.
+
+`partNumber` is read at the edge the way the api reads it: the name is exact-case (the api only
+recognises `partNumber`), leading zeros are stripped before the compare (`partNumber=0201` is
+`201`), an empty or absent value means "no part" and the request hashes on the path alone, and a
+repeated parameter takes its first occurrence at the edge while the api rejects the duplicate
+with 400 — so a request whose two values disagree is never served from the wrong node.
+
+This is why the base hash is `path-only` rather than the full URI: hashing the whole query string
+would put every UploadPart on its own node — including parts 1..N, losing the local prefix — and
+would also move `?versionId` and presigned reads of a key off its node. Spreading is wanted for
+exactly one parameter and only above N, so that one is folded in deliberately.
 
 **Ring agreement.** The ring is built from each server's `id` and `weight` (vnodes per server are
 `weight × 16`). Several load balancers front the same nodes, and a key must map to the same node
@@ -58,7 +90,9 @@ different ids (or a different hash function) computes a different ring and silen
 large share of keys to the wrong node — locality degrades to the round-robin baseline with
 nothing failing. Weight is set to 100 on all servers (not the default 1) so the ring has enough
 vnodes to spread keys evenly. Adding a node means adding it with a new fixed `id` on every box
-in the same change; never let haproxy auto-assign ids.
+in the same change; never let haproxy auto-assign ids. The same holds for the second level of
+the key: every box must apply the same N and build the `path#partNumber` suffix the same way, or
+tail parts of one upload land differently depending on which load balancer took them.
 
 **Bounded-load spill is off initially.** haproxy's `hash-balance-factor` lets a request spill to
 the next server on the ring when the owner is "too busy". Its notion of busy is relative to the
@@ -81,7 +115,9 @@ inflight caps (section 4), not by the load balancer.
 
 An object is misplaced when its SSD copy is on a node other than its hash owner: uploaded before
 the cutover, uploaded while its owner was out of the ring during a node rollout, or spilled (once
-the factor is on). Nothing special is done for these; the existing per-part directory serves them:
+the factor is on). The tail of a spread multipart object (parts above N, section 2) is not
+misplaced — it is where the hash put it — but the key node reads it through the same path.
+Nothing special is done for either; the existing per-part directory serves them:
 
 1. The api on the hash owner misses locally and resolves the part's holder from
    `cephor_ssd_residency` (joined to `replicated` status), else from
@@ -93,6 +129,8 @@ the factor is on). Nothing special is done for these; the existing per-part dire
    ([hippius_s3/cache/dual_fs_store.py](../hippius_s3/cache/dual_fs_store.py)).
 3. After one full read the hash owner holds the object locally and every later GET is a local
    read. The original copy stays on its ingest node until that node's evictor reclaims it.
+   Promotion stops at `HIPPIUS_PROMOTE_MAX_PART_NUMBER` (= N): parts above it are peer-served on
+   every read, by design, so the tail of a giant never accumulates on its key node.
 
 No new state is introduced: the directory, the hint and the promotion path all predate the hash,
 and the hash is only a way of making the local hit the common case.
@@ -163,18 +201,35 @@ evictions persisting after these two.
   the owner at the round-robin rate and peer-fetch otherwise; repeats are absorbed by the cache.
 - Virtual-hosted-style bucket hosts are not on the hashed path; they keep going through the edge
   cache as before.
-- AbortMultipartUpload now lands on the node that ingested the parts, so besides the local
-  chunk delete it drops that node's `cephor_ssd_residency` rows (`ResidencyRecorder.drop_version`)
-  and the fresh-part hints (`PeerRegistry.forget_parts`). Parts of pre-cutover uploads that sit
-  on other nodes are still reclaimed by the drain's failed-part path after the reclaim grace.
-- A large multipart upload now lands entirely on one node, so the ingest-pressure 503 from
-  `fs_cache_pressure` becomes key-sticky: retrying the same key retries the same full disk. This is
-  the correct behaviour (the parts must be on one node) but changes what a client's retry sees.
+- AbortMultipartUpload lands on the key node, which holds only the prefix (parts 1..N). The
+  handler's local chunk delete removes that prefix and is a no-op for the spread parts;
+  `ResidencyRecorder.drop_version` is node-scoped by design (it drops only this node's
+  `cephor_ssd_residency` rows) and `PeerRegistry.forget_parts` is node-agnostic (it clears the
+  fresh-part hint of every part number the upload listed, wherever the part landed). The spread
+  parts' bytes and residency rows are reclaimed by the drain's failed-part path after
+  `CEPHOR_RECLAIM_GRACE_SECS`, the same path that reclaims pre-cutover parts on other nodes.
+- The ingest-pressure 503 from `fs_cache_pressure` is sticky per part, not per key: a full node
+  blocks only the parts hashed there — a whole single-part object or multipart prefix, or the
+  individual tail parts that landed on it — and retrying that part retries the same full disk
+  while the other parts of the same upload keep landing elsewhere.
 - A DaemonSet rollout can truncate a transfer longer than the drain window on the node being
   rolled. Pre-existing; the hash does not change it, but it does make the affected keys
   predictable.
 - The CopyObject fast path is DB-only (it re-points chunk rows without moving bytes), so the first
   GET of a fresh copy is a backend download on whichever node owns the destination key.
+
+## Known limitations
+
+- S4 appends carry no part number in the URL, so an append-only object grows on its key node
+  without bound (follow-up: api guard).
+- Many giants hashing to one node pin up to N × 512 MiB each.
+- Reads of a giant funnel through its key node (the bounded-load factor later spreads readers to
+  the part owners).
+- A duplicate `partNumber` is handled by a 400.
+- Abort/delete of a giant leaves the spread parts on their nodes until the drain grace (1 h
+  failed / 24 h orphan).
+- Non-sequential part numbering changes which parts are above N but stays bounded.
+- Part-wise GET (`?partNumber` reads) is not implemented and no mainstream client uses it.
 
 ## 7. Operations
 
@@ -216,9 +271,10 @@ placement, and the per-part directory serves everything either way.
 
 **Verification header.** Every response carries `X-Hippius-Node`, the node name of the api pod
 that handled it (present whenever `NODE_NAME` is set on the pod). For a sequential PUT-then-GET of
-one key the GET's node must equal the PUT's; a multipart upload must show one node across every
-UploadPart and the Complete; repeated bucket LISTs must spread across more than one node. The AWS
-CLI prints response headers under `--debug`:
+one key the GET's node must equal the PUT's. For a multipart upload, parts 1..N and every
+control-plane call (Create, ListParts, Complete, Abort) and every GET must show the key node,
+while `UploadPart`s with `partNumber` > N must spread across more than one node. Repeated bucket
+LISTs must spread across more than one node. The AWS CLI prints response headers under `--debug`:
 
 ```bash
 aws --endpoint-url "$ENDPOINT" s3api put-object --bucket b --key k --body f --debug 2>&1 | grep -i x-hippius-node
@@ -243,6 +299,11 @@ HIPPIUS_ROUTING_ENDPOINT="$ENDPOINT" AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY
 Optional env: `AWS_DEFAULT_REGION` (default `decentralized`), `HIPPIUS_PROBE_KEYS` (20),
 `HIPPIUS_PROBE_GETS` (5), `HIPPIUS_PROBE_LISTS` (50), `HIPPIUS_PROBE_KEEP_BUCKET` (leave the
 bucket behind for inspection). Without an endpoint and credentials it prints one line and exits 0.
+`HIPPIUS_PROBE_SPREAD=1` adds the spread check: it uploads N + 5 parts of 5 MiB
+(`HIPPIUS_PROBE_SPREAD_THRESHOLD`, default 200), completes, and reads the object back once with an
+md5 check. Create, a sample of the prefix (parts 1, 2, N-1, N), Complete and the GET must sit on
+one node; parts N+1..N+5 must spread over more than one (staging has two nodes, so more than one
+distinct node is the bar).
 `HIPPIUS_PROBE_DRILL=1` adds the misplaced-object drill: it waits for you to drain one node at the
 edge (section "Draining a node" above), PUTs a key while the node is out of the ring, waits for you
 to restore it, then fires 30 concurrent GETs and requires every one to succeed with a TTFB under
@@ -252,5 +313,9 @@ That exercises the peer-fetch + promotion path of section 3 under the singleflig
 A mismatch on a freshly written key means either the rings disagree (check `id`/`weight` on
 every hashing box) or the two requests used different encodings of the key. The server-side
 check is the per-stream tier log the api emits when a body finishes:
-`STREAM tiers ray_id=... object_id=... v=... local=N peer=N pool=N bytes=N owner=<node>` — a
-GET that landed on its owner shows every chunk under `local=`.
+`STREAM tiers ray_id=... object_id=... v=... local=N peer=N pool=N bytes=N owner=<node> owners=N`
+— a GET that landed on its owner shows every chunk under `local=`. For a spread object read on its
+key node, `local=` is roughly the prefix's chunk count and `peer=` roughly the tail's; `owner=` is
+the memoised holder of the first part and `owners=` the number of distinct nodes the tail resolved
+to. A large `peer=` on a single-part object, or `pool=` on anything fresh, is the misplacement
+signal; on a giant it is the design.
