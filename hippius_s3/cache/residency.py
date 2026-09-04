@@ -179,9 +179,10 @@ class ResidencyRecorder:
         copy only, so only this node's rows describe bytes that are gone. A peer's row for the
         same version still names a real directory on the peer's disk, and deleting it would leave
         that copy with no owner — exactly the unreclaimable-leak this table exists to prevent.
-        The rows themselves are not dangerous while they linger (the evictor only walks
-        `replicated` parts, and an aborted version is `failed`), but they count toward
-        node_cache_bytes, so the allocator would steer on bytes the disk no longer holds.
+        A lingering row is inert rather than dangerous: every reader of this table joins the
+        replication row on `status = 'replicated'`, and the abort marks the version `failed`
+        first. It is still wrong — the ledger names a directory the disk does not hold — and
+        it would otherwise wait for the drain's failed-part reclaim to reach it after its grace.
         """
         try:
             async with self._pool.acquire() as conn:
@@ -198,7 +199,8 @@ class ResidencyRecorder:
             # Never raises: the directory is already gone and the abort has already succeeded
             # from the client's point of view. A leftover row is bounded harm — the drain's
             # failed-part reclaim deletes the version's residency rows fleet-wide when it
-            # reaches them — but until then it is phantom bytes in node_cache_bytes, so count it.
+            # reaches them — but a sustained rate here means this node's ledger is drifting
+            # from its disk with nothing else in the logs to say so, so count it.
             _record_drop_failure()
             logger.warning(
                 "dropping residency rows for %s v%s failed (rows stay accounted until reclaim): %s",

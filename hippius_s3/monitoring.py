@@ -228,9 +228,10 @@ class MetricsCollector:
         )
 
         # An aborted MPU's directory was removed from this node's SSD but its residency rows
-        # could not be. Each one is phantom bytes in node_cache_bytes until the drain's
-        # failed-part reclaim deletes them, so a sustained rate means the allocator is steering
-        # on a figure the disk does not hold.
+        # could not be. Inert while they linger (the version is `failed`, and every residency
+        # reader requires `replicated`) and deleted by the drain's failed-part reclaim later,
+        # but a sustained rate means this node's ledger is drifting from its disk on every
+        # abort, which nothing else reports.
         self.residency_drop_failures = self.meter.create_counter(
             name="residency_drop_failures_total",
             description="Aborted-version residency rows left in place because the delete failed",

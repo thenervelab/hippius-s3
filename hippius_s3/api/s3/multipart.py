@@ -994,11 +994,10 @@ async def abort_multipart_upload(
                 object_version,
             )
             part_numbers = [int(part["part_number"]) for part in parts]
-            if parts:
+            if part_numbers:
                 redis_client = request.app.state.redis_client
                 delegate = RedisObjectPartsCache(redis_client)
-                for part in parts:
-                    part_num = int(part["part_number"])
+                for part_num in part_numbers:
                     meta_key = delegate.build_meta_key(str(object_id), object_version, part_num)
                     base_key = delegate.build_key(str(object_id), object_version, part_num)
                     # MPU-4: delete the meta + chunk keys by computed name in one pipelined UNLINK
@@ -1057,14 +1056,17 @@ async def abort_multipart_upload(
             with contextlib.suppress(Exception):
                 await request.app.state.fs_store.delete_object(str(object_id), int(object_version))
             # The rmtree above leaves two records pointing at a directory that no longer exists:
-            # this node's cephor_ssd_residency rows (phantom bytes in node_cache_bytes) and the
-            # fresh-part hints (a peer GET routed here for the rest of their TTL). With haproxy
-            # locality hashing the abort lands on the node that ingested the parts, so this is
-            # the common case and both are cleaned here. A pre-cutover upload's parts live on
-            # OTHER nodes; their rows and directories are the drain's failed-part reclaim's
-            # (after CEPHOR_RECLAIM_GRACE_SECS) — the mark above is what makes them eligible.
-            # Both never raise; ordered after the delete so a failure here can never orphan bytes.
-            residency_recorder = getattr(request.app.state, "residency_recorder", None)
+            # this node's cephor_ssd_residency rows and the fresh-part hints (a peer GET routed
+            # here for the rest of their TTL). With haproxy locality hashing the abort lands on
+            # the node that ingested the parts, so this is the common case and both are cleaned
+            # here. A pre-cutover upload's parts live on OTHER nodes; their rows and directories
+            # are the drain's failed-part reclaim's (after CEPHOR_RECLAIM_GRACE_SECS) — the mark
+            # above is what makes them eligible, and it is also what keeps a lingering row inert
+            # meanwhile: every residency reader joins the replication row on status='replicated'.
+            # Both never raise. Ordered after the delete on purpose: the bytes stay owned by that
+            # same reclaim through the replication row, but a ledger that claims a directory the
+            # disk does not hold is the one state this table must never describe.
+            residency_recorder = request.app.state.residency_recorder
             if residency_recorder is not None:
                 await residency_recorder.drop_version(str(object_id), int(object_version))
             registry = get_active_registry()
