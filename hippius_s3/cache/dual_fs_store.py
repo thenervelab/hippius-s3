@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Awaitable
 from typing import Callable
@@ -44,9 +45,25 @@ PeerFetcher = Callable[[str, int, int, int], Awaitable[Optional[bytes]]]
 # not be allowed to serve it. Contract: never raises; unknown degrades to False.
 ReplicationSuspectFn = Callable[[str, int, int], Awaitable[bool]]
 
+# Called AFTER a chunk has landed on the local tier through promotion, with (object_id, version,
+# part_number, chunk_index). The api wires this to the chunk-ready pub/sub, so a reader that
+# missed every tier and is parked in `wait_for_chunk` wakes as soon as a sibling reader's
+# promotion makes the chunk readable here — nothing else publishes for a promoted chunk.
+# A fault in it is contained by the store: it runs after a read already has its bytes, and a
+# missed wakeup only costs the waiter its timeout re-check.
+PromotedHook = Callable[[str, int, int, int], Awaitable[None]]
+
+# Per-stream tier counts, set by the read path for the lifetime of one response so the stream
+# can log how many of its chunks came off local flash, a peer, and the pool. None outside a
+# stream (workers, tests), where `_record_tier` counts into metrics alone.
+_stream_tiers: ContextVar[Optional[dict[str, int]]] = ContextVar("stream_tiers", default=None)
+
 
 def _record_tier(tier: ChunkReadTier) -> None:
     """Count which tier served a chunk. Never let observability break a read."""
+    counts = _stream_tiers.get()
+    if counts is not None:
+        counts[tier] = counts.get(tier, 0) + 1
     try:
         from hippius_s3.monitoring import get_metrics_collector
 
@@ -95,12 +112,14 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         space_gate: Optional[FreeSpaceGate] = None,
         on_local_read: Optional[LocalReadRecorder] = None,
         replication_suspect: Optional[ReplicationSuspectFn] = None,
+        on_promoted: Optional[PromotedHook] = None,
     ) -> None:
         super().__init__(primary_dir)
         self.fallback = FileSystemPartsStore(fallback_dir)
         self._promote = promote
         self._on_promote = on_promote
         self._on_promote_release = on_promote_release
+        self._on_promoted = on_promoted
         self._peer_fetch = peer_fetch
         # Consulted by `invalidate_local_chunk` alone, so the normal read path never pays for
         # it. `None` (workers, tests, deployments without a drain) keeps the pool-presence gate
@@ -176,6 +195,30 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
             )
             return None
 
+    async def peer_locate(self, object_id: str, object_version: int, part_number: int) -> tuple[Optional[str], bool]:
+        """`(owner node or None, unreplicated)` for a part from the peer resolver; `(None, False)` without one.
+
+        Best-effort on the same grounds as `_fetch_from_peer`: the peer tier is an optimisation
+        and must never be able to fail a read, and this runs on the request path before the
+        first byte.
+        """
+        locate = getattr(self._peer_fetch, "locate", None)
+        if locate is None:
+            return None, False
+        try:
+            owner, unreplicated = await locate(object_id, int(object_version), int(part_number))
+        except Exception as exc:  # noqa: BLE001 - a peer must never be able to fail a read
+            logger.debug("peer locate failed for %s v%s part %s: %s", object_id, object_version, part_number, exc)
+            return None, False
+        return owner, bool(unreplicated)
+
+    def peer_last_owner(self, object_id: str, object_version: int, part_number: int) -> Optional[str]:
+        """The peer resolver's memoised owner for a part, with no lookup. Safe inside a response body."""
+        last_owner = getattr(self._peer_fetch, "last_owner", None)
+        if last_owner is None:
+            return None
+        return last_owner(object_id, int(object_version), int(part_number))
+
     async def _promote_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int, data: bytes
     ) -> None:
@@ -232,6 +275,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
             return
         self._promoting.add(in_flight)
         claimed = False
+        written = False
         try:
             meta = await self.fallback.get_meta(object_id, object_version, part_number)
             if meta is None:
@@ -265,6 +309,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
                     size_bytes=int(meta["size_bytes"]),
                 )
             await self.set_chunk(object_id, object_version, part_number, chunk_index, data)
+            written = True
         except (OSError, KeyError, TypeError, ValueError) as exc:
             logger.debug(
                 "promotion to the local tier failed for %s v%s part %s chunk %s: %s",
@@ -282,6 +327,20 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
                 await self._on_promote_release(object_id, object_version, part_number, len(data))
         finally:
             self._promoting.discard(in_flight)
+        # Outside the try: the hook runs only for a copy that landed, and a hook fault must not
+        # read as a failed write and give back a claim the copy is actually using.
+        if written and self._on_promoted is not None:
+            try:
+                await self._on_promoted(object_id, int(object_version), int(part_number), int(chunk_index))
+            except Exception as exc:  # noqa: BLE001 - a wakeup is best-effort; the read already has its bytes
+                logger.debug(
+                    "promoted-chunk hook failed for %s v%s part %s chunk %s: %s",
+                    object_id,
+                    object_version,
+                    part_number,
+                    chunk_index,
+                    exc,
+                )
 
     async def invalidate_local_chunk(
         self, object_id: str, object_version: int, part_number: int, chunk_index: int

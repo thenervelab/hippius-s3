@@ -228,6 +228,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 # The httpx timeout above bounds each socket operation, never the whole
                 # response; this is what stops a peer that drips bytes forever.
                 deadline_seconds=config.peer_fetch_deadline_seconds,
+                # A shed on a part the pool does not hold yet has nowhere to fall to, so
+                # those wait for the peer (bounded) instead of parking in wait_for_chunk.
+                unreplicated_wait_seconds=config.peer_fetch_unreplicated_wait_seconds,
             )
             logger.info("Peer chunk fetch enabled for node %s", node_name)
             set_active_registry(app.state.peer_registry)
@@ -267,6 +270,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # configured here. The queues Redis is the only instance both processes share (the agent
         # has no main-Redis URL); an unavailable key falls back to `promote_min_free_ratio`.
         published_floor = create_published_floor_source(app.state.redis_queues_client, node_name)
+
+        async def _announce_promoted(object_id: str, object_version: int, part_number: int, chunk_index: int) -> None:
+            # A reader that missed every tier is parked in wait_for_chunk on this chunk's pub/sub
+            # channel, and promotion is the only writer here that never published to it. Resolved
+            # through app.state at call time because obj_cache is built from the store below,
+            # which also contains a failed publish so it never fails the read.
+            await app.state.obj_cache.notify_chunk(object_id, object_version, part_number, chunk_index)
+
         app.state.fs_store = create_fs_store(
             config,
             on_promote=app.state.residency_recorder,
@@ -281,6 +292,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # AEAD-retry guard: a redrive marks a part's pool copy stale while `chunk_exists`
             # still passes, so the invalidation path re-checks the status freshly per failure.
             replication_suspect=create_replication_suspect_probe(app.state.postgres_pool),
+            on_promoted=_announce_promoted,
         )
         app.state.obj_cache = RedisObjectPartsCache(
             app.state.redis_client,

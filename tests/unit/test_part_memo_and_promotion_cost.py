@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 
+import asyncpg
 import pytest
 
 from hippius_s3.cache.dual_fs_store import DualFileSystemPartsStore
@@ -249,3 +250,84 @@ async def test_the_release_statement_subtracts_the_claimed_bytes_with_a_zero_flo
         f"the release no longer subtracts, or lost its floor: {normalised}"
     )
     assert pool.executed[0] == ("node-a", OBJ, 1, 1, 4096), "the release must target exactly the claimed key"
+
+
+@pytest.mark.asyncio
+async def test_drop_version_deletes_only_this_nodes_rows_for_that_version() -> None:
+    """AbortMultipartUpload removes the version directory from THIS node's SSD, so the rows
+    that must go are this node's and no other's: a peer's row for the same version still names
+    a directory on the peer's disk, and deleting it would leave that copy unowned by the
+    node-scoped evictor. Pinned on the SQL text and the bound parameters because `drop_version`
+    swallows DB errors by design, so a statement Postgres rejects would pass a mocked suite.
+    """
+    pool = FakePool()
+    await ResidencyRecorder(pool, "node-a").drop_version(OBJ, 3)
+
+    normalised = " ".join(pool.statements[0].split())
+    assert normalised.startswith("DELETE FROM cephor_ssd_residency"), normalised
+    assert "node_id = $1" in normalised, "the delete must be node-scoped"
+    assert "object_id = $2" in normalised and "version = $3" in normalised, normalised
+    assert "part_number" not in normalised, "every part of the version goes, not one"
+    assert pool.executed[0] == ("node-a", OBJ, 3)
+
+
+@pytest.mark.asyncio
+async def test_drop_version_never_raises_when_the_db_is_down() -> None:
+    """The directory is already gone when this runs; a DB fault must not turn a completed
+    abort into a 500. The leftover rows are reclaimed later by the drain's failed-part reclaim."""
+
+    class _DownPool:
+        def acquire(self):  # noqa: ANN201 - async context manager double
+            raise asyncpg.InterfaceError("pool is closed")
+
+    await ResidencyRecorder(_DownPool(), "node-a").drop_version(OBJ, 3)
+
+
+@pytest.mark.asyncio
+async def test_drop_version_binds_the_recorder_node_not_a_constant() -> None:
+    """Two recorders, two nodes: each delete must carry ITS node as $1. A hard-coded or shared
+    node here would have one node's abort delete a peer's rows for the same version."""
+    pool = FakePool()
+    await ResidencyRecorder(pool, "node-b").drop_version(OBJ, 3)
+    await ResidencyRecorder(pool, "node-c").drop_version(OBJ, 3)
+
+    assert [row[0] for row in pool.executed] == ["node-b", "node-c"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        asyncpg.PostgresError("relation does not exist"),
+        asyncpg.InterfaceError("connection is closed"),
+        OSError("network unreachable"),
+    ],
+    ids=["postgres", "interface", "os"],
+)
+async def test_drop_version_counts_a_failed_delete_and_does_not_raise(monkeypatch, exc: Exception) -> None:
+    """`InterfaceError` is not a `PostgresError` and a socket fault is neither; all three are what
+    a residency outage looks like from the abort path, and each must be counted, not raised —
+    the directory is already gone and the client already has its 204."""
+    from hippius_s3.cache import residency
+
+    counted: list[bool] = []
+    monkeypatch.setattr(residency, "_record_drop_failure", lambda: counted.append(True))
+
+    class _FailingConn:
+        async def execute(self, *_: object) -> None:
+            raise exc
+
+    class _Pool:
+        def acquire(self):  # noqa: ANN201 - async context manager double
+            class _Ctx:
+                async def __aenter__(self):  # noqa: ANN204
+                    return _FailingConn()
+
+                async def __aexit__(self, *_: object) -> None:
+                    return None
+
+            return _Ctx()
+
+    await ResidencyRecorder(_Pool(), "node-a").drop_version(OBJ, 3)
+
+    assert counted == [True]
