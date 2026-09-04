@@ -47,26 +47,24 @@ the prefetch depth at wiring time, so a stale config degrades to a startup warni
 silently halved peer tier. It does **not** add peer capacity: the semaphore is shared across
 readers on the pod, so under concurrency shedding just moves to the peer's `server_busy`.
 
-Four things on the peer tier exist because of the locality rollout ([docs/locality-routing.md](../../docs/locality-routing.md)),
-which sends every request for a key to one node and so turns "many readers of one fresh
-object" from a rare case into the normal one. **Singleflight**: concurrent readers of one
-`(object, version, part, chunk)` on a pod join a single leader fetch instead of each taking a
-peer slot; a failure is not cached, so followers get `None` and fall through. **Unreplicated
-wait**: a part the drain has not replicated yet has no pool copy, so shedding it "to the pool"
-used to mean a 25 s first-chunk 503 or a 300 s mid-stream wait. For those parts the fetcher waits
-for a slot and retries `server_busy` with backoff inside
-`HIPPIUS_PEER_FETCH_UNREPLICATED_WAIT_SECONDS` (0 restores the shed); replicated parts still shed
-immediately. **Promote-notify**: `_promote_chunk` publishes `notify:` after `set_chunk`, so a
-reader blocked in `wait_for_chunk` wakes when a neighbour lands the chunk rather than at the
-timeout. **Serve-path recency**: the internal parts endpoint reads through `read_local_chunk`,
-which stamps `_on_local_read` like a client-facing hit — without it the owner's copy of a part
-that is only ever peer-served looks cold to the evictor.
-
 Promotion is gated on free space (`HIPPIUS_PROMOTE_MIN_FREE_RATIO`, default 0.175) because it
 shares the ingest mount with PUTs — `HIPPIUS_OBJECT_CACHE_DIR` is the drain agent's
 `CEPHOR_SSD_ROOT` and the mount `fs_cache_pressure` measures. The floor must sit strictly inside
 the evictor's band, above its reserve (0.150) and below its target (0.200), or promotion either
 chatters or deadlocks permanently; `validate_promotion_band` enforces that at startup.
+
+The locality rollout ([docs/locality-routing.md](../../docs/locality-routing.md)) sends every
+request for a key to one node, which turns "many readers of one fresh object on one pod" from a
+rare case into the normal one. Four peer-tier behaviours exist because of it and ship with it:
+per-chunk **singleflight** in `PeerChunkFetcher` ([peers.py](peers.py)); the **unreplicated
+wait** (`HIPPIUS_PEER_FETCH_UNREPLICATED_WAIT_SECONDS`, default 10, `0` restores shed-always) for
+parts that have no pool copy to shed to yet; **promote-notify**
+(`DualFileSystemPartsStore(on_promoted=...)`, wired to `obj_cache.notify_chunk` in `main.py`) so a
+reader parked in `wait_for_chunk` wakes when a neighbour lands the chunk; and **serve-path
+recency** (`DualFileSystemPartsStore.read_local_chunk` stamps `_on_local_read`,
+[read_recency.py](read_recency.py)) so the owner's copy of a part that is only ever peer-served
+does not look cold to the evictor. The mechanics live with the code they describe; the doc is
+the why.
 
 ## Invalidating a chunk that fails AEAD
 

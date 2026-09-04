@@ -109,7 +109,7 @@ The planner ([reader/planner.py](hippius_s3/reader/planner.py)) only includes ch
 
 ### 3.4 Request placement (which node gets the request)
 
-Under drain-direct the fastest copy of an object lives on the SSD of the node that received the PUT, so a GET is only fast if the edge sends it there. The edge load balancer consistent-hashes every object-level path (a non-empty key after the bucket, query string stripped) so PutObject, every UploadPart, Complete, GET/HEAD/Range and DeleteObject for one key land on one node; bucket- and service-level requests stay round-robin. Requests that placement does not cover (objects uploaded before the cutover or during a rollout) are served through the peer tier and promoted onto the hash owner after one read. The rule, the bounded-load caveat, hot-object behaviour and the drain/rollback procedure are in [docs/locality-routing.md](docs/locality-routing.md).
+Under drain-direct the fastest copy of an object lives on the SSD of the node that received the PUT, so a GET is only fast if the edge sends it there. The edge load balancer (staging first, prod after the soak — see the rollout status in the doc) consistent-hashes every authenticated or presigned object-level path (a non-empty key after the bucket, query string stripped) so PutObject, every UploadPart, Complete, GET/HEAD/Range and DeleteObject for one key land on one node; bucket- and service-level requests stay round-robin. Requests that placement does not cover (objects uploaded before the cutover or during a rollout) are served through the peer tier and promoted onto the hash owner after one read. The rule, the bounded-load caveat, hot-object behaviour and the drain/rollback procedure are in [docs/locality-routing.md](docs/locality-routing.md).
 
 ---
 
