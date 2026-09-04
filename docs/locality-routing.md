@@ -228,5 +228,6 @@ aws --endpoint-url "$ENDPOINT" s3api get-object --bucket b --key k /dev/null --d
 A mismatch on a freshly written key means either the rings disagree (check `id`/`weight` on
 every hashing box) or the two requests used different encodings of the key. The server-side
 check is the per-stream tier log the api emits when a body finishes:
-`STREAM tiers ray_id=... object_id=... v=... local=N peer=N pool=N bytes=N owner=<node>` — a
+`STREAM tiers ray_id=... object_id=... v=... local=N peer=N pool=N bytes=N owner=<node> owners=N`
+(`owners` is the number of distinct nodes the read's parts resolved to) — a
 GET that landed on its owner shows every chunk under `local=`.

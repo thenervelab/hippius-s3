@@ -66,8 +66,9 @@ fresh-part Redis hint or from the `tier_pref = 1` arm of the residency query, i.
 503 with jittered exponential backoff (0.05 × 2ⁿ, capped at 1s) for up to
 `HIPPIUS_PEER_FETCH_UNREPLICATED_WAIT_SECONDS` (default 10; `0` restores shed-always).
 Replicated parts keep the shed behaviour exactly. `locate(...)` exposes `(owner, unreplicated)`
-through the same memo and `build_stream_context` uses it to skip the Arion download for parts
-Arion cannot have yet; `last_owner(...)` is the memo-only read the stream log uses. The serve
+through the same memo and `build_stream_context` uses it (via `locate_many(...)`, one query for
+every missing part) to skip the Arion download for parts Arion cannot have yet;
+`last_owner(...)` is the memo-only read the stream log uses. The serve
 cap is sized `(nodes-1) × per-peer fetch cap` (64 on a 5-node fleet) so a full fetch window
 from every other node fits before the owner sheds.
 
@@ -77,7 +78,22 @@ promoting the same chunk slept out the chunk timeout. `DualFileSystemPartsStore(
 is called after `set_chunk` lands; the api wires it to `obj_cache.notify_chunk`, best-effort.
 A per-stream tier split (`local`/`peer`/`pool` chunk counts) is collected through the
 `_stream_tiers` ContextVar and logged by `read_response` when the body ends, with the memoised
-owner of the first part.
+owner of the first part (`owner=`) and the number of distinct nodes the plan's parts resolved
+to (`owners=`, memo-only as well — no DB work inside a response body).
+
+**Part-spread cap.** The edge keeps every request for a key on the key's node, UploadPart for
+`partNumber <= N` included, and spreads `partNumber > N` across the ingest nodes so no single
+node has to hold a whole large object. A read of a spread object lands on the key node, serves
+the head locally and peer-fetches the tail from its owners — and promoting that tail would
+copy it onto the key node on the first read, undoing the spread. `HIPPIUS_PROMOTE_MAX_PART_NUMBER`
+(default 200, `0` = no cap) makes `_promote_chunk` skip parts above it, counted as
+`promotion_skipped_total{reason=part_cap}`. **It must equal haproxy's part-spread threshold N**;
+the api cannot verify that, so the k8s manifests set it next to a comment saying so. Because a
+spread read misses locally on every tail part at once, `build_stream_context` resolves the
+owners of all missing parts in one `locate_many` query instead of one per part, and
+`UploadPart` refuses a request with more than one `partNumber` value (400 `InvalidArgument`):
+haproxy hashes on the first value and Starlette's `query_params.get` returns the last, so a
+duplicate would be placed as one part and stored as another.
 
 Promotion is gated on free space (`HIPPIUS_PROMOTE_MIN_FREE_RATIO`, default 0.175) because it
 shares the ingest mount with PUTs — `HIPPIUS_OBJECT_CACHE_DIR` is the drain agent's

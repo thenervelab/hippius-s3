@@ -169,6 +169,13 @@ spec:
             # is local. Requires NODE_NAME (above) to claim residency for the evictor.
             - name: HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ
               value: "true"
+            # Never promote parts above the edge's part-spread threshold. haproxy keeps every
+            # request for a key on the key's node and spreads UploadPart partNumber > N across
+            # the ingest nodes; a read of a spread object peer-fetches its tail from the
+            # owners, and promoting that tail onto the key node would undo the spread on the
+            # first read. MUST EQUAL haproxy's N — change both together.
+            - name: HIPPIUS_PROMOTE_MAX_PART_NUMBER
+              value: "200"
             # Per-peer fanout caps. A part that is hot and resident on ONE node otherwise
             # draws every other node's fetches onto that node's api pod — the same uvicorn
             # serving its own ingest. The client cap bounds what one pod sends; the serve cap

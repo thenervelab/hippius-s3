@@ -586,6 +586,69 @@ class PeerChunkFetcher:
             unreplicated,
         )
 
+    async def _resolve_parts(
+        self, object_id: str, object_version: int, part_numbers: list[int]
+    ) -> dict[int, tuple[str, dict[int, int], bool]]:
+        """`_resolve_part` over many parts in ONE round trip: `{part_number: (owner, sizes, unreplicated)}`.
+
+        Same two candidate arms, same ordering, same LATERAL sizes as the single-part query —
+        the choice is just made per part with `DISTINCT ON` instead of `LIMIT 1`. A part with
+        no candidate is absent from the result, which is the single query's `None` row.
+
+        Exists for spread multipart objects: a read on the key node misses locally on EVERY
+        tail part at once, and resolving those one query per part put O(parts) Postgres round
+        trips in front of the first byte.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH candidates AS (
+                    SELECT r.part_number, r.node_id, 0 AS tier_pref, r.resident_at AS ord
+                    FROM cephor_ssd_residency r
+                    JOIN cephor_replication_status s
+                      ON s.object_id = r.object_id AND s.version = r.version AND s.part_number = r.part_number
+                    WHERE r.object_id = $1 AND r.version = $2 AND r.part_number = ANY($3::bigint[])
+                      AND r.node_id <> $4
+                      AND s.status = 'replicated'
+                    UNION ALL
+                    SELECT s.part_number, s.node_id, 1 AS tier_pref, s.claimed_at AS ord
+                    FROM cephor_replication_status s
+                    WHERE s.object_id = $1 AND s.version = $2 AND s.part_number = ANY($3::bigint[])
+                      AND s.status IN ('pending', 'draining', 'corrupt')
+                      AND s.node_id IS NOT NULL
+                      AND s.node_id <> $4
+                ), owner AS (
+                    SELECT DISTINCT ON (part_number) part_number, node_id, tier_pref
+                    FROM candidates
+                    ORDER BY part_number, tier_pref, ord
+                )
+                SELECT o.part_number, o.node_id, o.tier_pref, sizes.chunk_indexes, sizes.cipher_sizes
+                FROM owner o
+                LEFT JOIN LATERAL (
+                    SELECT
+                        array_agg(pc.chunk_index ORDER BY pc.chunk_index) AS chunk_indexes,
+                        array_agg(pc.cipher_size_bytes ORDER BY pc.chunk_index) AS cipher_sizes
+                    FROM parts p
+                    JOIN part_chunks pc ON pc.part_id = p.part_id
+                    WHERE p.object_id = $1::uuid AND p.object_version = $2 AND p.part_number = o.part_number
+                ) sizes ON TRUE
+                """,
+                str(object_id),
+                int(object_version),
+                [int(n) for n in part_numbers],
+                self._node_name,
+            )
+        resolved: dict[int, tuple[str, dict[int, int], bool]] = {}
+        for row in rows:
+            indexes = row["chunk_indexes"] or []
+            sizes = row["cipher_sizes"] or []
+            resolved[int(row["part_number"])] = (
+                str(row["node_id"]),
+                {int(i): int(s) for i, s in zip(indexes, sizes, strict=False)},
+                int(row.get("tier_pref") or 0) == 1,
+            )
+        return resolved
+
     async def _chunk_sizes(self, object_id: str, object_version: int, part_number: int) -> dict[int, int]:
         """Ciphertext size of each chunk. Used when the owner came from the fresh-part hint."""
         async with self._pool.acquire() as conn:
@@ -621,6 +684,12 @@ class PeerChunkFetcher:
         owner, sizes, unreplicated = await self._resolve_part(object_id, object_version, part_number)
         if owner is not None:
             return owner, sizes, unreplicated
+        return await self._hinted_owner(object_id, object_version, part_number)
+
+    async def _hinted_owner(
+        self, object_id: str, object_version: int, part_number: int
+    ) -> tuple[Optional[str], dict[int, int], bool]:
+        """The fresh-part hint's answer for a part Postgres has no owner for."""
         hinted = await self._registry.lookup_fresh_part(object_id, object_version, part_number)
         if hinted is None:
             return None, {}, False
@@ -637,6 +706,17 @@ class PeerChunkFetcher:
             return cached
         owner, sizes, unreplicated = await self._uncached_owner(object_id, object_version, part_number)
         base = await self._registry.resolve(owner) if owner is not None else None
+        return self._memoise(part_key, owner, base, sizes, unreplicated)
+
+    def _memoise(
+        self,
+        part_key: tuple[str, int, int],
+        owner: Optional[str],
+        base: Optional[str],
+        sizes: dict[int, int],
+        unreplicated: bool,
+    ) -> PartOwner:
+        """Record a resolved part in the memo, negatively when it is not actually fetchable."""
         if base is None or not sizes:
             # No peer, or we found the ingest node but not per-chunk sizes (postgres
             # replica lag / write_meta before the tail txn). A 30s positive memo of
@@ -659,6 +739,42 @@ class PeerChunkFetcher:
         """
         owner = await self._owner(object_id, object_version, part_number)
         return owner.node_name, owner.unreplicated
+
+    async def locate_many(
+        self, object_id: str, object_version: int, part_numbers: list[int]
+    ) -> dict[int, tuple[Optional[str], bool]]:
+        """`locate` for many parts at once: memo hits cost nothing, every miss shares ONE query.
+
+        Same answer per part as `locate`, fed into the same memo — negative entries included —
+        so the fetches that follow pay nothing more. Parts Postgres has no owner for still get
+        the fresh-part hint, one Redis GET each, exactly as the single-part path does.
+        """
+        oid, ov = str(object_id), int(object_version)
+        located: dict[int, tuple[Optional[str], bool]] = {}
+        misses: list[int] = []
+        for pn in sorted({int(n) for n in part_numbers}):
+            cached = self._owner_url.get((oid, ov, pn))
+            if cached is None:
+                misses.append(pn)
+            else:
+                located[pn] = (cached.node_name, cached.unreplicated)
+        if not misses:
+            return located
+        resolved = await self._resolve_parts(oid, ov, misses)
+        # One registry lookup per distinct owner rather than per part: a spread object's tail
+        # parts are held by a handful of nodes, not one node per part.
+        bases: dict[str, Optional[str]] = {}
+        for pn in misses:
+            answer = resolved.get(pn)
+            owner, sizes, unreplicated = answer if answer is not None else await self._hinted_owner(oid, ov, pn)
+            base = None
+            if owner is not None:
+                if owner not in bases:
+                    bases[owner] = await self._registry.resolve(owner)
+                base = bases[owner]
+            entry = self._memoise((oid, ov, pn), owner, base, sizes, unreplicated)
+            located[pn] = (entry.node_name, entry.unreplicated)
+        return located
 
     def last_owner(self, object_id: str, object_version: int, part_number: int) -> Optional[str]:
         """The memoised owner node name with no lookup; None when nothing is memoised."""

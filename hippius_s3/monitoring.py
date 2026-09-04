@@ -51,8 +51,9 @@ PeerShedReason = Literal[
 
 # Why a chunk that could have been promoted onto local flash was not. Closed by construction.
 # `residency_failed` is the fail-closed arm: the claim that makes this node's evictor the owner
-# of the copy did not land, so the copy is not made.
-PromotionSkipReason = Literal["disk_pressure", "residency_failed"]
+# of the copy did not land, so the copy is not made. `part_cap` is a part above
+# HIPPIUS_PROMOTE_MAX_PART_NUMBER: the edge spread it onto another node on purpose.
+PromotionSkipReason = Literal["disk_pressure", "residency_failed", "part_cap"]
 
 # Which way the drain agent's published promote floor differs from this process's configured
 # one. Closed by construction, like the labels above.
@@ -210,9 +211,11 @@ class MetricsCollector:
         # threshold. Flat at zero while free space falls means the gate is not engaging.
         # `residency_failed` says promotion is off because the residency DB is unreachable —
         # sustained, it means the read tier has stopped warming and only this counter says so.
+        # `part_cap` is routine on a key node reading a spread multipart object: its tail
+        # parts are peer-served and deliberately left where the edge put them.
         self.promotion_skipped = self.meter.create_counter(
             name="promotion_skipped_total",
-            description="Chunks not promoted to the local read tier, by reason (disk_pressure|residency_failed)",
+            description="Chunks not promoted to the local read tier, by reason (disk_pressure|residency_failed|part_cap)",
             unit="1",
         )
 
