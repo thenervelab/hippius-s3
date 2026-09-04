@@ -140,30 +140,35 @@ def evaluate_single_part(observations: Sequence[KeyObservation]) -> CheckResult:
     return CheckResult("single-part agreement", not mismatches, details)
 
 
-def evaluate_colocation(name: str, ops: Mapping[str, str | None], extra: Sequence[str] = ()) -> CheckResult:
+def evaluate_colocation(
+    name: str, ops: Mapping[str, str | None], problems: Sequence[str] = (), notes: Sequence[str] = ()
+) -> CheckResult:
     nodes = set(ops.values())
     strays = [f"{op} -> {label(node)}" for op, node in ops.items() if node is None]
-    passed = len(nodes) == 1 and None not in nodes
-    if passed:
+    colocated = len(nodes) == 1 and None not in nodes
+    if colocated:
         details = [f"{len(ops)} ops all on {label(next(iter(nodes)))}"]
     else:
         details = [f"{op}={label(node)}" for op, node in ops.items()]
         details.extend(strays)
-    details.extend(extra)
-    return CheckResult(name, passed, details)
+    details.extend(problems)
+    details.extend(notes)
+    return CheckResult(name, colocated and not problems, details)
 
 
-def evaluate_spread(name: str, nodes: Sequence[str | None], extra: Sequence[str] = ()) -> CheckResult:
+def evaluate_spread(
+    name: str, nodes: Sequence[str | None], problems: Sequence[str] = (), notes: Sequence[str] = ()
+) -> CheckResult:
     missing = sum(1 for node in nodes if node is None)
     distinct = {node for node in nodes if node is not None}
-    passed = missing == 0 and len(distinct) > 1
     details = [f"{len(nodes)} calls over {len(distinct)} nodes: {distribution(nodes)}"]
     if missing:
         details.append(f"{missing} responses with {NO_NODE}")
     if len(distinct) <= 1:
         details.append("expected more than one node")
-    details.extend(extra)
-    return CheckResult(name, passed, details)
+    details.extend(problems)
+    details.extend(notes)
+    return CheckResult(name, missing == 0 and len(distinct) > 1 and not problems, details)
 
 
 def prefix_sample(threshold: int) -> list[int]:
@@ -178,15 +183,14 @@ def evaluate_multipart_spread(
     threshold: int,
     control: Mapping[str, str | None],
     part_nodes: Mapping[int, str | None],
-    extra: Sequence[str] = (),
+    problems: Sequence[str] = (),
 ) -> list[CheckResult]:
     ops: dict[str, str | None] = {"create": control["create"]}
     for pn in prefix_sample(threshold):
         ops[f"part{pn}"] = part_nodes.get(pn)
     ops["complete"] = control["complete"]
     ops["get"] = control["get"]
-    prefix = evaluate_colocation(f"multipart prefix co-location (parts <= {threshold})", ops, extra)
-    prefix.passed = prefix.passed and not extra
+    prefix = evaluate_colocation(f"multipart prefix co-location (parts <= {threshold})", ops, problems)
     tail = [part_nodes.get(pn) for pn in spread_parts(threshold)]
     return [prefix, evaluate_spread(f"multipart spread (parts > {threshold})", tail)]
 
@@ -306,33 +310,38 @@ class Probe:
             observations.append(KeyObservation(key, put_node, tuple(get_nodes), head_node, body_ok))
         return evaluate_single_part(observations)
 
-    def check_multipart(self) -> CheckResult:
-        key = "mpu/object.bin"
-        ops: dict[str, str | None] = {}
-        node, created = self.call("create_multipart_upload", Key=key)
-        ops["create"] = node
-        upload_id = created["UploadId"]
+    def upload_parts(self, key: str, upload_id: str, count: int) -> tuple[dict[int, str | None], bytes, list[dict]]:
         digest = hashlib.md5()
-        parts = []
-        for pn in range(1, MPU_PARTS + 1):
+        part_nodes: dict[int, str | None] = {}
+        parts: list[dict] = []
+        for pn in range(1, count + 1):
             data = os.urandom(MPU_PART_BYTES)
             digest.update(data)
             node, uploaded = self.call("upload_part", Key=key, PartNumber=pn, UploadId=upload_id, Body=data)
-            ops[f"part{pn}"] = node
+            part_nodes[pn] = node
             parts.append({"PartNumber": pn, "ETag": uploaded["ETag"]})
+        return part_nodes, digest.digest(), parts
+
+    def complete(self, key: str, upload_id: str, parts: list[dict]) -> str | None:
+        node, _ = self.call("complete_multipart_upload", Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts})
+        return node
+
+    def check_multipart(self) -> CheckResult:
+        key = "mpu/object.bin"
+        ops: dict[str, str | None] = {}
+        ops["create"], created = self.call("create_multipart_upload", Key=key)
+        upload_id = created["UploadId"]
+        part_nodes, body_md5, parts = self.upload_parts(key, upload_id, MPU_PARTS)
+        ops.update({f"part{pn}": node for pn, node in part_nodes.items()})
         ops["list_parts"], _ = self.call("list_parts", Key=key, UploadId=upload_id)
-        ops["complete"], _ = self.call(
-            "complete_multipart_upload", Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts}
-        )
-        extra: list[str] = []
+        ops["complete"] = self.complete(key, upload_id, parts)
+        problems: list[str] = []
         for i in range(MPU_GETS):
             node, data = self.get(key)
             ops[f"get{i + 1}"] = node
-            if hashlib.md5(data).digest() != digest.digest():
-                extra.append(f"get{i + 1} body-mismatch")
-        result = evaluate_colocation("multipart co-location", ops, extra)
-        result.passed = result.passed and not extra
-        return result
+            if hashlib.md5(data).digest() != body_md5:
+                problems.append(f"get{i + 1} body-mismatch")
+        return evaluate_colocation("multipart co-location", ops, problems)
 
     def check_multipart_abort(self) -> CheckResult:
         key = "mpu/aborted.bin"
@@ -353,56 +362,45 @@ class Probe:
         control: dict[str, str | None] = {}
         control["create"], created = self.call("create_multipart_upload", Key=key)
         upload_id = created["UploadId"]
-        digest = hashlib.md5()
-        part_nodes: dict[int, str | None] = {}
-        parts = []
-        for pn in range(1, total + 1):
-            data = os.urandom(MPU_PART_BYTES)
-            digest.update(data)
-            node, uploaded = self.call("upload_part", Key=key, PartNumber=pn, UploadId=upload_id, Body=data)
-            part_nodes[pn] = node
-            parts.append({"PartNumber": pn, "ETag": uploaded["ETag"]})
-        control["complete"], _ = self.call(
-            "complete_multipart_upload", Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts}
-        )
-        control["get"], body_md5 = self.get_md5(key)
-        extra = [] if body_md5 == digest.digest() else ["get body-mismatch"]
-        return evaluate_multipart_spread(threshold, control, part_nodes, extra)
+        part_nodes, body_md5, parts = self.upload_parts(key, upload_id, total)
+        control["complete"] = self.complete(key, upload_id, parts)
+        control["get"], read_md5 = self.get_md5(key)
+        problems = [] if read_md5 == body_md5 else ["get body-mismatch"]
+        return evaluate_multipart_spread(threshold, control, part_nodes, problems)
 
     def check_bucket_spread(self) -> CheckResult:
         list_nodes = [self.call("list_objects_v2")[0] for _ in range(self.cfg.lists)]
         head_nodes = [self.call("head_bucket")[0] for _ in range(HEAD_BUCKET_CALLS)]
-        extra = [f"head_bucket: {distribution(head_nodes)}"]
-        result = evaluate_spread("bucket-level spread", list_nodes, extra)
-        result.passed = result.passed and None not in head_nodes
-        return result
+        problems = [f"head_bucket {NO_NODE}"] if None in head_nodes else []
+        return evaluate_spread(
+            "bucket-level spread", list_nodes, problems, [f"head_bucket: {distribution(head_nodes)}"]
+        )
 
     def check_read_variants(self) -> CheckResult:
         key = "variants/one.bin"
         body = os.urandom(SINGLE_PART_BYTES)
         ops: dict[str, str | None] = {}
         ops["put"], version_id = self.put(key, body)
-        extra: list[str] = []
+        problems: list[str] = []
+        notes: list[str] = []
         node, data = self.get(key, Range="bytes=0-1023")
         ops["range"] = node
         if data != body[:1024]:
-            extra.append("range body-mismatch")
+            problems.append("range body-mismatch")
         if version_id is None:
-            extra.append("PUT returned no VersionId, versioned GET skipped")
+            notes.append("PUT returned no VersionId, versioned GET skipped")
         else:
             ops["versioned"], data = self.get(key, VersionId=version_id)
             if data != body:
-                extra.append("versioned body-mismatch")
+                problems.append("versioned body-mismatch")
         url = self.client.generate_presigned_url(
             "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=PRESIGN_EXPIRES_SECONDS
         )
         with urllib.request.urlopen(url, timeout=120) as response:
             ops["presigned"] = node_from_headers(response.headers)
             if response.read() != body:
-                extra.append("presigned body-mismatch")
-        result = evaluate_colocation("read variants (range/versioned/presigned)", ops, extra)
-        result.passed = result.passed and not any(e.endswith("body-mismatch") for e in extra)
-        return result
+                problems.append("presigned body-mismatch")
+        return evaluate_colocation("read variants (range/versioned/presigned)", ops, problems, notes)
 
     def check_drill(self) -> CheckResult:
         key = "drill/misplaced.bin"

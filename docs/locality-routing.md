@@ -9,7 +9,9 @@ on one node's SSD in the first place).
 Rollout status (2026-09-04): the hashed edge config ships on staging first; the production
 ingresses follow after the soak. Until then prod placement is still round-robin and every
 number below that is not from the 2026-09-03 benchmark is a design expectation, not a
-measurement.
+measurement. The two-level key of section 2 is a second edge change on top of the phase-1 path
+hash; its api-side pieces (the promotion cap, the batched owner lookup, the duplicate-`partNumber`
+400) ship with the read-path change and are described here as one model.
 
 ## 1. The problem
 
@@ -44,19 +46,23 @@ only, by one query parameter. The hash key is two-level, with N = 200:
 | Request | Hash key | Lands on |
 |---|---|---|
 | Bucket- and service-level: `/`, `/bucket`, `/bucket/` (ListObjects, `?delete`, `?uploads` listing, acl/policy/location/versioning on a bucket, CreateBucket) | none — round-robin on a sibling backend with identical health checks, timeouts and rate-limit tracking | any node |
-| Object-level (`^/[^/]+/.+`), every method and every query string | `path` (query stripped) | the key node |
+| Object-level (`^/[^/]+/.+`), every method and query string except the row below | `path` (query stripped) | the key node |
 | `PUT` UploadPart / UploadPartCopy with `partNumber` > N | `path#partNumber` | a per-part node, spread over the ring |
 
-The base is `balance uri path-only` under `hash-type consistent sdbm avalanche`; the third row
-appends the part number to that path before hashing. UploadPartCopy hashes on the destination
-path in both rows.
+Phase 1 shipped the second row as `balance uri path-only` under `hash-type consistent sdbm
+avalanche`. The two-level key replaces it with `balance hash` over an expression that starts with
+`path` (same parser: host stripped, query dropped, raw bytes) and appends `#<partNumber>` only
+when the request is a `PUT` whose `partNumber` is above N. For every other request the sample is
+the bare path, byte-identical to what `balance uri path-only` hashed, so the migration moves no
+key that was already placed; only the tail parts of giants in flight during the switch land
+differently. UploadPartCopy hashes on the destination path in both rows.
 
 What that means per operation:
 
 - **Single-part objects and all reads land on the key node.** PutObject, Create/Complete/Abort
   MultipartUpload, ListParts, S4 append, DeleteObject, and every read — GET/HEAD, Range,
   `?versionId`, presigned URLs and `?partNumber` reads (the api serves those as whole-object
-  reads, section "Known limitations") — hash on the path alone. `uploadId`, `versionId` and the
+  reads, section 7) — hash on the path alone. `uploadId`, `versionId` and the
   `X-Amz-*` presign parameters live in the query string and never move a request off the key
   node.
 - **A multipart object keeps parts 1..N on the key node.** Reads of an object with at most N
@@ -218,20 +224,22 @@ evictions persisting after these two.
 - The CopyObject fast path is DB-only (it re-points chunk rows without moving bytes), so the first
   GET of a fresh copy is a backend download on whichever node owns the destination key.
 
-## Known limitations
+## 7. Known limitations
 
 - S4 appends carry no part number in the URL, so an append-only object grows on its key node
   without bound (follow-up: api guard).
 - Many giants hashing to one node pin up to N × 512 MiB each.
 - Reads of a giant funnel through its key node (the bounded-load factor later spreads readers to
   the part owners).
-- A duplicate `partNumber` is handled by a 400.
+- A request that repeats `partNumber` is rejected by the api with 400 rather than reconciled: the
+  edge places it by the first value and the api would otherwise read the last.
 - Abort/delete of a giant leaves the spread parts on their nodes until the drain grace (1 h
   failed / 24 h orphan).
-- Non-sequential part numbering changes which parts are above N but stays bounded.
+- Part numbers need not be contiguous. A client that numbers sparsely (1000, 2000, ...) has every
+  part above N spread and reads the whole object through the peer tier; the per-node bound holds.
 - Part-wise GET (`?partNumber` reads) is not implemented and no mainstream client uses it.
 
-## 7. Operations
+## 8. Operations
 
 **Draining a node.** Set the server's weight to 0 on both the hashed backend and its round-robin
 twin, on every load balancer, through the runtime API (`set weight <backend>/<server> 0` on the
@@ -283,11 +291,11 @@ aws --endpoint-url "$ENDPOINT" s3api get-object --bucket b --key k /dev/null --d
 
 **Probe script.** [scripts/locality_probe.py](../scripts/locality_probe.py) runs the checks above
 end to end with boto3 and prints one PASS/FAIL line per check (exit 1 on any FAIL). It creates a
-throwaway `locality-probe-<epoch>` bucket, checks that N single-part keys read back (GET x G, HEAD)
-from their PUT node and reports how the PUT nodes spread, that a 4 x 5 MiB multipart upload
-(Create, UploadPart, ListParts, Complete, GETs) and an aborted one sit on one node, that repeated
-`ListObjectsV2`/`HeadBucket` spread over more than one node, and that Range, `?versionId` and a
-presigned GET of one key all land on its PUT node. Every response's `X-Hippius-Node` is captured
+throwaway `locality-probe-<epoch>` bucket, checks that `HIPPIUS_PROBE_KEYS` single-part keys read
+back (GET × `HIPPIUS_PROBE_GETS`, HEAD) from their PUT node and reports how the PUT nodes spread,
+that a 4 x 5 MiB multipart upload (Create, UploadPart, ListParts, Complete, GETs) and an aborted
+one sit on one node, that repeated `ListObjectsV2`/`HeadBucket` spread over more than one node,
+and that Range, `?versionId` and a presigned GET of one key all land on its PUT node. Every response's `X-Hippius-Node` is captured
 through a botocore `after-call` hook; a missing header fails the check rather than crashing.
 
 ```bash
@@ -299,11 +307,15 @@ HIPPIUS_ROUTING_ENDPOINT="$ENDPOINT" AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY
 Optional env: `AWS_DEFAULT_REGION` (default `decentralized`), `HIPPIUS_PROBE_KEYS` (20),
 `HIPPIUS_PROBE_GETS` (5), `HIPPIUS_PROBE_LISTS` (50), `HIPPIUS_PROBE_KEEP_BUCKET` (leave the
 bucket behind for inspection). Without an endpoint and credentials it prints one line and exits 0.
-`HIPPIUS_PROBE_SPREAD=1` adds the spread check: it uploads N + 5 parts of 5 MiB
-(`HIPPIUS_PROBE_SPREAD_THRESHOLD`, default 200), completes, and reads the object back once with an
-md5 check. Create, a sample of the prefix (parts 1, 2, N-1, N), Complete and the GET must sit on
-one node; parts N+1..N+5 must spread over more than one (staging has two nodes, so more than one
-distinct node is the bar).
+A FAIL still cleans up; an exception mid-run (the script has no error handling by design) leaves
+the bucket behind, so delete `locality-probe-*` by hand after a crash.
+
+`HIPPIUS_PROBE_SPREAD=1` adds the spread check: it uploads N + 5 parts of 5 MiB (about 1 GB at
+the default N; `HIPPIUS_PROBE_SPREAD_THRESHOLD` sets N, default 200, and must match the edge's),
+completes, and reads the object back once with a streamed md5 check. Create, a sample of the
+prefix (parts 1, 2, N-1, N), Complete and the GET must sit on one node; parts N+1..N+5 must spread
+over more than one — the bar a two-node fleet can show, so a partial spread passes and the
+distribution is printed for the eye.
 `HIPPIUS_PROBE_DRILL=1` adds the misplaced-object drill: it waits for you to drain one node at the
 edge (section "Draining a node" above), PUTs a key while the node is out of the ring, waits for you
 to restore it, then fires 30 concurrent GETs and requires every one to succeed with a TTFB under

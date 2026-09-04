@@ -299,3 +299,130 @@ def test_check_multipart_spread_uploads_threshold_plus_five_parts(monkeypatch: p
     assert ops[1:8] == [("upload_part", pn) for pn in range(1, 8)]
     assert ops[8:] == [("complete_multipart_upload", None), ("get_object", None)]
     assert [x["PartNumber"] for x in client.calls[8][1]["MultipartUpload"]["Parts"]] == list(range(1, 8))
+
+
+def test_load_config_rejects_non_integer_spread_threshold() -> None:
+    with pytest.raises(ValueError):
+        config(HIPPIUS_PROBE_SPREAD="1", HIPPIUS_PROBE_SPREAD_THRESHOLD="two-hundred")
+
+
+def test_colocation_problems_fail_the_check_but_notes_do_not() -> None:
+    ops = {"put": "n1", "range": "n1"}
+    noted = probe.evaluate_colocation("rv", ops, notes=["PUT returned no VersionId, versioned GET skipped"])
+    assert noted.passed and "versioned GET skipped" in noted.line()
+    broken = probe.evaluate_colocation("rv", ops, problems=["range body-mismatch"])
+    assert not broken.passed and "range body-mismatch" in broken.line()
+
+
+def test_spread_problems_fail_the_check_but_notes_do_not() -> None:
+    nodes = ["n1", "n2"]
+    noted = probe.evaluate_spread("bucket", nodes, notes=["head_bucket: n1=3"])
+    assert noted.passed and "head_bucket: n1=3" in noted.line()
+    broken = probe.evaluate_spread("bucket", nodes, problems=[f"head_bucket {probe.NO_NODE}"])
+    assert not broken.passed and f"head_bucket {probe.NO_NODE}" in broken.line()
+
+
+def test_multipart_spread_at_staging_sized_thresholds() -> None:
+    control = {"create": "n1", "complete": "n1", "get": "n1"}
+    prefix, spread = probe.evaluate_multipart_spread(1, control, {1: "n1", 2: "n2", 3: "n1", 4: "n2", 5: "n2", 6: "n1"})
+    assert prefix.passed and "4 ops all on n1" in prefix.line()
+    assert spread.passed and "5 calls over 2 nodes" in spread.line()
+    prefix, spread = probe.evaluate_multipart_spread(
+        2, control, {1: "n1", 2: "n1", 3: "n2", 4: "n2", 5: "n2", 6: "n2", 7: "n1"}
+    )
+    assert prefix.passed and "5 ops all on n1" in prefix.line()
+    assert spread.passed and "n1=1, n2=4" in spread.line()
+
+
+def test_multipart_spread_flags_missing_header_in_the_tail() -> None:
+    control = {"create": "n1", "complete": "n1", "get": "n1"}
+    part_nodes = {1: "n1", 2: "n1", 3: "n1", 4: "n1", 5: "n2", 6: None, 7: "n1", 8: "n2", 9: "n1"}
+    prefix, spread = probe.evaluate_multipart_spread(4, control, part_nodes)
+    assert prefix.passed
+    assert not spread.passed and f"1 responses with {probe.NO_NODE}" in spread.line()
+
+
+def test_multipart_spread_flags_control_call_off_the_key_node() -> None:
+    part_nodes = dict.fromkeys(range(1, 5), "n1") | {5: "n1", 6: "n2", 7: "n1", 8: "n2", 9: "n1"}
+    prefix, spread = probe.evaluate_multipart_spread(4, {"create": "n1", "complete": "n1", "get": "n2"}, part_nodes)
+    assert not prefix.passed and "get=n2" in prefix.line()
+    assert spread.passed
+
+
+def stub_checks(monkeypatch: pytest.MonkeyPatch, ran: list[str]) -> None:
+    def stub(name: str, results: Any) -> Any:
+        def _check(self: Any) -> Any:
+            ran.append(name)
+            return results
+
+        return _check
+
+    for name in ("check_single_part", "check_multipart", "check_multipart_abort", "check_bucket_spread"):
+        monkeypatch.setattr(probe.Probe, name, stub(name, probe.CheckResult(name, True)))
+    monkeypatch.setattr(probe.Probe, "check_read_variants", stub("check_read_variants", probe.CheckResult("rv", False)))
+    monkeypatch.setattr(
+        probe.Probe,
+        "check_multipart_spread",
+        stub("check_multipart_spread", [probe.CheckResult("prefix", True), probe.CheckResult("spread", True)]),
+    )
+    monkeypatch.setattr(probe.Probe, "check_drill", stub("check_drill", probe.CheckResult("drill", True)))
+
+
+def test_run_skips_spread_and_drill_unless_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    ran: list[str] = []
+    stub_checks(monkeypatch, ran)
+    client = FakeClient(["n1"] * 3)
+    results = probe.run(config(), client, "bkt")
+    assert ran == [
+        "check_single_part",
+        "check_multipart",
+        "check_multipart_abort",
+        "check_bucket_spread",
+        "check_read_variants",
+    ]
+    assert [r.name for r in results] == [
+        "check_single_part",
+        "check_multipart",
+        "check_multipart_abort",
+        "check_bucket_spread",
+        "rv",
+    ]
+    assert probe.exit_code(results) == 1
+    assert [op for op, _ in client.calls] == ["create_bucket", "list_objects_v2", "delete_bucket"]
+
+
+def test_run_flattens_spread_results_and_keeps_bucket_when_asked(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ran: list[str] = []
+    stub_checks(monkeypatch, ran)
+    client = FakeClient(["n1"])
+    cfg = config(HIPPIUS_PROBE_SPREAD="yes", HIPPIUS_PROBE_DRILL="1", HIPPIUS_PROBE_KEEP_BUCKET="1")
+    results = probe.run(cfg, client, "bkt")
+    assert ran.index("check_multipart_spread") == 3 and ran[-1] == "check_drill"
+    assert [r.name for r in results][3:5] == ["prefix", "spread"]
+    assert len(results) == 8
+    assert [op for op, _ in client.calls] == ["create_bucket"]
+    out = capsys.readouterr().out
+    assert "PASS prefix" in out and "PASS spread" in out and "FAIL rv" in out and "keeping bucket bkt" in out
+
+
+def test_check_multipart_spread_fails_on_body_mismatch_and_still_reports_placement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(probe, "MPU_PART_BYTES", 16)
+    monkeypatch.setattr(probe.os, "urandom", lambda n: b"\x01" * n)
+    nodes = ["n1", "n1", "n2", "n1", "n2", "n1", "n2", "n1", "n1"]
+    client = FakeClient(
+        nodes,
+        {
+            "create_multipart_upload": {"UploadId": "u"},
+            "upload_part": {"ETag": '"e"'},
+            "get_object": {"Body": FakeBody(b"\x02" * (16 * 6))},
+        },
+    )
+    p = probe.Probe(client, config(HIPPIUS_PROBE_SPREAD_THRESHOLD="1"), "bkt")
+    prefix, spread = p.check_multipart_spread()
+    assert not prefix.passed and "get body-mismatch" in prefix.line()
+    assert spread.passed and "5 calls over 2 nodes" in spread.line()
+    assert [kw.get("PartNumber") for op, kw in client.calls if op == "upload_part"] == [1, 2, 3, 4, 5, 6]
