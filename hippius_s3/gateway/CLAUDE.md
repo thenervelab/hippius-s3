@@ -21,7 +21,7 @@ Registered in [hippius_s3/main.py](../main.py). FastAPI's `@app.middleware("http
 | # | Middleware | Purpose | Short-circuit |
 |---|-----------|---------|---------------|
 | 1 (outermost) | `cors_middleware` | Adds CORS headers to every response (including error paths). | — |
-| 2 | `ray_id_middleware` | Generates or propagates ray id + stamps `gateway_start_time`; runs early so every inner middleware logs a real ray_id. | — |
+| 2 | `ray_id_middleware` | Generates or propagates ray id + stamps `gateway_start_time`; runs early so every inner middleware logs a real ray_id. Also sets `X-Hippius-Node` (see below). | — |
 | 3 | `cache_control_middleware` | Cache-Control stamping for anonymous-readable objects (ATS/browser caching). | — |
 | 4 | `ats_purge_middleware` | Fans PURGE requests out to ATS cache endpoints. | — |
 | 5 | `cache_invalidation_middleware` | Invalidates ATS cache on writes. | — |
@@ -38,6 +38,13 @@ Registered in [hippius_s3/main.py](../main.py). FastAPI's `@app.middleware("http
 | 16 | `metrics_middleware` | Request latency, status codes, account attribution. | — |
 | 17 | `audit_log_middleware` | Operation audit (when `ENABLE_AUDIT_LOGGING=true`). | — |
 | 18 (innermost) | `auth_probe_middleware` | ATS auth-probe short-circuit; MUST stay innermost (see warning in main.py). | 200 |
+
+**`X-Hippius-Node`.** Alongside `X-Hippius-Ray-ID`, the ray-id middleware stamps every
+response — errors included — with the `NODE_NAME` of the pod that served it, when the env var is
+set. It exists for the locality rollout ([docs/locality-routing.md](../../docs/locality-routing.md)):
+the edge hashes object paths onto nodes, and the header is how a client (or the routing probe)
+checks that a GET landed on the node that took the PUT. It is a node name, not an address, and
+carries no auth meaning.
 
 **Not wired today**: `rate_limit` and `banhammer`. The modules at [gateway/middlewares/rate_limit.py](middlewares/rate_limit.py) and [gateway/middlewares/banhammer.py](middlewares/banhammer.py) exist but `main.py` doesn't register them — see the log line `"Rate limiting and banhammer disabled"` at [main.py:94](main.py). See [todo.md](../../todo.md) P2.
 

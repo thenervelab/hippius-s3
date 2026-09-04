@@ -107,6 +107,10 @@ A **subsystem index** with links to per-directory `CLAUDE.md` files is in sectio
 
 The planner ([reader/planner.py](hippius_s3/reader/planner.py)) only includes chunks that intersect the requested range, and sets `slice_start`/`slice_end_excl` on the first and last to trim plaintext. The downloader, when invoked for a Range miss, fetches **full chunks** (not byte ranges) from Arion — there is no `BackendClient.download_range` yet. See [todo.md](todo.md) for this optimization.
 
+### 3.4 Request placement (which node gets the request)
+
+Under drain-direct the fastest copy of an object lives on the SSD of the node that received the PUT, so a GET is only fast if the edge sends it there. The edge load balancer (staging first, prod after the soak — see the rollout status in the doc) consistent-hashes every authenticated or presigned object-level path (a non-empty key after the bucket, query string stripped) so PutObject, every UploadPart, Complete, GET/HEAD/Range and DeleteObject for one key land on one node; bucket- and service-level requests stay round-robin. Requests that placement does not cover (objects uploaded before the cutover or during a rollout) are served through the peer tier and promoted onto the hash owner after one read. The rule, the bounded-load caveat, hot-object behaviour and the drain/rollback procedure are in [docs/locality-routing.md](docs/locality-routing.md).
+
 ---
 
 ## 4. Crypto / KMS cheat sheet

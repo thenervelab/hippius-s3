@@ -85,6 +85,19 @@ shares the ingest mount with PUTs — `HIPPIUS_OBJECT_CACHE_DIR` is the drain ag
 the evictor's band, above its reserve (0.150) and below its target (0.200), or promotion either
 chatters or deadlocks permanently; `validate_promotion_band` enforces that at startup.
 
+The locality rollout ([docs/locality-routing.md](../../docs/locality-routing.md)) sends every
+request for a key to one node, which turns "many readers of one fresh object on one pod" from a
+rare case into the normal one. Four peer-tier behaviours exist because of it and ship with it:
+per-chunk **singleflight** in `PeerChunkFetcher` ([peers.py](peers.py)); the **unreplicated
+wait** (`HIPPIUS_PEER_FETCH_UNREPLICATED_WAIT_SECONDS`, default 10, `0` restores shed-always) for
+parts that have no pool copy to shed to yet; **promote-notify**
+(`DualFileSystemPartsStore(on_promoted=...)`, wired to `obj_cache.notify_chunk` in `main.py`) so a
+reader parked in `wait_for_chunk` wakes when a neighbour lands the chunk; and **serve-path
+recency** (`DualFileSystemPartsStore.read_local_chunk` stamps `_on_local_read`,
+[read_recency.py](read_recency.py)) so the owner's copy of a part that is only ever peer-served
+does not look cold to the evictor. The mechanics live with the code they describe; the doc is
+the why.
+
 ## Invalidating a chunk that fails AEAD
 
 Promotion copies peer/pool bytes onto local flash, and the local tier is read FIRST — so a bad
