@@ -130,7 +130,9 @@ Separate from the janitor's `last_access_at`: the drain-agent's SSD evictor orde
 
 - `DualFileSystemPartsStore.get_chunk` on a local hit (`_on_local_read`).
 - `DualFileSystemPartsStore.read_local_chunk` — the peer-serve path (`api/internal_parts.py`). Without this stamp the owner's copy of a part that is only ever read by OTHER nodes looks cold and is the first thing its evictor drops. It still reads the primary only, never the pool or a peer.
-- `recorder.touch_parts(object_id, version, part_numbers)` from `object_reader.read_response`, for plans spanning more than one part: one node-scoped `UPDATE ... WHERE part_number = ANY($4::int[])` for the parts the memo has not seen, issued before streaming starts so the tail parts of a long read are marked hot before the evictor can take them.
+- `recorder.touch_parts(object_id, version, part_numbers)` from `object_reader._touch_plan_parts` (both `read_response` and `stream_object`, so a streaming CopyObject's source gets it too), for plans spanning more than one part: one node-scoped `UPDATE ... WHERE part_number = ANY($4::bigint[])` for the parts the memo has not seen, issued before the first chunk is waited on so the tail parts of a long read are marked hot before the evictor can take them. Range reads touch only the parts the planner put in the plan.
+
+Every stamp is awaited inline on the read path and is best-effort: the recorder bounds its pool acquire and its UPDATE to `_STAMP_TIMEOUT_SECONDS` (2 s) and swallows every failure, counted as `read_recency_writes_total{outcome=failed}`. A saturated pool therefore costs a lost sample (the part is evicted a little earlier than it deserves), never a stalled GET or a peer-serve slot held open. The touch stamps THIS node's rows only; a part that a peer holds is stamped by the peer, per chunk, through `read_local_chunk` when the chunk is actually served.
 
 ## `RedisObjectPartsCache`
 

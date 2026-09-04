@@ -391,6 +391,25 @@ async def build_stream_context(
     )
 
 
+async def _touch_plan_parts(object_id: str, ctx: StreamContext) -> None:
+    """Stamp every part of a multi-part read as used NOW, before the first chunk is waited on.
+
+    The recorder uses its own pool, so this is not DB work on the request's `db` — but the module
+    rule stands: nothing here runs from inside the response body. The per-chunk stamp in the store
+    only reaches a part when its first chunk streams, and on a long stream that can be minutes
+    later — after the evictor has already ranked the tail parts of this very object as its
+    coldest. Single-part reads are covered by the per-chunk stamp at no extra round trip. The
+    recorder swallows its own failures and bounds its wait, so this cannot fail or stall the read.
+    """
+    recorder = get_read_recency_recorder()
+    if recorder is None:
+        return
+    # `getattr` rather than attribute access: tests drive this with bare `object()` plan items.
+    plan_parts = sorted({int(item.part_number) for item in ctx.plan if getattr(item, "part_number", None) is not None})
+    if len(plan_parts) > 1:
+        await recorder.touch_parts(object_id, int(ctx.object_version), plan_parts)
+
+
 async def read_response(
     db: Any,
     redis: Any,
@@ -415,17 +434,7 @@ async def read_response(
         address=address,
         parts=parts,
     )
-    # Stamp every part of a multi-part read as used NOW, while this request still owns `db` (the
-    # recorder uses its own pool, but the module rule stands: no DB work from inside the body).
-    # The per-chunk stamp in the store only reaches a part when its first chunk streams, and on a
-    # long stream that can be minutes later — after the evictor has already ranked the tail parts
-    # of this very object as its coldest. Single-part reads are covered by the per-chunk stamp.
-    plan_parts = sorted(
-        {int(getattr(item, "part_number", 0)) for item in ctx.plan if getattr(item, "part_number", None) is not None}
-    )
-    recorder = get_read_recency_recorder()
-    if recorder is not None and len(plan_parts) > 1:
-        await recorder.touch_parts(str(info["object_id"]), int(ctx.object_version), plan_parts)
+    await _touch_plan_parts(str(info["object_id"]), ctx)
     gen = stream_plan(
         obj_cache=obj_cache,
         object_id=info["object_id"],
@@ -530,6 +539,9 @@ async def stream_object(
         rng=rng,
         address=address,
     )
+    # A streaming CopyObject reads its whole multi-part source; its tail parts need the same
+    # up-front stamp as a GET's, or the evictor can take them while the head is still copying.
+    await _touch_plan_parts(str(info["object_id"]), ctx)
     gen = stream_plan(
         obj_cache=obj_cache,
         object_id=info["object_id"],

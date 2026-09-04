@@ -393,3 +393,24 @@ async def test_a_miss_does_not_stamp_read_recency(tmp_path) -> None:
 
     assert response.status_code == 404
     assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_recency_recorder_never_fails_the_serve(tmp_path) -> None:
+    """The endpoint only maps OSError/ValueError to 404; anything else from the store is a 500 to
+    the peer, which then sheds to the pool. The recorder therefore has to swallow its own failure
+    — a residency-DB outage must not turn every peer serve on this node into a pool read."""
+    from hippius_s3.cache.read_recency import ReadRecencyRecorder
+
+    class DownPool:
+        def acquire(self, *, timeout: float | None = None) -> object:  # noqa: ASYNC109
+            raise RuntimeError("pool is closing")
+
+    recorder = ReadRecencyRecorder(DownPool(), "node-a")  # type: ignore[arg-type]
+    store = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), on_local_read=recorder)
+    await _write_part(store, part_number=2, chunk=b"local-bytes")
+
+    async with await _client(_app_with_secret(store, SECRET)) as client:
+        response = await client.get(f"/internal/parts/{OBJ}/1/2/chunks/0", headers=AUTH)
+
+    assert (response.status_code, response.content) == (200, b"local-bytes")

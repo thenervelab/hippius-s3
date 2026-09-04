@@ -291,3 +291,33 @@ async def test_read_local_chunk_stamps_recency_only_on_a_local_hit(tmp_path) -> 
     await _write_part(dual, part_number=1, chunk=b"on-ssd")
     assert await dual.read_local_chunk(OBJ, 1, 1, 0) == b"on-ssd"
     assert seen == [(OBJ, 1, 1)]
+
+
+@pytest.mark.asyncio
+async def test_read_local_chunk_stamps_recency_even_when_the_recorder_fails(tmp_path) -> None:
+    """The stamp is bookkeeping in front of a serve that already has its bytes: a recorder that
+    cannot reach its database must lose the sample, never the chunk."""
+    from hippius_s3.cache.read_recency import ReadRecencyRecorder
+
+    class DownPool:
+        def acquire(self, *, timeout: float | None = None) -> object:  # noqa: ASYNC109
+            raise RuntimeError("pool is closing")
+
+    recorder = ReadRecencyRecorder(DownPool(), "node-a")  # type: ignore[arg-type]
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), on_local_read=recorder)
+    await _write_part(dual, part_number=1, chunk=b"on-ssd")
+
+    assert await dual.read_local_chunk(OBJ, 1, 1, 0) == b"on-ssd"
+
+
+@pytest.mark.asyncio
+async def test_plain_store_read_local_chunk_is_unchanged(tmp_path) -> None:
+    """Without HIPPIUS_OBJECT_CACHE_FALLBACK_DIR the api runs a plain FileSystemPartsStore, which
+    has no recency hook: the override lives on the dual store only, and the base must still just
+    read its own copy."""
+    plain = FileSystemPartsStore(str(tmp_path / "single"))
+    assert not hasattr(plain, "_on_local_read")
+    assert await plain.read_local_chunk(OBJ, 1, 1, 0) is None
+
+    await _write_part(plain, part_number=1, chunk=b"single-tier")
+    assert await plain.read_local_chunk(OBJ, 1, 1, 0) == b"single-tier"
