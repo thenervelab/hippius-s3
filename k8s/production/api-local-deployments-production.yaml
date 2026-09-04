@@ -158,6 +158,13 @@ spec:
             # to reclaim promoted copies; prod runs drain-agent on every node.
             - name: HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ
               value: "true"
+            # Never promote parts above the edge's part-spread threshold. haproxy keeps every
+            # request for a key on the key's node and spreads UploadPart partNumber > N across
+            # the ingest nodes; a read of a spread object peer-fetches its tail from the
+            # owners, and promoting that tail onto the key node would undo the spread on the
+            # first read. MUST EQUAL haproxy's N — change both together.
+            - name: HIPPIUS_PROMOTE_MAX_PART_NUMBER
+              value: "200"
             # Client cap must be >= HTTP_STREAM_PREFETCH_CHUNKS (16) or a reader sheds its own
             # prefetch window. Serve cap sheds with 503 so peers cannot crowd out local ingest.
             - name: HIPPIUS_PEER_FETCH_MAX_INFLIGHT

@@ -78,6 +78,7 @@ def create_fs_store(
             on_local_read=on_local_read,
             replication_suspect=replication_suspect,
             on_promoted=on_promoted,
+            promote_max_part_number=int(getattr(config, "promote_max_part_number", 0)),
         )
     return FileSystemPartsStore(cache_dir)
 

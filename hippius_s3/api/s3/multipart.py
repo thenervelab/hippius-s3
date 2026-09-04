@@ -563,6 +563,16 @@ async def upload_part(
     if not upload_id or not part_number_str:
         return s3_error_response("InvalidRequest", "Missing uploadId or partNumber", status_code=400)
 
+    # The edge places an UploadPart by the FIRST partNumber value; `query_params.get` returns
+    # the LAST. A request carrying two would be placed as one part and stored as another, so
+    # it is refused rather than reconciled — S3 has no meaning for a repeated partNumber.
+    if len(request.query_params.getlist("partNumber")) > 1:
+        return s3_error_response(
+            "InvalidArgument",
+            "partNumber must be specified exactly once",
+            status_code=400,
+        )
+
     # Validate part number format
     try:
         part_number = int(part_number_str)

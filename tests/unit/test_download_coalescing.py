@@ -283,17 +283,44 @@ async def test_arion_object_skips_per_part_cid_query(
 
 
 class _LocatingFetcher:
-    """A peer resolver that reports every part as held by `owner`."""
+    """A peer resolver that reports every part as held by `owner`, or per part from `answers`.
 
-    def __init__(self, owner: str | None, unreplicated: bool) -> None:
+    Records every call of both shapes so a test can pin how many round trips the read path
+    spends resolving owners.
+    """
+
+    def __init__(
+        self,
+        owner: str | None,
+        unreplicated: bool,
+        answers: dict[int, tuple[str | None, bool]] | None = None,
+    ) -> None:
         self._owner = owner
         self._unreplicated = unreplicated
+        self._answers = answers
+        self.located: list[tuple[str, int, int]] = []
+        self.batches: list[tuple[str, int, list[int]]] = []
+
+    def _answer(self, part_number: int) -> tuple[str | None, bool]:
+        if self._answers is not None:
+            return self._answers.get(part_number, (None, False))
+        return self._owner, self._unreplicated
 
     async def __call__(self, object_id: str, version: int, part_number: int, chunk_index: int) -> bytes | None:
         return None
 
     async def locate(self, object_id: str, version: int, part_number: int) -> tuple[str | None, bool]:
-        return self._owner, self._unreplicated
+        self.located.append((object_id, version, part_number))
+        return self._answer(part_number)
+
+    async def locate_many(
+        self, object_id: str, version: int, part_numbers: list[int]
+    ) -> dict[int, tuple[str | None, bool]]:
+        self.batches.append((object_id, version, list(part_numbers)))
+        return {pn: self._answer(pn) for pn in part_numbers}
+
+    def last_owner(self, object_id: str, version: int, part_number: int) -> str | None:
+        return self._answer(part_number)[0]
 
 
 def _tiered_obj_cache(tmp_path, fetcher: _LocatingFetcher, exist_results: list[bool]) -> MagicMock:
@@ -458,3 +485,126 @@ async def test_a_store_without_a_peer_tier_enqueues_exactly_as_before(
 
     assert ctx.source == "pipeline"
     mock_enqueue.assert_awaited_once()
+
+
+def _multi_part_plan(part_numbers: list[int]) -> list:
+    from hippius_s3.reader.types import ChunkPlanItem
+
+    return [ChunkPlanItem(part_number=pn, chunk_index=0) for pn in part_numbers]
+
+
+@pytest.mark.asyncio
+@patch("hippius_s3.services.object_reader.get_bucket_kek_bytes", new=AsyncMock(return_value=b"k" * 32))
+@patch("hippius_s3.services.object_reader.unwrap_dek", new=MagicMock(return_value=b"d" * 32))
+@patch("hippius_s3.services.object_reader.CryptoService.is_supported_suite_id", new=MagicMock(return_value=True))
+@patch("hippius_s3.services.object_reader.resolve_object_backends", new=AsyncMock(return_value=["arion"]))
+@patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.build_chunk_plan", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.read_parts_list", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.get_config")
+async def test_every_missing_part_is_located_in_one_call_with_the_same_skip_rule(
+    mock_cfg,
+    mock_parts,
+    mock_plan,
+    mock_enqueue,
+    tmp_path,
+):
+    """A spread object misses on all its tail parts at once: one resolver call, not one per part.
+
+    The rule per part is unchanged — only a part whose owner is known AND unreplicated is kept
+    away from the downloader; a replicated one and an ownerless one are still fetched.
+    """
+    from hippius_s3.services.object_reader import build_stream_context
+
+    mock_cfg.return_value = _stub_config()
+    mock_parts.return_value = [{"part_number": pn, "plain_size": 4096, "cid": None} for pn in (1, 2, 3, 4)]
+    mock_plan.return_value = _multi_part_plan([1, 2, 3, 4])
+
+    fetcher = _LocatingFetcher(
+        None, False, answers={1: ("node-b", True), 2: ("node-b", False), 3: (None, True), 4: ("node-c", True)}
+    )
+    obj_cache = _tiered_obj_cache(tmp_path, fetcher, [False, False, False, True])
+
+    ctx = await build_stream_context(
+        db=_mock_db_pool(),
+        redis=_RedisStub(),
+        obj_cache=obj_cache,
+        info=_info(),
+        rng=None,
+        address="addr",
+    )
+
+    assert ctx.source == "pipeline"
+    assert fetcher.batches == [(OBJ, 1, [1, 2, 3])], "the missing parts, once, in one call"
+    assert fetcher.located == [], "no per-part lookups"
+    mock_enqueue.assert_awaited_once()
+    enqueued = mock_enqueue.await_args.args[0]
+    assert sorted(p.part_number for p in enqueued.chunks) == [2, 3]
+
+
+@pytest.mark.asyncio
+@patch("hippius_s3.services.object_reader.build_headers", new=MagicMock(return_value={}))
+@patch("hippius_s3.services.object_reader.get_read_recency_recorder", new=MagicMock(return_value=None))
+@patch("hippius_s3.services.object_reader.stream_plan")
+@patch("hippius_s3.services.object_reader.build_stream_context", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.get_config")
+async def test_the_stream_log_counts_the_distinct_owners_of_the_plan(
+    mock_cfg,
+    mock_ctx,
+    mock_stream,
+    tmp_path,
+    caplog,
+):
+    """`owner=` stays the first part's node; `owners=` is how many nodes the whole plan resolved to.
+
+    Both come from the resolver's memo alone — the body runs after the request's DB connection
+    is back in the pool, so nothing here may query.
+    """
+    import logging
+
+    from hippius_s3.services.object_reader import StreamContext
+    from hippius_s3.services.object_reader import read_response
+
+    cfg = _stub_config()
+    cfg.stream_first_chunk_timeout_seconds = 5.0
+    cfg.stream_chunk_timeout_seconds = 5.0
+    cfg.http_stream_prefetch_chunks = 0
+    mock_cfg.return_value = cfg
+    mock_ctx.return_value = StreamContext(
+        plan=_multi_part_plan([1, 2, 3, 4]),
+        object_version=1,
+        storage_version=5,
+        source="cache",
+        key_bytes=b"d" * 32,
+        suite_id="hip-enc/aes256gcm",
+        bucket_id="b",
+        upload_id="",
+    )
+
+    async def _gen(**_kwargs):
+        yield b"plaintext"
+
+    mock_stream.side_effect = lambda **kwargs: _gen(**kwargs)
+
+    fetcher = _LocatingFetcher(
+        None, False, answers={1: ("node-b", False), 2: ("node-c", True), 3: ("node-b", False), 4: (None, False)}
+    )
+    obj_cache = _tiered_obj_cache(tmp_path, fetcher, [True, True, True, True])
+
+    with caplog.at_level(logging.INFO, logger="hippius_s3.services.object_reader"):
+        response = await read_response(
+            db=_mock_db_pool(),
+            redis=_RedisStub(),
+            obj_cache=obj_cache,
+            info=_info(),
+            read_mode="full",
+            rng=None,
+            address="addr",
+        )
+        body = b"".join([chunk async for chunk in response.body_iterator])
+
+    assert body == b"plaintext"
+    line = next(r.getMessage() for r in caplog.records if "STREAM tiers" in r.getMessage())
+    assert "owner=node-b" in line
+    assert "owners=2" in line
+    assert fetcher.located == [] and fetcher.batches == [], "memo-only: the log resolved nothing"

@@ -280,13 +280,13 @@ async def _peer_held_unreplicated_parts(
     dual = _dual_store(obj_cache)
     if dual is None:
         return set()
-    missing = {int(item.part_number) for item, cached in zip(plan, exist_results, strict=True) if not cached}
-    held: set[int] = set()
-    for pn in sorted(missing):
-        owner, unreplicated = await dual.peer_locate(object_id, object_version, pn)
-        if owner is not None and unreplicated:
-            held.add(pn)
-    return held
+    missing = sorted({int(item.part_number) for item, cached in zip(plan, exist_results, strict=True) if not cached})
+    if not missing:
+        return set()
+    # One resolver call for every missing part: a spread multipart object misses on all of its
+    # tail parts at once, and a query per part is O(parts) round trips before the first byte.
+    located = await dual.peer_locate_many(object_id, object_version, missing)
+    return {pn for pn, (owner, unreplicated) in located.items() if owner is not None and unreplicated}
 
 
 async def build_stream_context(
@@ -431,6 +431,14 @@ async def build_stream_context(
     )
 
 
+def _plan_part_numbers(plan: list[ChunkPlanItem]) -> list[int]:
+    """The distinct part numbers a plan touches, ascending.
+
+    `getattr` rather than attribute access: tests drive this with bare `object()` plan items.
+    """
+    return sorted({int(item.part_number) for item in plan if getattr(item, "part_number", None) is not None})
+
+
 async def _touch_plan_parts(object_id: str, ctx: StreamContext) -> None:
     """Stamp every part of a multi-part read as used NOW, before the first chunk is waited on.
 
@@ -444,8 +452,7 @@ async def _touch_plan_parts(object_id: str, ctx: StreamContext) -> None:
     recorder = get_read_recency_recorder()
     if recorder is None:
         return
-    # `getattr` rather than attribute access: tests drive this with bare `object()` plan items.
-    plan_parts = sorted({int(item.part_number) for item in ctx.plan if getattr(item, "part_number", None) is not None})
+    plan_parts = _plan_part_numbers(ctx.plan)
     if len(plan_parts) > 1:
         await recorder.touch_parts(object_id, int(ctx.object_version), plan_parts)
 
@@ -535,6 +542,7 @@ async def read_response(
     dual = _dual_store(obj_cache)
     # Best-effort like the error path above: a malformed plan item must not fail the stream log.
     first_part = getattr(ctx.plan[0], "part_number", None) if ctx.plan else None
+    plan_parts = _plan_part_numbers(ctx.plan)
 
     async def _body() -> AsyncGenerator[bytes, None]:
         nonlocal first_chunk
@@ -557,10 +565,21 @@ async def read_response(
             # and resetting a token in a different context raises. The dict itself is closed over.
             _stream_tiers.set(None)
             owner = None
-            if dual is not None and first_part is not None:
-                owner = dual.peer_last_owner(object_id, ctx.object_version, int(first_part))
+            owners = 0
+            if dual is not None:
+                if first_part is not None:
+                    owner = dual.peer_last_owner(object_id, ctx.object_version, int(first_part))
+                # Distinct nodes this read's parts resolved to — memo-only, like `owner`. A spread
+                # object read on its key node shows local= for the head and owners>=1 for the tail.
+                owners = len(
+                    {
+                        held
+                        for pn in plan_parts
+                        if (held := dual.peer_last_owner(object_id, ctx.object_version, pn)) is not None
+                    }
+                )
             logger.info(
-                "STREAM tiers ray_id=%s object_id=%s v=%s local=%d peer=%d pool=%d bytes=%d owner=%s",
+                "STREAM tiers ray_id=%s object_id=%s v=%s local=%d peer=%d pool=%d bytes=%d owner=%s owners=%d",
                 ray_id,
                 object_id,
                 ctx.object_version,
@@ -569,6 +588,7 @@ async def read_response(
                 tiers.get("pool", 0),
                 yielded,
                 owner,
+                owners,
             )
 
     headers = build_headers(

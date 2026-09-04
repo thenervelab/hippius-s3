@@ -483,3 +483,127 @@ async def test_two_concurrent_streams_count_into_their_own_tier_dicts(tmp_path) 
     assert pool_counts == {"pool": 3}
     assert local_counts == {"local": 5}
     assert _stream_tiers.get() is None, "neither stream's counter leaked into the spawning task"
+
+
+# ------------------------------------------------------------------- the part-spread cap
+
+
+@pytest.mark.asyncio
+async def test_parts_above_the_cap_are_served_but_never_promoted(tmp_path, monkeypatch) -> None:
+    """The edge spreads partNumber > N onto other nodes on purpose; the key node must not undo it.
+
+    Part N is the last part the edge keeps on the key node, so it promotes; N+1 is the first
+    spread part, so it is served from the fallback and left there.
+    """
+    recorded: list[str] = []
+    monkeypatch.setattr("hippius_s3.cache.dual_fs_store._record_promotion_skipped", recorded.append)
+    dual = DualFileSystemPartsStore(
+        str(tmp_path / "ssd"), str(tmp_path / "pool"), promote=True, promote_max_part_number=200
+    )
+    await _write_part(dual.fallback, part_number=200, chunk=b"head")
+    await _write_part(dual.fallback, part_number=201, chunk=b"tail")
+
+    assert await dual.get_chunk(OBJ, 1, 200, 0) == b"head"
+    assert await dual.get_chunk(OBJ, 1, 201, 0) == b"tail", "the read itself is unaffected by the cap"
+
+    primary = FileSystemPartsStore(str(tmp_path / "ssd"))
+    assert await primary.get_chunk(OBJ, 1, 200, 0) == b"head", "part N is the key node's own; it promotes"
+    assert await primary.get_chunk(OBJ, 1, 201, 0) is None, "part N+1 belongs to another node"
+    assert recorded == ["part_cap"]
+
+
+@pytest.mark.asyncio
+async def test_a_zero_cap_promotes_every_part(tmp_path, monkeypatch) -> None:
+    recorded: list[str] = []
+    monkeypatch.setattr("hippius_s3.cache.dual_fs_store._record_promotion_skipped", recorded.append)
+    dual = DualFileSystemPartsStore(
+        str(tmp_path / "ssd"), str(tmp_path / "pool"), promote=True, promote_max_part_number=0
+    )
+    await _write_part(dual.fallback, part_number=10_000, chunk=b"tail")
+
+    assert await dual.get_chunk(OBJ, 1, 10_000, 0) == b"tail"
+
+    primary = FileSystemPartsStore(str(tmp_path / "ssd"))
+    assert await primary.get_chunk(OBJ, 1, 10_000, 0) == b"tail", "0 means no cap"
+    assert recorded == []
+
+
+@pytest.mark.asyncio
+async def test_the_cap_is_checked_before_the_residency_claim(tmp_path) -> None:
+    """A skipped promotion must not claim residency for bytes that are never written."""
+    claimed: list[tuple] = []
+
+    async def _record(*args: object) -> bool:
+        claimed.append(args)
+        return True
+
+    dual = DualFileSystemPartsStore(
+        str(tmp_path / "ssd"), str(tmp_path / "pool"), promote=True, on_promote=_record, promote_max_part_number=1
+    )
+    await _write_part(dual.fallback, part_number=2, chunk=b"tail")
+
+    assert await dual.get_chunk(OBJ, 1, 2, 0) == b"tail"
+    assert claimed == []
+
+
+def test_the_factory_threads_the_cap_from_config(tmp_path) -> None:
+    from hippius_s3.cache import create_fs_store
+
+    class _Config:
+        object_cache_dir = str(tmp_path / "ssd")
+        object_cache_fallback_dir = str(tmp_path / "pool")
+        promote_max_part_number = 7
+
+    store = create_fs_store(_Config())
+    assert isinstance(store, DualFileSystemPartsStore)
+    assert store._promote_max_part == 7
+
+
+@pytest.mark.asyncio
+async def test_peer_locate_many_without_a_fetcher_reports_no_owners(tmp_path) -> None:
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))
+
+    assert await dual.peer_locate_many(OBJ, 1, [1, 2]) == {1: (None, False), 2: (None, False)}
+
+
+@pytest.mark.asyncio
+async def test_peer_locate_many_asks_a_locate_only_fetcher_part_by_part(tmp_path) -> None:
+    fetcher = _LocatingFetcher("node-b", True)
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), peer_fetch=fetcher)
+
+    assert await dual.peer_locate_many(OBJ, 1, [1, 2]) == {1: ("node-b", True), 2: ("node-b", True)}
+    assert fetcher.located == [(OBJ, 1, 1), (OBJ, 1, 2)]
+
+
+class _BatchLocatingFetcher(_LocatingFetcher):
+    def __init__(self, answers: dict[int, tuple[str | None, bool]]) -> None:
+        super().__init__(None, False)
+        self._answers = answers
+        self.batches: list[tuple[str, int, list[int]]] = []
+
+    async def locate_many(self, object_id: str, version: int, parts: list[int]) -> dict[int, tuple[str | None, bool]]:
+        self.batches.append((object_id, version, parts))
+        return {pn: self._answers[pn] for pn in parts if pn in self._answers}
+
+
+@pytest.mark.asyncio
+async def test_peer_locate_many_passes_the_batch_through_and_fills_the_gaps(tmp_path) -> None:
+    fetcher = _BatchLocatingFetcher({1: ("node-b", True), 2: ("node-c", False)})
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), peer_fetch=fetcher)
+
+    located = await dual.peer_locate_many(OBJ, 1, [1, 2, 3])
+
+    assert located == {1: ("node-b", True), 2: ("node-c", False), 3: (None, False)}
+    assert fetcher.batches == [(OBJ, 1, [1, 2, 3])]
+    assert fetcher.located == [], "the per-part path was never used"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_peer_locate_many_never_fails_the_read_path(tmp_path) -> None:
+    class _Broken(_BatchLocatingFetcher):
+        async def locate_many(self, *args: object) -> dict[int, tuple[str | None, bool]]:
+            raise OSError("postgres down")
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), peer_fetch=_Broken({}))
+
+    assert await dual.peer_locate_many(OBJ, 1, [1, 2]) == {1: (None, False), 2: (None, False)}

@@ -113,6 +113,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         on_local_read: Optional[LocalReadRecorder] = None,
         replication_suspect: Optional[ReplicationSuspectFn] = None,
         on_promoted: Optional[PromotedHook] = None,
+        promote_max_part_number: int = 0,
     ) -> None:
         super().__init__(primary_dir)
         self.fallback = FileSystemPartsStore(fallback_dir)
@@ -133,6 +134,9 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         # rather than on arrival. Sampled inside the recorder — this is a dict probe on all but
         # the first local read of a part per window.
         self._on_local_read = on_local_read
+        # Parts above this number are never promoted; 0 means no cap. Mirrors the edge's
+        # part-spread threshold — see `promote_max_part_number` in config.py.
+        self._promote_max_part = int(promote_max_part_number)
         # Chunks whose promotion is in flight right now, so concurrent readers of the same
         # cold chunk write it once. Holds only in-flight keys, so it drains itself and needs
         # no bound or TTL — unlike a "already done" memo, which the out-of-process evictor
@@ -212,6 +216,30 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
             return None, False
         return owner, bool(unreplicated)
 
+    async def peer_locate_many(
+        self, object_id: str, object_version: int, part_numbers: list[int]
+    ) -> dict[int, tuple[Optional[str], bool]]:
+        """`peer_locate` for many parts through one resolver call; `(None, False)` wherever there is no owner.
+
+        Best-effort on the same grounds as `peer_locate`. A resolver that has only the per-part
+        `locate` is asked part by part, so the answer is the same either way — only the number
+        of round trips differs.
+        """
+        parts = [int(n) for n in part_numbers]
+        locate_many = getattr(self._peer_fetch, "locate_many", None)
+        if locate_many is None:
+            return {pn: await self.peer_locate(object_id, object_version, pn) for pn in parts}
+        try:
+            located = await locate_many(object_id, int(object_version), parts)
+        except Exception as exc:  # noqa: BLE001 - a peer must never be able to fail a read
+            logger.debug("peer locate failed for %s v%s parts %s: %s", object_id, object_version, parts, exc)
+            return dict.fromkeys(parts, (None, False))
+        answers: dict[int, tuple[Optional[str], bool]] = {}
+        for pn in parts:
+            owner, unreplicated = located.get(pn, (None, False))
+            answers[pn] = (owner, bool(unreplicated))
+        return answers
+
     def peer_last_owner(self, object_id: str, object_version: int, part_number: int) -> Optional[str]:
         """The peer resolver's memoised owner for a part, with no lookup. Safe inside a response body."""
         last_owner = getattr(self._peer_fetch, "last_owner", None)
@@ -251,6 +279,14 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         readable as it lands; writing it last would leave the whole part invisible until some
         read happened to promote the final chunk.
         """
+        # A tail part of a spread multipart object is on another node because the edge put it
+        # there, so that no single node holds a whole large object. Promoting it onto the key
+        # node — which every read of the object lands on — would undo the spread on the first
+        # read. Checked before the space gate: it is a compare, and it applies at any free ratio.
+        if 0 < self._promote_max_part < int(part_number):
+            _record_promotion_skipped("part_cap")
+            return
+
         # Yield to ingest before doing any work. Promotion competes for the same mount that
         # `fs_cache_pressure` refuses PUTs on, and it is the only writer here that is pure
         # optimisation — a cold cache costs latency, a full disk costs writes. The gate fires
