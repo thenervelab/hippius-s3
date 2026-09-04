@@ -472,3 +472,19 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         fallback = await self.fallback.chunks_exist_batch(object_id, object_version, missing)
         found = {check for check, present in zip(missing, fallback, strict=False) if present}
         return [present or check in found for check, present in zip(checks, primary, strict=False)]
+
+    async def read_local_chunk(
+        self, object_id: str, object_version: int, part_number: int, chunk_index: int
+    ) -> Optional[bytes]:
+        """The peer-serve read: this node's own copy, stamped as used.
+
+        Same tier rule as the base method — the primary only, never the pool and never a peer —
+        so a peer still answers from its flash or not at all. What the base cannot do is record
+        the hit: a part that is read ONLY through peers (the owner's copy, served to the other
+        nodes) never passed through `get_chunk` here and so never reached `_on_local_read`, and
+        the evictor ranked the one copy that mattered most as this node's coldest.
+        """
+        result = await FileSystemPartsStore.get_chunk(self, object_id, object_version, part_number, chunk_index)
+        if result is not None and self._on_local_read is not None:
+            await self._on_local_read(object_id, int(object_version), int(part_number))
+        return result

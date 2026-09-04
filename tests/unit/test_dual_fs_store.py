@@ -260,6 +260,73 @@ async def test_read_local_chunk_serves_a_local_part(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_local_chunk_never_consults_the_peer(tmp_path) -> None:
+    """The recency-stamping override must keep the base method's tier rule: primary only.
+
+    A peer that asked another peer would let two nodes bounce a request between them; a
+    peer that read the pool would put a network hop in front of the read the tier avoids.
+    """
+    peer_calls: list[tuple] = []
+
+    async def _peer(*args: object) -> bytes | None:
+        peer_calls.append(args)
+        return b"from-peer"
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), peer_fetch=_peer)
+    await _write_part(dual.fallback, part_number=1, chunk=b"pool-only")
+
+    assert await dual.read_local_chunk(OBJ, 1, 1, 0) is None
+    assert peer_calls == [], "a peer serve must never fan out to another peer"
+
+
+@pytest.mark.asyncio
+async def test_read_local_chunk_stamps_recency_only_on_a_local_hit(tmp_path) -> None:
+    seen: list[tuple] = []
+
+    async def on_local_read(*args: object) -> None:
+        seen.append(args)
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), on_local_read=on_local_read)
+    await _write_part(dual.fallback, part_number=1, chunk=b"pool-only")
+    assert await dual.read_local_chunk(OBJ, 1, 1, 0) is None
+    assert seen == []
+
+    await _write_part(dual, part_number=1, chunk=b"on-ssd")
+    assert await dual.read_local_chunk(OBJ, 1, 1, 0) == b"on-ssd"
+    assert seen == [(OBJ, 1, 1)]
+
+
+@pytest.mark.asyncio
+async def test_read_local_chunk_stamps_recency_even_when_the_recorder_fails(tmp_path) -> None:
+    """The stamp is bookkeeping in front of a serve that already has its bytes: a recorder that
+    cannot reach its database must lose the sample, never the chunk."""
+    from hippius_s3.cache.read_recency import ReadRecencyRecorder
+
+    class DownPool:
+        def acquire(self, *, timeout: float | None = None) -> object:  # noqa: ASYNC109
+            raise RuntimeError("pool is closing")
+
+    recorder = ReadRecencyRecorder(DownPool(), "node-a")  # type: ignore[arg-type]
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), on_local_read=recorder)
+    await _write_part(dual, part_number=1, chunk=b"on-ssd")
+
+    assert await dual.read_local_chunk(OBJ, 1, 1, 0) == b"on-ssd"
+
+
+@pytest.mark.asyncio
+async def test_plain_store_read_local_chunk_is_unchanged(tmp_path) -> None:
+    """Without HIPPIUS_OBJECT_CACHE_FALLBACK_DIR the api runs a plain FileSystemPartsStore, which
+    has no recency hook: the override lives on the dual store only, and the base must still just
+    read its own copy."""
+    plain = FileSystemPartsStore(str(tmp_path / "single"))
+    assert not hasattr(plain, "_on_local_read")
+    assert await plain.read_local_chunk(OBJ, 1, 1, 0) is None
+
+    await _write_part(plain, part_number=1, chunk=b"single-tier")
+    assert await plain.read_local_chunk(OBJ, 1, 1, 0) == b"single-tier"
+
+
+@pytest.mark.asyncio
 async def test_the_tier_counter_counts_only_inside_a_stream(tmp_path) -> None:
     """Outside a stream the ContextVar is unset and reads count into metrics alone."""
     dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"))

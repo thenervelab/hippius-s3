@@ -9,6 +9,8 @@ succeed, just slower and against the wrong tier.
 
 from __future__ import annotations
 
+import asyncio
+
 import asyncpg
 import pytest
 
@@ -25,7 +27,7 @@ class FakeConn:
         self._sink = sink
         self._fail = fail
 
-    async def execute(self, sql: str, *args: object) -> None:
+    async def execute(self, sql: str, *args: object, timeout: float | None = None) -> None:
         if self._fail:
             raise asyncpg.PostgresError("db down")
         self._sink.append((sql, args))
@@ -40,9 +42,11 @@ class FakeConn:
 class FakePool:
     def __init__(self, fail: bool = False) -> None:
         self.executed: list[tuple] = []
+        self.acquire_timeouts: list[float | None] = []
         self.fail = fail
 
-    def acquire(self) -> FakeConn:
+    def acquire(self, *, timeout: float | None = None) -> FakeConn:  # noqa: ASYNC109 (mirrors asyncpg pool.acquire)
+        self.acquire_timeouts.append(timeout)
         return FakeConn(self.executed, self.fail)
 
 
@@ -185,3 +189,133 @@ async def test_a_stamp_is_counted_so_the_write_rate_is_visible(monkeypatch) -> N
     failing = ReadRecencyRecorder(FakePool(fail=True), "node-a")
     await failing(OBJ, 1, 9)
     assert seen == ["written", "failed"], "a swallowed failure is still counted, under its own outcome"
+
+
+# ------------------------------------------------------------------------ touch_parts (bulk stamp)
+
+
+@pytest.mark.asyncio
+async def test_touch_parts_issues_one_node_scoped_update_for_all_parts() -> None:
+    """A multi-part read stamps every part in ONE statement, not one round trip per part."""
+    pool = FakePool()
+    await ReadRecencyRecorder(pool, "node-a").touch_parts(OBJ, 3, [1, 2, 3])
+
+    assert len(pool.executed) == 1
+    sql, args = pool.executed[0]
+    assert "last_read_at = now()" in sql
+    assert "node_id = $1" in sql, "the update must be node-scoped"
+    assert "part_number = ANY($4::bigint[])" in sql, "the column is BIGINT; no cross-type compare"
+    assert args == ("node-a", OBJ, 3, [1, 2, 3])
+
+
+@pytest.mark.asyncio
+async def test_touch_parts_sends_only_the_parts_the_memo_has_not_seen() -> None:
+    """The bulk stamp shares the per-chunk sampler's memo, so a part the store just stamped is
+    left out of the array — and once every part is memoised nothing is written at all."""
+    pool = FakePool()
+    recorder = ReadRecencyRecorder(pool, "node-a")
+
+    await recorder(OBJ, 1, 2)
+    await recorder.touch_parts(OBJ, 1, [1, 2, 3])
+    assert len(pool.executed) == 2
+    assert pool.executed[1][1] == ("node-a", OBJ, 1, [1, 3])
+
+    await recorder.touch_parts(OBJ, 1, [1, 2, 3])
+    assert len(pool.executed) == 2, "every part inside the window costs no write"
+
+    # And the bulk stamp memoises for the per-chunk path in turn.
+    await recorder(OBJ, 1, 3)
+    assert len(pool.executed) == 2
+
+
+@pytest.mark.asyncio
+async def test_touch_parts_db_outage_never_reaches_the_caller() -> None:
+    await ReadRecencyRecorder(FakePool(fail=True), "node-a").touch_parts(OBJ, 1, [1, 2])
+
+
+@pytest.mark.asyncio
+async def test_touch_parts_re_stamps_once_the_window_has_expired(monkeypatch) -> None:
+    """The memo is a sampler, not a "done" set: a part evicted and re-promoted inside a long-lived
+    pod must be stampable again once its window lapses, or it would look cold forever."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr("hippius_s3.cache.part_memo.time.monotonic", lambda: clock["t"])
+    pool = FakePool()
+    recorder = ReadRecencyRecorder(pool, "node-a")
+
+    await recorder.touch_parts(OBJ, 1, [1, 2])
+    clock["t"] += 299.0
+    await recorder.touch_parts(OBJ, 1, [1, 2])
+    assert len(pool.executed) == 1, "inside the window the bulk stamp is fully absorbed"
+
+    clock["t"] += 2.0
+    await recorder.touch_parts(OBJ, 1, [1, 2])
+    assert len(pool.executed) == 2
+    assert pool.executed[1][1] == ("node-a", OBJ, 1, [1, 2])
+
+
+@pytest.mark.asyncio
+async def test_touch_parts_re_stamps_a_part_the_memo_cap_evicted(monkeypatch) -> None:
+    """Over-evicting the memo costs one redundant UPDATE, never a lost stamp."""
+    monkeypatch.setattr("hippius_s3.cache.read_recency._SAMPLE_ENTRIES", 2)
+    pool = FakePool()
+    recorder = ReadRecencyRecorder(pool, "node-a")
+
+    await recorder.touch_parts(OBJ, 1, [1, 2, 3])
+    await recorder.touch_parts(OBJ, 1, [1, 2, 3])
+    # A memo smaller than the plan thrashes (oldest-first): every part is written again, which is
+    # the redundant UPDATE the cap is allowed to cost — a lost stamp is what it may not cost.
+    assert len(pool.executed) == 2
+    assert pool.executed[1][1] == ("node-a", OBJ, 1, [1, 2, 3])
+
+
+@pytest.mark.asyncio
+async def test_touch_parts_dedupes_repeated_and_string_part_numbers() -> None:
+    pool = FakePool()
+    await ReadRecencyRecorder(pool, "node-a").touch_parts(OBJ, "2", [3, "3", 1])  # type: ignore[arg-type,list-item]
+    assert pool.executed[0][1] == ("node-a", OBJ, 2, [3, 1])
+
+
+@pytest.mark.asyncio
+async def test_touch_parts_with_nothing_to_touch_costs_no_round_trip() -> None:
+    pool = FakePool()
+    await ReadRecencyRecorder(pool, "node-a").touch_parts(OBJ, 1, [])
+    assert pool.executed == []
+    assert pool.acquire_timeouts == [], "an empty touch must not even take a connection"
+
+
+@pytest.mark.asyncio
+async def test_touch_parts_failure_is_counted_like_a_single_stamp(monkeypatch) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr("hippius_s3.cache.read_recency._record_write", seen.append)
+
+    await ReadRecencyRecorder(FakePool(), "node-a").touch_parts(OBJ, 1, [1, 2])
+    await ReadRecencyRecorder(FakePool(fail=True), "node-a").touch_parts(OBJ, 1, [1, 2])
+    assert seen == ["written", "failed"], "one statement, one count — whatever the part count"
+
+
+@pytest.mark.asyncio
+async def test_every_stamp_bounds_its_wait_on_the_pool() -> None:
+    """Both stamps sit on the read path — ahead of the first chunk in read_response, and inside
+    the peer-serve in-flight slot — so a saturated pool has to cost a lost sample, not a stalled
+    read. asyncpg honours `acquire(timeout=)`; this pins that the recorder asks for it."""
+    from hippius_s3.cache.read_recency import _STAMP_TIMEOUT_SECONDS
+
+    pool = FakePool()
+    recorder = ReadRecencyRecorder(pool, "node-a")
+    await recorder(OBJ, 1, 1)
+    await recorder.touch_parts(OBJ, 1, [2, 3])
+    assert pool.acquire_timeouts == [_STAMP_TIMEOUT_SECONDS, _STAMP_TIMEOUT_SECONDS]
+
+
+@pytest.mark.asyncio
+async def test_a_pool_that_times_out_on_acquire_never_reaches_the_caller() -> None:
+    """What asyncpg raises when the bounded acquire lapses is asyncio.TimeoutError — neither a
+    PostgresError nor an OSError, so the broad except is what keeps the read alive."""
+
+    class SaturatedPool:
+        def acquire(self, *, timeout: float | None = None) -> FakeConn:  # noqa: ASYNC109
+            raise asyncio.TimeoutError()
+
+    recorder = ReadRecencyRecorder(SaturatedPool(), "node-a")
+    await recorder(OBJ, 1, 1)
+    await recorder.touch_parts(OBJ, 1, [2, 3])

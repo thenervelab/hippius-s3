@@ -51,6 +51,11 @@ _SAMPLE_WINDOW_SECONDS = 300.0
 # Bound on the sampling map so a long-lived pod cannot grow it without limit. Over-evicting an
 # entry only costs one redundant UPDATE.
 _SAMPLE_ENTRIES = 100_000
+# Bound on one stamp's wait for a pool connection and on the UPDATE itself. The stamp is awaited
+# inline on the read path — ahead of the first chunk in `read_response`, and inside the peer-serve
+# in-flight slot on `read_local_chunk` — so a saturated pool must cost a lost sample, not a stalled
+# read or a serve slot held for as long as the pool stays saturated.
+_STAMP_TIMEOUT_SECONDS = 2.0
 
 
 class ReadRecencyRecorder:
@@ -66,24 +71,52 @@ class ReadRecencyRecorder:
         if self._recent.get(key) is not None:
             return
         self._recent.put(key, True)
+        # Node-scoped: recency is per (node, part). Stamping a peer's row would protect a
+        # copy on a disk this node cannot see while leaving its own unprotected — and the
+        # evictor that reads this column is scoped to its own node_id.
+        #
+        # A part with no row here updates nothing, which is correct: the row is what says
+        # "this node holds it and this node's evictor owns it".
+        await self._stamp(
+            """
+            UPDATE cephor_ssd_residency SET last_read_at = now()
+            WHERE node_id = $1 AND object_id = $2 AND version = $3 AND part_number = $4
+            """,
+            key,
+        )
+
+    async def touch_parts(self, object_id: str, object_version: int, part_numbers: list[int]) -> None:
+        """Stamp every un-sampled part of one object in a single node-scoped UPDATE.
+
+        For a multi-part read the per-chunk stamp in `get_chunk` only reaches a part when its
+        first chunk streams, which for a long stream can be minutes after the request started —
+        long enough for the evictor to take the tail parts of the very object being read. One
+        statement up front costs one round trip regardless of part count, and shares the memo so
+        the parts the per-chunk path just stamped are not written twice.
+        """
+        oid = str(object_id)
+        version = int(object_version)
+        pending: list[int] = []
+        for part_number in part_numbers:
+            key = (oid, version, int(part_number))
+            if self._recent.get(key) is not None:
+                continue
+            self._recent.put(key, True)
+            pending.append(key[2])
+        if not pending:
+            return
+        await self._stamp(
+            """
+            UPDATE cephor_ssd_residency SET last_read_at = now()
+            WHERE node_id = $1 AND object_id = $2 AND version = $3 AND part_number = ANY($4::bigint[])
+            """,
+            (oid, version, pending),
+        )
+
+    async def _stamp(self, sql: str, args: tuple[object, ...]) -> None:
         try:
-            async with self._pool.acquire() as conn:
-                # Node-scoped: recency is per (node, part). Stamping a peer's row would protect a
-                # copy on a disk this node cannot see while leaving its own unprotected — and the
-                # evictor that reads this column is scoped to its own node_id.
-                #
-                # A part with no row here updates nothing, which is correct: the row is what says
-                # "this node holds it and this node's evictor owns it".
-                await conn.execute(
-                    """
-                    UPDATE cephor_ssd_residency SET last_read_at = now()
-                    WHERE node_id = $1 AND object_id = $2 AND version = $3 AND part_number = $4
-                    """,
-                    self._node_id,
-                    str(object_id),
-                    int(object_version),
-                    int(part_number),
-                )
+            async with self._pool.acquire(timeout=_STAMP_TIMEOUT_SECONDS) as conn:
+                await conn.execute(sql, self._node_id, *args, timeout=_STAMP_TIMEOUT_SECONDS)
             _record_write("written")
         except Exception as exc:  # noqa: BLE001 - a bookkeeping stamp must never fail its caller
             _record_write("failed")
@@ -93,13 +126,7 @@ class ReadRecencyRecorder:
             # than (PostgresError, OSError): asyncpg.InterfaceError — a closing/uninitialised
             # pool — is NEITHER, and since write_meta awaits this recorder bare, letting it
             # escape would fail the client PUT and skip the landed announcement below it.
-            logger.debug(
-                "recording read recency failed for %s v%s part %s: %s",
-                object_id,
-                object_version,
-                part_number,
-                exc,
-            )
+            logger.debug("recording read recency failed for %s: %s", args, exc)
 
 
 def create_read_recency_recorder(pool: Optional[asyncpg.Pool], node_id: str) -> Optional[ReadRecencyRecorder]:

@@ -350,3 +350,67 @@ async def test_each_segment_addresses_the_part_it_names(tmp_path) -> None:
         second = await client.get(f"/internal/parts/{OBJ}/1/2/chunks/0", headers=AUTH)
 
     assert (first.content, second.content) == (b"part-one", b"part-two")
+
+
+# ------------------------------------------------------------------ serving a peer marks the part used
+
+
+@pytest.mark.asyncio
+async def test_serving_a_local_chunk_stamps_read_recency(tmp_path) -> None:
+    """The owner's copy is read by OTHER nodes through this endpoint, never through its own
+    `get_chunk` — so this is the only place its use can be recorded. Without it a part that is
+    only ever peer-served ranks as the owner's coldest and is evicted first, exactly when
+    locality routing makes it the copy every other node depends on."""
+    seen: list[tuple] = []
+
+    async def on_local_read(*args: object) -> None:
+        seen.append(args)
+
+    store = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), on_local_read=on_local_read)
+    await _write_part(store, part_number=2, chunk=b"local-bytes")
+
+    async with await _client(_app_with_secret(store, SECRET)) as client:
+        response = await client.get(f"/internal/parts/{OBJ}/1/2/chunks/0", headers=AUTH)
+
+    assert response.status_code == 200
+    assert seen == [(OBJ, 1, 2)]
+
+
+@pytest.mark.asyncio
+async def test_a_miss_does_not_stamp_read_recency(tmp_path) -> None:
+    """A pool-only part has no local copy to protect; stamping it would order the evictor on
+    reads of a disk this node does not hold."""
+    seen: list[tuple] = []
+
+    async def on_local_read(*args: object) -> None:
+        seen.append(args)
+
+    store = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), on_local_read=on_local_read)
+    await _write_part(store.fallback, part_number=1, chunk=b"pool-bytes")
+
+    async with await _client(_app_with_secret(store, SECRET)) as client:
+        response = await client.get(f"/internal/parts/{OBJ}/1/1/chunks/0", headers=AUTH)
+
+    assert response.status_code == 404
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_recency_recorder_never_fails_the_serve(tmp_path) -> None:
+    """The endpoint only maps OSError/ValueError to 404; anything else from the store is a 500 to
+    the peer, which then sheds to the pool. The recorder therefore has to swallow its own failure
+    — a residency-DB outage must not turn every peer serve on this node into a pool read."""
+    from hippius_s3.cache.read_recency import ReadRecencyRecorder
+
+    class DownPool:
+        def acquire(self, *, timeout: float | None = None) -> object:  # noqa: ASYNC109
+            raise RuntimeError("pool is closing")
+
+    recorder = ReadRecencyRecorder(DownPool(), "node-a")  # type: ignore[arg-type]
+    store = DualFileSystemPartsStore(str(tmp_path / "ssd"), str(tmp_path / "pool"), on_local_read=recorder)
+    await _write_part(store, part_number=2, chunk=b"local-bytes")
+
+    async with await _client(_app_with_secret(store, SECRET)) as client:
+        response = await client.get(f"/internal/parts/{OBJ}/1/2/chunks/0", headers=AUTH)
+
+    assert (response.status_code, response.content) == (200, b"local-bytes")

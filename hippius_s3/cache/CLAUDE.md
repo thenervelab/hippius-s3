@@ -169,6 +169,16 @@ Reads no longer `os.utime` the chunk/meta files — the per-read atime touch was
 
 `touch_part(...)` ([fs_store.py:276](fs_store.py)) bulk-touches every file in a part dir — used by the uploader after a successful backend upload to extend the part's "hotness".
 
+## SSD-tier read recency (`cephor_ssd_residency.last_read_at`)
+
+Separate from the janitor's `last_access_at`: the drain-agent's SSD evictor orders on `COALESCE(last_read_at, resident_at)`, and `ReadRecencyRecorder` ([read_recency.py](read_recency.py)) is what fills that column. Three call sites feed it, all sharing one per-part memo (one write per part per 300 s window):
+
+- `DualFileSystemPartsStore.get_chunk` on a local hit (`_on_local_read`).
+- `DualFileSystemPartsStore.read_local_chunk` — the peer-serve path (`api/internal_parts.py`). Without this stamp the owner's copy of a part that is only ever read by OTHER nodes looks cold and is the first thing its evictor drops. It still reads the primary only, never the pool or a peer.
+- `recorder.touch_parts(object_id, version, part_numbers)` from `object_reader._touch_plan_parts` (both `read_response` and `stream_object`, so a streaming CopyObject's source gets it too), for plans spanning more than one part: one node-scoped `UPDATE ... WHERE part_number = ANY($4::bigint[])` for the parts the memo has not seen, issued before the first chunk is waited on so the tail parts of a long read are marked hot before the evictor can take them. Range reads touch only the parts the planner put in the plan.
+
+Every stamp is awaited inline on the read path and is best-effort: the recorder bounds its pool acquire and its UPDATE to `_STAMP_TIMEOUT_SECONDS` (2 s) and swallows every failure, counted as `read_recency_writes_total{outcome=failed}`. A saturated pool therefore costs a lost sample (the part is evicted a little earlier than it deserves), never a stalled GET or a peer-serve slot held open. The touch stamps THIS node's rows only; a part that a peer holds is stamped by the peer, per chunk, through `read_local_chunk` when the chunk is actually served.
+
 ## `RedisObjectPartsCache`
 
 [object_parts.py:59](object_parts.py). Misnomer — the class name is legacy. Actual composition:
