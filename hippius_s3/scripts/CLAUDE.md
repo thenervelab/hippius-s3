@@ -42,6 +42,28 @@ Operational and migration scripts. Most are invoked manually by an operator duri
 | [purge_buckets.py](purge_buckets.py) | **⚠️ DESTRUCTIVE**. Delete one or more buckets and their contents. |
 | [sweep_partless_multipart_uploads.py](sweep_partless_multipart_uploads.py) | **⚠️ DELETES**, but only MPU headers with **zero** `parts` rows — no chunk data exists behind them, so this is what `AbortMultipartUpload` already does. One-time cleanup of the ~874k such rows (97% of the incomplete backlog) that the mpu-reaper can never reach, because its query INNER-joins to `parts`. Dry run by default; needs `--yes`. Batched with a `statement_timeout` so it cannot itself pin the xmin horizon. |
 
+## Service-account protection
+
+Every destructive path here refuses to touch an account in `HIPPIUS_SERVICE_ACCOUNT_IDS`:
+
+- `nuke_user.py` and `purge_buckets.py` call `refuse_destructive_operation` **before** connecting
+  to the database and before `--dry-run` is considered, and exit 2. `nuke_user.py` guards both
+  `--address` and the address read out of `--from-json`.
+- `purge_source_versions.py` and `delete_legacy_object_versions.py` take no `--address`, so there
+  is nothing to refuse — they exclude the rows in SQL instead (`b.main_account_id <> ALL($n)`),
+  so no candidate is ever built. `<> ALL('{}')` is true for every row, so an empty allowlist
+  leaves both sweeps exactly as they were.
+- The admin API (`/admin/accounts/{id}/suspend` and `.../data`) returns 403 `ServiceAccountProtected`
+  before any write, and `workers/purger.py` refuses again when it claims the job — a job can
+  predate the allowlist, which the endpoint cannot see.
+
+**There is no `--force`, and do not add one.** The escape hatch is declarative: remove the address
+from `HIPPIUS_SERVICE_ACCOUNT_IDS`, redeploy, then run the operation. That is a reviewed, recorded,
+attributable change; a boolean parameter meaning "destroy the protected account anyway" is one
+careless refactor away from being passed `True` by something that should never have it, and that
+failure is silent and unrecoverable. Same shape as the `terminated_at` carve-out for Object Lock
+COMPLIANCE.
+
 ## Invocation
 
 All scripts expect the venv active and env loaded:

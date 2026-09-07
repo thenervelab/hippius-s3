@@ -63,3 +63,35 @@ def forbidden_write_grants(
 def describe_grants(grants: Iterable[Grant]) -> str:
     """Render grants for an error message or log line. No account ids beyond what the caller sent."""
     return ", ".join(f"{g.permission.value} to {g.grantee.uri or g.grantee.id or g.grantee.type.value}" for g in grants)
+
+
+class ServiceAccountProtected(Exception):
+    """A bulk-destructive operation was aimed at an internal Hippius service account."""
+
+
+def refuse_destructive_operation(
+    address: str | None,
+    service_account_ids: Collection[str],
+    *,
+    operation: str,
+) -> None:
+    """Raise if `operation` would mass-delete a service account's data.
+
+    Guards the ADMIN and OPERATOR paths — account purge, nuke_user, purge_buckets, the purge
+    worker — not ordinary S3 verbs. A service account deleting its own object through DeleteObject
+    is normal use and unaffected; what this stops is one mistyped SS58 on a maintenance script
+    taking out our own storage.
+
+    NOTE THE ABSENT `force` PARAMETER, and do not add one. A boolean meaning "destroy the
+    protected account anyway", sitting in the signature of functions that admin endpoints and
+    background workers call, is one careless refactor away from being passed True by something
+    that should never have it — and that failure is silent and unrecoverable. The escape hatch is
+    declarative instead: remove the address from HIPPIUS_SERVICE_ACCOUNT_IDS and redeploy, which
+    is a reviewed, recorded, attributable change, then run the operation. Same shape as the
+    `terminated_at` carve-out for Object Lock COMPLIANCE.
+    """
+    if is_service_account(address, service_account_ids):
+        raise ServiceAccountProtected(
+            f"{operation} refused: {address} is a Hippius service account. "
+            f"Remove it from HIPPIUS_SERVICE_ACCOUNT_IDS and redeploy before running this."
+        )

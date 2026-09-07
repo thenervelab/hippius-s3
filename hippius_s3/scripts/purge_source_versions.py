@@ -42,6 +42,11 @@ async def main_async(args: argparse.Namespace) -> int:
               AND (NOW() - ov.last_modified) >= ($1::int * INTERVAL '1 minute')
               AND ($2::text IS NULL OR b.bucket_name = $2)
               AND ($3::text IS NULL OR o.object_key = $3)
+              -- Service accounts are excluded at the source, so no candidate is ever built for
+              -- one. This sweep takes no --address, so a per-account refusal has nothing to
+              -- refuse: the only way to protect our data from a global sweep is to filter the
+              -- rows. `<> ALL('{}')` is true for every row, so an empty allowlist is a no-op.
+              AND b.main_account_id <> ALL($5::text[])
             ORDER BY ov.object_id, ov.object_version
             LIMIT COALESCE($4::int, 1000)
             """,
@@ -49,6 +54,7 @@ async def main_async(args: argparse.Namespace) -> int:
             (args.bucket or None),
             (args.key or None),
             (args.limit if args.limit and args.limit > 0 else None),
+            sorted(config.service_account_ids),
         )
 
         if args.dry_run:

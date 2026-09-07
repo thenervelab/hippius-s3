@@ -212,8 +212,19 @@ async def main_async(args: argparse.Namespace) -> int:
     log = logging.getLogger("nuke_user")
 
     from hippius_s3.config import get_config
+    from hippius_s3.services.service_accounts import ServiceAccountProtected
+    from hippius_s3.services.service_accounts import refuse_destructive_operation
 
     config = get_config()
+
+    # Guards BOTH entry paths: --address, and the address read out of --from-json below. Checked
+    # before the DB connection and before --dry-run, because this script deletes a whole account.
+    try:
+        refuse_destructive_operation(getattr(args, "address", None), config.service_account_ids, operation="nuke_user")
+    except ServiceAccountProtected as exc:
+        log.error(str(exc))
+        return 2
+
     redis_queues_client: async_redis.Redis | None = None
 
     if args.from_json:
@@ -228,6 +239,12 @@ async def main_async(args: argparse.Namespace) -> int:
 
         address = list(data.keys())[0]
         cids = data[address]
+
+        try:
+            refuse_destructive_operation(address, config.service_account_ids, operation="nuke_user --from-json")
+        except ServiceAccountProtected as exc:
+            log.error(str(exc))
+            return 2
 
         log.info(f"Loaded {len(cids)} CIDs for address: {address}")
 

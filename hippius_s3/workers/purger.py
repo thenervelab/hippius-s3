@@ -14,6 +14,7 @@ from hippius_s3.gateway.services.sub_token_scope_cache import scope_cache_key
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import enqueue_unpin_request
+from hippius_s3.services.service_accounts import refuse_destructive_operation
 from hippius_s3.utils import get_query
 
 
@@ -48,6 +49,13 @@ async def _purge_account(
 ) -> tuple[int, int]:
     job_id = job["job_id"]
     account_id = job["account_id"]
+
+    # Second gate, behind the admin endpoint's. A job can predate the allowlist, or an address
+    # can be added to it while a job is queued — the endpoint check cannot see either. Raising
+    # here lands on process_one_job's handler, which marks the job 'failed' with this message
+    # and never retries it: the right end state for a purge nobody should have asked for.
+    refuse_destructive_operation(account_id, config.service_account_ids, operation="Account purge")
+
     # Resume-safe: counters continue from the claimed row (reclaimed jobs keep their tally).
     deleted_objects = int(job["deleted_objects"])
     deleted_bytes = int(job["deleted_bytes"])
