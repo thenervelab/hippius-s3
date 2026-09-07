@@ -90,10 +90,17 @@ copy it onto the key node on the first read, undoing the spread. `HIPPIUS_PROMOT
 `promotion_skipped_total{reason=part_cap}`. **It must equal haproxy's part-spread threshold N**;
 the api cannot verify that, so the k8s manifests set it next to a comment saying so. Because a
 spread read misses locally on every tail part at once, `build_stream_context` resolves the
-owners of all missing parts in one `locate_many` query instead of one per part, and
+owners of all missing parts through `locate_many` — batches of `_RESOLVE_PARTS_BATCH` (512)
+part numbers per statement rather than one per part, with the fresh-part hints behind it in one
+`MGET` (`lookup_fresh_parts`), because a cold read resolves no Postgres owner for ANY part and
+per-part hints would leave the round trips the batching exists to remove.
+
 `UploadPart` refuses a request with more than one `partNumber` value (400 `InvalidArgument`):
 haproxy hashes on the first value and Starlette's `query_params.get` returns the last, so a
-duplicate would be placed as one part and stored as another.
+duplicate would be placed as one part and stored as another. The objects router dispatches to it
+on the PRESENCE of `uploadId` and `partNumber`, never on a truthy value — `?partNumber=3&partNumber=`
+is an UploadPart at the edge and an empty `.get` here, and a truthiness test sent the part body
+through `handle_put_object` and replaced the whole object with it.
 
 Promotion is gated on free space (`HIPPIUS_PROMOTE_MIN_FREE_RATIO`, default 0.175) because it
 shares the ingest mount with PUTs — `HIPPIUS_OBJECT_CACHE_DIR` is the drain agent's

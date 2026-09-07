@@ -608,3 +608,67 @@ async def test_the_stream_log_counts_the_distinct_owners_of_the_plan(
     assert "owner=node-b" in line
     assert "owners=2" in line
     assert fetcher.located == [] and fetcher.batches == [], "memo-only: the log resolved nothing"
+
+
+@pytest.mark.asyncio
+@patch("hippius_s3.services.object_reader.build_headers", new=MagicMock(return_value={}))
+@patch("hippius_s3.services.object_reader.get_read_recency_recorder", new=MagicMock(return_value=None))
+@patch("hippius_s3.services.object_reader.stream_plan")
+@patch("hippius_s3.services.object_reader.build_stream_context", new_callable=AsyncMock)
+@patch("hippius_s3.services.object_reader.get_config")
+async def test_the_stream_log_reports_no_owners_when_nothing_is_memoised(
+    mock_cfg,
+    mock_ctx,
+    mock_stream,
+    tmp_path,
+    caplog,
+):
+    """A fully local read resolves no peer at all, so the field is 0 rather than absent.
+
+    The log line is parsed by whoever is checking placement (docs/locality-routing.md), so its
+    shape has to be the same whether or not the read touched a peer.
+    """
+    import logging
+
+    from hippius_s3.services.object_reader import StreamContext
+    from hippius_s3.services.object_reader import read_response
+
+    cfg = _stub_config()
+    cfg.stream_first_chunk_timeout_seconds = 5.0
+    cfg.stream_chunk_timeout_seconds = 5.0
+    cfg.http_stream_prefetch_chunks = 0
+    mock_cfg.return_value = cfg
+    mock_ctx.return_value = StreamContext(
+        plan=_multi_part_plan([1, 2]),
+        object_version=1,
+        storage_version=5,
+        source="cache",
+        key_bytes=b"d" * 32,
+        suite_id="hip-enc/aes256gcm",
+        bucket_id="b",
+        upload_id="",
+    )
+
+    async def _gen(**_kwargs):
+        yield b"plaintext"
+
+    mock_stream.side_effect = lambda **kwargs: _gen(**kwargs)
+
+    fetcher = _LocatingFetcher(None, False, answers={})
+    obj_cache = _tiered_obj_cache(tmp_path, fetcher, [True, True])
+
+    with caplog.at_level(logging.INFO, logger="hippius_s3.services.object_reader"):
+        response = await read_response(
+            db=_mock_db_pool(),
+            redis=_RedisStub(),
+            obj_cache=obj_cache,
+            info=_info(),
+            read_mode="full",
+            rng=None,
+            address="addr",
+        )
+        assert b"".join([chunk async for chunk in response.body_iterator]) == b"plaintext"
+
+    line = next(r.getMessage() for r in caplog.records if "STREAM tiers" in r.getMessage())
+    assert "owner=None" in line
+    assert "owners=0" in line

@@ -542,7 +542,9 @@ async def read_response(
     dual = _dual_store(obj_cache)
     # Best-effort like the error path above: a malformed plan item must not fail the stream log.
     first_part = getattr(ctx.plan[0], "part_number", None) if ctx.plan else None
-    plan_parts = _plan_part_numbers(ctx.plan)
+    # Walked here rather than in the body: the plan is one item per CHUNK, so this is O(chunks)
+    # on a 2 TB object and belongs on the request path, not between two yields of it.
+    plan_parts = _plan_part_numbers(ctx.plan) if dual is not None else []
 
     async def _body() -> AsyncGenerator[bytes, None]:
         nonlocal first_chunk

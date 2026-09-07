@@ -31,6 +31,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
+from typing import Any
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -125,6 +126,11 @@ def _is_peer_address(url: str) -> bool:
 # would guard against nothing.
 _OWNER_MEMO_TTL_SECONDS = 30.0
 _OWNER_MEMO_ENTRIES = 50_000
+
+# Parts per batched owner query. Sized so the largest legal object (10,000 parts) is ~20 bounded
+# statements rather than one whose cost nobody has measured, since the LATERAL that fetches the
+# per-chunk sizes runs once per resolved part.
+_RESOLVE_PARTS_BATCH = 512
 
 # A miss ("no peer holds this") used to share the 30s owner TTL. Harbor's S3 driver GETs the
 # 20-byte `startedat` object on blob commit, often on a different api-local than the PUT, ~600ms
@@ -421,19 +427,12 @@ class PeerRegistry:
                 exc,
             )
 
-    async def lookup_fresh_part(
-        self, object_id: str, object_version: int, part_number: int
-    ) -> Optional[tuple[str, dict[int, int]]]:
-        """`(ingest_node, cipher_sizes)` of a not-yet-claimed part, or None.
+    def _hint(self, raw: Any) -> Optional[tuple[str, dict[int, int]]]:
+        """One stored hint decoded, or None when it is absent or names this node.
 
-        Excludes this node: the local tier already missed, so fetching ourselves is wasted.
-        `cipher_sizes` is empty when the writer stored the legacy bare node name.
+        Excluding this node is the point: the local tier already missed, so fetching ourselves
+        is wasted. `cipher_sizes` is empty when the writer stored the legacy bare node name.
         """
-        try:
-            raw = await self._redis.get(fresh_part_key(object_id, object_version, part_number))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("fresh-part lookup failed for %s: %s", object_id, exc)
-            return None
         if not raw:
             return None
         if isinstance(raw, (bytes, bytearray)):
@@ -442,6 +441,41 @@ class PeerRegistry:
         if not node or node == self._node_name:
             return None
         return node, sizes
+
+    async def lookup_fresh_part(
+        self, object_id: str, object_version: int, part_number: int
+    ) -> Optional[tuple[str, dict[int, int]]]:
+        """`(ingest_node, cipher_sizes)` of a not-yet-claimed part, or None."""
+        try:
+            raw = await self._redis.get(fresh_part_key(object_id, object_version, part_number))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("fresh-part lookup failed for %s: %s", object_id, exc)
+            return None
+        return self._hint(raw)
+
+    async def lookup_fresh_parts(
+        self, object_id: str, object_version: int, part_numbers: list[int]
+    ) -> dict[int, tuple[str, dict[int, int]]]:
+        """`lookup_fresh_part` for many parts in ONE `MGET`; parts with no hint are absent.
+
+        The batched owner query removes the per-part Postgres round trip, and without this the
+        hint fallback behind it would still spend one Redis round trip per part — which is most
+        of them on a cold read, where nothing is resident anywhere.
+        """
+        if not part_numbers:
+            return {}
+        keys = [fresh_part_key(object_id, object_version, n) for n in part_numbers]
+        try:
+            raws = await self._redis.mget(keys)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("fresh-part batch lookup failed for %s: %s", object_id, exc)
+            return {}
+        hints: dict[int, tuple[str, dict[int, int]]] = {}
+        for part_number, raw in zip(part_numbers, raws or [], strict=False):
+            hint = self._hint(raw)
+            if hint is not None:
+                hints[int(part_number)] = hint
+        return hints
 
 
 class PeerChunkFetcher:
@@ -589,7 +623,7 @@ class PeerChunkFetcher:
     async def _resolve_parts(
         self, object_id: str, object_version: int, part_numbers: list[int]
     ) -> dict[int, tuple[str, dict[int, int], bool]]:
-        """`_resolve_part` over many parts in ONE round trip: `{part_number: (owner, sizes, unreplicated)}`.
+        """`_resolve_part` over many parts at once: `{part_number: (owner, sizes, unreplicated)}`.
 
         Same two candidate arms, same ordering, same LATERAL sizes as the single-part query —
         the choice is just made per part with `DISTINCT ON` instead of `LIMIT 1`. A part with
@@ -598,10 +632,28 @@ class PeerChunkFetcher:
         Exists for spread multipart objects: a read on the key node misses locally on EVERY
         tail part at once, and resolving those one query per part put O(parts) Postgres round
         trips in front of the first byte.
+
+        Issued in batches of `_RESOLVE_PARTS_BATCH`. Parts are independent, so batching cannot
+        change an answer; it bounds the statement instead. S3 allows 10,000 parts and a cold
+        read of one misses on all of them, and the LATERAL runs once per resolved part — a
+        single statement carrying the whole set would be one unbounded query in front of the
+        first byte, on a connection nothing else can use meanwhile.
         """
+        if not part_numbers:
+            return {}
+        resolved: dict[int, tuple[str, dict[int, int], bool]] = {}
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
+            for start in range(0, len(part_numbers), _RESOLVE_PARTS_BATCH):
+                batch = [int(n) for n in part_numbers[start : start + _RESOLVE_PARTS_BATCH]]
+                resolved.update(await self._resolve_batch(conn, object_id, object_version, batch))
+        return resolved
+
+    async def _resolve_batch(
+        self, conn: Any, object_id: str, object_version: int, part_numbers: list[int]
+    ) -> dict[int, tuple[str, dict[int, int], bool]]:
+        """One `_resolve_parts` statement, on a connection the caller holds."""
+        rows = await conn.fetch(
+            """
                 WITH candidates AS (
                     SELECT r.part_number, r.node_id, 0 AS tier_pref, r.resident_at AS ord
                     FROM cephor_ssd_residency r
@@ -633,11 +685,11 @@ class PeerChunkFetcher:
                     WHERE p.object_id = $1::uuid AND p.object_version = $2 AND p.part_number = o.part_number
                 ) sizes ON TRUE
                 """,
-                str(object_id),
-                int(object_version),
-                [int(n) for n in part_numbers],
-                self._node_name,
-            )
+            str(object_id),
+            int(object_version),
+            [int(n) for n in part_numbers],
+            self._node_name,
+        )
         resolved: dict[int, tuple[str, dict[int, int], bool]] = {}
         for row in rows:
             indexes = row["chunk_indexes"] or []
@@ -691,6 +743,20 @@ class PeerChunkFetcher:
     ) -> tuple[Optional[str], dict[int, int], bool]:
         """The fresh-part hint's answer for a part Postgres has no owner for."""
         hinted = await self._registry.lookup_fresh_part(object_id, object_version, part_number)
+        return await self._from_hint(object_id, object_version, part_number, hinted)
+
+    async def _from_hint(
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        hinted: Optional[tuple[str, dict[int, int]]],
+    ) -> tuple[Optional[str], dict[int, int], bool]:
+        """An already-fetched hint turned into an owner triple, so the batched path shares this.
+
+        A hinted owner is unreplicated by construction: the hint exists only for the window
+        before the drain has claimed the part.
+        """
         if hinted is None:
             return None, {}, False
         node, hinted_sizes = hinted
@@ -743,11 +809,11 @@ class PeerChunkFetcher:
     async def locate_many(
         self, object_id: str, object_version: int, part_numbers: list[int]
     ) -> dict[int, tuple[Optional[str], bool]]:
-        """`locate` for many parts at once: memo hits cost nothing, every miss shares ONE query.
+        """`locate` for many parts at once: memo hits cost nothing, the misses share a batched query.
 
         Same answer per part as `locate`, fed into the same memo — negative entries included —
         so the fetches that follow pay nothing more. Parts Postgres has no owner for still get
-        the fresh-part hint, one Redis GET each, exactly as the single-part path does.
+        the fresh-part hint, and those share one MGET rather than a GET each.
         """
         oid, ov = str(object_id), int(object_version)
         located: dict[int, tuple[Optional[str], bool]] = {}
@@ -761,12 +827,18 @@ class PeerChunkFetcher:
         if not misses:
             return located
         resolved = await self._resolve_parts(oid, ov, misses)
+        # The hints for everything Postgres had no owner for, in one MGET. A cold read resolves
+        # no owner for any part, so per-part hint lookups would leave the round trips per part
+        # that the batched query exists to remove — just in Redis instead of Postgres.
+        hints = await self._registry.lookup_fresh_parts(oid, ov, [pn for pn in misses if pn not in resolved])
         # One registry lookup per distinct owner rather than per part: a spread object's tail
         # parts are held by a handful of nodes, not one node per part.
         bases: dict[str, Optional[str]] = {}
         for pn in misses:
             answer = resolved.get(pn)
-            owner, sizes, unreplicated = answer if answer is not None else await self._hinted_owner(oid, ov, pn)
+            if answer is None:
+                answer = await self._from_hint(oid, ov, pn, hints.get(pn))
+            owner, sizes, unreplicated = answer
             base = None
             if owner is not None:
                 if owner not in bases:

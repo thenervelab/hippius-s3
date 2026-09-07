@@ -425,3 +425,135 @@ async def test_another_parts_chunk_sizes_are_not_mixed_in(conn: asyncpg.Connecti
 
     assert part_three == {0: 100, 1: 100}
     assert part_four == {0: 7}
+
+
+# ---------------------------------------------------------------- the batched form of the same
+
+# `locate_many` resolves through the registry, which `_resolve_part` never touches. Only the two
+# calls the batched path makes are needed, and both answer "nothing else knows anything": the
+# point of these tests is the SQL, and a real Redis would only be able to hide it.
+
+
+class _NoRegistry:
+    """A registry with no peers registered and no fresh-part hints — every answer comes from SQL."""
+
+    async def resolve(self, node_name: str) -> Optional[str]:
+        return f"http://10.42.0.9:8000#{node_name}"
+
+    async def lookup_fresh_parts(self, *_: Any) -> dict[int, tuple[str, dict[int, int]]]:
+        return {}
+
+
+def _locating_fetcher(conn: asyncpg.Connection) -> PeerChunkFetcher:
+    return PeerChunkFetcher(
+        _SingleConnPool(conn),  # type: ignore[arg-type]
+        registry=_NoRegistry(),  # type: ignore[arg-type]
+        node_name=NODE,
+        client=None,  # type: ignore[arg-type]
+        auth_secret="unused-by-resolve",
+    )
+
+
+async def test_the_batched_query_answers_every_part_exactly_as_the_single_one_does(
+    conn: asyncpg.Connection,
+) -> None:
+    """The whole contract of `_resolve_parts`: same rows in, same triple out, per part.
+
+    `DISTINCT ON (part_number) ... ORDER BY part_number, tier_pref, ord` has to make the same
+    CHOICE per part that `ORDER BY tier_pref, ord LIMIT 1` makes for one — including the
+    read-tier-beats-fresh-arm preference and the longest-resident tie-break — and the LATERAL
+    has to correlate on the part it is joined to rather than on a parameter. Each part below is
+    one of the single-part cases above, seeded together so one statement has to keep them apart.
+    """
+    object_id = str(uuid.uuid4())
+    # replicated on a peer; short final chunk
+    await _seed(conn, object_id=object_id, sizes=[100, 100, 40], part_number=1)
+    # fresh: no residency, the drain's claimant holds the only copy
+    await _seed(
+        conn, object_id=object_id, sizes=[7], resident_on=None, status="pending", claimed_by=PEER, part_number=2
+    )
+    # two holders: the longest-resident copy must win
+    await _seed(
+        conn,
+        object_id=object_id,
+        sizes=[100],
+        resident_on=PROMOTED_PEER,
+        resident_at=datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc),
+        part_number=3,
+    )
+    await _add_residency(
+        conn, object_id=object_id, node=PEER, resident_at=datetime(2026, 8, 1, 9, 0, tzinfo=timezone.utc), part_number=3
+    )
+    # owner with no part_chunks rows: array_agg over nothing is NULL, not an empty array
+    await _seed(conn, object_id=object_id, sizes=[], part_number=4)
+    # terminal 'failed': no peer
+    await _seed(
+        conn, object_id=object_id, sizes=[100], resident_on=None, status="failed", claimed_by=PEER, part_number=5
+    )
+    # resident on THIS node only: never a peer of ourselves
+    await _seed(conn, object_id=object_id, sizes=[100], resident_on=NODE, part_number=6)
+    parts = [1, 2, 3, 4, 5, 6, 7]  # 7 was never seeded at all
+
+    fetcher = _fetcher(conn)
+    batched = await fetcher._resolve_parts(object_id, 1, parts)
+
+    for part_number in parts:
+        single = await fetcher._resolve_part(object_id, 1, part_number)
+        expected = NO_PEER if single[0] is None else single
+        assert batched.get(part_number, NO_PEER) == expected, f"part {part_number} disagreed with the single query"
+
+    assert batched[1] == (PEER, {0: 100, 1: 100, 2: 40}, False), "the sizes are joined per part, not shared"
+    assert batched[2] == (PEER, {0: 7}, True)
+    assert batched[3][0] == PEER, "the longest-resident copy wins here too"
+    assert batched[4] == (PEER, {}, False)
+    assert 5 not in batched and 6 not in batched and 7 not in batched
+
+
+async def test_the_batched_query_never_offers_this_node_as_a_peer(conn: asyncpg.Connection) -> None:
+    """`node_id <> $4` has to be on BOTH arms, exactly as in the single query.
+
+    A part we hold ourselves resolved as a "peer" would turn a local read into a loopback HTTP
+    fetch of our own disk, and the batched form is where an arm is easy to drop.
+    """
+    object_id = str(uuid.uuid4())
+    await _seed(conn, object_id=object_id, sizes=[100], resident_on=NODE, part_number=1)
+    await _seed(
+        conn, object_id=object_id, sizes=[100], resident_on=None, status="pending", claimed_by=NODE, part_number=2
+    )
+    await _seed(conn, object_id=object_id, sizes=[100], resident_on=PEER, part_number=3)
+
+    batched = await _fetcher(conn)._resolve_parts(object_id, 1, [1, 2, 3])
+
+    assert set(batched) == {3}, "only the part another node holds"
+
+
+async def test_the_batched_query_is_not_issued_for_no_parts(conn: asyncpg.Connection) -> None:
+    """A read that misses nothing must not spend a round trip saying so."""
+    assert await _fetcher(conn)._resolve_parts(str(uuid.uuid4()), 1, []) == {}
+
+
+async def test_locate_many_runs_end_to_end_against_postgres(conn: asyncpg.Connection) -> None:
+    """The public entry point, over the real statement, feeding the real memo.
+
+    A part is reported only when it is FETCHABLE — owner registered and sizes known — so the
+    ownerless one and the sizeless one both come back as no peer, and `last_owner` afterwards
+    shows the memo the streaming fetches will read.
+    """
+    object_id = str(uuid.uuid4())
+    await _seed(conn, object_id=object_id, sizes=[100, 40], part_number=201)
+    await _seed(
+        conn, object_id=object_id, sizes=[7], resident_on=None, status="draining", claimed_by=PEER, part_number=202
+    )
+    await _seed(conn, object_id=object_id, sizes=[], part_number=203)
+
+    fetcher = _locating_fetcher(conn)
+    located = await fetcher.locate_many(object_id, 1, [201, 202, 203, 204])
+
+    assert located == {
+        201: (PEER, False),
+        202: (PEER, True),
+        203: (None, False),
+        204: (None, False),
+    }
+    assert fetcher.last_owner(object_id, 1, 201) == PEER
+    assert fetcher.last_owner(object_id, 1, 203) is None, "an owner with no sizes is memoised negatively"

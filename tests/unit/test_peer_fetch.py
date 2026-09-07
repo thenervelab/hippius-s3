@@ -39,6 +39,7 @@ class FakeRedis:
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
         self.ttls: dict[str, int] = {}
+        self.mgets: list[list[str]] = []
         self.fail = False
 
     async def set(self, key: str, value: str, ex: int | None = None) -> None:
@@ -52,6 +53,12 @@ class FakeRedis:
         if self.fail:
             raise ConnectionError("redis down")
         return self.store.get(key)
+
+    async def mget(self, keys: list[str]) -> list[Optional[str]]:
+        if self.fail:
+            raise ConnectionError("redis down")
+        self.mgets.append(list(keys))
+        return [self.store.get(k) for k in keys]
 
     async def unlink(self, *keys: str) -> int:
         if self.fail:
@@ -1814,3 +1821,103 @@ async def test_locate_many_with_no_parts_touches_nothing() -> None:
 
     assert await fetcher.locate_many(OBJ, 1, []) == {}
     assert pool.conn.queries == []
+
+
+@pytest.mark.asyncio
+async def test_locate_many_asks_redis_for_every_hint_at_once() -> None:
+    """The hint fallback behind the batched query must not reinstate a round trip per part.
+
+    A COLD read is the case that matters: nothing is resident anywhere, so Postgres answers for
+    no part and every one of them falls through to the hint. One GET each would leave exactly
+    the O(parts) latency in front of the first byte that the batched query removed.
+    """
+    reader = await _two_registered_peers()
+    redis = reader._redis
+    pool = FakePool(rows=[])
+    fetcher = PeerChunkFetcher(pool, reader, "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    assert await fetcher.locate_many(OBJ, 1, [201, 202, 203]) == {
+        201: (None, False),
+        202: (None, False),
+        203: (None, False),
+    }
+
+    assert len(redis.mgets) == 1, "one MGET for every part Postgres had no owner for"
+    assert len(redis.mgets[0]) == 3
+
+
+@pytest.mark.asyncio
+async def test_locate_many_asks_for_hints_only_where_postgres_had_no_owner() -> None:
+    reader = await _two_registered_peers()
+    redis = reader._redis
+    pool = FakePool(rows=[part_row(201, "node-b")])
+    fetcher = PeerChunkFetcher(pool, reader, "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    await fetcher.locate_many(OBJ, 1, [201, 202])
+
+    assert redis.mgets == [[fresh_part_key(OBJ, 1, 202)]], "the resolved part needs no hint"
+
+
+@pytest.mark.asyncio
+async def test_locate_many_bounds_the_statement_for_a_ten_thousand_part_object() -> None:
+    """S3 allows 10,000 parts and a cold read of one misses on all of them at once.
+
+    Batched, but in bounded statements: the LATERAL that fetches per-chunk sizes runs once per
+    resolved part, so a single query carrying the whole set is one unbounded statement in front
+    of the first byte, holding a pool connection nothing else can use meanwhile.
+    """
+    pool = FakePool(rows=[])
+    fetcher = PeerChunkFetcher(pool, await _two_registered_peers(), "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    located = await fetcher.locate_many(OBJ, 1, list(range(1, 10_001)))
+
+    assert len(located) == 10_000
+    assert all(v == (None, False) for v in located.values())
+    sent = [args[2] for args in pool.conn.fetches]
+    assert max(len(batch) for batch in sent) <= 512, "no statement carries more than the batch size"
+    assert sorted(pn for batch in sent for pn in batch) == list(range(1, 10_001)), "and every part is asked once"
+
+
+@pytest.mark.asyncio
+async def test_an_owner_query_that_raises_memoises_nothing() -> None:
+    """`locate_many` raises exactly like `locate` does; the dual store is what contains it.
+
+    What must NOT happen is a half-written memo: a part left recorded as ownerless by a failed
+    query would keep the peer tier dark for the negative TTL for reasons that never applied.
+    """
+
+    class _BrokenPool(FakePool):
+        def acquire(self) -> Any:
+            class _Ctx:
+                async def __aenter__(self) -> Any:
+                    class _Conn:
+                        async def fetch(self, *_: Any) -> list[dict[str, Any]]:
+                            raise ConnectionError("postgres down")
+
+                    return _Conn()
+
+                async def __aexit__(self, *_: object) -> None:
+                    return None
+
+            return _Ctx()
+
+    fetcher = PeerChunkFetcher(
+        _BrokenPool(), await _two_registered_peers(), "node-a", FakeHttp(200), auth_secret=SECRET
+    )
+
+    with pytest.raises(ConnectionError):
+        await fetcher.locate_many(OBJ, 1, [201, 202])
+
+    assert fetcher.last_owner(OBJ, 1, 201) is None
+    assert fetcher.last_owner(OBJ, 1, 202) is None
+
+
+@pytest.mark.asyncio
+async def test_locate_many_reports_no_owner_when_redis_is_down_behind_the_hints() -> None:
+    """A hint lookup is best-effort in the single-part path, and stays so batched."""
+    reader = await _two_registered_peers()
+    reader._redis.fail = True
+    pool = FakePool(rows=[])
+    fetcher = PeerChunkFetcher(pool, reader, "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    assert await fetcher.locate_many(OBJ, 1, [201]) == {201: (None, False)}
