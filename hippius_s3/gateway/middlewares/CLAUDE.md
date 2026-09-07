@@ -44,18 +44,18 @@ silently demoting an internal account back to billed. Keyed only on the VERIFIED
 never on a header, and never on the bucket owner — the gate bills the caller. Reads set the flag
 but change nothing else.
 
-**The two identities — and why the worker keys on the other one.** The worker-side bypass (the
-`X-Billing-Bypass` header to Arion, in [hippius_s3/workers/uploader.py](../../workers/uploader.py))
-follows `object_versions.address`, the BUCKET OWNER — because Arion charges `account_ss58` = the
-owner for storage in their bucket whoever wrote the bytes. That is **owner-pays**, and it is
-deliberate: on a shared bucket the owner funds their guests' writes. When the owner is one of ours
-we simply do not bill ourselves, so the exemption follows the owner and nothing else.
+**The gateway is the only place we apply this.** The backend upload path needs nothing: Arion
+whitelists our service accounts on `/upload` itself, so that exemption is applied upstream. The
+uploader deliberately sends no `X-Billing-Bypass` for them — a second list of the same accounts,
+maintained in two systems, would be free to drift apart. `payload.bypass_billing` in
+[hippius_s3/workers/uploader.py](../../workers/uploader.py) is unrelated: the operator escape
+(`dlq_requeue --bypass-billing`) for re-driving an ordinary account's 402'd uploads, which predates
+service accounts.
 
-It is NOT also gated on the writer, and that is load-bearing. Billing a guest for a write into our
-bucket was never available — Arion bills the owner either way — so gating on the writer would not
-move the cost, it would 402 the upload (`is_billing_error` → `"billing"` → permanent → DLQ) against
-a service account that by definition carries no credit. That breaks shared buckets to protect
-nothing.
+What Arion's whitelist cannot cover is the gate above it. `has_credits` is read from **our**
+`redis-accounts` cache and checked BEFORE `can_upload`, so a service account with no cached credit
+would be refused `InsufficientAccountCredit` before Arion is consulted at all. That is what this
+branch exists for.
 
 **Nobody but the owner writes to a service-account bucket.** Enforced in two places, and the
 evaluation-time one is the control: [acl_service.py](../services/acl_service.py) `check_permission`
@@ -67,15 +67,6 @@ succeeds, a later `GET ?acl` reports a grant that does nothing, and the operator
 configured something they did not. READ and READ_ACP are untouched: publishing our own datasets
 publicly is the point of several of these buckets. The predicate is `forbidden_write_grants` in
 [services/service_accounts.py](../../services/service_accounts.py).
-
-`object_versions.billing_bypass` (this middleware's verdict on the verified CALLER, written through
-`set_object_version_address`) is therefore **observability, not authorization**: it is the only way
-to tell an unmetered upload we made ourselves from one a guest made into our bucket, since the
-caller cannot be recomputed in the worker — drain-direct means the Rust drain-agent builds the
-`UploadChainRequest`, not the API. It labels `billing_bypass_total{writer=owner|guest}` and raises a
-WARNING on `guest`. A `guest` sample is legitimate but only reachable through a WRITE grant on a
-service-account bucket, so it is the thing to alert on. Pre-migration rows read `FALSE` and so label
-`guest` — the conservative direction for a signal, not a gate.
 
 ### [trailing_slash.py](trailing_slash.py) — `trailing_slash_normalizer`
 

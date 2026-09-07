@@ -16,7 +16,6 @@ async def set_object_version_address(
     object_version: int,
     address: str,
     only_if_null: bool = False,
-    billing_bypass: bool = False,
 ) -> None:
     """Persist the main-account address on an object version (s3-2.1).
 
@@ -25,10 +24,6 @@ async def set_object_version_address(
 
     only_if_null (AP-2): gate the UPDATE on `address IS NULL` so a caller whose version already
     carries an address (e.g. the append hot path) issues a no-op instead of a redundant write.
-
-    billing_bypass: whether the VERIFIED CALLER was a service account. Distinct from `address`,
-    which is the bucket owner — the uploader needs both and must not infer one from the other.
-    Defaults False so any caller that has not been taught about the exemption records "billed".
     """
     query = "set_object_version_address_if_null" if only_if_null else "set_object_version_address"
     await db.execute(
@@ -36,7 +31,6 @@ async def set_object_version_address(
         object_id,
         int(object_version),
         address,
-        bool(billing_bypass),
     )
 
 

@@ -1366,7 +1366,6 @@ async def complete_multipart_upload(
             object_id=str(object_id),
             object_version=int(object_version),
             address=request.state.main_account_id,
-            billing_bypass=getattr(request.state, "service_account", False) is True,
         )
 
         # Drain wake: the address write above removes the cause of this version's defer

@@ -334,7 +334,6 @@ async def handle_streaming_copy(
             object_id=str(put_res.object_id),
             object_version=int(put_res.object_version),
             address=request.state.main_account_id,
-            billing_bypass=getattr(request.state, "service_account", False) is True,
         )
     except Exception:
         # B4: put_simple_stream_full already made the version serveable (size/md5 written). If the

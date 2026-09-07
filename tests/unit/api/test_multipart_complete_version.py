@@ -97,9 +97,7 @@ async def test_complete_resolves_version_from_parts_not_pointer(monkeypatch: Any
             seen["complete_version"] = kw["object_version"]
             return SimpleNamespace(etag="abc", size_bytes=100)
 
-    async def _addr(
-        _pool: Any, *, object_id: str, object_version: int, address: str, billing_bypass: bool = False
-    ) -> None:
+    async def _addr(_pool: Any, *, object_id: str, object_version: int, address: str) -> None:
         seen["address_version"] = object_version
 
     monkeypatch.setattr(multipart, "ObjectWriter", _FakeWriter)

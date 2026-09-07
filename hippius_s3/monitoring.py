@@ -83,13 +83,6 @@ AeadFailureOutcome = Literal["recovered", "unrecovered"]
 # a rolling deploy, so the counter must keep them apart.
 BillingBypassSurface = Literal["gateway", "uploader"]
 
-# Who wrote the bytes on an exempted upload. The exemption follows the BUCKET OWNER (owner-pays),
-# so a `guest` sample is a third party's write landing unmetered in one of our buckets — legitimate
-# under owner-pays, only reachable via a WRITE grant on a service-account bucket, and the thing to
-# alert on. `owner` is our own ingest. Closed in code; the gateway surface is always `owner`
-# (it decides on the authenticated caller).
-BillingBypassWriter = Literal["owner", "guest"]
-
 
 class MetricsCollector:
     """OTel metrics for the API, gateway and workers.
@@ -199,13 +192,13 @@ class MetricsCollector:
         # attribution lives in the BILLING_BYPASS log lines, which are the only record of what was
         # actually not charged for. (The audit log's service_account field answers a DIFFERENT
         # question — "was the caller a service account" — which is true for reads too, where
-        # nothing is bypassed, and absent for uploader-surface bypasses, which produce no audit
-        # line. Do not use it to count exemptions.)
+        # nothing is bypassed. Do not use it to count exemptions.)
+        #
+        # `uploader` samples are the operator DLQ escape only: Arion whitelists our service
+        # accounts on /upload itself, so that path sends no header for them.
         self.billing_bypass_total = self.meter.create_counter(
             name="billing_bypass_total",
-            description=(
-                "Billing gates skipped for service accounts, by surface (gateway|uploader) and writer (owner|guest)"
-            ),
+            description="Billing gates skipped, by surface (gateway|uploader)",
             unit="1",
         )
 
@@ -714,9 +707,10 @@ class MetricsCollector:
         """
         self.fs_cache_shed_total.add(1, attributes={"reason": reason, "pressure_mode": pressure_mode})
 
-    def record_billing_bypass(self, surface: BillingBypassSurface, writer: BillingBypassWriter = "owner") -> None:
-        """Record a billing gate skipped for a service account."""
-        self.billing_bypass_total.add(1, attributes={"surface": surface, "writer": writer})
+    def record_billing_bypass(self, surface: BillingBypassSurface) -> None:
+        """Record a billing gate skipped: `gateway` for a service account, `uploader` for the
+        operator DLQ escape."""
+        self.billing_bypass_total.add(1, attributes={"surface": surface})
 
     def record_cache_operation(
         self,
