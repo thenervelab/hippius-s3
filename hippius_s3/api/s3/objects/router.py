@@ -181,9 +181,11 @@ async def put_object(
     if (invalid := invalid_canned_acl_response(x_amz_acl)) is not None:
         return invalid
 
-    upload_id = request.query_params.get("uploadId")
-    part_number = request.query_params.get("partNumber")
-    if upload_id and part_number:
+    # Presence, not a truthy value. `?uploadId=U&partNumber=3&partNumber=` is an UploadPart to the
+    # edge, which places it on the FIRST value, while `.get` returns the empty LAST one — so a
+    # truthiness test sent the part's body to handle_put_object and REPLACED the whole object with
+    # it. `upload_part` rejects the empty and the repeated forms itself.
+    if "uploadId" in request.query_params and "partNumber" in request.query_params:
         response = await upload_part(request, pool)
     elif "tagging" in request.query_params:
         if (rejected := _reject_version_id(request, object_key, "tagging")) is not None:

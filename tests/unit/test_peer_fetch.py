@@ -39,6 +39,7 @@ class FakeRedis:
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
         self.ttls: dict[str, int] = {}
+        self.mgets: list[list[str]] = []
         self.fail = False
 
     async def set(self, key: str, value: str, ex: int | None = None) -> None:
@@ -52,6 +53,12 @@ class FakeRedis:
         if self.fail:
             raise ConnectionError("redis down")
         return self.store.get(key)
+
+    async def mget(self, keys: list[str]) -> list[Optional[str]]:
+        if self.fail:
+            raise ConnectionError("redis down")
+        self.mgets.append(list(keys))
+        return [self.store.get(k) for k in keys]
 
     async def unlink(self, *keys: str) -> int:
         if self.fail:
@@ -78,18 +85,26 @@ def sized_row(sizes: list[int], node_id: str = "node-b") -> dict[str, Any]:
 
 
 class FakeConn:
-    def __init__(self, row: Optional[dict[str, Any]]) -> None:
+    def __init__(self, row: Optional[dict[str, Any]], rows: Optional[list[dict[str, Any]]] = None) -> None:
         self._row = row
+        self._rows = list(rows or [])
         self.queries: list[tuple[Any, ...]] = []
+        # The batched (`fetch`) lookups alone; `queries` counts every round trip of either kind.
+        self.fetches: list[tuple[Any, ...]] = []
 
     async def fetchrow(self, _sql: str, *args: Any) -> Optional[dict[str, Any]]:
         self.queries.append(args)
         return self._row
 
+    async def fetch(self, _sql: str, *args: Any) -> list[dict[str, Any]]:
+        self.queries.append(args)
+        self.fetches.append(args)
+        return list(self._rows)
+
 
 class FakePool:
-    def __init__(self, row: Optional[dict[str, Any]] = None) -> None:
-        self.conn = FakeConn(row)
+    def __init__(self, row: Optional[dict[str, Any]] = None, rows: Optional[list[dict[str, Any]]] = None) -> None:
+        self.conn = FakeConn(row, rows)
 
     def acquire(self) -> Any:
         conn = self.conn
@@ -1672,3 +1687,237 @@ async def test_locate_reports_no_owner_while_the_memo_is_poisoned() -> None:
     assert await fetcher(OBJ, 1, 3, 0) is None
     assert await fetcher.locate(OBJ, 1, 3) == (None, False)
     assert fetcher.last_owner(OBJ, 1, 3) is None
+
+
+# ------------------------------------------------------------------- locate_many (part spread)
+
+
+def part_row(part_number: int, node_id: str = "node-b", *, tier_pref: int = 0, num_chunks: int = 2) -> dict[str, Any]:
+    """One row of the batched owner query: a part, its holder, which arm won, and its sizes."""
+    return {
+        "part_number": part_number,
+        "node_id": node_id,
+        "tier_pref": tier_pref,
+        "chunk_indexes": list(range(num_chunks)),
+        "cipher_sizes": [10] * num_chunks,
+    }
+
+
+async def _two_registered_peers() -> PeerRegistry:
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", PEER_URL, 90).register()
+    await PeerRegistry(redis, "node-c", f"http://10.42.3.7:{PEER_PORT}", 90).register()
+    return PeerRegistry(redis, "node-a", SELF_URL, 90)
+
+
+@pytest.mark.asyncio
+async def test_locate_many_resolves_every_miss_in_one_query() -> None:
+    """A spread object misses on all of its tail parts at once; that must be one round trip.
+
+    Each part keeps its own answer — owner and whether the pool has it yet — and a part with
+    no candidate is reported exactly as `locate` reports it, `(None, False)`.
+    """
+    pool = FakePool(rows=[part_row(201, "node-b"), part_row(202, "node-c", tier_pref=1)])
+    fetcher = PeerChunkFetcher(pool, await _two_registered_peers(), "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    located = await fetcher.locate_many(OBJ, 1, [201, 202, 203])
+
+    assert located == {201: ("node-b", False), 202: ("node-c", True), 203: (None, False)}
+    assert pool.conn.fetches == [(OBJ, 1, [201, 202, 203], "node-a")], "one query, this node bound out"
+    assert len(pool.conn.queries) == 1
+
+
+@pytest.mark.asyncio
+async def test_locate_many_feeds_the_memo_the_fetch_path_uses() -> None:
+    """The batched answer is the same memo entry a later fetch or `locate` would have made."""
+    pool = FakePool(rows=[part_row(201, "node-b")])
+    http = FakeHttp(200, b"x" * 10)
+    fetcher = PeerChunkFetcher(pool, await _two_registered_peers(), "node-a", http, auth_secret=SECRET)
+
+    await fetcher.locate_many(OBJ, 1, [201])
+
+    assert fetcher.last_owner(OBJ, 1, 201) == "node-b"
+    assert await fetcher(OBJ, 1, 201, 0) == b"x" * 10
+    assert await fetcher.locate(OBJ, 1, 201) == ("node-b", False)
+    assert len(pool.conn.queries) == 1, "the fetch and the single-part locate reused the batched entry"
+
+
+@pytest.mark.asyncio
+async def test_locate_many_serves_memo_hits_without_a_query() -> None:
+    pool = FakePool(residency_row(), rows=[part_row(3, "node-c")])
+    fetcher = PeerChunkFetcher(pool, await _two_registered_peers(), "node-a", FakeHttp(200), auth_secret=SECRET)
+    assert await fetcher.locate(OBJ, 1, 3) == ("node-b", False)
+
+    assert await fetcher.locate_many(OBJ, 1, [3]) == {3: ("node-b", False)}
+
+    assert pool.conn.fetches == [], "a memoised part is answered from the memo, not re-resolved"
+
+
+@pytest.mark.asyncio
+async def test_locate_many_queries_only_the_parts_the_memo_does_not_hold() -> None:
+    pool = FakePool(residency_row(), rows=[part_row(4, "node-c"), part_row(5, "node-c", tier_pref=1)])
+    fetcher = PeerChunkFetcher(pool, await _two_registered_peers(), "node-a", FakeHttp(200), auth_secret=SECRET)
+    await fetcher.locate(OBJ, 1, 3)
+
+    located = await fetcher.locate_many(OBJ, 1, [5, 3, 4, 3])
+
+    assert located == {3: ("node-b", False), 4: ("node-c", False), 5: ("node-c", True)}
+    assert pool.conn.fetches == [(OBJ, 1, [4, 5], "node-a")], "misses only, deduplicated and ordered"
+
+
+@pytest.mark.asyncio
+async def test_locate_many_respects_a_negative_memo() -> None:
+    """A part just resolved to 'no peer' is not re-asked, even though a query would now find one."""
+    pool = FakePool(None, rows=[part_row(3, "node-b")])
+    fetcher = PeerChunkFetcher(pool, await _two_registered_peers(), "node-a", FakeHttp(200), auth_secret=SECRET)
+    assert await fetcher.locate(OBJ, 1, 3) == (None, False)
+
+    assert await fetcher.locate_many(OBJ, 1, [3]) == {3: (None, False)}
+    assert pool.conn.fetches == []
+
+
+@pytest.mark.asyncio
+async def test_locate_many_memoises_its_own_misses_negatively() -> None:
+    """A part with no owner is remembered as such, so the fetches that follow do not re-query."""
+    pool = FakePool(rows=[])
+    fetcher = PeerChunkFetcher(pool, await _two_registered_peers(), "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    assert await fetcher.locate_many(OBJ, 1, [7]) == {7: (None, False)}
+    assert await fetcher(OBJ, 1, 7, 0) is None
+
+    assert len(pool.conn.queries) == 1, "the negative entry covered the fetch"
+
+
+@pytest.mark.asyncio
+async def test_locate_many_reports_an_unregistered_owner_as_no_owner() -> None:
+    """Same rule as `locate`: an owner this pod cannot reach must not suppress the Arion download."""
+    pool = FakePool(rows=[part_row(201, "node-z", tier_pref=1)])
+    fetcher = PeerChunkFetcher(pool, await _two_registered_peers(), "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    assert await fetcher.locate_many(OBJ, 1, [201]) == {201: (None, False)}
+
+
+@pytest.mark.asyncio
+async def test_locate_many_falls_back_to_the_fresh_hint_for_parts_postgres_has_not_claimed() -> None:
+    """The single-part path's hint fallback is preserved per part, so a fresh part is still SSD-only."""
+    redis = FakeRedis()
+    writer = PeerRegistry(redis, "node-b", PEER_URL, 90)
+    await writer.register()
+    await writer.remember_part(OBJ, 1, 202, cipher_sizes=[10])
+    reader = PeerRegistry(redis, "node-a", SELF_URL, 90)
+    pool = FakePool(rows=[part_row(201, "node-b")])
+    fetcher = PeerChunkFetcher(pool, reader, "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    located = await fetcher.locate_many(OBJ, 1, [201, 202])
+
+    assert located == {201: ("node-b", False), 202: ("node-b", True)}
+    assert len(pool.conn.queries) == 1, "the hint answered part 202 without a second query"
+
+
+@pytest.mark.asyncio
+async def test_locate_many_with_no_parts_touches_nothing() -> None:
+    pool = FakePool(rows=[part_row(1)])
+    fetcher = PeerChunkFetcher(pool, await _two_registered_peers(), "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    assert await fetcher.locate_many(OBJ, 1, []) == {}
+    assert pool.conn.queries == []
+
+
+@pytest.mark.asyncio
+async def test_locate_many_asks_redis_for_every_hint_at_once() -> None:
+    """The hint fallback behind the batched query must not reinstate a round trip per part.
+
+    A COLD read is the case that matters: nothing is resident anywhere, so Postgres answers for
+    no part and every one of them falls through to the hint. One GET each would leave exactly
+    the O(parts) latency in front of the first byte that the batched query removed.
+    """
+    reader = await _two_registered_peers()
+    redis = reader._redis
+    pool = FakePool(rows=[])
+    fetcher = PeerChunkFetcher(pool, reader, "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    assert await fetcher.locate_many(OBJ, 1, [201, 202, 203]) == {
+        201: (None, False),
+        202: (None, False),
+        203: (None, False),
+    }
+
+    assert len(redis.mgets) == 1, "one MGET for every part Postgres had no owner for"
+    assert len(redis.mgets[0]) == 3
+
+
+@pytest.mark.asyncio
+async def test_locate_many_asks_for_hints_only_where_postgres_had_no_owner() -> None:
+    reader = await _two_registered_peers()
+    redis = reader._redis
+    pool = FakePool(rows=[part_row(201, "node-b")])
+    fetcher = PeerChunkFetcher(pool, reader, "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    await fetcher.locate_many(OBJ, 1, [201, 202])
+
+    assert redis.mgets == [[fresh_part_key(OBJ, 1, 202)]], "the resolved part needs no hint"
+
+
+@pytest.mark.asyncio
+async def test_locate_many_bounds_the_statement_for_a_ten_thousand_part_object() -> None:
+    """S3 allows 10,000 parts and a cold read of one misses on all of them at once.
+
+    Batched, but in bounded statements: the LATERAL that fetches per-chunk sizes runs once per
+    resolved part, so a single query carrying the whole set is one unbounded statement in front
+    of the first byte, holding a pool connection nothing else can use meanwhile.
+    """
+    pool = FakePool(rows=[])
+    fetcher = PeerChunkFetcher(pool, await _two_registered_peers(), "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    located = await fetcher.locate_many(OBJ, 1, list(range(1, 10_001)))
+
+    assert len(located) == 10_000
+    assert all(v == (None, False) for v in located.values())
+    sent = [args[2] for args in pool.conn.fetches]
+    assert max(len(batch) for batch in sent) <= 512, "no statement carries more than the batch size"
+    assert sorted(pn for batch in sent for pn in batch) == list(range(1, 10_001)), "and every part is asked once"
+
+
+@pytest.mark.asyncio
+async def test_an_owner_query_that_raises_memoises_nothing() -> None:
+    """`locate_many` raises exactly like `locate` does; the dual store is what contains it.
+
+    What must NOT happen is a half-written memo: a part left recorded as ownerless by a failed
+    query would keep the peer tier dark for the negative TTL for reasons that never applied.
+    """
+
+    class _BrokenPool(FakePool):
+        def acquire(self) -> Any:
+            class _Ctx:
+                async def __aenter__(self) -> Any:
+                    class _Conn:
+                        async def fetch(self, *_: Any) -> list[dict[str, Any]]:
+                            raise ConnectionError("postgres down")
+
+                    return _Conn()
+
+                async def __aexit__(self, *_: object) -> None:
+                    return None
+
+            return _Ctx()
+
+    fetcher = PeerChunkFetcher(
+        _BrokenPool(), await _two_registered_peers(), "node-a", FakeHttp(200), auth_secret=SECRET
+    )
+
+    with pytest.raises(ConnectionError):
+        await fetcher.locate_many(OBJ, 1, [201, 202])
+
+    assert fetcher.last_owner(OBJ, 1, 201) is None
+    assert fetcher.last_owner(OBJ, 1, 202) is None
+
+
+@pytest.mark.asyncio
+async def test_locate_many_reports_no_owner_when_redis_is_down_behind_the_hints() -> None:
+    """A hint lookup is best-effort in the single-part path, and stays so batched."""
+    reader = await _two_registered_peers()
+    reader._redis.fail = True
+    pool = FakePool(rows=[])
+    fetcher = PeerChunkFetcher(pool, reader, "node-a", FakeHttp(200), auth_secret=SECRET)
+
+    assert await fetcher.locate_many(OBJ, 1, [201]) == {201: (None, False)}

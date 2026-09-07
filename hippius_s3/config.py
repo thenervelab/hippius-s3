@@ -451,6 +451,15 @@ class Config:
     # evictor only frees back to its target and could never restore enough for promotion to
     # resume. See FreeSpaceGate and test_promotion_pressure_guard.py.
     promote_min_free_ratio: float = env("HIPPIUS_PROMOTE_MIN_FREE_RATIO:0.175", convert=float)
+    # Highest multipart part number a read will promote onto local flash; 0 disables the cap.
+    # MUST EQUAL haproxy's part-spread threshold N: the edge keeps every request for a key —
+    # UploadPart for partNumber <= N included — on the key's node and spreads partNumber > N
+    # across the ingest nodes. A read of a spread object lands on the key node and
+    # peer-fetches the tail parts from their owners; promoting those would copy the whole
+    # tail of every large object onto the node that already holds its head, which is exactly
+    # what the spread exists to avoid. Parts <= N are ingested on the key node, so promoting
+    # them only ever repairs a misplaced object.
+    promote_max_part_number: int = env("HIPPIUS_PROMOTE_MAX_PART_NUMBER:200", convert=int)
     # Read a chunk from the peer node that holds it on flash (~6 ms + ~1 ms network) before
     # falling through to the CephFS pool (~40 ms). Resolved per PART: only ~2% of multi-part
     # objects have every part on one node, so there is no single node to route a request to.
