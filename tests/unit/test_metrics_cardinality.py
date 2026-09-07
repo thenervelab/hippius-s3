@@ -62,6 +62,9 @@ BOUNDED_LABELS = {
     # BillingBypassSurface Literal and passed from exactly two call sites. The account itself
     # is deliberately NOT a label here — see record_billing_bypass.
     "surface",
+    # Who wrote the bytes on an exempted upload: "owner" | "guest", the BillingBypassWriter
+    # Literal. Derived from a persisted boolean, never from a caller-supplied value.
+    "writer",
 }
 
 

@@ -44,16 +44,27 @@ silently demoting an internal account back to billed. Keyed only on the VERIFIED
 never on a header, and never on the bucket owner — the gate bills the caller. Reads set the flag
 but change nothing else.
 
-**The two identities.** The worker-side bypass (the `X-Billing-Bypass` header to Arion, in
-[hippius_s3/workers/uploader.py](../../workers/uploader.py)) charges `object_versions.address` —
-the BUCKET OWNER, not the writer. So it requires **both** halves before exempting: the persisted
-`object_versions.billing_bypass` (this middleware's verdict on the verified CALLER, written
-through `set_object_version_address`) **and** the owner being allowlisted. Either half alone is a
-hole: owner-only would exempt a third party writing into a service account's bucket via a WRITE
-grant; caller-only would bill a stranger's storage to nobody. The caller cannot be recomputed in
-the worker — since drain-direct the API does not build the `UploadChainRequest`, the Rust
-drain-agent does — which is why the verdict is persisted rather than derived. Legacy rows default
-`FALSE`, so anything predating the column is billed.
+**The two identities — and why the worker keys on the other one.** The worker-side bypass (the
+`X-Billing-Bypass` header to Arion, in [hippius_s3/workers/uploader.py](../../workers/uploader.py))
+follows `object_versions.address`, the BUCKET OWNER — because Arion charges `account_ss58` = the
+owner for storage in their bucket whoever wrote the bytes. That is **owner-pays**, and it is
+deliberate: on a shared bucket the owner funds their guests' writes. When the owner is one of ours
+we simply do not bill ourselves, so the exemption follows the owner and nothing else.
+
+It is NOT also gated on the writer, and that is load-bearing. Billing a guest for a write into our
+bucket was never available — Arion bills the owner either way — so gating on the writer would not
+move the cost, it would 402 the upload (`is_billing_error` → `"billing"` → permanent → DLQ) against
+a service account that by definition carries no credit. That breaks shared buckets to protect
+nothing.
+
+`object_versions.billing_bypass` (this middleware's verdict on the verified CALLER, written through
+`set_object_version_address`) is therefore **observability, not authorization**: it is the only way
+to tell an unmetered upload we made ourselves from one a guest made into our bucket, since the
+caller cannot be recomputed in the worker — drain-direct means the Rust drain-agent builds the
+`UploadChainRequest`, not the API. It labels `billing_bypass_total{writer=owner|guest}` and raises a
+WARNING on `guest`. A `guest` sample is legitimate but only reachable through a WRITE grant on a
+service-account bucket, so it is the thing to alert on. Pre-migration rows read `FALSE` and so label
+`guest` — the conservative direction for a signal, not a gate.
 
 ### [trailing_slash.py](trailing_slash.py) — `trailing_slash_normalizer`
 

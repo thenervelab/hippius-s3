@@ -98,44 +98,72 @@ async def test_service_account_upload_carries_the_bypass_header(mock_db_pool: An
 
 
 @pytest.mark.asyncio
-async def test_third_party_write_into_a_service_account_bucket_is_billed() -> None:
-    """THE laundering case. `payload.address` is the bucket OWNER, so a regular user holding a
-    WRITE grant on a service-account bucket (a public-read-write ACL, or an explicit grant)
-    produces an upload whose address is on the allowlist but whose writer is not. Keying on the
-    address alone would hand that user unmetered storage at our expense; the persisted
-    caller verdict is what refuses it.
+async def test_guest_write_into_a_service_account_bucket_still_succeeds_unmetered() -> None:
+    """Shared buckets. A guest holding a WRITE grant on a service-account bucket produces an
+    upload whose address is on the allowlist but whose writer is not.
+
+    It must still be exempted. Arion charges `account_ss58` = the bucket OWNER whoever wrote the
+    bytes, so refusing the exemption here would not shift a cent onto the guest — it would 402
+    against a service account that carries no credit, classify "billing" (permanent), and strand
+    the upload in the DLQ. Owner-pays means the owner pays; the owner is us.
     """
     headers = await _headers_for(
         _config(allowlist=frozenset({SERVICE_ACCOUNT})),
         _payload(SERVICE_ACCOUNT),  # bucket owner IS the service account
-        _pool(caller_was_exempt=False),  # but the api recorded a non-exempt writer
+        _pool(caller_was_exempt=False),  # written by someone else
     )
 
-    assert headers is None
+    assert headers == {"X-Billing-Bypass": BYPASS_KEY}
+
+
+@pytest.mark.asyncio
+async def test_guest_write_is_flagged_for_alerting(caplog: Any, monkeypatch: Any) -> None:
+    """Legitimate but worth seeing: only a WRITE grant on one of our buckets makes it possible,
+    so it must never be silent. Labelled on the metric and warned in the log."""
+    from hippius_s3.workers import uploader as uploader_mod
+
+    collector = MagicMock()
+    monkeypatch.setattr(uploader_mod, "get_metrics_collector", lambda: collector)
+
+    with caplog.at_level("WARNING"):
+        await _headers_for(
+            _config(allowlist=frozenset({SERVICE_ACCOUNT})),
+            _payload(SERVICE_ACCOUNT),
+            _pool(caller_was_exempt=False),
+        )
+
+    collector.record_billing_bypass.assert_called_once_with(surface="uploader", writer="guest")
+    assert any("guest write into a service-account bucket" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_our_own_ingest_is_not_flagged_as_a_guest_write(caplog: Any, monkeypatch: Any) -> None:
+    """The ordinary case must not trip the alert, or the signal is worthless."""
+    from hippius_s3.workers import uploader as uploader_mod
+
+    collector = MagicMock()
+    monkeypatch.setattr(uploader_mod, "get_metrics_collector", lambda: collector)
+
+    with caplog.at_level("WARNING"):
+        await _headers_for(
+            _config(allowlist=frozenset({SERVICE_ACCOUNT})),
+            _payload(SERVICE_ACCOUNT),
+            _pool(caller_was_exempt=True),
+        )
+
+    collector.record_billing_bypass.assert_called_once_with(surface="uploader", writer="owner")
+    assert not any("guest write" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
 async def test_service_account_writing_into_someone_elses_bucket_is_billed() -> None:
-    """The mirror case: our service account writes into a regular user's bucket. The storage
-    attributes to — and is charged to — that user, so it must stay billed. Keying on the caller
-    alone would move a stranger's storage cost onto nobody."""
+    """The mirror case, and the one owner-pays settles the other way: our service account writes
+    into a regular user's bucket. The storage attributes to — and is charged to — that user, so
+    it must stay billed. The exemption follows the owner, and the owner here is not us."""
     headers = await _headers_for(
         _config(allowlist=frozenset({SERVICE_ACCOUNT})),
         _payload(REGULAR_ACCOUNT),  # bucket owner is a regular user
         _pool(caller_was_exempt=True),  # writer was the service account
-    )
-
-    assert headers is None
-
-
-@pytest.mark.asyncio
-async def test_legacy_version_predating_the_column_is_billed() -> None:
-    """Rows written before the migration read FALSE. Fail-closed: an object whose writer we
-    cannot establish is billed, never exempted."""
-    headers = await _headers_for(
-        _config(allowlist=frozenset({SERVICE_ACCOUNT})),
-        _payload(SERVICE_ACCOUNT),
-        _pool(caller_was_exempt=False),
     )
 
     assert headers is None
@@ -248,7 +276,7 @@ async def test_bypass_is_recorded_and_logged(mock_db_pool: Any, caplog: Any, mon
             mock_db_pool,
         )
 
-    collector.record_billing_bypass.assert_called_once_with(surface="uploader")
+    collector.record_billing_bypass.assert_called_once_with(surface="uploader", writer="owner")
     assert any("BILLING_BYPASS surface=uploader" in r.message for r in caplog.records)
 
 

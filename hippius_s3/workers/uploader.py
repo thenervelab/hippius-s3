@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from hippius_s3.cache import RedisObjectPartsCache
 from hippius_s3.cache import create_fs_store
 from hippius_s3.dlq.upload_dlq import UploadDLQManager
+from hippius_s3.monitoring import BillingBypassWriter
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
@@ -154,34 +155,47 @@ class Uploader:
                 f"Processing upload backend={self.backend_name} object_id={payload.object_id} chunks={len(payload.chunks)}"
             )
 
-            # The exemption needs BOTH identities to be a service account, because the two differ:
+            # Keyed on payload.address — the storage-attribution account, i.e. the BUCKET OWNER,
+            # which is the `account_ss58` Arion actually charges for this upload. That is the
+            # owner-pays model working as designed: storage in a bucket is billed to whoever owns
+            # the bucket, whoever wrote the bytes. When the owner is one of ours we do not bill
+            # ourselves, so the exemption follows the owner and nothing else.
             #
-            #   caller_was_exempt  — persisted by the api from the VERIFIED CALLER (the account
-            #                        that signed the request). Cannot be recomputed here: since
-            #                        drain-direct the api does not build the UploadChainRequest,
-            #                        the Rust drain-agent does, so nothing on the payload carries
-            #                        the caller. FALSE for every pre-migration row.
-            #   payload.address    — the storage-attribution account (the BUCKET OWNER), which is
-            #                        who Arion actually charges for this upload.
+            # Deliberately NOT also gated on the writer. Billing a guest for a write into our
+            # bucket was never an option — Arion charges the owner either way — so gating on the
+            # writer would not shift the cost, it would just 402 the upload into the DLQ
+            # (is_billing_error -> "billing" -> permanent) against a service account that by
+            # definition carries no credit. That breaks shared buckets rather than protecting
+            # anything.
             #
-            # Requiring only the address would exempt anything written INTO a service account's
-            # bucket, including by a third party holding a WRITE grant on it. Requiring only the
-            # caller would exempt a service account's writes into someone else's bucket, billing
-            # that owner's storage to nobody. Neither is what "our own data, on our own tab" means.
+            # `caller_was_exempt` (persisted by the api from the VERIFIED CALLER; FALSE for every
+            # pre-migration row) is therefore observability, not authorization: it is the only way
+            # to tell an unmetered upload we made ourselves from one a guest made into our bucket.
+            # The latter is worth alerting on — a permissive ACL on a service-account bucket is
+            # what makes it possible — but it must not fail the upload.
             #
-            # payload.bypass_billing stays a standalone escape: it is the operator path
+            # payload.bypass_billing stays a standalone escape: the operator path
             # (dlq_requeue --bypass-billing), set by a human re-driving 402-failed uploads.
             extra_headers: dict[str, str] | None = None
-            bypass_billing = payload.bypass_billing or (
-                bool(caller_was_exempt) and is_service_account(payload.address, self.config.service_account_ids)
-            )
+            owner_is_service_account = is_service_account(payload.address, self.config.service_account_ids)
+            bypass_billing = payload.bypass_billing or owner_is_service_account
+            writer: BillingBypassWriter = "owner" if caller_was_exempt else "guest"
             if bypass_billing and self.config.arion_billing_bypass_key:
                 extra_headers = {"X-Billing-Bypass": self.config.arion_billing_bypass_key}
                 logger.info(
-                    f"BILLING_BYPASS surface=uploader account={payload.address} "
+                    f"BILLING_BYPASS surface=uploader writer={writer} account={payload.address} "
                     f"object_id={payload.object_id} version={payload.object_version}"
                 )
-                get_metrics_collector().record_billing_bypass(surface="uploader")
+                if owner_is_service_account and writer == "guest":
+                    # Not an error — the owner pays, and the owner is us. But it means someone
+                    # else's bytes landed unmetered in our bucket, which only a WRITE grant on a
+                    # service-account bucket allows. Surfaced so it is never invisible.
+                    logger.warning(
+                        f"BILLING_BYPASS guest write into a service-account bucket: "
+                        f"owner={payload.address} object_id={payload.object_id} "
+                        f"version={payload.object_version}"
+                    )
+                get_metrics_collector().record_billing_bypass(surface="uploader", writer=writer)
             elif bypass_billing:
                 # Without this the upload silently bills the account, 402s, and lands in the DLQ
                 # classified as "billing" with nothing pointing at the missing key.

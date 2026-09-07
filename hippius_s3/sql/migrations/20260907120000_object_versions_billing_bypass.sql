@@ -1,12 +1,16 @@
 -- migrate:up
 -- Records, per version, that the VERIFIED CALLER who wrote it was a service account.
 --
--- The uploader charges `object_versions.address`, which is the storage-attribution account — the
--- BUCKET OWNER, not the writer. Deriving the billing exemption from that address alone would
--- exempt anything written into a service-account-owned bucket, including by a third party holding
--- a WRITE grant on it. The gateway's decision is made from the authenticated caller and cannot be
--- reconstructed in the worker (since drain-direct the API does not build the UploadChainRequest —
--- the Rust drain-agent does), so it is persisted here instead.
+-- OBSERVABILITY, NOT AUTHORIZATION. The billing exemption itself follows `address` (the bucket
+-- owner), because Arion charges the owner for storage in their bucket whoever wrote the bytes —
+-- owner-pays. What that leaves invisible is WHICH unmetered uploads into our own buckets we made
+-- ourselves and which a guest made through a WRITE grant. This column is the only thing that can
+-- tell them apart: the caller's identity cannot be reconstructed in the worker, because since
+-- drain-direct the API does not build the UploadChainRequest — the Rust drain-agent does.
+--
+-- Deliberately not used to gate the upload. Refusing the exemption for a guest write would not
+-- move the cost (Arion bills the owner regardless), it would 402 the upload into the DLQ against
+-- a service account that carries no credit — breaking shared buckets to protect nothing.
 --
 -- ONLINE SAFETY: `object_versions` is ~152M rows / ~79 GB in production and migrations run on
 -- deploy against the live primary. ADD COLUMN with a non-volatile DEFAULT has not rewritten the
