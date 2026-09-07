@@ -174,6 +174,7 @@ async def handle_append(
             object_version=int(object_version),
             address=request.state.main_account_id,
             only_if_null=True,  # AP-2: no-op when already set; only fills a legacy NULL row
+            billing_bypass=getattr(request.state, "service_account", False) is True,
         )
         with contextlib.suppress(Exception):
             logger.info(

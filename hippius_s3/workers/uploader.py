@@ -136,6 +136,11 @@ class Uploader:
                     payload.object_id,
                     payload.object_version,
                 )
+                caller_was_exempt = await conn.fetchval(
+                    get_query("get_object_version_billing_bypass"),
+                    payload.object_id,
+                    payload.object_version,
+                )
             if is_deleted:
                 logger.info(
                     f"Skipping upload for deleted object/version: backend={self.backend_name} "
@@ -149,17 +154,26 @@ class Uploader:
                 f"Processing upload backend={self.backend_name} object_id={payload.object_id} chunks={len(payload.chunks)}"
             )
 
-            # payload.address is the STORAGE-ATTRIBUTION account (the bucket owner, written by
-            # set_object_version_address) — which is exactly who Arion charges for this upload,
-            # so it is the right identity to test against the allowlist here.
+            # The exemption needs BOTH identities to be a service account, because the two differ:
             #
-            # Derived from the payload rather than carried on it because since the drain-direct
-            # cutover the API no longer enqueues UploadChainRequest at all: the Rust drain-agent
-            # builds and LPUSHes it. A flag set by the API would never reach this worker. The
-            # explicit payload.bypass_billing flag remains the operator path (dlq_requeue).
+            #   caller_was_exempt  — persisted by the api from the VERIFIED CALLER (the account
+            #                        that signed the request). Cannot be recomputed here: since
+            #                        drain-direct the api does not build the UploadChainRequest,
+            #                        the Rust drain-agent does, so nothing on the payload carries
+            #                        the caller. FALSE for every pre-migration row.
+            #   payload.address    — the storage-attribution account (the BUCKET OWNER), which is
+            #                        who Arion actually charges for this upload.
+            #
+            # Requiring only the address would exempt anything written INTO a service account's
+            # bucket, including by a third party holding a WRITE grant on it. Requiring only the
+            # caller would exempt a service account's writes into someone else's bucket, billing
+            # that owner's storage to nobody. Neither is what "our own data, on our own tab" means.
+            #
+            # payload.bypass_billing stays a standalone escape: it is the operator path
+            # (dlq_requeue --bypass-billing), set by a human re-driving 402-failed uploads.
             extra_headers: dict[str, str] | None = None
-            bypass_billing = payload.bypass_billing or is_service_account(
-                payload.address, self.config.service_account_ids
+            bypass_billing = payload.bypass_billing or (
+                bool(caller_was_exempt) and is_service_account(payload.address, self.config.service_account_ids)
             )
             if bypass_billing and self.config.arion_billing_bypass_key:
                 extra_headers = {"X-Billing-Bypass": self.config.arion_billing_bypass_key}

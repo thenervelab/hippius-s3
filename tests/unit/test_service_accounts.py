@@ -66,6 +66,26 @@ def test_invalid_entry_raises_rather_than_being_dropped(bad: str) -> None:
         _parse_service_accounts(bad)
 
 
+def test_rejects_the_right_key_under_the_wrong_network_prefix() -> None:
+    """The likeliest real mistake, and the one a bare is_valid_ss58_address does NOT catch: the
+    correct public key encoded with a non-Hippius prefix. It is a valid SS58 address, so a
+    format-agnostic check passes it, the pod boots, the address appears in the startup line — and
+    then never matches account_address, which is derived at format 42. Silent billing.
+    """
+    from substrateinterface.utils.ss58 import ss58_decode
+    from substrateinterface.utils.ss58 import ss58_encode
+
+    public_key = ss58_decode(ALICE)
+    for wrong_format in (0, 2, 137):
+        wrong = ss58_encode(public_key, wrong_format)
+        assert wrong != ALICE
+        with pytest.raises(ValueError, match="invalid SS58"):
+            _parse_service_accounts(wrong)
+
+    # sanity: the same key at the Hippius format is accepted
+    assert _parse_service_accounts(ss58_encode(public_key, 42)) == frozenset({ALICE})
+
+
 def test_one_bad_entry_rejects_the_whole_list() -> None:
     """No partial application: half an allowlist is a silently wrong allowlist."""
     with pytest.raises(ValueError):

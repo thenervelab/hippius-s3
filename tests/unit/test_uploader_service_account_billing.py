@@ -1,9 +1,14 @@
 """Uploader-side billing bypass for service accounts.
 
-Since the drain-direct cutover the API no longer enqueues UploadChainRequest — the Rust
-drain-agent builds and LPUSHes it — so a flag set on the request path can never reach this
-worker. The uploader therefore derives the exemption from payload.address, which is the
-storage-attribution account (the bucket owner) and exactly who Arion charges.
+The exemption requires BOTH identities, which differ:
+
+  - the VERIFIED CALLER, persisted by the api as `object_versions.billing_bypass` and read back
+    here (it cannot be recomputed — since drain-direct the Rust drain-agent builds the
+    UploadChainRequest, so nothing on the payload carries the caller);
+  - the BUCKET OWNER, `payload.address`, who is who Arion actually charges.
+
+Requiring only the owner would exempt a third party writing into a service account's bucket.
+Requiring only the caller would bill a stranger's storage to nobody. Both halves, or billed.
 """
 
 from typing import Any
@@ -24,13 +29,19 @@ REGULAR_ACCOUNT = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 BYPASS_KEY = "secret-bypass-key"
 
 
-@pytest.fixture  # type: ignore[misc]
-def mock_db_pool() -> Any:
+def _pool(*, caller_was_exempt: bool) -> Any:
+    """Uploader pool whose two fetchvals answer is_object_deleted then billing_bypass, in order."""
     pool = MagicMock()
     conn = AsyncMock()
-    conn.fetchval = AsyncMock(return_value=False)  # object is not deleted
+    conn.fetchval = AsyncMock(side_effect=[False, caller_was_exempt])
     pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=conn)))
     return pool
+
+
+@pytest.fixture  # type: ignore[misc]
+def mock_db_pool() -> Any:
+    """The ordinary case: the api recorded that the writer was a service account."""
+    return _pool(caller_was_exempt=True)
 
 
 def _config(*, allowlist: frozenset[str], bypass_key: str = BYPASS_KEY) -> Any:
@@ -75,8 +86,8 @@ async def _headers_for(config: Any, payload: UploadChainRequest, db_pool: Any) -
 
 @pytest.mark.asyncio
 async def test_service_account_upload_carries_the_bypass_header(mock_db_pool: Any) -> None:
-    """No bypass_billing flag on the payload — the drain never sets one. The exemption has to
-    come from the address alone or the feature does not work in production at all."""
+    """No bypass_billing flag on the payload — the drain never sets one. Caller (from the DB)
+    and owner (from the payload) are both the service account, which is the ordinary case."""
     headers = await _headers_for(
         _config(allowlist=frozenset({SERVICE_ACCOUNT})),
         _payload(SERVICE_ACCOUNT),
@@ -84,6 +95,50 @@ async def test_service_account_upload_carries_the_bypass_header(mock_db_pool: An
     )
 
     assert headers == {"X-Billing-Bypass": BYPASS_KEY}
+
+
+@pytest.mark.asyncio
+async def test_third_party_write_into_a_service_account_bucket_is_billed() -> None:
+    """THE laundering case. `payload.address` is the bucket OWNER, so a regular user holding a
+    WRITE grant on a service-account bucket (a public-read-write ACL, or an explicit grant)
+    produces an upload whose address is on the allowlist but whose writer is not. Keying on the
+    address alone would hand that user unmetered storage at our expense; the persisted
+    caller verdict is what refuses it.
+    """
+    headers = await _headers_for(
+        _config(allowlist=frozenset({SERVICE_ACCOUNT})),
+        _payload(SERVICE_ACCOUNT),  # bucket owner IS the service account
+        _pool(caller_was_exempt=False),  # but the api recorded a non-exempt writer
+    )
+
+    assert headers is None
+
+
+@pytest.mark.asyncio
+async def test_service_account_writing_into_someone_elses_bucket_is_billed() -> None:
+    """The mirror case: our service account writes into a regular user's bucket. The storage
+    attributes to — and is charged to — that user, so it must stay billed. Keying on the caller
+    alone would move a stranger's storage cost onto nobody."""
+    headers = await _headers_for(
+        _config(allowlist=frozenset({SERVICE_ACCOUNT})),
+        _payload(REGULAR_ACCOUNT),  # bucket owner is a regular user
+        _pool(caller_was_exempt=True),  # writer was the service account
+    )
+
+    assert headers is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_version_predating_the_column_is_billed() -> None:
+    """Rows written before the migration read FALSE. Fail-closed: an object whose writer we
+    cannot establish is billed, never exempted."""
+    headers = await _headers_for(
+        _config(allowlist=frozenset({SERVICE_ACCOUNT})),
+        _payload(SERVICE_ACCOUNT),
+        _pool(caller_was_exempt=False),
+    )
+
+    assert headers is None
 
 
 @pytest.mark.asyncio
@@ -109,13 +164,14 @@ async def test_empty_allowlist_bills_everyone(mock_db_pool: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_operator_bypass_flag_still_works_for_an_unlisted_account(mock_db_pool: Any) -> None:
+async def test_operator_bypass_flag_still_works_for_an_unlisted_account() -> None:
     """dlq_requeue --bypass-billing is the recovery path for 402-failed uploads on ordinary
-    accounts. Deriving the exemption from the address must not have replaced it."""
+    accounts, set by a human. It is a standalone escape and must survive the two-sided check —
+    neither identity here is a service account."""
     headers = await _headers_for(
         _config(allowlist=frozenset({SERVICE_ACCOUNT})),
         _payload(REGULAR_ACCOUNT, bypass_billing=True),
-        mock_db_pool,
+        _pool(caller_was_exempt=False),
     )
 
     assert headers == {"X-Billing-Bypass": BYPASS_KEY}

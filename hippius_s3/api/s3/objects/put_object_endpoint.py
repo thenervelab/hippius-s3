@@ -237,6 +237,7 @@ async def handle_put_object(
                     object_id=str(put_res.object_id),
                     object_version=int(put_res.object_version),
                     address=request.state.main_account_id,
+                    billing_bypass=getattr(request.state, "service_account", False) is True,
                 )
             except Exception:
                 # B4: the version was made serveable (size/md5 written) BEFORE the drain address

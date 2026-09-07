@@ -33,6 +33,11 @@ def _parse_backends(value: str | None, default: str = "arion") -> list[str]:
     return [b.strip() for b in value.split(",") if b.strip()]
 
 
+# The Hippius network's SS58 prefix — the format cacher/run_cacher.py derives account addresses
+# in, and so the only encoding an account_address is ever compared against.
+HIPPIUS_SS58_FORMAT = 42
+
+
 def _parse_service_accounts(value: str | None) -> frozenset[str]:
     """Parse the comma-separated HIPPIUS_SERVICE_ACCOUNT_IDS allowlist into SS58 addresses.
 
@@ -42,6 +47,11 @@ def _parse_service_accounts(value: str | None) -> frozenset[str]:
     fail-closed: nothing bypasses billing unless it was spelled correctly.
 
     SS58 is base58 and case-sensitive; entries are never normalised.
+
+    The network prefix is pinned to 42 (the format the account cacher derives addresses in, and
+    therefore the only form account_address ever takes). Without it the check passes for the SAME
+    public key encoded under any other prefix — the likeliest real mistake, and one that is
+    invisible: the pod boots, logs the address in its startup line, and then never matches.
     """
     from substrateinterface.utils.ss58 import is_valid_ss58_address
 
@@ -50,8 +60,11 @@ def _parse_service_accounts(value: str | None) -> frozenset[str]:
         candidate = part.strip().strip('"').strip("'")
         if not candidate:
             continue
-        if not is_valid_ss58_address(candidate):
-            raise ValueError(f"HIPPIUS_SERVICE_ACCOUNT_IDS contains an invalid SS58 address: {candidate!r}")
+        if not is_valid_ss58_address(candidate, valid_ss58_format=HIPPIUS_SS58_FORMAT):
+            raise ValueError(
+                f"HIPPIUS_SERVICE_ACCOUNT_IDS contains an invalid SS58 address "
+                f"(must be network format {HIPPIUS_SS58_FORMAT}): {candidate!r}"
+            )
         accounts.add(candidate)
     return frozenset(accounts)
 

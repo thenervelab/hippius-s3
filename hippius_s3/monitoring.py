@@ -75,9 +75,13 @@ LandedAnnounceOutcome = Literal["timeout", "error"]
 # `local`/`recovered` rate is a poisoner planting bad bytes on this node — the pool copy is fine.
 # Anything `unrecovered` survived a tier change, so it is a key or object fault, not local
 # corruption; the two must stay distinguishable or a DEK fault reads like cache poisoning.
-BillingBypassSurface = Literal["gateway", "uploader"]
 AeadFailureTier = Literal["local", "remote"]
 AeadFailureOutcome = Literal["recovered", "unrecovered"]
+
+# Which of the two billing gates a service account skipped: the request-path credit/can_upload
+# check, or the worker's charge to Arion. They are decided independently and can disagree during
+# a rolling deploy, so the counter must keep them apart.
+BillingBypassSurface = Literal["gateway", "uploader"]
 
 
 class MetricsCollector:
@@ -185,8 +189,11 @@ class MetricsCollector:
         # firing more than our own workloads explain. Deliberately NOT labelled by account: the
         # allowlist would bound the cardinality today, but the VALUE would come from a request,
         # so cardinality would silently ride on the bypass predicate staying tight. Per-account
-        # attribution lives in the BILLING_BYPASS log line and the audit log's service_account
-        # field, which is where an auditor looks and which costs no series.
+        # attribution lives in the BILLING_BYPASS log lines, which are the only record of what was
+        # actually not charged for. (The audit log's service_account field answers a DIFFERENT
+        # question — "was the caller a service account" — which is true for reads too, where
+        # nothing is bypassed, and absent for uploader-surface bypasses, which produce no audit
+        # line. Do not use it to count exemptions.)
         self.billing_bypass_total = self.meter.create_counter(
             name="billing_bypass_total",
             description="Billing gates skipped for service accounts, by surface (gateway|uploader)",

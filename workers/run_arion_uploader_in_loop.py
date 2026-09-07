@@ -137,6 +137,10 @@ async def run_arion_uploader_loop():
             f"accounts={','.join(sorted(config.service_account_ids))} "
             f"bypass_key_set={bool(config.arion_billing_bypass_key)}"
         )
+    else:
+        # Logged rather than left silent: the empty case is exactly the one you are looking for
+        # mid-rollout, and no line at all is indistinguishable from a pre-feature build.
+        logger.info("No service accounts configured; all uploads are billed")
 
     # Periodic retry-mover — one per pod, off the per-request hot path (running it
     # per dequeue across N concurrent workers would multiply Redis load).

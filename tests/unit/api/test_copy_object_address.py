@@ -93,10 +93,13 @@ async def test_streaming_copy_persists_dest_address_then_completes_upload(
 
     captured: dict[str, Any] = {}
 
-    async def fake_set_address(_db: Any, *, object_id: str, object_version: int, address: str) -> None:
+    async def fake_set_address(
+        _db: Any, *, object_id: str, object_version: int, address: str, billing_bypass: bool = False
+    ) -> None:
         captured["object_id"] = object_id
         captured["object_version"] = object_version
         captured["address"] = address
+        captured["billing_bypass"] = billing_bypass
         captured["completed_before_address"] = _completed_queries(pool)
 
     monkeypatch.setattr(copy_helpers, "set_object_version_address", fake_set_address)

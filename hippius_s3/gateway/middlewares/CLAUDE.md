@@ -41,11 +41,19 @@ redis-accounts credit fetch and Arion `can_upload` — and gets `request.state.s
 for the audit log. The predicate is [services/service_accounts.py](../../services/service_accounts.py);
 the allowlist is parsed and SS58-validated at config time, so a typo fails startup rather than
 silently demoting an internal account back to billed. Keyed only on the VERIFIED `account_address`,
-never on a header, and never on the bucket owner — the gate bills the caller, so writing into a
-service account's bucket does not launder a regular user's upload. Reads set the flag but change
-nothing else. The matching worker-side bypass (the `X-Billing-Bypass` header to Arion) lives in
-[hippius_s3/workers/uploader.py](../../workers/uploader.py) and is derived from `payload.address`,
-because since drain-direct the API no longer enqueues the upload request at all.
+never on a header, and never on the bucket owner — the gate bills the caller. Reads set the flag
+but change nothing else.
+
+**The two identities.** The worker-side bypass (the `X-Billing-Bypass` header to Arion, in
+[hippius_s3/workers/uploader.py](../../workers/uploader.py)) charges `object_versions.address` —
+the BUCKET OWNER, not the writer. So it requires **both** halves before exempting: the persisted
+`object_versions.billing_bypass` (this middleware's verdict on the verified CALLER, written
+through `set_object_version_address`) **and** the owner being allowlisted. Either half alone is a
+hole: owner-only would exempt a third party writing into a service account's bucket via a WRITE
+grant; caller-only would bill a stranger's storage to nobody. The caller cannot be recomputed in
+the worker — since drain-direct the API does not build the `UploadChainRequest`, the Rust
+drain-agent does — which is why the verdict is persisted rather than derived. Legacy rows default
+`FALSE`, so anything predating the column is billed.
 
 ### [trailing_slash.py](trailing_slash.py) — `trailing_slash_normalizer`
 
