@@ -57,6 +57,17 @@ move the cost, it would 402 the upload (`is_billing_error` → `"billing"` → p
 a service account that by definition carries no credit. That breaks shared buckets to protect
 nothing.
 
+**Nobody but the owner writes to a service-account bucket.** Enforced in two places, and the
+evaluation-time one is the control: [acl_service.py](../services/acl_service.py) `check_permission`
+refuses WRITE / WRITE_ACP on any bucket whose owner is allowlisted, after the owner match and
+before the grant loop. That makes the ban retroactive over grants that already exist and total over
+any path that reaches the acl tables another way. The write-time refusals (`?acl` bucket/object,
+`x-amz-acl` on CreateBucket, canned object ACLs) are the loud half — without them the write
+succeeds, a later `GET ?acl` reports a grant that does nothing, and the operator believes they
+configured something they did not. READ and READ_ACP are untouched: publishing our own datasets
+publicly is the point of several of these buckets. The predicate is `forbidden_write_grants` in
+[services/service_accounts.py](../../services/service_accounts.py).
+
 `object_versions.billing_bypass` (this middleware's verdict on the verified CALLER, written through
 `set_object_version_address`) is therefore **observability, not authorization**: it is the only way
 to tell an unmetered upload we made ourselves from one a guest made into our bucket, since the

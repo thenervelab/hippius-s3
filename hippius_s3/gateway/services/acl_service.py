@@ -7,6 +7,7 @@ import redis.asyncio as redis
 from pydantic import BaseModel
 from redis.exceptions import RedisError
 
+from hippius_s3.config import get_config
 from hippius_s3.gateway.repositories.cached_acl_repository import CachedACLRepository
 from hippius_s3.gateway.utils.accounts import is_sentinel_account_id
 from hippius_s3.models.acl import ACL
@@ -15,6 +16,8 @@ from hippius_s3.models.acl import GranteeType
 from hippius_s3.models.acl import Permission
 from hippius_s3.models.acl import WellKnownGroups
 from hippius_s3.repositories.acl_repository import ACLRepository
+from hippius_s3.services.service_accounts import WRITE_PERMISSIONS
+from hippius_s3.services.service_accounts import is_service_account
 
 
 logger = logging.getLogger(__name__)
@@ -232,6 +235,24 @@ class ACLService:
                 f"grants={len(acl.grants)}{grants_summary}, result=GRANTED (owner match)"
             )
             return True
+
+        # Nobody but the owner writes to a service account's bucket — enforced HERE, at
+        # evaluation, not only where ACLs are written. A write-time check alone would leave every
+        # grant that already exists live, and would miss any path that reaches the acl tables
+        # another way (a direct DB write, a future endpoint, a restored backup). Refusing at the
+        # point of use makes the ban retroactive and total: the grant may sit in the table, it is
+        # simply never honoured.
+        #
+        # Placed after the owner match so the service account itself is unaffected, and scoped to
+        # write permissions so public READ of our own datasets keeps working.
+        if permission in WRITE_PERMISSIONS and is_service_account(acl.owner.id, get_config().service_account_ids):
+            logger.warning(
+                f"ACL check: account={account_id}, access_key={access_key or 'None'}, bucket={bucket}, "
+                f"key={key or 'None'}, required_perm={permission.value}, owner={acl.owner.id}, "
+                f"grants={len(acl.grants)}{grants_summary}, "
+                f"result=DENIED (write to a service-account bucket is never granted)"
+            )
+            return False
 
         for grant in acl.grants:
             if self._grant_matches(grant, account_id, access_key) and self._permission_implies(
