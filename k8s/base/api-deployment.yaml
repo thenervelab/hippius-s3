@@ -89,6 +89,15 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: ARION_BEARER_TOKEN
+            # optional so a secret that predates this key cannot wedge the rollout. Absent
+            # resolves to an empty allowlist, which is the fail-closed direction: every
+            # account gets billed.
+            - name: HIPPIUS_SERVICE_ACCOUNT_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_ACCOUNT_IDS
+                  optional: true
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:

@@ -33,6 +33,29 @@ def _parse_backends(value: str | None, default: str = "arion") -> list[str]:
     return [b.strip() for b in value.split(",") if b.strip()]
 
 
+def _parse_service_accounts(value: str | None) -> frozenset[str]:
+    """Parse the comma-separated HIPPIUS_SERVICE_ACCOUNT_IDS allowlist into SS58 addresses.
+
+    Raises on a malformed entry rather than dropping it. A typo here does not fail visibly —
+    it silently demotes an internal account back to "billed", which only surfaces much later
+    as a DLQ full of 402s with no obvious cause. Unset/empty stays empty, so the allowlist is
+    fail-closed: nothing bypasses billing unless it was spelled correctly.
+
+    SS58 is base58 and case-sensitive; entries are never normalised.
+    """
+    from substrateinterface.utils.ss58 import is_valid_ss58_address
+
+    accounts: set[str] = set()
+    for part in str(value or "").split(","):
+        candidate = part.strip().strip('"').strip("'")
+        if not candidate:
+            continue
+        if not is_valid_ss58_address(candidate):
+            raise ValueError(f"HIPPIUS_SERVICE_ACCOUNT_IDS contains an invalid SS58 address: {candidate!r}")
+        accounts.add(candidate)
+    return frozenset(accounts)
+
+
 def _parse_account_whitelist() -> list[str]:
     """Parse comma-separated account whitelist from environment variable."""
     import os
@@ -100,6 +123,11 @@ class Config:
     validator_region: str = env("HIPPIUS_VALIDATOR_REGION")
     hippius_api_base_url: str = env("HIPPIUS_API_BASE_URL:https://api.hippius.com/")
     arion_billing_bypass_key: str = env("ARION_BILLING_BYPASS_KEY:")
+    # Internal Hippius-owned accounts that store our own data. Their writes skip the credit and
+    # can_upload gates in the gateway and carry the X-Billing-Bypass header to Arion. Deliberately
+    # an explicit per-account allowlist, NOT a blanket switch like enable_bypass_credit_check —
+    # and for that reason it is NOT clamped off outside ENVIRONMENT=test.
+    service_account_ids: frozenset[str] = env("HIPPIUS_SERVICE_ACCOUNT_IDS:", convert=_parse_service_accounts)
     arion_rate_limiting_proxy_bypass_key: str = env("ARION_RATE_LIMITING_PROXY_BYPASS_KEY:")
     arion_base_url: str = env("HIPPIUS_ARION_BASE_URL:https://arion.hippius.com/")
     arion_verify_ssl: bool = env("HIPPIUS_ARION_VERIFY_SSL:true", convert=lambda x: x.lower() == "true")

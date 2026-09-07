@@ -35,6 +35,18 @@ For seed-phrase auth: fetches subaccount role/credits from Arion via [gateway/se
 
 **Gotcha**: If Arion is down, this returns 503. There's no graceful degradation — non-seed-phrase auth methods (bearer, access key) don't hit this middleware's hot path, but seed-phrase auth blocks on Arion.
 
+**Service accounts**: an access-key caller whose `account_address` is in `HIPPIUS_SERVICE_ACCOUNT_IDS`
+(comma-separated SS58, a GitHub secret in prod) skips both mutating-path gates — the
+redis-accounts credit fetch and Arion `can_upload` — and gets `request.state.service_account = True`
+for the audit log. The predicate is [services/service_accounts.py](../../services/service_accounts.py);
+the allowlist is parsed and SS58-validated at config time, so a typo fails startup rather than
+silently demoting an internal account back to billed. Keyed only on the VERIFIED `account_address`,
+never on a header, and never on the bucket owner — the gate bills the caller, so writing into a
+service account's bucket does not launder a regular user's upload. Reads set the flag but change
+nothing else. The matching worker-side bypass (the `X-Billing-Bypass` header to Arion) lives in
+[hippius_s3/workers/uploader.py](../../workers/uploader.py) and is derived from `payload.address`,
+because since drain-direct the API no longer enqueues the upload request at all.
+
 ### [trailing_slash.py](trailing_slash.py) — `trailing_slash_normalizer`
 
 Keeps `/foo/bar/` and `/foo/bar` equivalent for S3 operations.

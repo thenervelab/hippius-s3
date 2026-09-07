@@ -19,6 +19,8 @@ def mock_config():
     config.arion_upload_concurrency = 5
     config.cache_ttl_seconds = 1800
     config.object_cache_dir = "/tmp/test_cache"
+    # explicit, so the bypass decision here never rides on MagicMock.__contains__
+    config.service_account_ids = frozenset()
     return config
 
 

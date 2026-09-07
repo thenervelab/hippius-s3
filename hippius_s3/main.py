@@ -307,6 +307,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Metrics collector initialized")
         logger.info("Tracing and metrics handled by programmatic OTel init")
 
+        # Logged so an operator can confirm from the pod logs which accounts this replica
+        # considers exempt — during a rolling deploy the api and uploader can briefly disagree,
+        # and this is the only way to tell which side already has the new list.
+        if config.service_account_ids:
+            logger.info(
+                "Service accounts configured (billing bypassed): count=%d accounts=%s",
+                len(config.service_account_ids),
+                ",".join(sorted(config.service_account_ids)),
+            )
+        else:
+            logger.info("No service accounts configured; all accounts are billed")
+
         # Start background metrics collection
         app.state.background_metrics_collector = BackgroundMetricsCollector(
             app.state.metrics_collector,

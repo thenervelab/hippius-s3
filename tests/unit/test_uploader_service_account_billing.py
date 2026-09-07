@@ -1,0 +1,226 @@
+"""Uploader-side billing bypass for service accounts.
+
+Since the drain-direct cutover the API no longer enqueues UploadChainRequest — the Rust
+drain-agent builds and LPUSHes it — so a flag set on the request path can never reach this
+worker. The uploader therefore derives the exemption from payload.address, which is the
+storage-attribution account (the bucket owner) and exactly who Arion charges.
+"""
+
+from typing import Any
+from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
+from unittest.mock import patch
+
+import pytest
+from fakeredis.aioredis import FakeRedis
+
+from hippius_s3.queue import Chunk
+from hippius_s3.queue import UploadChainRequest
+from hippius_s3.workers.uploader import Uploader
+
+
+SERVICE_ACCOUNT = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+REGULAR_ACCOUNT = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+BYPASS_KEY = "secret-bypass-key"
+
+
+@pytest.fixture  # type: ignore[misc]
+def mock_db_pool() -> Any:
+    pool = MagicMock()
+    conn = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=False)  # object is not deleted
+    pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=conn)))
+    return pool
+
+
+def _config(*, allowlist: frozenset[str], bypass_key: str = BYPASS_KEY) -> Any:
+    config = MagicMock()
+    config.uploader_multipart_max_concurrency = 5
+    config.arion_upload_concurrency = 5
+    config.cache_ttl_seconds = 1800
+    config.object_cache_dir = "/tmp/test_cache"
+    config.arion_billing_bypass_key = bypass_key
+    config.service_account_ids = allowlist
+    return config
+
+
+def _payload(address: str, *, bypass_billing: bool = False) -> UploadChainRequest:
+    return UploadChainRequest(
+        address=address,
+        bucket_name="test-bucket",
+        object_key="test-key",
+        object_id="obj-123",
+        object_version=1,
+        chunks=[Chunk(id=1)],
+        upload_id="upload-123",
+        bypass_billing=bypass_billing,
+    )
+
+
+async def _headers_for(config: Any, payload: UploadChainRequest, db_pool: Any) -> Any:
+    """Run process_upload and return the extra_headers handed to _upload_chunks."""
+    uploader = Uploader(
+        db_pool, FakeRedis(), FakeRedis(), config, backend_name="arion", backend_client=MagicMock()
+    )
+    with patch.object(uploader, "_upload_chunks", new_callable=AsyncMock) as upload_chunks:
+        upload_chunks.return_value = ["QmCID1"]
+        await uploader.process_upload(payload)
+        return upload_chunks.call_args.kwargs["extra_headers"]
+
+
+# ---------------------------------------------------------------------------
+# The feature
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_service_account_upload_carries_the_bypass_header(mock_db_pool: Any) -> None:
+    """No bypass_billing flag on the payload — the drain never sets one. The exemption has to
+    come from the address alone or the feature does not work in production at all."""
+    headers = await _headers_for(
+        _config(allowlist=frozenset({SERVICE_ACCOUNT})),
+        _payload(SERVICE_ACCOUNT),
+        mock_db_pool,
+    )
+
+    assert headers == {"X-Billing-Bypass": BYPASS_KEY}
+
+
+@pytest.mark.asyncio
+async def test_regular_account_upload_is_still_billed(mock_db_pool: Any) -> None:
+    headers = await _headers_for(
+        _config(allowlist=frozenset({SERVICE_ACCOUNT})),
+        _payload(REGULAR_ACCOUNT),
+        mock_db_pool,
+    )
+
+    assert headers is None
+
+
+@pytest.mark.asyncio
+async def test_empty_allowlist_bills_everyone(mock_db_pool: Any) -> None:
+    headers = await _headers_for(
+        _config(allowlist=frozenset()),
+        _payload(SERVICE_ACCOUNT),
+        mock_db_pool,
+    )
+
+    assert headers is None
+
+
+@pytest.mark.asyncio
+async def test_operator_bypass_flag_still_works_for_an_unlisted_account(mock_db_pool: Any) -> None:
+    """dlq_requeue --bypass-billing is the recovery path for 402-failed uploads on ordinary
+    accounts. Deriving the exemption from the address must not have replaced it."""
+    headers = await _headers_for(
+        _config(allowlist=frozenset({SERVICE_ACCOUNT})),
+        _payload(REGULAR_ACCOUNT, bypass_billing=True),
+        mock_db_pool,
+    )
+
+    assert headers == {"X-Billing-Bypass": BYPASS_KEY}
+
+
+@pytest.mark.asyncio
+async def test_case_flipped_address_is_still_billed(mock_db_pool: Any) -> None:
+    near_miss = SERVICE_ACCOUNT[0] + SERVICE_ACCOUNT[1].swapcase() + SERVICE_ACCOUNT[2:]
+    assert near_miss != SERVICE_ACCOUNT
+
+    headers = await _headers_for(
+        _config(allowlist=frozenset({SERVICE_ACCOUNT})),
+        _payload(near_miss),
+        mock_db_pool,
+    )
+
+    assert headers is None
+
+
+# ---------------------------------------------------------------------------
+# The misconfiguration that would otherwise be silent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_missing_bypass_key_sends_no_header_and_warns(mock_db_pool: Any, caplog: Any) -> None:
+    """Allowlisted but ARION_BILLING_BYPASS_KEY unset — the half-configured deployment. The
+    upload must not invent a header, and must leave a log line: otherwise it bills the account,
+    402s, and lands in the DLQ classified as 'billing' with nothing pointing at the missing key.
+    """
+    with caplog.at_level("WARNING"):
+        headers = await _headers_for(
+            _config(allowlist=frozenset({SERVICE_ACCOUNT}), bypass_key=""),
+            _payload(SERVICE_ACCOUNT),
+            mock_db_pool,
+        )
+
+    assert headers is None
+    assert any(
+        "BILLING_BYPASS requested but ARION_BILLING_BYPASS_KEY is unset" in r.message for r in caplog.records
+    ), "a silently-billed service account is the failure this warning exists to prevent"
+
+
+@pytest.mark.asyncio
+async def test_no_warning_when_nothing_was_requested(mock_db_pool: Any, caplog: Any) -> None:
+    """The warning must be specific to a requested-but-impossible bypass, not fire on every
+    ordinary upload in a deployment that has no bypass key."""
+    with caplog.at_level("WARNING"):
+        await _headers_for(
+            _config(allowlist=frozenset(), bypass_key=""),
+            _payload(REGULAR_ACCOUNT),
+            mock_db_pool,
+        )
+
+    assert not any("BILLING_BYPASS" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bypass_is_recorded_and_logged(mock_db_pool: Any, caplog: Any, monkeypatch: Any) -> None:
+    from hippius_s3.workers import uploader as uploader_mod
+
+    collector = MagicMock()
+    monkeypatch.setattr(uploader_mod, "get_metrics_collector", lambda: collector)
+
+    with caplog.at_level("INFO"):
+        await _headers_for(
+            _config(allowlist=frozenset({SERVICE_ACCOUNT})),
+            _payload(SERVICE_ACCOUNT),
+            mock_db_pool,
+        )
+
+    collector.record_billing_bypass.assert_called_once_with(surface="uploader")
+    assert any("BILLING_BYPASS surface=uploader" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_no_bypass_metric_for_a_billed_upload(mock_db_pool: Any, monkeypatch: Any) -> None:
+    from hippius_s3.workers import uploader as uploader_mod
+
+    collector = MagicMock()
+    monkeypatch.setattr(uploader_mod, "get_metrics_collector", lambda: collector)
+
+    await _headers_for(
+        _config(allowlist=frozenset({SERVICE_ACCOUNT})),
+        _payload(REGULAR_ACCOUNT),
+        mock_db_pool,
+    )
+
+    collector.record_billing_bypass.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bypass_key_never_reaches_the_logs(mock_db_pool: Any, caplog: Any) -> None:
+    """The header value is a shared secret with Arion. It is fine in a request header and must
+    never be in a log line an operator or Loki can read."""
+    with caplog.at_level("DEBUG"):
+        await _headers_for(
+            _config(allowlist=frozenset({SERVICE_ACCOUNT})),
+            _payload(SERVICE_ACCOUNT),
+            mock_db_pool,
+        )
+
+    assert not any(BYPASS_KEY in r.getMessage() for r in caplog.records)

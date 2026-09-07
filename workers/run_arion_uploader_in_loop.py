@@ -128,6 +128,15 @@ async def run_arion_uploader_loop():
         f"Starting Arion uploader service (max_inflight={max_inflight} "
         f"arion_concurrency={config.arion_upload_concurrency} db_pool_max={pool_max})"
     )
+    # Mirrors the api's startup line. During a rolling deploy the two sides can hold different
+    # lists, and an uploader that has not picked up a new service account will bill its uploads
+    # into the DLQ — these two lines are how you tell which side is behind.
+    if config.service_account_ids:
+        logger.info(
+            f"Service accounts configured (billing bypassed): count={len(config.service_account_ids)} "
+            f"accounts={','.join(sorted(config.service_account_ids))} "
+            f"bypass_key_set={bool(config.arion_billing_bypass_key)}"
+        )
 
     # Periodic retry-mover — one per pod, off the per-request hot path (running it
     # per dequeue across N concurrent workers would multiply Redis load).

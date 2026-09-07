@@ -15,10 +15,12 @@ from hippius_s3.gateway.services.account_service import fetch_account_by_main_ad
 from hippius_s3.gateway.utils.errors import s3_error_response
 from hippius_s3.gateway.utils.paths import routing_path
 from hippius_s3.models.account import HippiusAccount
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.services.arion_service import CanUploadResponse
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
+from hippius_s3.services.service_accounts import is_service_account
 
 
 config = get_config()
@@ -239,6 +241,13 @@ async def account_middleware(
     if auth_method == "access_key":
         account_address = request.state.account_address
 
+        # Keyed on account_address, which auth_router derived from a VERIFIED signature/token —
+        # never from a client-supplied header — so only the holder of the service account's own
+        # credentials can land here. Recorded for reads too, where nothing is bypassed, so the
+        # audit log tells the whole story of what an internal account did.
+        service_account = is_service_account(account_address, config.service_account_ids)
+        request.state.service_account = service_account
+
         try:
             request.state.account_id = account_address
 
@@ -254,6 +263,21 @@ async def account_middleware(
                     upload=False,
                     delete=False,
                 )
+            elif service_account:
+                # Skips the redis-accounts fetch as well as the gates: an internal account has no
+                # meaningful credit row to consult, and consulting one would make our own writes
+                # fail whenever the account-cacher lags.
+                request.state.account = HippiusAccount(
+                    id=account_address,
+                    main_account=account_address,
+                    has_credits=True,
+                    upload=True,
+                    delete=True,
+                )
+                logger.info(
+                    f"BILLING_BYPASS surface=gateway account={account_address} method={request.method} path={path}"
+                )
+                get_metrics_collector().record_billing_bypass(surface="gateway")
             else:
                 redis_accounts_client = request.app.state.redis_accounts_client
                 request.state.account = await fetch_account_by_main_address(
@@ -291,6 +315,7 @@ async def account_middleware(
         # Anonymous access (no auth method)
         account_id = "anonymous"
         request.state.account_id = account_id
+        request.state.service_account = False
         request.state.account = HippiusAccount(
             id=account_id,
             main_account=account_id,

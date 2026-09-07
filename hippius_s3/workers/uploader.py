@@ -19,6 +19,7 @@ from hippius_s3.dlq.upload_dlq import UploadDLQManager
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
+from hippius_s3.services.service_accounts import is_service_account
 from hippius_s3.utils import get_query
 from hippius_s3.workers.errors import is_billing_error
 
@@ -148,9 +149,33 @@ class Uploader:
                 f"Processing upload backend={self.backend_name} object_id={payload.object_id} chunks={len(payload.chunks)}"
             )
 
+            # payload.address is the STORAGE-ATTRIBUTION account (the bucket owner, written by
+            # set_object_version_address) — which is exactly who Arion charges for this upload,
+            # so it is the right identity to test against the allowlist here.
+            #
+            # Derived from the payload rather than carried on it because since the drain-direct
+            # cutover the API no longer enqueues UploadChainRequest at all: the Rust drain-agent
+            # builds and LPUSHes it. A flag set by the API would never reach this worker. The
+            # explicit payload.bypass_billing flag remains the operator path (dlq_requeue).
             extra_headers: dict[str, str] | None = None
-            if payload.bypass_billing and self.config.arion_billing_bypass_key:
+            bypass_billing = payload.bypass_billing or is_service_account(
+                payload.address, self.config.service_account_ids
+            )
+            if bypass_billing and self.config.arion_billing_bypass_key:
                 extra_headers = {"X-Billing-Bypass": self.config.arion_billing_bypass_key}
+                logger.info(
+                    f"BILLING_BYPASS surface=uploader account={payload.address} "
+                    f"object_id={payload.object_id} version={payload.object_version}"
+                )
+                get_metrics_collector().record_billing_bypass(surface="uploader")
+            elif bypass_billing:
+                # Without this the upload silently bills the account, 402s, and lands in the DLQ
+                # classified as "billing" with nothing pointing at the missing key.
+                logger.warning(
+                    f"BILLING_BYPASS requested but ARION_BILLING_BYPASS_KEY is unset — upload will be "
+                    f"billed: account={payload.address} object_id={payload.object_id}"
+                )
+            span.set_attribute("billing_bypass", bypass_billing)
 
             all_chunk_cids = await self._upload_chunks(
                 object_id=payload.object_id,

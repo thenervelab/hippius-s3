@@ -75,6 +75,7 @@ LandedAnnounceOutcome = Literal["timeout", "error"]
 # `local`/`recovered` rate is a poisoner planting bad bytes on this node — the pool copy is fine.
 # Anything `unrecovered` survived a tier change, so it is a key or object fault, not local
 # corruption; the two must stay distinguishable or a DEK fault reads like cache poisoning.
+BillingBypassSurface = Literal["gateway", "uploader"]
 AeadFailureTier = Literal["local", "remote"]
 AeadFailureOutcome = Literal["recovered", "unrecovered"]
 
@@ -176,6 +177,19 @@ class MetricsCollector:
         self.fs_cache_shed_total = self.meter.create_counter(
             name="fs_cache_shed_total",
             description="Writes rejected by the FS-cache-pressure gate, by reason and pressure mode",
+            unit="1",
+        )
+
+        # Every operation that skipped a billing gate because the account is on the
+        # service-account allowlist — the quantitative signal to alert on if the bypass starts
+        # firing more than our own workloads explain. Deliberately NOT labelled by account: the
+        # allowlist would bound the cardinality today, but the VALUE would come from a request,
+        # so cardinality would silently ride on the bypass predicate staying tight. Per-account
+        # attribution lives in the BILLING_BYPASS log line and the audit log's service_account
+        # field, which is where an auditor looks and which costs no series.
+        self.billing_bypass_total = self.meter.create_counter(
+            name="billing_bypass_total",
+            description="Billing gates skipped for service accounts, by surface (gateway|uploader)",
             unit="1",
         )
 
@@ -684,6 +698,10 @@ class MetricsCollector:
         """
         self.fs_cache_shed_total.add(1, attributes={"reason": reason, "pressure_mode": pressure_mode})
 
+    def record_billing_bypass(self, surface: BillingBypassSurface) -> None:
+        """Record a billing gate skipped for a service account."""
+        self.billing_bypass_total.add(1, attributes={"surface": surface})
+
     def record_cache_operation(
         self,
         hit: bool,
@@ -984,6 +1002,9 @@ class NullMetricsCollector:
         pass
 
     def record_fs_cache_shed(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_billing_bypass(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_chunk_read_tier(self, *args: object, **kwargs: object) -> None:

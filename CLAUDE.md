@@ -313,7 +313,8 @@ Config is a typed dataclass: [hippius_s3/config.py](hippius_s3/config.py). Value
 | Variable | Default | Notes |
 |---|---|---|
 | `ENABLE_AUDIT_LOGGING` | `true` | Gateway audit log middleware. |
-| `HIPPIUS_BYPASS_CREDIT_CHECK` | `false` | Test-only. |
+| `HIPPIUS_BYPASS_CREDIT_CHECK` | `false` | Test-only (clamped off unless `ENVIRONMENT=test`). |
+| `HIPPIUS_SERVICE_ACCOUNT_IDS` | `` | Comma-separated SS58 of internal accounts exempt from billing. Prod-valid (NOT clamped); SS58-validated at config time; empty = nobody. |
 | `HIPPIUS_READ_ONLY_MODE` | `false` | Blocks all writes at gateway. |
 | `ENABLE_REQUEST_PROFILING` | `false` | Speedscope profiler middleware. |
 
