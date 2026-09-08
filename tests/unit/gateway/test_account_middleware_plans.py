@@ -424,3 +424,32 @@ async def test_completing_a_multipart_upload_is_never_refused(plan_config: Any, 
         )
 
     assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subresource", ["acl", "tagging", "retention", "legal-hold"])
+async def test_object_metadata_operations_are_not_quota_gated(
+    plan_config: Any, monkeypatch: Any, subresource: str
+) -> None:
+    """`PUT /{bucket}/{key}?acl|?tagging|?retention|?legal-hold` sets metadata and stores no object
+    data. required_op grades them write_object — correct for authorisation — so without an explicit
+    subtraction an over-quota customer could not put a legal hold on an object or change its tags,
+    and would be told to delete things to do it."""
+    app, _ = build_app(plan_config, monkeypatch, plan_id="pro", storage_bytes=1 * GB, used=500 * GB)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put(
+            f"/test-bucket/test-key?{subresource}", content=b"<x/>", headers={"content-length": "4"}
+        )
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_a_plain_object_write_is_still_gated_when_over_quota(
+    plan_config: Any, monkeypatch: Any
+) -> None:
+    """The counterweight to the exemptions above: none of them may leak into the ordinary write."""
+    app, _ = build_app(plan_config, monkeypatch, plan_id="pro", storage_bytes=1 * GB, used=500 * GB)
+
+    assert (await put(app)).status_code == 402

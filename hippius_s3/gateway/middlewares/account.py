@@ -68,6 +68,13 @@ def _is_transient_billing_error(error: str | None) -> bool:
 _UNREACHABLE_ERRORS = (httpx.TimeoutException, httpx.NetworkError, httpx.ProxyError, httpx.RemoteProtocolError)
 
 
+# Object subresources that set metadata rather than store data. `required_op` grades them
+# `write_object` — correctly, for authorisation — but a quota must not refuse a zero-byte tag or
+# retention change just because the account is over its limit. Object-scoped only: the bucket
+# equivalents are already `write_bucket_meta` and never reach this check.
+_OBJECT_METADATA_SUBRESOURCES = frozenset({"acl", "tagging", "retention", "legal-hold"})
+
+
 # Shadow verdicts get their own label so an enforced denial and a shadow one are never summed
 # together on plan_gate_total. Enforcing mode needs no map: its outcomes already ARE the labels,
 # and `would_deny` is unreachable there.
@@ -160,23 +167,31 @@ def _adds_storage(request: Request) -> bool:
     `required_op` already encodes both, and is the same mapping sub-token authorisation reads — so
     there is one place that knows what an S3 request is, not two.
 
-    CompleteMultipartUpload is excluded on top of that: its parts have already been written and
-    already passed this gate individually, so refusing the commit reclaims nothing and strands them.
-    That is `POST ?uploadId` WITHOUT `partNumber` — matching on `uploadId` alone would also exempt
-    every `PUT ?partNumber&uploadId` part upload, i.e. exactly the requests that carry the bytes,
-    which is how large uploads happen.
+    Two things `required_op` cannot express are subtracted on top, because it answers "what
+    permission does this need", not "does this store bytes", and both would otherwise refuse a
+    zero-byte control operation the moment an account is over its limit:
 
-    Residual, tracked in todo.md: `required_op` grades `PUT /{bucket}/{key}?acl|?tagging` as
-    write_object, so those stay gated. Fixing that means splitting object subresources in the shared
-    mapping, which also changes sub-token authorisation — deliberately not done here.
+      * `POST ?uploadId` WITHOUT `partNumber` is CompleteMultipartUpload. Its parts are already
+        written and already passed this gate individually, so refusing the commit reclaims nothing
+        and strands them with no path forward. Matching on `uploadId` alone would also exempt every
+        `PUT ?partNumber&uploadId` part upload — exactly the requests that carry the bytes.
+      * `PUT /{bucket}/{key}?acl|?tagging|?retention|?legal-hold` sets object metadata.
+        `required_op` grades these `write_object` because that is the permission they need, but
+        they store no object data.
+
+    Both sets are spelled out here rather than pushed into `required_op`, because changing that
+    mapping also changes sub-token authorisation — a different question with a different blast
+    radius. What must NOT be re-derived here is the verb+query -> operation classification itself:
+    doing that by hand is how `PUT /{bucket}/{key}?delete` became a total quota bypass.
     """
     params = dict(request.query_params)
     _, key = parse_s3_path(routing_path(request))
     if required_op(request.method, key is not None, params) is not Op.write_object:
         return False
 
-    is_complete_mpu = request.method == "POST" and "uploadId" in params and "partNumber" not in params
-    return not is_complete_mpu
+    if request.method == "POST" and "uploadId" in params and "partNumber" not in params:
+        return False
+    return not (_OBJECT_METADATA_SUBRESOURCES & params.keys())
 
 
 def _log_plan_shadow(

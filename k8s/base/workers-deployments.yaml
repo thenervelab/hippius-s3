@@ -1001,6 +1001,16 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: DATABASE_URL
+            # Replica endpoint. The per-account storage counts are aggregates over the
+            # largest tables in the schema and must not run on the primary. optional:true so a
+            # Secret predating this key cannot wedge the rollout — absent falls back to
+            # DATABASE_URL, which is correct but heavier.
+            - name: DATABASE_READONLY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_READONLY_URL
+                  optional: true
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:

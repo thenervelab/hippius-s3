@@ -103,6 +103,19 @@ There are only a few tens of plan accounts, which is the whole reason there is n
 no triggers: at that cardinality a maintained counter would buy nothing but a second source of
 truth to keep in step.
 
+**The counts run against a REPLICA** (`DATABASE_READONLY_URL`, falling back to `DATABASE_URL` when
+unset). They are aggregates over the largest tables in the schema — measured on prod, ~200-320ms for
+a typical account, and this cluster's primary has been stalled by a read-storm before. A replica
+also cancels a query past `max_standby_streaming_delay` rather than letting it lag replay, which
+turns a pathological account into a failed cycle (previous roll keeps serving) instead of a
+replication problem.
+
+Measured on prod (2026-09): 348 accounts have buckets and 338 of them have ≤20, so the per-account
+count is comfortably sub-second for essentially all of them. Cost is driven by BUCKET FAN-OUT, not
+data volume — one outlier account with 2024 buckets holding 257 KB takes ~9s, because the planner
+abandons the index path. If a plan account ever has hundreds of buckets, that is the case to
+re-measure before trusting the cycle time.
+
 ⚠️ **The refresh interval IS the enforcement lag, in both directions.** An account can overshoot its
 quota by one cycle's worth of uploads, and a customer who deletes data to get back under stays
 refused until the next cycle sees it. Nothing on the request path recomputes.

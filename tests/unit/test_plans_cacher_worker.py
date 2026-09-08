@@ -8,6 +8,7 @@ Second, the semantics of the upstream row — which accounts get an allowance an
 pay-as-you-go. Getting that wrong hands free storage to lapsed subscribers, or 402s paying ones.
 """
 
+import pathlib
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -433,3 +434,45 @@ def test_an_address_in_the_wrong_network_prefix_is_dropped() -> None:
         )
     )
     assert accounts == {}
+
+
+# --------------------------------------------------------------------------- read-only DSN
+
+
+def test_the_readonly_dsn_falls_back_to_the_primary_when_unset(monkeypatch) -> None:
+    """Local dev, tests and e2e set only DATABASE_URL. An unset replica DSN must resolve to it
+    rather than to an empty string, or the worker cannot connect at all."""
+    from hippius_s3.config import Config
+    from hippius_s3.config import get_config
+
+    import hippius_s3.config as config_module
+
+    monkeypatch.delenv("DATABASE_READONLY_URL", raising=False)
+    monkeypatch.setattr(config_module, "_config_singleton", None)
+
+    cfg = get_config()
+    assert cfg.database_readonly_url == cfg.database_url
+
+    assert Config().database_readonly_url == "", "the raw field is empty; the fallback is in get_config"
+
+
+def test_the_readonly_dsn_is_used_when_set(monkeypatch) -> None:
+    from hippius_s3.config import get_config
+
+    import hippius_s3.config as config_module
+
+    monkeypatch.setenv("DATABASE_READONLY_URL", "postgresql://postgres@postgres-nvme-ro:5432/hippius")
+    monkeypatch.setattr(config_module, "_config_singleton", None)
+
+    cfg = get_config()
+    assert "-ro:" in cfg.database_readonly_url
+    assert cfg.database_readonly_url != cfg.database_url
+
+
+def test_the_cacher_opens_its_pool_against_the_readonly_dsn() -> None:
+    """Pins the reason this exists: these counts are aggregates over the largest tables in the
+    schema, and a read-storm has stalled this cluster's primary before. Reading config.database_url
+    here would silently put them back on it."""
+    source = pathlib.Path(pc.__file__).read_text()
+    assert "config.database_readonly_url" in source
+    assert "create_pool(config.database_url" not in source

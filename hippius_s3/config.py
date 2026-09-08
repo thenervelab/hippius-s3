@@ -150,6 +150,16 @@ class Config:
     database_url: str = env("DATABASE_URL")
     # Inline default prevents KeyError during class init; runtime fallback to DATABASE_URL is applied in get_config()
     encryption_database_url: str = env("HIPPIUS_KEYSTORE_DATABASE_URL:", convert=str)
+    # A read-only DSN, for background work that only reads and can tolerate replica lag. Falls back
+    # to DATABASE_URL when unset (get_config), so local dev, tests and e2e need not set it.
+    #
+    # Only the plans-cacher uses it today, and deliberately: its per-account storage counts are
+    # aggregates over the largest tables in the schema, run on a timer with nobody waiting. Keeping
+    # them off the primary matters on this cluster specifically -- a janitor read-storm has stalled
+    # it before and triggered a failover. The replica also cancels a query past
+    # max_standby_streaming_delay rather than letting it lag replay, which turns a pathological
+    # account into a failed cycle (last known good keeps serving) instead of a replication problem.
+    database_readonly_url: str = env("DATABASE_READONLY_URL:", convert=str)
 
     # Security
     frontend_hmac_secret: str = env("FRONTEND_HMAC_SECRET")
@@ -850,6 +860,9 @@ def get_config() -> Config:
     # Ensure a usable keystore DSN (falls back to DATABASE_URL)
     if not cfg.encryption_database_url:
         object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
+
+    if not cfg.database_readonly_url:
+        object.__setattr__(cfg, "database_readonly_url", cfg.database_url)
 
     # Enforce environment constraints:
     # - Only in 'test' can enable_bypass_credit_check be True

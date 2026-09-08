@@ -225,9 +225,18 @@ async def run_cycle(redis_client: Redis, pool: asyncpg.Pool) -> bool:
 
 async def run_plans_cacher_loop() -> None:
     redis_client = Redis.from_url(config.redis_accounts_url)
+    # READ-ONLY DSN. These counts are aggregates over the largest tables in the schema, run on a
+    # timer with nobody waiting, so they belong nowhere near the primary — on this cluster a
+    # read-storm has stalled it before and triggered a failover. Falls back to DATABASE_URL when
+    # unset, so local dev and e2e are unaffected. A replica may cancel a long query under recovery
+    # conflict rather than let it lag replay; run_cycle already treats that as a failed cycle and
+    # keeps the previous roll serving, which is the behaviour we want.
+    #
     # Sized to the usage concurrency and no larger: this worker's only DB work is those counts, and
     # an oversized pool here is idle backends against Postgres max_connections for nothing.
-    pool = await asyncpg.create_pool(config.database_url, min_size=1, max_size=max(1, config.plans_usage_concurrency))
+    pool = await asyncpg.create_pool(
+        config.database_readonly_url, min_size=1, max_size=max(1, config.plans_usage_concurrency)
+    )
     initialize_metrics_collector()
 
     logger.info(
