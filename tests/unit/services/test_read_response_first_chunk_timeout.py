@@ -12,7 +12,6 @@ import contextlib
 from types import SimpleNamespace
 from typing import Any
 from typing import Iterator
-from unittest.mock import AsyncMock
 from unittest.mock import patch
 
 import pytest
@@ -48,7 +47,6 @@ def _patched(cfg: Any, stream_plan_factory: Any) -> Iterator[None]:
     """Patch read_response's collaborators: a fixed ctx, the given config, no-op headers, and a
     controllable stream_plan (each call returns a fresh generator from `stream_plan_factory`)."""
     with (
-        patch.object(object_reader, "build_stream_context", new=AsyncMock(return_value=_ctx())),
         patch.object(object_reader, "get_config", return_value=cfg),
         patch.object(object_reader, "build_headers", return_value={}),
         patch.object(object_reader, "stream_plan", new=lambda **kw: stream_plan_factory()),
@@ -76,7 +74,7 @@ async def test_first_chunk_timeout_raises_download_not_ready() -> None:
         t0 = loop.time()
         with pytest.raises(object_reader.DownloadNotReadyError):
             await object_reader.read_response(
-                db=None, redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
+                ctx=_ctx(), redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
             )
         assert loop.time() - t0 < 5.0, "must fail fast on the bound, not hang"
 
@@ -94,7 +92,7 @@ async def test_warm_read_streams_all_chunks_including_the_peeked_first() -> None
     )
     with _patched(cfg, _two):
         resp = await object_reader.read_response(
-            db=None, redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
+            ctx=_ctx(), redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
         )
         assert resp.status_code == 200
         assert await _collect(resp) == b"helloworld"
@@ -113,7 +111,7 @@ async def test_zero_byte_object_streams_empty_body() -> None:
     )
     with _patched(cfg, _empty):
         resp = await object_reader.read_response(
-            db=None, redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
+            ctx=_ctx(), redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
         )
         assert resp.status_code == 200
         assert await _collect(resp) == b""

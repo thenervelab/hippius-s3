@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 # `db` LIFETIME — READ BEFORE ADDING A QUERY HERE.
-# get_object_endpoint does `db = await pool.acquire()` and releases it in a `finally` that runs
-# when the endpoint RETURNS — i.e. when the StreamingResponse object is handed to the ASGI
-# server, before a single body byte is produced. So `db` is only ours until build_stream_context
+# get_object_endpoint holds its pooled connection only for the `async with acquire_with_timeout`
+# block that ends right after build_stream_context returns — BEFORE read_response's first-chunk
+# wait, and before the StreamingResponse object is handed to the ASGI server. (It used to be held
+# until the endpoint returned; a cold read then pinned a pool slot for the whole
+# stream_first_chunk_timeout_seconds, and ~60 such reads on one pod starved every PUT on it into
+# a pool-acquire 503 — observed 2026-09-08.) So `db` is only ours until build_stream_context
 # finishes. Anything reached from inside the response body (stream_plan's wait/decrypt path)
 # must do ZERO DB work: by then the connection is back in the pool and probably owned by another
 # request, and asyncpg Connections are not safe for concurrent use. Violating this raises
@@ -391,7 +394,7 @@ async def build_stream_context(
 
 
 async def read_response(
-    db: Any,
+    ctx: StreamContext,
     redis: Any,
     obj_cache: Any,
     info: dict,
@@ -400,20 +403,14 @@ async def read_response(
     rng: RangeRequest | None,
     address: str,
     range_was_invalid: bool = False,
-    parts: list[dict] | None = None,
 ) -> Response:
+    """Turn an already-built StreamContext into the streaming response.
+
+    Takes the context rather than `db` on purpose: everything below — the first-chunk wait (up
+    to stream_first_chunk_timeout_seconds on a cold read) and the body — does zero DB work, so
+    the endpoint releases its pooled connection before calling this. See the module note.
+    """
     cfg = get_config()
-    # RD-3: the endpoint already built the parts catalog; pass it through so build_stream_context and
-    # the planner don't re-read `parts`. None → they read it themselves (unchanged).
-    ctx = await build_stream_context(
-        db,
-        redis,
-        obj_cache,
-        info,
-        rng=rng,
-        address=address,
-        parts=parts,
-    )
     gen = stream_plan(
         obj_cache=obj_cache,
         object_id=info["object_id"],
