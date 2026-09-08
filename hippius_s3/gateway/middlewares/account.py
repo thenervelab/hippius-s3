@@ -11,6 +11,7 @@ from fastapi import Response
 from starlette import status
 
 from hippius_s3.config import get_config
+from hippius_s3.gateway.services import plan_gate
 from hippius_s3.gateway.services.account_service import fetch_account_by_main_address
 from hippius_s3.gateway.utils.errors import s3_error_response
 from hippius_s3.gateway.utils.paths import routing_path
@@ -97,6 +98,91 @@ async def _can_upload(
         return CanUploadResponse(result=False, error=f"billing service unavailable ({type(exc).__name__})"), True
 
 
+def _declared_content_length(request: Request) -> int:
+    """Bytes this request claims it will write.
+
+    AWS CLI v2+ uses chunked transfer encoding and sends the real size in
+    x-amz-decoded-content-length instead of Content-Length.
+
+    Returns 0 when neither header is present, which makes both the can_upload gate and the plan
+    quota gate pass trivially. That hole predates plans (a chunked upload with no declared length,
+    and CopyObject, both arrive as 0) and is unchanged here — see todo.md.
+    """
+    return int(request.headers.get("x-amz-decoded-content-length") or request.headers.get("content-length") or "0")
+
+
+async def _check_plan_quota(
+    request: Request,
+    logger: logging.Logger | logging.LoggerAdapter,
+    account_address: str,
+) -> tuple[bool, Response | None]:
+    """Storage-quota gate for accounts on a billing plan.
+
+    Returns (handled, error_response). `handled` False means this account is pay-as-you-go (or the
+    plan caches could not be consulted) and the caller must run the normal credit + can_upload path.
+    """
+    redis_accounts = request.app.state.redis_accounts_client
+
+    try:
+        resolved = await plan_gate.resolve_plan(redis_accounts, account_address, config)
+    except plan_gate.PlanLookupUnavailable as e:
+        logger.warning(f"PLAN_LOOKUP unavailable account={account_address}: {e}; falling back to pay-as-you-go")
+        get_metrics_collector().record_plan_gate(outcome="unavailable")
+        return False, None
+
+    if resolved is None:
+        return False, None
+
+    plan_id, quota = resolved
+    request.state.plan_id = plan_id
+
+    # Deletes free space; never gate them on a quota. This is what lets a customer who downgraded
+    # below their current usage dig themselves out instead of being stuck.
+    if request.method not in ("PUT", "POST"):
+        get_metrics_collector().record_plan_gate(outcome="allow")
+        return True, None
+
+    decision = await plan_gate.evaluate_quota(
+        db=request.app.state.postgres_pool,
+        redis_accounts_client=redis_accounts,
+        main_account_id=account_address,
+        plan_id=plan_id,
+        quota=quota,
+        incoming_bytes=_declared_content_length(request),
+        config=config,
+    )
+    get_metrics_collector().record_plan_gate(outcome=decision.outcome)
+
+    if decision.outcome == "catalog_miss":
+        logger.warning(
+            f"PLAN_QUOTA catalog miss account={account_address} plan={plan_id}; allowing. "
+            f"The plans-cacher may be cold or this plan id is unknown to the catalog."
+        )
+        return True, None
+
+    if decision.outcome == "would_deny":
+        logger.warning(
+            f"PLAN_QUOTA would deny (observe mode) account={account_address} plan={plan_id} "
+            f"used={decision.used_bytes} limit={decision.quota_bytes}"
+        )
+        return True, None
+
+    if decision.outcome == "deny":
+        logger.warning(
+            f"PLAN_QUOTA denied account={account_address} plan={plan_id} "
+            f"used={decision.used_bytes} limit={decision.quota_bytes}"
+        )
+        bucket_match = re.match(r"^/([^/]+)", routing_path(request))
+        return True, s3_error_response(
+            code="QuotaExceeded",
+            message=plan_gate.quota_exceeded_message(decision),
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            BucketName=bucket_match.group(1) if bucket_match else "",
+        )
+
+    return True, None
+
+
 async def _check_can_upload(
     request: Request,
     logger: logging.Logger | logging.LoggerAdapter,
@@ -110,11 +196,7 @@ async def _check_can_upload(
     if request.method not in ("PUT", "POST"):
         return None
 
-    # AWS CLI v2+ uses chunked transfer encoding and sends the actual file size
-    # in x-amz-decoded-content-length instead of Content-Length
-    content_length = int(
-        request.headers.get("x-amz-decoded-content-length") or request.headers.get("content-length") or "0"
-    )
+    content_length = _declared_content_length(request)
     main_account = request.state.account.main_account
     arion_client = request.app.state.arion_client
     redis_accounts = request.app.state.redis_accounts_client
@@ -279,31 +361,52 @@ async def account_middleware(
                 )
                 get_metrics_collector().record_billing_bypass(surface="gateway")
             else:
-                redis_accounts_client = request.app.state.redis_accounts_client
-                request.state.account = await fetch_account_by_main_address(
-                    account_address,
-                    redis_accounts_client,
-                    config.substrate_url,
-                )
-                logger.debug(f"Checking credit for {request.method} operation: {path}")
-
-                if not request.state.account.has_credits:
-                    logger.warning(f"Access key account lacks credits: {account_address}")
-                    bucket_name = None
-                    bucket_match = re.match(r"^/([^/]+)", path)
-                    if bucket_match:
-                        bucket_name = bucket_match.group(1)
-
-                    return s3_error_response(
-                        code="InsufficientAccountCredit",
-                        message="The account does not have sufficient credit to perform this operation",
-                        status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                        BucketName=bucket_name if bucket_name else "",
+                # Billing plans run in PARALLEL with pay-as-you-go. An account on a plan buys a
+                # storage allowance rather than credits, so it skips BOTH gates below: the substrate
+                # has_credits check (a plan customer holds no substrate credits and would be 402'd
+                # by it) and Arion can_upload. An account with no plan falls straight through to the
+                # unchanged pay-as-you-go path.
+                plan_handled, plan_error = await _check_plan_quota(request, logger, account_address)
+                if plan_handled:
+                    request.state.account = HippiusAccount(
+                        id=account_address,
+                        main_account=account_address,
+                        has_credits=True,
+                        upload=True,
+                        delete=True,
                     )
+                    if plan_error is not None:
+                        return plan_error
+                    # Deliberately no `return await call_next(request)` here: falling out of the try
+                    # reaches the shared call_next at the end of the middleware. Calling it inside
+                    # this block would put the whole downstream request under the `except Exception`
+                    # below, turning any handler error into a 503 AccountVerificationError.
+                else:
+                    redis_accounts_client = request.app.state.redis_accounts_client
+                    request.state.account = await fetch_account_by_main_address(
+                        account_address,
+                        redis_accounts_client,
+                        config.substrate_url,
+                    )
+                    logger.debug(f"Checking credit for {request.method} operation: {path}")
 
-                can_upload_error = await _check_can_upload(request, logger)
-                if can_upload_error is not None:
-                    return can_upload_error
+                    if not request.state.account.has_credits:
+                        logger.warning(f"Access key account lacks credits: {account_address}")
+                        bucket_name = None
+                        bucket_match = re.match(r"^/([^/]+)", path)
+                        if bucket_match:
+                            bucket_name = bucket_match.group(1)
+
+                        return s3_error_response(
+                            code="InsufficientAccountCredit",
+                            message="The account does not have sufficient credit to perform this operation",
+                            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                            BucketName=bucket_name if bucket_name else "",
+                        )
+
+                    can_upload_error = await _check_can_upload(request, logger)
+                    if can_upload_error is not None:
+                        return can_upload_error
         except Exception as e:
             logger.exception(f"Error in access key account verification: {e}")
             return s3_error_response(

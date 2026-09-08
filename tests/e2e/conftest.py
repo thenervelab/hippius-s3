@@ -261,6 +261,7 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
                 "purger",
                 "janitor",
                 "account-cacher",
+                "plans-cacher",
                 "drain-agent",
                 "drain-allocator",
             ]:

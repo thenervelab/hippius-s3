@@ -68,6 +68,43 @@ configured something they did not. READ and READ_ACP are untouched: publishing o
 publicly is the point of several of these buckets. The predicate is `forbidden_write_grants` in
 [services/service_accounts.py](../../services/service_accounts.py).
 
+**Billing plans (parallel to pay-as-you-go).** A mutating access-key request now resolves the
+caller's plan before the credit gates. The branch order inside `account_middleware` is:
+
+```
+reads (GET/HEAD)      -> lightweight account, no gates
+service account       -> bypass everything                       (unchanged)
+on a billing plan     -> storage-quota gate                      (NEW)
+everything else       -> has_credits + Arion can_upload          (unchanged)
+```
+
+An account on a plan skips BOTH pay-as-you-go gates. That is not an optimisation: a plan customer
+holds no substrate credits, so leaving `has_credits` in place would 402 every one of them before the
+quota check ran. Deletes short-circuit to allow — a customer who downgraded below their usage has to
+be able to dig themselves out.
+
+Plan membership is read from two `redis-accounts` hashes populated by the `plans-cacher` worker;
+nothing is added to the auth path and `/objectstore/tokens/auth/` is untouched. Decision logic is
+[services/plan_gate.py](../services/plan_gate.py); the caches are
+[hippius_s3/services/plans_cache.py](../../services/plans_cache.py).
+
+Two failure postures, deliberately different:
+
+- **The lookup fails** (Redis down, malformed cached JSON) -> fall through to the pay-as-you-go
+  path. That is exactly what the code did before plans existed, so a Redis blip can never be a new
+  failure mode.
+- **The lookup succeeds but the quota is unknown** (cold catalog, unknown plan id) -> ALLOW, loudly.
+  A positively identified paying customer is never blocked because our cache has not warmed up.
+
+**Asymmetric verification.** The cheap `bucket_storage_usage` rollup may only ALLOW. Every denial is
+re-checked against the authoritative `SUM` first, under a timeout, allowing on timeout — so counter
+drift can cost us an over-quota upload but can never 402 a paying customer. Denials are rare, so the
+expensive query is affordable there.
+
+Kill switches, any one of which returns every account to pay-as-you-go:
+`HIPPIUS_PLANS_ENFORCEMENT_ENABLED=false`, `HIPPIUS_PLANS_ENFORCEMENT_MODE=observe` (evaluates and
+records `would_deny` but never refuses), or an empty `hippius_s3_plan_accounts` hash.
+
 ### [trailing_slash.py](trailing_slash.py) — `trailing_slash_normalizer`
 
 Keeps `/foo/bar/` and `/foo/bar` equivalent for S3 operations.

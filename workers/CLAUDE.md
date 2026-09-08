@@ -12,6 +12,7 @@ Worker entry points — the `run_*.py` scripts that actually run as pod processe
 | [run_janitor_in_loop.py](run_janitor_in_loop.py) | FS cache GC with replication gate, hot retention, and pressure modes. | Single instance |
 | [run_orphan_checker_in_loop.py](run_orphan_checker_in_loop.py) | Periodically scans the Hippius chain for orphaned files and enqueues cleanup. | Single instance |
 | [run_account_cacher_in_loop.py](run_account_cacher_in_loop.py) | Warms account credit cache from Substrate. | Single instance |
+| [run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py) | Scrapes the S3 billing-plan catalog + account→plan map from api.hippius.com into `redis-accounts`. | Single instance (**must stay `replicas: 1`**) |
 | [run_migrator_once.py](run_migrator_once.py) | One-shot data migration (e.g., v4→v5). Invoked as a K8s Job. | Job |
 | [cachet_health_check.py](cachet_health_check.py) | Pushes status to the external Cachet status page. | CronJob |
 
@@ -71,6 +72,45 @@ Config:
 ## Account cacher
 
 [run_account_cacher_in_loop.py](run_account_cacher_in_loop.py). Polls Substrate for account state (free/reserved balance, credits, bandwidth) and mirrors into `redis-accounts`. Cache TTL set by the cacher, not clients. `CACHER_LOOP_SLEEP=60`.
+
+## Plans cacher
+
+[run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py). Two independent poll loops in one
+process, feeding the billing-plan quota gate in `account_middleware`:
+
+| Loop | Endpoint | Interval | Redis key (on `redis-accounts`) |
+|---|---|---|---|
+| `catalog`  | `GET /s3-plans`          | 10 min (`HIPPIUS_PLANS_CATALOG_LOOP_SLEEP`)  | `HASH hippius_s3_plans` — plan_id → allowance |
+| `accounts` | `GET /s3-plans/accounts` |  5 min (`HIPPIUS_PLANS_ACCOUNTS_LOOP_SLEEP`) | `HASH hippius_s3_plan_accounts` — SS58 → plan_id |
+
+**This pod being down is not an outage.** Neither hash has a TTL and `redis-accounts` is
+`noeviction` + AOF, so the last known good maps keep serving through an api.hippius.com outage and
+across a Redis restart. Alert on `plans_cache_age_seconds`, not on pod restarts.
+
+Three invariants, all in [hippius_s3/services/plans_cache.py](../hippius_s3/services/plans_cache.py),
+each of which exists to stop the same failure — silently demoting plan customers to pay-as-you-go
+and 402ing them on their next upload:
+
+1. **Publication is a whole-hash build-then-`RENAME`.** `refresh_account_plans_once` fetches EVERY
+   page before publishing; a failure on page 7 of 20 leaves the live hash untouched.
+2. **An empty or heavily-shrunk map is refused** (`MAX_ACCOUNT_MAP_SHRINK_RATIO`, 50%). One bad
+   upstream deploy returning a truncated-but-valid list must not wipe the fleet's plans.
+3. **No TTL, ever.** A TTL would delete the last-known-good map during exactly the outage it exists
+   to survive.
+
+Pagination is bounded by `MAX_ACCOUNT_PAGES` so a self-referential `next` cursor cannot spin the
+worker forever without publishing.
+
+`replicas` must stay 1 — two replicas would not corrupt anything (last `RENAME` wins) but would
+double the upstream load for nothing.
+
+## Storage-usage reconciler
+
+[hippius_s3/scripts/reconcile_storage_usage.py](../hippius_s3/scripts/reconcile_storage_usage.py).
+Not a loop worker — a script, run as a Job or by hand. `bucket_storage_usage` is maintained by
+database triggers (see `migrations/20260908120000_bucket_storage_usage.sql`); this exists to PROVE
+they are correct. Expected drift is exactly zero, so any non-zero `usage_counter_drift_bytes` sample
+is a trigger defect rather than staleness. Run `--backfill` once after the migration.
 
 ## Migrator
 

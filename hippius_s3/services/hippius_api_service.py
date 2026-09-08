@@ -19,6 +19,7 @@ from typing import TypeVar
 
 import httpx
 from pydantic import BaseModel
+from pydantic import ConfigDict
 
 from hippius_s3.config import get_config
 
@@ -123,6 +124,50 @@ class ListFilesResponse(BaseModel):
     next: str | None
     previous: str | None
     results: list[FileItem]
+
+
+# ---------------------------------------------------------------------------
+# S3 billing plans.
+#
+# PLACEHOLDER SHAPES. Neither endpoint is deployed yet (every path variant 404s as of 2026-09-08),
+# so these model a guess at the payload. Two rules keep that survivable:
+#   * extra="ignore" everywhere, so a payload richer than we modelled parses instead of crashing
+#     the plans-cacher and stranding the whole fleet on last-known-good.
+#   * every field except the identifier is optional-with-default.
+# The wire -> internal translation is confined to _parse_plan_catalog / _parse_account_plans in
+# workers/run_plans_cacher_in_loop.py, so swapping in the real payload is one function each.
+# ---------------------------------------------------------------------------
+
+
+class S3PlanQuota(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    plan_id: str
+    name: str | None = None
+    # None means "this plan's allowance is unknown". It is NEVER read as "zero bytes allowed" --
+    # see PlanQuota.enforceable in hippius_s3/services/plans_cache.py.
+    storage_bytes: int | None = None
+
+
+class S3PlansResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    plans: list[S3PlanQuota] = []
+
+
+class AccountPlanEntry(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    account_id: str
+    plan_id: str | None = None
+
+
+class AccountPlansResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    accounts: list[AccountPlanEntry] = []
+    # Pagination shape is a guess; `next` is honoured if present, otherwise one page is assumed.
+    next: str | None = None
 
 
 class HippiusAPIError(Exception):
@@ -485,3 +530,38 @@ class HippiusApiClient:
 
         response.raise_for_status()
         return ListFilesResponse.model_validate(response.json())
+
+    @retry_on_error(retries=3, backoff=5.0)
+    async def get_s3_plans(self) -> S3PlansResponse:
+        """Fetch the S3 plan catalog (plan_id -> allowance).
+
+        Maps to: GET /s3-plans
+
+        Small and slow-changing; the plans-cacher polls it every 10 minutes. A failure here is not
+        an outage -- the last known good catalog stays in Redis with no TTL.
+        """
+        response = await self._client.get(
+            "/s3-plans",
+            headers=self._get_headers(),
+            timeout=httpx.Timeout(self._config.plans_api_timeout_seconds, connect=5.0),
+        )
+        response.raise_for_status()
+        return S3PlansResponse.model_validate(response.json())
+
+    @retry_on_error(retries=3, backoff=5.0)
+    async def get_account_plans(self, page: str | None = None) -> AccountPlansResponse:
+        """Fetch one page of the account -> plan_id map.
+
+        Maps to: GET /s3-plans/accounts
+
+        The caller MUST treat a mid-pagination failure as "publish nothing": a partial map demotes
+        every missing account to pay-as-you-go and 402s paying customers. See publish_account_plans.
+        """
+        response = await self._client.get(
+            "/s3-plans/accounts",
+            params={"page": page} if page else None,
+            headers=self._get_headers(),
+            timeout=httpx.Timeout(self._config.plans_api_timeout_seconds, connect=5.0),
+        )
+        response.raise_for_status()
+        return AccountPlansResponse.model_validate(response.json())

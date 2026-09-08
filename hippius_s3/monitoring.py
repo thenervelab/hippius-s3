@@ -83,6 +83,15 @@ AeadFailureOutcome = Literal["recovered", "unrecovered"]
 # a rolling deploy, so the counter must keep them apart.
 BillingBypassSurface = Literal["gateway", "uploader"]
 
+# The plan_gate_total axis. Mirrors GateMetricOutcome in gateway/services/plan_gate.py: the four
+# quota decisions plus "unavailable", which the middleware records when the plan caches could not be
+# consulted and it fell back to pay-as-you-go. The plan_id is deliberately NOT a label — it is
+# upstream-controlled, so labelling by it would let a pricing-page edit grow our cardinality.
+PlanGateOutcome = Literal["allow", "deny", "would_deny", "catalog_miss", "unavailable"]
+
+# Which plans-cacher poll loop a sample came from. Two values, fixed at the two _loop() call sites.
+PlansCacherLoop = Literal["catalog", "accounts"]
+
 
 class MetricsCollector:
     """OTel metrics for the API, gateway and workers.
@@ -564,6 +573,39 @@ class MetricsCollector:
             name="account_cacher_duration_seconds", description="Account-cacher cycle duration", unit="s"
         )
 
+        # S3 billing plans. `plan_gate_total` is the one to watch after a deploy: a spike in
+        # outcome=deny means the usage rollup is wrong, not that customers suddenly filled up.
+        # outcome=would_deny is shadow mode; outcome=catalog_miss and unavailable are both
+        # fail-open paths and should be ~0 in steady state.
+        self.plan_gate_total = self.meter.create_counter(
+            name="plan_gate_total",
+            description="Plan quota gate decisions (allow|deny|would_deny|catalog_miss|unavailable)",
+            unit="1",
+        )
+        self.plans_cacher_cycles_total = self.meter.create_counter(
+            name="plans_cacher_cycles_total",
+            description="Plans-cacher cycles run, by loop (catalog|accounts) and success",
+            unit="1",
+        )
+        self.plans_cacher_entries_total = self.meter.create_counter(
+            name="plans_cacher_entries_total", description="Entries published per plans-cacher loop", unit="1"
+        )
+        self.plans_cacher_duration_seconds = self.meter.create_histogram(
+            name="plans_cacher_duration_seconds", description="Plans-cacher cycle duration", unit="s"
+        )
+        # Age of the cached maps. The caches deliberately have no TTL so an upstream outage cannot
+        # delete them, which means staleness is invisible unless it is measured here.
+        self.plans_cache_age_seconds = self.meter.create_histogram(
+            name="plans_cache_age_seconds", description="Age of the cached plan maps", unit="s"
+        )
+        # Difference between the trigger-maintained rollup and ground truth, per reconciled bucket.
+        # Expected value is exactly 0 -- any non-zero sample is a trigger defect, not noise.
+        self.usage_counter_drift_bytes = self.meter.create_histogram(
+            name="usage_counter_drift_bytes",
+            description="bucket_storage_usage drift vs ground truth at reconcile time",
+            unit="By",
+        )
+
         self.cachet_health_checks_total = self.meter.create_counter(
             name="cachet_health_checks_total", description="Gateway health checks run by the cachet worker", unit="1"
         )
@@ -976,6 +1018,22 @@ class MetricsCollector:
         if accounts_cached > 0:
             self.account_cacher_accounts_cached_total.add(accounts_cached)
 
+    def record_plan_gate(self, outcome: PlanGateOutcome) -> None:
+        """One plan-quota decision. See plan_gate_total for what each outcome means."""
+        self.plan_gate_total.add(1, attributes={"outcome": outcome})
+
+    def record_plans_cacher_cycle(self, loop: PlansCacherLoop, success: bool, entries: int, duration: float) -> None:
+        self.plans_cacher_cycles_total.add(1, attributes={"loop": loop, "success": str(success).lower()})
+        self.plans_cacher_duration_seconds.record(duration, attributes={"loop": loop})
+        if entries > 0:
+            self.plans_cacher_entries_total.add(entries, attributes={"loop": loop})
+
+    def record_plans_cache_age(self, loop: PlansCacherLoop, age_seconds: float) -> None:
+        self.plans_cache_age_seconds.record(age_seconds, attributes={"loop": loop})
+
+    def record_usage_counter_drift(self, drift_bytes: int) -> None:
+        self.usage_counter_drift_bytes.record(drift_bytes)
+
     def record_cachet_check(self, status: str, update_success: bool) -> None:
         self.cachet_health_checks_total.add(1, attributes={"status": status})
         self.cachet_updates_total.add(1, attributes={"success": str(update_success).lower()})
@@ -1081,6 +1139,18 @@ class NullMetricsCollector:
         pass
 
     def record_orphan_checker_cycle(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_plan_gate(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_plans_cacher_cycle(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_plans_cache_age(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_usage_counter_drift(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_account_cacher_cycle(self, *args: object, **kwargs: object) -> None:

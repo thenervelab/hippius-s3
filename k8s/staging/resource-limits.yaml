@@ -38,6 +38,23 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: plans-cacher
+spec:
+  template:
+    spec:
+      containers:
+        - name: plans-cacher
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 512Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   name: janitor
 spec:
   template:

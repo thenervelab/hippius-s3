@@ -161,6 +161,44 @@ async def token_auth(payload: TokenAuthRequest):
     )
 
 
+# --------------------------------------------------------------------------- S3 billing plans
+#
+# Mutable at runtime so a test can change a plan or move an account between plans and then watch
+# the gate follow. POST /_plans replaces both maps; the plans-cacher picks the change up on its
+# next cycle (or immediately, if the test restarts it).
+#
+# MOCK_ACCOUNT_ADDRESS starts with NO plan, so the default e2e stack exercises the unchanged
+# pay-as-you-go path and every existing test keeps passing.
+plan_catalog: list[dict] = [
+    {"plan_id": "plan-starter", "name": "Starter", "storage_bytes": 1_000_000_000},
+    {"plan_id": "plan-scale", "name": "Scale", "storage_bytes": 1_000_000_000_000},
+]
+account_plans: list[dict] = []
+
+
+@app.get("/s3-plans")
+async def s3_plans():
+    await fault.gate("plans")
+    return {"plans": plan_catalog}
+
+
+@app.get("/s3-plans/accounts")
+async def s3_plan_accounts(page: str | None = None):
+    await fault.gate("account_plans")
+    return {"accounts": account_plans, "next": None}
+
+
+@app.post("/_plans")
+async def set_plans(payload: dict):
+    """Test hook. `{"plans": [...], "accounts": [...]}` — either key may be omitted."""
+    global plan_catalog, account_plans
+    if "plans" in payload:
+        plan_catalog = payload["plans"]
+    if "accounts" in payload:
+        account_plans = payload["accounts"]
+    return {"plans": len(plan_catalog), "accounts": len(account_plans)}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}

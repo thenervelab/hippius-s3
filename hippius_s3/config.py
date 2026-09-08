@@ -176,6 +176,34 @@ class Config:
     can_upload_transient_retries: int = env("CAN_UPLOAD_TRANSIENT_RETRIES:2", convert=int)
     can_upload_transient_retry_delay_seconds: float = env("CAN_UPLOAD_TRANSIENT_RETRY_DELAY_SECONDS:0.4", convert=float)
 
+    # S3 billing plans. Accounts on a subscription plan are gated on a storage quota instead of
+    # substrate credits + Arion can_upload; accounts with no plan keep the pay-as-you-go path
+    # untouched. Both maps are scraped by the plans-cacher worker into redis-accounts.
+    #
+    # The kill switch: with this false, resolve_plan() returns None for everyone and every account
+    # takes the pay-as-you-go path, exactly as before the feature existed.
+    plans_enforcement_enabled: bool = env(
+        "HIPPIUS_PLANS_ENFORCEMENT_ENABLED:false", convert=lambda x: x.lower() == "true"
+    )
+    # "observe" runs the whole gate and records what it WOULD have denied without ever returning
+    # 402. Shadow mode is how we validate the usage rollup against ground truth at fleet scale
+    # before a wrong number can cost a customer an upload.
+    plans_enforcement_mode: str = env("HIPPIUS_PLANS_ENFORCEMENT_MODE:observe", convert=str)
+    plans_catalog_loop_sleep: int = env("HIPPIUS_PLANS_CATALOG_LOOP_SLEEP:600", convert=int)
+    plans_accounts_loop_sleep: int = env("HIPPIUS_PLANS_ACCOUNTS_LOOP_SLEEP:300", convert=int)
+    # Per-attempt bound on the scrape. Retry COUNTS cannot bound latency when the per-attempt cost
+    # is unbounded, and this worker holds no request.
+    plans_api_timeout_seconds: float = env("HIPPIUS_PLANS_API_TIMEOUT_SECONDS:30.0", convert=float)
+    # Age past which the cached maps are reported stale. Serving stale is still strictly better than
+    # failing closed, so this drives a metric and an alert, never a behaviour change.
+    plans_stale_after_seconds: int = env("HIPPIUS_PLANS_STALE_AFTER_SECONDS:3600", convert=int)
+    # How long an account's total usage is cached. Invalidated on write, so this only bounds the
+    # window in which concurrent in-flight requests can overshoot a quota.
+    usage_cache_ttl_seconds: int = env("HIPPIUS_USAGE_CACHE_TTL_SECONDS:30", convert=int)
+    # Bound on the authoritative SUM run before a denial. On timeout the gate ALLOWS: a slow
+    # ground-truth query must never become a 402 for a paying customer.
+    usage_authoritative_timeout_seconds: float = env("HIPPIUS_USAGE_AUTHORITATIVE_TIMEOUT_SECONDS:5.0", convert=float)
+
     # ATS (Apache Traffic Server) reverse-proxy cache endpoints (CSV). When ATS_CACHE_ENDPOINT is unset,
     # all PURGE + public Cache-Control logic becomes a no-op — safe default for local dev.
     # Multiple endpoints are purged in parallel so every ATS pod's cache stays consistent.
