@@ -278,3 +278,23 @@ async def test_pagination_is_bounded_so_a_looping_cursor_cannot_hang_the_worker(
     with patch.object(pc, "HippiusApiClient", api):
         with pytest.raises(RuntimeError, match="pagination exceeded"):
             await pc.refresh_plan_roll_once(FakeRedis())
+
+
+@pytest.mark.asyncio
+async def test_a_cold_start_with_no_subscribers_completes_the_cycle() -> None:
+    """End to end for the cold-start case: an empty roll must publish, record meta, and report
+    success — otherwise the cacher no-ops forever on a fresh environment and nothing alarms."""
+    redis = FakeRedis()
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page(results=[])))
+    collector = MagicMock()
+
+    with (
+        patch.object(pc, "HippiusApiClient", api),
+        patch.object(pc, "get_metrics_collector", return_value=collector),
+    ):
+        assert await pc.run_cycle(redis) is True
+        await pc._report_cache_age(redis)
+
+    meta = await plans_cache.get_meta(redis)
+    assert meta["fetched_at"] > 0
+    assert collector.record_plans_cache_age.called, "the staleness metric must be recorded"

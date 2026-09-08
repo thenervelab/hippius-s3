@@ -88,6 +88,24 @@ async def resolve_plan(
         raise PlanLookupUnavailable(str(e)) from e
 
 
+async def _cached_bytes(db: Any, redis_accounts_client: Any, main_account_id: str, config: Config) -> int:
+    """Cached usage total, raising PlanLookupUnavailable on any failure.
+
+    This read touches redis-accounts AND Postgres, so without the wrapper a pool timeout, a
+    statement cancellation or a corrupt cached value would escape into account_middleware's blanket
+    handler and answer 503 AccountVerificationError -- making Postgres a hard dependency of the
+    gateway's write path, for plan accounts only. The module promises the opposite posture: a
+    failure to consult our own state falls back to pay-as-you-go, which is what the account would
+    have got before this feature existed.
+    """
+    try:
+        return await usage_service.get_account_bytes(
+            db, redis_accounts_client, main_account_id, config.usage_cache_ttl_seconds
+        )
+    except Exception as e:
+        raise PlanLookupUnavailable(f"usage lookup failed: {e}") from e
+
+
 async def evaluate_quota(
     db: Any,
     redis_accounts_client: Any,
@@ -102,12 +120,7 @@ async def evaluate_quota(
         return PlanDecision(plan_id=plan_id, outcome="catalog_miss")
 
     limit = quota.storage_bytes or 0
-    used = await usage_service.get_account_bytes(
-        db,
-        redis_accounts_client,
-        main_account_id,
-        config.usage_cache_ttl_seconds,
-    )
+    used = await _cached_bytes(db, redis_accounts_client, main_account_id, config)
 
     if used + incoming_bytes <= limit:
         return PlanDecision(plan_id=plan_id, outcome="allow", quota_bytes=limit, used_bytes=used)
@@ -156,12 +169,7 @@ async def shadow_evaluate(
         return PlanDecision(plan_id=plan_id, outcome="catalog_miss")
 
     limit = quota.storage_bytes or 0
-    used = await usage_service.get_account_bytes(
-        db,
-        redis_accounts_client,
-        main_account_id,
-        config.usage_cache_ttl_seconds,
-    )
+    used = await _cached_bytes(db, redis_accounts_client, main_account_id, config)
     outcome: Outcome = "allow" if used + incoming_bytes <= limit else "would_deny"
     return PlanDecision(plan_id=plan_id, outcome=outcome, quota_bytes=limit, used_bytes=used)
 
@@ -179,16 +187,29 @@ async def _authoritative_bytes(db: Any, main_account_id: str, config: Config) ->
         return None
 
 
+def format_bytes(value: int) -> str:
+    """Human-readable size in BINARY units.
+
+    Plan allowances arrive as powers of two (10995116277760 is 10 TiB), so dividing by 1e9 renders
+    a "10 TB" plan as "10995.12 GB" -- a number no customer can reconcile with anything they were
+    sold. Units drifting between what we enforce and what we display is a known past bug in this
+    ecosystem, and the console fix in this same change exists to stop exactly that.
+    """
+    for unit, size in (("TiB", 1 << 40), ("GiB", 1 << 30), ("MiB", 1 << 20)):
+        if abs(value) >= size:
+            return f"{value / size:.2f} {unit}"
+    return f"{value} bytes"
+
+
 def quota_exceeded_message(decision: PlanDecision) -> str:
     """The 402 body. Clients surface the S3 <Message> verbatim, so this is the entire UX.
 
     Must not contain any phrase from _TRANSIENT_BILLING_ERROR_MARKERS in account.py -- those are
     substring-matched against billing error text to decide what is retryable.
     """
-    limit_gb = (decision.quota_bytes or 0) / 1_000_000_000
-    used_gb = (decision.used_bytes or 0) / 1_000_000_000
     return (
-        f"Your plan includes {limit_gb:.2f} GB of storage and you are currently using "
-        f"{used_gb:.2f} GB. This upload would exceed the storage quota allowed by your plan. "
-        f"Delete objects you no longer need, or upgrade to a plan with more storage."
+        f"Your plan includes {format_bytes(decision.quota_bytes or 0)} of storage and you are "
+        f"currently using {format_bytes(decision.used_bytes or 0)}. This upload would exceed the "
+        f"storage quota allowed by your plan. Delete objects you no longer need, or upgrade to a "
+        f"plan with more storage."
     )

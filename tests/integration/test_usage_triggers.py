@@ -385,7 +385,7 @@ async def test_bulk_deleting_a_whole_bucket_out_of_band_zeroes_it(pg_tx: asyncpg
 
 
 async def test_the_counter_never_goes_negative(pg_tx: asyncpg.Connection, account: str) -> None:
-    """A double decrement must floor at 0. A negative counter would read as unlimited free storage."""
+    """A double decrement must floor at 0 on the UPDATE arm."""
     bucket = await make_bucket(pg_tx, account)
     await put_object(pg_tx, bucket, "a", GB)
 
@@ -394,6 +394,50 @@ async def test_the_counter_never_goes_negative(pg_tx: asyncpg.Connection, accoun
     counter, objects = await rollup(pg_tx, bucket)
     assert counter == 0
     assert objects == 0
+
+
+async def test_a_negative_delta_on_a_bucket_with_no_row_yet_cannot_insert_a_negative(
+    pg_tx: asyncpg.Connection, account: str
+) -> None:
+    """The INSERT arm needs the same clamp as the UPDATE arm, and only this case reaches it.
+
+    The triggers are created before the backfill runs, so on deploy every pre-existing bucket has no
+    rollup row. The first delete or overwrite there is a negative delta with nothing to conflict
+    against. An unclamped INSERT would store it, and because the account total SUMs across buckets
+    that one negative row would subtract from the account's usage and inflate its headroom.
+    """
+    bucket = await make_bucket(pg_tx, account)
+    assert await rollup(pg_tx, bucket) == (0, 0), "no row yet"
+
+    await pg_tx.execute("SELECT usage_apply($1, $2, $3)", bucket, -(5 * GB), -1)
+
+    counter, objects = await rollup(pg_tx, bucket)
+    assert counter == 0
+    assert objects == 0
+
+    row = await pg_tx.fetchrow(
+        "SELECT COALESCE(SUM(bytes_used), 0)::bigint AS bytes FROM bucket_storage_usage WHERE main_account_id = $1",
+        account,
+    )
+    assert int(row["bytes"]) >= 0, "a negative bucket row would inflate the account's headroom"
+
+
+async def test_decrements_still_work_after_the_insert_arm_is_clamped(
+    pg_tx: asyncpg.Connection, account: str
+) -> None:
+    """Guards the obvious wrong fix.
+
+    Clamping the INSERT arm's SELECT and leaving DO UPDATE on EXCLUDED.* would make EXCLUDED carry
+    the clamped value, flooring every decrement at 0 -- the counter could then only ever grow, which
+    is worse than the bug being fixed. The DO UPDATE arm adds the raw parameters for this reason.
+    """
+    bucket = await make_bucket(pg_tx, account)
+    await put_object(pg_tx, bucket, "a", 10 * GB)
+    assert (await rollup(pg_tx, bucket))[0] == 10 * GB
+
+    await pg_tx.execute("SELECT usage_apply($1, $2, $3)", bucket, -(4 * GB), 0)
+
+    assert (await rollup(pg_tx, bucket))[0] == 6 * GB, "a decrement on an existing row must subtract"
 
 
 # --------------------------------------------------------------------------- account totals + repair

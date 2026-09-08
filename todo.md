@@ -191,6 +191,38 @@ Fast-path copy: rewraps the DEK under the destination's AAD, copies `chunk_backe
 
 **Proposed**: add a prominent comment block at [copy_service_v5.py:24](hippius_s3/services/copy_service_v5.py) documenting the invariant ("fast path requires either (a) non-MPU single-part object OR (b) explicit FS backfill of all chunks into the destination object_id path"). Consider a feature flag before re-enabling for MPU.
 
+### P1 — Billing plans: the quota gate keys on the CALLER, the rollup on the OWNER
+
+`account_middleware` runs before `acl_middleware`, so `bucket_owner_id` is not resolved when the
+plan gate runs; it passes the caller's `account_address` as `main_account_id`. But
+`bucket_storage_usage.main_account_id` is copied from `buckets.main_account_id` — the owner. Billing
+here is owner-pays (Arion charges `object_versions.address`).
+
+Consequence: a plan customer at 100% of quota who holds a cross-account WRITE grant on someone
+else's bucket passes the gate on every PUT — their own total never grows — while the bytes accrue to
+the owner's rollup, which no gate consults for that request. `can_upload` has the same caller/owner
+asymmetry today, so this is not a regression, but it becomes load-bearing once a quota is enforced.
+
+Fixing it needs the owner resolved before the gate, which means either reordering the middleware
+chain or resolving the bucket owner twice. Size it first: `plan_gate_total` plus a cross-account
+counter will say whether this is a real pattern or a theoretical one.
+
+### P2 — Billing plans: an overwrite is charged as if it were additive
+
+`evaluate_quota` tests `used + incoming_bytes <= limit`, and `used` already contains the bytes of
+the version being replaced. A customer at 99% who re-uploads an unchanged file — an ordinary
+`aws s3 sync` re-run — is refused for a net-zero write.
+
+The gate runs before the object key is resolved, so a correct fix needs the current version's size
+at that point. Until then the 402 is technically wrong for overwrites, though it errs toward
+refusing rather than admitting.
+
+### P2 — Billing plans: in-flight MPU parts are uncounted until Complete
+
+`multipart_uploads` has no size column and `object_versions.size_bytes` only lands at
+`mpu_complete`, so part uploads are gated individually on their declared length but never against
+the accumulating total. Gating `CompleteMultipartUpload` on the summed part sizes would close it.
+
 ### P2 — Gateway → API streaming hop
 
 **What**: Every request streams through `gateway → forward_service → httpx → api`. Client body is read once via `request.stream()`, forwarded via `httpx.AsyncClient.stream()`, and the API response is re-streamed to the client via `StreamingResponse`. No buffering. ([hippius_s3/gateway/services/forward_service.py:113-170](hippius_s3/gateway/services/forward_service.py)).

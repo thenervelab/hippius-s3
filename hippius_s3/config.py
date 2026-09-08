@@ -268,9 +268,15 @@ class Config:
     # Age past which the cached maps are reported stale. Serving stale is still strictly better than
     # failing closed, so this drives a metric and an alert, never a behaviour change.
     plans_stale_after_seconds: int = env("HIPPIUS_PLANS_STALE_AFTER_SECONDS:3600", convert=int)
-    # How long an account's total usage is cached. Invalidated on write, so this only bounds the
-    # window in which concurrent in-flight requests can overshoot a quota.
-    usage_cache_ttl_seconds: int = env("HIPPIUS_USAGE_CACHE_TTL_SECONDS:30", convert=int)
+    # How long an account's total usage is cached on the request path.
+    #
+    # This TTL is the ONLY bound on quota overshoot. The rollup is maintained by database triggers,
+    # so there is no application write path to hang an invalidation off — every write inside the
+    # window reads the same total, and an account can therefore exceed its allowance by roughly one
+    # window's worth of upload before the gate notices. Kept short for the same reason
+    # CAN_UPLOAD_CACHE_TTL_SECONDS is: the read it saves is one indexed sum over a handful of rows,
+    # which is cheap enough that a longer window buys very little and costs enforcement accuracy.
+    usage_cache_ttl_seconds: int = env("HIPPIUS_USAGE_CACHE_TTL_SECONDS:10", convert=int)
     # Bound on the authoritative SUM run before a denial. On timeout the gate ALLOWS: a slow
     # ground-truth query must never become a 402 for a paying customer.
     usage_authoritative_timeout_seconds: float = env("HIPPIUS_USAGE_AUTHORITATIVE_TIMEOUT_SECONDS:5.0", convert=float)

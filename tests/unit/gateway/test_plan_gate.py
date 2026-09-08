@@ -256,12 +256,28 @@ async def test_a_zero_byte_request_is_allowed_when_already_at_the_limit() -> Non
 
 
 def test_the_denial_message_carries_the_real_numbers_and_an_action() -> None:
-    decision = plan_gate.PlanDecision(plan_id="pro", outcome="deny", quota_bytes=10 * GB, used_bytes=12 * GB)
+    TiB = 1 << 40
+    decision = plan_gate.PlanDecision(plan_id="pro", outcome="deny", quota_bytes=10 * TiB, used_bytes=12 * TiB)
     message = plan_gate.quota_exceeded_message(decision)
 
-    assert "10.00 GB" in message
-    assert "12.00 GB" in message
+    assert "10.00 TiB" in message
+    assert "12.00 TiB" in message
     assert "upgrade" in message.lower()
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (10995116277760, "10.00 TiB"),  # the real "10 TB" plan, as the endpoint denominates it
+        (54975581388800, "50.00 TiB"),
+        (5 * (1 << 30), "5.00 GiB"),
+        (0, "0 bytes"),
+    ],
+)
+def test_sizes_are_rendered_in_binary_units(value: int, expected: str) -> None:
+    """Dividing by 1e9 would render the 10 TiB plan as "10995.12 GB" — a number no customer can
+    reconcile with what they were sold, and a unit mismatch against the console."""
+    assert plan_gate.format_bytes(value) == expected
 
 
 def test_the_denial_message_cannot_be_misread_as_a_transient_billing_error() -> None:

@@ -26,6 +26,7 @@ from tests.unit.mocks.mock_arion_service import MockArionService
 
 
 GB = 1_000_000_000
+TiB = 1 << 40
 ACCOUNT = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 
 
@@ -107,6 +108,10 @@ def build_app(
     async def endpoint(request: Request) -> dict[str, Any]:
         return {"plan_id": getattr(request.state, "plan_id", None)}
 
+    @app.api_route("/test-bucket", methods=["GET", "PUT", "POST", "DELETE", "HEAD"])
+    async def bucket_endpoint(request: Request) -> dict[str, Any]:
+        return {"plan_id": getattr(request.state, "plan_id", None)}
+
     async def inject_access_key(request: Request, call_next: Any) -> Any:
         request.state.auth_method = "access_key"
         request.state.account_address = ACCOUNT
@@ -139,9 +144,9 @@ async def test_a_plan_account_over_quota_is_refused_with_a_useful_message(plan_c
         plan_config,
         monkeypatch,
         plan_id="pro",
-        storage_bytes=10 * GB,
-        cached_usage=11 * GB,
-        authoritative_usage=11 * GB,
+        storage_bytes=10 * TiB,
+        cached_usage=11 * TiB,
+        authoritative_usage=11 * TiB,
     )
 
     response = await put(app)
@@ -149,7 +154,10 @@ async def test_a_plan_account_over_quota_is_refused_with_a_useful_message(plan_c
     assert response.status_code == 402
     body = response.content.decode()
     assert "QuotaExceeded" in body
-    assert "10.00 GB" in body
+    # Binary units, matching how the allowance is actually denominated upstream: a "10 TB" plan is
+    # 10995116277760 bytes, which decimal formatting would render as the meaningless "10995.12 GB".
+    assert "10.00 TiB" in body
+    assert "11.00 TiB" in body
     assert "upgrade" in body.lower()
     assert len(arion.can_upload_calls) == 0
 
@@ -369,3 +377,80 @@ async def test_a_service_account_is_still_exempt_before_the_plan_branch(plan_con
 
     assert (await put(app)).status_code == 200
     assert len(arion.can_upload_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_an_over_quota_plan_account_can_still_bulk_delete(plan_config: Any, monkeypatch: Any) -> None:
+    """S3 multi-object delete is POST /{bucket}?delete — the verb alone does not identify a delete.
+
+    `aws s3 rm --recursive` and `aws s3 sync --delete` issue exactly this. Gating it would answer an
+    over-quota customer's bulk delete with a 402 whose message tells them to delete things.
+    """
+    app, _ = build_app(
+        plan_config,
+        monkeypatch,
+        plan_id="pro",
+        storage_bytes=1 * GB,
+        cached_usage=500 * GB,
+        authoritative_usage=500 * GB,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/test-bucket?delete",
+            content=b"<Delete><Object><Key>a</Key></Object></Delete>",
+            headers={"content-length": "46"},
+        )
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_a_normal_post_is_still_quota_gated(plan_config: Any, monkeypatch: Any) -> None:
+    """The ?delete carve-out must not accidentally exempt CompleteMultipartUpload and friends."""
+    app, _ = build_app(
+        plan_config,
+        monkeypatch,
+        plan_id="pro",
+        storage_bytes=1 * GB,
+        cached_usage=500 * GB,
+        authoritative_usage=500 * GB,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/test-bucket/test-key?uploads", content=b"x", headers={"content-length": "1"})
+
+    assert response.status_code == 402
+
+
+@pytest.mark.asyncio
+async def test_a_usage_lookup_failure_falls_back_to_pay_as_you_go(plan_config: Any, monkeypatch: Any) -> None:
+    """The usage read touches Postgres. A pool timeout there must not become a 503 for plan
+    accounts — that would make Postgres a hard dependency of the gateway's write path, for plan
+    customers only, which is the opposite of this module's stated posture."""
+    app, arion = build_app(plan_config, monkeypatch, plan_id="pro", storage_bytes=10 * GB)
+    monkeypatch.setattr(
+        "hippius_s3.gateway.services.plan_gate.usage_service.get_account_bytes",
+        AsyncMock(side_effect=RuntimeError("connection pool exhausted")),
+    )
+
+    response = await put(app)
+
+    assert response.status_code == 200, "must not 503"
+    assert len(arion.can_upload_calls) == 1, "falls back to the pay-as-you-go path"
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_cached_usage_value_falls_back_rather_than_500ing(plan_config: Any, monkeypatch: Any) -> None:
+    app, arion = build_app(plan_config, monkeypatch, plan_id="pro", storage_bytes=10 * GB)
+
+    class CorruptRedis(PlanRedis):
+        async def get(self, key: str) -> bytes | None:
+            if key.startswith("hippius_s3_usage:"):
+                return b"not-a-number"
+            return None
+
+    app.state.redis_accounts_client = CorruptRedis("pro", 10 * GB, 0)
+
+    assert (await put(app)).status_code == 200
+    assert len(arion.can_upload_calls) == 1

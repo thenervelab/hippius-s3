@@ -52,11 +52,6 @@ async def get_account_bytes(
     return total
 
 
-async def invalidate_account_bytes(redis_client: Any, main_account_id: str) -> None:
-    """Drop the cached total. Best-effort -- a stale entry only shortens the enforcement lag."""
-    await redis_client.delete(_cache_key(main_account_id))
-
-
 async def get_account_bytes_authoritative(db: Any, main_account_id: str) -> int:
     """Ground-truth total. Expensive; see the query header for who is allowed to call it."""
     row = await db.fetchrow(get_query("get_account_storage_usage_authoritative"), main_account_id)

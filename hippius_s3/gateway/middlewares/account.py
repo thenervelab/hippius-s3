@@ -115,6 +115,20 @@ def _declared_content_length(request: Request) -> int:
     return int(request.headers.get("x-amz-decoded-content-length") or request.headers.get("content-length") or "0")
 
 
+def _adds_storage(request: Request) -> bool:
+    """Whether this operation can ADD stored bytes, and so is subject to the plan quota.
+
+    Deletes free space and must never be quota-gated — that is what lets a customer who downgraded
+    below their current usage dig themselves out. Judging that on the HTTP verb alone is wrong:
+    S3's multi-object delete is `POST /{bucket}?delete`, which is what `aws s3 rm --recursive` and
+    `aws s3 sync --delete` actually issue. Gating it would answer an over-quota customer's bulk
+    delete with a 402 whose message tells them to delete things.
+    """
+    if request.method not in ("PUT", "POST"):
+        return False
+    return "delete" not in request.query_params
+
+
 async def _log_plan_shadow(
     request: Request,
     logger: logging.Logger | logging.LoggerAdapter,
@@ -138,7 +152,7 @@ async def _log_plan_shadow(
     Nothing in here may break the request. The shadow path is pure observation, so a failure to
     produce a log line is swallowed -- the alternative is a diagnostic feature 500ing live uploads.
     """
-    if request.method not in ("PUT", "POST"):
+    if not _adds_storage(request):
         return
 
     incoming = _declared_content_length(request)
@@ -185,38 +199,40 @@ async def _check_plan_quota(
     """
     redis_accounts = request.app.state.redis_accounts_client
 
+    # The whole plan evaluation sits in one try: BOTH the plan lookup and the usage read consult
+    # our own state (redis-accounts, and Postgres for the usage rollup), and neither is worth
+    # failing a customer's upload over. Any inability to reach a verdict falls back to the
+    # pay-as-you-go path, which is exactly what the account would have got before this feature
+    # existed — so nothing here can be a NEW failure mode.
     try:
         resolved = await plan_gate.resolve_plan(redis_accounts, account_address, config)
+        if resolved is None:
+            return False, None
+
+        quota = resolved
+        plan_id = quota.plan_id
+        request.state.plan_id = plan_id
+
+        if not config.enable_billing_plans:
+            await _log_plan_shadow(request, logger, account_address, quota)
+            return False, None
+
+        if not _adds_storage(request):
+            get_metrics_collector().record_plan_gate(outcome="allow")
+            return True, None
+
+        decision = await plan_gate.evaluate_quota(
+            db=request.app.state.postgres_pool,
+            redis_accounts_client=redis_accounts,
+            main_account_id=account_address,
+            quota=quota,
+            incoming_bytes=_declared_content_length(request),
+            config=config,
+        )
     except plan_gate.PlanLookupUnavailable as e:
         logger.warning(f"PLAN_LOOKUP unavailable account={account_address}: {e}; falling back to pay-as-you-go")
         get_metrics_collector().record_plan_gate(outcome="unavailable")
         return False, None
-
-    if resolved is None:
-        return False, None
-
-    quota = resolved
-    plan_id = quota.plan_id
-    request.state.plan_id = plan_id
-
-    if not config.enable_billing_plans:
-        await _log_plan_shadow(request, logger, account_address, quota)
-        return False, None
-
-    # Deletes free space; never gate them on a quota. This is what lets a customer who downgraded
-    # below their current usage dig themselves out instead of being stuck.
-    if request.method not in ("PUT", "POST"):
-        get_metrics_collector().record_plan_gate(outcome="allow")
-        return True, None
-
-    decision = await plan_gate.evaluate_quota(
-        db=request.app.state.postgres_pool,
-        redis_accounts_client=redis_accounts,
-        main_account_id=account_address,
-        quota=quota,
-        incoming_bytes=_declared_content_length(request),
-        config=config,
-    )
     # Mapped explicitly, like the shadow arm: the label set stays closed, and anything that is not
     # a hard deny or a catalog miss is recorded as what actually happened to the request — allowed.
     enforced_outcome: PlanGateOutcome = (

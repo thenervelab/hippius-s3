@@ -229,3 +229,28 @@ async def test_plan_quota_json_shape_is_what_the_worker_writes(redis: FakeRedis)
     await plans_cache.publish_plan_roll(redis, {"a": acct("pro", 5)}, {"pro": {"h256": "0x1", "storage_bytes": 5}})
     assert json.loads(redis.hashes[PLAN_CATALOG_KEY]["pro"]) == {"h256": "0x1", "storage_bytes": 5}
     assert json.loads(redis.hashes[PLAN_ACCOUNTS_KEY]["a"]) == {"plan": "pro", "storage_bytes": 5}
+
+
+@pytest.mark.asyncio
+async def test_an_empty_roll_on_a_cold_cache_publishes_cleanly(redis: FakeRedis) -> None:
+    """A fresh deploy with no subscribers yet must not wedge the cacher.
+
+    RENAME on a never-written scratch key raises "no such key". Because accounts publish before the
+    catalog, that aborted the whole cycle — silently, since run_cycle swallows it, and permanently,
+    since touch_meta never ran so the staleness alarm had no timestamp to fire on. It is also the
+    default e2e state.
+    """
+    accounts, plans = await plans_cache.publish_plan_roll(redis, {}, {"pro": {"storage_bytes": 1}})
+
+    assert accounts == 0
+    assert plans == 1
+    assert await plans_cache.get_plan_for_account(redis, "anyone") is None
+
+
+@pytest.mark.asyncio
+async def test_an_empty_roll_still_records_meta_so_staleness_can_alarm(redis: FakeRedis) -> None:
+    await plans_cache.publish_plan_roll(redis, {}, {})
+    await plans_cache.touch_meta(redis, 0, 0)
+
+    meta = await plans_cache.get_meta(redis)
+    assert meta["fetched_at"] > 0, "without this the age metric is never recorded"

@@ -79,6 +79,16 @@ async def _publish_hash(redis_client: Any, key: str, entries: Mapping[str, str])
     building = key + _BUILDING_SUFFIX
     await redis_client.delete(building)
 
+    if not entries:
+        # RENAME on a key that was never written raises "no such key", and because accounts publish
+        # before the catalog that would abort the whole cycle -- silently, since run_cycle swallows
+        # it, and permanently, since touch_meta never runs so the staleness alarm has no timestamp
+        # to fire on. Reaching here with nothing is legitimate: publish_plan_roll has already
+        # refused an empty roll over a non-empty live hash, so this is the genuinely-zero case
+        # (a fresh deploy before the first subscriber, and the default e2e state). Clear and return.
+        await redis_client.delete(key)
+        return 0
+
     pipe = redis_client.pipeline()
     written = 0
     for field, value in entries.items():

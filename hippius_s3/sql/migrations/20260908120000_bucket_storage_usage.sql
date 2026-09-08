@@ -115,8 +115,18 @@ $$;
 -- here fails a user's PUT. A missing `buckets` row therefore inserts nothing rather than erroring --
 -- INSERT..SELECT yields zero rows and the statement is a no-op.
 --
--- GREATEST(0, ...) clamps both counters. A counter driven negative by a double-decrement must never
--- read as "this account stores negative bytes" and hand out unlimited free storage.
+-- GREATEST(0, ...) clamps both counters, on BOTH arms. A counter driven negative must never read as
+-- "this account stores negative bytes": get_account_storage_usage.sql SUMs across an account's
+-- buckets, so one negative row would subtract from the account total and inflate its headroom.
+--
+-- The INSERT arm matters as much as the UPDATE arm, and is easy to miss. The triggers are created
+-- before the backfill runs, so on deploy EVERY pre-existing bucket has no rollup row yet — the
+-- first delete or overwrite on such a bucket arrives here as a negative delta with nothing to
+-- conflict against, and an unclamped INSERT would store it verbatim.
+--
+-- The DO UPDATE arm deliberately adds p_bytes/p_objects rather than EXCLUDED.*: EXCLUDED carries
+-- the INSERT arm's already-clamped values, so using it here would floor every decrement at 0 and
+-- the counter could only ever grow.
 CREATE OR REPLACE FUNCTION public.usage_apply(
     p_bucket_id uuid,
     p_bytes bigint,
@@ -130,12 +140,15 @@ BEGIN
 
     INSERT INTO public.bucket_storage_usage AS bsu
         (bucket_id, main_account_id, bytes_used, objects_count)
-    SELECT p_bucket_id, b.main_account_id, COALESCE(p_bytes, 0), COALESCE(p_objects, 0)
+    SELECT p_bucket_id,
+           b.main_account_id,
+           GREATEST(0, COALESCE(p_bytes, 0)),
+           GREATEST(0, COALESCE(p_objects, 0))
     FROM public.buckets b
     WHERE b.bucket_id = p_bucket_id
     ON CONFLICT (bucket_id) DO UPDATE
-        SET bytes_used    = GREATEST(0, bsu.bytes_used    + EXCLUDED.bytes_used),
-            objects_count = GREATEST(0, bsu.objects_count + EXCLUDED.objects_count),
+        SET bytes_used    = GREATEST(0, bsu.bytes_used    + COALESCE(p_bytes, 0)),
+            objects_count = GREATEST(0, bsu.objects_count + COALESCE(p_objects, 0)),
             updated_at    = now();
 END $$;
 
