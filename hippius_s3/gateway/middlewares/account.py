@@ -106,9 +106,11 @@ def _declared_content_length(request: Request) -> int:
     AWS CLI v2+ uses chunked transfer encoding and sends the real size in
     x-amz-decoded-content-length instead of Content-Length.
 
-    Returns 0 when neither header is present, which makes both the can_upload gate and the plan
-    quota gate pass trivially. That hole predates plans (a chunked upload with no declared length,
-    and CopyObject, both arrive as 0) and is unchanged here — see todo.md.
+    This is a CLAIM, not a measurement: it is whatever the caller declared, and it is 0 when neither
+    header is present. Treat it as a lower bound on the write, never as its true size. Both billing
+    gates have always been built on it — the plan gate inherits exactly the same precision as
+    can_upload, no better and no worse. Anything that needs the real figure must be enforced after
+    the write, where it is known. See todo.md.
     """
     return int(request.headers.get("x-amz-decoded-content-length") or request.headers.get("content-length") or "0")
 

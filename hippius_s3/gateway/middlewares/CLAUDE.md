@@ -118,10 +118,24 @@ unbounded query there for the sake of a log line would be a self-inflicted laten
 cost is that a shadow `would_deny` is UNVERIFIED and should be cross-checked before it is trusted.
 Nothing in the shadow path can fail the request.
 
-The flag is parsed by `_parse_bool` (true/True/1/yes/on), sourced from the GitHub secret of the same
-name via `hippius-s3-secrets` rather than the defaults ConfigMap, so it can be flipped per
-environment. A typo fails the pod loudly rather than silently leaving the feature off. An empty
-`hippius_s3_plan_accounts` hash is the other kill switch.
+The flag is held as **two GitHub secrets**, so the environments move independently:
+
+| Secret | Read by |
+|---|---|
+| `HIPPIUS_ENABLE_BILLING_PLANS_STAGING` | pods with `ENVIRONMENT=staging` |
+| `HIPPIUS_ENABLE_BILLING_PLANS_PROD` | pods with `ENVIRONMENT=production` |
+| `HIPPIUS_ENABLE_BILLING_PLANS` | local dev and tests (fallback) |
+
+Each deploy workflow seeds only its own key into that cluster's Secret, so staging's Secret never
+contains the production value at all. `config.py::_parse_enable_billing_plans` then selects by the
+pod's OWN `ENVIRONMENT`, which means even a mis-seeded Secret cannot let production read staging's
+flag. Note `production` maps to the `_PROD` suffix — an uppercase of `ENVIRONMENT` would look for
+`_PRODUCTION`, find nothing, and silently leave the feature off, so the mapping is explicit.
+
+Values are parsed by `_parse_bool` (true/True/1/yes/on); a typo fails the pod loudly rather than
+silently leaving the feature off, and an environment secret that is present-but-empty falls through
+to the fallback rather than pinning the feature off. An empty `hippius_s3_plan_accounts` hash is the
+other kill switch.
 
 ### [trailing_slash.py](trailing_slash.py) — `trailing_slash_normalizer`
 

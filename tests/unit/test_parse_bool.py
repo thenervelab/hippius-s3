@@ -53,18 +53,123 @@ def test_the_error_names_the_accepted_values() -> None:
     assert "'ture'" in message, "the rejected value must appear so the fix is obvious"
 
 
-def test_billing_plans_defaults_to_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Ship-disabled is the contract: the feature must never be live because someone forgot to set
-    something."""
+# ---------------------------------------------------------------------------
+# The switch is held as TWO GitHub secrets, HIPPIUS_ENABLE_BILLING_PLANS_STAGING and
+# ..._PROD, so staging and production move independently. Each deploy workflow writes only its own
+# key into that cluster's Secret, and the pod then selects by its own ENVIRONMENT.
+# ---------------------------------------------------------------------------
+
+BILLING_VARS = (
+    "HIPPIUS_ENABLE_BILLING_PLANS",
+    "HIPPIUS_ENABLE_BILLING_PLANS_STAGING",
+    "HIPPIUS_ENABLE_BILLING_PLANS_PROD",
+)
+
+
+@pytest.fixture
+def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    for var in BILLING_VARS:
+        monkeypatch.delenv(var, raising=False)
+    return monkeypatch
+
+
+def resolve() -> bool:
     from hippius_s3.config import Config
 
-    monkeypatch.delenv("HIPPIUS_ENABLE_BILLING_PLANS", raising=False)
-    assert Config().enable_billing_plans is False
+    return Config().enable_billing_plans
+
+
+def test_defaults_to_off_when_nothing_is_set(clean_env: pytest.MonkeyPatch) -> None:
+    """Ship-disabled is the contract: the feature must never be live because someone forgot to set
+    something."""
+    clean_env.setenv("ENVIRONMENT", "production")
+    assert resolve() is False
 
 
 @pytest.mark.parametrize("value,expected", [("1", True), ("True", True), ("0", False), ("False", False)])
-def test_billing_plans_reads_the_env_var(monkeypatch: pytest.MonkeyPatch, value: str, expected: bool) -> None:
-    from hippius_s3.config import Config
+def test_the_unsuffixed_var_still_works_for_local_and_tests(
+    clean_env: pytest.MonkeyPatch, value: str, expected: bool
+) -> None:
+    clean_env.setenv("ENVIRONMENT", "local")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS", value)
+    assert resolve() is expected
 
-    monkeypatch.setenv("HIPPIUS_ENABLE_BILLING_PLANS", value)
-    assert Config().enable_billing_plans is expected
+
+def test_staging_reads_the_staging_secret(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("ENVIRONMENT", "staging")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS_STAGING", "true")
+    assert resolve() is True
+
+
+def test_production_reads_the_prod_secret(clean_env: pytest.MonkeyPatch) -> None:
+    """ENVIRONMENT is "production" but the secret suffix is PROD — an uppercase of ENVIRONMENT would
+    look for _PRODUCTION, find nothing, and silently leave the feature off."""
+    clean_env.setenv("ENVIRONMENT", "production")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS_PROD", "true")
+    assert resolve() is True
+
+
+def test_production_cannot_read_stagings_flag(clean_env: pytest.MonkeyPatch) -> None:
+    """THE safety property. Each workflow seeds only its own key, but if both ever landed in one
+    cluster a production pod must still refuse to enable itself from staging's value."""
+    clean_env.setenv("ENVIRONMENT", "production")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS_STAGING", "true")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS_PROD", "false")
+    assert resolve() is False
+
+
+def test_staging_cannot_read_productions_flag(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("ENVIRONMENT", "staging")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS_STAGING", "false")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS_PROD", "true")
+    assert resolve() is False
+
+
+def test_the_environment_specific_secret_beats_the_unsuffixed_one(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("ENVIRONMENT", "staging")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS", "true")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS_STAGING", "false")
+    assert resolve() is False
+
+
+def test_an_empty_environment_secret_falls_through_rather_than_forcing_false(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """An unset GitHub secret interpolates to '' through --from-literal. That means "not configured
+    here", not "explicitly disabled" — otherwise adding the secretKeyRef before creating the secret
+    would silently pin the feature off and mask the unsuffixed fallback."""
+    clean_env.setenv("ENVIRONMENT", "staging")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS_STAGING", "")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS", "true")
+    assert resolve() is True
+
+
+def test_an_unknown_environment_falls_back_to_the_unsuffixed_var(clean_env: pytest.MonkeyPatch) -> None:
+    """e2e runs with ENVIRONMENT=test, which has no dedicated secret."""
+    clean_env.setenv("ENVIRONMENT", "test")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS_STAGING", "true")
+    assert resolve() is False
+
+
+def test_a_typo_in_the_environment_secret_still_raises(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("ENVIRONMENT", "staging")
+    clean_env.setenv("HIPPIUS_ENABLE_BILLING_PLANS_STAGING", "ture")
+    with pytest.raises(ValueError, match="expected a boolean"):
+        resolve()
+
+
+def test_each_workflow_seeds_only_its_own_secret() -> None:
+    """The first line of defence is that staging's Secret never contains the prod key at all.
+
+    A copy-paste that seeded both from one workflow would put production's flag inside the staging
+    cluster, where a future refactor of the selection logic could reach it.
+    """
+    import pathlib
+
+    staging = pathlib.Path(".github/workflows/staging-deploy.yaml").read_text()
+    production = pathlib.Path(".github/workflows/production-deploy.yaml").read_text()
+
+    assert "HIPPIUS_ENABLE_BILLING_PLANS_STAGING" in staging
+    assert "HIPPIUS_ENABLE_BILLING_PLANS_PROD" not in staging
+    assert "HIPPIUS_ENABLE_BILLING_PLANS_PROD" in production
+    assert "HIPPIUS_ENABLE_BILLING_PLANS_STAGING" not in production

@@ -245,8 +245,9 @@ async def test_an_unknown_quota_allows_and_reports_catalog_miss() -> None:
 
 @pytest.mark.asyncio
 async def test_a_zero_byte_request_is_allowed_when_already_at_the_limit() -> None:
-    """A request with no declared content-length reads as 0 bytes. Documents the known hole: it
-    passes the quota check the same way it already passes can_upload."""
+    """A request that declares no size reads as 0 bytes and is admitted, exactly as can_upload
+    already admits it. Pinned so the plan gate's precision is understood to be identical to the
+    gate it sits beside — see _declared_content_length."""
     decision = await evaluate(cached_used=10 * GB, authoritative=10 * GB, incoming=0, limit=10 * GB)
     assert decision.outcome == "allow"
 

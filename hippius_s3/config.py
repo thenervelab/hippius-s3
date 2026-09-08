@@ -99,6 +99,39 @@ def _parse_bool(value: str | None) -> bool:
     )
 
 
+# The billing-plans switch is held as TWO GitHub secrets, one per environment, so staging can run
+# the feature live while production stays on pay-as-you-go. ENVIRONMENT is "staging" / "production"
+# (k8s/{staging,production}/environment-patch.yaml), and note that production maps to PROD, not
+# PRODUCTION — hence an explicit map rather than an uppercase of ENVIRONMENT.
+_BILLING_PLANS_ENV_SUFFIX = {"staging": "STAGING", "production": "PROD"}
+
+
+def _parse_enable_billing_plans() -> bool:
+    """Resolve HIPPIUS_ENABLE_BILLING_PLANS, preferring the environment-specific secret.
+
+    Looks for HIPPIUS_ENABLE_BILLING_PLANS_<STAGING|PROD> first, chosen by this pod's own
+    ENVIRONMENT, then falls back to the unsuffixed HIPPIUS_ENABLE_BILLING_PLANS (which is what
+    .env.defaults and local dev set).
+
+    Selecting by the pod's OWN environment is the safety property: even if both secrets somehow
+    landed in one cluster, a staging pod can only ever read the staging value and a production pod
+    the production one. There is no code path by which prod picks up staging's flag.
+
+    A suffixed variable that is present but EMPTY falls through rather than forcing false — an unset
+    GitHub secret interpolates to '' through `--from-literal`, and that should mean "not configured
+    here", not "explicitly disabled".
+    """
+    import os
+
+    suffix = _BILLING_PLANS_ENV_SUFFIX.get(os.environ.get("ENVIRONMENT", "").strip().lower())
+    if suffix:
+        specific = os.environ.get(f"HIPPIUS_ENABLE_BILLING_PLANS_{suffix}")
+        if specific is not None and specific.strip().strip('"').strip("'") != "":
+            return _parse_bool(specific)
+
+    return _parse_bool(os.environ.get("HIPPIUS_ENABLE_BILLING_PLANS"))
+
+
 def _parse_account_whitelist() -> list[str]:
     """Parse comma-separated account whitelist from environment variable."""
     import os
@@ -210,7 +243,10 @@ class Config:
     # substrate credits + Arion can_upload; accounts with no plan keep the pay-as-you-go path
     # untouched. Both maps are scraped by the plans-cacher worker into redis-accounts.
     #
-    # THE master switch for the whole feature. Set from the GitHub secret of the same name.
+    # THE master switch for the whole feature, held as two GitHub secrets so each environment moves
+    # independently: HIPPIUS_ENABLE_BILLING_PLANS_STAGING and HIPPIUS_ENABLE_BILLING_PLANS_PROD.
+    # This pod reads only the one matching its own ENVIRONMENT (see _parse_enable_billing_plans),
+    # falling back to the unsuffixed HIPPIUS_ENABLE_BILLING_PLANS for local dev and tests.
     #
     # false (the default) — every account takes the pay-as-you-go path exactly as it did before
     #   this feature existed: substrate credits, then Arion can_upload. The plan caches are STILL
@@ -223,7 +259,7 @@ class Config:
     #
     # Parsed by _parse_bool, so true/True/1/yes/on all work and a typo fails the pod loudly rather
     # than silently leaving the feature off.
-    enable_billing_plans: bool = env("HIPPIUS_ENABLE_BILLING_PLANS:false", convert=_parse_bool)
+    enable_billing_plans: bool = dataclasses.field(default_factory=_parse_enable_billing_plans)
     # One endpoint carries both the catalog and the account roll, so there is one poll interval.
     plans_loop_sleep: int = env("HIPPIUS_PLANS_LOOP_SLEEP:300", convert=int)
     # Per-attempt bound on the scrape. Retry COUNTS cannot bound latency when the per-attempt cost
