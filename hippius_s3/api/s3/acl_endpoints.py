@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 from fastapi import Request
 from fastapi.responses import Response
 
+from hippius_s3.config import get_config
 from hippius_s3.gateway.services.acl_service import ACLService
 from hippius_s3.gateway.utils.errors import s3_error_response
 from hippius_s3.models.acl import ACL
@@ -23,6 +24,8 @@ from hippius_s3.models.acl import GranteeType
 from hippius_s3.models.acl import Owner
 from hippius_s3.models.acl import Permission
 from hippius_s3.models.acl import validate_grant_grantees
+from hippius_s3.services.service_accounts import describe_grants
+from hippius_s3.services.service_accounts import forbidden_write_grants
 
 
 logger = logging.getLogger(__name__)
@@ -423,6 +426,10 @@ async def put_bucket_acl(bucket: str, request: Request) -> Response:
             status_code=400,
         )
 
+    grant_error = service_account_grant_response(bucket_owner_id, new_acl, f"bucket {bucket}")
+    if grant_error is not None:
+        return grant_error
+
     await acl_service.acl_repo.set_bucket_acl(bucket, bucket_owner_id, new_acl)
 
     await acl_service.invalidate_cache(bucket)
@@ -569,11 +576,35 @@ async def put_object_acl(bucket: str, key: str, request: Request) -> Response:
             status_code=400,
         )
 
+    grant_error = service_account_grant_response(original_owner_id, new_acl, f"object {bucket}/{key}")
+    if grant_error is not None:
+        return grant_error
+
     await acl_service.acl_repo.set_object_acl(bucket, key, original_owner_id, new_acl)
 
     await acl_service.invalidate_cache(bucket, key)
 
     return Response(status_code=200)
+
+
+def service_account_grant_response(owner_id: str, acl: ACL, target: str) -> Response | None:
+    """403 when an ACL would hand write access on a service-account bucket to anyone else.
+
+    The evaluation-time refusal in ACLService.check_permission is what actually stops such a
+    grant being honoured — including grants that already exist. This is the loud half: without
+    it the write succeeds, a later GET ?acl reports a grant that does nothing, and the operator
+    believes they configured something they did not.
+    """
+    forbidden = forbidden_write_grants(owner_id, acl.grants, get_config().service_account_ids)
+    if not forbidden:
+        return None
+
+    logger.warning(f"Refused write grant on service-account {target} (owner={owner_id}): {describe_grants(forbidden)}")
+    return s3_error_response(
+        code="AccessDenied",
+        message="Write access to a Hippius service-account bucket cannot be granted to another account.",
+        status_code=403,
+    )
 
 
 def invalid_canned_acl_response(x_amz_acl: str | None) -> Response | None:
@@ -599,6 +630,19 @@ async def materialize_canned_object_acl(request: Request, bucket: str, key: str,
     try:
         acl_svc: ACLService = request.app.state.acl_service
         new_acl = await acl_svc.canned_acl_to_acl(x_amz_acl, account_id, bucket)
+        # The BUCKET owner, not the writer. Keying on the writer would drop a service account's
+        # `bucket-owner-full-control` handoff into someone else's bucket — the standard
+        # cross-account pattern — reading it as "a service account granting write to a stranger".
+        bucket_owner = getattr(request.state, "bucket_owner_id", None) or account_id
+        forbidden = forbidden_write_grants(bucket_owner, new_acl.grants, get_config().service_account_ids)
+        if forbidden:
+            # The object write already succeeded and this helper cannot fail it, so the ACL is
+            # simply not persisted — the object stays private, which is the safe end state.
+            logger.warning(
+                f"Refused canned ACL '{x_amz_acl}' on service-account object {bucket}/{key} "
+                f"(owner={account_id}): {describe_grants(forbidden)}; object left private"
+            )
+            return
         await acl_svc.acl_repo.set_object_acl(bucket, key, account_id, new_acl)
         await acl_svc.invalidate_cache(bucket, key)
         logger.info(f"Created {x_amz_acl} ACL for object {bucket}/{key}")

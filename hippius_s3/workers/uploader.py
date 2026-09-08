@@ -148,9 +148,31 @@ class Uploader:
                 f"Processing upload backend={self.backend_name} object_id={payload.object_id} chunks={len(payload.chunks)}"
             )
 
+            # No service-account handling here on purpose. Arion whitelists our service accounts
+            # on /upload itself, so the exemption that matters on this path is already applied
+            # upstream — sending X-Billing-Bypass as well would be a second list of the same
+            # accounts, maintained in two systems, free to drift apart.
+            #
+            # What remains is the OPERATOR escape: dlq_requeue --bypass-billing, set by a human
+            # re-driving uploads that 402'd for an ordinary account. That is unrelated to service
+            # accounts and predates them.
             extra_headers: dict[str, str] | None = None
-            if payload.bypass_billing and self.config.arion_billing_bypass_key:
+            bypass_billing = payload.bypass_billing
+            if bypass_billing and self.config.arion_billing_bypass_key:
                 extra_headers = {"X-Billing-Bypass": self.config.arion_billing_bypass_key}
+                logger.info(
+                    f"BILLING_BYPASS surface=uploader account={payload.address} "
+                    f"object_id={payload.object_id} version={payload.object_version}"
+                )
+                get_metrics_collector().record_billing_bypass(surface="uploader")
+            elif bypass_billing:
+                # Without this the upload silently bills the account, 402s, and lands in the DLQ
+                # classified as "billing" with nothing pointing at the missing key.
+                logger.warning(
+                    f"BILLING_BYPASS requested but ARION_BILLING_BYPASS_KEY is unset — upload will be "
+                    f"billed: account={payload.address} object_id={payload.object_id}"
+                )
+            span.set_attribute("billing_bypass", bypass_billing)
 
             all_chunk_cids = await self._upload_chunks(
                 object_id=payload.object_id,

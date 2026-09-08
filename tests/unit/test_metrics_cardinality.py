@@ -58,6 +58,10 @@ BOUNDED_LABELS = {
     "outcome",
     # Purge job outcome: "done" | "failed", fixed in record_purger_job.
     "result",
+    # Which billing gate a service account skipped: "gateway" | "uploader", typed as the
+    # BillingBypassSurface Literal and passed from exactly two call sites. The account itself
+    # is deliberately NOT a label here — see record_billing_bypass.
+    "surface",
 }
 
 

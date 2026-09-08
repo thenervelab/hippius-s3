@@ -21,6 +21,9 @@ def _config(**overrides: Any) -> SimpleNamespace:
         "purger_backpressure_sleep_seconds": 0,
         "purger_lease_seconds": 600,
         "purger_interval_seconds": 0,
+        # Empty by default so these exercise the ordinary purge path; the protection itself is
+        # covered in test_service_account_purge_protection.py.
+        "service_account_ids": frozenset(),
     }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

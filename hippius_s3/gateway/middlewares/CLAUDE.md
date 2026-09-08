@@ -35,6 +35,39 @@ For seed-phrase auth: fetches subaccount role/credits from Arion via [gateway/se
 
 **Gotcha**: If Arion is down, this returns 503. There's no graceful degradation — non-seed-phrase auth methods (bearer, access key) don't hit this middleware's hot path, but seed-phrase auth blocks on Arion.
 
+**Service accounts**: an access-key caller whose `account_address` is in `HIPPIUS_SERVICE_ACCOUNT_IDS`
+(comma-separated SS58, a GitHub secret in prod) skips both mutating-path gates — the
+redis-accounts credit fetch and Arion `can_upload` — and gets `request.state.service_account = True`
+for the audit log. The predicate is [services/service_accounts.py](../../services/service_accounts.py);
+the allowlist is parsed and SS58-validated at config time, so a typo fails startup rather than
+silently demoting an internal account back to billed. Keyed only on the VERIFIED `account_address`,
+never on a header, and never on the bucket owner — the gate bills the caller. Reads set the flag
+but change nothing else.
+
+**The gateway is the only place we apply this.** The backend upload path needs nothing: Arion
+whitelists our service accounts on `/upload` itself, so that exemption is applied upstream. The
+uploader deliberately sends no `X-Billing-Bypass` for them — a second list of the same accounts,
+maintained in two systems, would be free to drift apart. `payload.bypass_billing` in
+[hippius_s3/workers/uploader.py](../../workers/uploader.py) is unrelated: the operator escape
+(`dlq_requeue --bypass-billing`) for re-driving an ordinary account's 402'd uploads, which predates
+service accounts.
+
+What Arion's whitelist cannot cover is the gate above it. `has_credits` is read from **our**
+`redis-accounts` cache and checked BEFORE `can_upload`, so a service account with no cached credit
+would be refused `InsufficientAccountCredit` before Arion is consulted at all. That is what this
+branch exists for.
+
+**Nobody but the owner writes to a service-account bucket.** Enforced in two places, and the
+evaluation-time one is the control: [acl_service.py](../services/acl_service.py) `check_permission`
+refuses WRITE / WRITE_ACP on any bucket whose owner is allowlisted, after the owner match and
+before the grant loop. That makes the ban retroactive over grants that already exist and total over
+any path that reaches the acl tables another way. The write-time refusals (`?acl` bucket/object,
+`x-amz-acl` on CreateBucket, canned object ACLs) are the loud half — without them the write
+succeeds, a later `GET ?acl` reports a grant that does nothing, and the operator believes they
+configured something they did not. READ and READ_ACP are untouched: publishing our own datasets
+publicly is the point of several of these buckets. The predicate is `forbidden_write_grants` in
+[services/service_accounts.py](../../services/service_accounts.py).
+
 ### [trailing_slash.py](trailing_slash.py) — `trailing_slash_normalizer`
 
 Keeps `/foo/bar/` and `/foo/bar` equivalent for S3 operations.

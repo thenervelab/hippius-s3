@@ -78,6 +78,11 @@ LandedAnnounceOutcome = Literal["timeout", "error"]
 AeadFailureTier = Literal["local", "remote"]
 AeadFailureOutcome = Literal["recovered", "unrecovered"]
 
+# Which of the two billing gates a service account skipped: the request-path credit/can_upload
+# check, or the worker's charge to Arion. They are decided independently and can disagree during
+# a rolling deploy, so the counter must keep them apart.
+BillingBypassSurface = Literal["gateway", "uploader"]
+
 
 class MetricsCollector:
     """OTel metrics for the API, gateway and workers.
@@ -176,6 +181,24 @@ class MetricsCollector:
         self.fs_cache_shed_total = self.meter.create_counter(
             name="fs_cache_shed_total",
             description="Writes rejected by the FS-cache-pressure gate, by reason and pressure mode",
+            unit="1",
+        )
+
+        # Every operation that skipped a billing gate because the account is on the
+        # service-account allowlist — the quantitative signal to alert on if the bypass starts
+        # firing more than our own workloads explain. Deliberately NOT labelled by account: the
+        # allowlist would bound the cardinality today, but the VALUE would come from a request,
+        # so cardinality would silently ride on the bypass predicate staying tight. Per-account
+        # attribution lives in the BILLING_BYPASS log lines, which are the only record of what was
+        # actually not charged for. (The audit log's service_account field answers a DIFFERENT
+        # question — "was the caller a service account" — which is true for reads too, where
+        # nothing is bypassed. Do not use it to count exemptions.)
+        #
+        # `uploader` samples are the operator DLQ escape only: Arion whitelists our service
+        # accounts on /upload itself, so that path sends no header for them.
+        self.billing_bypass_total = self.meter.create_counter(
+            name="billing_bypass_total",
+            description="Billing gates skipped, by surface (gateway|uploader)",
             unit="1",
         )
 
@@ -684,6 +707,11 @@ class MetricsCollector:
         """
         self.fs_cache_shed_total.add(1, attributes={"reason": reason, "pressure_mode": pressure_mode})
 
+    def record_billing_bypass(self, surface: BillingBypassSurface) -> None:
+        """Record a billing gate skipped: `gateway` for a service account, `uploader` for the
+        operator DLQ escape."""
+        self.billing_bypass_total.add(1, attributes={"surface": surface})
+
     def record_cache_operation(
         self,
         hit: bool,
@@ -984,6 +1012,9 @@ class NullMetricsCollector:
         pass
 
     def record_fs_cache_shed(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_billing_bypass(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_chunk_read_tier(self, *args: object, **kwargs: object) -> None:

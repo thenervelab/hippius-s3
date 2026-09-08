@@ -120,6 +120,7 @@ Create a `.env` file. Base defaults are in `.env.defaults`.
 |----------|---------|-------------|
 | `ENABLE_AUDIT_LOGGING` | `true` | Operation audit trails |
 | `HIPPIUS_BYPASS_CREDIT_CHECK` | `false` | Skip credit verification (testing only) |
+| `HIPPIUS_SERVICE_ACCOUNT_IDS` | `` | Comma-separated SS58 addresses of internal accounts exempt from billing |
 | `ENABLE_REQUEST_PROFILING` | `false` | Request profiling |
 | `ENABLE_API_DOCS` | `true` | Swagger UI |
 

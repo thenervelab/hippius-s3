@@ -271,8 +271,22 @@ async def main_async(args: argparse.Namespace) -> int:
     log = logging.getLogger("purge_buckets")
 
     from hippius_s3.config import get_config
+    from hippius_s3.services.service_accounts import ServiceAccountProtected
+    from hippius_s3.services.service_accounts import refuse_destructive_operation
+    from hippius_s3.services.service_accounts import require_service_account_env
 
     config = get_config()
+
+    # Before the DB connection, before --dry-run, before anything: one mistyped SS58 here
+    # otherwise deletes our own storage.
+    try:
+        require_service_account_env("purge_buckets")
+        refuse_destructive_operation(args.address, config.service_account_ids, operation="purge_buckets")
+    except ServiceAccountProtected as exc:
+        log.error(str(exc))
+        return 2
+    log.info(f"Service accounts protected in this environment: {len(config.service_account_ids)}")
+
     redis_queues_client: async_redis.Redis | None = None
 
     db = await asyncpg.connect(config.database_url)

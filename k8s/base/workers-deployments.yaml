@@ -56,6 +56,17 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            # Read by refuse_destructive_operation (the purger) and by the operator scripts
+            # when they are kubectl-exec'd into a worker pod. Declared on EVERY worker, not
+            # just today's readers: the cost is nil, and the failure mode of omitting it is a
+            # data-destruction guard that silently does nothing. optional:true so a secret
+            # predating the key cannot wedge a rollout — absent means an empty allowlist.
+            - name: HIPPIUS_SERVICE_ACCOUNT_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_ACCOUNT_IDS
+                  optional: true
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -252,6 +263,17 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            # Read by refuse_destructive_operation (the purger) and by the operator scripts
+            # when they are kubectl-exec'd into a worker pod. Declared on EVERY worker, not
+            # just today's readers: the cost is nil, and the failure mode of omitting it is a
+            # data-destruction guard that silently does nothing. optional:true so a secret
+            # predating the key cannot wedge a rollout — absent means an empty allowlist.
+            - name: HIPPIUS_SERVICE_ACCOUNT_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_ACCOUNT_IDS
+                  optional: true
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -441,6 +463,17 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            # Read by refuse_destructive_operation (the purger) and by the operator scripts
+            # when they are kubectl-exec'd into a worker pod. Declared on EVERY worker, not
+            # just today's readers: the cost is nil, and the failure mode of omitting it is a
+            # data-destruction guard that silently does nothing. optional:true so a secret
+            # predating the key cannot wedge a rollout — absent means an empty allowlist.
+            - name: HIPPIUS_SERVICE_ACCOUNT_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_ACCOUNT_IDS
+                  optional: true
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -594,6 +627,17 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            # Read by refuse_destructive_operation (the purger) and by the operator scripts
+            # when they are kubectl-exec'd into a worker pod. Declared on EVERY worker, not
+            # just today's readers: the cost is nil, and the failure mode of omitting it is a
+            # data-destruction guard that silently does nothing. optional:true so a secret
+            # predating the key cannot wedge a rollout — absent means an empty allowlist.
+            - name: HIPPIUS_SERVICE_ACCOUNT_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_ACCOUNT_IDS
+                  optional: true
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -772,6 +816,17 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            # Read by refuse_destructive_operation (the purger) and by the operator scripts
+            # when they are kubectl-exec'd into a worker pod. Declared on EVERY worker, not
+            # just today's readers: the cost is nil, and the failure mode of omitting it is a
+            # data-destruction guard that silently does nothing. optional:true so a secret
+            # predating the key cannot wedge a rollout — absent means an empty allowlist.
+            - name: HIPPIUS_SERVICE_ACCOUNT_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_ACCOUNT_IDS
+                  optional: true
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -903,6 +958,17 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            # Read by refuse_destructive_operation (the purger) and by the operator scripts
+            # when they are kubectl-exec'd into a worker pod. Declared on EVERY worker, not
+            # just today's readers: the cost is nil, and the failure mode of omitting it is a
+            # data-destruction guard that silently does nothing. optional:true so a secret
+            # predating the key cannot wedge a rollout — absent means an empty allowlist.
+            - name: HIPPIUS_SERVICE_ACCOUNT_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_ACCOUNT_IDS
+                  optional: true
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -1050,6 +1116,17 @@ spec:
             - configMapRef:
                 name: hippius-s3-environment
           env:
+            # Read by refuse_destructive_operation (the purger) and by the operator scripts
+            # when they are kubectl-exec'd into a worker pod. Declared on EVERY worker, not
+            # just today's readers: the cost is nil, and the failure mode of omitting it is a
+            # data-destruction guard that silently does nothing. optional:true so a secret
+            # predating the key cannot wedge a rollout — absent means an empty allowlist.
+            - name: HIPPIUS_SERVICE_ACCOUNT_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_ACCOUNT_IDS
+                  optional: true
             - name: POD_NAME
               valueFrom:
                 fieldRef:

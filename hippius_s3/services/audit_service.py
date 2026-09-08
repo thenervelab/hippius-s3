@@ -31,10 +31,14 @@ class AuditLogger:
         ray_id: str = "no-ray-id",
         total_time_ms: float | None = None,
         pre_handler_ms: float | None = None,
+        service_account: bool = False,
     ) -> None:
         if self.should_skip(path, client_ip):
             return
 
+        # `service_account` is emitted on EVERY line, not only when true, so the field can be
+        # relied on as present: a Loki query for the false case is otherwise indistinguishable
+        # from a query against log lines written before the field existed.
         audit_data = {
             "ray_id": ray_id,
             "timestamp": timestamp,
@@ -47,6 +51,7 @@ class AuditLogger:
             "status_code": status_code,
             "processing_time_ms": round(processing_time_ms, 2),
             "content_length": content_length,
+            "service_account": service_account,
         }
 
         # Added rather than folded into processing_time_ms: dashboards, alerts and the
