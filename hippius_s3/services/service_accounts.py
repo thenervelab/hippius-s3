@@ -95,3 +95,30 @@ def refuse_destructive_operation(
             f"{operation} refused: {address} is a Hippius service account. "
             f"Remove it from HIPPIUS_SERVICE_ACCOUNT_IDS and redeploy before running this."
         )
+
+
+SERVICE_ACCOUNT_ENV_VAR = "HIPPIUS_SERVICE_ACCOUNT_IDS"
+
+
+def require_service_account_env(operation: str) -> None:
+    """Refuse to run a destructive operator script from a pod that has no allowlist wired.
+
+    An UNSET variable and an empty one mean different things and must not be conflated. Empty is
+    a deliberate "nothing is protected here". Unset means this process was never told, and every
+    guard downstream — `refuse_destructive_operation`, and the `<> ALL($n)` exclusions in the
+    global sweeps — then silently permits everything. That is the worst failure shape available:
+    a protection that reports nothing and does nothing.
+
+    These scripts are run by hand via `kubectl exec`, so which pod the operator happened to pick
+    decides whether the guard exists at all. Fail closed on absence and say which variable is
+    missing.
+    """
+    import os
+
+    if SERVICE_ACCOUNT_ENV_VAR not in os.environ:
+        raise ServiceAccountProtected(
+            f"{operation} refused: {SERVICE_ACCOUNT_ENV_VAR} is not set in this environment, so "
+            f"service-account protection cannot be applied. Run this from a pod that declares it "
+            f"(every api and worker deployment does), or set it explicitly to an empty value to "
+            f"confirm that nothing is protected."
+        )

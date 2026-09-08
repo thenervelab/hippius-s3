@@ -27,7 +27,20 @@ class DeleteCandidate:
 
 
 async def main_async(args: argparse.Namespace) -> int:
+    from hippius_s3.services.service_accounts import ServiceAccountProtected
+    from hippius_s3.services.service_accounts import require_service_account_env
+
     cfg = get_config()
+
+    # The SQL exclusions below are only as good as the allowlist this process was given. Unset
+    # means `<> ALL('{}')` matches every row and the sweep quietly eats our own data.
+    try:
+        require_service_account_env("delete_legacy_object_versions")
+    except ServiceAccountProtected as exc:
+        print(str(exc))
+        return 2
+    print(f"Service accounts protected in this environment: {len(cfg.service_account_ids)}")
+
     db = await asyncpg.connect(cfg.database_url)
     unpin = not args.no_unpin
     redis_q = None

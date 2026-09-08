@@ -137,7 +137,8 @@ class Config:
     hippius_api_base_url: str = env("HIPPIUS_API_BASE_URL:https://api.hippius.com/")
     arion_billing_bypass_key: str = env("ARION_BILLING_BYPASS_KEY:")
     # Internal Hippius-owned accounts that store our own data. Their writes skip the credit and
-    # can_upload gates in the gateway and carry the X-Billing-Bypass header to Arion. Deliberately
+    # can_upload gates in the gateway; the backend upload path needs nothing, because Arion
+    # whitelists these accounts on /upload itself. Deliberately
     # an explicit per-account allowlist, NOT a blanket switch like enable_bypass_credit_check —
     # and for that reason it is NOT clamped off outside ENVIRONMENT=test.
     service_account_ids: frozenset[str] = env("HIPPIUS_SERVICE_ACCOUNT_IDS:", convert=_parse_service_accounts)

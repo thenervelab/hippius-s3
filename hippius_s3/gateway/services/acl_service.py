@@ -245,10 +245,14 @@ class ACLService:
         #
         # Placed after the owner match so the service account itself is unaffected, and scoped to
         # write permissions so public READ of our own datasets keeps working.
-        if permission in WRITE_PERMISSIONS and is_service_account(acl.owner.id, get_config().service_account_ids):
+        # `bucket_owner_id` in preference to `acl.owner.id`: for an OBJECT acl the latter is
+        # whoever stored the row (the writer), not who owns the bucket, and what is being
+        # protected here is the bucket. Falls back when the caller did not resolve an owner.
+        protected_owner = bucket_owner_id or acl.owner.id
+        if permission in WRITE_PERMISSIONS and is_service_account(protected_owner, get_config().service_account_ids):
             logger.warning(
                 f"ACL check: account={account_id}, access_key={access_key or 'None'}, bucket={bucket}, "
-                f"key={key or 'None'}, required_perm={permission.value}, owner={acl.owner.id}, "
+                f"key={key or 'None'}, required_perm={permission.value}, owner={protected_owner}, "
                 f"grants={len(acl.grants)}{grants_summary}, "
                 f"result=DENIED (write to a service-account bucket is never granted)"
             )

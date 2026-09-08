@@ -178,13 +178,54 @@ async def test_admin_still_suspends_a_regular_account(monkeypatch: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "script",
-    [
-        "hippius_s3/scripts/purge_source_versions.py",
-        "hippius_s3/scripts/delete_legacy_object_versions.py",
-    ],
-)
+GLOBAL_SWEEPS = [
+    "hippius_s3/scripts/purge_source_versions.py",
+    "hippius_s3/scripts/delete_legacy_object_versions.py",
+    "hippius_s3/scripts/cleanup_migration_versions.py",
+]
+
+PER_ACCOUNT_SCRIPTS = [
+    "hippius_s3/scripts/nuke_user.py",
+    "hippius_s3/scripts/purge_buckets.py",
+]
+
+
+# Destructive-looking but deliberately UNGUARDED, with the reason. Guarding these would be
+# actively wrong: the first two act only on data the owner has ALREADY deleted or superseded —
+# refusing them would leave our own released storage pinned and paid for forever — and the third
+# removes multipart_uploads headers that have zero `parts` rows, i.e. no chunk data behind them,
+# which is exactly what AbortMultipartUpload already does.
+DELIBERATELY_UNGUARDED = {
+    "hippius_s3/scripts/backfill_soft_delete_unpins.py": "acts only on rows already soft-deleted",
+    "hippius_s3/scripts/backfill_superseded_version_unpins.py": "acts only on superseded versions",
+    "hippius_s3/scripts/sweep_partless_multipart_uploads.py": "removes MPU headers with no parts behind them",
+}
+
+
+def test_every_destructive_script_is_accounted_for() -> None:
+    """scripts/CLAUDE.md claims EVERY destructive path is guarded. This is what keeps that claim
+    honest: a new bulk-delete script has to be classified here, or this fails. The original miss
+    was cleanup_migration_versions.py — structurally identical to purge_source_versions.py, and
+    silently unguarded while the docs said otherwise.
+    """
+    import pathlib
+
+    guarded = set(GLOBAL_SWEEPS) | set(PER_ACCOUNT_SCRIPTS) | set(DELIBERATELY_UNGUARDED)
+    unclassified = []
+    for path in pathlib.Path("hippius_s3/scripts").glob("*.py"):
+        source = path.read_text()
+        # A bulk destructive script is one that DELETEs rows or enqueues unpins wholesale.
+        destroys = "DELETE FROM" in source or "enqueue_unpin_request" in source
+        if destroys and str(path) not in guarded:
+            unclassified.append(str(path))
+
+    assert not unclassified, (
+        f"destructive script(s) with no service-account guard: {unclassified}. "
+        f"Add the guard and list it above, or explain why it cannot touch account data."
+    )
+
+
+@pytest.mark.parametrize("script", GLOBAL_SWEEPS)
 def test_global_sweeps_exclude_service_accounts_in_sql(script: str) -> None:
     """These take no --address, so a per-account refusal has nothing to refuse — the only way to
     protect our rows is to exclude them from the candidate query itself. Pinning the predicate's
@@ -195,11 +236,38 @@ def test_global_sweeps_exclude_service_accounts_in_sql(script: str) -> None:
     assert "service_account_ids" in source
 
 
-def test_per_account_scripts_guard_before_touching_the_database() -> None:
+@pytest.mark.parametrize("script", PER_ACCOUNT_SCRIPTS)
+def test_per_account_scripts_guard_before_touching_the_database(script: str) -> None:
     """The refusal has to precede the connect: a script that validates the user exists first
     would already have run against production before deciding not to."""
-    for script in ("hippius_s3/scripts/nuke_user.py", "hippius_s3/scripts/purge_buckets.py"):
-        source = open(script).read()
-        guard = source.index("refuse_destructive_operation(")
-        connect = source.index("asyncpg.connect(")
-        assert guard < connect, f"{script}: guard must run before the DB connection"
+    source = open(script).read()
+    guard = source.index("refuse_destructive_operation(")
+    connect = source.index("asyncpg.connect(")
+    assert guard < connect, f"{script}: guard must run before the DB connection"
+
+
+@pytest.mark.parametrize("script", GLOBAL_SWEEPS + PER_ACCOUNT_SCRIPTS)
+def test_every_script_refuses_to_run_without_the_allowlist_wired(script: str) -> None:
+    """These are run by hand via `kubectl exec`, so which pod the operator picked decides whether
+    the guard exists at all. An UNSET variable must abort — otherwise `<> ALL('{}')` matches every
+    row and `refuse_destructive_operation` returns silently, and the protection reports nothing
+    and does nothing.
+    """
+    source = open(script).read()
+    assert "require_service_account_env(" in source, f"{script}: must fail closed on a missing allowlist"
+    env_check = source.index("require_service_account_env(")
+    connect = source.index("asyncpg.connect(")
+    assert env_check < connect, f"{script}: env check must precede the DB connection"
+
+
+def test_env_check_distinguishes_unset_from_empty(monkeypatch: Any) -> None:
+    """Empty is a deliberate 'nothing is protected here'. Unset means nobody told this process,
+    which is a different and more dangerous state — conflating them is the whole bug."""
+    from hippius_s3.services.service_accounts import require_service_account_env
+
+    monkeypatch.setenv("HIPPIUS_SERVICE_ACCOUNT_IDS", "")
+    require_service_account_env("test")  # explicitly empty: allowed
+
+    monkeypatch.delenv("HIPPIUS_SERVICE_ACCOUNT_IDS", raising=False)
+    with pytest.raises(ServiceAccountProtected, match="not set in this environment"):
+        require_service_account_env("test")

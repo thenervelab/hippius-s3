@@ -630,7 +630,11 @@ async def materialize_canned_object_acl(request: Request, bucket: str, key: str,
     try:
         acl_svc: ACLService = request.app.state.acl_service
         new_acl = await acl_svc.canned_acl_to_acl(x_amz_acl, account_id, bucket)
-        forbidden = forbidden_write_grants(account_id, new_acl.grants, get_config().service_account_ids)
+        # The BUCKET owner, not the writer. Keying on the writer would drop a service account's
+        # `bucket-owner-full-control` handoff into someone else's bucket — the standard
+        # cross-account pattern — reading it as "a service account granting write to a stranger".
+        bucket_owner = getattr(request.state, "bucket_owner_id", None) or account_id
+        forbidden = forbidden_write_grants(bucket_owner, new_acl.grants, get_config().service_account_ids)
         if forbidden:
             # The object write already succeeded and this helper cannot fail it, so the ACL is
             # simply not persisted — the object stays private, which is the safe end state.

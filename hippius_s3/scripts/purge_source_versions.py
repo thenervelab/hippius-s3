@@ -12,7 +12,20 @@ from hippius_s3.queue import enqueue_unpin_request
 
 
 async def main_async(args: argparse.Namespace) -> int:
+    from hippius_s3.services.service_accounts import ServiceAccountProtected
+    from hippius_s3.services.service_accounts import require_service_account_env
+
     config = get_config()
+
+    # The SQL exclusion below is only as good as the allowlist this process was given. Unset means
+    # `<> ALL('{}')` matches every row and the sweep quietly eats our own data.
+    try:
+        require_service_account_env("purge_source_versions")
+    except ServiceAccountProtected as exc:
+        print(str(exc))
+        return 2
+    print(f"Service accounts protected in this environment: {len(config.service_account_ids)}")
+
     db = await asyncpg.connect(config.database_url)
     redis_queues_client = async_redis.from_url(config.redis_queues_url)
 

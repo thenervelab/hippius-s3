@@ -49,13 +49,29 @@ Every destructive path here refuses to touch an account in `HIPPIUS_SERVICE_ACCO
 - `nuke_user.py` and `purge_buckets.py` call `refuse_destructive_operation` **before** connecting
   to the database and before `--dry-run` is considered, and exit 2. `nuke_user.py` guards both
   `--address` and the address read out of `--from-json`.
-- `purge_source_versions.py` and `delete_legacy_object_versions.py` take no `--address`, so there
-  is nothing to refuse — they exclude the rows in SQL instead (`b.main_account_id <> ALL($n)`),
-  so no candidate is ever built. `<> ALL('{}')` is true for every row, so an empty allowlist
-  leaves both sweeps exactly as they were.
+- `purge_source_versions.py`, `delete_legacy_object_versions.py` and `cleanup_migration_versions.py`
+  take no `--address`, so there is nothing to refuse — they exclude the rows in SQL instead
+  (`b.main_account_id <> ALL($n)`), so no candidate is ever built. `<> ALL('{}')` is true for every
+  row, so an empty allowlist leaves the sweeps exactly as they were.
 - The admin API (`/admin/accounts/{id}/suspend` and `.../data`) returns 403 `ServiceAccountProtected`
   before any write, and `workers/purger.py` refuses again when it claims the job — a job can
   predate the allowlist, which the endpoint cannot see.
+
+**All five abort if `HIPPIUS_SERVICE_ACCOUNT_IDS` is UNSET** (as opposed to empty), and print the
+protected count before doing anything. These are run by hand via `kubectl exec`, so which pod you
+picked would otherwise decide whether the guard exists at all: unset means `<> ALL('{}')` matches
+every row and `refuse_destructive_operation` returns silently — a protection that reports nothing
+and does nothing. Every api and worker deployment declares the variable; an empty value is a
+deliberate "nothing is protected here" and is allowed.
+
+Three scripts here look destructive and are deliberately **not** guarded, because guarding them
+would be wrong: `backfill_soft_delete_unpins.py` and `backfill_superseded_version_unpins.py` act
+only on versions the owner has already deleted or superseded (refusing would leave our own released
+storage pinned and paid for), and `sweep_partless_multipart_uploads.py` removes MPU headers with
+zero `parts` rows, i.e. no chunk data behind them. `tests/unit/test_service_account_purge_protection.py::test_every_destructive_script_is_accounted_for`
+enumerates the directory and fails on any new `DELETE FROM` / `enqueue_unpin_request` script that is
+in neither list — that inventory is what keeps the claim above honest, and it is how the
+`cleanup_migration_versions.py` gap was found.
 
 **There is no `--force`, and do not add one.** The escape hatch is declarative: remove the address
 from `HIPPIUS_SERVICE_ACCOUNT_IDS`, redeploy, then run the operation. That is a reviewed, recorded,
