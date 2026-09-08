@@ -75,31 +75,55 @@ Config:
 
 ## Plans cacher
 
-[run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py). Two independent poll loops in one
-process, feeding the billing-plan quota gate in `account_middleware`:
+[run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py). One poll loop against one endpoint:
 
-| Loop | Endpoint | Interval | Redis key (on `redis-accounts`) |
-|---|---|---|---|
-| `catalog`  | `GET /s3-plans`          | 10 min (`HIPPIUS_PLANS_CATALOG_LOOP_SLEEP`)  | `HASH hippius_s3_plans` — plan_id → allowance |
-| `accounts` | `GET /s3-plans/accounts` |  5 min (`HIPPIUS_PLANS_ACCOUNTS_LOOP_SLEEP`) | `HASH hippius_s3_plan_accounts` — SS58 → plan_id |
+```
+GET /api/s3/plans/accounts/?page=1&page_size=500     every HIPPIUS_PLANS_LOOP_SLEEP (300s)
+```
+
+It carries both halves — `plans` is the catalog, `results` is the paginated account roll — and is
+split across two hashes on `redis-accounts`:
+
+| Redis key | Field | Value |
+|---|---|---|
+| `hippius_s3_plan_accounts` | account SS58 | `{"plan": ..., "storage_bytes": ...}` |
+| `hippius_s3_plans` | plan name | `{"h256": ..., "storage_bytes": ...}` |
+| `hippius_s3_plans:meta` | — | `{fetched_at, accounts, plans}` |
+
+The account row carries its own resolved allowance, so the request path is normally ONE `HGET`; the
+catalog is the fallback for a row that arrives without one, and honouring the per-account value is
+what lets a bespoke enterprise limit survive.
+
+**Only accounts with an ACTIVE plan are written.** A row needs all three of `billing == "plan"`, a
+plan name, and `active` true. A lapsed subscription still comes back with `billing: "plan"` and its
+old plan name and `active: false`; honouring that would hand a free allowance to someone who stopped
+paying, so the row is dropped and the account takes the pay-as-you-go path — where a non-subscriber
+belongs. Everything else is simply absent from the hash, which is exactly what the request path
+already reads as pay-as-you-go.
+
+**Caching is unconditional.** This worker does not read `HIPPIUS_ENABLE_BILLING_PLANS` and is not
+deployed with it, so the maps stay warm and observably correct long before enforcement is switched
+on — flipping the flag on the api is then a config change, not a cold-cache event.
 
 **This pod being down is not an outage.** Neither hash has a TTL and `redis-accounts` is
-`noeviction` + AOF, so the last known good maps keep serving through an api.hippius.com outage and
+`noeviction` + AOF, so the last known good roll keeps serving through an api.hippius.com outage and
 across a Redis restart. Alert on `plans_cache_age_seconds`, not on pod restarts.
 
 Three invariants, all in [hippius_s3/services/plans_cache.py](../hippius_s3/services/plans_cache.py),
 each of which exists to stop the same failure — silently demoting plan customers to pay-as-you-go
 and 402ing them on their next upload:
 
-1. **Publication is a whole-hash build-then-`RENAME`.** `refresh_account_plans_once` fetches EVERY
-   page before publishing; a failure on page 7 of 20 leaves the live hash untouched.
-2. **An empty or heavily-shrunk map is refused** (`MAX_ACCOUNT_MAP_SHRINK_RATIO`, 50%). One bad
+1. **Publication is a whole-hash build-then-`RENAME`.** `refresh_plan_roll_once` fetches EVERY page
+   before publishing; a failure on page 7 of 20 leaves the live hash untouched.
+2. **An empty or heavily-shrunk roll is refused** (`MAX_ACCOUNT_MAP_SHRINK_RATIO`, 50%). One bad
    upstream deploy returning a truncated-but-valid list must not wipe the fleet's plans.
 3. **No TTL, ever.** A TTL would delete the last-known-good map during exactly the outage it exists
    to survive.
 
-Pagination is bounded by `MAX_ACCOUNT_PAGES` so a self-referential `next` cursor cannot spin the
-worker forever without publishing.
+Pagination is bounded by `MAX_PAGES` so a self-referential `next` cursor cannot spin the worker
+forever without publishing. Upstream returns `next` as an ABSOLUTE url; only its path and query are
+followed, re-homed on our own configured host — otherwise the e2e cacher would walk out of
+mock-hippius-api and into production.
 
 `replicas` must stay 1 — two replicas would not corrupt anything (last `RENAME` wins) but would
 double the upstream load for nothing.

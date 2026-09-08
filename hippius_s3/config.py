@@ -69,6 +69,36 @@ def _parse_service_accounts(value: str | None) -> frozenset[str]:
     return frozenset(accounts)
 
 
+_TRUE_VALUES = frozenset({"true", "1", "yes", "y", "on"})
+_FALSE_VALUES = frozenset({"false", "0", "no", "n", "off", ""})
+
+
+def _parse_bool(value: str | None) -> bool:
+    """Parse a boolean feature flag, accepting the forms an operator actually types.
+
+    `true/True/TRUE/1/yes/on` are true; `false/False/0/no/off` and unset are false. Surrounding
+    whitespace and quotes are stripped, because a value threaded through GitHub Actions ->
+    `kubectl create secret --from-literal` -> envFrom picks both up easily.
+
+    Anything else RAISES at config load rather than defaulting. The repo's older flags use
+    `x.lower() == "true"`, which silently reads `1` as false — for a switch that decides whether a
+    billing feature is live, "we set it and nothing happened" is the worst failure mode, so a typo
+    fails the pod loudly instead of being invisible.
+    """
+    if value is None:
+        return False
+
+    normalised = str(value).strip().strip('"').strip("'").lower()
+    if normalised in _TRUE_VALUES:
+        return True
+    if normalised in _FALSE_VALUES:
+        return False
+
+    raise ValueError(
+        f"expected a boolean (one of {sorted(_TRUE_VALUES)} / {sorted(_FALSE_VALUES - {''})}), got {value!r}"
+    )
+
+
 def _parse_account_whitelist() -> list[str]:
     """Parse comma-separated account whitelist from environment variable."""
     import os
@@ -180,17 +210,22 @@ class Config:
     # substrate credits + Arion can_upload; accounts with no plan keep the pay-as-you-go path
     # untouched. Both maps are scraped by the plans-cacher worker into redis-accounts.
     #
-    # The kill switch: with this false, resolve_plan() returns None for everyone and every account
-    # takes the pay-as-you-go path, exactly as before the feature existed.
-    plans_enforcement_enabled: bool = env(
-        "HIPPIUS_PLANS_ENFORCEMENT_ENABLED:false", convert=lambda x: x.lower() == "true"
-    )
-    # "observe" runs the whole gate and records what it WOULD have denied without ever returning
-    # 402. Shadow mode is how we validate the usage rollup against ground truth at fleet scale
-    # before a wrong number can cost a customer an upload.
-    plans_enforcement_mode: str = env("HIPPIUS_PLANS_ENFORCEMENT_MODE:observe", convert=str)
-    plans_catalog_loop_sleep: int = env("HIPPIUS_PLANS_CATALOG_LOOP_SLEEP:600", convert=int)
-    plans_accounts_loop_sleep: int = env("HIPPIUS_PLANS_ACCOUNTS_LOOP_SLEEP:300", convert=int)
+    # THE master switch for the whole feature. Set from the GitHub secret of the same name.
+    #
+    # false (the default) — every account takes the pay-as-you-go path exactly as it did before
+    #   this feature existed: substrate credits, then Arion can_upload. The plan caches are STILL
+    #   consulted on writes, and a BILLING_PLAN_SHADOW line is logged for any account that has a
+    #   plan, recording what we would have charged them against. Nothing about the response
+    #   changes. That is how we watch the feature work end to end before it can cost anyone an
+    #   upload; flipping this to true is then a config change, not a code change.
+    #
+    # true — accounts on a plan are gated on their storage quota and skip both PAYG gates.
+    #
+    # Parsed by _parse_bool, so true/True/1/yes/on all work and a typo fails the pod loudly rather
+    # than silently leaving the feature off.
+    enable_billing_plans: bool = env("HIPPIUS_ENABLE_BILLING_PLANS:false", convert=_parse_bool)
+    # One endpoint carries both the catalog and the account roll, so there is one poll interval.
+    plans_loop_sleep: int = env("HIPPIUS_PLANS_LOOP_SLEEP:300", convert=int)
     # Per-attempt bound on the scrape. Retry COUNTS cannot bound latency when the per-attempt cost
     # is unbounded, and this worker holds no request.
     plans_api_timeout_seconds: float = env("HIPPIUS_PLANS_API_TIMEOUT_SECONDS:30.0", convert=float)

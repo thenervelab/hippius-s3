@@ -98,6 +98,16 @@ spec:
                   name: hippius-s3-secrets
                   key: HIPPIUS_SERVICE_ACCOUNT_IDS
                   optional: true
+            # The master switch for S3 billing plans. Sourced from the Secret rather than the
+            # defaults ConfigMap so it can be flipped per environment without a repo change.
+            # optional + absent means false, which is the safe direction: pay-as-you-go, with
+            # BILLING_PLAN_SHADOW lines logged for accounts that have a plan.
+            - name: HIPPIUS_ENABLE_BILLING_PLANS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_ENABLE_BILLING_PLANS
+                  optional: true
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:

@@ -101,9 +101,27 @@ re-checked against the authoritative `SUM` first, under a timeout, allowing on t
 drift can cost us an over-quota upload but can never 402 a paying customer. Denials are rare, so the
 expensive query is affordable there.
 
-Kill switches, any one of which returns every account to pay-as-you-go:
-`HIPPIUS_PLANS_ENFORCEMENT_ENABLED=false`, `HIPPIUS_PLANS_ENFORCEMENT_MODE=observe` (evaluates and
-records `would_deny` but never refuses), or an empty `hippius_s3_plan_accounts` hash.
+**`HIPPIUS_ENABLE_BILLING_PLANS` is the master switch, and it ships OFF.** With it false every
+account takes the pay-as-you-go path exactly as before — but the plan caches are still consulted on
+writes, and any account that HAS a plan gets a `BILLING_PLAN_SHADOW` line recording what we would
+have charged them against. That is how the whole chain is proven working in prod logs before it can
+cost anyone an upload; flipping it on is then a config change, not a code change.
+
+```
+{namespace="hippius-s3-prod",app="api"} |= "BILLING_PLAN_SHADOW"
+{namespace="hippius-s3-prod",app="api"} |= "BILLING_PLAN_SHADOW" |= "would=would_deny"
+```
+
+The shadow path is cheaper than the real gate on purpose: it reads the cached rollup and stops,
+never running the authoritative SUM. It sits on the pay-as-you-go path of every write, and an
+unbounded query there for the sake of a log line would be a self-inflicted latency regression — the
+cost is that a shadow `would_deny` is UNVERIFIED and should be cross-checked before it is trusted.
+Nothing in the shadow path can fail the request.
+
+The flag is parsed by `_parse_bool` (true/True/1/yes/on), sourced from the GitHub secret of the same
+name via `hippius-s3-secrets` rather than the defaults ConfigMap, so it can be flipped per
+environment. A typo fails the pod loudly rather than silently leaving the feature off. An empty
+`hippius_s3_plan_accounts` hash is the other kill switch.
 
 ### [trailing_slash.py](trailing_slash.py) — `trailing_slash_normalizer`
 

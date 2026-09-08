@@ -129,10 +129,11 @@ data:
   SENTRY_DSN: ""
   SENTRY_TRACES_SAMPLE_RATE: "0.1"
   # S3 billing plans — keep in step with .env.defaults.
-  HIPPIUS_PLANS_ENFORCEMENT_ENABLED: "false"
-  HIPPIUS_PLANS_ENFORCEMENT_MODE: "observe"
-  HIPPIUS_PLANS_CATALOG_LOOP_SLEEP: "600"
-  HIPPIUS_PLANS_ACCOUNTS_LOOP_SLEEP: "300"
+  #
+  # HIPPIUS_ENABLE_BILLING_PLANS is deliberately NOT set here. It comes from the hippius-s3-secrets
+  # Secret (populated from the GitHub secret of the same name) so it can be flipped per environment
+  # without a repo change. Unset means false — see _parse_bool in hippius_s3/config.py.
+  HIPPIUS_PLANS_LOOP_SLEEP: "300"
   HIPPIUS_PLANS_API_TIMEOUT_SECONDS: "30.0"
   HIPPIUS_PLANS_STALE_AFTER_SECONDS: "3600"
   HIPPIUS_USAGE_CACHE_TTL_SECONDS: "30"

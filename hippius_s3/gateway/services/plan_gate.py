@@ -31,8 +31,7 @@ from typing import Literal
 from hippius_s3.config import Config
 from hippius_s3.services import usage_service
 from hippius_s3.services.plans_cache import PlanQuota
-from hippius_s3.services.plans_cache import get_plan_id_for_account
-from hippius_s3.services.plans_cache import get_plan_quota
+from hippius_s3.services.plans_cache import get_plan_for_account
 
 
 logger = logging.getLogger(__name__)
@@ -64,46 +63,45 @@ async def resolve_plan(
     redis_accounts_client: Any,
     main_account_id: str,
     config: Config,
-) -> tuple[str, PlanQuota | None] | None:
-    """Resolve an account's plan.
+) -> PlanQuota | None:
+    """Resolve an account's plan and allowance in one Redis lookup.
 
-    Returns None when the account is pay-as-you-go (the common case -- no plan row).
-    Returns (plan_id, quota) when it is on a plan; `quota` is None when the catalog cannot price it.
+    Returns None when the account is pay-as-you-go. That covers every non-subscriber case, because
+    the plans-cacher only writes rows for accounts with an ACTIVE plan: no subscription, a lapsed
+    one, and an account upstream has never heard of all look identical here, and all belong on the
+    pay-as-you-go path.
+
+    A returned PlanQuota may still be unpriceable (`storage_bytes` None or non-positive); callers
+    read that as "on a plan, allowance unknown" and ALLOW. See PlanQuota.enforceable.
+
     Raises PlanLookupUnavailable when the caches could not be read at all.
-    """
-    if not config.plans_enforcement_enabled:
-        return None
 
+    Deliberately NOT gated on config.enable_billing_plans: the caller resolves the plan either way,
+    because with the feature off we still want the shadow log line. The flag decides what is DONE
+    with the answer, not whether the question is asked.
+    """
     try:
-        plan_id = await get_plan_id_for_account(redis_accounts_client, main_account_id)
-        if plan_id is None:
-            return None
-        quota = await get_plan_quota(redis_accounts_client, plan_id)
+        return await get_plan_for_account(redis_accounts_client, main_account_id)
     except Exception as e:
         # Narrow by intent, broad by necessity: a Redis transport error and a malformed cached
         # payload must both degrade to "we don't know", never to a 500 on a user's upload.
         raise PlanLookupUnavailable(str(e)) from e
-
-    if quota is not None and not quota.enforceable:
-        return plan_id, None
-
-    return plan_id, quota
 
 
 async def evaluate_quota(
     db: Any,
     redis_accounts_client: Any,
     main_account_id: str,
-    plan_id: str,
-    quota: PlanQuota | None,
+    quota: PlanQuota,
     incoming_bytes: int,
     config: Config,
 ) -> PlanDecision:
     """Decide whether this write fits inside the account's plan allowance."""
-    if quota is None or quota.storage_bytes is None:
+    plan_id = quota.plan_id
+    if not quota.enforceable:
         return PlanDecision(plan_id=plan_id, outcome="catalog_miss")
 
-    limit = quota.storage_bytes
+    limit = quota.storage_bytes or 0
     used = await usage_service.get_account_bytes(
         db,
         redis_accounts_client,
@@ -131,8 +129,41 @@ async def evaluate_quota(
         )
         return PlanDecision(plan_id=plan_id, outcome="allow", quota_bytes=limit, used_bytes=verified)
 
-    outcome: Outcome = "deny" if config.plans_enforcement_mode == "enforce" else "would_deny"
-    return PlanDecision(plan_id=plan_id, outcome=outcome, quota_bytes=limit, used_bytes=verified)
+    return PlanDecision(plan_id=plan_id, outcome="deny", quota_bytes=limit, used_bytes=verified)
+
+
+async def shadow_evaluate(
+    db: Any,
+    redis_accounts_client: Any,
+    main_account_id: str,
+    quota: PlanQuota,
+    incoming_bytes: int,
+    config: Config,
+) -> PlanDecision:
+    """What the gate WOULD have decided, for logging only, while the feature is switched off.
+
+    Deliberately cheaper than evaluate_quota: it reads the cached rollup and stops there. It must
+    NOT run the authoritative SUM, which can take seconds on a large account -- this runs on the
+    pay-as-you-go path of every write, and adding an unbounded query to a live upload for the sake
+    of a log line would be a self-inflicted latency regression.
+
+    The consequence is that a `would_deny` here is UNVERIFIED: it reflects the rollup, which is
+    exactly the thing shadow mode exists to validate. Cross-check any account it names against
+    get_account_storage_usage_authoritative.sql before trusting it.
+    """
+    plan_id = quota.plan_id
+    if not quota.enforceable:
+        return PlanDecision(plan_id=plan_id, outcome="catalog_miss")
+
+    limit = quota.storage_bytes or 0
+    used = await usage_service.get_account_bytes(
+        db,
+        redis_accounts_client,
+        main_account_id,
+        config.usage_cache_ttl_seconds,
+    )
+    outcome: Outcome = "allow" if used + incoming_bytes <= limit else "would_deny"
+    return PlanDecision(plan_id=plan_id, outcome=outcome, quota_bytes=limit, used_bytes=used)
 
 
 async def _authoritative_bytes(db: Any, main_account_id: str, config: Config) -> int | None:

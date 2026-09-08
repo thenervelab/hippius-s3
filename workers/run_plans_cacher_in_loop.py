@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Scrapes the S3 billing-plan endpoints on api.hippius.com into redis-accounts.
+"""Scrapes the S3 billing-plan roll from api.hippius.com into redis-accounts.
 
-Two independent loops in one process:
+    GET /api/s3/plans/accounts/?page=1&page_size=500
 
-    catalog   GET /s3-plans           every 10 min   plan_id -> allowance
-    accounts  GET /s3-plans/accounts  every  5 min   account SS58 -> plan_id
+One endpoint carries both halves — `plans` is the catalog, `results` is the paginated per-account
+roll — so this is a single loop, polled every HIPPIUS_PLANS_LOOP_SLEEP seconds (default 300).
 
-They are independent on purpose: the catalog is a handful of rows that change when someone edits a
-pricing page, the account map is ~40k rows that change whenever anyone subscribes. A failure in one
-must not stall the other, so each has its own cycle, its own backoff and its own metrics label.
+Caching is UNCONDITIONAL. This worker does not read HIPPIUS_ENABLE_BILLING_PLANS and is not deployed
+with it: the maps stay warm and observably correct long before enforcement is switched on, so
+flipping the flag on the api is a config change rather than a cold-cache event.
 
-Neither cache has a TTL, and neither is ever published partially -- see the module docstring of
-hippius_s3/services/plans_cache.py for why both of those are correctness requirements rather than
-optimisations. The short version: this worker failing must degrade to "serve the last known good
-map", never to "every plan customer silently becomes pay-as-you-go and gets 402'd".
+This worker failing is not an outage. Neither cache has a TTL and neither is ever published
+partially — see the module docstring of hippius_s3/services/plans_cache.py for why both of those are
+correctness requirements rather than optimisations. The short version: a failure here must degrade
+to "serve the last known good map", never to "every plan customer silently becomes pay-as-you-go and
+gets 402'd on their next upload".
 """
 
 import asyncio
@@ -21,6 +22,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from redis.asyncio import Redis
 
@@ -33,9 +35,9 @@ from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.sentry import init_sentry
 from hippius_s3.services import plans_cache
-from hippius_s3.services.hippius_api_service import AccountPlansResponse
 from hippius_s3.services.hippius_api_service import HippiusApiClient
-from hippius_s3.services.hippius_api_service import S3PlansResponse
+from hippius_s3.services.hippius_api_service import S3PlanAccountRow
+from hippius_s3.services.hippius_api_service import S3PlanAccountsResponse
 from hippius_s3.workers.shutdown import run_worker
 
 
@@ -47,119 +49,121 @@ init_sentry("plans-cacher", is_worker=True)
 
 # Bound on how many pages we will follow before declaring the upstream pagination broken. Without
 # it a `next` pointer that loops back on itself spins this worker forever, holding the scrape open
-# and never publishing.
-MAX_ACCOUNT_PAGES = 500
+# and never publishing. 500 pages x 500 rows = 250k accounts, well clear of the current ~1.3k.
+MAX_PAGES = 500
+
+# Upstream's own name for "this account is on a subscription". Anything else in `billing` — today
+# only "pay_as_you_go" — means exactly that.
+_PLAN_BILLING = "plan"
 
 
-def _parse_plan_catalog(response: S3PlansResponse) -> dict[str, dict[str, object]]:
-    """Wire shape -> what we cache. The single place to change when the real payload lands."""
-    return {
-        plan.plan_id: {"name": plan.name, "storage_bytes": plan.storage_bytes}
-        for plan in response.plans
-        if plan.plan_id
-    }
+def _is_enforceable_plan_row(row: S3PlanAccountRow) -> bool:
+    """Whether this account should be gated on a plan quota rather than billed pay-as-you-go.
 
+    Requires all three of billing == "plan", a plan name, and active is true.
 
-def _parse_account_plans(pages: list[AccountPlansResponse]) -> dict[str, str]:
-    """Wire shape -> what we cache. Accounts with a null plan_id are pay-as-you-go and are simply
-    absent from the map -- an absent field is exactly what the request path treats as PAYG, so
-    there is nothing to encode for them."""
-    mapping: dict[str, str] = {}
-    for page in pages:
-        for entry in page.accounts:
-            if entry.account_id and entry.plan_id:
-                mapping[entry.account_id] = entry.plan_id
-    return mapping
-
-
-async def refresh_plan_catalog_once(redis_client: Redis) -> int:
-    async with HippiusApiClient() as api_client:
-        response = await api_client.get_s3_plans()
-
-    quotas = _parse_plan_catalog(response)
-    published = await plans_cache.publish_plan_catalog(redis_client, quotas)
-    await plans_cache.touch_meta(redis_client, "plans_fetched_at", published)
-    logger.info(f"Published plan catalog: {published} plans")
-    return published
-
-
-async def refresh_account_plans_once(redis_client: Redis) -> int:
-    """Fetch EVERY page before publishing anything.
-
-    This is the load-bearing part of the whole worker. If page 7 of 20 fails, the exception
-    propagates out of this function before publish_account_plans is reached, the live hash is left
-    untouched, and the cycle is recorded as a failure. Publishing what we had so far would drop
-    ~65% of plan customers to pay-as-you-go and 402 them on their next upload.
+    `active: false` is the interesting one. A lapsed or cancelled subscription still comes back with
+    billing="plan" and its old plan name, and honouring it would hand a free allowance to someone
+    who has stopped paying. Dropping the row instead sends them down the pay-as-you-go path, which
+    is where a non-subscriber belongs — Arion then decides on credit, exactly as it does for every
+    other PAYG account. It is deliberately NOT a quota denial: their storage is not over any limit,
+    their subscription simply is not in force.
     """
-    pages: list[AccountPlansResponse] = []
-    next_page: str | None = None
+    return bool(row.billing == _PLAN_BILLING and row.plan and row.active)
+
+
+def _parse_page(page: S3PlanAccountsResponse) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Wire shape -> what we cache. The single place to change if the payload moves.
+
+    Accounts that are not on an active plan are simply ABSENT from the map: an absent field is
+    exactly what the request path already treats as pay-as-you-go, so there is nothing to encode
+    for them and nothing to keep in sync.
+
+    The per-account `storage_bytes` is preferred over the catalog's, so a bespoke allowance on one
+    enterprise account is honoured rather than silently overwritten by the list price.
+    """
+    accounts: dict[str, dict[str, Any]] = {}
+    for row in page.results:
+        if not row.ss58 or not _is_enforceable_plan_row(row):
+            continue
+        accounts[row.ss58] = {"plan": row.plan, "storage_bytes": row.storage_bytes}
+
+    catalog = {name: {"h256": entry.h256, "storage_bytes": entry.storage_bytes} for name, entry in page.plans.items()}
+    return accounts, catalog
+
+
+async def refresh_plan_roll_once(redis_client: Redis) -> tuple[int, int]:
+    """Fetch EVERY page, then publish. Returns (accounts, plans).
+
+    The all-or-nothing shape is the load-bearing part of this worker. If page 7 of 20 fails, the
+    exception propagates out of here before publish_plan_roll is reached, the live hashes are left
+    untouched, and the cycle is recorded as a failure. Publishing what we had so far would drop the
+    accounts on the unfetched pages to pay-as-you-go and 402 them on their next upload.
+    """
+    accounts: dict[str, dict[str, Any]] = {}
+    catalog: dict[str, dict[str, Any]] = {}
+    next_url: str | None = None
+    pages = 0
+    rows_seen = 0
 
     async with HippiusApiClient() as api_client:
-        for _ in range(MAX_ACCOUNT_PAGES):
-            response = await api_client.get_account_plans(page=next_page)
-            pages.append(response)
-            next_page = response.next
-            if not next_page:
+        for _ in range(MAX_PAGES):
+            page = await api_client.get_s3_plan_accounts(next_url=next_url)
+            pages += 1
+            rows_seen += len(page.results)
+
+            page_accounts, page_catalog = _parse_page(page)
+            accounts.update(page_accounts)
+            # The catalog is repeated on every page; later pages simply confirm it.
+            catalog.update(page_catalog)
+
+            next_url = page.next
+            if not next_url:
                 break
         else:
             raise RuntimeError(
-                f"account plan pagination exceeded {MAX_ACCOUNT_PAGES} pages; refusing to publish a "
-                f"map built from a possibly looping cursor"
+                f"account plan pagination exceeded {MAX_PAGES} pages; refusing to publish a map "
+                f"built from a possibly looping cursor"
             )
 
-    mapping = _parse_account_plans(pages)
-    published = await plans_cache.publish_account_plans(redis_client, mapping)
-    await plans_cache.touch_meta(redis_client, "accounts_fetched_at", published)
-    logger.info(f"Published account plan map: {published} accounts over {len(pages)} page(s)")
-    return published
+    published_accounts, published_plans = await plans_cache.publish_plan_roll(redis_client, accounts, catalog)
+    await plans_cache.touch_meta(redis_client, published_accounts, published_plans)
+
+    logger.info(
+        f"Published plan roll: {published_accounts} accounts on an active plan out of {rows_seen} rows, "
+        f"{published_plans} plans, over {pages} page(s)"
+    )
+    return published_accounts, published_plans
 
 
 async def _report_cache_age(redis_client: Redis) -> None:
     """The caches never expire, so staleness has to be measured explicitly or it is invisible."""
     meta = await plans_cache.get_meta(redis_client)
-    now = int(time.time())
-    collector = get_metrics_collector()
-    for loop, field in (("catalog", "plans_fetched_at"), ("accounts", "accounts_fetched_at")):
-        fetched_at = meta.get(field)
-        if not fetched_at:
-            continue
-        age = now - int(fetched_at)
-        collector.record_plans_cache_age(loop=loop, age_seconds=age)
-        if age > config.plans_stale_after_seconds:
-            logger.error(
-                f"PLANS_CACHE_STALE loop={loop} age={age}s exceeds {config.plans_stale_after_seconds}s. "
-                f"Still serving the last known good map; uploads are unaffected."
-            )
+    fetched_at = meta.get("fetched_at")
+    if not fetched_at:
+        return
+
+    age = int(time.time()) - int(fetched_at)
+    get_metrics_collector().record_plans_cache_age(age_seconds=age)
+    if age > config.plans_stale_after_seconds:
+        logger.error(
+            f"PLANS_CACHE_STALE age={age}s exceeds {config.plans_stale_after_seconds}s. Still serving "
+            f"the last known good map; uploads are unaffected."
+        )
 
 
-async def run_cycle(loop_name: str, redis_client: Redis) -> bool:
+async def run_cycle(redis_client: Redis) -> bool:
     """Run one refresh. Never raises -- a failed cycle must leave the previous cache serving."""
     collector = get_metrics_collector()
     started = time.monotonic()
     try:
-        if loop_name == "catalog":
-            entries = await refresh_plan_catalog_once(redis_client)
-        else:
-            entries = await refresh_account_plans_once(redis_client)
-        collector.record_plans_cacher_cycle(
-            loop=loop_name, success=True, entries=entries, duration=time.monotonic() - started
-        )
+        accounts, _ = await refresh_plan_roll_once(redis_client)
+        collector.record_plans_cacher_cycle(success=True, entries=accounts, duration=time.monotonic() - started)
         return True
     except Exception as e:
-        logger.error(f"plans-cacher {loop_name} cycle failed: {e}; keeping last known good cache", exc_info=True)
-        collector.record_plans_cacher_cycle(
-            loop=loop_name, success=False, entries=0, duration=time.monotonic() - started
-        )
+        logger.error(f"plans-cacher cycle failed: {e}; keeping last known good cache", exc_info=True)
+        collector.record_plans_cacher_cycle(success=False, entries=0, duration=time.monotonic() - started)
         return False
-
-
-async def _loop(loop_name: str, redis_client: Redis, interval: int) -> None:
-    while True:
-        ok = await run_cycle(loop_name, redis_client)
-        await _report_cache_age(redis_client)
-        sleep_for = interval if ok else 60
-        logger.info(f"plans-cacher {loop_name}: sleeping {sleep_for}s")
-        await asyncio.sleep(sleep_for)
 
 
 async def run_plans_cacher_loop() -> None:
@@ -167,19 +171,19 @@ async def run_plans_cacher_loop() -> None:
     initialize_metrics_collector()
 
     logger.info(
-        f"Starting plans-cacher: catalog every {config.plans_catalog_loop_sleep}s, "
-        f"accounts every {config.plans_accounts_loop_sleep}s, "
-        f"enforcement={'on' if config.plans_enforcement_enabled else 'off'} "
-        f"mode={config.plans_enforcement_mode}"
+        f"Starting plans-cacher: polling every {config.plans_loop_sleep}s. Caching is unconditional "
+        f"— it does not depend on whether plan enforcement is enabled."
     )
 
     # Closing on the way out is what tells Redis this client is gone; a cancelled worker otherwise
     # leaves its connection behind.
     try:
-        await asyncio.gather(
-            _loop("catalog", redis_client, config.plans_catalog_loop_sleep),
-            _loop("accounts", redis_client, config.plans_accounts_loop_sleep),
-        )
+        while True:
+            ok = await run_cycle(redis_client)
+            await _report_cache_age(redis_client)
+            sleep_for = config.plans_loop_sleep if ok else 60
+            logger.info(f"plans-cacher: sleeping {sleep_for}s")
+            await asyncio.sleep(sleep_for)
     finally:
         await redis_client.aclose()
 

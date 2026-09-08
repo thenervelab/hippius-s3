@@ -87,10 +87,19 @@ BillingBypassSurface = Literal["gateway", "uploader"]
 # quota decisions plus "unavailable", which the middleware records when the plan caches could not be
 # consulted and it fell back to pay-as-you-go. The plan_id is deliberately NOT a label — it is
 # upstream-controlled, so labelling by it would let a pricing-page edit grow our cardinality.
-PlanGateOutcome = Literal["allow", "deny", "would_deny", "catalog_miss", "unavailable"]
-
-# Which plans-cacher poll loop a sample came from. Two values, fixed at the two _loop() call sites.
-PlansCacherLoop = Literal["catalog", "accounts"]
+PlanGateOutcome = Literal[
+    # enforcement on
+    "allow",
+    "deny",
+    "catalog_miss",
+    "unavailable",
+    # enforcement off (HIPPIUS_ENABLE_BILLING_PLANS=false): what the gate WOULD have decided, while
+    # the request is actually billed pay-as-you-go. shadow_would_deny is the one to graph before
+    # flipping the flag -- it is the count of uploads that would start failing.
+    "shadow_allow",
+    "shadow_would_deny",
+    "shadow_catalog_miss",
+]
 
 
 class MetricsCollector:
@@ -583,12 +592,12 @@ class MetricsCollector:
             unit="1",
         )
         self.plans_cacher_cycles_total = self.meter.create_counter(
-            name="plans_cacher_cycles_total",
-            description="Plans-cacher cycles run, by loop (catalog|accounts) and success",
-            unit="1",
+            name="plans_cacher_cycles_total", description="Plans-cacher cycles run, by success", unit="1"
         )
         self.plans_cacher_entries_total = self.meter.create_counter(
-            name="plans_cacher_entries_total", description="Entries published per plans-cacher loop", unit="1"
+            name="plans_cacher_entries_total",
+            description="Accounts on an active plan published per plans-cacher cycle",
+            unit="1",
         )
         self.plans_cacher_duration_seconds = self.meter.create_histogram(
             name="plans_cacher_duration_seconds", description="Plans-cacher cycle duration", unit="s"
@@ -1022,14 +1031,14 @@ class MetricsCollector:
         """One plan-quota decision. See plan_gate_total for what each outcome means."""
         self.plan_gate_total.add(1, attributes={"outcome": outcome})
 
-    def record_plans_cacher_cycle(self, loop: PlansCacherLoop, success: bool, entries: int, duration: float) -> None:
-        self.plans_cacher_cycles_total.add(1, attributes={"loop": loop, "success": str(success).lower()})
-        self.plans_cacher_duration_seconds.record(duration, attributes={"loop": loop})
+    def record_plans_cacher_cycle(self, success: bool, entries: int, duration: float) -> None:
+        self.plans_cacher_cycles_total.add(1, attributes={"success": str(success).lower()})
+        self.plans_cacher_duration_seconds.record(duration)
         if entries > 0:
-            self.plans_cacher_entries_total.add(entries, attributes={"loop": loop})
+            self.plans_cacher_entries_total.add(entries)
 
-    def record_plans_cache_age(self, loop: PlansCacherLoop, age_seconds: float) -> None:
-        self.plans_cache_age_seconds.record(age_seconds, attributes={"loop": loop})
+    def record_plans_cache_age(self, age_seconds: float) -> None:
+        self.plans_cache_age_seconds.record(age_seconds)
 
     def record_usage_counter_drift(self, drift_bytes: int) -> None:
         self.usage_counter_drift_bytes.record(drift_bytes)

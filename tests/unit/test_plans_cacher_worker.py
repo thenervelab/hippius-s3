@@ -1,8 +1,11 @@
-"""The plans-cacher loops.
+"""The plans-cacher loop.
 
-The behaviour under test is what happens when api.hippius.com misbehaves. A failed cycle must be
-recorded and slept off, never raised -- and, above all, it must never publish a partial map. The
-cron failing is the expected case this whole design is built around; it is not an outage.
+Two things under test. First, what happens when api.hippius.com misbehaves: a failed cycle must be
+recorded and slept off, never raised, and above all must never publish a partial roll. The scrape
+failing is the expected case this whole design is built around; it is not an outage.
+
+Second, the semantics of the upstream row — which accounts get an allowance and which are left to
+pay-as-you-go. Getting that wrong hands free storage to lapsed subscribers, or 402s paying ones.
 """
 
 from unittest.mock import AsyncMock
@@ -11,12 +14,55 @@ from unittest.mock import patch
 
 import pytest
 
-from hippius_s3.services.hippius_api_service import AccountPlanEntry
-from hippius_s3.services.hippius_api_service import AccountPlansResponse
-from hippius_s3.services.hippius_api_service import S3PlanQuota
-from hippius_s3.services.hippius_api_service import S3PlansResponse
+from hippius_s3.services import plans_cache
+from hippius_s3.services.hippius_api_service import S3PlanAccountsResponse
 from tests.unit.test_plans_cache import FakeRedis
 from workers import run_plans_cacher_in_loop as pc
+
+
+TB = 1_099_511_627_776
+
+# The payload shape as documented by the endpoint, trimmed to the fields we read.
+SAMPLE_PAGE = {
+    "generated_at": "2026-09-08T16:05:12Z",
+    "count": 3,
+    "next": None,
+    "previous": None,
+    "plans": {
+        "pro": {"h256": "0x96e928fd", "storage_bytes": 10 * TB},
+        "business": {"h256": "0x44e0c670", "storage_bytes": 50 * TB},
+        "enterprise": {"h256": "0xde9221ce", "storage_bytes": 100 * TB},
+    },
+    "results": [
+        {
+            "ss58": "5E71kYuD",
+            "billing": "plan",
+            "plan": "business",
+            "active": True,
+            "storage_bytes": 50 * TB,
+            "next_charge": "2026-10-01",
+            "subscription_id": 4412,
+        },
+        {
+            "ss58": "5FHneW46",
+            "billing": "plan",
+            "plan": "pro",
+            "active": False,
+            "storage_bytes": 10 * TB,
+            "next_charge": None,
+            "subscription_id": 3901,
+        },
+        {
+            "ss58": "5DAAnrj7",
+            "billing": "pay_as_you_go",
+            "plan": None,
+            "active": True,
+            "storage_bytes": None,
+            "next_charge": None,
+            "subscription_id": None,
+        },
+    ],
+}
 
 
 def api_client_returning(**methods: object) -> MagicMock:
@@ -29,40 +75,122 @@ def api_client_returning(**methods: object) -> MagicMock:
     return MagicMock(return_value=ctx)
 
 
-@pytest.mark.asyncio
-async def test_the_catalog_cycle_publishes_and_records_success() -> None:
-    redis = FakeRedis()
-    api = api_client_returning(
-        get_s3_plans=AsyncMock(
-            return_value=S3PlansResponse(plans=[S3PlanQuota(plan_id="plan-1", name="Starter", storage_bytes=1_000)])
+def page(**overrides: object) -> S3PlanAccountsResponse:
+    payload = {**SAMPLE_PAGE, **overrides}
+    return S3PlanAccountsResponse.model_validate(payload)
+
+
+# --------------------------------------------------------------------------- row semantics
+
+
+def test_only_accounts_with_an_active_plan_are_published() -> None:
+    accounts, catalog = pc._parse_page(page())
+
+    assert set(accounts) == {"5E71kYuD"}, "only the active subscriber gets an allowance"
+    assert accounts["5E71kYuD"] == {"plan": "business", "storage_bytes": 50 * TB}
+    assert set(catalog) == {"pro", "business", "enterprise"}
+
+
+def test_a_lapsed_subscription_is_treated_as_pay_as_you_go() -> None:
+    """active=false with billing="plan" still carries the old plan name.
+
+    Honouring it would hand a free allowance to someone who stopped paying. Dropping the row sends
+    them down the pay-as-you-go path, where a non-subscriber belongs — Arion then decides on credit.
+    It is deliberately NOT a quota denial: their storage is not over any limit, their subscription
+    simply is not in force.
+    """
+    accounts, _ = pc._parse_page(page())
+    assert "5FHneW46" not in accounts
+
+
+def test_a_pay_as_you_go_row_is_absent_rather_than_encoded() -> None:
+    """An absent field is exactly what the request path already reads as pay-as-you-go, so there is
+    nothing to encode for them and nothing to keep in sync."""
+    accounts, _ = pc._parse_page(page())
+    assert "5DAAnrj7" not in accounts
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"ss58": "x", "billing": "plan", "plan": None, "active": True},
+        {"ss58": "x", "billing": "pay_as_you_go", "plan": "pro", "active": True},
+        {"ss58": "x", "billing": "plan", "plan": "pro"},  # `active` omitted -> defaults False
+        {"ss58": "x"},
+    ],
+)
+def test_a_row_missing_any_requirement_gets_no_allowance(row: dict) -> None:
+    accounts, _ = pc._parse_page(page(results=[row]))
+    assert accounts == {}
+
+
+def test_a_bespoke_per_account_allowance_beats_the_catalog_price() -> None:
+    """An enterprise account on a negotiated limit must not be silently reset to the list price."""
+    accounts, _ = pc._parse_page(
+        page(
+            results=[{"ss58": "vip", "billing": "plan", "plan": "pro", "active": True, "storage_bytes": 999 * TB}],
         )
     )
+    assert accounts["vip"]["storage_bytes"] == 999 * TB
+
+
+def test_an_unknown_upstream_field_does_not_break_parsing() -> None:
+    """The payload will grow. A richer response must not crash the cacher and strand the fleet on
+    last-known-good."""
+    accounts, catalog = pc._parse_page(
+        page(
+            results=[
+                {
+                    "ss58": "a",
+                    "billing": "plan",
+                    "plan": "pro",
+                    "active": True,
+                    "storage_bytes": TB,
+                    "promo_code": "SUMMER",
+                    "seats": 4,
+                }
+            ],
+            plans={"pro": {"h256": "0x1", "storage_bytes": TB, "price_usd_cents": 900}},
+        )
+    )
+    assert accounts["a"]["storage_bytes"] == TB
+    assert catalog["pro"]["storage_bytes"] == TB
+
+
+# --------------------------------------------------------------------------- the cycle
+
+
+@pytest.mark.asyncio
+async def test_a_successful_cycle_publishes_and_records() -> None:
+    redis = FakeRedis()
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
     collector = MagicMock()
 
     with (
         patch.object(pc, "HippiusApiClient", api),
         patch.object(pc, "get_metrics_collector", return_value=collector),
     ):
-        assert await pc.run_cycle("catalog", redis) is True
+        assert await pc.run_cycle(redis) is True
 
-    assert redis.hashes["hippius_s3_plans"]
+    quota = await plans_cache.get_plan_for_account(redis, "5E71kYuD")
+    assert quota is not None and quota.plan_id == "business" and quota.storage_bytes == 50 * TB
+
     kwargs = collector.record_plans_cacher_cycle.call_args.kwargs
     assert kwargs["success"] is True
-    assert kwargs["entries"] == 1
-    assert kwargs["loop"] == "catalog"
+    assert kwargs["entries"] == 1, "the count is accounts on an active plan, not rows seen"
 
 
 @pytest.mark.asyncio
 async def test_a_failed_cycle_is_recorded_without_raising() -> None:
     redis = FakeRedis()
-    api = api_client_returning(get_s3_plans=AsyncMock(side_effect=RuntimeError("upstream 500")))
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(side_effect=RuntimeError("upstream 500")))
     collector = MagicMock()
 
     with (
         patch.object(pc, "HippiusApiClient", api),
         patch.object(pc, "get_metrics_collector", return_value=collector),
     ):
-        assert await pc.run_cycle("catalog", redis) is False
+        assert await pc.run_cycle(redis) is False
 
     kwargs = collector.record_plans_cacher_cycle.call_args.kwargs
     assert kwargs["success"] is False
@@ -70,116 +198,83 @@ async def test_a_failed_cycle_is_recorded_without_raising() -> None:
 
 
 @pytest.mark.asyncio
-async def test_an_upstream_failure_leaves_the_previous_catalog_serving() -> None:
+async def test_an_upstream_failure_leaves_the_previous_roll_serving() -> None:
     """The whole point of the no-TTL cache: an api.hippius.com outage is not an outage for us."""
     redis = FakeRedis()
-    good = api_client_returning(
-        get_s3_plans=AsyncMock(return_value=S3PlansResponse(plans=[S3PlanQuota(plan_id="plan-1", storage_bytes=42)]))
-    )
+    good = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
     with patch.object(pc, "HippiusApiClient", good), patch.object(pc, "get_metrics_collector", MagicMock()):
-        await pc.run_cycle("catalog", redis)
+        await pc.run_cycle(redis)
 
-    bad = api_client_returning(get_s3_plans=AsyncMock(side_effect=RuntimeError("upstream is down")))
+    bad = api_client_returning(get_s3_plan_accounts=AsyncMock(side_effect=RuntimeError("upstream is down")))
     with patch.object(pc, "HippiusApiClient", bad), patch.object(pc, "get_metrics_collector", MagicMock()):
-        await pc.run_cycle("catalog", redis)
+        await pc.run_cycle(redis)
 
-    from hippius_s3.services import plans_cache
-
-    quota = await plans_cache.get_plan_quota(redis, "plan-1")
-    assert quota is not None and quota.storage_bytes == 42
+    quota = await plans_cache.get_plan_for_account(redis, "5E71kYuD")
+    assert quota is not None and quota.storage_bytes == 50 * TB
 
 
 @pytest.mark.asyncio
 async def test_a_mid_pagination_failure_publishes_nothing() -> None:
     """THE test for this worker.
 
-    Publishing pages 1-6 of 20 would drop ~65% of plan customers to pay-as-you-go and 402 them on
-    their next upload, with a green-looking cycle. refresh_account_plans_once must collect every
-    page before it publishes anything.
+    Publishing pages 1-6 of 20 would drop the accounts on the unfetched pages to pay-as-you-go and
+    402 them on their next upload, with a green-looking cycle. refresh_plan_roll_once must collect
+    every page before it publishes anything.
     """
     redis = FakeRedis()
-
-    seed = api_client_returning(
-        get_account_plans=AsyncMock(
-            return_value=AccountPlansResponse(
-                accounts=[AccountPlanEntry(account_id=f"acct-{i}", plan_id="plan-1") for i in range(10)],
-                next=None,
-            )
-        )
-    )
+    seeded = [
+        {"ss58": f"acct-{i}", "billing": "plan", "plan": "pro", "active": True, "storage_bytes": TB} for i in range(10)
+    ]
+    seed = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page(results=seeded, next=None)))
     with patch.object(pc, "HippiusApiClient", seed), patch.object(pc, "get_metrics_collector", MagicMock()):
-        await pc.run_cycle("accounts", redis)
+        await pc.run_cycle(redis)
     before = dict(redis.hashes["hippius_s3_plan_accounts"])
     assert len(before) == 10
 
     calls = {"n": 0}
 
-    async def failing_pages(page: str | None = None) -> AccountPlansResponse:
+    async def failing_pages(next_url: str | None = None, page_size: int = 500) -> S3PlanAccountsResponse:
         calls["n"] += 1
         if calls["n"] >= 3:
             raise RuntimeError("upstream died on page 3")
-        return AccountPlansResponse(
-            accounts=[AccountPlanEntry(account_id=f"new-{calls['n']}", plan_id="plan-2")],
-            next=f"page-{calls['n'] + 1}",
+        return page(
+            results=[{"ss58": f"new-{calls['n']}", "billing": "plan", "plan": "pro", "active": True}],
+            next=f"https://api.hippius.com/api/s3/plans/accounts/?page={calls['n'] + 1}",
         )
 
-    api = api_client_returning(get_account_plans=failing_pages)
+    api = api_client_returning(get_s3_plan_accounts=failing_pages)
     with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
-        assert await pc.run_cycle("accounts", redis) is False
+        assert await pc.run_cycle(redis) is False
 
     assert redis.hashes["hippius_s3_plan_accounts"] == before
     assert "hippius_s3_plan_accounts:building" not in redis.hashes
 
 
 @pytest.mark.asyncio
-async def test_pagination_is_bounded_so_a_looping_cursor_cannot_hang_the_worker() -> None:
-    async def never_ending(page: str | None = None) -> AccountPlansResponse:
-        return AccountPlansResponse(accounts=[AccountPlanEntry(account_id="a", plan_id="plan-1")], next="always-more")
+async def test_every_page_contributes_to_the_published_roll() -> None:
+    redis = FakeRedis()
+    calls = {"n": 0}
 
-    api = api_client_returning(get_account_plans=never_ending)
+    async def two_pages(next_url: str | None = None, page_size: int = 500) -> S3PlanAccountsResponse:
+        calls["n"] += 1
+        return page(
+            results=[{"ss58": f"p{calls['n']}", "billing": "plan", "plan": "pro", "active": True, "storage_bytes": TB}],
+            next=("https://api.hippius.com/api/s3/plans/accounts/?page=2" if calls["n"] == 1 else None),
+        )
+
+    api = api_client_returning(get_s3_plan_accounts=two_pages)
+    with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
+        assert await pc.run_cycle(redis) is True
+
+    assert set(redis.hashes["hippius_s3_plan_accounts"]) == {"p1", "p2"}
+
+
+@pytest.mark.asyncio
+async def test_pagination_is_bounded_so_a_looping_cursor_cannot_hang_the_worker() -> None:
+    async def never_ending(next_url: str | None = None, page_size: int = 500) -> S3PlanAccountsResponse:
+        return page(next="https://api.hippius.com/api/s3/plans/accounts/?page=2")
+
+    api = api_client_returning(get_s3_plan_accounts=never_ending)
     with patch.object(pc, "HippiusApiClient", api):
         with pytest.raises(RuntimeError, match="pagination exceeded"):
-            await pc.refresh_account_plans_once(FakeRedis())
-
-
-@pytest.mark.asyncio
-async def test_accounts_with_no_plan_are_simply_absent_from_the_map() -> None:
-    """A null plan_id means pay-as-you-go, which the request path reads as "no hash field". There
-    is nothing to encode for them."""
-    pages = [
-        AccountPlansResponse(
-            accounts=[
-                AccountPlanEntry(account_id="on-a-plan", plan_id="plan-1"),
-                AccountPlanEntry(account_id="payg", plan_id=None),
-            ]
-        )
-    ]
-    assert pc._parse_account_plans(pages) == {"on-a-plan": "plan-1"}
-
-
-@pytest.mark.asyncio
-async def test_an_upstream_payload_with_unknown_fields_still_parses() -> None:
-    """The endpoints are not deployed yet, so the modelled shape is a guess. A richer payload must
-    not crash the cacher and strand the fleet on last-known-good."""
-    response = S3PlansResponse.model_validate(
-        {
-            "plans": [
-                {
-                    "plan_id": "plan-1",
-                    "name": "Starter",
-                    "storage_bytes": 5,
-                    "price_usd_cents": 900,
-                    "features": ["a", "b"],
-                }
-            ],
-            "generated_at": "2026-09-08T00:00:00Z",
-        }
-    )
-
-    assert pc._parse_plan_catalog(response) == {"plan-1": {"name": "Starter", "storage_bytes": 5}}
-
-
-@pytest.mark.asyncio
-async def test_a_plan_missing_its_allowance_still_parses() -> None:
-    response = S3PlansResponse.model_validate({"plans": [{"plan_id": "plan-1"}]})
-    assert pc._parse_plan_catalog(response) == {"plan-1": {"name": None, "storage_bytes": None}}
+            await pc.refresh_plan_roll_once(FakeRedis())

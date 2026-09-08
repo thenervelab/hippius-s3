@@ -62,11 +62,6 @@ BOUNDED_LABELS = {
     # BillingBypassSurface Literal and passed from exactly two call sites. The account itself
     # is deliberately NOT a label here — see record_billing_bypass.
     "surface",
-    # Which plans-cacher poll loop a sample came from: "catalog" | "accounts". Two values, fixed
-    # in code at the two _loop(...) call sites in run_plans_cacher_in_loop.py — never account- or
-    # plan-derived. The plan_id is deliberately NOT a label anywhere: it is upstream-controlled,
-    # so labelling by it would let a pricing-page edit grow our metric cardinality.
-    "loop",
 }
 
 

@@ -1,11 +1,15 @@
 """Redis layer for the S3 billing-plan caches.
 
-Two hashes on redis-accounts, both written only by the plans-cacher worker and read on the request
-path by account_middleware:
+Fed by one upstream page — GET /api/s3/plans/accounts/ carries both the catalog and the account
+roll — and split across two hashes on redis-accounts:
 
-    hippius_s3_plan_accounts   field = account SS58   value = plan_id
-    hippius_s3_plans           field = plan_id        value = quota JSON
-    hippius_s3_plans:meta      JSON {plans_fetched_at, accounts_fetched_at, ...}
+    hippius_s3_plan_accounts   field = account SS58   value = {"plan": ..., "storage_bytes": ...}
+    hippius_s3_plans           field = plan name      value = {"h256": ..., "storage_bytes": ...}
+    hippius_s3_plans:meta      JSON {fetched_at, counts}
+
+The account row carries its own resolved allowance, so the request path is normally ONE `HGET`: the
+catalog hash is consulted only when a row arrives without a `storage_bytes` of its own (and is kept
+regardless, because it is what makes the cached state legible to an operator).
 
 Deliberately NO TTL on either hash. A TTL would delete the last-known-good mapping in the middle of
 an api.hippius.com outage -- exactly the failure the cache exists to survive -- and silently demote
@@ -41,7 +45,7 @@ _BUILDING_SUFFIX = ":building"
 _HSET_BATCH = 1000
 
 # Refuse to publish an account map that lost more than this fraction of its entries. One bad
-# upstream deploy that returns a truncated (but syntactically valid) list would otherwise demote
+# upstream deploy that returns a truncated (but syntactically valid) roll would otherwise demote
 # most plan customers to PAYG and 402 them, with nothing in the logs but a successful cycle.
 MAX_ACCOUNT_MAP_SHRINK_RATIO = 0.5
 
@@ -54,7 +58,6 @@ class PlanMapShrankTooMuch(Exception):
 class PlanQuota:
     plan_id: str
     storage_bytes: int | None
-    name: str | None = None
 
     @property
     def enforceable(self) -> bool:
@@ -72,85 +75,101 @@ def _decode(value: Any) -> str | None:
     return str(value)
 
 
-async def publish_account_plans(redis_client: Any, mapping: Mapping[str, str]) -> int:
-    """Atomically replace the account -> plan_id map. Returns the number of entries published."""
-    building = PLAN_ACCOUNTS_KEY + _BUILDING_SUFFIX
+async def _publish_hash(redis_client: Any, key: str, entries: Mapping[str, str]) -> int:
+    building = key + _BUILDING_SUFFIX
+    await redis_client.delete(building)
 
+    pipe = redis_client.pipeline()
+    written = 0
+    for field, value in entries.items():
+        await pipe.hset(building, field, value)
+        written += 1
+        if written % _HSET_BATCH == 0:
+            await pipe.execute()
+            pipe = redis_client.pipeline()
+    if written % _HSET_BATCH != 0:
+        await pipe.execute()
+
+    await redis_client.rename(building, key)
+    return written
+
+
+async def publish_plan_roll(
+    redis_client: Any,
+    accounts: Mapping[str, dict[str, Any]],
+    catalog: Mapping[str, dict[str, Any]],
+) -> tuple[int, int]:
+    """Atomically replace both hashes. Returns (accounts_published, plans_published).
+
+    Refuses outright rather than publishing a roll that would strip most accounts of their plan --
+    an empty result set, or one that shrank past MAX_ACCOUNT_MAP_SHRINK_RATIO. Both are far more
+    likely to be an upstream bug than 1284 people cancelling at once, and the cost of being wrong in
+    the other direction (a fleet-wide 402) is not symmetric.
+    """
     live_size = int(await redis_client.hlen(PLAN_ACCOUNTS_KEY) or 0)
-    if live_size and len(mapping) < live_size * (1 - MAX_ACCOUNT_MAP_SHRINK_RATIO):
+
+    if not accounts and live_size:
         raise PlanMapShrankTooMuch(
-            f"refusing to publish account plan map: {len(mapping)} entries vs {live_size} live "
+            f"refusing to publish an empty account plan map over {live_size} live entries; keeping last known good"
+        )
+    if live_size and len(accounts) < live_size * (1 - MAX_ACCOUNT_MAP_SHRINK_RATIO):
+        raise PlanMapShrankTooMuch(
+            f"refusing to publish account plan map: {len(accounts)} entries vs {live_size} live "
             f"(shrink > {MAX_ACCOUNT_MAP_SHRINK_RATIO:.0%}); keeping last known good"
         )
 
-    await redis_client.delete(building)
+    published_accounts = await _publish_hash(
+        redis_client, PLAN_ACCOUNTS_KEY, {ss58: json.dumps(row) for ss58, row in accounts.items()}
+    )
+    published_plans = 0
+    if catalog:
+        published_plans = await _publish_hash(
+            redis_client, PLAN_CATALOG_KEY, {name: json.dumps(entry) for name, entry in catalog.items()}
+        )
 
-    if not mapping:
-        # An empty upstream response is never a legitimate reason to wipe the live map. Bail before
-        # the RENAME so the previous map keeps serving.
-        raise PlanMapShrankTooMuch("refusing to publish an empty account plan map")
-
-    pipe = redis_client.pipeline()
-    pending = 0
-    for account_id, plan_id in mapping.items():
-        await pipe.hset(building, account_id, plan_id)
-        pending += 1
-        if pending % _HSET_BATCH == 0:
-            await pipe.execute()
-            pipe = redis_client.pipeline()
-    if pending % _HSET_BATCH != 0:
-        await pipe.execute()
-
-    await redis_client.rename(building, PLAN_ACCOUNTS_KEY)
-    return pending
+    return published_accounts, published_plans
 
 
-async def publish_plan_catalog(redis_client: Any, quotas: Mapping[str, dict[str, Any]]) -> int:
-    """Atomically replace the plan_id -> quota catalog. Returns the number of plans published."""
-    building = PLAN_CATALOG_KEY + _BUILDING_SUFFIX
-    await redis_client.delete(building)
-
-    if not quotas:
-        raise PlanMapShrankTooMuch("refusing to publish an empty plan catalog")
-
-    pipe = redis_client.pipeline()
-    for plan_id, quota in quotas.items():
-        await pipe.hset(building, plan_id, json.dumps(quota))
-    await pipe.execute()
-
-    await redis_client.rename(building, PLAN_CATALOG_KEY)
-    return len(quotas)
-
-
-async def touch_meta(redis_client: Any, field: str, count: int) -> None:
-    """Record a successful publish. Best-effort: the meta key feeds staleness metrics only."""
-    raw = await redis_client.get(PLANS_META_KEY)
-    meta: dict[str, Any] = json.loads(raw) if raw else {}
-    meta[field] = int(time.time())
-    meta[f"{field}_count"] = count
-    await redis_client.set(PLANS_META_KEY, json.dumps(meta))
+async def touch_meta(redis_client: Any, accounts: int, plans: int) -> None:
+    """Record a successful publish. Feeds the staleness metric; the hashes themselves never expire."""
+    await redis_client.set(
+        PLANS_META_KEY,
+        json.dumps({"fetched_at": int(time.time()), "accounts": accounts, "plans": plans}),
+    )
 
 
 async def get_meta(redis_client: Any) -> dict[str, Any]:
-    raw = await redis_client.get(PLANS_META_KEY)
+    raw = _decode(await redis_client.get(PLANS_META_KEY))
     return json.loads(raw) if raw else {}
 
 
-async def get_plan_id_for_account(redis_client: Any, account_id: str) -> str | None:
-    """The account's plan_id, or None when they are pay-as-you-go."""
-    return _decode(await redis_client.hget(PLAN_ACCOUNTS_KEY, account_id))
+async def get_plan_for_account(redis_client: Any, account_id: str) -> PlanQuota | None:
+    """The account's enforceable plan, or None when they are pay-as-you-go.
 
+    Only accounts with an ACTIVE plan are in the hash at all (see _plan_row in the plans-cacher), so
+    a miss here covers every pay-as-you-go case: no subscription, a lapsed one, or an account the
+    upstream does not know about.
 
-async def get_plan_quota(redis_client: Any, plan_id: str) -> PlanQuota | None:
-    """The plan's quota, or None when the catalog is cold or does not know this plan."""
-    raw = _decode(await redis_client.hget(PLAN_CATALOG_KEY, plan_id))
+    Falls back to the catalog only when the account row carries no allowance of its own.
+    """
+    raw = _decode(await redis_client.hget(PLAN_ACCOUNTS_KEY, account_id))
     if raw is None:
         return None
 
-    payload = json.loads(raw)
-    storage_bytes = payload.get("storage_bytes")
-    return PlanQuota(
-        plan_id=plan_id,
-        storage_bytes=int(storage_bytes) if storage_bytes is not None else None,
-        name=payload.get("name"),
-    )
+    row = json.loads(raw)
+    plan_id = row.get("plan")
+    if not plan_id:
+        return None
+
+    storage_bytes = row.get("storage_bytes")
+    if storage_bytes is None:
+        storage_bytes = await _catalog_storage_bytes(redis_client, plan_id)
+
+    return PlanQuota(plan_id=str(plan_id), storage_bytes=int(storage_bytes) if storage_bytes is not None else None)
+
+
+async def _catalog_storage_bytes(redis_client: Any, plan_id: str) -> int | None:
+    raw = _decode(await redis_client.hget(PLAN_CATALOG_KEY, plan_id))
+    if raw is None:
+        return None
+    return json.loads(raw).get("storage_bytes")

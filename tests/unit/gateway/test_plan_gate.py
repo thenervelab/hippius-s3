@@ -22,8 +22,7 @@ GB = 1_000_000_000
 
 def make_config(**overrides: object) -> SimpleNamespace:
     base = dict(
-        plans_enforcement_enabled=True,
-        plans_enforcement_mode="enforce",
+        enable_billing_plans=True,
         usage_cache_ttl_seconds=30,
         usage_authoritative_timeout_seconds=5.0,
     )
@@ -32,27 +31,36 @@ def make_config(**overrides: object) -> SimpleNamespace:
 
 
 class StubRedis:
-    def __init__(self, plan_id: str | None = None, quota: dict | None = None) -> None:
+    """redis-accounts stand-in: the account hash carries plan + allowance, the catalog is fallback."""
+
+    def __init__(self, plan_id: str | None = None, storage_bytes: int | None = None) -> None:
         self._plan_id = plan_id
-        self._quota = quota
+        self._storage_bytes = storage_bytes
 
     async def hget(self, key: str, field: str):
         import json
 
         if key == "hippius_s3_plan_accounts":
-            return self._plan_id.encode() if self._plan_id else None
-        if self._quota is None:
-            return None
-        return json.dumps(self._quota).encode()
+            if not self._plan_id:
+                return None
+            return json.dumps({"plan": self._plan_id, "storage_bytes": self._storage_bytes}).encode()
+        return None
 
 
 # --------------------------------------------------------------------------- resolve_plan
 
 
 @pytest.mark.asyncio
-async def test_the_kill_switch_makes_everyone_pay_as_you_go() -> None:
-    redis = StubRedis(plan_id="plan-1", quota={"storage_bytes": GB})
-    assert await plan_gate.resolve_plan(redis, "acct", make_config(plans_enforcement_enabled=False)) is None
+async def test_resolve_plan_still_answers_when_the_feature_is_off() -> None:
+    """resolve_plan is deliberately NOT gated on enable_billing_plans.
+
+    With the feature off we still want to know the account is on a plan, so the middleware can emit
+    the BILLING_PLAN_SHADOW line. The flag decides what is DONE with the answer, not whether the
+    question is asked.
+    """
+    redis = StubRedis(plan_id="pro", storage_bytes=GB)
+    resolved = await plan_gate.resolve_plan(redis, "acct", make_config(enable_billing_plans=False))
+    assert resolved is not None and resolved.plan_id == "pro"
 
 
 @pytest.mark.asyncio
@@ -62,29 +70,29 @@ async def test_an_account_with_no_plan_row_is_pay_as_you_go() -> None:
 
 @pytest.mark.asyncio
 async def test_a_plan_with_a_known_quota_resolves() -> None:
-    redis = StubRedis(plan_id="plan-1", quota={"storage_bytes": 5 * GB, "name": "Starter"})
-    plan_id, quota = await plan_gate.resolve_plan(redis, "acct", make_config())
+    redis = StubRedis(plan_id="business", storage_bytes=5 * GB)
+    quota = await plan_gate.resolve_plan(redis, "acct", make_config())
 
-    assert plan_id == "plan-1"
-    assert quota == PlanQuota(plan_id="plan-1", storage_bytes=5 * GB, name="Starter")
+    assert quota == PlanQuota(plan_id="business", storage_bytes=5 * GB)
+    assert quota.enforceable
 
 
 @pytest.mark.asyncio
 async def test_a_plan_whose_quota_is_unknown_resolves_with_no_quota() -> None:
     """Cold catalog. The account is positively on a plan, so it must NOT fall to pay-as-you-go
     (which would 402 them on the credit check) -- it resolves with quota None and is allowed."""
-    redis = StubRedis(plan_id="plan-1", quota=None)
-    plan_id, quota = await plan_gate.resolve_plan(redis, "acct", make_config())
+    redis = StubRedis(plan_id="pro", storage_bytes=None)
+    quota = await plan_gate.resolve_plan(redis, "acct", make_config())
 
-    assert plan_id == "plan-1"
-    assert quota is None
+    assert quota is not None and quota.plan_id == "pro"
+    assert not quota.enforceable, "on a plan, allowance unknown -> callers ALLOW"
 
 
 @pytest.mark.asyncio
 async def test_a_nonpositive_allowance_resolves_with_no_quota() -> None:
-    redis = StubRedis(plan_id="plan-1", quota={"storage_bytes": 0})
-    _, quota = await plan_gate.resolve_plan(redis, "acct", make_config())
-    assert quota is None
+    redis = StubRedis(plan_id="pro", storage_bytes=0)
+    quota = await plan_gate.resolve_plan(redis, "acct", make_config())
+    assert quota is not None and not quota.enforceable
 
 
 @pytest.mark.asyncio
@@ -104,8 +112,6 @@ async def test_a_redis_error_raises_lookup_unavailable() -> None:
 async def test_malformed_cached_quota_json_raises_lookup_unavailable() -> None:
     class GarbageRedis:
         async def hget(self, key: str, field: str) -> bytes:
-            if key == "hippius_s3_plan_accounts":
-                return b"plan-1"
             return b"{not json"
 
     with pytest.raises(PlanLookupUnavailable):
@@ -116,7 +122,7 @@ async def test_malformed_cached_quota_json_raises_lookup_unavailable() -> None:
 
 
 async def evaluate(cached_used: int, authoritative: int | None, incoming: int, limit: int | None, **cfg):
-    quota = PlanQuota(plan_id="plan-1", storage_bytes=limit) if limit is not None else None
+    quota = PlanQuota(plan_id="pro", storage_bytes=limit)
     with (
         patch.object(plan_gate.usage_service, "get_account_bytes", AsyncMock(return_value=cached_used)),
         patch.object(plan_gate, "_authoritative_bytes", AsyncMock(return_value=authoritative)),
@@ -125,7 +131,6 @@ async def evaluate(cached_used: int, authoritative: int | None, incoming: int, l
             db=object(),
             redis_accounts_client=object(),
             main_account_id="acct",
-            plan_id="plan-1",
             quota=quota,
             incoming_bytes=incoming,
             config=make_config(**cfg),
@@ -143,8 +148,7 @@ async def test_under_quota_allows_without_consulting_ground_truth() -> None:
             db=object(),
             redis_accounts_client=object(),
             main_account_id="acct",
-            plan_id="plan-1",
-            quota=PlanQuota(plan_id="plan-1", storage_bytes=10 * GB),
+            quota=PlanQuota(plan_id="pro", storage_bytes=10 * GB),
             incoming_bytes=1 * GB,
             config=make_config(),
         )
@@ -184,17 +188,52 @@ async def test_an_unavailable_ground_truth_allows_rather_than_denies() -> None:
     assert decision.outcome == "allow"
 
 
+# --------------------------------------------------------------------------- shadow_evaluate
+
+
+async def shadow(cached_used: int, incoming: int, limit: int | None):
+    quota = PlanQuota(plan_id="pro", storage_bytes=limit)
+    with (
+        patch.object(plan_gate.usage_service, "get_account_bytes", AsyncMock(return_value=cached_used)),
+        patch.object(plan_gate.usage_service, "get_account_bytes_authoritative", AsyncMock()) as authoritative,
+    ):
+        decision = await plan_gate.shadow_evaluate(
+            db=object(),
+            redis_accounts_client=object(),
+            main_account_id="acct",
+            quota=quota,
+            incoming_bytes=incoming,
+            config=make_config(enable_billing_plans=False),
+        )
+    return decision, authoritative
+
+
 @pytest.mark.asyncio
-async def test_observe_mode_never_denies() -> None:
-    decision = await evaluate(
-        cached_used=20 * GB,
-        authoritative=20 * GB,
-        incoming=1 * GB,
-        limit=10 * GB,
-        plans_enforcement_mode="observe",
-    )
+async def test_shadow_reports_would_deny_without_denying_anything() -> None:
+    decision, _ = await shadow(cached_used=20 * GB, incoming=1 * GB, limit=10 * GB)
     assert decision.outcome == "would_deny"
-    assert decision.allowed
+    assert decision.allowed, "shadow mode must never produce a denial"
+
+
+@pytest.mark.asyncio
+async def test_shadow_reports_allow_when_under_quota() -> None:
+    decision, _ = await shadow(cached_used=1 * GB, incoming=1 * GB, limit=10 * GB)
+    assert decision.outcome == "allow"
+
+
+@pytest.mark.asyncio
+async def test_shadow_never_runs_the_expensive_authoritative_query() -> None:
+    """Shadow runs on the pay-as-you-go path of every write. The authoritative SUM can take seconds
+    on a large account; adding it to a live upload for the sake of a log line would be a
+    self-inflicted latency regression."""
+    _, authoritative = await shadow(cached_used=999 * GB, incoming=1 * GB, limit=1 * GB)
+    authoritative.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shadow_reports_catalog_miss_when_the_plan_has_no_known_quota() -> None:
+    decision, _ = await shadow(cached_used=1 * GB, incoming=1, limit=None)
+    assert decision.outcome == "catalog_miss"
 
 
 @pytest.mark.asyncio
@@ -216,7 +255,7 @@ async def test_a_zero_byte_request_is_allowed_when_already_at_the_limit() -> Non
 
 
 def test_the_denial_message_carries_the_real_numbers_and_an_action() -> None:
-    decision = plan_gate.PlanDecision(plan_id="plan-1", outcome="deny", quota_bytes=10 * GB, used_bytes=12 * GB)
+    decision = plan_gate.PlanDecision(plan_id="pro", outcome="deny", quota_bytes=10 * GB, used_bytes=12 * GB)
     message = plan_gate.quota_exceeded_message(decision)
 
     assert "10.00 GB" in message
@@ -229,7 +268,7 @@ def test_the_denial_message_cannot_be_misread_as_a_transient_billing_error() -> 
     containing one of those phrases would turn a hard denial into a retry loop."""
     from hippius_s3.gateway.middlewares.account import _TRANSIENT_BILLING_ERROR_MARKERS
 
-    decision = plan_gate.PlanDecision(plan_id="plan-1", outcome="deny", quota_bytes=10 * GB, used_bytes=12 * GB)
+    decision = plan_gate.PlanDecision(plan_id="pro", outcome="deny", quota_bytes=10 * GB, used_bytes=12 * GB)
     message = plan_gate.quota_exceeded_message(decision).lower()
 
     for marker in _TRANSIENT_BILLING_ERROR_MARKERS:

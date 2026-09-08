@@ -16,10 +16,12 @@ from hippius_s3.gateway.services.account_service import fetch_account_by_main_ad
 from hippius_s3.gateway.utils.errors import s3_error_response
 from hippius_s3.gateway.utils.paths import routing_path
 from hippius_s3.models.account import HippiusAccount
+from hippius_s3.monitoring import PlanGateOutcome
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.services.arion_service import CanUploadResponse
+from hippius_s3.services.plans_cache import PlanQuota
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.service_accounts import is_service_account
 
@@ -111,6 +113,63 @@ def _declared_content_length(request: Request) -> int:
     return int(request.headers.get("x-amz-decoded-content-length") or request.headers.get("content-length") or "0")
 
 
+async def _log_plan_shadow(
+    request: Request,
+    logger: logging.Logger | logging.LoggerAdapter,
+    account_address: str,
+    quota: PlanQuota,
+) -> None:
+    """Record what the plan gate WOULD have done, while HIPPIUS_ENABLE_BILLING_PLANS is off.
+
+    The request itself is untouched: it goes on to the pay-as-you-go path and is billed exactly as
+    it is today. This exists so the whole chain -- plans-cacher -> redis maps -> usage rollup ->
+    quota arithmetic -- is observably working in prod logs before the flag is flipped and it can
+    cost anyone an upload.
+
+    Only accounts that actually HAVE a plan are logged. Emitting a line for every pay-as-you-go
+    write would bury the signal in the volume it is meant to be found in.
+
+    Grep in Loki:
+        {namespace="hippius-s3-prod",app="api"} |= "BILLING_PLAN_SHADOW"
+        {namespace="hippius-s3-prod",app="api"} |= "BILLING_PLAN_SHADOW" |= "would=would_deny"
+
+    Nothing in here may break the request. The shadow path is pure observation, so a failure to
+    produce a log line is swallowed -- the alternative is a diagnostic feature 500ing live uploads.
+    """
+    if request.method not in ("PUT", "POST"):
+        return
+
+    incoming = _declared_content_length(request)
+    try:
+        decision = await plan_gate.shadow_evaluate(
+            db=request.app.state.postgres_pool,
+            redis_accounts_client=request.app.state.redis_accounts_client,
+            main_account_id=account_address,
+            quota=quota,
+            incoming_bytes=incoming,
+            config=config,
+        )
+    except Exception as e:
+        logger.warning(f"BILLING_PLAN_SHADOW account={account_address} plan={quota.plan_id} error={e!r}")
+        return
+
+    # Mapped explicitly rather than f-string-prefixed so the metric label stays a closed, typed set.
+    shadow_outcome: PlanGateOutcome = (
+        "shadow_would_deny"
+        if decision.outcome == "would_deny"
+        else "shadow_catalog_miss"
+        if decision.outcome == "catalog_miss"
+        else "shadow_allow"
+    )
+    get_metrics_collector().record_plan_gate(outcome=shadow_outcome)
+    logger.info(
+        f"BILLING_PLAN_SHADOW enforcement=disabled account={account_address} plan={quota.plan_id} "
+        f"method={request.method} used_bytes={decision.used_bytes} limit_bytes={decision.quota_bytes} "
+        f"incoming_bytes={incoming} would={decision.outcome} "
+        f"note=charged via pay-as-you-go instead; set HIPPIUS_ENABLE_BILLING_PLANS=true to enforce"
+    )
+
+
 async def _check_plan_quota(
     request: Request,
     logger: logging.Logger | logging.LoggerAdapter,
@@ -118,8 +177,9 @@ async def _check_plan_quota(
 ) -> tuple[bool, Response | None]:
     """Storage-quota gate for accounts on a billing plan.
 
-    Returns (handled, error_response). `handled` False means this account is pay-as-you-go (or the
-    plan caches could not be consulted) and the caller must run the normal credit + can_upload path.
+    Returns (handled, error_response). `handled` False means the caller must run the normal
+    pay-as-you-go path (credits + can_upload) -- because the account has no plan, because the caches
+    could not be consulted, or because HIPPIUS_ENABLE_BILLING_PLANS is off.
     """
     redis_accounts = request.app.state.redis_accounts_client
 
@@ -133,8 +193,13 @@ async def _check_plan_quota(
     if resolved is None:
         return False, None
 
-    plan_id, quota = resolved
+    quota = resolved
+    plan_id = quota.plan_id
     request.state.plan_id = plan_id
+
+    if not config.enable_billing_plans:
+        await _log_plan_shadow(request, logger, account_address, quota)
+        return False, None
 
     # Deletes free space; never gate them on a quota. This is what lets a customer who downgraded
     # below their current usage dig themselves out instead of being stuck.
@@ -146,24 +211,21 @@ async def _check_plan_quota(
         db=request.app.state.postgres_pool,
         redis_accounts_client=redis_accounts,
         main_account_id=account_address,
-        plan_id=plan_id,
         quota=quota,
         incoming_bytes=_declared_content_length(request),
         config=config,
     )
-    get_metrics_collector().record_plan_gate(outcome=decision.outcome)
+    # Mapped explicitly, like the shadow arm: the label set stays closed, and anything that is not
+    # a hard deny or a catalog miss is recorded as what actually happened to the request — allowed.
+    enforced_outcome: PlanGateOutcome = (
+        "deny" if decision.outcome == "deny" else "catalog_miss" if decision.outcome == "catalog_miss" else "allow"
+    )
+    get_metrics_collector().record_plan_gate(outcome=enforced_outcome)
 
     if decision.outcome == "catalog_miss":
         logger.warning(
             f"PLAN_QUOTA catalog miss account={account_address} plan={plan_id}; allowing. "
             f"The plans-cacher may be cold or this plan id is unknown to the catalog."
-        )
-        return True, None
-
-    if decision.outcome == "would_deny":
-        logger.warning(
-            f"PLAN_QUOTA would deny (observe mode) account={account_address} plan={plan_id} "
-            f"used={decision.used_bytes} limit={decision.quota_bytes}"
         )
         return True, None
 
