@@ -191,46 +191,37 @@ Fast-path copy: rewraps the DEK under the destination's AAD, copies `chunk_backe
 
 **Proposed**: add a prominent comment block at [copy_service_v5.py:24](hippius_s3/services/copy_service_v5.py) documenting the invariant ("fast path requires either (a) non-MPU single-part object OR (b) explicit FS backfill of all chunks into the destination object_id path"). Consider a feature flag before re-enabling for MPU.
 
-### P1 — Billing plans: the quota gate keys on the CALLER, but storage is owner-pays
+### P1 — Billing plans: the quota gate keys on the CALLER, the rollup on the OWNER
 
 `account_middleware` runs before `acl_middleware`, so `bucket_owner_id` is not resolved when the
-plan gate runs; it looks up the caller's own plan and the caller's own reported usage. But billing
-is owner-pays (Arion charges `object_versions.address`, the bucket owner).
+plan gate runs; it passes the caller's `account_address` as `main_account_id`. But
+`bucket_storage_usage.main_account_id` is copied from `buckets.main_account_id` — the owner. Billing
+here is owner-pays (Arion charges `object_versions.address`).
 
 Consequence: a plan customer at 100% of quota who holds a cross-account WRITE grant on someone
-else's bucket passes the gate on every PUT — their own reported usage does not grow — while the
-bytes accrue to the owner. `can_upload` has the same caller/owner asymmetry today, so this is not a
-regression, but it becomes load-bearing once a quota is enforced.
+else's bucket passes the gate on every PUT — their own total never grows — while the bytes accrue to
+the owner's rollup, which no gate consults for that request. `can_upload` has the same caller/owner
+asymmetry today, so this is not a regression, but it becomes load-bearing once a quota is enforced.
 
-This is also what AWS and R2 do differently: in both, the **bucket owner** pays for stored bytes
-regardless of who wrote them (S3 Requester Pays shifts request and transfer costs, never storage).
-So the owner is the correct subject, and the fix needs the owner resolved before the gate — either
-reordering the middleware chain or resolving the bucket owner twice. Size it first with a
-cross-account counter on `plan_gate_total`.
-
-### P2 — Billing plans: quota enforcement lags by one poll interval
-
-Usage is reported by `GET /api/s3/plans/accounts/` (computed on chain) rather than measured per
-request, so an account can exceed its allowance by up to `HIPPIUS_PLANS_LOOP_SLEEP` (60s) worth of
-uploads before the gate sees it. There is also no second source to verify a denial against, so a
-stale-high number can refuse a customer who has just deleted data. Shortening the poll is the only
-lever today; a local counter would be the alternative, and was deliberately removed as redundant
-with the upstream figure.
+Fixing it needs the owner resolved before the gate, which means either reordering the middleware
+chain or resolving the bucket owner twice. Size it first: `plan_gate_total` plus a cross-account
+counter will say whether this is a real pattern or a theoretical one.
 
 ### P2 — Billing plans: an overwrite is charged as if it were additive
 
-The gate tests `used + incoming_bytes <= limit`, and `used` already contains the bytes of the
-version being replaced. A customer at 99% who re-uploads an unchanged file — an ordinary
-`aws s3 sync` re-run — is refused for a net-zero write. Fixing it needs the current version's size,
-which is not resolved at that point in the chain.
+`evaluate_quota` tests `used + incoming_bytes <= limit`, and `used` already contains the bytes of
+the version being replaced. A customer at 99% who re-uploads an unchanged file — an ordinary
+`aws s3 sync` re-run — is refused for a net-zero write.
 
-### P2 — Billing plans: in-flight MPU parts and object-level subresources
+The gate runs before the object key is resolved, so a correct fix needs the current version's size
+at that point. Until then the 402 is technically wrong for overwrites, though it errs toward
+refusing rather than admitting.
 
-Part uploads are gated individually on their declared length but never against the accumulating
-total, so an MPU can cross the allowance and only be caught on the next poll. Separately,
-`required_op` grades `PUT /bucket/key?acl|?tagging` as `write_object`, so those are quota-gated
-even though they store no bytes; fixing that means splitting object subresources in the shared
-mapping, which also touches sub-token authorisation.
+### P2 — Billing plans: in-flight MPU parts are uncounted until Complete
+
+`multipart_uploads` has no size column and `object_versions.size_bytes` only lands at
+`mpu_complete`, so part uploads are gated individually on their declared length but never against
+the accumulating total. Gating `CompleteMultipartUpload` on the summed part sizes would close it.
 
 ### P2 — Gateway → API streaming hop
 

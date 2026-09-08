@@ -73,7 +73,9 @@ def no_create(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("subresource", sorted(BUCKET_PUT_SUBRESOURCES))
-async def test_no_bucket_put_subresource_reaches_create_bucket(subresource: str, no_create: None) -> None:
+async def test_no_bucket_put_subresource_reaches_create_bucket(
+    subresource: str, no_create: None
+) -> None:
     """Every member of the set must be routed or refused — never silently created.
 
     Parametrised over the set itself, so adding a subresource without a router branch fails here
@@ -93,7 +95,9 @@ async def test_no_bucket_put_subresource_reaches_create_bucket(subresource: str,
     # deliberate behaviour change and belongs in its own PR.
     handled_inside_create = {"tagging", "lifecycle", "policy", "cors"}
     try:
-        result = await bucket_router.create_or_modify_bucket("some-bucket", _request(subresource), _Pool())
+        result = await bucket_router.create_or_modify_bucket(
+            "some-bucket", _request(subresource), _Pool()
+        )
     except _Unreachable:
         assert subresource in handled_inside_create, (
             f"PUT /bucket?{subresource} fell through to handle_create_bucket. Because "
@@ -108,7 +112,9 @@ async def test_no_bucket_put_subresource_reaches_create_bucket(subresource: str,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("subresource", ["retention", "legal-hold"])
-async def test_object_level_subresources_are_refused_on_a_bucket_path(subresource: str, no_create: None) -> None:
+async def test_object_level_subresources_are_refused_on_a_bucket_path(
+    subresource: str, no_create: None
+) -> None:
     """Retention and legal hold address an object version; on a bucket path they address nothing.
 
     Asserted as a 4xx specifically, rather than merely "did not create": a 200 here would be the

@@ -79,28 +79,14 @@ def _parse_page(page: S3PlanAccountsResponse) -> tuple[dict[str, dict[str, Any]]
     exactly what the request path already treats as pay-as-you-go, so there is nothing to encode
     for them and nothing to keep in sync.
 
-    THE TWO `storage_bytes` FIELDS MEAN OPPOSITE THINGS, and confusing them is catastrophic:
-
-      * `plans.<name>.storage_bytes` is the plan's ALLOWANCE.
-      * `results[].storage_bytes` is that account's CURRENT TOTAL S3 USAGE, computed on chain.
-
-    Reading an account's usage as its allowance would hand every plan customer a limit exactly equal
-    to what they already store, and deny their very next upload. They are stored here under names
-    that cannot be mixed up: `storage_limit_bytes` and `used_bytes`.
-
-    Both are resolved at publish time, so the request path is a single HGET against one key, with no
-    catalog lookup and no database work.
+    The per-account `storage_bytes` is preferred over the catalog's, so a bespoke allowance on one
+    enterprise account is honoured rather than silently overwritten by the list price.
     """
     accounts: dict[str, dict[str, Any]] = {}
     for row in page.results:
         if not row.ss58 or not _is_enforceable_plan_row(row):
             continue
-        plan = page.plans.get(row.plan or "")
-        accounts[row.ss58] = {
-            "plan": row.plan,
-            "storage_limit_bytes": plan.storage_bytes if plan else None,
-            "used_bytes": row.storage_bytes or 0,
-        }
+        accounts[row.ss58] = {"plan": row.plan, "storage_bytes": row.storage_bytes}
 
     catalog = {name: {"h256": entry.h256, "storage_bytes": entry.storage_bytes} for name, entry in page.plans.items()}
     return accounts, catalog

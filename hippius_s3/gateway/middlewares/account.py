@@ -11,15 +11,11 @@ from fastapi import Response
 from starlette import status
 
 from hippius_s3.config import get_config
-from hippius_s3.gateway.middlewares.acl import parse_s3_path
 from hippius_s3.gateway.services import plan_gate
 from hippius_s3.gateway.services.account_service import fetch_account_by_main_address
-from hippius_s3.gateway.services.sub_token_scope import required_op
 from hippius_s3.gateway.utils.errors import s3_error_response
-from hippius_s3.gateway.utils.paths import first_path_segment
 from hippius_s3.gateway.utils.paths import routing_path
 from hippius_s3.models.account import HippiusAccount
-from hippius_s3.models.sub_token import Op
 from hippius_s3.monitoring import PlanGateOutcome
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.peer_auth import is_authorized_peer_fetch
@@ -67,30 +63,6 @@ def _is_transient_billing_error(error: str | None) -> bool:
 # them in would turn a total upload outage into a fleet-wide "please retry" that never resolves
 # and carries no stack trace. They stay on the blanket handler where they stay loud.
 _UNREACHABLE_ERRORS = (httpx.TimeoutException, httpx.NetworkError, httpx.ProxyError, httpx.RemoteProtocolError)
-
-
-# Decision -> metric label, one closed map per disposition. Anything not named here is recorded as
-# what actually happened to the request: it was allowed.
-_ENFORCED_LABEL: dict[plan_gate.Outcome, PlanGateOutcome] = {"deny": "deny", "catalog_miss": "catalog_miss"}
-_SHADOW_LABEL: dict[plan_gate.Outcome, PlanGateOutcome] = {
-    "would_deny": "shadow_would_deny",
-    "catalog_miss": "shadow_catalog_miss",
-}
-
-
-def _permissive_account(account_address: str) -> HippiusAccount:
-    """The account object for a caller whose write is not credit-gated.
-
-    Used by the test bypass, the service-account bypass and the plan branch alike: each has already
-    decided the request may proceed, and none of them consults the credit fields afterwards.
-    """
-    return HippiusAccount(
-        id=account_address,
-        main_account=account_address,
-        has_credits=True,
-        upload=True,
-        delete=True,
-    )
 
 
 async def _can_upload(
@@ -146,22 +118,15 @@ def _declared_content_length(request: Request) -> int:
 def _adds_storage(request: Request) -> bool:
     """Whether this operation can ADD stored bytes, and so is subject to the plan quota.
 
-    Delegates to the repo's existing verb+query -> operation mapping rather than re-deriving one.
-    Classifying this by hand gets it wrong in both directions, and both mistakes are user-hostile:
-
-      * `POST /{bucket}?delete` is the bulk DeleteObjects that `aws s3 rm --recursive` issues. It
-        frees space, so gating it would answer an over-quota customer's bulk delete with a 402
-        telling them to delete things.
-      * `PUT /{bucket}?acl|?tagging|?versioning|...` and `CreateBucket` store no object bytes.
-        Refusing "set a tag on my bucket" with "this upload would exceed your storage quota" is the
-        same class of error, one query param over.
-
-    `required_op` already encodes both, with the DeleteObjects carve-out and the bucket-subresource
-    split spelled out where sub-token authorisation reads them too — so there is one place that
-    knows what an S3 request is, not three.
+    Deletes free space and must never be quota-gated — that is what lets a customer who downgraded
+    below their current usage dig themselves out. Judging that on the HTTP verb alone is wrong:
+    S3's multi-object delete is `POST /{bucket}?delete`, which is what `aws s3 rm --recursive` and
+    `aws s3 sync --delete` actually issue. Gating it would answer an over-quota customer's bulk
+    delete with a 402 whose message tells them to delete things.
     """
-    _, key = parse_s3_path(routing_path(request))
-    return required_op(request.method, key is not None, dict(request.query_params)) is Op.write_object
+    if request.method not in ("PUT", "POST"):
+        return False
+    return "delete" not in request.query_params
 
 
 async def _log_plan_shadow(
@@ -191,9 +156,28 @@ async def _log_plan_shadow(
         return
 
     incoming = _declared_content_length(request)
-    decision = plan_gate.evaluate_quota(quota, incoming, enforcing=False)
+    try:
+        decision = await plan_gate.shadow_evaluate(
+            db=request.app.state.postgres_pool,
+            redis_accounts_client=request.app.state.redis_accounts_client,
+            main_account_id=account_address,
+            quota=quota,
+            incoming_bytes=incoming,
+            config=config,
+        )
+    except Exception as e:
+        logger.warning(f"BILLING_PLAN_SHADOW account={account_address} plan={quota.plan_id} error={e!r}")
+        return
 
-    get_metrics_collector().record_plan_gate(outcome=_SHADOW_LABEL.get(decision.outcome, "shadow_allow"))
+    # Mapped explicitly rather than f-string-prefixed so the metric label stays a closed, typed set.
+    shadow_outcome: PlanGateOutcome = (
+        "shadow_would_deny"
+        if decision.outcome == "would_deny"
+        else "shadow_catalog_miss"
+        if decision.outcome == "catalog_miss"
+        else "shadow_allow"
+    )
+    get_metrics_collector().record_plan_gate(outcome=shadow_outcome)
     logger.info(
         f"BILLING_PLAN_SHADOW enforcement=disabled account={account_address} plan={quota.plan_id} "
         f"method={request.method} used_bytes={decision.used_bytes} limit_bytes={decision.quota_bytes} "
@@ -221,7 +205,7 @@ async def _check_plan_quota(
     # pay-as-you-go path, which is exactly what the account would have got before this feature
     # existed — so nothing here can be a NEW failure mode.
     try:
-        resolved = await plan_gate.resolve_plan(redis_accounts, account_address)
+        resolved = await plan_gate.resolve_plan(redis_accounts, account_address, config)
         if resolved is None:
             return False, None
 
@@ -237,12 +221,24 @@ async def _check_plan_quota(
             get_metrics_collector().record_plan_gate(outcome="allow")
             return True, None
 
-        decision = plan_gate.evaluate_quota(quota, _declared_content_length(request))
+        decision = await plan_gate.evaluate_quota(
+            db=request.app.state.postgres_pool,
+            redis_accounts_client=redis_accounts,
+            main_account_id=account_address,
+            quota=quota,
+            incoming_bytes=_declared_content_length(request),
+            config=config,
+        )
     except plan_gate.PlanLookupUnavailable as e:
         logger.warning(f"PLAN_LOOKUP unavailable account={account_address}: {e}; falling back to pay-as-you-go")
         get_metrics_collector().record_plan_gate(outcome="unavailable")
         return False, None
-    get_metrics_collector().record_plan_gate(outcome=_ENFORCED_LABEL.get(decision.outcome, "allow"))
+    # Mapped explicitly, like the shadow arm: the label set stays closed, and anything that is not
+    # a hard deny or a catalog miss is recorded as what actually happened to the request — allowed.
+    enforced_outcome: PlanGateOutcome = (
+        "deny" if decision.outcome == "deny" else "catalog_miss" if decision.outcome == "catalog_miss" else "allow"
+    )
+    get_metrics_collector().record_plan_gate(outcome=enforced_outcome)
 
     if decision.outcome == "catalog_miss":
         logger.warning(
@@ -256,11 +252,12 @@ async def _check_plan_quota(
             f"PLAN_QUOTA denied account={account_address} plan={plan_id} "
             f"used={decision.used_bytes} limit={decision.quota_bytes}"
         )
+        bucket_match = re.match(r"^/([^/]+)", routing_path(request))
         return True, s3_error_response(
             code="QuotaExceeded",
             message=plan_gate.quota_exceeded_message(decision),
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            BucketName=first_path_segment(request),
+            BucketName=bucket_match.group(1) if bucket_match else "",
         )
 
     return True, None
@@ -366,7 +363,13 @@ async def account_middleware(
         if auth_method == "access_key":
             account_address = getattr(request.state, "account_address", "anonymous")
             request.state.account_id = account_address
-            request.state.account = _permissive_account(account_address)
+            request.state.account = HippiusAccount(
+                id=account_address,
+                main_account=account_address,
+                has_credits=True,
+                upload=True,
+                delete=True,
+            )
         else:
             account_id = "anonymous"
             request.state.account_id = account_id
@@ -426,7 +429,13 @@ async def account_middleware(
                 # Skips the redis-accounts fetch as well as the gates: an internal account has no
                 # meaningful credit row to consult, and consulting one would make our own writes
                 # fail whenever the account-cacher lags.
-                request.state.account = _permissive_account(account_address)
+                request.state.account = HippiusAccount(
+                    id=account_address,
+                    main_account=account_address,
+                    has_credits=True,
+                    upload=True,
+                    delete=True,
+                )
                 logger.info(
                     f"BILLING_BYPASS surface=gateway account={account_address} method={request.method} path={path}"
                 )
@@ -439,7 +448,13 @@ async def account_middleware(
                 # unchanged pay-as-you-go path.
                 plan_handled, plan_error = await _check_plan_quota(request, logger, account_address)
                 if plan_handled:
-                    request.state.account = _permissive_account(account_address)
+                    request.state.account = HippiusAccount(
+                        id=account_address,
+                        main_account=account_address,
+                        has_credits=True,
+                        upload=True,
+                        delete=True,
+                    )
                     if plan_error is not None:
                         return plan_error
                     # Deliberately no `return await call_next(request)` here: falling out of the try

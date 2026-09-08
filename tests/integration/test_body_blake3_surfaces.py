@@ -56,7 +56,8 @@ async def seeded() -> AsyncGenerator[tuple[asyncpg.Connection, dict], None]:
     # 6 skipped" — a green run in which every DB assertion silently vanished, which is the same
     # false-green that let the crash-looping e2e workers go unnoticed for months. Fail loudly.
     if not await conn.fetchval(
-        "SELECT 1 FROM information_schema.columns WHERE table_name = 'object_versions' AND column_name = 'body_blake3'"
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'object_versions' AND column_name = 'body_blake3'"
     ):
         await conn.close()
         pytest.fail("object_versions.body_blake3 is missing — run `python -m hippius_s3.scripts.migrate`")

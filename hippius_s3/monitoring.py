@@ -607,6 +607,13 @@ class MetricsCollector:
         self.plans_cache_age_seconds = self.meter.create_histogram(
             name="plans_cache_age_seconds", description="Age of the cached plan maps", unit="s"
         )
+        # Difference between the trigger-maintained rollup and ground truth, per reconciled bucket.
+        # Expected value is exactly 0 -- any non-zero sample is a trigger defect, not noise.
+        self.usage_counter_drift_bytes = self.meter.create_histogram(
+            name="usage_counter_drift_bytes",
+            description="bucket_storage_usage drift vs ground truth at reconcile time",
+            unit="By",
+        )
 
         self.cachet_health_checks_total = self.meter.create_counter(
             name="cachet_health_checks_total", description="Gateway health checks run by the cachet worker", unit="1"
@@ -1033,6 +1040,9 @@ class MetricsCollector:
     def record_plans_cache_age(self, age_seconds: float) -> None:
         self.plans_cache_age_seconds.record(age_seconds)
 
+    def record_usage_counter_drift(self, drift_bytes: int) -> None:
+        self.usage_counter_drift_bytes.record(drift_bytes)
+
     def record_cachet_check(self, status: str, update_success: bool) -> None:
         self.cachet_health_checks_total.add(1, attributes={"status": status})
         self.cachet_updates_total.add(1, attributes={"success": str(update_success).lower()})
@@ -1147,6 +1157,9 @@ class NullMetricsCollector:
         pass
 
     def record_plans_cache_age(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_usage_counter_drift(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_account_cacher_cycle(self, *args: object, **kwargs: object) -> None:

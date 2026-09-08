@@ -3,17 +3,13 @@
 Fed by one upstream page — GET /api/s3/plans/accounts/ carries both the catalog and the account
 roll — and split across two hashes on redis-accounts:
 
-    hippius_s3_plan_accounts   field = account SS58   value = {"plan": ..., "used_bytes": ...}
+    hippius_s3_plan_accounts   field = account SS58   value = {"plan": ..., "storage_bytes": ...}
     hippius_s3_plans           field = plan name      value = {"h256": ..., "storage_bytes": ...}
     hippius_s3_plans:meta      JSON {fetched_at, counts}
 
-Upstream reports each account's CURRENT S3 USAGE alongside its plan, so the quota check is a
-comparison between two numbers that both arrive on the same page: `used_bytes` from the account row
-and the allowance from the catalog. The request path is ONE `HGET` and no database work at all.
-
-The freshness of `used_bytes` is therefore the poll interval (HIPPIUS_PLANS_LOOP_SLEEP, 300s), not
-a per-request read. An account can exceed its allowance by up to one poll interval's worth of
-uploads before the gate sees it.
+The account row carries its own resolved allowance, so the request path is normally ONE `HGET`: the
+catalog hash is consulted only when a row arrives without a `storage_bytes` of its own (and is kept
+regardless, because it is what makes the cached state legible to an operator).
 
 Deliberately NO TTL on either hash. A TTL would delete the last-known-good mapping in the middle of
 an api.hippius.com outage -- exactly the failure the cache exists to survive -- and silently demote
@@ -62,7 +58,6 @@ class PlanMapShrankTooMuch(Exception):
 class PlanQuota:
     plan_id: str
     storage_bytes: int | None
-    used_bytes: int
 
     @property
     def enforceable(self) -> bool:
@@ -94,12 +89,19 @@ async def _publish_hash(redis_client: Any, key: str, entries: Mapping[str, str])
         await redis_client.delete(key)
         return 0
 
-    items = list(entries.items())
-    for start in range(0, len(items), _HSET_BATCH):
-        await redis_client.hset(building, mapping=dict(items[start : start + _HSET_BATCH]))
+    pipe = redis_client.pipeline()
+    written = 0
+    for field, value in entries.items():
+        await pipe.hset(building, field, value)
+        written += 1
+        if written % _HSET_BATCH == 0:
+            await pipe.execute()
+            pipe = redis_client.pipeline()
+    if written % _HSET_BATCH != 0:
+        await pipe.execute()
 
     await redis_client.rename(building, key)
-    return len(items)
+    return written
 
 
 async def publish_plan_roll(
@@ -152,14 +154,13 @@ async def get_meta(redis_client: Any) -> dict[str, Any]:
 
 
 async def get_plan_for_account(redis_client: Any, account_id: str) -> PlanQuota | None:
-    """The account's plan, allowance and reported usage, or None when they are pay-as-you-go.
+    """The account's enforceable plan, or None when they are pay-as-you-go.
 
-    Only accounts with an ACTIVE plan are in the hash at all (see _parse_page in the plans-cacher),
-    so a miss here covers every pay-as-you-go case: no subscription, a lapsed one, or an account
+    Only accounts with an ACTIVE plan are in the hash at all (see _plan_row in the plans-cacher), so
+    a miss here covers every pay-as-you-go case: no subscription, a lapsed one, or an account the
     upstream does not know about.
 
-    One HGET: the plans-cacher resolves the allowance against the catalog at publish time, so the
-    request path never has to chase a second key.
+    Falls back to the catalog only when the account row carries no allowance of its own.
     """
     raw = _decode(await redis_client.hget(PLAN_ACCOUNTS_KEY, account_id))
     if raw is None:
@@ -170,9 +171,15 @@ async def get_plan_for_account(redis_client: Any, account_id: str) -> PlanQuota 
     if not plan_id:
         return None
 
-    limit = row.get("storage_limit_bytes")
-    return PlanQuota(
-        plan_id=str(plan_id),
-        storage_bytes=int(limit) if limit is not None else None,
-        used_bytes=int(row.get("used_bytes") or 0),
-    )
+    storage_bytes = row.get("storage_bytes")
+    if storage_bytes is None:
+        storage_bytes = await _catalog_storage_bytes(redis_client, plan_id)
+
+    return PlanQuota(plan_id=str(plan_id), storage_bytes=int(storage_bytes) if storage_bytes is not None else None)
+
+
+async def _catalog_storage_bytes(redis_client: Any, plan_id: str) -> int | None:
+    raw = _decode(await redis_client.hget(PLAN_CATALOG_KEY, plan_id))
+    if raw is None:
+        return None
+    return json.loads(raw).get("storage_bytes")

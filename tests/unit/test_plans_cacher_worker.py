@@ -87,7 +87,7 @@ def test_only_accounts_with_an_active_plan_are_published() -> None:
     accounts, catalog = pc._parse_page(page())
 
     assert set(accounts) == {"5E71kYuD"}, "only the active subscriber gets an allowance"
-    assert accounts["5E71kYuD"] == {"plan": "business", "storage_limit_bytes": 50 * TB, "used_bytes": 50 * TB}
+    assert accounts["5E71kYuD"] == {"plan": "business", "storage_bytes": 50 * TB}
     assert set(catalog) == {"pro", "business", "enterprise"}
 
 
@@ -124,17 +124,14 @@ def test_a_row_missing_any_requirement_gets_no_allowance(row: dict) -> None:
     assert accounts == {}
 
 
-def test_the_two_storage_bytes_fields_are_never_confused() -> None:
-    """`plans.<name>.storage_bytes` is the ALLOWANCE; `results[].storage_bytes` is that account's
-    CURRENT USAGE, computed on chain. Reading usage as the allowance would give every plan customer
-    a limit equal to what they already store and deny their very next upload."""
+def test_a_bespoke_per_account_allowance_beats_the_catalog_price() -> None:
+    """An enterprise account on a negotiated limit must not be silently reset to the list price."""
     accounts, _ = pc._parse_page(
         page(
-            results=[{"ss58": "vip", "billing": "plan", "plan": "pro", "active": True, "storage_bytes": 3 * TB}],
+            results=[{"ss58": "vip", "billing": "plan", "plan": "pro", "active": True, "storage_bytes": 999 * TB}],
         )
     )
-    assert accounts["vip"]["used_bytes"] == 3 * TB, "the account row is usage"
-    assert accounts["vip"]["storage_limit_bytes"] == 10 * TB, "the allowance comes from the catalog"
+    assert accounts["vip"]["storage_bytes"] == 999 * TB
 
 
 def test_an_unknown_upstream_field_does_not_break_parsing() -> None:
@@ -156,7 +153,7 @@ def test_an_unknown_upstream_field_does_not_break_parsing() -> None:
             plans={"pro": {"h256": "0x1", "storage_bytes": TB, "price_usd_cents": 900}},
         )
     )
-    assert accounts["a"]["used_bytes"] == TB
+    assert accounts["a"]["storage_bytes"] == TB
     assert catalog["pro"]["storage_bytes"] == TB
 
 
@@ -176,10 +173,7 @@ async def test_a_successful_cycle_publishes_and_records() -> None:
         assert await pc.run_cycle(redis) is True
 
     quota = await plans_cache.get_plan_for_account(redis, "5E71kYuD")
-    assert quota is not None
-    assert quota.plan_id == "business"
-    assert quota.storage_bytes == 50 * TB, "allowance from the catalog"
-    assert quota.used_bytes == 50 * TB, "usage from the account row"
+    assert quota is not None and quota.plan_id == "business" and quota.storage_bytes == 50 * TB
 
     kwargs = collector.record_plans_cacher_cycle.call_args.kwargs
     assert kwargs["success"] is True

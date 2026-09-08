@@ -58,6 +58,41 @@ chunk_backend(chunk_id, backend, backend_identifier, deleted, deleted_at, create
 
 The janitor's "fully replicated" check looks for a non-deleted row for every backend in `upload_backends ∪ backup_backends`.
 
+### `bucket_storage_usage`
+
+Per-bucket rollup of billable bytes, read by the billing-plan quota gate.
+
+```
+bucket_storage_usage(bucket_id PK, main_account_id, bytes_used, objects_count,
+                     updated_at, reconciled_at, reconciled_bytes)
+```
+
+**Maintained entirely by triggers, never by application code.** Four of them, defined with a long
+rationale in [migrations/20260908120000_bucket_storage_usage.sql](migrations/20260908120000_bucket_storage_usage.sql):
+
+| Trigger | Table | Owns |
+|---|---|---|
+| `trg_usage_object_versions_update` | `object_versions` | size changes to a row that is ALREADY current |
+| `trg_usage_objects_update` | `objects` | version repoint, soft-delete, revival |
+| `trg_usage_objects_insert` | `objects` | a brand-new key |
+| `trg_usage_objects_delete` | `objects` | hard-delete (BEFORE, so children are still readable) |
+
+⚠️ **Do NOT add a trigger on `object_versions` INSERT or DELETE.** The `objects` triggers already own
+the transition that makes a version current; covering it twice double-counts every new object. The
+exact trigger set is pinned by `tests/integration/test_usage_triggers.py`, so this fails the build
+rather than corrupting billing.
+
+⚠️ **Any future bulk migration over `objects` / `object_versions` fires these per row.** Such a
+migration must `ALTER TABLE ... DISABLE TRIGGER USER`, do its work, re-enable, then recompute the
+affected buckets with `hippius_s3/scripts/reconcile_storage_usage.py`.
+
+The counter is a **cache of a computable truth**: `recompute_bucket_storage_usage.sql` restores any
+row from ground truth, so drift is always repairable. Four queries encode ONE definition of "storage
+used" and must stay in sync — `get_account_storage_usage_authoritative.sql`,
+`recompute_bucket_storage_usage.sql`, `get_admin_account_stats.sql` and `console_list_buckets.sql`.
+The last two disagreed with each other until this change; once a plan refuses uploads on the number,
+the one a customer sees in the console has to be the one we enforce.
+
 ### `buckets`, `bucket_acls`, `object_acls`
 
 Standard S3 metadata + ACL rows.
