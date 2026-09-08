@@ -919,9 +919,9 @@ spec:
               cpu: 1000m
               memory: 2Gi
 ---
-# Scrapes the two api.hippius.com billing-plan endpoints into redis-accounts:
-#   GET /s3-plans           every 10 min  ->  HASH hippius_s3_plans
-#   GET /s3-plans/accounts  every  5 min  ->  HASH hippius_s3_plan_accounts
+# Scrapes the api.hippius.com billing-plan roll into redis-accounts:
+#   GET /api/s3/plans/accounts/   every HIPPIUS_PLANS_LOOP_SLEEP (300s)
+# One endpoint carries both halves -> HASH hippius_s3_plan_accounts + HASH hippius_s3_plans.
 #
 # replicas MUST stay 1. Publication is a whole-hash build-then-RENAME; two replicas racing would
 # not corrupt anything (last RENAME wins) but would double the upstream load for no benefit.

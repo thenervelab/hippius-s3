@@ -7,8 +7,7 @@
 -- survivable now that a billing plan refuses uploads on it: the number a customer sees in the
 -- console has to be the number we enforce, or every near-limit rejection becomes a support ticket.
 --
--- Keep in sync with get_account_storage_usage_authoritative.sql and usage_billable() in
--- migrations/20260908120000_bucket_storage_usage.sql. Those three encode one definition.
+-- Keep in sync with get_admin_account_stats.sql. Those two encode one definition.
 --
 -- Parameters: $1: main_account_id
 SELECT

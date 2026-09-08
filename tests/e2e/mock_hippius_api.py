@@ -168,8 +168,7 @@ async def token_auth(payload: TokenAuthRequest):
 #
 # Registered under BOTH paths because HIPPIUS_API_BASE_URL differs between environments: in prod it
 # ends in /api so the client requests /api/s3/plans/accounts/, while against this mock the base has
-# no prefix and the same relative path resolves to /s3/plans/accounts/. The `next` url we hand back
-# is absolute-from-root, so page 2 arrives on the /api form either way.
+# no prefix and the same relative path resolves to /s3/plans/accounts/.
 #
 # MOCK_ACCOUNT_ADDRESS starts on NO plan, so the default e2e stack exercises the unchanged
 # pay-as-you-go path and every existing test keeps passing. POST /_plans swaps that at runtime.
@@ -198,13 +197,8 @@ def _plans_page():
 
 
 @app.get("/s3/plans/accounts/")
-async def s3_plan_accounts(page: int = 1, page_size: int = 500):
-    await fault.gate("plans")
-    return _plans_page()
-
-
 @app.get("/api/s3/plans/accounts/")
-async def s3_plan_accounts_api_prefixed(page: int = 1, page_size: int = 500):
+async def s3_plan_accounts():
     await fault.gate("plans")
     return _plans_page()
 

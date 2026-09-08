@@ -78,7 +78,7 @@ Config:
 [run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py). One poll loop against one endpoint:
 
 ```
-GET /api/s3/plans/accounts/?page=1&page_size=500     every HIPPIUS_PLANS_LOOP_SLEEP (300s)
+GET /api/s3/plans/accounts/?page=1&page_size=500     every HIPPIUS_PLANS_LOOP_SLEEP (60s)
 ```
 
 It carries both halves — `plans` is the catalog, `results` is the paginated account roll — and is
@@ -86,13 +86,21 @@ split across two hashes on `redis-accounts`:
 
 | Redis key | Field | Value |
 |---|---|---|
-| `hippius_s3_plan_accounts` | account SS58 | `{"plan": ..., "storage_bytes": ...}` |
+| `hippius_s3_plan_accounts` | account SS58 | `{"plan": ..., "storage_limit_bytes": ..., "used_bytes": ...}` |
 | `hippius_s3_plans` | plan name | `{"h256": ..., "storage_bytes": ...}` |
 | `hippius_s3_plans:meta` | — | `{fetched_at, accounts, plans}` |
 
-The account row carries its own resolved allowance, so the request path is normally ONE `HGET`; the
-catalog is the fallback for a row that arrives without one, and honouring the per-account value is
-what lets a bespoke enterprise limit survive.
+⚠️ **The upstream payload has two `storage_bytes` fields meaning opposite things.**
+`plans.<name>.storage_bytes` is the plan's ALLOWANCE; `results[].storage_bytes` is that account's
+CURRENT TOTAL S3 USAGE, computed on chain. Reading usage as the allowance would hand every plan
+customer a limit equal to what they already store and deny their very next upload. `_parse_page`
+resolves both at publish time and stores them under names that cannot be mixed up
+(`storage_limit_bytes` / `used_bytes`), so the request path is one `HGET`, a comparison, and no
+database work at all.
+
+**The poll interval IS the enforcement lag.** Usage is reported by upstream rather than computed
+per request, so an account can exceed its allowance by up to one poll's worth of uploads before the
+gate sees it. 60s keeps that window small; the cost is ~3 requests/minute at page_size=500.
 
 **Only accounts with an ACTIVE plan are written.** A row needs all three of `billing == "plan"`, a
 plan name, and `active` true. A lapsed subscription still comes back with `billing: "plan"` and its
@@ -127,14 +135,6 @@ mock-hippius-api and into production.
 
 `replicas` must stay 1 — two replicas would not corrupt anything (last `RENAME` wins) but would
 double the upstream load for nothing.
-
-## Storage-usage reconciler
-
-[hippius_s3/scripts/reconcile_storage_usage.py](../hippius_s3/scripts/reconcile_storage_usage.py).
-Not a loop worker — a script, run as a Job or by hand. `bucket_storage_usage` is maintained by
-database triggers (see `migrations/20260908120000_bucket_storage_usage.sql`); this exists to PROVE
-they are correct. Expected drift is exactly zero, so any non-zero `usage_counter_drift_bytes` sample
-is a trigger defect rather than staleness. Run `--backfill` once after the migration.
 
 ## Migrator
 

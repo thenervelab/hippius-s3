@@ -162,8 +162,9 @@ class S3PlanAccountRow(BaseModel):
     # active=false. Defaulting to False is the safe direction: an unparseable row does not hand out
     # an allowance. See _is_enforceable_plan_row.
     active: bool = False
-    # The account's OWN allowance, which may differ from the catalog's for a bespoke deal. Preferred
-    # over the catalog value when present.
+    # This account's CURRENT TOTAL S3 USAGE, computed on chain -- NOT its allowance. The allowance
+    # is plans.<name>.storage_bytes. The two fields share a name and mean opposite things; reading
+    # this one as the limit would give every account a quota equal to what it already stores.
     storage_bytes: int | None = None
     next_charge: str | None = None
     subscription_id: int | None = None

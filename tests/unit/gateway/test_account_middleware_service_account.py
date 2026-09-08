@@ -55,9 +55,7 @@ def _build_app(
 
     async def spy_fetch(address: str, redis_client: Any, substrate_url: str) -> HippiusAccount:
         fetch_calls["n"] += 1
-        return HippiusAccount(
-            id=address, main_account=address, has_credits=has_credits, upload=True, delete=True
-        )
+        return HippiusAccount(id=address, main_account=address, has_credits=has_credits, upload=True, delete=True)
 
     monkeypatch.setattr(account_mod, "fetch_account_by_main_address", spy_fetch)
 
@@ -106,9 +104,7 @@ async def _put(app: FastAPI, headers: dict[str, str] | None = None) -> Any:
 
 @pytest.mark.asyncio
 async def test_service_account_put_skips_both_billing_gates(monkeypatch: Any) -> None:
-    app, arion, fetch_calls = _build_app(
-        monkeypatch, caller=SERVICE_ACCOUNT, allowlist=frozenset({SERVICE_ACCOUNT})
-    )
+    app, arion, fetch_calls = _build_app(monkeypatch, caller=SERVICE_ACCOUNT, allowlist=frozenset({SERVICE_ACCOUNT}))
 
     response = await _put(app)
 
@@ -173,9 +169,7 @@ async def test_multiple_accounts_on_the_allowlist_are_all_exempt(monkeypatch: An
 @pytest.mark.asyncio
 async def test_regular_account_is_still_fully_gated(monkeypatch: Any) -> None:
     """Regression guard on the whole existing billing path."""
-    app, arion, fetch_calls = _build_app(
-        monkeypatch, caller=REGULAR_ACCOUNT, allowlist=frozenset({SERVICE_ACCOUNT})
-    )
+    app, arion, fetch_calls = _build_app(monkeypatch, caller=REGULAR_ACCOUNT, allowlist=frozenset({SERVICE_ACCOUNT}))
 
     response = await _put(app)
 
@@ -244,9 +238,7 @@ async def test_case_flipped_address_is_not_exempt(monkeypatch: Any) -> None:
 async def test_client_headers_cannot_claim_the_exemption(monkeypatch: Any, headers: dict[str, str]) -> None:
     """The exemption is derived from verified auth state, never from anything on the wire.
     A regular caller naming the service account in any header stays billed."""
-    app, arion, fetch_calls = _build_app(
-        monkeypatch, caller=REGULAR_ACCOUNT, allowlist=frozenset({SERVICE_ACCOUNT})
-    )
+    app, arion, fetch_calls = _build_app(monkeypatch, caller=REGULAR_ACCOUNT, allowlist=frozenset({SERVICE_ACCOUNT}))
 
     response = await _put(app, headers=headers)
 
@@ -336,9 +328,7 @@ async def test_bypass_survives_an_uninitialised_metrics_collector(monkeypatch: A
 async def test_bypass_is_recorded_on_the_metrics_collector(monkeypatch: Any) -> None:
     from hippius_s3.gateway.middlewares import account as account_mod
 
-    app, _arion, _fetch = _build_app(
-        monkeypatch, caller=SERVICE_ACCOUNT, allowlist=frozenset({SERVICE_ACCOUNT})
-    )
+    app, _arion, _fetch = _build_app(monkeypatch, caller=SERVICE_ACCOUNT, allowlist=frozenset({SERVICE_ACCOUNT}))
     collector = MagicMock()
     monkeypatch.setattr(account_mod, "get_metrics_collector", lambda: collector)
 
@@ -351,9 +341,7 @@ async def test_bypass_is_recorded_on_the_metrics_collector(monkeypatch: Any) -> 
 async def test_no_bypass_metric_for_a_regular_account(monkeypatch: Any) -> None:
     from hippius_s3.gateway.middlewares import account as account_mod
 
-    app, _arion, _fetch = _build_app(
-        monkeypatch, caller=REGULAR_ACCOUNT, allowlist=frozenset({SERVICE_ACCOUNT})
-    )
+    app, _arion, _fetch = _build_app(monkeypatch, caller=REGULAR_ACCOUNT, allowlist=frozenset({SERVICE_ACCOUNT}))
     collector = MagicMock()
     monkeypatch.setattr(account_mod, "get_metrics_collector", lambda: collector)
 
@@ -372,9 +360,7 @@ async def test_service_account_read_is_flagged_but_gains_no_privilege(monkeypatc
     """Reads are not billed, so there is nothing to bypass. The flag is still stamped — the audit
     log should show everything an internal account did — but the account object must stay the
     same lightweight read stand-in every other caller gets (GW-4), not a credited one."""
-    app, arion, fetch_calls = _build_app(
-        monkeypatch, caller=SERVICE_ACCOUNT, allowlist=frozenset({SERVICE_ACCOUNT})
-    )
+    app, arion, fetch_calls = _build_app(monkeypatch, caller=SERVICE_ACCOUNT, allowlist=frozenset({SERVICE_ACCOUNT}))
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get("/test-bucket/test-key")

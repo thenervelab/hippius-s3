@@ -81,9 +81,7 @@ async def test_field_is_present_even_when_the_middleware_never_ran(monkeypatch: 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("truthy", ["true", "1", 1, ["yes"], object()])
-async def test_a_truthy_non_bool_does_not_become_a_service_account_claim(
-    monkeypatch: Any, truthy: Any
-) -> None:
+async def test_a_truthy_non_bool_does_not_become_a_service_account_claim(monkeypatch: Any, truthy: Any) -> None:
     """The audit log must only ever report the exemption the account middleware actually granted,
     which it signals with a literal True. Anything else is not that claim."""
     logged = await _logged(_app({"service_account": truthy}), monkeypatch)
