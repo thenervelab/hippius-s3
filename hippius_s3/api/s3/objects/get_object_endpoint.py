@@ -23,6 +23,7 @@ from hippius_s3.api.s3.common import parse_response_overrides
 from hippius_s3.api.s3.common import parse_version_id
 from hippius_s3.api.s3.range_utils import parse_range_header
 from hippius_s3.config import get_config
+from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.services.object_reader import DownloadNotReadyError
 from hippius_s3.services.parts_catalog import PartsCatalog
@@ -112,264 +113,285 @@ async def handle_get_object(
             status_code=400,
         )
 
-    db = await pool.acquire()
     try:
-        # Skip user creation for anonymous accounts
-        if request.state.main_account_id and request.state.main_account_id != "anonymous":
-            with tracer.start_as_current_span(
-                "get_object.get_or_create_user",
-                attributes={"hippius.account.main": request.state.main_account_id},
-            ):
-                await db.fetchrow(
-                    get_query("get_or_create_user_by_main_account"),
-                    request.state.main_account_id,
-                    datetime.now(timezone.utc),
-                )
-
-        # Get object info for download (gateway already checked permissions)
-        with tracer.start_as_current_span(
-            "get_object.get_object_info",
-            attributes={"hippius.account.main": account_id, "has_version_id": version_id is not None},
-        ) as span:
-            if version_id is not None:
-                object_info = await db.fetchrow(
-                    get_query("get_object_for_download_with_permissions_by_version"),
-                    bucket_name,
-                    object_key,
-                    version_id,
-                )
-                if not object_info:
-                    bucket_exists = await db.fetchval(
-                        "SELECT 1 FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL",
-                        bucket_name,
+        # Bounded like the PUT path: a saturated pool answers 503 SlowDown after
+        # db_pool_acquire_timeout instead of queueing. The block ends once the stream context
+        # is built — the first-chunk wait inside read_response can take
+        # stream_first_chunk_timeout_seconds on a cold read and must not hold a pool slot.
+        async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as db:
+            # Skip user creation for anonymous accounts
+            if request.state.main_account_id and request.state.main_account_id != "anonymous":
+                with tracer.start_as_current_span(
+                    "get_object.get_or_create_user",
+                    attributes={"hippius.account.main": request.state.main_account_id},
+                ):
+                    await db.fetchrow(
+                        get_query("get_or_create_user_by_main_account"),
+                        request.state.main_account_id,
+                        datetime.now(timezone.utc),
                     )
-                    if not bucket_exists:
-                        return errors.s3_error_response(
-                            code="NoSuchBucket",
-                            message=f"The specified bucket {bucket_name} does not exist",
-                            status_code=404,
-                            BucketName=bucket_name,
+
+            # Get object info for download (gateway already checked permissions)
+            with tracer.start_as_current_span(
+                "get_object.get_object_info",
+                attributes={"hippius.account.main": account_id, "has_version_id": version_id is not None},
+            ) as span:
+                if version_id is not None:
+                    object_info = await db.fetchrow(
+                        get_query("get_object_for_download_with_permissions_by_version"),
+                        bucket_name,
+                        object_key,
+                        version_id,
+                    )
+                    if not object_info:
+                        bucket_exists = await db.fetchval(
+                            "SELECT 1 FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL",
+                            bucket_name,
                         )
-                    object_exists = await db.fetchval(
-                        """
-                        SELECT 1 FROM objects o
-                        JOIN buckets b ON o.bucket_id = b.bucket_id
-                        WHERE b.bucket_name = $1 AND o.object_key = $2 AND b.deleted_at IS NULL
-                        """,
+                        if not bucket_exists:
+                            return errors.s3_error_response(
+                                code="NoSuchBucket",
+                                message=f"The specified bucket {bucket_name} does not exist",
+                                status_code=404,
+                                BucketName=bucket_name,
+                            )
+                        object_exists = await db.fetchval(
+                            """
+                            SELECT 1 FROM objects o
+                            JOIN buckets b ON o.bucket_id = b.bucket_id
+                            WHERE b.bucket_name = $1 AND o.object_key = $2 AND b.deleted_at IS NULL
+                            """,
+                            bucket_name,
+                            object_key,
+                        )
+                        if object_exists:
+                            return errors.s3_error_response(
+                                code="NoSuchVersion",
+                                message=f"The specified version does not exist: {version_id}",
+                                status_code=404,
+                                Key=object_key,
+                                VersionId=str(version_id),
+                            )
+                        return errors.s3_error_response(
+                            code="NoSuchKey",
+                            message=f"The specified key {object_key} does not exist",
+                            status_code=404,
+                            Key=object_key,
+                        )
+                else:
+                    object_info = await db.fetchrow(
+                        get_query("get_object_for_download_with_permissions"),
                         bucket_name,
                         object_key,
                     )
-                    if object_exists:
+                    if not object_info:
+                        bucket_exists = await db.fetchval(
+                            "SELECT 1 FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL",
+                            bucket_name,
+                        )
+                        if not bucket_exists:
+                            return errors.s3_error_response(
+                                code="NoSuchBucket",
+                                message=f"The specified bucket {bucket_name} does not exist",
+                                status_code=404,
+                                BucketName=bucket_name,
+                            )
                         return errors.s3_error_response(
-                            code="NoSuchVersion",
-                            message=f"The specified version does not exist: {version_id}",
+                            code="NoSuchKey",
+                            message=f"The specified key {object_key} does not exist or you don't have permission to access it",
                             status_code=404,
                             Key=object_key,
-                            VersionId=str(version_id),
                         )
+
+                if object_info:
+                    set_span_attributes(
+                        span,
+                        {
+                            "object_id": str(object_info["object_id"]),
+                            "has_object_id": True,
+                            "size_bytes": int(object_info.get("size_bytes") or 0),
+                            "multipart": bool(object_info.get("multipart")),
+                            "storage_version": int(object_info["storage_version"]),
+                            "is_public": bool(object_info.get("is_public")),
+                            "object_version": int(object_info.get("object_version") or 1),
+                        },
+                    )
+
+            # A delete marker has no bytes. AWS answers a plain GET on one with 404 and an explicit
+            # ?versionId= on one with 405, both carrying x-amz-delete-marker: true.
+            if object_info.get("is_delete_marker"):
+                marker_version = int(object_info.get("object_version") or 1)
+                marker_headers = {
+                    "x-amz-delete-marker": "true",
+                    "x-amz-version-id": str(marker_version),
+                }
+                if version_id is None:
                     return errors.s3_error_response(
                         code="NoSuchKey",
                         message=f"The specified key {object_key} does not exist",
                         status_code=404,
+                        extra_headers=marker_headers,
                         Key=object_key,
                     )
-            else:
-                object_info = await db.fetchrow(
-                    get_query("get_object_for_download_with_permissions"),
-                    bucket_name,
-                    object_key,
+                return errors.s3_error_response(
+                    code="MethodNotAllowed",
+                    message="The specified method is not allowed against this resource.",
+                    status_code=405,
+                    extra_headers={
+                        **marker_headers,
+                        # The marker's own timestamp — `created_at` is the key's first PUT.
+                        "Last-Modified": object_info["version_last_modified"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                    },
+                    Key=object_key,
+                    VersionId=str(version_id),
                 )
-                if not object_info:
-                    bucket_exists = await db.fetchval(
-                        "SELECT 1 FROM buckets WHERE bucket_name = $1 AND deleted_at IS NULL",
-                        bucket_name,
-                    )
-                    if not bucket_exists:
-                        return errors.s3_error_response(
-                            code="NoSuchBucket",
-                            message=f"The specified bucket {bucket_name} does not exist",
-                            status_code=404,
-                            BucketName=bucket_name,
-                        )
-                    return errors.s3_error_response(
-                        code="NoSuchKey",
-                        message=f"The specified key {object_key} does not exist or you don't have permission to access it",
-                        status_code=404,
-                        Key=object_key,
-                    )
 
-            if object_info:
+            md5_hash = object_info.get("md5_hash") or ""
+            if md5_hash and if_none_match_matches(request.headers.get("if-none-match"), md5_hash):
+                return Response(status_code=304, headers={"ETag": f'"{md5_hash}"'})
+
+            # Build download chunk list from DB parts
+            request.state.object_size = int(object_info.get("size_bytes") or 0)
+            with tracer.start_as_current_span("get_object.build_parts_catalog") as span:
+                download_chunks = (
+                    json.loads(object_info["download_chunks"]) if object_info.get("download_chunks") else []
+                )
+                try:
+                    built_chunks = await PartsCatalog.build_initial_download_chunks(
+                        db, object_info if isinstance(object_info, dict) else dict(object_info)
+                    )
+                    if built_chunks:
+                        download_chunks = built_chunks
+                        parts_source = "db"
+                    else:
+                        parts_source = "cached"
+                except Exception:
+                    logger.debug("Failed to build parts catalog", exc_info=True)
+                    parts_source = "cached_fallback"
+
                 set_span_attributes(
                     span,
                     {
-                        "object_id": str(object_info["object_id"]),
-                        "has_object_id": True,
-                        "size_bytes": int(object_info.get("size_bytes") or 0),
-                        "multipart": bool(object_info.get("multipart")),
-                        "storage_version": int(object_info["storage_version"]),
-                        "is_public": bool(object_info.get("is_public")),
-                        "object_version": int(object_info.get("object_version") or 1),
+                        "parts_source": parts_source,
+                        "num_download_chunks": len(download_chunks),
                     },
                 )
 
-        # A delete marker has no bytes. AWS answers a plain GET on one with 404 and an explicit
-        # ?versionId= on one with 405, both carrying x-amz-delete-marker: true.
-        if object_info.get("is_delete_marker"):
-            marker_version = int(object_info.get("object_version") or 1)
-            marker_headers = {
-                "x-amz-delete-marker": "true",
-                "x-amz-version-id": str(marker_version),
-            }
-            if version_id is None:
-                return errors.s3_error_response(
-                    code="NoSuchKey",
-                    message=f"The specified key {object_key} does not exist",
-                    status_code=404,
-                    extra_headers=marker_headers,
-                    Key=object_key,
-                )
-            return errors.s3_error_response(
-                code="MethodNotAllowed",
-                message="The specified method is not allowed against this resource.",
-                status_code=405,
-                extra_headers={
-                    **marker_headers,
-                    # The marker's own timestamp — `created_at` is the key's first PUT.
-                    "Last-Modified": object_info["version_last_modified"].strftime("%a, %d %b %Y %H:%M:%S GMT"),
-                },
-                Key=object_key,
-                VersionId=str(version_id),
-            )
-
-        md5_hash = object_info.get("md5_hash") or ""
-        if md5_hash and if_none_match_matches(request.headers.get("if-none-match"), md5_hash):
-            return Response(status_code=304, headers={"ETag": f'"{md5_hash}"'})
-
-        # Build download chunk list from DB parts
-        request.state.object_size = int(object_info.get("size_bytes") or 0)
-        with tracer.start_as_current_span("get_object.build_parts_catalog") as span:
-            download_chunks = json.loads(object_info["download_chunks"]) if object_info.get("download_chunks") else []
-            try:
-                built_chunks = await PartsCatalog.build_initial_download_chunks(
-                    db, object_info if isinstance(object_info, dict) else dict(object_info)
-                )
-                if built_chunks:
-                    download_chunks = built_chunks
-                    parts_source = "db"
-                else:
-                    parts_source = "cached"
-            except Exception:
-                logger.debug("Failed to build parts catalog", exc_info=True)
-                parts_source = "cached_fallback"
-
-            set_span_attributes(
-                span,
-                {
-                    "parts_source": parts_source,
-                    "num_download_chunks": len(download_chunks),
-                },
-            )
-
-            # Attach parts to object_info for cache assembly
-            try:
-                if not isinstance(object_info, dict):
-                    object_info = dict(object_info)
-                object_info["download_chunks"] = json.dumps(download_chunks)
-            except Exception:
-                pass
-        # Validate/resolve range with effective size (objects.size_bytes or sum of chunks)
-        start_byte = end_byte = None
-        range_was_invalid = False
-        if range_header:
-            with tracer.start_as_current_span("get_object.parse_range") as span:
+                # Attach parts to object_info for cache assembly
                 try:
-                    effective_size = int(object_info.get("size_bytes") or 0)
-                    if (not effective_size) and download_chunks:
-                        try:
-                            effective_size = sum(int(c.get("size_bytes", 0)) for c in download_chunks)
-                        except Exception:
-                            effective_size = 0
-                    start_byte, end_byte = parse_range_header(range_header, effective_size)
+                    if not isinstance(object_info, dict):
+                        object_info = dict(object_info)
+                    object_info["download_chunks"] = json.dumps(download_chunks)
+                except Exception:
+                    pass
+            # Validate/resolve range with effective size (objects.size_bytes or sum of chunks)
+            start_byte = end_byte = None
+            range_was_invalid = False
+            if range_header:
+                with tracer.start_as_current_span("get_object.parse_range") as span:
+                    try:
+                        effective_size = int(object_info.get("size_bytes") or 0)
+                        if (not effective_size) and download_chunks:
+                            try:
+                                effective_size = sum(int(c.get("size_bytes", 0)) for c in download_chunks)
+                            except Exception:
+                                effective_size = 0
+                        start_byte, end_byte = parse_range_header(range_header, effective_size)
 
-                    original_parts = range_header.lower().strip()
-                    if original_parts.startswith("bytes="):
-                        spec = original_parts[len("bytes=") :]
-                        range_parts = spec.split("-", 1)
-                        if len(range_parts) == 2 and range_parts[0].isdigit() and range_parts[1].isdigit():
-                            orig_start = int(range_parts[0])
-                            orig_end = int(range_parts[1])
-                            if orig_end < orig_start:
-                                range_was_invalid = True
+                        original_parts = range_header.lower().strip()
+                        if original_parts.startswith("bytes="):
+                            spec = original_parts[len("bytes=") :]
+                            range_parts = spec.split("-", 1)
+                            if len(range_parts) == 2 and range_parts[0].isdigit() and range_parts[1].isdigit():
+                                orig_start = int(range_parts[0])
+                                orig_end = int(range_parts[1])
+                                if orig_end < orig_start:
+                                    range_was_invalid = True
 
-                    set_span_attributes(
-                        span,
-                        {
-                            "start_byte": int(start_byte) if start_byte is not None else None,
-                            "end_byte": int(end_byte) if end_byte is not None else None,
-                            "effective_size": int(effective_size),
-                            "range_size_bytes": int(end_byte - start_byte + 1)
-                            if start_byte is not None and end_byte is not None
-                            else int(effective_size),
-                            "range_was_invalid": range_was_invalid,
-                        },
-                    )
-                except ValueError:
-                    return Response(
-                        status_code=416,
-                        headers={
-                            "Content-Range": f"bytes */{effective_size}",
-                            "Accept-Ranges": "bytes",
-                            "Content-Length": "0",
-                        },
-                    )
+                        set_span_attributes(
+                            span,
+                            {
+                                "start_byte": int(start_byte) if start_byte is not None else None,
+                                "end_byte": int(end_byte) if end_byte is not None else None,
+                                "effective_size": int(effective_size),
+                                "range_size_bytes": int(end_byte - start_byte + 1)
+                                if start_byte is not None and end_byte is not None
+                                else int(effective_size),
+                                "range_was_invalid": range_was_invalid,
+                            },
+                        )
+                    except ValueError:
+                        return Response(
+                            status_code=416,
+                            headers={
+                                "Content-Range": f"bytes */{effective_size}",
+                                "Accept-Ranges": "bytes",
+                                "Content-Length": "0",
+                            },
+                        )
 
-        with contextlib.suppress(Exception):
-            logger.debug(
-                f"GET multipart={object_info.get('multipart')} parts={[c if isinstance(c, dict) else c for c in download_chunks]}"
-            )
+            with contextlib.suppress(Exception):
+                logger.debug(
+                    f"GET multipart={object_info.get('multipart')} parts={[c if isinstance(c, dict) else c for c in download_chunks]}"
+                )
 
-        # Use new reader (flat chunk plan; blocks between parts; no downloader meta dependency)
-        from hippius_s3.reader.types import RangeRequest as V2Range
-        from hippius_s3.services.object_reader import read_response
+            # Use new reader (flat chunk plan; blocks between parts; no downloader meta dependency)
+            from hippius_s3.reader.types import RangeRequest as V2Range
+            from hippius_s3.services.object_reader import build_stream_context
+            from hippius_s3.services.object_reader import read_response
 
-        v2_rng = None
-        if range_header and start_byte is not None and end_byte is not None:
-            v2_rng = V2Range(start=int(start_byte), end=int(end_byte))
+            v2_rng = None
+            if range_header and start_byte is not None and end_byte is not None:
+                v2_rng = V2Range(start=int(start_byte), end=int(end_byte))
 
-        # Decide decryption internally based on storage_version (v3+: always decrypt)
-        storage_version = require_supported_storage_version(int(object_info["storage_version"]))
-        bucket_owner_id = str(object_info.get("bucket_owner_id") or "")
-        is_anonymous = account_id == "anonymous"
+            # Decide decryption internally based on storage_version (v3+: always decrypt)
+            storage_version = require_supported_storage_version(int(object_info["storage_version"]))
+            bucket_owner_id = str(object_info.get("bucket_owner_id") or "")
+            is_anonymous = account_id == "anonymous"
 
-        # Chunks are stored under the bucket OWNER's Arion namespace, never the caller's, so the
-        # download address is always the storage-attribution account (state.main_account_id =
-        # bucket owner, caller fallback). Before the state.account split this read the rebound
-        # account.main_account (also the owner); reading the un-rebound caller here sent
-        # cross-account and signed-public-bucket reads to the wrong namespace on a cache miss.
-        resolved_address = bucket_owner_id if is_anonymous else request.state.main_account_id
+            # Chunks are stored under the bucket OWNER's Arion namespace, never the caller's, so the
+            # download address is always the storage-attribution account (state.main_account_id =
+            # bucket owner, caller fallback). Before the state.account split this read the rebound
+            # account.main_account (also the owner); reading the un-rebound caller here sent
+            # cross-account and signed-public-bucket reads to the wrong namespace on a cache miss.
+            resolved_address = bucket_owner_id if is_anonymous else request.state.main_account_id
 
-        info_dict = {
-            "object_id": str(object_info["object_id"]),
-            "bucket_id": str(object_info.get("bucket_id") or ""),
-            "bucket_name": object_info["bucket_name"],
-            "object_key": object_key,
-            "size_bytes": int(object_info["size_bytes"]),
-            "content_type": object_info["content_type"],
-            "md5_hash": object_info["md5_hash"],
-            "created_at": object_info["created_at"],
-            "metadata": object_info.get("metadata") or {},
-            "multipart": bool(object_info["multipart"]),
-            # Ensure reader uses the current object version for cache keys and downloader
-            "object_version": int(object_info.get("object_version") or 1),
-            "storage_version": storage_version,
-            # v5 envelope encryption metadata (required when storage_version >= 5)
-            "encryption_version": object_info.get("encryption_version"),
-            "enc_suite_id": object_info.get("enc_suite_id"),
-            "enc_chunk_size_bytes": object_info.get("enc_chunk_size_bytes"),
-            "kek_id": object_info.get("kek_id"),
-            "wrapped_dek": object_info.get("wrapped_dek"),
-            "ray_id": getattr(request.state, "ray_id", None),
-        }
+            info_dict = {
+                "object_id": str(object_info["object_id"]),
+                "bucket_id": str(object_info.get("bucket_id") or ""),
+                "bucket_name": object_info["bucket_name"],
+                "object_key": object_key,
+                "size_bytes": int(object_info["size_bytes"]),
+                "content_type": object_info["content_type"],
+                "md5_hash": object_info["md5_hash"],
+                "created_at": object_info["created_at"],
+                "metadata": object_info.get("metadata") or {},
+                "multipart": bool(object_info["multipart"]),
+                # Ensure reader uses the current object version for cache keys and downloader
+                "object_version": int(object_info.get("object_version") or 1),
+                "storage_version": storage_version,
+                # v5 envelope encryption metadata (required when storage_version >= 5)
+                "encryption_version": object_info.get("encryption_version"),
+                "enc_suite_id": object_info.get("enc_suite_id"),
+                "enc_chunk_size_bytes": object_info.get("enc_chunk_size_bytes"),
+                "kek_id": object_info.get("kek_id"),
+                "wrapped_dek": object_info.get("wrapped_dek"),
+                "ray_id": getattr(request.state, "ray_id", None),
+            }
+
+            with tracer.start_as_current_span("get_object.build_stream_context"):
+                # RD-3: reuse the parts catalog built above only when it came from the DB (carries
+                # chunk_size_bytes + the completed-parts filter). "cached"/fallback → None so the
+                # reader re-reads authoritatively.
+                ctx = await build_stream_context(
+                    db,
+                    request.app.state.redis_client,
+                    request.app.state.obj_cache,
+                    info_dict,
+                    rng=v2_rng,
+                    address=resolved_address,
+                    parts=download_chunks if parts_source == "db" else None,
+                )
 
         with tracer.start_as_current_span(
             "get_object.read_response",
@@ -380,7 +402,7 @@ async def handle_get_object(
             },
         ) as span:
             response = await read_response(
-                db=db,
+                ctx=ctx,
                 redis=request.app.state.redis_client,
                 obj_cache=request.app.state.obj_cache,
                 info=info_dict,
@@ -388,10 +410,6 @@ async def handle_get_object(
                 rng=v2_rng,
                 address=resolved_address,
                 range_was_invalid=range_was_invalid,
-                # RD-3: reuse the parts catalog built above only when it came from the DB (carries
-                # chunk_size_bytes + the completed-parts filter). "cached"/fallback → None so the
-                # reader re-reads authoritatively.
-                parts=download_chunks if parts_source == "db" else None,
             )
             set_span_attributes(span, {"http.status_code": int(response.status_code)})
 
@@ -484,6 +502,3 @@ async def handle_get_object(
             message=f"We encountered an internal error: {str(e)}. Please try again.",
             status_code=500,
         )
-
-    finally:
-        await pool.release(db)

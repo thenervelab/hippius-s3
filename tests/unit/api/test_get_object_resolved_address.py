@@ -57,7 +57,7 @@ class _Pool:
     def __init__(self) -> None:
         self._conn = _Conn()
 
-    async def acquire(self) -> _Conn:
+    async def acquire(self, timeout: float | None = None) -> _Conn:  # noqa: ASYNC109 (mirrors asyncpg pool.acquire)
         return self._conn
 
     async def release(self, _conn: Any) -> None:
@@ -86,10 +86,15 @@ async def test_cross_account_get_resolves_download_address_to_bucket_owner(monke
 
     captured: dict[str, Any] = {}
 
+    async def _fake_build_stream_context(db: Any, *args: Any, **kwargs: Any) -> Any:
+        captured["build_address"] = kwargs["address"]
+        return object()
+
     async def _fake_read_response(**kwargs: Any) -> Response:
         captured["address"] = kwargs["address"]
         return Response(status_code=200)
 
+    monkeypatch.setattr("hippius_s3.services.object_reader.build_stream_context", _fake_build_stream_context)
     monkeypatch.setattr("hippius_s3.services.object_reader.read_response", _fake_read_response)
 
     response = await get_object_endpoint.handle_get_object(
@@ -99,3 +104,4 @@ async def test_cross_account_get_resolves_download_address_to_bucket_owner(monke
     assert response.status_code == 200
     # The owner's namespace, never the caller's — this is the whole point of the split.
     assert captured["address"] == OWNER
+    assert captured["build_address"] == OWNER
