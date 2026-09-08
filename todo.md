@@ -208,6 +208,19 @@ the correct subject, and the fix needs the owner resolved before the gate — ei
 middleware chain or resolving the bucket owner twice. Size it first with a cross-account counter on
 `plan_gate_total`.
 
+### P1 — Billing plans: nothing accumulates bytes admitted between refreshes
+
+Every request compares against the same cached `used_bytes` until the next plans-cacher cycle, so
+within a 10-minute window the quota bounds nothing: an account at 9.9/10 TiB can issue an unbounded
+number of 100 GiB PUTs, each of which individually "fits". With concurrent clients that is
+effectively unlimited, not "one cycle's worth".
+
+The fix that does not reintroduce a database read: a Redis `INCRBY` accumulator keyed on
+`(account, publish epoch)`, incremented by the declared size of each admitted write and added to
+`used_bytes` in the comparison. The publish epoch resets it every cycle, so it never needs pruning
+and can never drift far. That bounds overshoot to what was actually admitted rather than to elapsed
+time.
+
 ### P2 — Billing plans: enforcement lags by one refresh interval, in both directions
 
 Usage is counted by the plans-cacher every `HIPPIUS_PLANS_LOOP_SLEEP` (10 min), and nothing on the

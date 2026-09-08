@@ -4,8 +4,12 @@ Fed by one upstream page — GET /api/s3/plans/accounts/ carries both the catalo
 roll — and split across two hashes on redis-accounts:
 
     hippius_s3_plan_accounts   field = account SS58   value = {"plan", "storage_limit_bytes", "used_bytes"}
-    hippius_s3_plans           field = plan name      value = {"h256", "storage_bytes"}
+    hippius_s3_plans           field = plan name      value = {"h256", "storage_bytes"}   (see below)
     hippius_s3_plans:meta      JSON {fetched_at, counts}
+
+Only the FIRST of those is on the serving path. `hippius_s3_plans` is published for operators --
+it answers "what does plan X allow" when someone is debugging a quota decision -- and nothing reads
+it in code: the per-account row already carries the resolved limit.
 
 The account row carries everything the quota gate needs, so the request path is ONE `HGET` and a
 comparison -- no catalog lookup, no database. The two halves come from different places and it
@@ -33,14 +37,11 @@ depend on that and none are optional:
 from __future__ import annotations
 
 import json
-import logging
 import time
 from dataclasses import dataclass
 from typing import Any
 from typing import Mapping
 
-
-logger = logging.getLogger(__name__)
 
 PLAN_ACCOUNTS_KEY = "hippius_s3_plan_accounts"
 PLAN_CATALOG_KEY = "hippius_s3_plans"
@@ -129,14 +130,19 @@ async def publish_plan_roll(
             f"(shrink > {MAX_ACCOUNT_MAP_SHRINK_RATIO:.0%}); keeping last known good"
         )
 
-    published_accounts = await _publish_hash(
-        redis_client, PLAN_ACCOUNTS_KEY, {ss58: json.dumps(row) for ss58, row in accounts.items()}
-    )
+    # Catalog first, accounts second. Nothing on the request path reads the catalog -- it is an
+    # operator-facing record of what each plan allows -- so publishing it first means a failure
+    # there aborts before the accounts hash moves. The other order can leave a freshly-published
+    # accounts map with a stale meta timestamp, so the staleness alarm fires against current data.
     published_plans = 0
     if catalog:
         published_plans = await _publish_hash(
             redis_client, PLAN_CATALOG_KEY, {name: json.dumps(entry) for name, entry in catalog.items()}
         )
+
+    published_accounts = await _publish_hash(
+        redis_client, PLAN_ACCOUNTS_KEY, {ss58: json.dumps(row) for ss58, row in accounts.items()}
+    )
 
     return published_accounts, published_plans
 

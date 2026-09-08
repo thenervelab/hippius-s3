@@ -919,9 +919,9 @@ spec:
               cpu: 1000m
               memory: 2Gi
 ---
-# Scrapes the two api.hippius.com billing-plan endpoints into redis-accounts:
-#   GET /s3-plans           every 10 min  ->  HASH hippius_s3_plans
-#   GET /s3-plans/accounts  every  5 min  ->  HASH hippius_s3_plan_accounts
+# Scrapes the api.hippius.com billing-plan roll into redis-accounts, and counts each plan account's
+# storage usage itself (upstream reports the quota but not the usage):
+#   GET /api/s3/plans/accounts/   every HIPPIUS_PLANS_LOOP_SLEEP (600s)
 #
 # replicas MUST stay 1. Publication is a whole-hash build-then-RENAME; two replicas racing would
 # not corrupt anything (last RENAME wins) but would double the upstream load for no benefit.
@@ -930,7 +930,8 @@ spec:
 # noeviction + AOF, so the last known good maps keep serving indefinitely and the request path is
 # unaffected. Alert on plans_cache_age_seconds, not on pod restarts.
 #
-# No DB, no PVC, no wait-for-migrations init container — it touches redis-accounts only.
+# Needs the DB (it counts each plan account's storage) but no PVC and no
+# wait-for-migrations init container — it only reads, and adds no schema.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

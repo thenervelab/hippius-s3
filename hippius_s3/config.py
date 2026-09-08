@@ -272,6 +272,11 @@ class Config:
     # plan accounts: enough that one very large account does not set the pace for the cycle, small
     # enough that these aggregates never become the heaviest thing on the primary.
     plans_usage_concurrency: int = env("HIPPIUS_PLANS_USAGE_CONCURRENCY:4", convert=int)
+    # Server-side bound on ONE account's storage count. api/admin.py bounds the identical aggregate
+    # for the same reason: the largest account holds 11.8M objects and can push it into seconds.
+    # Unbounded, a single bad plan would stall the cycle holding a pool connection, and every plan
+    # account's usage would silently freeze at its last good value while the gate kept enforcing it.
+    plans_usage_timeout_seconds: float = env("HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS:30.0", convert=float)
     # Per-attempt bound on the scrape. Retry COUNTS cannot bound latency when the per-attempt cost
     # is unbounded, and this worker holds no request.
     plans_api_timeout_seconds: float = env("HIPPIUS_PLANS_API_TIMEOUT_SECONDS:30.0", convert=float)

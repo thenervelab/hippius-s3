@@ -1,9 +1,10 @@
 """Quota-gate decision logic.
 
-The property under test throughout is the asymmetry: the cheap cached counter may ALLOW, only the
-authoritative SUM may DENY. Every path where ground truth is unavailable must resolve to "allow",
-because a drifted or slow counter blocking a paying customer's upload is a support incident, while
-letting one over-quota upload through is a rounding error the reconciler catches.
+The gate is a pure function over one cached row: no database, no I/O, nothing that can be slow or
+unavailable. What these tests pin is that the arithmetic is shared between enforcement and shadow
+mode, and that every path where we do not positively know the answer resolves to "allow" -- a
+paying customer blocked by our own cold cache is a support incident, an over-quota upload getting
+through is a rounding error the next refresh corrects.
 """
 
 import pytest

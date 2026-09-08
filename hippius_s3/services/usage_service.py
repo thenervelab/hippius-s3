@@ -11,16 +11,22 @@ the query header for why that matters.
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from hippius_s3.utils import get_query
 
 
-logger = logging.getLogger(__name__)
+async def get_account_storage_bytes(db: Any, main_account_id: str, timeout: float) -> int:  # noqa: ASYNC109
+    """Bytes stored by this account, computed now. Expensive; see the query header.
 
+    `timeout` is not optional. api/admin.py bounds the identical aggregate for the same reason: a
+    10+ TB account can push it into tens of seconds, and here that would hold one of only a few
+    pool connections and pin the xmin horizon for the duration. A timeout fails the cycle, which is
+    already the all-or-nothing behaviour the caller wants.
 
-async def get_account_storage_bytes(db: Any, main_account_id: str) -> int:
-    """Bytes stored by this account, computed now. Expensive; see the query header."""
-    row = await db.fetchrow(get_query("get_account_storage_bytes"), main_account_id)
+    It is asyncpg's own `timeout=`, not `asyncio.timeout` (hence the ASYNC109 waiver): asyncpg
+    cancels the query server-side, whereas an asyncio timeout would abandon the coroutine and leave
+    the aggregate running on the backend -- exactly the thing being bounded.
+    """
+    row = await db.fetchrow(get_query("get_account_storage_bytes"), main_account_id, timeout=timeout)
     return int(row["bytes_used"]) if row else 0

@@ -463,6 +463,8 @@ services:
       args:
         BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
     depends_on:
+      db:
+        condition: service_healthy
       redis-accounts:
         condition: service_healthy
     restart: unless-stopped

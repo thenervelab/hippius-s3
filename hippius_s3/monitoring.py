@@ -83,10 +83,11 @@ AeadFailureOutcome = Literal["recovered", "unrecovered"]
 # a rolling deploy, so the counter must keep them apart.
 BillingBypassSurface = Literal["gateway", "uploader"]
 
-# The plan_gate_total axis. Mirrors GateMetricOutcome in gateway/services/plan_gate.py: the four
-# quota decisions plus "unavailable", which the middleware records when the plan caches could not be
-# consulted and it fell back to pay-as-you-go. The plan_id is deliberately NOT a label — it is
-# upstream-controlled, so labelling by it would let a pricing-page edit grow our cardinality.
+# The plan_gate_total axis. Wider than plan_gate.Outcome by design: the middleware adds
+# "unavailable" (the caches could not be consulted, so it fell back to pay-as-you-go) and prefixes
+# the shadow-mode verdicts, so an enforced denial and a shadow one are never summed together. The
+# plan_id is deliberately NOT a label — it is upstream-controlled, so labelling by it would let a
+# pricing-page edit grow our cardinality.
 PlanGateOutcome = Literal[
     # enforcement on
     "allow",

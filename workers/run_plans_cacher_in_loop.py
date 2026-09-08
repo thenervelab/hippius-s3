@@ -37,10 +37,12 @@ from typing import Any
 
 import asyncpg
 from redis.asyncio import Redis
+from substrateinterface.utils.ss58 import is_valid_ss58_address
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from hippius_s3.config import HIPPIUS_SS58_FORMAT
 from hippius_s3.config import get_config
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.monitoring import get_metrics_collector
@@ -100,6 +102,14 @@ def _parse_page(page: S3PlanAccountsResponse) -> tuple[dict[str, dict[str, Any]]
     for row in page.results:
         if not row.ss58 or not _is_enforceable_plan_row(row):
             continue
+        if not is_valid_ss58_address(row.ss58, valid_ss58_format=HIPPIUS_SS58_FORMAT):
+            # Every address we key on is network prefix 42 (config._parse_service_accounts pins the
+            # same thing, for the same reason). An address in another prefix -- the likeliest real
+            # upstream mistake -- would match no bucket, so its count would come back 0 and we would
+            # publish it as "stores nothing", i.e. unlimited headroom, with nothing to distinguish
+            # it from a genuinely empty account. Drop the row; the account falls back to PAYG.
+            logger.error(f"PLANS_BAD_ADDRESS skipping row with non-network-42 ss58: {row.ss58!r}")
+            continue
         plan = page.plans.get(row.plan or "")
         limit = row.storage_bytes if row.storage_bytes is not None else (plan.storage_bytes if plan else None)
         accounts[row.ss58] = {"plan": row.plan, "storage_limit_bytes": limit}
@@ -121,11 +131,15 @@ async def _attach_usage(pool: asyncpg.Pool, accounts: dict[str, dict[str, Any]])
     writing used_bytes=0 for the accounts we failed to count, silently handing them unlimited
     headroom until the next cycle.
     """
-    semaphore = asyncio.Semaphore(config.plans_usage_concurrency)
 
     async def count(account_id: str) -> tuple[str, int]:
-        async with semaphore, pool.acquire() as conn:
-            return account_id, await usage_service.get_account_storage_bytes(conn, account_id)
+        # The pool IS the concurrency limiter -- it is sized to plans_usage_concurrency, so
+        # acquire() blocks past that many in flight. A semaphore in front of it would be a second
+        # knob for one limit, and could only ever disagree with the pool.
+        async with pool.acquire() as conn:
+            return account_id, await usage_service.get_account_storage_bytes(
+                conn, account_id, timeout=config.plans_usage_timeout_seconds
+            )
 
     for account_id, used in await asyncio.gather(*(count(a) for a in accounts)):
         accounts[account_id]["used_bytes"] = used

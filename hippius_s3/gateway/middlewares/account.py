@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import re
 from typing import Callable
 
 import httpx
@@ -11,12 +10,15 @@ from fastapi import Response
 from starlette import status
 
 from hippius_s3.config import get_config
+from hippius_s3.gateway.middlewares.acl import parse_s3_path
 from hippius_s3.gateway.services import plan_gate
 from hippius_s3.gateway.services.account_service import fetch_account_by_main_address
+from hippius_s3.gateway.services.sub_token_scope import required_op
 from hippius_s3.gateway.utils.errors import s3_error_response
 from hippius_s3.gateway.utils.paths import first_path_segment
 from hippius_s3.gateway.utils.paths import routing_path
 from hippius_s3.models.account import HippiusAccount
+from hippius_s3.models.sub_token import Op
 from hippius_s3.monitoring import PlanGateOutcome
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.peer_auth import is_authorized_peer_fetch
@@ -66,10 +68,11 @@ def _is_transient_billing_error(error: str | None) -> bool:
 _UNREACHABLE_ERRORS = (httpx.TimeoutException, httpx.NetworkError, httpx.ProxyError, httpx.RemoteProtocolError)
 
 
-# Decision -> metric label, one closed map per disposition. Anything not named here is recorded as
-# what actually happened to the request: it was allowed.
-_ENFORCED_LABEL: dict[plan_gate.Outcome, PlanGateOutcome] = {"deny": "deny", "catalog_miss": "catalog_miss"}
+# Shadow verdicts get their own label so an enforced denial and a shadow one are never summed
+# together on plan_gate_total. Enforcing mode needs no map: its outcomes already ARE the labels,
+# and `would_deny` is unreachable there.
 _SHADOW_LABEL: dict[plan_gate.Outcome, PlanGateOutcome] = {
+    "allow": "shadow_allow",
     "would_deny": "shadow_would_deny",
     "catalog_miss": "shadow_catalog_miss",
 }
@@ -143,18 +146,40 @@ def _declared_content_length(request: Request) -> int:
 def _adds_storage(request: Request) -> bool:
     """Whether this operation can ADD stored bytes, and so is subject to the plan quota.
 
-    Deletes free space and must never be quota-gated — that is what lets a customer who downgraded
-    below their current usage dig themselves out. Judging that on the HTTP verb alone is wrong:
-    S3's multi-object delete is `POST /{bucket}?delete`, which is what `aws s3 rm --recursive` and
-    `aws s3 sync --delete` actually issue. Gating it would answer an over-quota customer's bulk
-    delete with a 402 whose message tells them to delete things.
+    Delegates to the repo's existing verb+query -> operation mapping rather than re-deriving one.
+    Judging this on the HTTP verb alone is wrong in both directions, and both mistakes are
+    user-hostile:
+
+      * `POST /{bucket}?delete` is the bulk DeleteObjects that `aws s3 rm --recursive` issues. It
+        frees space, so gating it would answer an over-quota customer's bulk delete with a 402
+        telling them to delete things.
+      * `PUT /{bucket}?acl|?tagging|?versioning|?lifecycle|...` and `CreateBucket` store no object
+        bytes. Refusing "set a tag on my bucket" with "this upload would exceed your storage quota"
+        is the same class of error, one query param over.
+
+    `required_op` already encodes both, and is the same mapping sub-token authorisation reads — so
+    there is one place that knows what an S3 request is, not two.
+
+    CompleteMultipartUpload is excluded on top of that: its parts have already been written and
+    already passed this gate individually, so refusing the commit reclaims nothing and strands them.
+    That is `POST ?uploadId` WITHOUT `partNumber` — matching on `uploadId` alone would also exempt
+    every `PUT ?partNumber&uploadId` part upload, i.e. exactly the requests that carry the bytes,
+    which is how large uploads happen.
+
+    Residual, tracked in todo.md: `required_op` grades `PUT /{bucket}/{key}?acl|?tagging` as
+    write_object, so those stay gated. Fixing that means splitting object subresources in the shared
+    mapping, which also changes sub-token authorisation — deliberately not done here.
     """
-    if request.method not in ("PUT", "POST"):
+    params = dict(request.query_params)
+    _, key = parse_s3_path(routing_path(request))
+    if required_op(request.method, key is not None, params) is not Op.write_object:
         return False
-    return "delete" not in request.query_params
+
+    is_complete_mpu = request.method == "POST" and "uploadId" in params and "partNumber" not in params
+    return not is_complete_mpu
 
 
-async def _log_plan_shadow(
+def _log_plan_shadow(
     request: Request,
     logger: logging.Logger | logging.LoggerAdapter,
     account_address: str,
@@ -174,8 +199,11 @@ async def _log_plan_shadow(
         {namespace="hippius-s3-prod",app="api"} |= "BILLING_PLAN_SHADOW"
         {namespace="hippius-s3-prod",app="api"} |= "BILLING_PLAN_SHADOW" |= "would=would_deny"
 
-    Nothing in here may break the request. The shadow path is pure observation, so a failure to
-    produce a log line is swallowed -- the alternative is a diagnostic feature 500ing live uploads.
+    Deliberately synchronous and side-effect-free apart from the log line and the counter: shadow
+    mode runs on the pay-as-you-go path of every write while the feature is OFF, so anything that
+    can block, fail or wait does not belong here. There is no try/except because there is nothing
+    here that can raise -- if you add a fallible call (a Redis write, a DB read), it will surface as
+    a 503 on a live upload, so wrap it then.
     """
     if not _adds_storage(request):
         return
@@ -183,7 +211,7 @@ async def _log_plan_shadow(
     incoming = _declared_content_length(request)
     decision = plan_gate.evaluate_quota(quota, incoming, enforcing=False)
 
-    get_metrics_collector().record_plan_gate(outcome=_SHADOW_LABEL.get(decision.outcome, "shadow_allow"))
+    get_metrics_collector().record_plan_gate(outcome=_SHADOW_LABEL[decision.outcome])
     logger.info(
         f"BILLING_PLAN_SHADOW enforcement=disabled account={account_address} plan={quota.plan_id} "
         f"method={request.method} used_bytes={decision.used_bytes} limit_bytes={decision.quota_bytes} "
@@ -205,22 +233,20 @@ async def _check_plan_quota(
     """
     redis_accounts = request.app.state.redis_accounts_client
 
-    # The whole plan evaluation sits in one try: BOTH the plan lookup and the usage read consult
-    # our own state (redis-accounts, and Postgres for the usage rollup), and neither is worth
-    # failing a customer's upload over. Any inability to reach a verdict falls back to the
-    # pay-as-you-go path, which is exactly what the account would have got before this feature
-    # existed — so nothing here can be a NEW failure mode.
+    # The plan lookup consults our own state (one redis-accounts HGET; there is no database work on
+    # this path). Failing to reach a verdict is not worth failing a customer's upload over, so it
+    # falls back to the pay-as-you-go path — exactly what the account would have got before this
+    # feature existed, so nothing here can be a NEW failure mode.
     try:
         resolved = await plan_gate.resolve_plan(redis_accounts, account_address)
         if resolved is None:
             return False, None
 
         quota = resolved
-        plan_id = quota.plan_id
-        request.state.plan_id = plan_id
+        request.state.plan_id = quota.plan_id
 
         if not config.enable_billing_plans:
-            await _log_plan_shadow(request, logger, account_address, quota)
+            _log_plan_shadow(request, logger, account_address, quota)
             return False, None
 
         if not _adds_storage(request):
@@ -232,18 +258,20 @@ async def _check_plan_quota(
         logger.warning(f"PLAN_LOOKUP unavailable account={account_address}: {e}; falling back to pay-as-you-go")
         get_metrics_collector().record_plan_gate(outcome="unavailable")
         return False, None
-    get_metrics_collector().record_plan_gate(outcome=_ENFORCED_LABEL.get(decision.outcome, "allow"))
+    # `would_deny` cannot occur when enforcing; the remaining outcomes are already valid labels.
+    enforced: PlanGateOutcome = "allow" if decision.outcome == "would_deny" else decision.outcome
+    get_metrics_collector().record_plan_gate(outcome=enforced)
 
     if decision.outcome == "catalog_miss":
         logger.warning(
-            f"PLAN_QUOTA catalog miss account={account_address} plan={plan_id}; allowing. "
+            f"PLAN_QUOTA catalog miss account={account_address} plan={quota.plan_id}; allowing. "
             f"The plans-cacher may be cold or this plan id is unknown to the catalog."
         )
         return True, None
 
     if decision.outcome == "deny":
         logger.warning(
-            f"PLAN_QUOTA denied account={account_address} plan={plan_id} "
+            f"PLAN_QUOTA denied account={account_address} plan={quota.plan_id} "
             f"used={decision.used_bytes} limit={decision.quota_bytes}"
         )
         return True, s3_error_response(
@@ -447,16 +475,11 @@ async def account_middleware(
 
                     if not request.state.account.has_credits:
                         logger.warning(f"Access key account lacks credits: {account_address}")
-                        bucket_name = None
-                        bucket_match = re.match(r"^/([^/]+)", path)
-                        if bucket_match:
-                            bucket_name = bucket_match.group(1)
-
                         return s3_error_response(
                             code="InsufficientAccountCredit",
                             message="The account does not have sufficient credit to perform this operation",
                             status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                            BucketName=bucket_name if bucket_name else "",
+                            BucketName=first_path_segment(request),
                         )
 
                     can_upload_error = await _check_can_upload(request, logger)

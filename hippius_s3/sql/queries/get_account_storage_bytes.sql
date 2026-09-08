@@ -5,12 +5,10 @@
 -- 11.8M objects in one bucket, where this is seconds and admin.py already degrades to a null count
 -- on timeout. So it must never run on a routine request path.
 --
--- Two callers, both of which can afford it:
---   1. The plans-cacher, in the background, once per poll per PLAN account (a few tens of accounts,
---      so a few seconds a cycle with nobody waiting on it).
---   2. The quota gate's DENIAL path. The cached figure may only ALLOW; a refusal is re-checked
---      against this query first, under a timeout, allowing on timeout. That way a stale-high cached
---      number can never 402 someone who has just deleted data.
+-- ONE caller: the plans-cacher, in the background, once per poll per PLAN account (a few tens of
+-- accounts, so a few seconds a cycle with nobody waiting on it). Nothing on the request path runs
+-- this -- the quota gate reads the cached result and does not re-check, not even to confirm a
+-- denial, which is why the refresh interval is the enforcement lag in both directions.
 --
 -- Keep in sync with get_admin_account_stats.sql and console_list_buckets.sql -- those two disagreed
 -- with each other until 2026-09, and they are the numbers an operator and a customer each see.

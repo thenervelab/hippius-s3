@@ -116,11 +116,11 @@ cost anyone an upload; flipping it on is then a config change, not a code change
 {namespace="hippius-s3-prod",app="api"} |= "BILLING_PLAN_SHADOW" |= "would=would_deny"
 ```
 
-The shadow path is cheaper than the real gate on purpose: it reads the cached rollup and stops,
-never running the authoritative SUM. It sits on the pay-as-you-go path of every write, and an
-unbounded query there for the sake of a log line would be a self-inflicted latency regression — the
-cost is that a shadow `would_deny` is UNVERIFIED and should be cross-checked before it is trusted.
-Nothing in the shadow path can fail the request.
+Shadow mode runs the SAME function on the SAME inputs as enforcement — `evaluate_quota(...,
+enforcing=False)` — and differs only in naming the over-quota verdict `would_deny` instead of
+`deny`. That is deliberate and pinned by `test_shadow_and_enforced_share_the_arithmetic`: a second
+copy of the arithmetic could drift, and the shadow period is precisely the window in which the
+drift would go unnoticed. Nothing in the shadow path can fail the request.
 
 The flag is held as **two GitHub secrets**, so the environments move independently:
 

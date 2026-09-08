@@ -29,7 +29,6 @@ FAILURE POSTURE -- the two cases are deliberately different:
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any
 from typing import Literal
@@ -37,8 +36,6 @@ from typing import Literal
 from hippius_s3.services.plans_cache import PlanQuota
 from hippius_s3.services.plans_cache import get_plan_for_account
 
-
-logger = logging.getLogger(__name__)
 
 Outcome = Literal["allow", "deny", "would_deny", "catalog_miss"]
 

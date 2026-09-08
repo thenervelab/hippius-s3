@@ -379,3 +379,48 @@ async def test_a_denial_is_not_re_checked_against_the_database(plan_config: Any,
     response = await put(app)
 
     assert response.status_code == 402
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path,params",
+    [
+        ("/test-bucket/test-key", "?delete"),
+        ("/test-bucket/test-key", "?partNumber=1&uploadId=abc&delete"),
+        ("/test-bucket/test-key", "?uploadId=abc&partNumber=1"),
+    ],
+)
+async def test_a_write_cannot_escape_the_quota_by_adding_a_query_param(
+    plan_config: Any, monkeypatch: Any, path: str, params: str
+) -> None:
+    """The object router ignores unrecognised query params, so `PUT /bucket/key?delete` is a plain
+    object write. Exempting anything whose query string merely CONTAINS "delete" would let an
+    over-quota account store unlimited data by appending it — and exempting anything with an
+    uploadId would exempt the part uploads that carry the bytes. Both must stay gated.
+    """
+    app, _ = build_app(
+        plan_config, monkeypatch, plan_id="pro", storage_bytes=1 * GB, used=500 * GB
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put(path + params, content=b"x" * 5, headers={"content-length": "5"})
+
+    assert response.status_code == 402
+
+
+@pytest.mark.asyncio
+async def test_completing_a_multipart_upload_is_never_refused(plan_config: Any, monkeypatch: Any) -> None:
+    """The parts are already stored and already passed this gate individually. Refusing the commit
+    reclaims nothing and strands them, with no path forward for the customer."""
+    app, _ = build_app(
+        plan_config, monkeypatch, plan_id="pro", storage_bytes=1 * GB, used=500 * GB
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/test-bucket/test-key?uploadId=abc",
+            content=b"<CompleteMultipartUpload/>",
+            headers={"content-length": "26"},
+        )
+
+    assert response.status_code == 200
