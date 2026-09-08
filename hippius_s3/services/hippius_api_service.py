@@ -16,9 +16,12 @@ from typing import Callable
 from typing import Coroutine
 from typing import Dict
 from typing import TypeVar
+from urllib.parse import urlparse
+from urllib.parse import urlunparse
 
 import httpx
 from pydantic import BaseModel
+from pydantic import ConfigDict
 
 from hippius_s3.config import get_config
 
@@ -123,6 +126,60 @@ class ListFilesResponse(BaseModel):
     next: str | None
     previous: str | None
     results: list[FileItem]
+
+
+# ---------------------------------------------------------------------------
+# S3 billing plans. GET /api/s3/plans/accounts/?page=1&page_size=500
+#
+# ONE endpoint carries both halves: `plans` is the catalog (plan name -> allowance) and `results` is
+# the per-account roll, paginated. So there is one scrape loop, not two.
+#
+# `extra="ignore"` throughout and every field but the identifier optional-with-default: a payload
+# that grows a field must not crash the plans-cacher and strand the fleet on last-known-good.
+#
+# The wire -> internal translation lives in _parse_page() in workers/run_plans_cacher_in_loop.py.
+# ---------------------------------------------------------------------------
+
+
+class S3PlanCatalogEntry(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    # Opaque on-chain plan hash. Carried through for observability; nothing keys off it.
+    h256: str | None = None
+    # None means "this plan's allowance is unknown". NEVER read as "zero bytes allowed" -- see
+    # PlanQuota.enforceable in hippius_s3/services/plans_cache.py.
+    storage_bytes: int | None = None
+
+
+class S3PlanAccountRow(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    ss58: str
+    # "plan" | "pay_as_you_go". Anything that is not exactly "plan" is treated as pay-as-you-go.
+    billing: str | None = None
+    plan: str | None = None
+    # A lapsed/cancelled subscription still appears with billing="plan" and its plan name, but
+    # active=false. Defaulting to False is the safe direction: an unparseable row does not hand out
+    # an allowance. See _is_enforceable_plan_row.
+    active: bool = False
+    # The account's OWN allowance, which may differ from the catalog's for a bespoke deal. Preferred
+    # over the catalog value when present.
+    storage_bytes: int | None = None
+    next_charge: str | None = None
+    subscription_id: int | None = None
+
+
+class S3PlanAccountsResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    generated_at: str | None = None
+    count: int | None = None
+    # An ABSOLUTE url (e.g. https://api.hippius.com/api/s3/plans/accounts/?page=2&page_size=500).
+    # Only its path+query is followed -- see get_s3_plan_accounts.
+    next: str | None = None
+    previous: str | None = None
+    plans: dict[str, S3PlanCatalogEntry] = {}
+    results: list[S3PlanAccountRow] = []
 
 
 class HippiusAPIError(Exception):
@@ -485,3 +542,48 @@ class HippiusApiClient:
 
         response.raise_for_status()
         return ListFilesResponse.model_validate(response.json())
+
+    @retry_on_error(retries=3, backoff=5.0)
+    async def get_s3_plan_accounts(
+        self,
+        next_url: str | None = None,
+        page_size: int = 500,
+    ) -> S3PlanAccountsResponse:
+        """Fetch one page of the S3 billing-plan roll: the catalog plus per-account rows.
+
+        Maps to: GET /api/s3/plans/accounts/?page=1&page_size=500
+
+        NOTE the path passed here is "s3/plans/accounts/", not "/api/s3/plans/accounts/".
+        HIPPIUS_API_BASE_URL already ends in /api (see .env.defaults), and every other call on this
+        client is written relative to it — "objectstore/tokens/auth/", "storage-control/files/".
+        Spelling the /api again would request /api/api/s3/plans/accounts/ and 404 forever.
+
+        `next_url` continues a previous page. Upstream returns it as an ABSOLUTE url, and we
+        deliberately keep only its path and query, re-homing them on our OWN configured host. Two
+        reasons, both load-bearing:
+          * in e2e HIPPIUS_API_BASE_URL points at mock-hippius-api, and following the absolute
+            https://api.hippius.com/... would walk straight out of the mock and hit production;
+          * an upstream response field can never redirect our service-token-authenticated client
+            at a host we did not choose.
+
+        The caller MUST treat a mid-pagination failure as "publish nothing": a partial roll demotes
+        every missing account to pay-as-you-go and 402s paying customers. See publish_plan_roll.
+        """
+        timeout = httpx.Timeout(self._config.plans_api_timeout_seconds, connect=5.0)
+
+        if next_url:
+            page = urlparse(next_url)
+            base = urlparse(str(self._client.base_url))
+            # Absolute, so httpx uses it as-is rather than re-merging it under base_url's /api.
+            target = urlunparse((base.scheme, base.netloc, page.path, "", page.query, ""))
+            response = await self._client.get(target, headers=self._get_headers(), timeout=timeout)
+        else:
+            response = await self._client.get(
+                "s3/plans/accounts/",
+                params={"page": 1, "page_size": page_size},
+                headers=self._get_headers(),
+                timeout=timeout,
+            )
+
+        response.raise_for_status()
+        return S3PlanAccountsResponse.model_validate(response.json())

@@ -98,6 +98,27 @@ spec:
                   name: hippius-s3-secrets
                   key: HIPPIUS_SERVICE_ACCOUNT_IDS
                   optional: true
+            # The master switch for S3 billing plans, held as one GitHub secret PER ENVIRONMENT so
+            # staging and production move independently. Each deploy workflow writes only its own
+            # key into that cluster's Secret — staging never receives the prod value and vice versa
+            # — so both refs are declared here and exactly one resolves in any given cluster.
+            # config.py::_parse_enable_billing_plans then picks the one matching this pod's
+            # ENVIRONMENT, which means even a mis-seeded Secret cannot make prod read staging's flag.
+            #
+            # optional + absent means false, which is the safe direction: pay-as-you-go, with
+            # BILLING_PLAN_SHADOW lines logged for accounts that have a plan.
+            - name: HIPPIUS_ENABLE_BILLING_PLANS_STAGING
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_ENABLE_BILLING_PLANS_STAGING
+                  optional: true
+            - name: HIPPIUS_ENABLE_BILLING_PLANS_PROD
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_ENABLE_BILLING_PLANS_PROD
+                  optional: true
             - name: HIPPIUS_AUTH_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:

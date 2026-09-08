@@ -191,6 +191,67 @@ Fast-path copy: rewraps the DEK under the destination's AAD, copies `chunk_backe
 
 **Proposed**: add a prominent comment block at [copy_service_v5.py:24](hippius_s3/services/copy_service_v5.py) documenting the invariant ("fast path requires either (a) non-MPU single-part object OR (b) explicit FS backfill of all chunks into the destination object_id path"). Consider a feature flag before re-enabling for MPU.
 
+### P1 — Billing plans: the quota gate keys on the CALLER, but storage is owner-pays
+
+`account_middleware` runs before `acl_middleware`, so `bucket_owner_id` is not resolved when the
+plan gate runs; it reads the caller's own plan and the caller's own usage. But billing is owner-pays
+— Arion charges `object_versions.address`, the bucket owner.
+
+Consequence: a plan customer at 100% of quota who holds a cross-account WRITE grant on someone
+else's bucket passes the gate on every PUT — their own usage does not grow — while the bytes accrue
+to the owner. `can_upload` has the same asymmetry today, so this is not a regression, but it becomes
+load-bearing once a quota is enforced.
+
+AWS and R2 both settle this the same way: the **bucket owner** pays for stored bytes regardless of
+who wrote them (S3 Requester Pays shifts request and transfer costs, never storage). So the owner is
+the correct subject, and the fix needs the owner resolved before the gate — either reordering the
+middleware chain or resolving the bucket owner twice. Size it first with a cross-account counter on
+`plan_gate_total`.
+
+### P1 — Billing plans: nothing accumulates bytes admitted between refreshes
+
+Every request compares against the same cached `used_bytes` until the next plans-cacher cycle, so
+within a 10-minute window the quota bounds nothing: an account at 9.9/10 TiB can issue an unbounded
+number of 100 GiB PUTs, each of which individually "fits". With concurrent clients that is
+effectively unlimited, not "one cycle's worth".
+
+The fix that does not reintroduce a database read: a Redis `INCRBY` accumulator keyed on
+`(account, publish epoch)`, incremented by the declared size of each admitted write and added to
+`used_bytes` in the comparison. The publish epoch resets it every cycle, so it never needs pruning
+and can never drift far. That bounds overshoot to what was actually admitted rather than to elapsed
+time.
+
+### P2 — Billing plans: enforcement lags by one refresh interval, in both directions
+
+Usage is counted by the plans-cacher every `HIPPIUS_PLANS_LOOP_SLEEP` (10 min), and nothing on the
+request path recomputes. So an account can overshoot its quota by one cycle's worth of uploads, and
+— the sharper edge — a customer who deletes data to get back under stays refused until the next
+cycle. The 402 message says as much, but the real levers are the interval itself, or re-checking on
+the denial path (deliberately not done: it would put an unbounded query in front of a live upload).
+
+### P2 — Billing plans: an overwrite is charged as if it were additive
+
+The gate tests `used + incoming_bytes <= limit`, and `used` already contains the bytes of the
+version being replaced. A customer at 99% who re-uploads an unchanged file — an ordinary
+`aws s3 sync` re-run — is refused for a net-zero write. Fixing it needs the current version's size,
+which is not resolved at that point in the chain.
+
+### P2 — Billing plans: in-flight MPU parts and object-level subresources
+
+Part uploads are gated individually on their declared length but never against the accumulating
+total, so an MPU can cross the quota and only be caught on the next refresh. Separately,
+`required_op` grades `PUT /bucket/key?acl|?tagging` as `write_object`, so those are quota-gated even
+though they store no bytes; fixing that means splitting object subresources in the shared mapping,
+which also touches sub-token authorisation.
+
+### P3 — `_parse_bool` is applied to one flag while ~18 others keep the fragile form
+
+`config.py` now has two boolean conventions. The older `lambda x: x.lower() == "true"` reads `1` as
+FALSE, which for `HIPPIUS_READ_ONLY_MODE` or `HIPPIUS_BYPASS_CREDIT_CHECK` is the same silent
+misconfiguration `_parse_bool` was written to prevent. Not a safe blanket sweep — `_parse_bool`
+raises on an unrecognised value, so any pod carrying a stray value today would start crash-looping —
+so do it deliberately, flag by flag.
+
 ### P2 — Gateway → API streaming hop
 
 **What**: Every request streams through `gateway → forward_service → httpx → api`. Client body is read once via `request.stream()`, forwarded via `httpx.AsyncClient.stream()`, and the API response is re-streamed to the client via `StreamingResponse`. No buffering. ([hippius_s3/gateway/services/forward_service.py:113-170](hippius_s3/gateway/services/forward_service.py)).

@@ -12,6 +12,7 @@ Worker entry points — the `run_*.py` scripts that actually run as pod processe
 | [run_janitor_in_loop.py](run_janitor_in_loop.py) | FS cache GC with replication gate, hot retention, and pressure modes. | Single instance |
 | [run_orphan_checker_in_loop.py](run_orphan_checker_in_loop.py) | Periodically scans the Hippius chain for orphaned files and enqueues cleanup. | Single instance |
 | [run_account_cacher_in_loop.py](run_account_cacher_in_loop.py) | Warms account credit cache from Substrate. | Single instance |
+| [run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py) | Scrapes the S3 billing-plan catalog + account→plan map from api.hippius.com into `redis-accounts`. | Single instance (**must stay `replicas: 1`**) |
 | [run_migrator_once.py](run_migrator_once.py) | One-shot data migration (e.g., v4→v5). Invoked as a K8s Job. | Job |
 | [cachet_health_check.py](cachet_health_check.py) | Pushes status to the external Cachet status page. | CronJob |
 
@@ -71,6 +72,91 @@ Config:
 ## Account cacher
 
 [run_account_cacher_in_loop.py](run_account_cacher_in_loop.py). Polls Substrate for account state (free/reserved balance, credits, bandwidth) and mirrors into `redis-accounts`. Cache TTL set by the cacher, not clients. `CACHER_LOOP_SLEEP=60`.
+
+## Plans cacher
+
+[run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py). One poll loop against one endpoint:
+
+```
+GET /api/s3/plans/accounts/?page=1&page_size=500     every HIPPIUS_PLANS_LOOP_SLEEP (600s)
+```
+
+It carries both halves — `plans` is the catalog, `results` is the paginated account roll — and is
+split across two hashes on `redis-accounts`:
+
+| Redis key | Field | Value |
+|---|---|---|
+| `hippius_s3_plan_accounts` | account SS58 | `{"plan", "storage_limit_bytes", "used_bytes"}` |
+| `hippius_s3_plans` | plan name | `{"h256": ..., "storage_bytes": ...}` |
+| `hippius_s3_plans:meta` | — | `{fetched_at, accounts, plans}` |
+
+The account row carries everything the quota gate needs, so the request path is ONE `HGET` and a
+comparison — no catalog lookup, no database. The two halves come from different places:
+
+- **`storage_limit_bytes`** is the account's MAX QUOTA, from upstream. `results[].storage_bytes`
+  wins over the plan's list price, so a negotiated limit is not silently overwritten.
+- **`used_bytes`** is what the account actually stores, **counted by this worker** — upstream
+  reports no usage figure. One `SUM` per plan account per cycle, over
+  `HIPPIUS_PLANS_USAGE_CONCURRENCY` (4) connections.
+
+There are only a few tens of plan accounts, which is the whole reason there is no rollup table and
+no triggers: at that cardinality a maintained counter would buy nothing but a second source of
+truth to keep in step.
+
+**The counts run against a REPLICA** (`DATABASE_READONLY_URL`, falling back to `DATABASE_URL` when
+unset). They are aggregates over the largest tables in the schema — measured on prod, ~200-320ms for
+a typical account, and this cluster's primary has been stalled by a read-storm before. A replica
+also cancels a query past `max_standby_streaming_delay` rather than letting it lag replay, which
+turns a pathological account into a failed cycle (previous roll keeps serving) instead of a
+replication problem.
+
+Measured on prod (2026-09): 348 accounts have buckets and 338 of them have ≤20, so the per-account
+count is comfortably sub-second for essentially all of them. Cost is driven by BUCKET FAN-OUT, not
+data volume — one outlier account with 2024 buckets holding 257 KB takes ~9s, because the planner
+abandons the index path. If a plan account ever has hundreds of buckets, that is the case to
+re-measure before trusting the cycle time.
+
+⚠️ **The refresh interval IS the enforcement lag, in both directions.** An account can overshoot its
+quota by one cycle's worth of uploads, and a customer who deletes data to get back under stays
+refused until the next cycle sees it. Nothing on the request path recomputes.
+
+A count failing for ANY account fails the whole cycle and keeps the previous roll: publishing a
+partial answer would write `used_bytes=0` for the accounts we could not count, silently handing them
+unlimited headroom.
+
+**Only accounts with an ACTIVE plan are written.** A row needs all three of `billing == "plan"`, a
+plan name, and `active` true. A lapsed subscription still comes back with `billing: "plan"` and its
+old plan name and `active: false`; honouring that would hand a free allowance to someone who stopped
+paying, so the row is dropped and the account takes the pay-as-you-go path — where a non-subscriber
+belongs. Everything else is simply absent from the hash, which is exactly what the request path
+already reads as pay-as-you-go.
+
+**Caching is unconditional.** This worker does not read `HIPPIUS_ENABLE_BILLING_PLANS` and is not
+deployed with it, so the maps stay warm and observably correct long before enforcement is switched
+on — flipping the flag on the api is then a config change, not a cold-cache event.
+
+**This pod being down is not an outage.** Neither hash has a TTL and `redis-accounts` is
+`noeviction` + AOF, so the last known good roll keeps serving through an api.hippius.com outage and
+across a Redis restart. Alert on `plans_cache_age_seconds`, not on pod restarts.
+
+Three invariants, all in [hippius_s3/services/plans_cache.py](../hippius_s3/services/plans_cache.py),
+each of which exists to stop the same failure — silently demoting plan customers to pay-as-you-go
+and 402ing them on their next upload:
+
+1. **Publication is a whole-hash build-then-`RENAME`.** `refresh_plan_roll_once` fetches EVERY page
+   before publishing; a failure on page 7 of 20 leaves the live hash untouched.
+2. **An empty or heavily-shrunk roll is refused** (`MAX_ACCOUNT_MAP_SHRINK_RATIO`, 50%). One bad
+   upstream deploy returning a truncated-but-valid list must not wipe the fleet's plans.
+3. **No TTL, ever.** A TTL would delete the last-known-good map during exactly the outage it exists
+   to survive.
+
+Pagination is bounded by `MAX_PAGES` so a self-referential `next` cursor cannot spin the worker
+forever without publishing. Upstream returns `next` as an ABSOLUTE url; only its path and query are
+followed, re-homed on our own configured host — otherwise the e2e cacher would walk out of
+mock-hippius-api and into production.
+
+`replicas` must stay 1 — two replicas would not corrupt anything (last `RENAME` wins) but would
+double the upstream load for nothing.
 
 ## Migrator
 

@@ -128,3 +128,14 @@ data:
   HIPPIUS_FS_STORE_SCAN_CONCURRENCY: "64"
   SENTRY_DSN: ""
   SENTRY_TRACES_SAMPLE_RATE: "0.1"
+  # S3 billing plans — keep in step with .env.defaults.
+  #
+  # The billing-plans switch is deliberately NOT set here. It comes from the hippius-s3-secrets
+  # Secret as one key PER ENVIRONMENT — HIPPIUS_ENABLE_BILLING_PLANS_STAGING / _PROD, each seeded by
+  # its own deploy workflow — so the environments move independently without a repo change. Unset
+  # means false; see _parse_enable_billing_plans in hippius_s3/config.py.
+  HIPPIUS_PLANS_LOOP_SLEEP: "600"
+  HIPPIUS_PLANS_USAGE_CONCURRENCY: "4"
+  HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS: "30.0"
+  HIPPIUS_PLANS_API_TIMEOUT_SECONDS: "30.0"
+  HIPPIUS_PLANS_STALE_AFTER_SECONDS: "3600"

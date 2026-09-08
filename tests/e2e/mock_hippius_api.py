@@ -161,6 +161,65 @@ async def token_auth(payload: TokenAuthRequest):
     )
 
 
+# --------------------------------------------------------------------------- S3 billing plans
+#
+# Mirrors GET /api/s3/plans/accounts/ — one endpoint carrying both the catalog (`plans`) and the
+# paginated account roll (`results`).
+#
+# Registered under BOTH paths because HIPPIUS_API_BASE_URL differs between environments: in prod it
+# ends in /api so the client requests /api/s3/plans/accounts/, while against this mock the base has
+# no prefix and the same relative path resolves to /s3/plans/accounts/. The `next` url we hand back
+# is absolute-from-root, so page 2 arrives on the /api form either way.
+#
+# MOCK_ACCOUNT_ADDRESS starts on NO plan, so the default e2e stack exercises the unchanged
+# pay-as-you-go path and every existing test keeps passing. POST /_plans swaps that at runtime.
+plan_catalog: dict = {
+    "pro": {
+        "h256": "0x96e900000000000000000000000000000000000000000000000000000000028f",
+        "storage_bytes": 10995116277760,
+    },
+    "business": {
+        "h256": "0x44e0000000000000000000000000000000000000000000000000000000000c67",
+        "storage_bytes": 54975581388800,
+    },
+}
+plan_accounts: list[dict] = []
+
+
+def _plans_page():
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(plan_accounts),
+        "next": None,
+        "previous": None,
+        "plans": plan_catalog,
+        "results": plan_accounts,
+    }
+
+
+@app.get("/s3/plans/accounts/")
+async def s3_plan_accounts(page: int = 1, page_size: int = 500):
+    await fault.gate("plans")
+    return _plans_page()
+
+
+@app.get("/api/s3/plans/accounts/")
+async def s3_plan_accounts_api_prefixed(page: int = 1, page_size: int = 500):
+    await fault.gate("plans")
+    return _plans_page()
+
+
+@app.post("/_plans")
+async def set_plans(payload: dict):
+    """Test hook. `{"plans": {...}, "results": [...]}` — either key may be omitted."""
+    global plan_catalog, plan_accounts
+    if "plans" in payload:
+        plan_catalog = payload["plans"]
+    if "results" in payload:
+        plan_accounts = payload["results"]
+    return {"plans": len(plan_catalog), "accounts": len(plan_accounts)}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}

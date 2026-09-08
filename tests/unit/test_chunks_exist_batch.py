@@ -189,6 +189,7 @@ class TestParallelPartScans:
         result = await cache.chunks_exist_batch(OBJ, 1, checks)
         assert result == [True, False, True, True, True, False]
 
+
 @pytest.mark.parametrize(
     "bogus",
     ["chunk_007.bin", "chunk_+1.bin", "chunk_ 1.bin", "chunk_١.bin", "chunk_-1.bin"],

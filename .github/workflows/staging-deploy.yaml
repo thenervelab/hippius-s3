@@ -216,11 +216,15 @@ jobs:
       - name: Update secrets
         run: |
           DATABASE_URL="postgresql://postgres:${{ secrets.DATABASE_PASSWORD }}@postgres-rw:5432/hippius?sslmode=disable"
+          # Replica endpoint, for background readers that tolerate lag (the plans-cacher
+          # counts per-account storage here rather than on the primary).
+          DATABASE_READONLY_URL="postgresql://postgres:${{ secrets.DATABASE_PASSWORD }}@postgres-ro:5432/hippius?sslmode=disable"
 
           kubectl create secret generic hippius-s3-secrets \
             --from-literal=DATABASE_PASSWORD='${{ secrets.DATABASE_PASSWORD }}' \
             --from-literal=DATABASE_URL="${DATABASE_URL}" \
             --from-literal=HIPPIUS_KEYSTORE_DATABASE_URL="${DATABASE_URL}" \
+            --from-literal=DATABASE_READONLY_URL="${DATABASE_READONLY_URL}" \
             --from-literal=REDIS_URL='redis://redis-cluster.hippius-s3-staging.svc.cluster.local:6379?cluster=true' \
             --from-literal=REDIS_ACCOUNTS_URL='redis://redis-accounts:6379' \
             --from-literal=REDIS_QUEUES_URL='redis://redis-queues:6379' \
@@ -231,6 +235,7 @@ jobs:
             --from-literal=ARION_BEARER_TOKEN='${{ secrets.ARION_BEARER_TOKEN }}' \
             --from-literal=ARION_BILLING_BYPASS_KEY='${{ secrets.ARION_BILLING_BYPASS_KEY }}' \
             --from-literal=HIPPIUS_SERVICE_ACCOUNT_IDS='${{ secrets.HIPPIUS_SERVICE_ACCOUNT_IDS }}' \
+            --from-literal=HIPPIUS_ENABLE_BILLING_PLANS_STAGING='${{ secrets.HIPPIUS_ENABLE_BILLING_PLANS_STAGING }}' \
             --from-literal=ARION_RATE_LIMITING_PROXY_BYPASS_KEY='${{ secrets.ARION_RATE_LIMITING_PROXY_BYPASS_KEY }}' \
             --from-literal=HIPPIUS_AUTH_ENCRYPTION_KEY='${{ secrets.HIPPIUS_AUTH_ENCRYPTION_KEY }}' \
             --from-literal=HIPPIUS_UPLOAD_QUEUE_NAMES='${{ secrets.HIPPIUS_UPLOAD_QUEUE_NAMES }}' \
