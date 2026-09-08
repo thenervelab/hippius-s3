@@ -33,6 +33,42 @@ def _parse_backends(value: str | None, default: str = "arion") -> list[str]:
     return [b.strip() for b in value.split(",") if b.strip()]
 
 
+# The Hippius network's SS58 prefix — the format cacher/run_cacher.py derives account addresses
+# in, and so the only encoding an account_address is ever compared against.
+HIPPIUS_SS58_FORMAT = 42
+
+
+def _parse_service_accounts(value: str | None) -> frozenset[str]:
+    """Parse the comma-separated HIPPIUS_SERVICE_ACCOUNT_IDS allowlist into SS58 addresses.
+
+    Raises on a malformed entry rather than dropping it. A typo here does not fail visibly —
+    it silently demotes an internal account back to "billed", which only surfaces much later
+    as a DLQ full of 402s with no obvious cause. Unset/empty stays empty, so the allowlist is
+    fail-closed: nothing bypasses billing unless it was spelled correctly.
+
+    SS58 is base58 and case-sensitive; entries are never normalised.
+
+    The network prefix is pinned to 42 (the format the account cacher derives addresses in, and
+    therefore the only form account_address ever takes). Without it the check passes for the SAME
+    public key encoded under any other prefix — the likeliest real mistake, and one that is
+    invisible: the pod boots, logs the address in its startup line, and then never matches.
+    """
+    from substrateinterface.utils.ss58 import is_valid_ss58_address
+
+    accounts: set[str] = set()
+    for part in str(value or "").split(","):
+        candidate = part.strip().strip('"').strip("'")
+        if not candidate:
+            continue
+        if not is_valid_ss58_address(candidate, valid_ss58_format=HIPPIUS_SS58_FORMAT):
+            raise ValueError(
+                f"HIPPIUS_SERVICE_ACCOUNT_IDS contains an invalid SS58 address "
+                f"(must be network format {HIPPIUS_SS58_FORMAT}): {candidate!r}"
+            )
+        accounts.add(candidate)
+    return frozenset(accounts)
+
+
 def _parse_account_whitelist() -> list[str]:
     """Parse comma-separated account whitelist from environment variable."""
     import os
@@ -100,6 +136,12 @@ class Config:
     validator_region: str = env("HIPPIUS_VALIDATOR_REGION")
     hippius_api_base_url: str = env("HIPPIUS_API_BASE_URL:https://api.hippius.com/")
     arion_billing_bypass_key: str = env("ARION_BILLING_BYPASS_KEY:")
+    # Internal Hippius-owned accounts that store our own data. Their writes skip the credit and
+    # can_upload gates in the gateway; the backend upload path needs nothing, because Arion
+    # whitelists these accounts on /upload itself. Deliberately
+    # an explicit per-account allowlist, NOT a blanket switch like enable_bypass_credit_check —
+    # and for that reason it is NOT clamped off outside ENVIRONMENT=test.
+    service_account_ids: frozenset[str] = env("HIPPIUS_SERVICE_ACCOUNT_IDS:", convert=_parse_service_accounts)
     arion_rate_limiting_proxy_bypass_key: str = env("ARION_RATE_LIMITING_PROXY_BYPASS_KEY:")
     arion_base_url: str = env("HIPPIUS_ARION_BASE_URL:https://arion.hippius.com/")
     arion_verify_ssl: bool = env("HIPPIUS_ARION_VERIFY_SSL:true", convert=lambda x: x.lower() == "true")

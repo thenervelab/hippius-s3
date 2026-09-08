@@ -82,6 +82,11 @@ async def audit_log_middleware(
         ray_id=ray_id,
         total_time_ms=(total_time * 1000) if total_time is not None else None,
         pre_handler_ms=(pre_handler_time * 1000) if pre_handler_time is not None else None,
+        # Set by account_middleware from the VERIFIED account address. Read via getattr because
+        # the paths that never reach it (docs, /admin, peer fetch) leave it unset, and those are
+        # by definition not service-account traffic. `is True` so a stray truthy value on
+        # request.state can never widen this to a claim we did not make.
+        service_account=getattr(request.state, "service_account", False) is True,
     )
 
     return response

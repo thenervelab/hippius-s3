@@ -220,6 +220,30 @@ async def handle_create_bucket(bucket_name: str, request: Request, db: Any) -> R
 
             # Check for x-amz-acl header
             x_amz_acl = request.headers.get("x-amz-acl")
+
+            # Refused BEFORE the transaction: a service account must not create a bucket the
+            # world can write to. The evaluation-time check in ACLService is what actually keeps
+            # the grant from being honoured, but creating the bucket and silently not honouring
+            # its stated ACL is the worse outcome — the operator would believe it worked.
+            if x_amz_acl:
+                from hippius_s3.config import get_config
+                from hippius_s3.services.acl_helper import canned_acl_to_acl
+                from hippius_s3.services.service_accounts import forbidden_write_grants
+
+                candidate = await canned_acl_to_acl(x_amz_acl, main_account_id, db, bucket_name)
+                if forbidden_write_grants(main_account_id, candidate.grants, get_config().service_account_ids):
+                    logger.warning(
+                        f"Refused canned ACL '{x_amz_acl}' on service-account bucket '{bucket_name}' "
+                        f"(owner={main_account_id})"
+                    )
+                    return errors.s3_error_response(
+                        code="AccessDenied",
+                        message=(
+                            "Write access to a Hippius service-account bucket cannot be granted to another account."
+                        ),
+                        status_code=403,
+                    )
+
             # Object Lock enablement at bucket creation time (Tier 1, no enforcement).
             object_lock_enabled = request.headers.get("x-amz-bucket-object-lock-enabled", "").strip().lower() == "true"
 

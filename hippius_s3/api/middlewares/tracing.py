@@ -52,6 +52,7 @@ async def tracing_middleware(
                     {
                         "hippius.account.main": request.state.main_account_id,
                         "hippius.account.sub": request.state.account_id,
+                        "hippius.account.service": getattr(request.state, "service_account", False) is True,
                     },
                 )
 

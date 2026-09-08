@@ -37,11 +37,13 @@ from pydantic import BaseModel
 from pydantic import Field
 from redis.exceptions import RedisError
 
+from hippius_s3.config import get_config
 from hippius_s3.dependencies import DBConnection
 from hippius_s3.dependencies import get_postgres
 from hippius_s3.gateway.services.suspension import SUSPENSION_CACHE_TTL_SECONDS
 from hippius_s3.gateway.services.suspension import suspension_cache_key
 from hippius_s3.models.sub_token import SS58_PATTERN
+from hippius_s3.services.service_accounts import is_service_account
 from hippius_s3.utils import get_query
 
 
@@ -110,6 +112,25 @@ def _raise(code: str, message: str, http_status: int) -> NoReturn:
     raise HTTPException(status_code=http_status, detail={"code": code, "message": message})
 
 
+def _refuse_service_account(account_id: str, operation: str) -> None:
+    """403 before anything is written when an admin action targets one of our own accounts.
+
+    Placed ahead of every side effect, not just the destructive one: purge_account_data upserts
+    a `full` suspension BEFORE it creates the job, so a check after that point would already
+    have taken our own ingest offline.
+    """
+    if is_service_account(account_id, get_config().service_account_ids):
+        logger.error(f"Refused {operation} on service account {account_id}")
+        _raise(
+            "ServiceAccountProtected",
+            (
+                f"{account_id} is a Hippius service account and cannot be {operation}. "
+                "Remove it from HIPPIUS_SERVICE_ACCOUNT_IDS and redeploy first."
+            ),
+            status.HTTP_403_FORBIDDEN,
+        )
+
+
 def _validate_account_id(account_id: str) -> None:
     if not SS58_PATTERN.match(account_id):
         _raise("InvalidArgument", f"Invalid account_id (must be SS58): {account_id}", status.HTTP_400_BAD_REQUEST)
@@ -161,6 +182,9 @@ async def suspend_account(
     db: DBConnection = Depends(get_postgres),
 ) -> AccountStateResponse:
     _validate_account_id(account_id)
+    # Not destructive, but suspending a service account takes our own ingest offline — and it is
+    # the first step purge_account_data performs, so blocking it here closes both.
+    _refuse_service_account(account_id, "suspended")
 
     row = await db.fetchrow(get_query("upsert_account_suspension"), account_id, body.mode)
     await _write_suspension_cache(request.app.state.redis_client, account_id, body.mode)
@@ -268,6 +292,7 @@ async def purge_account_data(
     db: DBConnection = Depends(get_postgres),
 ) -> PurgeAcceptedResponse:
     _validate_account_id(account_id)
+    _refuse_service_account(account_id, "purged")
 
     await db.fetchrow(get_query("upsert_account_suspension"), account_id, "full")
     await _write_suspension_cache(request.app.state.redis_client, account_id, "full")

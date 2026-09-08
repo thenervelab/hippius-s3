@@ -27,7 +27,20 @@ class DeleteCandidate:
 
 
 async def main_async(args: argparse.Namespace) -> int:
+    from hippius_s3.services.service_accounts import ServiceAccountProtected
+    from hippius_s3.services.service_accounts import require_service_account_env
+
     cfg = get_config()
+
+    # The SQL exclusions below are only as good as the allowlist this process was given. Unset
+    # means `<> ALL('{}')` matches every row and the sweep quietly eats our own data.
+    try:
+        require_service_account_env("delete_legacy_object_versions")
+    except ServiceAccountProtected as exc:
+        print(str(exc))
+        return 2
+    print(f"Service accounts protected in this environment: {len(cfg.service_account_ids)}")
+
     db = await asyncpg.connect(cfg.database_url)
     unpin = not args.no_unpin
     redis_q = None
@@ -102,6 +115,10 @@ async def main_async(args: argparse.Namespace) -> int:
               AND ($2::text IS NULL OR b.bucket_name = $2)
               AND ($3::bool OR ov.object_version <> o.current_object_version)
               AND f.has_v4
+              -- Excluded at the source: this sweep takes no --address, so a per-account refusal
+              -- has nothing to refuse. `<> ALL('{}')` is true for every row, so an empty
+              -- allowlist leaves the sweep exactly as it was.
+              AND b.main_account_id <> ALL($5::text[])
             ORDER BY b.bucket_name, o.object_key, ov.object_id, ov.object_version
             LIMIT COALESCE($4::int, 1000000)
             """,
@@ -109,6 +126,7 @@ async def main_async(args: argparse.Namespace) -> int:
             bucket,
             include_current,
             (args.limit if args.limit and args.limit > 0 else None),
+            sorted(cfg.service_account_ids),
         )
 
         candidates: list[DeleteCandidate] = [
@@ -181,9 +199,13 @@ async def main_async(args: argparse.Namespace) -> int:
                     SELECT 1 FROM object_versions ov
                     WHERE ov.object_id = o.object_id AND ov.storage_version >= 4
                   )
+                  -- Same exclusion as the version sweep above, and it matters more here: this
+                  -- branch deletes whole OBJECTS and cascades to every version, part and chunk.
+                  AND b.main_account_id <> ALL($3::text[])
                 """,
                 max_sv,
                 bucket,
+                sorted(cfg.service_account_ids),
             )
             if unpin:
                 for lr in legacy_only:
