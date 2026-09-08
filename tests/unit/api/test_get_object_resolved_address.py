@@ -94,8 +94,8 @@ async def test_cross_account_get_resolves_download_address_to_bucket_owner(monke
         captured["address"] = kwargs["address"]
         return Response(status_code=200)
 
-    monkeypatch.setattr("hippius_s3.services.object_reader.build_stream_context", _fake_build_stream_context)
-    monkeypatch.setattr("hippius_s3.services.object_reader.read_response", _fake_read_response)
+    monkeypatch.setattr(get_object_endpoint, "build_stream_context", _fake_build_stream_context)
+    monkeypatch.setattr(get_object_endpoint, "read_response", _fake_read_response)
 
     response = await get_object_endpoint.handle_get_object(
         "someone-elses-bucket", "key.txt", _request(), _Pool(), redis_client=object()

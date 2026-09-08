@@ -25,7 +25,10 @@ from hippius_s3.api.s3.range_utils import parse_range_header
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.monitoring import get_metrics_collector
+from hippius_s3.reader.types import RangeRequest as V2Range
 from hippius_s3.services.object_reader import DownloadNotReadyError
+from hippius_s3.services.object_reader import build_stream_context
+from hippius_s3.services.object_reader import read_response
 from hippius_s3.services.parts_catalog import PartsCatalog
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
@@ -336,10 +339,6 @@ async def handle_get_object(
                 )
 
             # Use new reader (flat chunk plan; blocks between parts; no downloader meta dependency)
-            from hippius_s3.reader.types import RangeRequest as V2Range
-            from hippius_s3.services.object_reader import build_stream_context
-            from hippius_s3.services.object_reader import read_response
-
             v2_rng = None
             if range_header and start_byte is not None and end_byte is not None:
                 v2_rng = V2Range(start=int(start_byte), end=int(end_byte))

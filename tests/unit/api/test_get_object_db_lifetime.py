@@ -125,8 +125,8 @@ async def test_connection_is_released_before_the_first_chunk_wait(monkeypatch: A
         assert "db" not in kwargs, "read_response must not receive the pooled connection"
         return SimpleNamespace(status_code=200, headers={})
 
-    monkeypatch.setattr("hippius_s3.services.object_reader.build_stream_context", _fake_build_stream_context)
-    monkeypatch.setattr("hippius_s3.services.object_reader.read_response", _fake_read_response)
+    monkeypatch.setattr(get_object_endpoint, "build_stream_context", _fake_build_stream_context)
+    monkeypatch.setattr(get_object_endpoint, "read_response", _fake_read_response)
 
     response = await get_object_endpoint.handle_get_object("bucket", "key.txt", _request(), pool, redis_client=object())
 
@@ -146,8 +146,8 @@ async def test_saturated_pool_returns_503_slowdown_not_a_hang(monkeypatch: Any) 
     async def _must_not_run(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("no stream work may start without a connection")
 
-    monkeypatch.setattr("hippius_s3.services.object_reader.build_stream_context", _must_not_run)
-    monkeypatch.setattr("hippius_s3.services.object_reader.read_response", _must_not_run)
+    monkeypatch.setattr(get_object_endpoint, "build_stream_context", _must_not_run)
+    monkeypatch.setattr(get_object_endpoint, "read_response", _must_not_run)
 
     response = await get_object_endpoint.handle_get_object(
         "bucket", "key.txt", _request(), _Pool(acquire_hangs=True), redis_client=object()
@@ -170,7 +170,7 @@ async def test_error_inside_the_db_block_still_releases_the_connection(monkeypat
     async def _boom(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("catalog exploded")
 
-    monkeypatch.setattr("hippius_s3.services.object_reader.build_stream_context", _boom)
+    monkeypatch.setattr(get_object_endpoint, "build_stream_context", _boom)
 
     response = await get_object_endpoint.handle_get_object("bucket", "key.txt", _request(), pool, redis_client=object())
 
