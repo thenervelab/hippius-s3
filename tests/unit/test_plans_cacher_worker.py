@@ -75,6 +75,33 @@ def api_client_returning(**methods: object) -> MagicMock:
     return MagicMock(return_value=ctx)
 
 
+class FakePool:
+    """asyncpg pool stand-in returning a fixed usage per account."""
+
+    def __init__(self, usage: dict[str, int] | None = None, fail: Exception | None = None) -> None:
+        self.usage = usage or {}
+        self.fail = fail
+        self.acquired = 0
+
+    def acquire(self):
+        pool = self
+
+        class _Ctx:
+            async def __aenter__(self):
+                pool.acquired += 1
+                return pool
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+    async def fetchrow(self, _query: str, account_id: str):
+        if self.fail:
+            raise self.fail
+        return {"bytes_used": self.usage.get(account_id, 0)}
+
+
 def page(**overrides: object) -> S3PlanAccountsResponse:
     payload = {**SAMPLE_PAGE, **overrides}
     return S3PlanAccountsResponse.model_validate(payload)
@@ -87,7 +114,7 @@ def test_only_accounts_with_an_active_plan_are_published() -> None:
     accounts, catalog = pc._parse_page(page())
 
     assert set(accounts) == {"5E71kYuD"}, "only the active subscriber gets an allowance"
-    assert accounts["5E71kYuD"] == {"plan": "business", "storage_bytes": 50 * TB}
+    assert accounts["5E71kYuD"] == {"plan": "business", "storage_limit_bytes": 50 * TB}
     assert set(catalog) == {"pro", "business", "enterprise"}
 
 
@@ -131,7 +158,7 @@ def test_a_bespoke_per_account_allowance_beats_the_catalog_price() -> None:
             results=[{"ss58": "vip", "billing": "plan", "plan": "pro", "active": True, "storage_bytes": 999 * TB}],
         )
     )
-    assert accounts["vip"]["storage_bytes"] == 999 * TB
+    assert accounts["vip"]["storage_limit_bytes"] == 999 * TB
 
 
 def test_an_unknown_upstream_field_does_not_break_parsing() -> None:
@@ -153,7 +180,7 @@ def test_an_unknown_upstream_field_does_not_break_parsing() -> None:
             plans={"pro": {"h256": "0x1", "storage_bytes": TB, "price_usd_cents": 900}},
         )
     )
-    assert accounts["a"]["storage_bytes"] == TB
+    assert accounts["a"]["storage_limit_bytes"] == TB
     assert catalog["pro"]["storage_bytes"] == TB
 
 
@@ -170,7 +197,7 @@ async def test_a_successful_cycle_publishes_and_records() -> None:
         patch.object(pc, "HippiusApiClient", api),
         patch.object(pc, "get_metrics_collector", return_value=collector),
     ):
-        assert await pc.run_cycle(redis) is True
+        assert await pc.run_cycle(redis, FakePool()) is True
 
     quota = await plans_cache.get_plan_for_account(redis, "5E71kYuD")
     assert quota is not None and quota.plan_id == "business" and quota.storage_bytes == 50 * TB
@@ -190,7 +217,7 @@ async def test_a_failed_cycle_is_recorded_without_raising() -> None:
         patch.object(pc, "HippiusApiClient", api),
         patch.object(pc, "get_metrics_collector", return_value=collector),
     ):
-        assert await pc.run_cycle(redis) is False
+        assert await pc.run_cycle(redis, FakePool()) is False
 
     kwargs = collector.record_plans_cacher_cycle.call_args.kwargs
     assert kwargs["success"] is False
@@ -203,11 +230,11 @@ async def test_an_upstream_failure_leaves_the_previous_roll_serving() -> None:
     redis = FakeRedis()
     good = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
     with patch.object(pc, "HippiusApiClient", good), patch.object(pc, "get_metrics_collector", MagicMock()):
-        await pc.run_cycle(redis)
+        await pc.run_cycle(redis, FakePool())
 
     bad = api_client_returning(get_s3_plan_accounts=AsyncMock(side_effect=RuntimeError("upstream is down")))
     with patch.object(pc, "HippiusApiClient", bad), patch.object(pc, "get_metrics_collector", MagicMock()):
-        await pc.run_cycle(redis)
+        await pc.run_cycle(redis, FakePool())
 
     quota = await plans_cache.get_plan_for_account(redis, "5E71kYuD")
     assert quota is not None and quota.storage_bytes == 50 * TB
@@ -227,7 +254,7 @@ async def test_a_mid_pagination_failure_publishes_nothing() -> None:
     ]
     seed = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page(results=seeded, next=None)))
     with patch.object(pc, "HippiusApiClient", seed), patch.object(pc, "get_metrics_collector", MagicMock()):
-        await pc.run_cycle(redis)
+        await pc.run_cycle(redis, FakePool())
     before = dict(redis.hashes["hippius_s3_plan_accounts"])
     assert len(before) == 10
 
@@ -244,7 +271,7 @@ async def test_a_mid_pagination_failure_publishes_nothing() -> None:
 
     api = api_client_returning(get_s3_plan_accounts=failing_pages)
     with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
-        assert await pc.run_cycle(redis) is False
+        assert await pc.run_cycle(redis, FakePool()) is False
 
     assert redis.hashes["hippius_s3_plan_accounts"] == before
     assert "hippius_s3_plan_accounts:building" not in redis.hashes
@@ -264,7 +291,7 @@ async def test_every_page_contributes_to_the_published_roll() -> None:
 
     api = api_client_returning(get_s3_plan_accounts=two_pages)
     with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
-        assert await pc.run_cycle(redis) is True
+        assert await pc.run_cycle(redis, FakePool()) is True
 
     assert set(redis.hashes["hippius_s3_plan_accounts"]) == {"p1", "p2"}
 
@@ -277,7 +304,7 @@ async def test_pagination_is_bounded_so_a_looping_cursor_cannot_hang_the_worker(
     api = api_client_returning(get_s3_plan_accounts=never_ending)
     with patch.object(pc, "HippiusApiClient", api):
         with pytest.raises(RuntimeError, match="pagination exceeded"):
-            await pc.refresh_plan_roll_once(FakeRedis())
+            await pc.refresh_plan_roll_once(FakeRedis(), FakePool())
 
 
 @pytest.mark.asyncio
@@ -292,9 +319,55 @@ async def test_a_cold_start_with_no_subscribers_completes_the_cycle() -> None:
         patch.object(pc, "HippiusApiClient", api),
         patch.object(pc, "get_metrics_collector", return_value=collector),
     ):
-        assert await pc.run_cycle(redis) is True
+        assert await pc.run_cycle(redis, FakePool()) is True
         await pc._report_cache_age(redis)
 
     meta = await plans_cache.get_meta(redis)
     assert meta["fetched_at"] > 0
     assert collector.record_plans_cache_age.called, "the staleness metric must be recorded"
+
+
+@pytest.mark.asyncio
+async def test_usage_is_counted_by_us_and_attached_to_every_account() -> None:
+    """Upstream reports a max quota but no usage, so the worker counts it. `used_bytes` must come
+    from our count and `storage_limit_bytes` from upstream -- swapping them would give every account
+    a quota equal to what it stores."""
+    redis = FakeRedis()
+    pool = FakePool(usage={"5E71kYuD": 7 * TB})
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
+
+    with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
+        assert await pc.run_cycle(redis, pool) is True
+
+    quota = await plans_cache.get_plan_for_account(redis, "5E71kYuD")
+    assert quota is not None
+    assert quota.storage_bytes == 50 * TB, "quota from upstream"
+    assert quota.used_bytes == 7 * TB, "usage from our own count"
+
+
+@pytest.mark.asyncio
+async def test_a_usage_count_failure_publishes_nothing() -> None:
+    """Publishing a partial answer would write used_bytes=0 for the accounts we failed to count,
+    silently handing them unlimited headroom. Keep the previous roll instead."""
+    redis = FakeRedis()
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
+
+    with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
+        await pc.run_cycle(redis, FakePool(usage={"5E71kYuD": 7 * TB}))
+        before = dict(redis.hashes["hippius_s3_plan_accounts"])
+        assert await pc.run_cycle(redis, FakePool(fail=RuntimeError("statement timeout"))) is False
+
+    assert redis.hashes["hippius_s3_plan_accounts"] == before
+
+
+@pytest.mark.asyncio
+async def test_usage_counting_is_bounded_by_the_configured_concurrency() -> None:
+    """Unbounded fan-out over a few tens of aggregates could become the heaviest thing on the
+    primary; one serial pass would let a single huge account set the pace for the cycle."""
+    accounts = {f"acct-{i}": {"plan": "pro", "storage_limit_bytes": TB} for i in range(20)}
+    pool = FakePool()
+
+    await pc._attach_usage(pool, accounts)
+
+    assert all("used_bytes" in row for row in accounts.values())
+    assert pool.acquired == 20, "one connection acquisition per account, serialised by the semaphore"

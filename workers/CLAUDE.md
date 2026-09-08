@@ -78,7 +78,7 @@ Config:
 [run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py). One poll loop against one endpoint:
 
 ```
-GET /api/s3/plans/accounts/?page=1&page_size=500     every HIPPIUS_PLANS_LOOP_SLEEP (300s)
+GET /api/s3/plans/accounts/?page=1&page_size=500     every HIPPIUS_PLANS_LOOP_SLEEP (600s)
 ```
 
 It carries both halves — `plans` is the catalog, `results` is the paginated account roll — and is
@@ -86,13 +86,30 @@ split across two hashes on `redis-accounts`:
 
 | Redis key | Field | Value |
 |---|---|---|
-| `hippius_s3_plan_accounts` | account SS58 | `{"plan": ..., "storage_bytes": ...}` |
+| `hippius_s3_plan_accounts` | account SS58 | `{"plan", "storage_limit_bytes", "used_bytes"}` |
 | `hippius_s3_plans` | plan name | `{"h256": ..., "storage_bytes": ...}` |
 | `hippius_s3_plans:meta` | — | `{fetched_at, accounts, plans}` |
 
-The account row carries its own resolved allowance, so the request path is normally ONE `HGET`; the
-catalog is the fallback for a row that arrives without one, and honouring the per-account value is
-what lets a bespoke enterprise limit survive.
+The account row carries everything the quota gate needs, so the request path is ONE `HGET` and a
+comparison — no catalog lookup, no database. The two halves come from different places:
+
+- **`storage_limit_bytes`** is the account's MAX QUOTA, from upstream. `results[].storage_bytes`
+  wins over the plan's list price, so a negotiated limit is not silently overwritten.
+- **`used_bytes`** is what the account actually stores, **counted by this worker** — upstream
+  reports no usage figure. One `SUM` per plan account per cycle, over
+  `HIPPIUS_PLANS_USAGE_CONCURRENCY` (4) connections.
+
+There are only a few tens of plan accounts, which is the whole reason there is no rollup table and
+no triggers: at that cardinality a maintained counter would buy nothing but a second source of
+truth to keep in step.
+
+⚠️ **The refresh interval IS the enforcement lag, in both directions.** An account can overshoot its
+quota by one cycle's worth of uploads, and a customer who deletes data to get back under stays
+refused until the next cycle sees it. Nothing on the request path recomputes.
+
+A count failing for ANY account fails the whole cycle and keeps the previous roll: publishing a
+partial answer would write `used_bytes=0` for the accounts we could not count, silently handing them
+unlimited headroom.
 
 **Only accounts with an ACTIVE plan are written.** A row needs all three of `billing == "plan"`, a
 plan name, and `active` true. A lapsed subscription still comes back with `billing: "plan"` and its
@@ -127,14 +144,6 @@ mock-hippius-api and into production.
 
 `replicas` must stay 1 — two replicas would not corrupt anything (last `RENAME` wins) but would
 double the upstream load for nothing.
-
-## Storage-usage reconciler
-
-[hippius_s3/scripts/reconcile_storage_usage.py](../hippius_s3/scripts/reconcile_storage_usage.py).
-Not a loop worker — a script, run as a Job or by hand. `bucket_storage_usage` is maintained by
-database triggers (see `migrations/20260908120000_bucket_storage_usage.sql`); this exists to PROVE
-they are correct. Expected drift is exactly zero, so any non-zero `usage_counter_drift_bytes` sample
-is a trigger defect rather than staleness. Run `--backfill` once after the migration.
 
 ## Migrator
 

@@ -96,10 +96,14 @@ Two failure postures, deliberately different:
 - **The lookup succeeds but the quota is unknown** (cold catalog, unknown plan id) -> ALLOW, loudly.
   A positively identified paying customer is never blocked because our cache has not warmed up.
 
-**Asymmetric verification.** The cheap `bucket_storage_usage` rollup may only ALLOW. Every denial is
-re-checked against the authoritative `SUM` first, under a timeout, allowing on timeout — so counter
-drift can cost us an over-quota upload but can never 402 a paying customer. Denials are rare, so the
-expensive query is affordable there.
+**Where the numbers come from.** Both the quota and the usage sit on one cached row published by
+the plans-cacher — quota from upstream, usage counted by that worker in the background. The gate is
+therefore a single Redis `HGET` and a pure comparison, with no database work on the request path.
+
+The cost, stated plainly: usage is only as fresh as the last refresh
+(`HIPPIUS_PLANS_LOOP_SLEEP`, 10 min), and a denial is **not** re-checked live. A customer who
+deletes data to get back under quota stays refused until the next cycle. The refresh interval is the
+only lever on that, and the 402 message says so.
 
 **`HIPPIUS_ENABLE_BILLING_PLANS` is the master switch, and it ships OFF.** With it false every
 account takes the pay-as-you-go path exactly as before — but the plan caches are still consulted on

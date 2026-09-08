@@ -30,8 +30,8 @@ class FakeRedis:
         value = self.hashes.get(key, {}).get(field)
         return value.encode() if value is not None else None
 
-    async def hset(self, key: str, field: str, value: str) -> None:
-        self.hashes.setdefault(key, {})[field] = value
+    async def hset(self, key: str, mapping: dict[str, str]) -> None:
+        self.hashes.setdefault(key, {}).update(mapping)
 
     async def delete(self, key: str) -> None:
         self.hashes.pop(key, None)
@@ -49,22 +49,14 @@ class FakeRedis:
     async def set(self, key: str, value: str) -> None:
         self.strings[key] = value
 
-    def pipeline(self) -> "FakeRedis":
-        # Commands apply immediately; execute() is a no-op. Ordering within a publish is
-        # irrelevant because nothing reads the :building key.
-        return self
-
-    async def execute(self) -> None:
-        return None
-
 
 @pytest.fixture
 def redis() -> FakeRedis:
     return FakeRedis()
 
 
-def acct(plan: str, storage_bytes: int | None = 1_000) -> dict:
-    return {"plan": plan, "storage_bytes": storage_bytes}
+def acct(plan: str, limit: int | None = 1_000, used: int = 0) -> dict:
+    return {"plan": plan, "storage_limit_bytes": limit, "used_bytes": used}
 
 
 async def publish_accounts(redis: "FakeRedis", accounts: dict) -> int:
@@ -151,11 +143,11 @@ async def test_a_failed_scrape_leaves_the_live_map_untouched(redis: FakeRedis) -
 @pytest.mark.asyncio
 async def test_the_catalog_prices_a_row_with_no_allowance_of_its_own(redis: FakeRedis) -> None:
     await plans_cache.publish_plan_roll(
-        redis, {"acct-a": {"plan": "pro", "storage_bytes": None}}, {"pro": {"storage_bytes": 100_000_000_000}}
+        redis, {"acct-a": acct("pro", limit=100_000_000_000, used=7)}, {"pro": {"storage_bytes": 100_000_000_000}}
     )
 
     quota = await plans_cache.get_plan_for_account(redis, "acct-a")
-    assert quota == PlanQuota(plan_id="pro", storage_bytes=100_000_000_000)
+    assert quota == PlanQuota(plan_id="pro", storage_bytes=100_000_000_000, used_bytes=7)
     assert quota.enforceable
 
 
@@ -186,7 +178,7 @@ async def test_a_missing_or_nonpositive_allowance_is_not_enforceable(
 
     Reading a malformed payload as a zero quota would deny every upload for a paying customer.
     """
-    await publish_accounts(redis, {"acct-a": {"plan": "pro", "storage_bytes": storage_bytes}})
+    await publish_accounts(redis, {"acct-a": acct("pro", limit=storage_bytes)})
 
     quota = await plans_cache.get_plan_for_account(redis, "acct-a")
     assert quota is not None
@@ -226,9 +218,15 @@ async def test_the_caches_are_written_without_a_ttl(redis: FakeRedis) -> None:
 
 @pytest.mark.asyncio
 async def test_plan_quota_json_shape_is_what_the_worker_writes(redis: FakeRedis) -> None:
-    await plans_cache.publish_plan_roll(redis, {"a": acct("pro", 5)}, {"pro": {"h256": "0x1", "storage_bytes": 5}})
+    await plans_cache.publish_plan_roll(
+        redis, {"a": acct("pro", limit=5, used=2)}, {"pro": {"h256": "0x1", "storage_bytes": 5}}
+    )
     assert json.loads(redis.hashes[PLAN_CATALOG_KEY]["pro"]) == {"h256": "0x1", "storage_bytes": 5}
-    assert json.loads(redis.hashes[PLAN_ACCOUNTS_KEY]["a"]) == {"plan": "pro", "storage_bytes": 5}
+    assert json.loads(redis.hashes[PLAN_ACCOUNTS_KEY]["a"]) == {
+        "plan": "pro",
+        "storage_limit_bytes": 5,
+        "used_bytes": 2,
+    }
 
 
 @pytest.mark.asyncio

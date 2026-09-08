@@ -260,26 +260,24 @@ class Config:
     # Parsed by _parse_bool, so true/True/1/yes/on all work and a typo fails the pod loudly rather
     # than silently leaving the feature off.
     enable_billing_plans: bool = dataclasses.field(default_factory=_parse_enable_billing_plans)
-    # One endpoint carries both the catalog and the account roll, so there is one poll interval.
-    plans_loop_sleep: int = env("HIPPIUS_PLANS_LOOP_SLEEP:300", convert=int)
+    # One endpoint carries both the catalog and the account roll, so there is one poll interval —
+    # and it is also the interval at which we recount each  plan account's usage.
+    #
+    # This interval IS the enforcement lag, in both directions. An account can overshoot its quota
+    # by one cycle's worth of uploads, and a customer who deletes data to get back under stays
+    # refused until the next cycle sees it (nothing on the request path recomputes). Shortening it
+    # is the only lever; the cost is one storage count per plan account per cycle.
+    plans_loop_sleep: int = env("HIPPIUS_PLANS_LOOP_SLEEP:600", convert=int)
+    # How many per-account storage counts the plans-cacher runs at once. Sized for a few tens of
+    # plan accounts: enough that one very large account does not set the pace for the cycle, small
+    # enough that these aggregates never become the heaviest thing on the primary.
+    plans_usage_concurrency: int = env("HIPPIUS_PLANS_USAGE_CONCURRENCY:4", convert=int)
     # Per-attempt bound on the scrape. Retry COUNTS cannot bound latency when the per-attempt cost
     # is unbounded, and this worker holds no request.
     plans_api_timeout_seconds: float = env("HIPPIUS_PLANS_API_TIMEOUT_SECONDS:30.0", convert=float)
     # Age past which the cached maps are reported stale. Serving stale is still strictly better than
     # failing closed, so this drives a metric and an alert, never a behaviour change.
     plans_stale_after_seconds: int = env("HIPPIUS_PLANS_STALE_AFTER_SECONDS:3600", convert=int)
-    # How long an account's total usage is cached on the request path.
-    #
-    # This TTL is the ONLY bound on quota overshoot. The rollup is maintained by database triggers,
-    # so there is no application write path to hang an invalidation off — every write inside the
-    # window reads the same total, and an account can therefore exceed its allowance by roughly one
-    # window's worth of upload before the gate notices. Kept short for the same reason
-    # CAN_UPLOAD_CACHE_TTL_SECONDS is: the read it saves is one indexed sum over a handful of rows,
-    # which is cheap enough that a longer window buys very little and costs enforcement accuracy.
-    usage_cache_ttl_seconds: int = env("HIPPIUS_USAGE_CACHE_TTL_SECONDS:10", convert=int)
-    # Bound on the authoritative SUM run before a denial. On timeout the gate ALLOWS: a slow
-    # ground-truth query must never become a 402 for a paying customer.
-    usage_authoritative_timeout_seconds: float = env("HIPPIUS_USAGE_AUTHORITATIVE_TIMEOUT_SECONDS:5.0", convert=float)
 
     # ATS (Apache Traffic Server) reverse-proxy cache endpoints (CSV). When ATS_CACHE_ENDPOINT is unset,
     # all PURGE + public Cache-Control logic becomes a no-op — safe default for local dev.

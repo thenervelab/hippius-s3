@@ -4,7 +4,18 @@
     GET /api/s3/plans/accounts/?page=1&page_size=500
 
 One endpoint carries both halves — `plans` is the catalog, `results` is the paginated per-account
-roll — so this is a single loop, polled every HIPPIUS_PLANS_LOOP_SLEEP seconds (default 300).
+roll — so this is a single loop, polled every HIPPIUS_PLANS_LOOP_SLEEP seconds (default 600).
+
+Upstream reports each account's MAX QUOTA but not its usage, so this worker also computes the usage
+itself: one SUM per account that is actually on a plan, run here in the background rather than on
+anyone's upload. There are only a few tens of such accounts, so a cycle is a few seconds of work
+spread over HIPPIUS_PLANS_USAGE_CONCURRENCY connections. That cardinality is the whole reason there
+is no rollup table and no triggers — a maintained counter would buy nothing here except a second
+source of truth to keep in step.
+
+The refresh interval IS the enforcement lag, in both directions: an account can overshoot by one
+cycle's worth of uploads, and a customer who deletes data stays refused until the next cycle sees
+it. Nothing on the request path recomputes.
 
 Caching is UNCONDITIONAL. This worker does not read HIPPIUS_ENABLE_BILLING_PLANS and is not deployed
 with it: the maps stay warm and observably correct long before enforcement is switched on, so
@@ -24,6 +35,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import asyncpg
 from redis.asyncio import Redis
 
 
@@ -35,6 +47,7 @@ from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.sentry import init_sentry
 from hippius_s3.services import plans_cache
+from hippius_s3.services import usage_service
 from hippius_s3.services.hippius_api_service import HippiusApiClient
 from hippius_s3.services.hippius_api_service import S3PlanAccountRow
 from hippius_s3.services.hippius_api_service import S3PlanAccountsResponse
@@ -79,20 +92,46 @@ def _parse_page(page: S3PlanAccountsResponse) -> tuple[dict[str, dict[str, Any]]
     exactly what the request path already treats as pay-as-you-go, so there is nothing to encode
     for them and nothing to keep in sync.
 
-    The per-account `storage_bytes` is preferred over the catalog's, so a bespoke allowance on one
-    enterprise account is honoured rather than silently overwritten by the list price.
+    `results[].storage_bytes` is the account's own MAX QUOTA, and it wins over the plan's list price
+    so a negotiated limit is not silently overwritten. Upstream reports NO usage figure -- that is
+    filled in afterwards by _attach_usage, from our own count.
     """
     accounts: dict[str, dict[str, Any]] = {}
     for row in page.results:
         if not row.ss58 or not _is_enforceable_plan_row(row):
             continue
-        accounts[row.ss58] = {"plan": row.plan, "storage_bytes": row.storage_bytes}
+        plan = page.plans.get(row.plan or "")
+        limit = row.storage_bytes if row.storage_bytes is not None else (plan.storage_bytes if plan else None)
+        accounts[row.ss58] = {"plan": row.plan, "storage_limit_bytes": limit}
 
     catalog = {name: {"h256": entry.h256, "storage_bytes": entry.storage_bytes} for name, entry in page.plans.items()}
     return accounts, catalog
 
 
-async def refresh_plan_roll_once(redis_client: Redis) -> tuple[int, int]:
+async def _attach_usage(pool: asyncpg.Pool, accounts: dict[str, dict[str, Any]]) -> None:
+    """Fill in `used_bytes` for every account, in parallel, mutating `accounts` in place.
+
+    Each count is O(objects the account owns) -- sub-second for a typical account, seconds for the
+    largest. Bounded concurrency rather than one serial pass, so a single 11.8M-object account does
+    not set the pace for the whole cycle; and bounded rather than unbounded, so a few tens of
+    simultaneous aggregates cannot become the heaviest thing running on the primary.
+
+    A failure for ANY account propagates. refresh_plan_roll_once then publishes nothing and the
+    previous roll keeps serving, which is the right trade: publishing a partial answer would mean
+    writing used_bytes=0 for the accounts we failed to count, silently handing them unlimited
+    headroom until the next cycle.
+    """
+    semaphore = asyncio.Semaphore(config.plans_usage_concurrency)
+
+    async def count(account_id: str) -> tuple[str, int]:
+        async with semaphore, pool.acquire() as conn:
+            return account_id, await usage_service.get_account_storage_bytes(conn, account_id)
+
+    for account_id, used in await asyncio.gather(*(count(a) for a in accounts)):
+        accounts[account_id]["used_bytes"] = used
+
+
+async def refresh_plan_roll_once(redis_client: Redis, pool: asyncpg.Pool) -> tuple[int, int]:
     """Fetch EVERY page, then publish. Returns (accounts, plans).
 
     The all-or-nothing shape is the load-bearing part of this worker. If page 7 of 20 fails, the
@@ -126,12 +165,16 @@ async def refresh_plan_roll_once(redis_client: Redis) -> tuple[int, int]:
                 f"built from a possibly looping cursor"
             )
 
+    usage_started = time.monotonic()
+    await _attach_usage(pool, accounts)
+    usage_seconds = time.monotonic() - usage_started
+
     published_accounts, published_plans = await plans_cache.publish_plan_roll(redis_client, accounts, catalog)
     await plans_cache.touch_meta(redis_client, published_accounts, published_plans)
 
     logger.info(
         f"Published plan roll: {published_accounts} accounts on an active plan out of {rows_seen} rows, "
-        f"{published_plans} plans, over {pages} page(s)"
+        f"{published_plans} plans, over {pages} page(s); usage counted in {usage_seconds:.1f}s"
     )
     return published_accounts, published_plans
 
@@ -152,12 +195,12 @@ async def _report_cache_age(redis_client: Redis) -> None:
         )
 
 
-async def run_cycle(redis_client: Redis) -> bool:
+async def run_cycle(redis_client: Redis, pool: asyncpg.Pool) -> bool:
     """Run one refresh. Never raises -- a failed cycle must leave the previous cache serving."""
     collector = get_metrics_collector()
     started = time.monotonic()
     try:
-        accounts, _ = await refresh_plan_roll_once(redis_client)
+        accounts, _ = await refresh_plan_roll_once(redis_client, pool)
         collector.record_plans_cacher_cycle(success=True, entries=accounts, duration=time.monotonic() - started)
         return True
     except Exception as e:
@@ -168,23 +211,28 @@ async def run_cycle(redis_client: Redis) -> bool:
 
 async def run_plans_cacher_loop() -> None:
     redis_client = Redis.from_url(config.redis_accounts_url)
+    # Sized to the usage concurrency and no larger: this worker's only DB work is those counts, and
+    # an oversized pool here is idle backends against Postgres max_connections for nothing.
+    pool = await asyncpg.create_pool(config.database_url, min_size=1, max_size=max(1, config.plans_usage_concurrency))
     initialize_metrics_collector()
 
     logger.info(
-        f"Starting plans-cacher: polling every {config.plans_loop_sleep}s. Caching is unconditional "
-        f"— it does not depend on whether plan enforcement is enabled."
+        f"Starting plans-cacher: polling every {config.plans_loop_sleep}s, counting usage over "
+        f"{config.plans_usage_concurrency} connections. Caching is unconditional — it does not "
+        f"depend on whether plan enforcement is enabled."
     )
 
-    # Closing on the way out is what tells Redis this client is gone; a cancelled worker otherwise
-    # leaves its connection behind.
+    # Closing on the way out is what tells Postgres and Redis these clients are gone; a cancelled
+    # worker otherwise leaves its backends behind.
     try:
         while True:
-            ok = await run_cycle(redis_client)
+            ok = await run_cycle(redis_client, pool)
             await _report_cache_age(redis_client)
             sleep_for = config.plans_loop_sleep if ok else 60
             logger.info(f"plans-cacher: sleeping {sleep_for}s")
             await asyncio.sleep(sleep_for)
     finally:
+        await pool.close()
         await redis_client.aclose()
 
 

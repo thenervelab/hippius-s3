@@ -1,9 +1,10 @@
 -- Bucket count + logical bytes (current versions only) for the admin status endpoint.
 -- Bounded by the caller's statement timeout: a 10+ TB account can push the SUM into
 -- seconds — the endpoint degrades to null counts on timeout rather than 500ing.
--- Keep in sync with get_account_storage_usage_authoritative.sql, console_list_buckets.sql and
--- usage_billable() in migrations/20260908120000_bucket_storage_usage.sql -- these encode ONE
--- definition of "storage used", and a billing plan is now enforced on it.
+-- Keep in sync with get_account_storage_bytes.sql (which the quota gate is enforced on) and
+-- console_list_buckets.sql. These three encode one definition of "storage used"; the last two
+-- disagreed with each other until 2026-09, and they are the numbers an operator and a customer
+-- each see.
 -- Parameters: $1: account_id (SS58)
 SELECT
     (SELECT COUNT(*)

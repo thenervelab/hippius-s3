@@ -959,7 +959,7 @@ spec:
           command:
             - sh
             - -c
-            - until nc -z redis-accounts 6379; do echo waiting for redis-accounts; sleep 5; done
+            - until nc -z postgres-rw 5432 && nc -z redis-accounts 6379; do echo waiting for services; sleep 5; done
       containers:
         - name: plans-cacher
           image: ghcr.io/thenervelab/hippius-s3/workers:latest

@@ -94,9 +94,9 @@ def test_the_three_figures_are_internally_consistent() -> None:
     request = _request(gateway_start_time=time.time() - 0.200)
     audit, recorded = _run(request, inner_seconds=0.030)
 
-    assert audit["total_time_ms"] == pytest.approx(
-        audit["processing_time_ms"] + audit["pre_handler_ms"], abs=1.0
-    ), "total must be the two halves, or the split is describing nothing"
+    assert audit["total_time_ms"] == pytest.approx(audit["processing_time_ms"] + audit["pre_handler_ms"], abs=1.0), (
+        "total must be the two halves, or the split is describing nothing"
+    )
     assert recorded[0][2] * 1000 == pytest.approx(audit["pre_handler_ms"], abs=1.0), (
         "the metric and the log line must agree; if they drift, one of them is lying"
     )

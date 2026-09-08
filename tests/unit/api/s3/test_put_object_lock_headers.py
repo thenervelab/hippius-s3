@@ -83,9 +83,7 @@ class TestBucketMustHaveOptedIn:
             ({"enabled": False, "mode": "GOVERNANCE", "days": 30}, "disabled but carrying a stale rule"),
         ],
     )
-    def test_lock_headers_are_refused(
-        self, headers: dict[str, str], why: str, config: Any, label: str
-    ) -> None:
+    def test_lock_headers_are_refused(self, headers: dict[str, str], why: str, config: Any, label: str) -> None:
         result = lock_for_new_version(_request(headers, bucket_lock=config))
         assert isinstance(result, Response), f"{why} accepted on a bucket with {label}"
         assert result.status_code == 400
