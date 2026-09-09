@@ -191,38 +191,54 @@ Fast-path copy: rewraps the DEK under the destination's AAD, copies `chunk_backe
 
 **Proposed**: add a prominent comment block at [copy_service_v5.py:24](hippius_s3/services/copy_service_v5.py) documenting the invariant ("fast path requires either (a) non-MPU single-part object OR (b) explicit FS backfill of all chunks into the destination object_id path"). Consider a feature flag before re-enabling for MPU.
 
-### P1 — BLOCKS PROD: the plan account's usage count exceeds every timeout it has
+### P2 — Billing plans: usage is recomputed from scratch every cycle, forever
 
-**This must be resolved before the plans-cacher is promoted to production.** It is not active today
-only because the worker is deployed to staging alone (prod has no `plans-cacher` pod yet), and
-because staging's copy of the one plan account holds 2 buckets rather than 203.
+**Superseded a P1 that mis-diagnosed this.** The earlier entry blamed 203-bucket fan-out and quoted
+~33s. Both were wrong: the account has **25 live buckets** (203 total; the query filters
+`deleted_at IS NULL`), one of which is a JuiceFS bucket with **7.83M live objects** that is 99.5% of
+the work, and the true single-statement cost is **~64s**, not 33 — 33s was where the replica's
+cancellation fired, not where the query finished.
 
-The single admitted account (`5E71kYuD…`, business) owns **203 buckets in prod**. Running
-[get_account_storage_bytes.sql](hippius_s3/sql/queries/get_account_storage_bytes.sql) for it on the
-prod replica exceeded 30s and was cancelled — measured twice, ~33s wall each time. Both ceilings sit
-at 30s and neither can be raised past the other:
+The immediate blocker is fixed: `usage_service.py` now walks each bucket in keyset pages, so no
+single statement approaches the 30s ceilings. Measured cold on the prod replica at the 200k default,
+one page is 2.91s and the whole account is **~115s** across ~40 statements.
 
-- `HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS` = 30.0 (asyncpg server-side)
-- the replica's `max_standby_streaming_delay` = 30s (cancels regardless of our timeout)
+**What remains** is that ~115s of database work per cycle, per cycle, forever — recomputing a number
+that changed by a few objects. It is O(objects) and that bucket only grows, so this gets worse on its
+own. Every other object store treats this as an incrementally maintained number rather than a repeated
+scan ([Ceph RGW](https://docs.ceph.com/en/latest/radosgw/admin/) caches per-instance stats behind
+`rgw bucket quota ttl`; [Swift](https://docs.openstack.org/swift/latest/api/container_quotas.html)
+updates account/container DBs asynchronously; AWS ships Storage Lens daily and offers no quota at all).
 
-`_attach_usage` propagates any single account's failure, so `refresh_plan_roll_once` publishes
-NOTHING — no accounts and no catalog — and `run_cycle` retries every 60s, failing every time, with a
-traceback to Sentry each cycle. The net effect in prod would be the same inert gate this PR set out
-to fix, reached by a hard-failing loop instead of a clean filter.
+**Proposed: an insert-only delta ledger folded into a per-bucket rollup.**
 
-Note the design comment in `run_plans_cacher_loop` says a replica cancellation is fine because
-"run_cycle already treats that as a failed cycle and keeps the previous roll serving". That reasoning
-assumes the failure is TRANSIENT. For a 203-bucket account it is deterministic, and "the previous
-roll" is the empty one.
+```
+object_versions / objects   --AFTER-ROW TRIGGERS, INSERT only-->  storage_delta_ledger
+                                                                          |
+                              compactor: DELETE ... RETURNING *, fold     v
+                                                              bucket_storage_usage
+                                                                          |
+                                          account total = indexed SUM  <--+  (sub-ms)
+```
 
-**To close**, one of:
-1. Make the count cheap enough to finish (index or query rewrite — a per-bucket loop measured 43ms
-   on a sample bucket, so 203 sequential counts may beat one aggregate).
-2. Make a per-account count failure non-fatal. Needs a policy decision, because every fallback has a
-   real cost: publishing `used_bytes=0` or "unknown" means unmetered storage for that account (see
-   the `catalog_miss` note below); omitting the account drops a paying customer to pay-as-you-go,
-   where no substrate credit means a 402.
-3. Give the counts their own replica with a longer `max_standby_streaming_delay`.
+The refinement over the trigger design deleted earlier in this project: keep the triggers, but make
+what they write an **INSERT, not an UPDATE**. That preserves the property that made triggers
+attractive — `ON DELETE CASCADE` means `nuke_user.py`, `purge_buckets.py` and the janitor's
+hard-delete are accounted for automatically, and no new endpoint can forget to call a helper — while
+removing the hot-row contention and MVCC bloat that made them risky. The full-scan cost then runs
+**once per bucket as a backfill and never again**, which is the only property that actually ends
+this problem. Sharded counters are the wrong tool here: the guidance is consistent that they suit
+approximate display counters and push correctness onto the read path, which is not acceptable for
+billing.
+
+Worth stealing alongside it: RGW's **soft threshold**, where the cached number is trusted while an
+account is comfortably under quota and refreshed only near the limit. With a rollup making reads
+sub-millisecond we could afford it on every request, which would also close the "refresh interval is
+the enforcement lag" gap below.
+
+Note the premise the current design was justified on — "only a few tens of plan accounts" — was never
+the relevant number. **Account cardinality was never the problem; objects-per-account is.** One
+account with one 7.8M-object bucket breaks a recount design no matter how few accounts exist.
 
 ### P1 — Billing plans: `active` is ignored because upstream returns it false on every row
 

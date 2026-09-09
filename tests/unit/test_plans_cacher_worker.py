@@ -126,8 +126,17 @@ def api_client_returning(**methods: object) -> MagicMock:
     return MagicMock(return_value=ctx)
 
 
+_BUCKET_OF = "bucket-of-"
+
+
 class FakePool:
-    """asyncpg pool stand-in returning a fixed usage per account."""
+    """asyncpg pool stand-in returning a fixed usage per account.
+
+    Models the two-step chunked count: `fetch` lists the account's buckets, then `fetchrow` walks
+    that bucket in keyset pages. Each account gets ONE synthetic bucket that returns its whole usage
+    in a single SHORT page, which is the terminating case of the walk. The multi-page path is
+    covered directly against usage_service in tests/unit/test_usage_service.py.
+    """
 
     def __init__(self, usage: dict[str, int] | None = None, fail: Exception | None = None) -> None:
         self.usage = usage or {}
@@ -147,10 +156,17 @@ class FakePool:
 
         return _Ctx()
 
-    async def fetchrow(self, _query: str, account_id: str, timeout: float | None = None):
+    async def fetch(self, _query: str, account_id: str, timeout: float | None = None):
         if self.fail:
             raise self.fail
-        return {"bytes_used": self.usage.get(account_id, 0)}
+        return [{"bucket_id": f"{_BUCKET_OF}{account_id}"}]
+
+    async def fetchrow(self, _query: str, bucket_id: str, _cursor: str, page_size: int, timeout: float | None = None):
+        if self.fail:
+            raise self.fail
+        account_id = str(bucket_id).removeprefix(_BUCKET_OF)
+        # rows_seen < page_size ends the walk after one page.
+        return {"rows_seen": 1, "last_key": "k", "bytes_used": self.usage.get(account_id, 0)}
 
 
 def page(**overrides: object) -> S3PlanAccountsResponse:

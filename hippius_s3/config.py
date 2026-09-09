@@ -282,11 +282,25 @@ class Config:
     # plan accounts: enough that one very large account does not set the pace for the cycle, small
     # enough that these aggregates never become the heaviest thing on the primary.
     plans_usage_concurrency: int = env("HIPPIUS_PLANS_USAGE_CONCURRENCY:4", convert=int)
-    # Server-side bound on ONE account's storage count. api/admin.py bounds the identical aggregate
-    # for the same reason: the largest account holds 11.8M objects and can push it into seconds.
-    # Unbounded, a single bad plan would stall the cycle holding a pool connection, and every plan
-    # account's usage would silently freeze at its last good value while the gate kept enforcing it.
+    # Server-side bound on ONE STATEMENT of a storage count -- one keyset page, not the whole
+    # account. Unbounded, a single bad plan would stall the cycle holding a pool connection, and
+    # every plan account's usage would silently freeze at its last good value while the gate kept
+    # enforcing it. Note the replica enforces its own 30s ceiling via max_standby_streaming_delay,
+    # so raising this past 30s buys nothing on its own.
     plans_usage_timeout_seconds: float = env("HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS:30.0", convert=float)
+    # Objects per keyset page when counting a bucket. The ceiling that matters is
+    # plans_usage_timeout_seconds AND the replica's max_standby_streaming_delay, BOTH 30s.
+    #
+    # Measured cold on the prod replica against the 7.83M-object JuiceFS bucket, each from an
+    # un-warmed region of the key space:
+    #     100k -> 1.88s  (18.8 us/row, 16x margin)
+    #     200k -> 2.91s  (14.6 us/row, 10x margin)   <-- best throughput AND ample margin
+    #     500k -> 20.2s  (40.0 us/row, 1.5x margin)  <-- do not
+    # The cost per row is NOT linear: past a few hundred thousand rows the random heap fetches stop
+    # fitting the cache and the page falls off a cliff. That is why this is tuned by measurement
+    # rather than set as large as possible to save round trips. There is no correctness difference
+    # at any value -- only how close one statement gets to being cancelled.
+    plans_usage_page_size: int = env("HIPPIUS_PLANS_USAGE_PAGE_SIZE:200000", convert=int)
     # Per-attempt bound on the scrape. Retry COUNTS cannot bound latency when the per-attempt cost
     # is unbounded, and this worker holds no request.
     plans_api_timeout_seconds: float = env("HIPPIUS_PLANS_API_TIMEOUT_SECONDS:30.0", convert=float)

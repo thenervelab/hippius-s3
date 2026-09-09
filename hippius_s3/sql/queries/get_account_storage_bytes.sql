@@ -5,10 +5,16 @@
 -- 11.8M objects in one bucket, where this is seconds and admin.py already degrades to a null count
 -- on timeout. So it must never run on a routine request path.
 --
--- ONE caller: the plans-cacher, in the background, once per poll per PLAN account (a few tens of
--- accounts, so a few seconds a cycle with nobody waiting on it). Nothing on the request path runs
--- this -- the quota gate reads the cached result and does not re-check, not even to confirm a
--- denial, which is why the refresh interval is the enforcement lag in both directions.
+-- NO RUNTIME CALLER, AND THAT IS DELIBERATE -- DO NOT DELETE THIS AS DEAD SQL. The plans-cacher
+-- walks each bucket in keyset pages instead (get_bucket_storage_bytes_page.sql), because this form
+-- cannot finish for a 7.83M-object bucket inside the 30s ceilings that apply to it. This query
+-- survives as the CANONICAL DEFINITION, and as the oracle the chunked walk is asserted against case
+-- by case in tests/integration/test_usage_service_chunked.py. Delete it and the chunked path has
+-- nothing independent left to be checked for correctness against.
+--
+-- Nothing on the request path runs either form -- the quota gate reads the cached result and does
+-- not re-check, not even to confirm a denial, which is why the refresh interval is the enforcement
+-- lag in both directions.
 --
 -- Keep in sync with get_admin_account_stats.sql and console_list_buckets.sql -- those two disagreed
 -- with each other until 2026-09, and they are the numbers an operator and a customer each see.

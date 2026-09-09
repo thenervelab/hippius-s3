@@ -96,25 +96,46 @@ comparison — no catalog lookup, no database. The two halves come from differen
 - **`storage_limit_bytes`** is the account's MAX QUOTA, from upstream. `results[].storage_bytes`
   wins over the plan's list price, so a negotiated limit is not silently overwritten.
 - **`used_bytes`** is what the account actually stores, **counted by this worker** — upstream
-  reports no usage figure. One `SUM` per plan account per cycle, over
+  reports no usage figure. Counted per bucket, in keyset pages, over
   `HIPPIUS_PLANS_USAGE_CONCURRENCY` (4) connections.
 
-There are only a few tens of plan accounts, which is the whole reason there is no rollup table and
-no triggers: at that cardinality a maintained counter would buy nothing but a second source of
-truth to keep in step.
+### Why the count is chunked
+
+The obvious form is one aggregate per account, and that is what this used to do. It cannot finish.
+
+Cost is driven by OBJECTS PER BUCKET, not by bucket fan-out and not by account count. One prod plan
+account owns a JuiceFS bucket holding **7.83M live objects**; the single-statement aggregate for it
+takes ~64s. Both ceilings that apply are 30s — `HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS` and the
+replica's `max_standby_streaming_delay` — so it was cancelled every cycle, and because one account's
+failure fails the whole cycle, the roll was never published at all.
+
+`usage_service.py` therefore lists the account's live buckets, then walks each bucket in keyset
+pages of `HIPPIUS_PLANS_USAGE_PAGE_SIZE` objects (`get_bucket_storage_bytes_page.sql`). Same
+definition, same bytes, spread over N statements — pinned against the canonical query in
+`tests/integration/test_usage_service_chunked.py`. It does not make the total work smaller; it makes
+no single STATEMENT long enough to be cancelled, and stops the count pinning the xmin horizon for a
+minute at a time.
+
+**Per-row cost is NOT linear in page size** — measured cold on the prod replica, each from an
+un-warmed region of that bucket's key space:
+
+| page size | cold | per row | margin under 30s |
+|---|---|---|---|
+| 100k | 1.88s | 18.8 µs | 16x |
+| **200k** | **2.91s** | **14.6 µs** | **10x** ← default |
+| 500k | 20.2s | 40.0 µs | 1.5x — do not |
+
+Past a few hundred thousand rows the random heap fetches stop fitting cache and the page falls off a
+cliff. Tune this by measurement, not by maximising it to save round trips.
 
 **The counts run against a REPLICA** (`DATABASE_READONLY_URL`, falling back to `DATABASE_URL` when
-unset). They are aggregates over the largest tables in the schema — measured on prod, ~200-320ms for
-a typical account, and this cluster's primary has been stalled by a read-storm before. A replica
-also cancels a query past `max_standby_streaming_delay` rather than letting it lag replay, which
-turns a pathological account into a failed cycle (previous roll keeps serving) instead of a
-replication problem.
+unset), with `jit=off` on the pool — JIT is pure overhead for an index-probe-bound query and cost
+107ms of a 326ms count for a 1,300-object account. This cluster's primary has been stalled by a
+read-storm before.
 
-Measured on prod (2026-09): 348 accounts have buckets and 338 of them have ≤20, so the per-account
-count is comfortably sub-second for essentially all of them. Cost is driven by BUCKET FAN-OUT, not
-data volume — one outlier account with 2024 buckets holding 257 KB takes ~9s, because the planner
-abandons the index path. If a plan account ever has hundreds of buckets, that is the case to
-re-measure before trusting the cycle time.
+A maintained counter — a delta ledger folded into a per-bucket rollup — is the real long-term answer
+and is written up in todo.md. Chunking is what makes the current design work until then; recounting
+is O(objects) forever, and that bucket only grows.
 
 ⚠️ **The refresh interval IS the enforcement lag, in both directions.** An account can overshoot its
 quota by one cycle's worth of uploads, and a customer who deletes data to get back under stays
