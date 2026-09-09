@@ -14,6 +14,20 @@
 -- within a bucket with no ties, and `> $2` resumes exactly where the last page stopped. OFFSET
 -- would re-walk the prefix on every page and turn this quadratic.
 --
+-- PRECONDITION: object_key is never the empty string. The walk starts at `> ''`, so a '' key would
+-- be skipped on every page forever -- a silent UNDER-count of a billed number, which is why it is
+-- called out rather than left implicit. It holds structurally (a keyless S3 path is a BUCKET
+-- operation, never PutObject) and was confirmed on prod: zero rows with object_key = ''. There is
+-- no CHECK constraint enforcing it. If one is ever added, this is the query that depends on it;
+-- if empty keys ever become reachable, this walk needs a NULL-cursor first page instead.
+--
+-- SNAPSHOT: the single-statement form ran in ONE MVCC snapshot; this runs one per page. An object
+-- written into a key range the walk has already passed is missed until the next cycle, and one
+-- written ahead of the cursor is included. That is a per-cycle skew of at most the writes landing
+-- during the walk, on a number that is already a 10-minute-old estimate by design -- see the
+-- enforcement-lag warning in workers/CLAUDE.md. It is not a new class of staleness, only slightly
+-- more of it.
+--
 -- rows_seen counts PAGE rows, NOT joined rows. An object whose current version is soft-deleted or
 -- is a delete marker contributes no row to the join, so counting joined rows would under-report the
 -- page as short and stop the walk early -- silently under-counting the account. That distinction is

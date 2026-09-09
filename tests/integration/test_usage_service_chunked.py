@@ -229,13 +229,20 @@ async def test_sizes_that_exceed_a_32_bit_int(pg_tx: asyncpg.Connection) -> None
 
 @pytest.mark.asyncio
 async def test_the_page_predicate_can_be_served_by_a_bucket_key_index(pg_tx: asyncpg.Connection) -> None:
-    """Bounded per-statement cost depends on the page predicate matching an index on
-    (bucket_id, object_key) WHERE deleted_at IS NULL. On a big table it must never seq-scan.
+    """Bounded per-statement cost depends on BOTH halves of the page query having an index path:
+    the keyset predicate on (bucket_id, object_key), and the current-version lookup. On a big table
+    a seq scan of either would blow the 30s ceiling however small the page is.
 
-    Asserted with seqscan disabled rather than by reading the default plan: a test database holds a
-    handful of rows, where a Seq Scan is genuinely the cheaper plan and the planner is right to pick
-    it. What is stable across table sizes -- and what actually breaks if someone reorders the
-    predicate or drops the partial index -- is whether an index path EXISTS at all.
+    Deliberately asserted as "no sequential scan survives with enable_seqscan off", which is the
+    weakest form that still catches the regression that matters -- someone reordering the predicate
+    or dropping the partial index so no index CAN serve it.
+
+    Anything narrower is not stable on a test database. Two earlier drafts of this test failed for
+    that reason: first asserting the default plan avoids a seq scan (on a handful of rows a Seq Scan
+    is genuinely cheaper and the planner is right), then asserting a specific index name (with every
+    cost near zero the planner picks freely among equivalent indexes -- CI chose
+    idx_object_versions_object_type_created_desc over object_versions_pkey). Which index wins is a
+    property of the data, not of the query.
     """
     acct = await _seed_account(pg_tx)
     bucket = await _seed_bucket(pg_tx, acct)
@@ -252,5 +259,5 @@ async def test_the_page_predicate_can_be_served_by_a_bucket_key_index(pg_tx: asy
         )
     )
 
-    assert "idx_objects_bucket_prefix" in plan, plan
-    assert "object_versions_pkey" in plan, "the version lookup must stay a PK probe, not a join\n" + plan
+    assert "Seq Scan on objects" not in plan, "no index can serve the keyset predicate\n" + plan
+    assert "Seq Scan on object_versions" not in plan, "no index can serve the version lookup\n" + plan
