@@ -8,7 +8,9 @@ Second, the semantics of the upstream row — which accounts get an allowance an
 pay-as-you-go. Getting that wrong hands free storage to lapsed subscribers, or 402s paying ones.
 """
 
+import logging
 import pathlib
+from typing import Any
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -16,6 +18,7 @@ from unittest.mock import patch
 import pytest
 
 from hippius_s3.services import plans_cache
+from hippius_s3.services.hippius_api_service import S3PlanAccountRow
 from hippius_s3.services.hippius_api_service import S3PlanAccountsResponse
 from tests.unit.test_plans_cache import FakeRedis
 from workers import run_plans_cacher_in_loop as pc
@@ -82,8 +85,10 @@ SAMPLE_PAGE = {
             "next_charge": "2026-10-01",
             "subscription_id": 4412,
         },
-        # Shaped after the FIRST REAL payload: a live subscription -- real id, future next_charge --
-        # that upstream nonetheless reports as active=false. This row is why the flag is not consulted.
+        # Shaped after the FIRST REAL payload: a live subscription (a real subscription id, and a
+        # next_charge in the future) that upstream nonetheless reports as active=false. That
+        # combination is why the flag is not consulted. Ids and sizes here are fixtures, not the
+        # production account's -- see workers/CLAUDE.md for the real row.
         {
             "ss58": ACCT_INACTIVE_FLAG,
             "billing": "plan",
@@ -199,6 +204,43 @@ def test_a_row_missing_any_requirement_gets_no_allowance(row: dict) -> None:
     assert accounts == {}
 
 
+@pytest.mark.asyncio
+async def test_the_cycle_logs_how_many_rows_upstream_marked_active(caplog: Any) -> None:
+    """The trigger condition for restoring the `active` check has to announce itself.
+
+    Nothing reads the field any more, so this log line is the only thing that would tell us upstream
+    started populating it. Counted over EVERY row, not just plan rows — the question is whether the
+    field is written at all, and today the answer in production is zero across the whole payload.
+    SAMPLE_PAGE has two active=true rows (one plan, one pay-as-you-go).
+    """
+    redis = FakeRedis()
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
+
+    with (
+        patch.object(pc, "HippiusApiClient", api),
+        patch.object(pc, "get_metrics_collector", return_value=MagicMock()),
+        caplog.at_level(logging.INFO),
+    ):
+        assert await pc.run_cycle(redis, FakePool()) is True
+
+    assert "upstream_active=2" in caplog.text
+
+
+def test_a_null_active_does_not_fail_the_page() -> None:
+    """`active: bool = False` would reject an explicit null, and model_validate runs on the WHOLE
+    page -- so one such row would abort the scrape and freeze the roll at last-known-good.
+
+    This is the field we expect upstream to start populating, which makes null its likeliest next
+    state, so the model must absorb it rather than crash the worker.
+    """
+    accounts, _ = pc._parse_page(
+        page(results=[{"ss58": ACCT_BUSINESS, "billing": "plan", "plan": "pro", "active": None}])
+    )
+
+    assert accounts[ACCT_BUSINESS] == {"plan": "pro", "storage_limit_bytes": 10 * TB}
+    assert S3PlanAccountRow(ss58=ACCT_BUSINESS).active is None, "the default must stay nullable too"
+
+
 def test_an_omitted_active_field_still_gets_an_allowance() -> None:
     """`active` defaults to False on the model, and that default must not deny a plan either.
 
@@ -266,6 +308,58 @@ async def test_a_successful_cycle_publishes_and_records() -> None:
     kwargs = collector.record_plans_cacher_cycle.call_args.kwargs
     assert kwargs["success"] is True
     assert kwargs["entries"] == 2, "the count is accounts on a plan, not rows seen"
+
+
+@pytest.mark.asyncio
+async def test_restoring_the_active_check_is_wedged_by_the_shrink_guard() -> None:
+    """The documented rollback does NOT work on its own, and this pins that.
+
+    Restoring `active` admits ~nobody (upstream sets it false everywhere), so the next roll is empty
+    over a live hash. publish_plan_roll refuses that, run_cycle swallows the raise, and the OLD wide
+    roll keeps serving with used_bytes frozen — a deploy that looks clean and changes nothing.
+
+    Any rollback must `DEL hippius_s3_plan_accounts` on redis-accounts first.
+    """
+    redis = FakeRedis()
+    # Mirrors production: EVERY row is active=false, so restoring the check admits nobody at all.
+    prod_shaped = page(
+        results=[
+            {
+                "ss58": ACCT_INACTIVE_FLAG,
+                "billing": "plan",
+                "plan": "pro",
+                "active": False,
+                "storage_bytes": 10 * TB,
+            }
+        ]
+    )
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=prod_shaped))
+
+    with (
+        patch.object(pc, "HippiusApiClient", api),
+        patch.object(pc, "get_metrics_collector", return_value=MagicMock()),
+    ):
+        assert await pc.run_cycle(redis, FakePool()) is True
+        before = await plans_cache.get_plan_for_account(redis, ACCT_INACTIVE_FLAG)
+
+        # The rollback: put the `active` requirement back.
+        with patch.object(pc, "_is_enforceable_plan_row", lambda r: bool(r.billing == "plan" and r.plan and r.active)):
+            assert await pc.run_cycle(redis, FakePool()) is False, "the guard refuses the smaller roll"
+
+    after = await plans_cache.get_plan_for_account(redis, ACCT_INACTIVE_FLAG)
+    assert before is not None and after is not None, "the account the rollback meant to drop is still served"
+    assert after == before
+
+    # And the documented escape hatch clears it.
+    await redis.delete(plans_cache.PLAN_ACCOUNTS_KEY)
+    with (
+        patch.object(pc, "HippiusApiClient", api),
+        patch.object(pc, "get_metrics_collector", return_value=MagicMock()),
+        patch.object(pc, "_is_enforceable_plan_row", lambda r: bool(r.billing == "plan" and r.plan and r.active)),
+    ):
+        assert await pc.run_cycle(redis, FakePool()) is True
+
+    assert await plans_cache.get_plan_for_account(redis, ACCT_INACTIVE_FLAG) is None
 
 
 @pytest.mark.asyncio

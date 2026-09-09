@@ -94,7 +94,7 @@ def test_a_plan_account_still_uploads_while_enforcement_is_off(
                 "ss58": MOCK_ACCOUNT_ADDRESS,
                 "billing": "plan",
                 "plan": "pro",
-                "active": True,
+                "active": False,
                 "storage_bytes": 1,
             }
         ]
@@ -124,7 +124,7 @@ def test_an_over_quota_plan_account_can_still_delete(boto3_client: Any, plan_rol
                 "ss58": MOCK_ACCOUNT_ADDRESS,
                 "billing": "plan",
                 "plan": "pro",
-                "active": True,
+                "active": False,
                 "storage_bytes": 1,
             }
         ]
@@ -159,8 +159,10 @@ def test_an_account_reported_inactive_is_served_normally(
                 "plan": "pro",
                 "active": False,
                 "storage_bytes": 1,
+                # A future charge date alongside active=false is the combination that disproved the
+                # "false means lapsed" reading. The quota is 1 byte because this test is about the
+                # row parsing, not the arithmetic.
                 "next_charge": "2026-10-08",
-                "subscription_id": 148,
             }
         ]
     )
@@ -186,7 +188,7 @@ def test_the_upstream_endpoint_going_down_does_not_break_uploads(
                 "ss58": MOCK_ACCOUNT_ADDRESS,
                 "billing": "plan",
                 "plan": "pro",
-                "active": True,
+                "active": False,
                 "storage_bytes": 10 * TB,
             }
         ]

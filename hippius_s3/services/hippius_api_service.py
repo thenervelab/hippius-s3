@@ -161,7 +161,12 @@ class S3PlanAccountRow(BaseModel):
     # Carried for observability only -- NOT consulted when deciding whether a plan is in force.
     # Upstream returns false on every row today, including a live subscription with a future
     # next_charge, so it does not currently mean "lapsed". See _is_enforceable_plan_row.
-    active: bool = False
+    #
+    # NULLABLE ON PURPOSE. `bool = False` rejects an explicit null, and model_validate runs on the
+    # WHOLE page -- so one `"active": null` row would fail the page, abort the scrape and freeze the
+    # roll at last-known-good. This field is the one we expect upstream to start populating, which
+    # makes null its most likely next state, and nothing reads it any more.
+    active: bool | None = None
     # The account's OWN allowance, which may differ from the catalog's for a bespoke deal. Preferred
     # over the catalog value when present.
     storage_bytes: int | None = None

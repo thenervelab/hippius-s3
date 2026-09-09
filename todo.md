@@ -191,26 +191,76 @@ Fast-path copy: rewraps the DEK under the destination's AAD, copies `chunk_backe
 
 **Proposed**: add a prominent comment block at [copy_service_v5.py:24](hippius_s3/services/copy_service_v5.py) documenting the invariant ("fast path requires either (a) non-MPU single-part object OR (b) explicit FS backfill of all chunks into the destination object_id path"). Consider a feature flag before re-enabling for MPU.
 
-### P1 — Billing plans: `active` is ignored because upstream never sets it
+### P1 — BLOCKS PROD: the plan account's usage count exceeds every timeout it has
+
+**This must be resolved before the plans-cacher is promoted to production.** It is not active today
+only because the worker is deployed to staging alone (prod has no `plans-cacher` pod yet), and
+because staging's copy of the one plan account holds 2 buckets rather than 203.
+
+The single admitted account (`5E71kYuD…`, business) owns **203 buckets in prod**. Running
+[get_account_storage_bytes.sql](hippius_s3/sql/queries/get_account_storage_bytes.sql) for it on the
+prod replica exceeded 30s and was cancelled — measured twice, ~33s wall each time. Both ceilings sit
+at 30s and neither can be raised past the other:
+
+- `HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS` = 30.0 (asyncpg server-side)
+- the replica's `max_standby_streaming_delay` = 30s (cancels regardless of our timeout)
+
+`_attach_usage` propagates any single account's failure, so `refresh_plan_roll_once` publishes
+NOTHING — no accounts and no catalog — and `run_cycle` retries every 60s, failing every time, with a
+traceback to Sentry each cycle. The net effect in prod would be the same inert gate this PR set out
+to fix, reached by a hard-failing loop instead of a clean filter.
+
+Note the design comment in `run_plans_cacher_loop` says a replica cancellation is fine because
+"run_cycle already treats that as a failed cycle and keeps the previous roll serving". That reasoning
+assumes the failure is TRANSIENT. For a 203-bucket account it is deterministic, and "the previous
+roll" is the empty one.
+
+**To close**, one of:
+1. Make the count cheap enough to finish (index or query rewrite — a per-bucket loop measured 43ms
+   on a sample bucket, so 203 sequential counts may beat one aggregate).
+2. Make a per-account count failure non-fatal. Needs a policy decision, because every fallback has a
+   real cost: publishing `used_bytes=0` or "unknown" means unmetered storage for that account (see
+   the `catalog_miss` note below); omitting the account drops a paying customer to pay-as-you-go,
+   where no substrate credit means a 402.
+3. Give the counts their own replica with a longer `max_standby_streaming_delay`.
+
+### P1 — Billing plans: `active` is ignored because upstream returns it false on every row
 
 `_is_enforceable_plan_row` ([workers/run_plans_cacher_in_loop.py](workers/run_plans_cacher_in_loop.py))
 admits a row on `billing == "plan"` plus a plan name, and does NOT consult `active`.
 
 It did originally, on the reading that a lapsed subscription is distinguished only by that flag. The
-first live payload (2026-09-09) said otherwise: `active: false` on **all 3069 rows** across two days,
-including the sole real subscriber — `subscription_id` 148, plan `business`, `next_charge`
-`2026-10-08`, i.e. a month in the FUTURE. A cancelled subscription has no future charge date, so the
-field is not carrying that meaning; it looks simply unpopulated. Requiring it admitted nobody, making
-the gate permanently inert and unobservable even in shadow mode.
+live payload said otherwise: `active: false` on **every row** — 3069 at the last check, zero
+exceptions across the two days the endpoint has been up — including the sole real subscriber,
+`subscription_id` 148, plan `business`, `next_charge` `2026-10-08`, i.e. a month in the FUTURE. A
+cancelled subscription has no future charge date, so the field is not carrying that meaning; it
+looks simply unpopulated. Requiring it admitted nobody, making the gate permanently inert and
+unobservable even in shadow mode.
 
-**Accepted risk**: if upstream starts populating `active`, a cancelled subscriber keeps their
-allowance until the check is restored. Bounded and recoverable — they hold a plan they no longer pay
-for, not unlimited storage.
+**Measured blast radius**: exactly ONE row in 3069 carries `billing == "plan"`.
+
+**Accepted risks**, both directions — admission is not purely generous:
+1. A cancelled subscriber keeps their allowance until the check is restored.
+2. Admission also **imposes a cap** and removes the PAYG path: an admitted account over its plan
+   size but holding substrate credits used to upload fine via `can_upload`, and with enforcement on
+   is refused 402 until it deletes data and a cycle re-counts.
+3. An admitted account with an unknown quota (plan absent from the catalog, or null/0/negative
+   `storage_bytes`) resolves to `catalog_miss` → allowed **and** skips `has_credits` + `can_upload`.
+   Unmetered storage, not merely an unenforced quota. Alert on
+   `plan_gate_total{outcome="catalog_miss"}` before the prod flag flips.
+
+None of the three is reachable while `HIPPIUS_ENABLE_BILLING_PLANS` is off (how prod ships). Staging
+has it ON.
+
+**Rolling back needs `DEL hippius_s3_plan_accounts` first** — restoring the check yields an empty
+roll over a live hash, the shrink guard refuses it, and the old roll keeps serving with frozen
+`used_bytes`. Pinned by `test_restoring_the_active_check_is_wedged_by_the_shrink_guard`.
 
 **To close**: confirm with the api team what `active` means and whether it is written. Then either
 restore the check, or switch the liveness signal to `next_charge` being in the future — the field
 that actually tracked reality here. Invert
-`tests/unit/test_plans_cacher_worker.py::test_the_active_flag_is_not_consulted`.
+`tests/unit/test_plans_cacher_worker.py::test_the_active_flag_is_not_consulted`. The trigger will
+announce itself: every cycle logs `upstream_active=N` over the whole payload.
 
 ### P1 — Billing plans: the quota gate keys on the CALLER, but storage is owner-pays
 
