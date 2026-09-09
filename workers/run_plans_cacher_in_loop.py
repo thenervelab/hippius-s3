@@ -165,7 +165,10 @@ async def _attach_usage(pool: asyncpg.Pool, accounts: dict[str, dict[str, Any]])
         # knob for one limit, and could only ever disagree with the pool.
         async with pool.acquire() as conn:
             return account_id, await usage_service.get_account_storage_bytes(
-                conn, account_id, timeout=config.plans_usage_timeout_seconds
+                conn,
+                account_id,
+                timeout=config.plans_usage_timeout_seconds,
+                page_size=config.plans_usage_page_size,
             )
 
     for account_id, used in await asyncio.gather(*(count(a) for a in accounts)):
@@ -269,8 +272,16 @@ async def run_plans_cacher_loop() -> None:
     #
     # Sized to the usage concurrency and no larger: this worker's only DB work is those counts, and
     # an oversized pool here is idle backends against Postgres max_connections for nothing.
+    # jit=off for the whole pool. This worker runs nothing but the storage counts, and JIT is pure
+    # overhead for them: it fires because the planner's cost estimate is inflated (see the
+    # n_distinct migration), then spends 107ms of a 326ms count for a 1,300-object account compiling
+    # expressions for a query that is index-probe bound, not expression bound. Measured 20-35% off
+    # small accounts for free.
     pool = await asyncpg.create_pool(
-        config.database_readonly_url, min_size=1, max_size=max(1, config.plans_usage_concurrency)
+        config.database_readonly_url,
+        min_size=1,
+        max_size=max(1, config.plans_usage_concurrency),
+        server_settings={"jit": "off"},
     )
     initialize_metrics_collector()
 
