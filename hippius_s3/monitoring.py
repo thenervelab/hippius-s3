@@ -597,7 +597,7 @@ class MetricsCollector:
         )
         self.plans_cacher_entries_total = self.meter.create_counter(
             name="plans_cacher_entries_total",
-            description="Accounts on an active plan published per plans-cacher cycle",
+            description="Accounts billed as a plan published per plans-cacher cycle",
             unit="1",
         )
         self.plans_cacher_duration_seconds = self.meter.create_histogram(

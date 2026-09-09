@@ -115,8 +115,15 @@ async def publish_plan_roll(
 
     Refuses outright rather than publishing a roll that would strip most accounts of their plan --
     an empty result set, or one that shrank past MAX_ACCOUNT_MAP_SHRINK_RATIO. Both are far more
-    likely to be an upstream bug than 1284 people cancelling at once, and the cost of being wrong in
-    the other direction (a fleet-wide 402) is not symmetric.
+    likely to be an upstream bug than most of the roll cancelling at once, and the cost of being
+    wrong in the other direction (a fleet-wide 402) is not symmetric.
+
+    ⚠️ THIS GUARD ALSO BLOCKS AN INTENTIONAL SHRINK, INCLUDING A ROLLBACK. Restoring the `active`
+    check in _is_enforceable_plan_row (or any change that legitimately admits far fewer accounts)
+    computes a much smaller roll, trips this, and run_cycle swallows the raise -- so the OLD wide
+    roll keeps serving, with used_bytes frozen at the moment of the revert. The deploy looks clean
+    and nothing changes. Run `DEL hippius_s3_plan_accounts` on redis-accounts as part of any such
+    rollback; an empty live hash short-circuits both checks.
     """
     live_size = int(await redis_client.hlen(PLAN_ACCOUNTS_KEY) or 0)
 
@@ -163,9 +170,12 @@ async def get_meta(redis_client: Any) -> dict[str, Any]:
 async def get_plan_for_account(redis_client: Any, account_id: str) -> PlanQuota | None:
     """The account's plan, quota and usage, in one HGET, or None when they are pay-as-you-go.
 
-    Only accounts with an ACTIVE plan are in the hash at all (see _parse_page in the plans-cacher),
-    so a miss here covers every pay-as-you-go case: no subscription, a lapsed one, or an account
+    Only accounts upstream BILLS as a plan are in the hash at all (see _is_enforceable_plan_row in
+    the plans-cacher), so a miss here covers the pay-as-you-go cases: no subscription, or an account
     upstream does not know about.
+
+    A lapsed subscription is NOT a miss. `active` is not consulted, so a cancelled subscriber whose
+    row still carries billing="plan" and its old plan name is present here and keeps its allowance.
     """
     raw = _decode(await redis_client.hget(PLAN_ACCOUNTS_KEY, account_id))
     if raw is None:

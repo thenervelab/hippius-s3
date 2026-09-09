@@ -94,7 +94,7 @@ def test_a_plan_account_still_uploads_while_enforcement_is_off(
                 "ss58": MOCK_ACCOUNT_ADDRESS,
                 "billing": "plan",
                 "plan": "pro",
-                "active": True,
+                "active": False,
                 "storage_bytes": 1,
             }
         ]
@@ -124,7 +124,7 @@ def test_an_over_quota_plan_account_can_still_delete(boto3_client: Any, plan_rol
                 "ss58": MOCK_ACCOUNT_ADDRESS,
                 "billing": "plan",
                 "plan": "pro",
-                "active": True,
+                "active": False,
                 "storage_bytes": 1,
             }
         ]
@@ -139,12 +139,18 @@ def test_an_over_quota_plan_account_can_still_delete(boto3_client: Any, plan_rol
 
 @pytest.mark.e2e
 @pytest.mark.local
-def test_a_lapsed_subscription_is_treated_as_pay_as_you_go(
+def test_an_account_reported_inactive_is_served_normally(
     boto3_client: Any, plan_roll: Any
 ) -> None:
-    """`active: false` still carries the old plan name. Honouring it would hand a free allowance to
-    someone who stopped paying, so the account must fall back to pay-as-you-go — which, with the
-    e2e stack's credit check bypassed, means the upload simply succeeds."""
+    """`active: false` is what upstream reports for EVERY account, live subscriptions included, so
+    it is not consulted — the account is admitted to the plan roll on billing="plan" alone.
+
+    What this pins is that the inactive-flag row moves through the whole stack without upsetting
+    anything: it parses, it publishes, and the upload still succeeds. It deliberately does NOT
+    prove the admission decision — enforcement ships off, so an admitted plan account and a
+    pay-as-you-go one reach the same outcome here. That decision is pinned by
+    tests/unit/test_plans_cacher_worker.py::test_the_active_flag_is_not_consulted.
+    """
     plan_roll(
         [
             {
@@ -153,11 +159,15 @@ def test_a_lapsed_subscription_is_treated_as_pay_as_you_go(
                 "plan": "pro",
                 "active": False,
                 "storage_bytes": 1,
+                # A future charge date alongside active=false is the combination that disproved the
+                # "false means lapsed" reading. The quota is 1 byte because this test is about the
+                # row parsing, not the arithmetic.
+                "next_charge": "2026-10-08",
             }
         ]
     )
 
-    bucket = f"plans-lapsed-{uuid.uuid4().hex[:12]}"
+    bucket = f"plans-inactive-flag-{uuid.uuid4().hex[:12]}"
     boto3_client.create_bucket(Bucket=bucket)
     boto3_client.put_object(Bucket=bucket, Key="hello.txt", Body=b"hello")
 
@@ -178,7 +188,7 @@ def test_the_upstream_endpoint_going_down_does_not_break_uploads(
                 "ss58": MOCK_ACCOUNT_ADDRESS,
                 "billing": "plan",
                 "plan": "pro",
-                "active": True,
+                "active": False,
                 "storage_bytes": 10 * TB,
             }
         ]
