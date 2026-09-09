@@ -158,9 +158,9 @@ class S3PlanAccountRow(BaseModel):
     # "plan" | "pay_as_you_go". Anything that is not exactly "plan" is treated as pay-as-you-go.
     billing: str | None = None
     plan: str | None = None
-    # A lapsed/cancelled subscription still appears with billing="plan" and its plan name, but
-    # active=false. Defaulting to False is the safe direction: an unparseable row does not hand out
-    # an allowance. See _is_enforceable_plan_row.
+    # Carried for observability only -- NOT consulted when deciding whether a plan is in force.
+    # Upstream returns false on every row today, including a live subscription with a future
+    # next_charge, so it does not currently mean "lapsed". See _is_enforceable_plan_row.
     active: bool = False
     # The account's OWN allowance, which may differ from the catalog's for a bespoke deal. Preferred
     # over the catalog value when present.

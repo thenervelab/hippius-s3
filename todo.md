@@ -191,6 +191,27 @@ Fast-path copy: rewraps the DEK under the destination's AAD, copies `chunk_backe
 
 **Proposed**: add a prominent comment block at [copy_service_v5.py:24](hippius_s3/services/copy_service_v5.py) documenting the invariant ("fast path requires either (a) non-MPU single-part object OR (b) explicit FS backfill of all chunks into the destination object_id path"). Consider a feature flag before re-enabling for MPU.
 
+### P1 — Billing plans: `active` is ignored because upstream never sets it
+
+`_is_enforceable_plan_row` ([workers/run_plans_cacher_in_loop.py](workers/run_plans_cacher_in_loop.py))
+admits a row on `billing == "plan"` plus a plan name, and does NOT consult `active`.
+
+It did originally, on the reading that a lapsed subscription is distinguished only by that flag. The
+first live payload (2026-09-09) said otherwise: `active: false` on **all 3069 rows** across two days,
+including the sole real subscriber — `subscription_id` 148, plan `business`, `next_charge`
+`2026-10-08`, i.e. a month in the FUTURE. A cancelled subscription has no future charge date, so the
+field is not carrying that meaning; it looks simply unpopulated. Requiring it admitted nobody, making
+the gate permanently inert and unobservable even in shadow mode.
+
+**Accepted risk**: if upstream starts populating `active`, a cancelled subscriber keeps their
+allowance until the check is restored. Bounded and recoverable — they hold a plan they no longer pay
+for, not unlimited storage.
+
+**To close**: confirm with the api team what `active` means and whether it is written. Then either
+restore the check, or switch the liveness signal to `next_charge` being in the future — the field
+that actually tracked reality here. Invert
+`tests/unit/test_plans_cacher_worker.py::test_the_active_flag_is_not_consulted`.
+
 ### P1 — Billing plans: the quota gate keys on the CALLER, but storage is owner-pays
 
 `account_middleware` runs before `acl_middleware`, so `bucket_owner_id` is not resolved when the

@@ -75,22 +75,35 @@ _PLAN_BILLING = "plan"
 def _is_enforceable_plan_row(row: S3PlanAccountRow) -> bool:
     """Whether this account should be gated on a plan quota rather than billed pay-as-you-go.
 
-    Requires all three of billing == "plan", a plan name, and active is true.
+    Requires billing == "plan" and a plan name. `active` is deliberately NOT consulted.
 
-    `active: false` is the interesting one. A lapsed or cancelled subscription still comes back with
-    billing="plan" and its old plan name, and honouring it would hand a free allowance to someone
-    who has stopped paying. Dropping the row instead sends them down the pay-as-you-go path, which
-    is where a non-subscriber belongs — Arion then decides on credit, exactly as it does for every
-    other PAYG account. It is deliberately NOT a quota denial: their storage is not over any limit,
-    their subscription simply is not in force.
+    It used to be, on the reading that a lapsed subscription keeps billing="plan" and its old plan
+    name and is distinguished only by active=false. The first real payload said otherwise: upstream
+    returns active=false on EVERY row it serves — 3069 of them at the last check, with zero
+    exceptions over two days — including the one genuine subscriber (subscription_id 148, plan
+    "business", next_charge a month in the FUTURE). A cancelled
+    subscription does not have a future charge date, so the field is not carrying the meaning we
+    assumed; on present evidence it is simply not populated.
+
+    Honouring it therefore admitted nobody, which is worse than the failure it was guarding against:
+    the gate could never engage, so the feature could not be observed even in shadow mode, and
+    turning enforcement on would have been a silent no-op forever.
+
+    THE RISK THIS ACCEPTS: if upstream later starts setting `active` correctly, a cancelled
+    subscriber keeps their allowance until we put the check back. That is bounded — they are billed
+    a plan they no longer pay for, not handed unlimited storage — and it is the recoverable
+    direction. The unrecoverable one is a paying customer refused an upload.
+
+    When upstream confirms what `active` means, restore the check (or switch to `next_charge` in the
+    future, which is the field that actually tracked reality here). See todo.md.
     """
-    return bool(row.billing == _PLAN_BILLING and row.plan and row.active)
+    return bool(row.billing == _PLAN_BILLING and row.plan)
 
 
 def _parse_page(page: S3PlanAccountsResponse) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     """Wire shape -> what we cache. The single place to change if the payload moves.
 
-    Accounts that are not on an active plan are simply ABSENT from the map: an absent field is
+    Accounts that are not on a plan are simply ABSENT from the map: an absent field is
     exactly what the request path already treats as pay-as-you-go, so there is nothing to encode
     for them and nothing to keep in sync.
 
@@ -187,7 +200,7 @@ async def refresh_plan_roll_once(redis_client: Redis, pool: asyncpg.Pool) -> tup
     await plans_cache.touch_meta(redis_client, published_accounts, published_plans)
 
     logger.info(
-        f"Published plan roll: {published_accounts} accounts on an active plan out of {rows_seen} rows, "
+        f"Published plan roll: {published_accounts} accounts on a plan out of {rows_seen} rows, "
         f"{published_plans} plans, over {pages} page(s); usage counted in {usage_seconds:.1f}s"
     )
     return published_accounts, published_plans

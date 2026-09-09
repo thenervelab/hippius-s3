@@ -26,7 +26,7 @@ TB = 1_099_511_627_776
 # Real network-42 addresses: _parse_page validates the prefix, because an address in another
 # encoding would match no bucket, count as 0 bytes, and be published as unlimited headroom.
 ACCT_BUSINESS = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
-ACCT_LAPSED = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+ACCT_INACTIVE_FLAG = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 _POOL: list[str] = [
     "5EkcGC5AtPwAoTUJpmAzvHEDGhv5S1Nb6hKQZ9xhUd4WyRGs",
     "5Dc4UfsPGRiU6sDWvSx6SuQXSSVYNsFqzCDwYFY9LuGZfTXh",
@@ -82,13 +82,15 @@ SAMPLE_PAGE = {
             "next_charge": "2026-10-01",
             "subscription_id": 4412,
         },
+        # Shaped after the FIRST REAL payload: a live subscription -- real id, future next_charge --
+        # that upstream nonetheless reports as active=false. This row is why the flag is not consulted.
         {
-            "ss58": ACCT_LAPSED,
+            "ss58": ACCT_INACTIVE_FLAG,
             "billing": "plan",
             "plan": "pro",
             "active": False,
             "storage_bytes": 10 * TB,
-            "next_charge": None,
+            "next_charge": "2026-10-08",
             "subscription_id": 3901,
         },
         {
@@ -154,24 +156,27 @@ def page(**overrides: object) -> S3PlanAccountsResponse:
 # --------------------------------------------------------------------------- row semantics
 
 
-def test_only_accounts_with_an_active_plan_are_published() -> None:
+def test_every_row_billed_as_a_plan_is_published() -> None:
     accounts, catalog = pc._parse_page(page())
 
-    assert set(accounts) == {ACCT_BUSINESS}, "only the active subscriber gets an allowance"
+    assert set(accounts) == {ACCT_BUSINESS, ACCT_INACTIVE_FLAG}, "billing=plan is the whole test"
     assert accounts[ACCT_BUSINESS] == {"plan": "business", "storage_limit_bytes": 50 * TB}
     assert set(catalog) == {"pro", "business", "enterprise"}
 
 
-def test_a_lapsed_subscription_is_treated_as_pay_as_you_go() -> None:
-    """active=false with billing="plan" still carries the old plan name.
+def test_the_active_flag_is_not_consulted() -> None:
+    """A subscriber reported as active=false STILL gets their allowance.
 
-    Honouring it would hand a free allowance to someone who stopped paying. Dropping the row sends
-    them down the pay-as-you-go path, where a non-subscriber belongs — Arion then decides on credit.
-    It is deliberately NOT a quota denial: their storage is not over any limit, their subscription
-    simply is not in force.
+    Upstream returns active=false on every row it serves, including a subscription with a real id
+    and a next_charge in the future. Requiring the flag admitted nobody at all, which made the gate
+    permanently inert -- a worse failure than the lapsed-subscriber case it was meant to prevent.
+
+    If upstream starts populating the field, this is the test to invert.
     """
     accounts, _ = pc._parse_page(page())
-    assert ACCT_LAPSED not in accounts
+
+    assert ACCT_INACTIVE_FLAG in accounts
+    assert accounts[ACCT_INACTIVE_FLAG] == {"plan": "pro", "storage_limit_bytes": 10 * TB}
 
 
 def test_a_pay_as_you_go_row_is_absent_rather_than_encoded() -> None:
@@ -186,13 +191,23 @@ def test_a_pay_as_you_go_row_is_absent_rather_than_encoded() -> None:
     [
         {"ss58": ACCT_BUSINESS, "billing": "plan", "plan": None, "active": True},
         {"ss58": ACCT_BUSINESS, "billing": "pay_as_you_go", "plan": "pro", "active": True},
-        {"ss58": ACCT_BUSINESS, "billing": "plan", "plan": "pro"},  # `active` omitted -> defaults False
         {"ss58": "x"},
     ],
 )
 def test_a_row_missing_any_requirement_gets_no_allowance(row: dict) -> None:
     accounts, _ = pc._parse_page(page(results=[row]))
     assert accounts == {}
+
+
+def test_an_omitted_active_field_still_gets_an_allowance() -> None:
+    """`active` defaults to False on the model, and that default must not deny a plan either.
+
+    Sits apart from the parametrised cases above deliberately: it was one of them while the flag was
+    required, and moving it here is the behaviour change this test file exists to pin.
+    """
+    accounts, _ = pc._parse_page(page(results=[{"ss58": ACCT_BUSINESS, "billing": "plan", "plan": "pro"}]))
+
+    assert accounts[ACCT_BUSINESS] == {"plan": "pro", "storage_limit_bytes": 10 * TB}
 
 
 def test_a_bespoke_per_account_allowance_beats_the_catalog_price() -> None:
@@ -250,7 +265,7 @@ async def test_a_successful_cycle_publishes_and_records() -> None:
 
     kwargs = collector.record_plans_cacher_cycle.call_args.kwargs
     assert kwargs["success"] is True
-    assert kwargs["entries"] == 1, "the count is accounts on an active plan, not rows seen"
+    assert kwargs["entries"] == 2, "the count is accounts on a plan, not rows seen"
 
 
 @pytest.mark.asyncio

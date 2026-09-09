@@ -124,12 +124,29 @@ A count failing for ANY account fails the whole cycle and keeps the previous rol
 partial answer would write `used_bytes=0` for the accounts we could not count, silently handing them
 unlimited headroom.
 
-**Only accounts with an ACTIVE plan are written.** A row needs all three of `billing == "plan"`, a
-plan name, and `active` true. A lapsed subscription still comes back with `billing: "plan"` and its
-old plan name and `active: false`; honouring that would hand a free allowance to someone who stopped
-paying, so the row is dropped and the account takes the pay-as-you-go path — where a non-subscriber
-belongs. Everything else is simply absent from the hash, which is exactly what the request path
-already reads as pay-as-you-go.
+**Only accounts billed as a plan are written.** A row needs `billing == "plan"` and a plan name.
+Everything else is simply absent from the hash, which is exactly what the request path already reads
+as pay-as-you-go.
+
+⚠️ **`active` is NOT consulted, and that is a deliberate concession to the real payload.** The
+original filter also required `active` true, on the reading that a lapsed subscription keeps
+`billing: "plan"` and its old plan name and is distinguished only by that flag. The first live data
+(2026-09-09) contradicted it: upstream returns `active: false` on **every** row — 3069 of them
+across two days, zero exceptions — including the one genuine subscriber, which carries a real
+`subscription_id` and a `next_charge` a month in the future. A cancelled subscription does not have
+a future charge date, so the field is not carrying that meaning; on present evidence it is simply
+unpopulated.
+
+Requiring it admitted nobody, which is the worse failure: the gate could never engage, so the
+feature was unobservable even in shadow mode and enforcement would have been a permanent silent
+no-op. The risk now accepted is that a genuinely cancelled subscriber keeps their allowance until
+the check returns — bounded (they hold a plan they stopped paying for, not unlimited storage) and
+recoverable, unlike refusing a paying customer's upload.
+
+**When upstream confirms what `active` means, restore the check** — or switch to `next_charge` in
+the future, which is the field that actually tracked reality here. Pinned by
+`tests/unit/test_plans_cacher_worker.py::test_the_active_flag_is_not_consulted`, which is the test
+to invert.
 
 **Caching is unconditional.** This worker does not read `HIPPIUS_ENABLE_BILLING_PLANS` and is not
 deployed with it, so the maps stay warm and observably correct long before enforcement is switched
