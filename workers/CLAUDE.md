@@ -79,7 +79,7 @@ Config:
 [run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py). One poll loop against one endpoint:
 
 ```
-GET /api/s3/plans/accounts/?page=1&page_size=500     every HIPPIUS_PLANS_LOOP_SLEEP (600s)
+GET /api/s3/plans/accounts/?page=1&page_size=500     every HIPPIUS_PLANS_LOOP_SLEEP (120s)
 ```
 
 It carries both halves — `plans` is the catalog, `results` is the paginated account roll — and is
@@ -270,7 +270,7 @@ statement, therefore in ONE snapshot, so a write landing mid-recompute is counte
 
 **Why a separate worker rather than a second loop in the plans-cacher.** The plans-cacher's pool is
 `DATABASE_READONLY_URL`, a read replica, because its work must not run on the primary. Compaction
-WRITES. And the rollup's freshness wants seconds while the scrape wants ten minutes. Splitting them
+WRITES. And the rollup's freshness wants seconds while the scrape wants minutes. Splitting them
 also means the ledger keeps draining while api.hippius.com is down.
 
 **This pod being down is not an outage, but it IS a silently frozen billing number.** Nothing on the

@@ -277,7 +277,15 @@ class Config:
     # by one cycle's worth of uploads, and a customer who deletes data to get back under stays
     # refused until the next cycle sees it (nothing on the request path recomputes). Shortening it
     # is the only lever; the cost is one storage count per plan account per cycle.
-    plans_loop_sleep: int = env("HIPPIUS_PLANS_LOOP_SLEEP:600", convert=int)
+    #
+    # 120s rather than the original 600s. Ten minutes was priced against a usage read that scanned
+    # the object table per account; since the rollup landed that read is an indexed SUM over
+    # bucket_storage_usage returning in sub-milliseconds, so the DB side of a cycle is now
+    # negligible and there is no reason to make a customer who freed space wait ten minutes to be
+    # let back in. The remaining cost is the upstream plans scrape, which this multiplies by 5 --
+    # one paginated GET per cycle against an endpoint we do not own. That is the number to watch if
+    # this is shortened further, not the database.
+    plans_loop_sleep: int = env("HIPPIUS_PLANS_LOOP_SLEEP:120", convert=int)
     # How many per-account storage counts the plans-cacher runs at once. Sized for a few tens of
     # plan accounts: enough that one very large account does not set the pace for the cycle, small
     # enough that these aggregates never become the heaviest thing on the primary.
@@ -293,7 +301,11 @@ class Config:
     plans_api_timeout_seconds: float = env("HIPPIUS_PLANS_API_TIMEOUT_SECONDS:30.0", convert=float)
     # Age past which the cached maps are reported stale. Serving stale is still strictly better than
     # failing closed, so this drives a metric and an alert, never a behaviour change.
-    plans_stale_after_seconds: int = env("HIPPIUS_PLANS_STALE_AFTER_SECONDS:3600", convert=int)
+    #
+    # Tracks plans_loop_sleep at 5 missed cycles: at a 600s poll, 3600s was 6 cycles, and leaving it
+    # there while the poll dropped to 120s would mean 30 consecutive failed refreshes before anyone
+    # heard about it. The ratio is what matters, not the absolute number.
+    plans_stale_after_seconds: int = env("HIPPIUS_PLANS_STALE_AFTER_SECONDS:600", convert=int)
 
     # Storage-usage rollup (workers/run_usage_rollup_in_loop.py). See
     # 20260910120000_storage_usage_rollup.sql for the mechanism.

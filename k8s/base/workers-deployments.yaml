@@ -921,7 +921,7 @@ spec:
 ---
 # Scrapes the api.hippius.com billing-plan roll into redis-accounts, and counts each plan account's
 # storage usage itself (upstream reports the quota but not the usage):
-#   GET /api/s3/plans/accounts/   every HIPPIUS_PLANS_LOOP_SLEEP (600s)
+#   GET /api/s3/plans/accounts/   every HIPPIUS_PLANS_LOOP_SLEEP (120s)
 #
 # replicas MUST stay 1. Publication is a whole-hash build-then-RENAME; two replicas racing would
 # not corrupt anything (last RENAME wins) but would double the upstream load for no benefit.
