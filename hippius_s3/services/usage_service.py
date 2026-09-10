@@ -6,8 +6,9 @@ tens of them.
 
 That "few tens of ACCOUNTS" is not the same claim as "cheap per account", and the difference is what
 this module is shaped around. Account cardinality was never the problem -- objects-per-account is.
-One prod account owns a JuiceFS bucket holding 7.83M live objects, where the single-statement
-aggregate takes ~64s cold. See get_bucket_storage_bytes_page.sql.
+One account's objects are concentrated in a single bucket holding a filesystem-style workload of
+millions of small objects, where the single-statement aggregate takes over a minute cold. See
+get_bucket_storage_bytes_page.sql.
 
 A maintained counter (a delta ledger folded into a per-bucket rollup) is the real answer and is
 written up in todo.md; it is a schema change and a backfill, and this module is what makes the

@@ -103,9 +103,9 @@ comparison — no catalog lookup, no database. The two halves come from differen
 
 The obvious form is one aggregate per account, and that is what this used to do. It cannot finish.
 
-Cost is driven by OBJECTS PER BUCKET, not by bucket fan-out and not by account count. One prod plan
-account owns a JuiceFS bucket holding **7.83M live objects**; the single-statement aggregate for it
-takes ~64s. Both ceilings that apply are 30s — `HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS` and the
+Cost is driven by OBJECTS PER BUCKET, not by bucket fan-out and not by account count. One plan
+account's objects are concentrated in a single bucket holding a filesystem-style workload of
+**millions of small objects**; the single-statement aggregate for it takes over a minute. Both ceilings that apply are 30s — `HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS` and the
 replica's `max_standby_streaming_delay` — so it was cancelled every cycle, and because one account's
 failure fails the whole cycle, the roll was never published at all.
 

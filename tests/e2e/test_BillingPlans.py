@@ -162,7 +162,7 @@ def test_an_account_reported_inactive_is_served_normally(
                 # A future charge date alongside active=false is the combination that disproved the
                 # "false means lapsed" reading. The quota is 1 byte because this test is about the
                 # row parsing, not the arithmetic.
-                "next_charge": "2026-10-08",
+                "next_charge": "2099-01-01",
             }
         ]
     )

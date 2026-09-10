@@ -219,7 +219,7 @@ class TestNoUnboundedLabels:
                 request=_request(),
                 response=_response(),
                 duration=0.1,
-                **{kwarg: "5E71kYuDbwhMbnK7JVtH1xLMguogmvozTrNJHYD9KnEcuWgZ"},
+                **{kwarg: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"},
             )
 
     def test_no_record_method_anywhere_accepts_an_account(self) -> None:
