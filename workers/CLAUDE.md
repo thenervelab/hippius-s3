@@ -111,8 +111,8 @@ for the trigger set that keeps it right.
 It used to compute the number outright. Two designs, both retired:
 
 1. **One aggregate per account.** Cost is driven by OBJECTS PER BUCKET, not by bucket fan-out and
-   not by account count. One prod plan account owns a JuiceFS bucket holding **7.83M live objects**;
-   that aggregate takes ~64s. Both applicable ceilings are 30s — `HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS`
+   not by account count. One plan account's objects are concentrated in a single bucket holding a
+   filesystem-style workload of **millions of small objects**; that aggregate takes over a minute. Both applicable ceilings are 30s — `HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS`
    and the replica's `max_standby_streaming_delay` — so it was cancelled every cycle, and because
    one account's failure fails the whole cycle, the roll was never published at all.
 2. **The same aggregate, chunked into keyset pages.** That fixed the cancellation — no single

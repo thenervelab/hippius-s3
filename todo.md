@@ -196,9 +196,9 @@ Fast-path copy: rewraps the DEK under the destination's AAD, copies `chunk_backe
 **Superseded two designs that both mis-framed this.** The first blamed 203-bucket fan-out and quoted
 ~33s. The second fixed the cancellation by chunking, and left ~165s of replica work per cycle,
 forever. Both were shaped around "there are only a few tens of plan accounts", which was true and
-irrelevant: **account cardinality was never the problem; objects-per-account is.** The account has
-25 live buckets (203 total; the query filters `deleted_at IS NULL`), one of which is a JuiceFS
-bucket with **7.83M live objects** that is 99.5% of the work.
+irrelevant: **account cardinality was never the problem; objects-per-account is.** Most of that
+account's buckets are soft-deleted and the query filters `deleted_at IS NULL`; of the live ones, a
+single bucket holding a filesystem-style workload of millions of small objects is ~99% of the work.
 
 **Shipped: an insert-only delta ledger folded into a per-bucket rollup.**
 [20260910120000_storage_usage_rollup.sql](hippius_s3/sql/migrations/20260910120000_storage_usage_rollup.sql),
@@ -246,9 +246,9 @@ sub-millisecond we could now afford a live read on every request, which would al
 admits a row on `billing == "plan"` plus a plan name, and does NOT consult `active`.
 
 It did originally, on the reading that a lapsed subscription is distinguished only by that flag. The
-live payload said otherwise: `active: false` on **every row** — 3069 at the last check, zero
-exceptions across the two days the endpoint has been up — including the sole real subscriber,
-`subscription_id` 148, plan `business`, `next_charge` `2026-10-08`, i.e. a month in the FUTURE. A
+live payload said otherwise: `active: false` on **every row** it serves, zero exceptions across the
+two days the endpoint has been up — including the sole real subscriber, whose row carried a real
+subscription id and a `next_charge` date in the FUTURE. A
 cancelled subscription has no future charge date, so the field is not carrying that meaning; it
 looks simply unpopulated. Requiring it admitted nobody, making the gate permanently inert and
 unobservable even in shadow mode.

@@ -86,8 +86,8 @@ def _is_enforceable_plan_row(row: S3PlanAccountRow) -> bool:
     It used to be, on the reading that a lapsed subscription keeps billing="plan" and its old plan
     name and is distinguished only by active=false. The first real payload said otherwise: upstream
     returns active=false on EVERY row it serves — 3069 of them at the last check, with zero
-    exceptions over two days — including the one genuine subscriber (subscription_id 148, plan
-    "business", next_charge a month in the FUTURE). A cancelled
+    exceptions over two days — including the one genuine subscriber, whose row carried a real
+    subscription id and a next_charge date in the FUTURE. A cancelled
     subscription does not have a future charge date, so the field is not carrying the meaning we
     assumed; on present evidence it is simply not populated.
 

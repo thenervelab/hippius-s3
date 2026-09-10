@@ -7,8 +7,8 @@
 --
 -- NO RUNTIME CALLER, AND THAT IS DELIBERATE -- DO NOT DELETE THIS AS DEAD SQL. The plans-cacher
 -- reads a MAINTAINED counter instead (get_account_storage_bytes_rollup.sql), because this form
--- cannot finish for a 7.83M-object bucket inside the 30s ceilings that apply to it, and rerunning
--- it every cycle forever was O(objects) work to rediscover a number that had barely moved.
+-- cannot finish for a bucket of millions of objects inside the 30s ceilings that apply, and
+-- rerunning it every cycle forever was O(objects) work to rediscover a number that had barely moved.
 --
 -- This query survives as the CANONICAL DEFINITION, and as the ORACLE the rollup is asserted
 -- against case by case in tests/integration/test_storage_usage_rollup.py -- every write path in the
