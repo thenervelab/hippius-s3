@@ -1213,3 +1213,51 @@ async def test_recompute_drain_and_aggregate_share_one_snapshot(committed_pool: 
     async with committed_pool.acquire() as conn:
         await _compact(conn)
         assert await _raw_rollup(conn, acct) == await _oracle(conn, acct) == 1250
+
+
+@pytest.mark.asyncio
+async def test_a_pathological_size_cannot_abort_a_customer_write(pg_tx: asyncpg.Connection) -> None:
+    """No delta arithmetic may overflow, because an overflow inside a trigger fails the user's PUT.
+
+    This is not a reachable state through the application -- sizes are byte counts, and the largest
+    object is orders of magnitude below the bigint range. It is pinned because the guarantee is only
+    worth having unconditionally: before storage_usage_narrow existed, an overwrite between the
+    bigint extremes raised `bigint out of range` from inside
+    storage_usage_objects_update_trigger, and the affected row then became UNDELETABLE because the
+    delete trigger raised on the same negation. Verified against this schema, not theorised.
+
+    `object_versions.size_bytes` has no non-negative CHECK, so the schema does permit these values.
+    """
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+
+    row = await _reserve(pg_tx, bucket_id, "extremes")
+    object_id, version = row["object_id"], row["current_object_version"]
+
+    # Outgoing version at the bottom of the range, incoming at the top: the subtraction that
+    # storage_usage_apply performs is the widest possible.
+    await pg_tx.execute(
+        "UPDATE object_versions SET size_bytes = $1 WHERE object_id = $2 AND object_version = $3",
+        -(2**63),
+        object_id,
+        version,
+    )
+    await pg_tx.execute(
+        "UPDATE object_versions SET size_bytes = $1 WHERE object_id = $2 AND object_version = $3",
+        2**63 - 1,
+        object_id,
+        version,
+    )
+
+    # And the negation path: deleting the object while it holds the minimum.
+    await pg_tx.execute(
+        "UPDATE object_versions SET size_bytes = $1 WHERE object_id = $2 AND object_version = $3",
+        -(2**63),
+        object_id,
+        version,
+    )
+    await pg_tx.execute("DELETE FROM objects WHERE object_id = $1", object_id)
+
+    # Out-of-range deltas are dropped rather than written, so nothing corrupt reaches the ledger.
+    for delta in await _ledger_rows(pg_tx, bucket_id):
+        assert -(2**63) <= delta <= 2**63 - 1

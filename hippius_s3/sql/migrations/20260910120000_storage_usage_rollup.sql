@@ -147,15 +147,42 @@ $$;
 -- live in exactly one place.
 -- ---------------------------------------------------------------------------------------------
 
+-- Narrows a delta computed in `numeric` back to bigint, or NULL if it will not fit.
+--
+-- Every delta is computed in numeric and passed through here so that arithmetic can NEVER raise.
+-- bigint subtraction and negation overflow, and an overflow inside a trigger aborts the customer's
+-- statement -- verified against this schema: with size_bytes at the bigint extremes an overwrite
+-- fails, and worse, the row becomes UNDELETABLE because the delete trigger raises too.
+--
+-- Those values are not reachable through the application (sizes are byte counts, and the largest
+-- object is ~13 orders of magnitude below the overflow point) and `object_versions.size_bytes` has
+-- no non-negative CHECK to lean on either. So this is defence, not a live bug -- but "a trigger
+-- cannot abort a write" has to be true unconditionally to be worth anything, and returning NULL
+-- here makes it so: emit drops NULL, and the reconciler is what catches a bucket whose counter
+-- missed a delta.
+CREATE OR REPLACE FUNCTION storage_usage_narrow(p_delta numeric)
+RETURNS bigint
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT CASE
+        WHEN p_delta IS NULL THEN NULL
+        WHEN p_delta > 9223372036854775807::numeric THEN NULL
+        WHEN p_delta < (-9223372036854775808)::numeric THEN NULL
+        ELSE p_delta::bigint
+    END
+$$;
+
 CREATE OR REPLACE FUNCTION storage_usage_emit(p_bucket_id uuid, p_delta bigint)
 RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    -- TOTAL BY CONSTRUCTION. A NULL bucket means the objects row has already gone (a cascade), and
-    -- a zero delta means nothing moved; both must write nothing rather than raise, because a raise
-    -- here aborts a customer's PUT. There is no other way for this INSERT to fail: the table has no
-    -- FK, no CHECK and no unique constraint beyond its own generated key.
+    -- TOTAL. A NULL bucket means the objects row has already gone (a cascade); a NULL delta means
+    -- storage_usage_narrow refused it as out of range; a zero delta means nothing moved. All three
+    -- write nothing rather than raise, because a raise here aborts a customer's PUT. Nothing else
+    -- about this INSERT can fail: the table has no FK, no CHECK and no unique constraint beyond its
+    -- own generated key.
     IF p_bucket_id IS NULL OR p_delta IS NULL OR p_delta = 0 THEN
         RETURN;
     END IF;
@@ -177,10 +204,12 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     IF p_old_bucket IS NOT DISTINCT FROM p_new_bucket THEN
-        PERFORM storage_usage_emit(p_new_bucket, p_new_bytes - p_old_bytes);
+        PERFORM storage_usage_emit(
+            p_new_bucket, storage_usage_narrow(p_new_bytes::numeric - p_old_bytes::numeric)
+        );
     ELSE
-        PERFORM storage_usage_emit(p_old_bucket, -p_old_bytes);
-        PERFORM storage_usage_emit(p_new_bucket, p_new_bytes);
+        PERFORM storage_usage_emit(p_old_bucket, storage_usage_narrow(-p_old_bytes::numeric));
+        PERFORM storage_usage_emit(p_new_bucket, storage_usage_narrow(p_new_bytes::numeric));
     END IF;
 END;
 $$;
@@ -221,7 +250,7 @@ BEGIN
     IF NEW.deleted_at IS NULL THEN
         PERFORM storage_usage_emit(
             NEW.bucket_id,
-            storage_usage_version_bytes(NEW.object_id, NEW.current_object_version)
+            storage_usage_narrow(storage_usage_version_bytes(NEW.object_id, NEW.current_object_version)::numeric)
         );
     END IF;
     RETURN NULL;
@@ -267,7 +296,7 @@ BEGIN
     IF OLD.deleted_at IS NULL THEN
         PERFORM storage_usage_emit(
             OLD.bucket_id,
-            -storage_usage_version_bytes(OLD.object_id, OLD.current_object_version)
+            storage_usage_narrow(-storage_usage_version_bytes(OLD.object_id, OLD.current_object_version)::numeric)
         );
     END IF;
     RETURN OLD;
@@ -314,7 +343,9 @@ BEGIN
     IF OLD.deleted_at IS NULL
        AND NOT OLD.is_delete_marker
        AND storage_usage_version_is_current(OLD.object_id, OLD.object_version) THEN
-        PERFORM storage_usage_emit(storage_usage_bucket_of_object(OLD.object_id), -OLD.size_bytes);
+        PERFORM storage_usage_emit(
+            storage_usage_bucket_of_object(OLD.object_id), storage_usage_narrow(-OLD.size_bytes::numeric)
+        );
     END IF;
     RETURN NULL;
 END;

@@ -223,6 +223,44 @@ now runs **once per bucket as a backfill and never again**.
 Sharded counters were rejected: the guidance is consistent that they suit approximate display
 counters and push correctness onto the read path, which is not acceptable for billing.
 
+### 🚨 ROLLOUT: the triggers are the one part of billing plans with NO kill switch
+
+Everything else in this feature can be turned off in minutes — `HIPPIUS_ENABLE_BILLING_PLANS`, an
+empty `hippius_s3_plan_accounts` hash, or scaling the plans-cacher to zero. **The triggers can not.**
+They are schema, they fire on every object write by every account the moment the migration lands, and
+the billing flag does not gate them. So "ship it with billing disabled" protects the quota decision
+and gives no protection at all against the genuinely new risk.
+
+Three consequences worth holding in mind:
+
+- **Blast radius is every account, not plan customers.** Everything before this only touched accounts
+  in the plan hash. This touches all writes.
+- **The failure mode is a failed upload, not a wrong number.** A trigger that raises aborts the
+  caller's transaction, so a bug here is a data-plane outage on the hottest path, not a billing
+  discrepancy.
+- **Rollback is slower than a flag, and the brake can itself hurt.**
+  `ALTER TABLE ... DISABLE TRIGGER` is metadata-only but takes ACCESS EXCLUSIVE, so it queues behind
+  running queries while blocking every reader and writer. On a cluster where a janitor read-storm has
+  already caused failovers, that lever needs `lock_timeout` and a deliberate moment.
+
+**Ship it in this order:**
+
+1. Deploy with billing disabled. Triggers start collecting; reads refuse until backfilled.
+2. **LOAD-TEST THE WRITE PATH ON STAGING WITH TRIGGERS LIVE** — concurrent PUTs, overwrites, deletes
+   and MPUs, watching write error rate and p99 against a pre-deploy baseline. This is the step that
+   catches a raising trigger or a latency regression, and it is before any of it matters in prod. A
+   single `aws s3 cp` proves nothing about a trigger under contention; staging has no organic traffic,
+   so the load has to be generated.
+3. Run the backfill manually (`--dry-run`, then `--apply`).
+4. Confirm pay-as-you-go is unaffected — as a measurement, not a smoke test.
+5. Only then enable enforcement.
+
+**Before step 1, two things should exist:** a named incident runbook for `DISABLE TRIGGER` (the
+statements, the `lock_timeout`, and the requirement to `recompute_bucket_storage_usage()` afterwards
+— `hippius_s3/sql/CLAUDE.md` currently covers this only for bulk migrations, not for an incident),
+and an alert on `storage_delta_ledger` depth, because if the compactor dies the ledger grows silently
+and a failing ledger insert is a failing user write.
+
 **Still worth stealing:** RGW's **soft threshold**, where the cached number is trusted while an
 account is comfortably under quota and refreshed only near the limit. With the rollup making reads
 sub-millisecond we could now afford a live read on every request, which would also close the
