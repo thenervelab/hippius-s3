@@ -1,85 +1,76 @@
 """How many bytes an account stores.
 
-Computed outright, per bucket, in keyset pages. There is no rollup table, no counter and no
-triggers: the accounts that need this number are the ones on a billing plan, and there are a few
-tens of them.
+Read from a MAINTAINED counter, not computed. `bucket_storage_usage` holds per-bucket bytes,
+Postgres triggers record every movement into an insert-only ledger, and a compactor folds the
+ledger into the rollup -- see 20260910120000_storage_usage_rollup.sql for the mechanism and
+storage_rollup_service.py for the compactor and reconciler.
 
-That "few tens of ACCOUNTS" is not the same claim as "cheap per account", and the difference is what
-this module is shaped around. Account cardinality was never the problem -- objects-per-account is.
-One prod account owns a JuiceFS bucket holding 7.83M live objects, where the single-statement
-aggregate takes ~64s cold. See get_bucket_storage_bytes_page.sql.
+This used to walk every bucket in keyset pages and sum. That was O(objects) and ran every
+plans-cacher cycle, forever, on a bucket holding millions of objects that only grows -- minutes of
+replica work per cycle to recompute a number that had moved by a handful of objects. The full scan
+now happens once, as a backfill, and never again.
 
-A maintained counter (a delta ledger folded into a per-bucket rollup) is the real answer and is
-written up in todo.md; it is a schema change and a backfill, and this module is what makes the
-current design work until then.
+get_account_storage_bytes.sql remains THE canonical definition and is the oracle the rollup is
+asserted against, case by case, in tests/integration/test_storage_usage_rollup.py. It has no runtime
+caller and that is deliberate; do not delete it.
 
-The only caller is the plans-cacher, in the background. Nothing on the request path runs this.
+The only caller is the plans-cacher, in the background. Nothing on the request path runs this --
+though at sub-millisecond it could now afford to.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from hippius_s3.utils import get_query
 
 
-# Safety valve on the keyset walk. A cursor that fails to advance would otherwise spin forever
-# holding a pool connection; at the default page size this bounds one bucket at 5 billion objects,
-# which is far past anything real and far short of infinite.
-MAX_PAGES_PER_BUCKET = 10_000
+logger = logging.getLogger(__name__)
+
+
+class StorageRollupNotBackfilled(RuntimeError):
+    """The rollup exists but has not been seeded, so its numbers are not totals."""
 
 
 async def get_account_storage_bytes(
     db: Any,
     main_account_id: str,
     timeout: float,  # noqa: ASYNC109
-    page_size: int,
 ) -> int:
     """Bytes stored by this account: current versions of live objects in live buckets.
 
-    THE definition of "storage used" in this codebase. Must stay in step with
-    get_admin_account_stats.sql and console_list_buckets.sql -- those are the numbers an operator and
-    a customer respectively see, and enforcing a third one is how you get a support ticket nobody can
-    resolve.
+    Must stay in step with get_account_storage_bytes.sql, get_admin_account_stats.sql and
+    console_list_buckets.sql -- those are the numbers an operator and a customer respectively see,
+    and enforcing a third one is how you get a support ticket nobody can resolve.
 
-    `timeout` bounds each STATEMENT, not the whole account: chunking exists precisely so no single
-    statement approaches it. It is asyncpg's own `timeout=` (hence the ASYNC109 waiver), which
-    cancels server-side; an asyncio timeout would abandon the coroutine and leave the aggregate
-    running on the backend -- exactly the thing being bounded.
+    RAISES until the backfill has run. Before that the rollup holds only deltas recorded since the
+    migration, which would under-report every account that existed beforehand. Raising fails the
+    plans-cacher cycle, which leaves the previous roll serving -- the same degradation as any other
+    failed cycle, and far better than publishing a small number as a customer's usage.
+
+    `timeout` is asyncpg's own (hence the ASYNC109 waiver), so a cancellation lands server-side
+    rather than abandoning the coroutine with the query still running.
     """
-    buckets = await db.fetch(get_query("list_account_bucket_ids"), main_account_id, timeout=timeout)
+    row = await db.fetchrow(get_query("get_account_storage_bytes_rollup"), main_account_id, timeout=timeout)
 
-    total = 0
-    for row in buckets:
-        total += await _bucket_storage_bytes(db, row["bucket_id"], timeout, page_size)
-    return total
-
-
-async def _bucket_storage_bytes(db: Any, bucket_id: Any, timeout: float, page_size: int) -> int:  # noqa: ASYNC109
-    """Walk one bucket in keyset pages, summing as we go."""
-    total = 0
-    cursor = ""
-
-    for _ in range(MAX_PAGES_PER_BUCKET):
-        row = await db.fetchrow(
-            get_query("get_bucket_storage_bytes_page"),
-            bucket_id,
-            cursor,
-            page_size,
-            timeout=timeout,
+    if not row["ready"]:
+        raise StorageRollupNotBackfilled(
+            "bucket_storage_usage has not been backfilled (storage_usage_rollup_state.backfilled_at "
+            "is NULL), so its rows are deltas rather than totals. Run "
+            "hippius_s3/scripts/backfill_bucket_storage_usage.py."
         )
-        if row is None:
-            return total
 
-        total += int(row["bytes_used"])
-        # Short page means we reached the end. Compared against PAGE rows, not summed rows -- see
-        # the query header for why those differ.
-        if int(row["rows_seen"]) < page_size:
-            return total
+    if row["negative_buckets"]:
+        # Only reachable if a decrement was recorded without its increment, so it is a defect
+        # report rather than a condition to handle. Reported and served (clamped) rather than
+        # raised: the error direction is under-counting, which is the same fail-open direction as
+        # every other degraded path in the quota gate, and the reconciler repairs it within a pass.
+        logger.error(
+            f"STORAGE_ROLLUP_NEGATIVE account={main_account_id} "
+            f"buckets={row['negative_buckets']} bytes_used={row['bytes_used']}; "
+            f"serving the clamped total. The delta ledger has drifted -- check the reconciler's "
+            f"drift metric and recompute the account's buckets."
+        )
 
-        cursor = row["last_key"]
-
-    raise RuntimeError(
-        f"storage count for bucket {bucket_id} exceeded {MAX_PAGES_PER_BUCKET} pages; "
-        f"refusing to keep walking a cursor that may not be advancing"
-    )
+    return int(row["bytes_used"])

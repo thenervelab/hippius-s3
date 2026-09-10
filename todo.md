@@ -191,54 +191,54 @@ Fast-path copy: rewraps the DEK under the destination's AAD, copies `chunk_backe
 
 **Proposed**: add a prominent comment block at [copy_service_v5.py:24](hippius_s3/services/copy_service_v5.py) documenting the invariant ("fast path requires either (a) non-MPU single-part object OR (b) explicit FS backfill of all chunks into the destination object_id path"). Consider a feature flag before re-enabling for MPU.
 
-### P2 — Billing plans: usage is recomputed from scratch every cycle, forever
+### DONE — Billing plans: usage is no longer recomputed from scratch every cycle
 
-**Superseded a P1 that mis-diagnosed this.** The earlier entry blamed 203-bucket fan-out and quoted
-~33s. Both were wrong: the account has **25 live buckets** (203 total; the query filters
-`deleted_at IS NULL`), one of which is a JuiceFS bucket with **7.83M live objects** that is 99.5% of
-the work, and the true single-statement cost is **~64s**, not 33 — 33s was where the replica's
-cancellation fired, not where the query finished.
+**Superseded two designs that both mis-framed this.** The first blamed 203-bucket fan-out and quoted
+~33s. The second fixed the cancellation by chunking, and left ~165s of replica work per cycle,
+forever. Both were shaped around "there are only a few tens of plan accounts", which was true and
+irrelevant: **account cardinality was never the problem; objects-per-account is.** The account has
+25 live buckets (203 total; the query filters `deleted_at IS NULL`), one of which is a JuiceFS
+bucket with **7.83M live objects** that is 99.5% of the work.
 
-The immediate blocker is fixed: `usage_service.py` now walks each bucket in keyset pages, so no
-single statement approaches the 30s ceilings. Measured cold on the prod replica at the 200k default,
-one page is 2.91s and the whole account is **~115s** across ~40 statements.
-
-**What remains** is that ~115s of database work per cycle, per cycle, forever — recomputing a number
-that changed by a few objects. It is O(objects) and that bucket only grows, so this gets worse on its
-own. Every other object store treats this as an incrementally maintained number rather than a repeated
-scan ([Ceph RGW](https://docs.ceph.com/en/latest/radosgw/admin/) caches per-instance stats behind
-`rgw bucket quota ttl`; [Swift](https://docs.openstack.org/swift/latest/api/container_quotas.html)
-updates account/container DBs asynchronously; AWS ships Storage Lens daily and offers no quota at all).
-
-**Proposed: an insert-only delta ledger folded into a per-bucket rollup.**
+**Shipped: an insert-only delta ledger folded into a per-bucket rollup.**
+[20260910120000_storage_usage_rollup.sql](hippius_s3/sql/migrations/20260910120000_storage_usage_rollup.sql),
+[workers/run_usage_rollup_in_loop.py](workers/run_usage_rollup_in_loop.py).
 
 ```
-object_versions / objects   --AFTER-ROW TRIGGERS, INSERT only-->  storage_delta_ledger
-                                                                          |
-                              compactor: DELETE ... RETURNING *, fold     v
+objects / object_versions   --5 row triggers, INSERT only-->  storage_delta_ledger
+                                                                      |
+                            compactor: DELETE ... RETURNING, fold     v
                                                               bucket_storage_usage
-                                                                          |
-                                          account total = indexed SUM  <--+  (sub-ms)
+                                                                      |
+                                  account total = indexed SUM  <------+  (sub-ms)
 ```
 
-The refinement over the trigger design deleted earlier in this project: keep the triggers, but make
-what they write an **INSERT, not an UPDATE**. That preserves the property that made triggers
-attractive — `ON DELETE CASCADE` means `nuke_user.py`, `purge_buckets.py` and the janitor's
-hard-delete are accounted for automatically, and no new endpoint can forget to call a helper — while
-removing the hot-row contention and MVCC bloat that made them risky. The full-scan cost then runs
-**once per bucket as a backfill and never again**, which is the only property that actually ends
-this problem. Sharded counters are the wrong tool here: the guidance is consistent that they suit
-approximate display counters and push correctness onto the read path, which is not acceptable for
-billing.
+The refinement over the trigger design that was deleted earlier in this project: what the triggers
+write is an **INSERT, not an `UPDATE ... SET bytes = bytes + delta`**. That keeps the property which
+made triggers attractive — `ON DELETE CASCADE` means `nuke_user.py`, `purge_buckets.py` and the
+janitor's hard-delete are accounted for automatically, and no new endpoint can forget to call a
+helper — while removing the hot-row contention and MVCC bloat that made them risky. The full scan
+now runs **once per bucket as a backfill and never again**.
 
-Worth stealing alongside it: RGW's **soft threshold**, where the cached number is trusted while an
-account is comfortably under quota and refreshed only near the limit. With a rollup making reads
-sub-millisecond we could afford it on every request, which would also close the "refresh interval is
-the enforcement lag" gap below.
+Sharded counters were rejected: the guidance is consistent that they suit approximate display
+counters and push correctness onto the read path, which is not acceptable for billing.
 
-Note the premise the current design was justified on — "only a few tens of plan accounts" — was never
-the relevant number. **Account cardinality was never the problem; objects-per-account is.** One
-account with one 7.8M-object bucket breaks a recount design no matter how few accounts exist.
+**Still worth stealing:** RGW's **soft threshold**, where the cached number is trusted while an
+account is comfortably under quota and refreshed only near the limit. With the rollup making reads
+sub-millisecond we could now afford a live read on every request, which would also close the
+"refresh interval is the enforcement lag" gap below. Nothing on the request path reads it yet.
+
+**Two follow-ups this left open:**
+
+1. **`get_admin_account_stats.sql` and `console_list_buckets.sql` still compute the number.** They
+   are the operator's and the customer's views of the same figure, and they are the same O(objects)
+   aggregate the plans-cacher just stopped running — `admin.py` already degrades to a null count on
+   timeout for the largest account. Both could read `bucket_storage_usage` instead. Not done here
+   because a third consumer means a third chance to drift, and the parity tests currently pin one.
+2. **A soft-deleted bucket's counter is maintained but never verified.** The triggers do not care
+   about bucket liveness, so its counter stays correct; the reconciler skips it, because its total
+   is read by nobody. There is no path that revives a soft-deleted bucket today. If one is ever
+   added it must recompute the bucket on the way through.
 
 ### P1 — Billing plans: `active` is ignored because upstream returns it false on every row
 

@@ -6,11 +6,17 @@
 -- on timeout. So it must never run on a routine request path.
 --
 -- NO RUNTIME CALLER, AND THAT IS DELIBERATE -- DO NOT DELETE THIS AS DEAD SQL. The plans-cacher
--- walks each bucket in keyset pages instead (get_bucket_storage_bytes_page.sql), because this form
--- cannot finish for a 7.83M-object bucket inside the 30s ceilings that apply to it. This query
--- survives as the CANONICAL DEFINITION, and as the oracle the chunked walk is asserted against case
--- by case in tests/integration/test_usage_service_chunked.py. Delete it and the chunked path has
--- nothing independent left to be checked for correctness against.
+-- reads a MAINTAINED counter instead (get_account_storage_bytes_rollup.sql), because this form
+-- cannot finish for a 7.83M-object bucket inside the 30s ceilings that apply to it, and rerunning
+-- it every cycle forever was O(objects) work to rediscover a number that had barely moved.
+--
+-- This query survives as the CANONICAL DEFINITION, and as the ORACLE the rollup is asserted
+-- against case by case in tests/integration/test_storage_usage_rollup.py -- every write path in the
+-- system is checked by seeding it, running the real statements, compacting, and demanding the
+-- rollup equal this. It is also the aggregate that recompute_bucket_storage_usage() reimplements
+-- per bucket for the backfill and the reconciler; those two copies must agree with this one, and
+-- the tests are what hold them together. Delete it and the maintained counter has nothing
+-- independent left to be checked for correctness against.
 --
 -- Nothing on the request path runs either form -- the quota gate reads the cached result and does
 -- not re-check, not even to confirm a denial, which is why the refresh interval is the enforcement

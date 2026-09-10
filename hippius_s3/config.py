@@ -282,30 +282,39 @@ class Config:
     # plan accounts: enough that one very large account does not set the pace for the cycle, small
     # enough that these aggregates never become the heaviest thing on the primary.
     plans_usage_concurrency: int = env("HIPPIUS_PLANS_USAGE_CONCURRENCY:4", convert=int)
-    # Server-side bound on ONE STATEMENT of a storage count -- one keyset page, not the whole
-    # account. Unbounded, a single bad plan would stall the cycle holding a pool connection, and
-    # every plan account's usage would silently freeze at its last good value while the gate kept
-    # enforcing it. Note the replica enforces its own 30s ceiling via max_standby_streaming_delay,
-    # so raising this past 30s buys nothing on its own.
+    # Server-side bound on the per-account usage read. That read is now an indexed SUM over
+    # bucket_storage_usage and returns in sub-milliseconds, so this is a stuck-connection guard
+    # rather than a tuning knob: unbounded, one wedged query would stall the cycle holding a pool
+    # connection, and every plan account's usage would silently freeze at its last good value while
+    # the gate kept enforcing it.
     plans_usage_timeout_seconds: float = env("HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS:30.0", convert=float)
-    # Objects per keyset page when counting a bucket. Bounds ONE statement against the two 30s
-    # ceilings above; no value changes the total, only how close a statement gets to being cancelled.
-    #
-    # Tune it by measurement and judge it by the WORST page, never the mean. Per-row cost is neither
-    # linear in page size nor uniform across a bucket -- it roughly doubles between key regions from
-    # heap locality, and falls off a cliff past a few hundred thousand rows. Each of those cost a
-    # wrong default once: 500k looked fine extrapolated and took 20s, and 200k looked like a 10x
-    # margin on one sample that a second sample put at 5.7x.
-    #
-    # Numbers, and the offsets they were sampled at, live in workers/CLAUDE.md -- one copy, because
-    # two would drift.
-    plans_usage_page_size: int = env("HIPPIUS_PLANS_USAGE_PAGE_SIZE:200000", convert=int)
     # Per-attempt bound on the scrape. Retry COUNTS cannot bound latency when the per-attempt cost
     # is unbounded, and this worker holds no request.
     plans_api_timeout_seconds: float = env("HIPPIUS_PLANS_API_TIMEOUT_SECONDS:30.0", convert=float)
     # Age past which the cached maps are reported stale. Serving stale is still strictly better than
     # failing closed, so this drives a metric and an alert, never a behaviour change.
     plans_stale_after_seconds: int = env("HIPPIUS_PLANS_STALE_AFTER_SECONDS:3600", convert=int)
+
+    # Storage-usage rollup (workers/run_usage_rollup_in_loop.py). See
+    # 20260910120000_storage_usage_rollup.sql for the mechanism.
+    #
+    # How often the compactor wakes. This interval is the rollup's own staleness, on top of the
+    # plans-cacher's 10 minutes, so it wants to be small: the work is one indexed DELETE per batch
+    # and idling on an empty ledger costs one count.
+    usage_rollup_loop_sleep: int = env("HIPPIUS_USAGE_ROLLUP_LOOP_SLEEP:5", convert=int)
+    # Ledger rows claimed per fold. The claim is one transaction, so this bounds how long the
+    # rollup rows are locked and how much WAL one fold writes; the loop just runs more batches.
+    usage_rollup_batch_size: int = env("HIPPIUS_USAGE_ROLLUP_BATCH_SIZE:5000", convert=int)
+    # Live buckets fully recomputed per reconcile pass. Each one is a full aggregate over its
+    # objects -- the cost the rollup exists to avoid -- so this is deliberately small and serial.
+    # At 25 buckets an hour a ~46k-bucket estate takes months to cycle, which is the right trade:
+    # the reconciler is a drift ALARM, not the mechanism that keeps the number right.
+    usage_reconcile_buckets_per_cycle: int = env("HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE:25", convert=int)
+    # How often a reconcile pass runs.
+    usage_reconcile_interval_seconds: int = env("HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS:3600", convert=int)
+    # Server-side bound on ONE bucket recompute. The largest prod bucket takes ~64s, so this has to
+    # clear that or the reconciler could never verify the one bucket that matters most.
+    usage_reconcile_timeout_seconds: float = env("HIPPIUS_USAGE_RECONCILE_TIMEOUT_SECONDS:300.0", convert=float)
 
     # ATS (Apache Traffic Server) reverse-proxy cache endpoints (CSV). When ATS_CACHE_ENDPOINT is unset,
     # all PURGE + public Cache-Control logic becomes a no-op — safe default for local dev.

@@ -1,0 +1,80 @@
+# Seed the per-bucket storage rollup, once, after the triggers land.
+#
+# 20260910120000_storage_usage_rollup.sql creates the triggers, so every byte that moves from that
+# moment on is recorded. It does NOT seed the counters — that would be a full scan of the objects
+# tables inside a migration transaction, which is exactly the cost this whole change removes from
+# the steady state and must not be paid while a deploy waits on it.
+#
+# Until this Job completes, storage_usage_rollup_state.backfilled_at is NULL, usage_service refuses
+# to return a number, and the plans-cacher keeps publishing its previous roll. So the ordering
+# migration -> backfill -> (usage read) is enforced by the schema, not by remembering to run this;
+# but a plan account's usage figure is frozen until it does run.
+#
+# DEFAULTS TO A DRY RUN. It reports what each counter would move by and writes nothing. Check the
+# totals look like real bucket sizes, then add --apply to the args below.
+#
+# IMPORTANT: namespace below is hardcoded. Edit between staging and prod runs.
+# Run with:   kubectl create -f k8s/backfill-bucket-storage-usage-job.yaml
+# Re-run:     kubectl -n <namespace> delete job backfill-bucket-storage-usage \
+#               && kubectl create -f k8s/backfill-bucket-storage-usage-job.yaml
+# Inspect:    kubectl -n <namespace> logs job/backfill-bucket-storage-usage --follow
+#
+# Safe to run concurrently with live traffic and safe to run twice: each bucket is recomputed in
+# its own transaction, the recompute SETS rather than adds, and it discards that bucket's pending
+# ledger rows in the same snapshot it aggregates in. See the script's module docstring.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backfill-bucket-storage-usage
+  namespace: hippius-s3-staging
+  labels:
+    app: backfill-bucket-storage-usage
+    mode: dryrun
+spec:
+  backoffLimit: 0
+  # The estate's largest bucket alone is a ~64s aggregate and there are tens of thousands of
+  # buckets. Killing the Job part way through is harmless — nothing is marked backfilled until a
+  # complete pass finishes, and a re-run converges rather than double-counting.
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: backfill-bucket-storage-usage
+        mode: dryrun
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backfill
+          image: ghcr.io/thenervelab/hippius-s3/api:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+          env:
+            # The PRIMARY. This writes, and the aggregate must be consistent with the ledger rows it
+            # discards in the same snapshot — a replica cannot do either.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+          command:
+            - python
+            - -m
+            - hippius_s3.scripts.backfill_bucket_storage_usage
+          args:
+            - --dry-run
+            # Each recompute takes the rollup's advisory lock, which pauses the compactor for its
+            # duration. A small pause between buckets keeps the compactor able to keep up during a
+            # long run, and keeps a full-estate scan off the primary's back.
+            - --sleep-ms=25
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
