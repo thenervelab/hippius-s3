@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import re
 from typing import Callable
 
 import httpx
@@ -11,14 +10,21 @@ from fastapi import Response
 from starlette import status
 
 from hippius_s3.config import get_config
+from hippius_s3.gateway.middlewares.acl import parse_s3_path
+from hippius_s3.gateway.services import plan_gate
 from hippius_s3.gateway.services.account_service import fetch_account_by_main_address
+from hippius_s3.gateway.services.sub_token_scope import required_op
 from hippius_s3.gateway.utils.errors import s3_error_response
+from hippius_s3.gateway.utils.paths import first_path_segment
 from hippius_s3.gateway.utils.paths import routing_path
 from hippius_s3.models.account import HippiusAccount
+from hippius_s3.models.sub_token import Op
+from hippius_s3.monitoring import PlanGateOutcome
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.services.arion_service import CanUploadResponse
+from hippius_s3.services.plans_cache import PlanQuota
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.service_accounts import is_service_account
 
@@ -62,6 +68,38 @@ def _is_transient_billing_error(error: str | None) -> bool:
 _UNREACHABLE_ERRORS = (httpx.TimeoutException, httpx.NetworkError, httpx.ProxyError, httpx.RemoteProtocolError)
 
 
+# Object subresources that set metadata rather than store data. `required_op` grades them
+# `write_object` — correctly, for authorisation — but a quota must not refuse a zero-byte tag or
+# retention change just because the account is over its limit. Object-scoped only: the bucket
+# equivalents are already `write_bucket_meta` and never reach this check.
+_OBJECT_METADATA_SUBRESOURCES = frozenset({"acl", "tagging", "retention", "legal-hold"})
+
+
+# Shadow verdicts get their own label so an enforced denial and a shadow one are never summed
+# together on plan_gate_total. Enforcing mode needs no map: its outcomes already ARE the labels,
+# and `would_deny` is unreachable there.
+_SHADOW_LABEL: dict[plan_gate.Outcome, PlanGateOutcome] = {
+    "allow": "shadow_allow",
+    "would_deny": "shadow_would_deny",
+    "catalog_miss": "shadow_catalog_miss",
+}
+
+
+def _permissive_account(account_address: str) -> HippiusAccount:
+    """The account object for a caller whose write is not credit-gated.
+
+    Used by the test bypass, the service-account bypass and the plan branch alike: each has already
+    decided the request may proceed, and none of them consults the credit fields afterwards.
+    """
+    return HippiusAccount(
+        id=account_address,
+        main_account=account_address,
+        has_credits=True,
+        upload=True,
+        delete=True,
+    )
+
+
 async def _can_upload(
     arion_client: ArionClient,
     main_account: str,
@@ -97,6 +135,170 @@ async def _can_upload(
         return CanUploadResponse(result=False, error=f"billing service unavailable ({type(exc).__name__})"), True
 
 
+def _declared_content_length(request: Request) -> int:
+    """Bytes this request claims it will write.
+
+    AWS CLI v2+ uses chunked transfer encoding and sends the real size in
+    x-amz-decoded-content-length instead of Content-Length.
+
+    This is a CLAIM, not a measurement: it is whatever the caller declared, and it is 0 when neither
+    header is present. Treat it as a lower bound on the write, never as its true size. Both billing
+    gates have always been built on it — the plan gate inherits exactly the same precision as
+    can_upload, no better and no worse. Anything that needs the real figure must be enforced after
+    the write, where it is known. See todo.md.
+    """
+    return int(request.headers.get("x-amz-decoded-content-length") or request.headers.get("content-length") or "0")
+
+
+def _adds_storage(request: Request) -> bool:
+    """Whether this operation can ADD stored bytes, and so is subject to the plan quota.
+
+    Delegates to the repo's existing verb+query -> operation mapping rather than re-deriving one.
+    Judging this on the HTTP verb alone is wrong in both directions, and both mistakes are
+    user-hostile:
+
+      * `POST /{bucket}?delete` is the bulk DeleteObjects that `aws s3 rm --recursive` issues. It
+        frees space, so gating it would answer an over-quota customer's bulk delete with a 402
+        telling them to delete things.
+      * `PUT /{bucket}?acl|?tagging|?versioning|?lifecycle|...` and `CreateBucket` store no object
+        bytes. Refusing "set a tag on my bucket" with "this upload would exceed your storage quota"
+        is the same class of error, one query param over.
+
+    `required_op` already encodes both, and is the same mapping sub-token authorisation reads — so
+    there is one place that knows what an S3 request is, not two.
+
+    Two things `required_op` cannot express are subtracted on top, because it answers "what
+    permission does this need", not "does this store bytes", and both would otherwise refuse a
+    zero-byte control operation the moment an account is over its limit:
+
+      * `POST ?uploadId` WITHOUT `partNumber` is CompleteMultipartUpload. Its parts are already
+        written and already passed this gate individually, so refusing the commit reclaims nothing
+        and strands them with no path forward. Matching on `uploadId` alone would also exempt every
+        `PUT ?partNumber&uploadId` part upload — exactly the requests that carry the bytes.
+      * `PUT /{bucket}/{key}?acl|?tagging|?retention|?legal-hold` sets object metadata.
+        `required_op` grades these `write_object` because that is the permission they need, but
+        they store no object data.
+
+    Both sets are spelled out here rather than pushed into `required_op`, because changing that
+    mapping also changes sub-token authorisation — a different question with a different blast
+    radius. What must NOT be re-derived here is the verb+query -> operation classification itself:
+    doing that by hand is how `PUT /{bucket}/{key}?delete` became a total quota bypass.
+    """
+    params = dict(request.query_params)
+    _, key = parse_s3_path(routing_path(request))
+    if required_op(request.method, key is not None, params) is not Op.write_object:
+        return False
+
+    if request.method == "POST" and "uploadId" in params and "partNumber" not in params:
+        return False
+    return not (_OBJECT_METADATA_SUBRESOURCES & params.keys())
+
+
+def _log_plan_shadow(
+    request: Request,
+    logger: logging.Logger | logging.LoggerAdapter,
+    account_address: str,
+    quota: PlanQuota,
+) -> None:
+    """Record what the plan gate WOULD have done, while HIPPIUS_ENABLE_BILLING_PLANS is off.
+
+    The request itself is untouched: it goes on to the pay-as-you-go path and is billed exactly as
+    it is today. This exists so the whole chain -- plans-cacher -> redis maps -> usage rollup ->
+    quota arithmetic -- is observably working in prod logs before the flag is flipped and it can
+    cost anyone an upload.
+
+    Only accounts that actually HAVE a plan are logged. Emitting a line for every pay-as-you-go
+    write would bury the signal in the volume it is meant to be found in.
+
+    Grep in Loki:
+        {namespace="hippius-s3-prod",app="api"} |= "BILLING_PLAN_SHADOW"
+        {namespace="hippius-s3-prod",app="api"} |= "BILLING_PLAN_SHADOW" |= "would=would_deny"
+
+    Deliberately synchronous and side-effect-free apart from the log line and the counter: shadow
+    mode runs on the pay-as-you-go path of every write while the feature is OFF, so anything that
+    can block, fail or wait does not belong here. There is no try/except because there is nothing
+    here that can raise -- if you add a fallible call (a Redis write, a DB read), it will surface as
+    a 503 on a live upload, so wrap it then.
+    """
+    if not _adds_storage(request):
+        return
+
+    incoming = _declared_content_length(request)
+    decision = plan_gate.evaluate_quota(quota, incoming, enforcing=False)
+
+    get_metrics_collector().record_plan_gate(outcome=_SHADOW_LABEL[decision.outcome])
+    logger.info(
+        f"BILLING_PLAN_SHADOW enforcement=disabled account={account_address} plan={quota.plan_id} "
+        f"method={request.method} used_bytes={decision.used_bytes} limit_bytes={decision.quota_bytes} "
+        f"incoming_bytes={incoming} would={decision.outcome} "
+        f"note=charged via pay-as-you-go instead; set HIPPIUS_ENABLE_BILLING_PLANS=true to enforce"
+    )
+
+
+async def _check_plan_quota(
+    request: Request,
+    logger: logging.Logger | logging.LoggerAdapter,
+    account_address: str,
+) -> tuple[bool, Response | None]:
+    """Storage-quota gate for accounts on a billing plan.
+
+    Returns (handled, error_response). `handled` False means the caller must run the normal
+    pay-as-you-go path (credits + can_upload) -- because the account has no plan, because the caches
+    could not be consulted, or because HIPPIUS_ENABLE_BILLING_PLANS is off.
+    """
+    redis_accounts = request.app.state.redis_accounts_client
+
+    # The plan lookup consults our own state (one redis-accounts HGET; there is no database work on
+    # this path). Failing to reach a verdict is not worth failing a customer's upload over, so it
+    # falls back to the pay-as-you-go path — exactly what the account would have got before this
+    # feature existed, so nothing here can be a NEW failure mode.
+    try:
+        resolved = await plan_gate.resolve_plan(redis_accounts, account_address)
+        if resolved is None:
+            return False, None
+
+        quota = resolved
+        request.state.plan_id = quota.plan_id
+
+        if not config.enable_billing_plans:
+            _log_plan_shadow(request, logger, account_address, quota)
+            return False, None
+
+        if not _adds_storage(request):
+            get_metrics_collector().record_plan_gate(outcome="allow")
+            return True, None
+
+        decision = plan_gate.evaluate_quota(quota, _declared_content_length(request))
+    except plan_gate.PlanLookupUnavailable as e:
+        logger.warning(f"PLAN_LOOKUP unavailable account={account_address}: {e}; falling back to pay-as-you-go")
+        get_metrics_collector().record_plan_gate(outcome="unavailable")
+        return False, None
+    # `would_deny` cannot occur when enforcing; the remaining outcomes are already valid labels.
+    enforced: PlanGateOutcome = "allow" if decision.outcome == "would_deny" else decision.outcome
+    get_metrics_collector().record_plan_gate(outcome=enforced)
+
+    if decision.outcome == "catalog_miss":
+        logger.warning(
+            f"PLAN_QUOTA catalog miss account={account_address} plan={quota.plan_id}; allowing. "
+            f"The plans-cacher may be cold or this plan id is unknown to the catalog."
+        )
+        return True, None
+
+    if decision.outcome == "deny":
+        logger.warning(
+            f"PLAN_QUOTA denied account={account_address} plan={quota.plan_id} "
+            f"used={decision.used_bytes} limit={decision.quota_bytes}"
+        )
+        return True, s3_error_response(
+            code="QuotaExceeded",
+            message=plan_gate.quota_exceeded_message(decision),
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            BucketName=first_path_segment(request),
+        )
+
+    return True, None
+
+
 async def _check_can_upload(
     request: Request,
     logger: logging.Logger | logging.LoggerAdapter,
@@ -110,11 +312,7 @@ async def _check_can_upload(
     if request.method not in ("PUT", "POST"):
         return None
 
-    # AWS CLI v2+ uses chunked transfer encoding and sends the actual file size
-    # in x-amz-decoded-content-length instead of Content-Length
-    content_length = int(
-        request.headers.get("x-amz-decoded-content-length") or request.headers.get("content-length") or "0"
-    )
+    content_length = _declared_content_length(request)
     main_account = request.state.account.main_account
     arion_client = request.app.state.arion_client
     redis_accounts = request.app.state.redis_accounts_client
@@ -201,13 +399,7 @@ async def account_middleware(
         if auth_method == "access_key":
             account_address = getattr(request.state, "account_address", "anonymous")
             request.state.account_id = account_address
-            request.state.account = HippiusAccount(
-                id=account_address,
-                main_account=account_address,
-                has_credits=True,
-                upload=True,
-                delete=True,
-            )
+            request.state.account = _permissive_account(account_address)
         else:
             account_id = "anonymous"
             request.state.account_id = account_id
@@ -267,43 +459,47 @@ async def account_middleware(
                 # Skips the redis-accounts fetch as well as the gates: an internal account has no
                 # meaningful credit row to consult, and consulting one would make our own writes
                 # fail whenever the account-cacher lags.
-                request.state.account = HippiusAccount(
-                    id=account_address,
-                    main_account=account_address,
-                    has_credits=True,
-                    upload=True,
-                    delete=True,
-                )
+                request.state.account = _permissive_account(account_address)
                 logger.info(
                     f"BILLING_BYPASS surface=gateway account={account_address} method={request.method} path={path}"
                 )
                 get_metrics_collector().record_billing_bypass(surface="gateway")
             else:
-                redis_accounts_client = request.app.state.redis_accounts_client
-                request.state.account = await fetch_account_by_main_address(
-                    account_address,
-                    redis_accounts_client,
-                    config.substrate_url,
-                )
-                logger.debug(f"Checking credit for {request.method} operation: {path}")
-
-                if not request.state.account.has_credits:
-                    logger.warning(f"Access key account lacks credits: {account_address}")
-                    bucket_name = None
-                    bucket_match = re.match(r"^/([^/]+)", path)
-                    if bucket_match:
-                        bucket_name = bucket_match.group(1)
-
-                    return s3_error_response(
-                        code="InsufficientAccountCredit",
-                        message="The account does not have sufficient credit to perform this operation",
-                        status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                        BucketName=bucket_name if bucket_name else "",
+                # Billing plans run in PARALLEL with pay-as-you-go. An account on a plan buys a
+                # storage allowance rather than credits, so it skips BOTH gates below: the substrate
+                # has_credits check (a plan customer holds no substrate credits and would be 402'd
+                # by it) and Arion can_upload. An account with no plan falls straight through to the
+                # unchanged pay-as-you-go path.
+                plan_handled, plan_error = await _check_plan_quota(request, logger, account_address)
+                if plan_handled:
+                    request.state.account = _permissive_account(account_address)
+                    if plan_error is not None:
+                        return plan_error
+                    # Deliberately no `return await call_next(request)` here: falling out of the try
+                    # reaches the shared call_next at the end of the middleware. Calling it inside
+                    # this block would put the whole downstream request under the `except Exception`
+                    # below, turning any handler error into a 503 AccountVerificationError.
+                else:
+                    redis_accounts_client = request.app.state.redis_accounts_client
+                    request.state.account = await fetch_account_by_main_address(
+                        account_address,
+                        redis_accounts_client,
+                        config.substrate_url,
                     )
+                    logger.debug(f"Checking credit for {request.method} operation: {path}")
 
-                can_upload_error = await _check_can_upload(request, logger)
-                if can_upload_error is not None:
-                    return can_upload_error
+                    if not request.state.account.has_credits:
+                        logger.warning(f"Access key account lacks credits: {account_address}")
+                        return s3_error_response(
+                            code="InsufficientAccountCredit",
+                            message="The account does not have sufficient credit to perform this operation",
+                            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                            BucketName=first_path_segment(request),
+                        )
+
+                    can_upload_error = await _check_can_upload(request, logger)
+                    if can_upload_error is not None:
+                        return can_upload_error
         except Exception as e:
             logger.exception(f"Error in access key account verification: {e}")
             return s3_error_response(

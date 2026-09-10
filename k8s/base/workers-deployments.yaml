@@ -919,6 +919,171 @@ spec:
               cpu: 1000m
               memory: 2Gi
 ---
+# Scrapes the api.hippius.com billing-plan roll into redis-accounts, and counts each plan account's
+# storage usage itself (upstream reports the quota but not the usage):
+#   GET /api/s3/plans/accounts/   every HIPPIUS_PLANS_LOOP_SLEEP (600s)
+#
+# replicas MUST stay 1. Publication is a whole-hash build-then-RENAME; two replicas racing would
+# not corrupt anything (last RENAME wins) but would double the upstream load for no benefit.
+#
+# This pod being down is NOT an outage. Both caches are written without a TTL and redis-accounts is
+# noeviction + AOF, so the last known good maps keep serving indefinitely and the request path is
+# unaffected. Alert on plans_cache_age_seconds, not on pod restarts.
+#
+# Needs the DB (it counts each plan account's storage) but no PVC and no
+# wait-for-migrations init container — it only reads, and adds no schema.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: plans-cacher
+
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: plans-cacher
+  template:
+    metadata:
+      labels:
+        app: plans-cacher
+        worker-type: plans-cacher
+    spec:
+      # Workers take no inbound traffic, so there is no preStop endpoint-propagation wait —
+      # this is purely drain headroom. run_worker() cancels the loop on SIGTERM and bounds the
+      # cleanup at HIPPIUS_WORKER_DRAIN_TIMEOUT_SECONDS (20s), and that cleanup closing the
+      # asyncpg pool is what stops a long statement outliving the pod and pinning the xmin
+      # horizon. 40 leaves headroom over the 20s bound.
+      terminationGracePeriodSeconds: 40
+      initContainers:
+        - name: wait-for-services
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - until nc -z postgres-rw 5432 && nc -z redis-accounts 6379; do echo waiting for services; sleep 5; done
+      containers:
+        - name: plans-cacher
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+          env:
+            # Read by refuse_destructive_operation (the purger) and by the operator scripts
+            # when they are kubectl-exec'd into a worker pod. Declared on EVERY worker, not
+            # just today's readers: the cost is nil, and the failure mode of omitting it is a
+            # data-destruction guard that silently does nothing. optional:true so a secret
+            # predating the key cannot wedge a rollout — absent means an empty allowlist.
+            - name: HIPPIUS_SERVICE_ACCOUNT_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_ACCOUNT_IDS
+                  optional: true
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: OTEL_SERVICE_NAME
+              value: "hippius-s3-plans-cacher"
+            - name: WORKER_SCRIPT
+              value: "workers/run_plans_cacher_in_loop.py"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            # Replica endpoint. The per-account storage counts are aggregates over the
+            # largest tables in the schema and must not run on the primary. optional:true so a
+            # Secret predating this key cannot wedge the rollout — absent falls back to
+            # DATABASE_URL, which is correct but heavier.
+            - name: DATABASE_READONLY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_READONLY_URL
+                  optional: true
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_URL
+            - name: REDIS_ACCOUNTS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_ACCOUNTS_URL
+            - name: HIPPIUS_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
+            - name: HIPPIUS_AUTH_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_AUTH_ENCRYPTION_KEY
+            - name: FRONTEND_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: FRONTEND_HMAC_SECRET
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DISCORD_WEBHOOK_URL
+            - name: HIPPIUS_OVH_KMS_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_ENDPOINT
+            - name: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+            - name: HIPPIUS_OVH_KMS_OKMS_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_OKMS_ID
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:

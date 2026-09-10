@@ -69,6 +69,69 @@ def _parse_service_accounts(value: str | None) -> frozenset[str]:
     return frozenset(accounts)
 
 
+_TRUE_VALUES = frozenset({"true", "1", "yes", "y", "on"})
+_FALSE_VALUES = frozenset({"false", "0", "no", "n", "off", ""})
+
+
+def _parse_bool(value: str | None) -> bool:
+    """Parse a boolean feature flag, accepting the forms an operator actually types.
+
+    `true/True/TRUE/1/yes/on` are true; `false/False/0/no/off` and unset are false. Surrounding
+    whitespace and quotes are stripped, because a value threaded through GitHub Actions ->
+    `kubectl create secret --from-literal` -> envFrom picks both up easily.
+
+    Anything else RAISES at config load rather than defaulting. The repo's older flags use
+    `x.lower() == "true"`, which silently reads `1` as false — for a switch that decides whether a
+    billing feature is live, "we set it and nothing happened" is the worst failure mode, so a typo
+    fails the pod loudly instead of being invisible.
+    """
+    if value is None:
+        return False
+
+    normalised = str(value).strip().strip('"').strip("'").lower()
+    if normalised in _TRUE_VALUES:
+        return True
+    if normalised in _FALSE_VALUES:
+        return False
+
+    raise ValueError(
+        f"expected a boolean (one of {sorted(_TRUE_VALUES)} / {sorted(_FALSE_VALUES - {''})}), got {value!r}"
+    )
+
+
+# The billing-plans switch is held as TWO GitHub secrets, one per environment, so staging can run
+# the feature live while production stays on pay-as-you-go. ENVIRONMENT is "staging" / "production"
+# (k8s/{staging,production}/environment-patch.yaml), and note that production maps to PROD, not
+# PRODUCTION — hence an explicit map rather than an uppercase of ENVIRONMENT.
+_BILLING_PLANS_ENV_SUFFIX = {"staging": "STAGING", "production": "PROD"}
+
+
+def _parse_enable_billing_plans() -> bool:
+    """Resolve HIPPIUS_ENABLE_BILLING_PLANS, preferring the environment-specific secret.
+
+    Looks for HIPPIUS_ENABLE_BILLING_PLANS_<STAGING|PROD> first, chosen by this pod's own
+    ENVIRONMENT, then falls back to the unsuffixed HIPPIUS_ENABLE_BILLING_PLANS (which is what
+    .env.defaults and local dev set).
+
+    Selecting by the pod's OWN environment is the safety property: even if both secrets somehow
+    landed in one cluster, a staging pod can only ever read the staging value and a production pod
+    the production one. There is no code path by which prod picks up staging's flag.
+
+    A suffixed variable that is present but EMPTY falls through rather than forcing false — an unset
+    GitHub secret interpolates to '' through `--from-literal`, and that should mean "not configured
+    here", not "explicitly disabled".
+    """
+    import os
+
+    suffix = _BILLING_PLANS_ENV_SUFFIX.get(os.environ.get("ENVIRONMENT", "").strip().lower())
+    if suffix:
+        specific = os.environ.get(f"HIPPIUS_ENABLE_BILLING_PLANS_{suffix}")
+        if specific is not None and specific.strip().strip('"').strip("'") != "":
+            return _parse_bool(specific)
+
+    return _parse_bool(os.environ.get("HIPPIUS_ENABLE_BILLING_PLANS"))
+
+
 def _parse_account_whitelist() -> list[str]:
     """Parse comma-separated account whitelist from environment variable."""
     import os
@@ -87,6 +150,16 @@ class Config:
     database_url: str = env("DATABASE_URL")
     # Inline default prevents KeyError during class init; runtime fallback to DATABASE_URL is applied in get_config()
     encryption_database_url: str = env("HIPPIUS_KEYSTORE_DATABASE_URL:", convert=str)
+    # A read-only DSN, for background work that only reads and can tolerate replica lag. Falls back
+    # to DATABASE_URL when unset (get_config), so local dev, tests and e2e need not set it.
+    #
+    # Only the plans-cacher uses it today, and deliberately: its per-account storage counts are
+    # aggregates over the largest tables in the schema, run on a timer with nobody waiting. Keeping
+    # them off the primary matters on this cluster specifically -- a janitor read-storm has stalled
+    # it before and triggered a failover. The replica also cancels a query past
+    # max_standby_streaming_delay rather than letting it lag replay, which turns a pathological
+    # account into a failed cycle (last known good keeps serving) instead of a replication problem.
+    database_readonly_url: str = env("DATABASE_READONLY_URL:", convert=str)
 
     # Security
     frontend_hmac_secret: str = env("FRONTEND_HMAC_SECRET")
@@ -175,6 +248,64 @@ class Config:
     # retryable 503 SlowDown rather than a hard 402 that clients read as "insufficient funds".
     can_upload_transient_retries: int = env("CAN_UPLOAD_TRANSIENT_RETRIES:2", convert=int)
     can_upload_transient_retry_delay_seconds: float = env("CAN_UPLOAD_TRANSIENT_RETRY_DELAY_SECONDS:0.4", convert=float)
+
+    # S3 billing plans. Accounts on a subscription plan are gated on a storage quota instead of
+    # substrate credits + Arion can_upload; accounts with no plan keep the pay-as-you-go path
+    # untouched. Both maps are scraped by the plans-cacher worker into redis-accounts.
+    #
+    # THE master switch for the whole feature, held as two GitHub secrets so each environment moves
+    # independently: HIPPIUS_ENABLE_BILLING_PLANS_STAGING and HIPPIUS_ENABLE_BILLING_PLANS_PROD.
+    # This pod reads only the one matching its own ENVIRONMENT (see _parse_enable_billing_plans),
+    # falling back to the unsuffixed HIPPIUS_ENABLE_BILLING_PLANS for local dev and tests.
+    #
+    # false (the default) — every account takes the pay-as-you-go path exactly as it did before
+    #   this feature existed: substrate credits, then Arion can_upload. The plan caches are STILL
+    #   consulted on writes, and a BILLING_PLAN_SHADOW line is logged for any account that has a
+    #   plan, recording what we would have charged them against. Nothing about the response
+    #   changes. That is how we watch the feature work end to end before it can cost anyone an
+    #   upload; flipping this to true is then a config change, not a code change.
+    #
+    # true — accounts on a plan are gated on their storage quota and skip both PAYG gates.
+    #
+    # Parsed by _parse_bool, so true/True/1/yes/on all work and a typo fails the pod loudly rather
+    # than silently leaving the feature off.
+    enable_billing_plans: bool = dataclasses.field(default_factory=_parse_enable_billing_plans)
+    # One endpoint carries both the catalog and the account roll, so there is one poll interval —
+    # and it is also the interval at which we recount each  plan account's usage.
+    #
+    # This interval IS the enforcement lag, in both directions. An account can overshoot its quota
+    # by one cycle's worth of uploads, and a customer who deletes data to get back under stays
+    # refused until the next cycle sees it (nothing on the request path recomputes). Shortening it
+    # is the only lever; the cost is one storage count per plan account per cycle.
+    plans_loop_sleep: int = env("HIPPIUS_PLANS_LOOP_SLEEP:600", convert=int)
+    # How many per-account storage counts the plans-cacher runs at once. Sized for a few tens of
+    # plan accounts: enough that one very large account does not set the pace for the cycle, small
+    # enough that these aggregates never become the heaviest thing on the primary.
+    plans_usage_concurrency: int = env("HIPPIUS_PLANS_USAGE_CONCURRENCY:4", convert=int)
+    # Server-side bound on ONE STATEMENT of a storage count -- one keyset page, not the whole
+    # account. Unbounded, a single bad plan would stall the cycle holding a pool connection, and
+    # every plan account's usage would silently freeze at its last good value while the gate kept
+    # enforcing it. Note the replica enforces its own 30s ceiling via max_standby_streaming_delay,
+    # so raising this past 30s buys nothing on its own.
+    plans_usage_timeout_seconds: float = env("HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS:30.0", convert=float)
+    # Objects per keyset page when counting a bucket. Bounds ONE statement against the two 30s
+    # ceilings above; no value changes the total, only how close a statement gets to being cancelled.
+    #
+    # Tune it by measurement and judge it by the WORST page, never the mean. Per-row cost is neither
+    # linear in page size nor uniform across a bucket -- it roughly doubles between key regions from
+    # heap locality, and falls off a cliff past a few hundred thousand rows. Each of those cost a
+    # wrong default once: 500k looked fine extrapolated and took 20s, and 200k looked like a 10x
+    # margin on one sample that a second sample put at 5.7x.
+    #
+    # Numbers, and the offsets they were sampled at, live in workers/CLAUDE.md -- one copy, because
+    # two would drift.
+    plans_usage_page_size: int = env("HIPPIUS_PLANS_USAGE_PAGE_SIZE:200000", convert=int)
+    # Per-attempt bound on the scrape. Retry COUNTS cannot bound latency when the per-attempt cost
+    # is unbounded, and this worker holds no request.
+    plans_api_timeout_seconds: float = env("HIPPIUS_PLANS_API_TIMEOUT_SECONDS:30.0", convert=float)
+    # Age past which the cached maps are reported stale. Serving stale is still strictly better than
+    # failing closed, so this drives a metric and an alert, never a behaviour change.
+    plans_stale_after_seconds: int = env("HIPPIUS_PLANS_STALE_AFTER_SECONDS:3600", convert=int)
 
     # ATS (Apache Traffic Server) reverse-proxy cache endpoints (CSV). When ATS_CACHE_ENDPOINT is unset,
     # all PURGE + public Cache-Control logic becomes a no-op — safe default for local dev.
@@ -742,6 +873,9 @@ def get_config() -> Config:
     # Ensure a usable keystore DSN (falls back to DATABASE_URL)
     if not cfg.encryption_database_url:
         object.__setattr__(cfg, "encryption_database_url", cfg.database_url)
+
+    if not cfg.database_readonly_url:
+        object.__setattr__(cfg, "database_readonly_url", cfg.database_url)
 
     # Enforce environment constraints:
     # - Only in 'test' can enable_bypass_credit_check be True

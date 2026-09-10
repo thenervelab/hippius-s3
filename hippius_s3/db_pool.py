@@ -28,7 +28,7 @@ async def acquire_with_timeout(pool: Any, timeout: float) -> AsyncIterator[Any]:
     try:
         conn = await pool.acquire(timeout=timeout)
     except asyncio.TimeoutError as e:
-        raise PoolAcquireTimeout() from e
+        raise PoolAcquireTimeout(f"db pool acquire timed out after {timeout}s") from e
     try:
         yield conn
     finally:

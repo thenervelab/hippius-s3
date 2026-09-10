@@ -68,6 +68,79 @@ configured something they did not. READ and READ_ACP are untouched: publishing o
 publicly is the point of several of these buckets. The predicate is `forbidden_write_grants` in
 [services/service_accounts.py](../../services/service_accounts.py).
 
+**Billing plans (parallel to pay-as-you-go).** A mutating access-key request now resolves the
+caller's plan before the credit gates. The branch order inside `account_middleware` is:
+
+```
+reads (GET/HEAD)      -> lightweight account, no gates
+service account       -> bypass everything                       (unchanged)
+on a billing plan     -> storage-quota gate                      (NEW)
+everything else       -> has_credits + Arion can_upload          (unchanged)
+```
+
+An account on a plan skips BOTH pay-as-you-go gates. That is not an optimisation: a plan customer
+holds no substrate credits, so leaving `has_credits` in place would 402 every one of them before the
+quota check ran. Deletes short-circuit to allow — a customer who downgraded below their usage has to
+be able to dig themselves out.
+
+Plan membership is read from two `redis-accounts` hashes populated by the `plans-cacher` worker;
+nothing is added to the auth path and `/objectstore/tokens/auth/` is untouched. Decision logic is
+[services/plan_gate.py](../services/plan_gate.py); the caches are
+[hippius_s3/services/plans_cache.py](../../services/plans_cache.py).
+
+Two failure postures, deliberately different:
+
+- **The lookup fails** (Redis down, malformed cached JSON) -> fall through to the pay-as-you-go
+  path. That is exactly what the code did before plans existed, so a Redis blip can never be a new
+  failure mode.
+- **The lookup succeeds but the quota is unknown** (cold catalog, unknown plan id) -> ALLOW, loudly.
+  A positively identified paying customer is never blocked because our cache has not warmed up.
+
+**Where the numbers come from.** Both the quota and the usage sit on one cached row published by
+the plans-cacher — quota from upstream, usage counted by that worker in the background. The gate is
+therefore a single Redis `HGET` and a pure comparison, with no database work on the request path.
+
+The cost, stated plainly: usage is only as fresh as the last refresh
+(`HIPPIUS_PLANS_LOOP_SLEEP`, 10 min), and a denial is **not** re-checked live. A customer who
+deletes data to get back under quota stays refused until the next cycle. The refresh interval is the
+only lever on that, and the 402 message says so.
+
+**`HIPPIUS_ENABLE_BILLING_PLANS` is the master switch, and it ships OFF.** With it false every
+account takes the pay-as-you-go path exactly as before — but the plan caches are still consulted on
+writes, and any account that HAS a plan gets a `BILLING_PLAN_SHADOW` line recording what we would
+have charged them against. That is how the whole chain is proven working in prod logs before it can
+cost anyone an upload; flipping it on is then a config change, not a code change.
+
+```
+{namespace="hippius-s3-prod",app="api"} |= "BILLING_PLAN_SHADOW"
+{namespace="hippius-s3-prod",app="api"} |= "BILLING_PLAN_SHADOW" |= "would=would_deny"
+```
+
+Shadow mode runs the SAME function on the SAME inputs as enforcement — `evaluate_quota(...,
+enforcing=False)` — and differs only in naming the over-quota verdict `would_deny` instead of
+`deny`. That is deliberate and pinned by `test_shadow_and_enforced_share_the_arithmetic`: a second
+copy of the arithmetic could drift, and the shadow period is precisely the window in which the
+drift would go unnoticed. Nothing in the shadow path can fail the request.
+
+The flag is held as **two GitHub secrets**, so the environments move independently:
+
+| Secret | Read by |
+|---|---|
+| `HIPPIUS_ENABLE_BILLING_PLANS_STAGING` | pods with `ENVIRONMENT=staging` |
+| `HIPPIUS_ENABLE_BILLING_PLANS_PROD` | pods with `ENVIRONMENT=production` |
+| `HIPPIUS_ENABLE_BILLING_PLANS` | local dev and tests (fallback) |
+
+Each deploy workflow seeds only its own key into that cluster's Secret, so staging's Secret never
+contains the production value at all. `config.py::_parse_enable_billing_plans` then selects by the
+pod's OWN `ENVIRONMENT`, which means even a mis-seeded Secret cannot let production read staging's
+flag. Note `production` maps to the `_PROD` suffix — an uppercase of `ENVIRONMENT` would look for
+`_PRODUCTION`, find nothing, and silently leave the feature off, so the mapping is explicit.
+
+Values are parsed by `_parse_bool` (true/True/1/yes/on); a typo fails the pod loudly rather than
+silently leaving the feature off, and an environment secret that is present-but-empty falls through
+to the fallback rather than pinning the feature off. An empty `hippius_s3_plan_accounts` hash is the
+other kill switch.
+
 ### [trailing_slash.py](trailing_slash.py) — `trailing_slash_normalizer`
 
 Keeps `/foo/bar/` and `/foo/bar` equivalent for S3 operations.

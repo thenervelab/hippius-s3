@@ -12,6 +12,7 @@ Worker entry points — the `run_*.py` scripts that actually run as pod processe
 | [run_janitor_in_loop.py](run_janitor_in_loop.py) | FS cache GC with replication gate, hot retention, and pressure modes. | Single instance |
 | [run_orphan_checker_in_loop.py](run_orphan_checker_in_loop.py) | Periodically scans the Hippius chain for orphaned files and enqueues cleanup. | Single instance |
 | [run_account_cacher_in_loop.py](run_account_cacher_in_loop.py) | Warms account credit cache from Substrate. | Single instance |
+| [run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py) | Scrapes the S3 billing-plan catalog + account→plan map from api.hippius.com into `redis-accounts`. | Single instance (**must stay `replicas: 1`**) |
 | [run_migrator_once.py](run_migrator_once.py) | One-shot data migration (e.g., v4→v5). Invoked as a K8s Job. | Job |
 | [cachet_health_check.py](cachet_health_check.py) | Pushes status to the external Cachet status page. | CronJob |
 
@@ -71,6 +72,174 @@ Config:
 ## Account cacher
 
 [run_account_cacher_in_loop.py](run_account_cacher_in_loop.py). Polls Substrate for account state (free/reserved balance, credits, bandwidth) and mirrors into `redis-accounts`. Cache TTL set by the cacher, not clients. `CACHER_LOOP_SLEEP=60`.
+
+## Plans cacher
+
+[run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py). One poll loop against one endpoint:
+
+```
+GET /api/s3/plans/accounts/?page=1&page_size=500     every HIPPIUS_PLANS_LOOP_SLEEP (600s)
+```
+
+It carries both halves — `plans` is the catalog, `results` is the paginated account roll — and is
+split across two hashes on `redis-accounts`:
+
+| Redis key | Field | Value |
+|---|---|---|
+| `hippius_s3_plan_accounts` | account SS58 | `{"plan", "storage_limit_bytes", "used_bytes"}` |
+| `hippius_s3_plans` | plan name | `{"h256": ..., "storage_bytes": ...}` |
+| `hippius_s3_plans:meta` | — | `{fetched_at, accounts, plans}` |
+
+The account row carries everything the quota gate needs, so the request path is ONE `HGET` and a
+comparison — no catalog lookup, no database. The two halves come from different places:
+
+- **`storage_limit_bytes`** is the account's MAX QUOTA, from upstream. `results[].storage_bytes`
+  wins over the plan's list price, so a negotiated limit is not silently overwritten.
+- **`used_bytes`** is what the account actually stores, **counted by this worker** — upstream
+  reports no usage figure. Counted per bucket, in keyset pages, over
+  `HIPPIUS_PLANS_USAGE_CONCURRENCY` (4) connections.
+
+### Why the count is chunked
+
+The obvious form is one aggregate per account, and that is what this used to do. It cannot finish.
+
+Cost is driven by OBJECTS PER BUCKET, not by bucket fan-out and not by account count. One plan
+account's objects are concentrated in a single bucket holding a filesystem-style workload of
+**millions of small objects**; the single-statement aggregate for it takes over a minute. Both ceilings that apply are 30s — `HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS` and the
+replica's `max_standby_streaming_delay` — so it was cancelled every cycle, and because one account's
+failure fails the whole cycle, the roll was never published at all.
+
+`usage_service.py` therefore lists the account's live buckets, then walks each bucket in keyset
+pages of `HIPPIUS_PLANS_USAGE_PAGE_SIZE` objects (`get_bucket_storage_bytes_page.sql`). Same
+definition, same bytes, spread over N statements — pinned against the canonical query in
+`tests/integration/test_usage_service_chunked.py`. It does not make the total work smaller; it makes
+no single STATEMENT long enough to be cancelled, and stops the count pinning the xmin horizon for a
+minute at a time.
+
+Measured cold on the prod replica, each page read from an un-warmed region of that bucket's key
+space:
+
+| page size | offset | cold | per row |
+|---|---|---|---|
+| 100k | 5.0M | 1.88s | 18.8 µs |
+| **200k** | 6.5M | **2.91s** | **14.6 µs** ← default |
+| **200k** | 1.2M | **5.31s** | **26.6 µs** ← worst observed, **5.7x margin** |
+| 500k | 0 | 20.2s | 40.0 µs — 1.5x margin, do not |
+
+Only 200k has two samples. Read the 100k and 500k rows as single points from one region each — by
+the second property below, either could be ~2x off in another part of the bucket, so 100k is not
+established as cheaper per row than 200k.
+
+Two properties, each of which cost a wrong default once:
+
+**Per-row cost is not linear in page size.** Past a few hundred thousand rows the random heap
+fetches stop fitting cache and the page falls off a cliff — 500k is 2.7x the per-row cost of 200k.
+Maximising this to save round trips is how you get it cancelled.
+
+**Per-row cost also varies ~2x by REGION at a fixed page size**, from heap locality. A single sample
+is not a margin: the first 200k measurement said 2.91s and a second at a different depth said 5.31s.
+Judge a page size by the WORST observed page, not the mean.
+
+Whole-account projection for that account: ~40 pages at ~4.1s average ≈ **165s**, none of them near
+the ceiling. That is slower in total than the ~64s single statement would have been — but that
+statement never completed. Bounded-and-finishing beats fast-and-cancelled.
+
+**The counts run against a REPLICA** (`DATABASE_READONLY_URL`, falling back to `DATABASE_URL` when
+unset), with `jit=off` on the pool — JIT is pure overhead for an index-probe-bound query and cost
+107ms of a 326ms count for a 1,300-object account. This cluster's primary has been stalled by a
+read-storm before.
+
+A maintained counter — a delta ledger folded into a per-bucket rollup — is the real long-term answer
+and is written up in todo.md. Chunking is what makes the current design work until then; recounting
+is O(objects) forever, and that bucket only grows.
+
+⚠️ **The refresh interval IS the enforcement lag, in both directions.** An account can overshoot its
+quota by one cycle's worth of uploads, and a customer who deletes data to get back under stays
+refused until the next cycle sees it. Nothing on the request path recomputes.
+
+A count failing for ANY account fails the whole cycle and keeps the previous roll: publishing a
+partial answer would write `used_bytes=0` for the accounts we could not count, silently handing them
+unlimited headroom.
+
+**Only accounts billed as a plan are written.** A row needs `billing == "plan"` and a plan name.
+Everything else is simply absent from the hash, which is exactly what the request path already reads
+as pay-as-you-go.
+
+⚠️ **`active` is NOT consulted, and that is a deliberate concession to the real payload.** The
+original filter also required `active` true, on the reading that a lapsed subscription keeps
+`billing: "plan"` and its old plan name and is distinguished only by that flag. The live data
+contradicted it: upstream returns `active: false` on **every** row it serves — 3069 at the last
+check, zero exceptions across the two days it has been up (2026-09-08 to -09) — including the one
+genuine subscriber, which carries a real `subscription_id` and a `next_charge` a month in the
+future. A cancelled subscription does not have a future charge date, so the field is not carrying
+that meaning; on present evidence it is simply unpopulated.
+
+Requiring it admitted nobody, which is the worse failure: the gate could never engage, so the
+feature was unobservable even in shadow mode and enforcement would have been a permanent silent
+no-op.
+
+**Measured blast radius: exactly ONE row in 3069 carries `billing == "plan"`** (checked twice, a day
+apart). Re-measure before assuming otherwise — every risk below scales with that number, and so does
+the "few tens of accounts" cost model this worker's design rests on.
+
+The risks now accepted, **in both directions** — admission is not purely generous:
+
+1. A cancelled subscriber keeps their allowance until the check is restored.
+2. Admission also **imposes a cap** and removes the pay-as-you-go path. An admitted account that is
+   over its plan size but holds substrate credits used to upload fine via `can_upload`; with
+   enforcement on it is refused 402 until it deletes data *and* a cacher cycle re-counts.
+3. An admitted account whose quota is unknown — plan absent from the catalog, or a null/0/negative
+   `storage_bytes` — resolves to `catalog_miss`, which allows the write **and** skips `has_credits`
+   and `can_upload`. That is unmetered storage, not merely an unenforced quota.
+
+None of the three is reachable while `HIPPIUS_ENABLE_BILLING_PLANS` is off, which is how prod ships.
+Staging has it ON, so staging is where 2 and 3 would first appear.
+
+**When upstream confirms what `active` means, restore the check** — or switch to `next_charge` in
+the future, which is the field that actually tracked reality here. Pinned by
+`tests/unit/test_plans_cacher_worker.py::test_the_active_flag_is_not_consulted`, which is the test
+to invert.
+
+🚨 **A rollback needs `DEL hippius_s3_plan_accounts` on redis-accounts first.** Restoring the check
+admits ~nobody, so the new roll is empty over a live hash, the shrink guard refuses it, `run_cycle`
+swallows the raise — and the OLD wide roll keeps serving with `used_bytes` frozen at the moment of
+the revert. The deploy looks clean and nothing changes. Pinned by
+`test_restoring_the_active_check_is_wedged_by_the_shrink_guard`.
+
+**How you would know it is time:** every cycle logs `upstream_active=N` counted over every row in
+the payload. Nothing else reads the field, so that line is the only signal that upstream has started
+writing it. Alert on it going non-zero.
+
+```
+{namespace="hippius-s3-prod",app="plans-cacher"} |= "Published plan roll" != "upstream_active=0"
+```
+
+**Caching is unconditional.** This worker does not read `HIPPIUS_ENABLE_BILLING_PLANS` and is not
+deployed with it, so the maps stay warm and observably correct long before enforcement is switched
+on — flipping the flag on the api is then a config change, not a cold-cache event.
+
+**This pod being down is not an outage.** Neither hash has a TTL and `redis-accounts` is
+`noeviction` + AOF, so the last known good roll keeps serving through an api.hippius.com outage and
+across a Redis restart. Alert on `plans_cache_age_seconds`, not on pod restarts.
+
+Three invariants, all in [hippius_s3/services/plans_cache.py](../hippius_s3/services/plans_cache.py),
+each of which exists to stop the same failure — silently demoting plan customers to pay-as-you-go
+and 402ing them on their next upload:
+
+1. **Publication is a whole-hash build-then-`RENAME`.** `refresh_plan_roll_once` fetches EVERY page
+   before publishing; a failure on page 7 of 20 leaves the live hash untouched.
+2. **An empty or heavily-shrunk roll is refused** (`MAX_ACCOUNT_MAP_SHRINK_RATIO`, 50%). One bad
+   upstream deploy returning a truncated-but-valid list must not wipe the fleet's plans.
+3. **No TTL, ever.** A TTL would delete the last-known-good map during exactly the outage it exists
+   to survive.
+
+Pagination is bounded by `MAX_PAGES` so a self-referential `next` cursor cannot spin the worker
+forever without publishing. Upstream returns `next` as an ABSOLUTE url; only its path and query are
+followed, re-homed on our own configured host — otherwise the e2e cacher would walk out of
+mock-hippius-api and into production.
+
+`replicas` must stay 1 — two replicas would not corrupt anything (last `RENAME` wins) but would
+double the upstream load for nothing.
 
 ## Migrator
 

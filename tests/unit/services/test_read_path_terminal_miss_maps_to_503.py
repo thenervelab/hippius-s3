@@ -71,7 +71,7 @@ async def test_read_response_terminal_miss_raises_download_not_ready() -> None:
     with _patched(cfg, _terminal_miss):
         with pytest.raises(object_reader.DownloadNotReadyError):
             await object_reader.read_response(
-                db=None, redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
+                ctx=_ctx(), redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
             )
 
 
