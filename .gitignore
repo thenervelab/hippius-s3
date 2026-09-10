@@ -2,7 +2,12 @@
 .env
 .env.backup
 *.csv
+# Local AWS-CLI credential files for this gateway. The repo is PUBLIC, and these
+# hold live access keys and secrets, so match the whole family rather than
+# listing them one at a time -- .aws.billing.acc sat untracked-but-unignored for
+# a while, one `git add -A` away from being published.
 .aws.cli.env
+.aws.*
 
 # Python
 __pycache__/
