@@ -288,18 +288,17 @@ class Config:
     # enforcing it. Note the replica enforces its own 30s ceiling via max_standby_streaming_delay,
     # so raising this past 30s buys nothing on its own.
     plans_usage_timeout_seconds: float = env("HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS:30.0", convert=float)
-    # Objects per keyset page when counting a bucket. The ceiling that matters is
-    # plans_usage_timeout_seconds AND the replica's max_standby_streaming_delay, BOTH 30s.
+    # Objects per keyset page when counting a bucket. Bounds ONE statement against the two 30s
+    # ceilings above; no value changes the total, only how close a statement gets to being cancelled.
     #
-    # Measured cold on the prod replica against the 7.83M-object JuiceFS bucket, each from an
-    # un-warmed region of the key space:
-    #     100k -> 1.88s  (18.8 us/row, 16x margin)
-    #     200k -> 2.91s  (14.6 us/row, 10x margin)   <-- best throughput AND ample margin
-    #     500k -> 20.2s  (40.0 us/row, 1.5x margin)  <-- do not
-    # The cost per row is NOT linear: past a few hundred thousand rows the random heap fetches stop
-    # fitting the cache and the page falls off a cliff. That is why this is tuned by measurement
-    # rather than set as large as possible to save round trips. There is no correctness difference
-    # at any value -- only how close one statement gets to being cancelled.
+    # Tune it by measurement and judge it by the WORST page, never the mean. Per-row cost is neither
+    # linear in page size nor uniform across a bucket -- it roughly doubles between key regions from
+    # heap locality, and falls off a cliff past a few hundred thousand rows. Each of those cost a
+    # wrong default once: 500k looked fine extrapolated and took 20s, and 200k looked like a 10x
+    # margin on one sample that a second sample put at 5.7x.
+    #
+    # Numbers, and the offsets they were sampled at, live in workers/CLAUDE.md -- one copy, because
+    # two would drift.
     plans_usage_page_size: int = env("HIPPIUS_PLANS_USAGE_PAGE_SIZE:200000", convert=int)
     # Per-attempt bound on the scrape. Retry COUNTS cannot bound latency when the per-attempt cost
     # is unbounded, and this worker holds no request.
