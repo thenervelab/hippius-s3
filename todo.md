@@ -193,11 +193,11 @@ Fast-path copy: rewraps the DEK under the destination's AAD, copies `chunk_backe
 
 ### P2 — Billing plans: usage is recomputed from scratch every cycle, forever
 
-**Superseded a P1 that mis-diagnosed this.** The earlier entry blamed 203-bucket fan-out and quoted
-~33s. Both were wrong: the account has **25 live buckets** (203 total; the query filters
-`deleted_at IS NULL`), one of which is a JuiceFS bucket with **7.83M live objects** that is 99.5% of
-the work, and the true single-statement cost is **~64s**, not 33 — 33s was where the replica's
-cancellation fired, not where the query finished.
+**Superseded a P1 that mis-diagnosed this.** The earlier entry blamed bucket fan-out and quoted
+~33s. Both were wrong: most of the account's buckets are soft-deleted and the query filters
+`deleted_at IS NULL`, and of the live ones a single bucket holding a filesystem-style workload of
+millions of small objects is ~99% of the work. The true single-statement cost is over a minute —
+~33s was where the replica's cancellation fired, not where the query finished.
 
 The immediate blocker is fixed: `usage_service.py` now walks each bucket in keyset pages, so no
 single statement approaches the 30s ceilings. Measured cold on the prod replica at the 200k default,
@@ -246,10 +246,10 @@ account with one 7.8M-object bucket breaks a recount design no matter how few ac
 admits a row on `billing == "plan"` plus a plan name, and does NOT consult `active`.
 
 It did originally, on the reading that a lapsed subscription is distinguished only by that flag. The
-live payload said otherwise: `active: false` on **every row** — 3069 at the last check, zero
-exceptions across the two days the endpoint has been up — including the sole real subscriber,
-`subscription_id` 148, plan `business`, `next_charge` `2026-10-08`, i.e. a month in the FUTURE. A
-cancelled subscription has no future charge date, so the field is not carrying that meaning; it
+live payload said otherwise: `active: false` on **every row** it serves, zero exceptions across the
+two days the endpoint has been up — including the sole real subscriber, whose row carried a real
+subscription id and a `next_charge` date in the FUTURE. A cancelled subscription has no future
+charge date, so the field is not carrying that meaning; it
 looks simply unpopulated. Requiring it admitted nobody, making the gate permanently inert and
 unobservable even in shadow mode.
 

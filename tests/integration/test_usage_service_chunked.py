@@ -1,7 +1,7 @@
 """The chunked storage count must equal the single-statement one, byte for byte.
 
 usage_service walks each bucket in keyset pages instead of running one aggregate, because the
-single statement cannot finish for a 7.83M-object bucket inside either 30s ceiling (our asyncpg
+single statement cannot finish for a bucket of millions of objects inside either 30s ceiling (our
 timeout, and the replica's max_standby_streaming_delay). Chunking is a performance change ONLY --
 if it also changes the number, it changes what customers are billed.
 

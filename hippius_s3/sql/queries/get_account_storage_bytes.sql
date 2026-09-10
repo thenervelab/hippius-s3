@@ -7,7 +7,7 @@
 --
 -- NO RUNTIME CALLER, AND THAT IS DELIBERATE -- DO NOT DELETE THIS AS DEAD SQL. The plans-cacher
 -- walks each bucket in keyset pages instead (get_bucket_storage_bytes_page.sql), because this form
--- cannot finish for a 7.83M-object bucket inside the 30s ceilings that apply to it. This query
+-- cannot finish for a bucket of millions of objects inside the 30s ceilings that apply. This query
 -- survives as the CANONICAL DEFINITION, and as the oracle the chunked walk is asserted against case
 -- by case in tests/integration/test_usage_service_chunked.py. Delete it and the chunked path has
 -- nothing independent left to be checked for correctness against.

@@ -1,10 +1,11 @@
 -- One keyset page of a bucket's billable bytes. Step 2 of the chunked storage count.
 --
 -- WHY THIS EXISTS. The single-statement form (get_account_storage_bytes.sql) cannot finish for a
--- large bucket: one prod account owns a JuiceFS bucket of 7.83M live objects, measured at ~64s
--- cold. The plans-cacher's asyncpg timeout is 30s AND the replica's max_standby_streaming_delay is
--- 30s, so it was cancelled every cycle -- and because a single account's failure fails the whole
--- cycle, the roll was never published at all.
+-- large bucket: one account's objects are concentrated in a single bucket holding a filesystem-style
+-- workload of millions of small objects, measured at over a minute cold. The plans-cacher's asyncpg
+-- timeout is 30s AND the replica's max_standby_streaming_delay is 30s, so it was cancelled every
+-- cycle -- and because a single account's failure fails the whole cycle, the roll was never
+-- published at all.
 --
 -- Chunking does NOT make the total work smaller; it makes no single STATEMENT long enough to hit
 -- either 30s ceiling. Same bytes, same definition, spread over N round trips. It also stops the

@@ -87,15 +87,14 @@ SAMPLE_PAGE = {
         },
         # Shaped after the FIRST REAL payload: a live subscription (a real subscription id, and a
         # next_charge in the future) that upstream nonetheless reports as active=false. That
-        # combination is why the flag is not consulted. Ids and sizes here are fixtures, not the
-        # production account's -- see workers/CLAUDE.md for the real row.
+        # combination is why the flag is not consulted. Every id, size and date here is a fixture.
         {
             "ss58": ACCT_INACTIVE_FLAG,
             "billing": "plan",
             "plan": "pro",
             "active": False,
             "storage_bytes": 10 * TB,
-            "next_charge": "2026-10-08",
+            "next_charge": "2099-01-01",
             "subscription_id": 3901,
         },
         {
