@@ -126,6 +126,10 @@ space:
 | **200k** | 1.2M | **5.31s** | **26.6 µs** ← worst observed, **5.7x margin** |
 | 500k | 0 | 20.2s | 40.0 µs — 1.5x margin, do not |
 
+Only 200k has two samples. Read the 100k and 500k rows as single points from one region each — by
+the second property below, either could be ~2x off in another part of the bucket, so 100k is not
+established as cheaper per row than 200k.
+
 Two properties, each of which cost a wrong default once:
 
 **Per-row cost is not linear in page size.** Past a few hundred thousand rows the random heap
