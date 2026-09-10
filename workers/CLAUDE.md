@@ -243,7 +243,7 @@ Two jobs in one loop:
 | Job | Interval | What it does |
 |---|---|---|
 | **Compact** | `HIPPIUS_USAGE_ROLLUP_LOOP_SLEEP` (5s) | Claims `HIPPIUS_USAGE_ROLLUP_BATCH_SIZE` (5000) ledger rows with `DELETE ... RETURNING` and adds them to the counter. |
-| **Reconcile** | `HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS` (3600s) | Fully recomputes `HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE` (25) live buckets, oldest-recomputed first, and exports the correction as **drift**. |
+| **Reconcile** | `HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS` (300s) | Fully recomputes `HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE` (200) live buckets, oldest-recomputed first, and exports the correction as **drift**. ~19h for a full sweep, which is the only bound on how long a bucket can carry a wrong number — see the rate justification in [config.py](../hippius_s3/config.py). |
 
 **Compaction is exactly-once by construction.** The rows leave the ledger in the same transaction
 that adds them to the counter, so a crash puts them back and a second compactor can only see rows
