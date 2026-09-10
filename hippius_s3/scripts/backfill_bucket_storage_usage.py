@@ -25,7 +25,9 @@ run. Per-bucket, compaction interleaves.
 
 --dry-run reports what each bucket's counter WOULD move by without writing anything, which is the
 number to sanity-check before the real run: on a freshly migrated estate every bucket should move
-from 0 to its true size.
+from 0 to its true size. It runs the SAME recompute as --apply and rolls it back, rather than asking
+the question a second way -- a dry run whose arithmetic can disagree with the apply it predicts is
+worse than no dry run.
 """
 
 from __future__ import annotations
@@ -49,26 +51,6 @@ _ZERO_UUID = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
 # Bucket ids fetched per keyset page. Only bounds the id list, not any aggregate.
 _PAGE_SIZE = 1000
-
-# Read-only mirror of recompute_bucket_storage_usage's aggregate, for --dry-run. Kept here rather
-# than as a query file because nothing else may ever use it: any second caller of "count a bucket
-# the slow way" is a regression back to what this change removes.
-_DRY_RUN_SQL = """
-SELECT
-    COALESCE((SELECT bsu.bytes_used FROM bucket_storage_usage bsu WHERE bsu.bucket_id = $1), 0)::bigint
-        AS bytes_before,
-    COALESCE((
-        SELECT SUM(ov.size_bytes)
-        FROM objects o
-        JOIN object_versions ov
-          ON ov.object_id = o.object_id
-         AND ov.object_version = o.current_object_version
-         AND ov.deleted_at IS NULL
-         AND NOT ov.is_delete_marker
-        WHERE o.bucket_id = $1
-          AND o.deleted_at IS NULL
-    ), 0)::bigint AS bytes_after
-"""
 
 
 async def _bucket_ids(conn: asyncpg.Connection) -> list[uuid.UUID]:
@@ -96,12 +78,20 @@ async def main_async(args: argparse.Namespace) -> int:
         moved = 0
 
         for index, bucket_id in enumerate(bucket_ids, start=1):
+            # BOTH modes run the SAME recompute; --dry-run just rolls it back. A dry run that
+            # asked the question a different way could answer differently from the apply it is
+            # meant to predict, which is the one thing a dry run must not do -- and it would be a
+            # third copy of an aggregate that already exists twice.
             if args.apply:
                 result = await storage_rollup_service.recompute_bucket(conn, bucket_id, args.timeout)
-                before, after = result.bytes_before, result.bytes_after
             else:
-                row = await conn.fetchrow(_DRY_RUN_SQL, bucket_id, timeout=args.timeout)
-                before, after = int(row["bytes_before"]), int(row["bytes_after"])
+                tx = conn.transaction()
+                await tx.start()
+                try:
+                    result = await storage_rollup_service.recompute_bucket(conn, bucket_id, args.timeout)
+                finally:
+                    await tx.rollback()
+            before, after = result.bytes_before, result.bytes_after
 
             total_bytes += after
             if before != after:
