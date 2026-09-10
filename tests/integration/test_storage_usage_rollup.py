@@ -1261,3 +1261,73 @@ async def test_a_pathological_size_cannot_abort_a_customer_write(pg_tx: asyncpg.
     # Out-of-range deltas are dropped rather than written, so nothing corrupt reaches the ledger.
     for delta in await _ledger_rows(pg_tx, bucket_id):
         assert -(2**63) <= delta <= 2**63 - 1
+
+
+async def test_same_key_overwrites_in_separate_transactions_do_not_over_count(
+    committed_pool: CommittedPool,
+) -> None:
+    """The regression for the concurrent-overwrite over-count, in PRODUCTION's transaction shape.
+
+    THE DISTINCTION THAT MATTERS. test_parallel_overwrites_of_the_same_key_converge wraps the
+    reserve and the finalize in ONE transaction, which serialises the whole PUT on the objects row
+    lock and cannot expose this bug -- which is exactly why it passed while the counter was
+    over-billing in production. object_writer.py commits the reserve and the finalize SEPARATELY
+    (object_writer.py:255 and :470), because the streamed body sits between them and no connection
+    may be held across it. So `_put` is called WITHOUT a surrounding transaction here, on purpose.
+    Wrap it and this test stops testing anything.
+
+    Without the FOR NO KEY UPDATE in storage_usage_objects_update_trigger (migration
+    20260910180000) each version is added by its own finalize and never subtracted, because the
+    successor's reserve computed the decrement from a size that was still 0 in its snapshot.
+    Measured before the fix: +686,080 at concurrency 4 and +3,132,416 at 16.
+
+    Sizes MUST vary: an equal-size overwrite nets to zero and emits no ledger row at all, so a
+    constant-size version of this test would pass against the bug.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async def overwrite(size: int) -> None:
+        async with committed_pool.acquire() as conn:
+            await _put(conn, bucket_id, "hot", size)
+
+    for _ in range(4):
+        await asyncio.gather(*(overwrite(s) for s in (1024, 8192, 65536, 4096, 16384, 2048)))
+
+    async with committed_pool.acquire() as conn:
+        await _compact(conn)
+        # Asserted against the canonical query, never against a constant: which writer wins is a
+        # race, and only the survivor's bytes may be counted.
+        assert await _raw_rollup(conn, acct) == await _oracle(conn, acct)
+
+
+async def test_reserve_racing_a_finalize_of_the_outgoing_version(committed_pool: CommittedPool) -> None:
+    """The exact interleaving, rather than a stress that reaches it by luck.
+
+    A reserve of a new version runs while the OUTGOING version's finalize is still in flight. The
+    reserve's decrement must reflect the outgoing version's FINAL size, not the 0 it was reserved
+    at -- which is what the row lock forces.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    # Repeated, because a two-way race hits the window only some of the time -- a single attempt
+    # passes against the bug often enough to be worthless as a regression test.
+    for round_index in range(12):
+        async with committed_pool.acquire() as conn:
+            first = await _reserve(conn, bucket_id, "hot")
+
+        async def finalize_first(row: asyncpg.Record = first) -> None:
+            async with committed_pool.acquire() as conn:
+                await _finalize(conn, row["object_id"], row["current_object_version"], 7000 + round_index)
+
+        async def reserve_second() -> None:
+            async with committed_pool.acquire() as conn:
+                row = await _reserve(conn, bucket_id, "hot")
+                await _finalize(conn, row["object_id"], row["current_object_version"], 300 + round_index)
+
+        await asyncio.gather(finalize_first(), reserve_second())
+
+    async with committed_pool.acquire() as conn:
+        await _compact(conn)
+        assert await _raw_rollup(conn, acct) == await _oracle(conn, acct)
