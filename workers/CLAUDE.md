@@ -116,17 +116,29 @@ definition, same bytes, spread over N statements — pinned against the canonica
 no single STATEMENT long enough to be cancelled, and stops the count pinning the xmin horizon for a
 minute at a time.
 
-**Per-row cost is NOT linear in page size** — measured cold on the prod replica, each from an
-un-warmed region of that bucket's key space:
+Measured cold on the prod replica, each page read from an un-warmed region of that bucket's key
+space:
 
-| page size | cold | per row | margin under 30s |
+| page size | offset | cold | per row |
 |---|---|---|---|
-| 100k | 1.88s | 18.8 µs | 16x |
-| **200k** | **2.91s** | **14.6 µs** | **10x** ← default |
-| 500k | 20.2s | 40.0 µs | 1.5x — do not |
+| 100k | 5.0M | 1.88s | 18.8 µs |
+| **200k** | 6.5M | **2.91s** | **14.6 µs** ← default |
+| **200k** | 1.2M | **5.31s** | **26.6 µs** ← worst observed, **5.7x margin** |
+| 500k | 0 | 20.2s | 40.0 µs — 1.5x margin, do not |
 
-Past a few hundred thousand rows the random heap fetches stop fitting cache and the page falls off a
-cliff. Tune this by measurement, not by maximising it to save round trips.
+Two properties, each of which cost a wrong default once:
+
+**Per-row cost is not linear in page size.** Past a few hundred thousand rows the random heap
+fetches stop fitting cache and the page falls off a cliff — 500k is 2.7x the per-row cost of 200k.
+Maximising this to save round trips is how you get it cancelled.
+
+**Per-row cost also varies ~2x by REGION at a fixed page size**, from heap locality. A single sample
+is not a margin: the first 200k measurement said 2.91s and a second at a different depth said 5.31s.
+Judge a page size by the WORST observed page, not the mean.
+
+Whole-account projection for that account: ~40 pages at ~4.1s average ≈ **165s**, none of them near
+the ceiling. That is slower in total than the ~64s single statement would have been — but that
+statement never completed. Bounded-and-finishing beats fast-and-cancelled.
 
 **The counts run against a REPLICA** (`DATABASE_READONLY_URL`, falling back to `DATABASE_URL` when
 unset), with `jit=off` on the pool — JIT is pure overhead for an index-probe-bound query and cost

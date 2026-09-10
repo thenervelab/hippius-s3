@@ -291,15 +291,27 @@ class Config:
     # Objects per keyset page when counting a bucket. The ceiling that matters is
     # plans_usage_timeout_seconds AND the replica's max_standby_streaming_delay, BOTH 30s.
     #
-    # Measured cold on the prod replica against the 7.83M-object JuiceFS bucket, each from an
-    # un-warmed region of the key space:
-    #     100k -> 1.88s  (18.8 us/row, 16x margin)
-    #     200k -> 2.91s  (14.6 us/row, 10x margin)   <-- best throughput AND ample margin
-    #     500k -> 20.2s  (40.0 us/row, 1.5x margin)  <-- do not
-    # The cost per row is NOT linear: past a few hundred thousand rows the random heap fetches stop
-    # fitting the cache and the page falls off a cliff. That is why this is tuned by measurement
-    # rather than set as large as possible to save round trips. There is no correctness difference
-    # at any value -- only how close one statement gets to being cancelled.
+    # Measured cold on the prod replica against the 7.83M-object JuiceFS bucket, each page read from
+    # an un-warmed region of the key space:
+    #     100k, offset 5.0M -> 1.88s
+    #     200k, offset 6.5M -> 2.91s
+    #     200k, offset 1.2M -> 5.31s   <-- WORST observed: 5.7x margin under the 30s ceiling
+    #     500k, offset 0    -> 20.2s   <-- 1.5x margin; do not
+    #
+    # TWO THINGS THAT COST US A WRONG DEFAULT ONCE EACH, so both are written down:
+    #
+    # Cost per row is NOT linear in page size. Past a few hundred thousand rows the random heap
+    # fetches stop fitting cache and the page falls off a cliff -- 500k is 2.7x the per-row cost of
+    # 200k. Setting this as large as possible to save round trips is how you get it cancelled.
+    #
+    # Cost per row ALSO VARIES ~2x BY REGION at a fixed page size, from heap locality. A single
+    # sample is not a margin: the first 200k measurement said 2.91s (10x margin) and a second at a
+    # different depth said 5.31s. Quote the WORST observed page, not the mean, when judging whether
+    # a page size is safe.
+    #
+    # 200k stands: 5.7x margin at the worst observed page, and the best per-row throughput measured.
+    # There is no correctness difference at any value -- only how close one statement gets to being
+    # cancelled, and how many round trips the walk takes.
     plans_usage_page_size: int = env("HIPPIUS_PLANS_USAGE_PAGE_SIZE:200000", convert=int)
     # Per-attempt bound on the scrape. Retry COUNTS cannot bound latency when the per-attempt cost
     # is unbounded, and this worker holds no request.
