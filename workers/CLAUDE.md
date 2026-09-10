@@ -13,6 +13,7 @@ Worker entry points — the `run_*.py` scripts that actually run as pod processe
 | [run_orphan_checker_in_loop.py](run_orphan_checker_in_loop.py) | Periodically scans the Hippius chain for orphaned files and enqueues cleanup. | Single instance |
 | [run_account_cacher_in_loop.py](run_account_cacher_in_loop.py) | Warms account credit cache from Substrate. | Single instance |
 | [run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py) | Scrapes the S3 billing-plan catalog + account→plan map from api.hippius.com into `redis-accounts`. | Single instance (**must stay `replicas: 1`**) |
+| [run_usage_rollup_in_loop.py](run_usage_rollup_in_loop.py) | Folds the storage delta ledger into `bucket_storage_usage`; reconciles it and exports drift. | Single instance (**must stay `replicas: 1`**) |
 | [run_migrator_once.py](run_migrator_once.py) | One-shot data migration (e.g., v4→v5). Invoked as a K8s Job. | Job |
 | [cachet_health_check.py](cachet_health_check.py) | Pushes status to the external Cachet status page. | CronJob |
 
@@ -95,70 +96,52 @@ comparison — no catalog lookup, no database. The two halves come from differen
 
 - **`storage_limit_bytes`** is the account's MAX QUOTA, from upstream. `results[].storage_bytes`
   wins over the plan's list price, so a negotiated limit is not silently overwritten.
-- **`used_bytes`** is what the account actually stores, **counted by this worker** — upstream
-  reports no usage figure. Counted per bucket, in keyset pages, over
+- **`used_bytes`** is what the account actually stores, **read by this worker** from the maintained
+  rollup — upstream reports no usage figure. One indexed SUM per account, over
   `HIPPIUS_PLANS_USAGE_CONCURRENCY` (4) connections.
 
-### Why the count is chunked
+### Where `used_bytes` comes from
 
-The obvious form is one aggregate per account, and that is what this used to do. It cannot finish.
+`usage_service.get_account_storage_bytes` is one indexed SUM over `bucket_storage_usage` — a
+MAINTAINED counter, sub-millisecond, and flat in the number of objects an account owns. See the
+usage-rollup worker below, and
+[hippius_s3/sql/CLAUDE.md](../hippius_s3/sql/CLAUDE.md#storage-usage-rollup-the-only-triggers-in-this-schema-that-move-a-billed-number)
+for the trigger set that keeps it right.
 
-Cost is driven by OBJECTS PER BUCKET, not by bucket fan-out and not by account count. One plan
-account's objects are concentrated in a single bucket holding a filesystem-style workload of
-**millions of small objects**; the single-statement aggregate for it takes over a minute. Both ceilings that apply are 30s — `HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS` and the
-replica's `max_standby_streaming_delay` — so it was cancelled every cycle, and because one account's
-failure fails the whole cycle, the roll was never published at all.
+It used to compute the number outright. Two designs, both retired:
 
-`usage_service.py` therefore lists the account's live buckets, then walks each bucket in keyset
-pages of `HIPPIUS_PLANS_USAGE_PAGE_SIZE` objects (`get_bucket_storage_bytes_page.sql`). Same
-definition, same bytes, spread over N statements — pinned against the canonical query in
-`tests/integration/test_usage_service_chunked.py`. It does not make the total work smaller; it makes
-no single STATEMENT long enough to be cancelled, and stops the count pinning the xmin horizon for a
-minute at a time.
+1. **One aggregate per account.** Cost is driven by OBJECTS PER BUCKET, not by bucket fan-out and
+   not by account count. One plan account's objects are concentrated in a single bucket holding a
+   filesystem-style workload of **millions of small objects**; that aggregate takes over a minute. Both applicable ceilings are 30s — `HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS`
+   and the replica's `max_standby_streaming_delay` — so it was cancelled every cycle, and because
+   one account's failure fails the whole cycle, the roll was never published at all.
+2. **The same aggregate, chunked into keyset pages.** That fixed the cancellation — no single
+   statement got near either ceiling — at ~165s per cycle for that one account, forever, to
+   rediscover a number that had moved by a handful of objects. It was O(objects) and that bucket
+   only grows.
 
-Measured cold on the prod replica, each page read from an un-warmed region of that bucket's key
-space:
+**Account cardinality was never the problem; objects-per-account was.** The "only a few tens of plan
+accounts" premise both designs rested on was true and irrelevant: one account with one 7.8M-object
+bucket breaks a recount design no matter how few accounts exist. The full scan now happens **once**,
+as a backfill (`hippius_s3/scripts/backfill_bucket_storage_usage.py`), and never again.
 
-| page size | offset | cold | per row |
-|---|---|---|---|
-| 100k | 5.0M | 1.88s | 18.8 µs |
-| **200k** | 6.5M | **2.91s** | **14.6 µs** ← default |
-| **200k** | 1.2M | **5.31s** | **26.6 µs** ← worst observed, **5.7x margin** |
-| 500k | 0 | 20.2s | 40.0 µs — 1.5x margin, do not |
+**Before that backfill has run, the usage read RAISES.** `storage_usage_rollup_state.backfilled_at`
+is NULL until a complete pass finishes, and until then the rollup holds deltas-since-migration
+rather than totals. A raise fails the cycle, which keeps the previous roll serving — the same
+degradation as any other failed cycle, and far better than publishing a small number as a
+customer's usage.
 
-Only 200k has two samples. Read the 100k and 500k rows as single points from one region each — by
-the second property below, either could be ~2x off in another part of the bucket, so 100k is not
-established as cheaper per row than 200k.
-
-Two properties, each of which cost a wrong default once:
-
-**Per-row cost is not linear in page size.** Past a few hundred thousand rows the random heap
-fetches stop fitting cache and the page falls off a cliff — 500k is 2.7x the per-row cost of 200k.
-Maximising this to save round trips is how you get it cancelled.
-
-**Per-row cost also varies ~2x by REGION at a fixed page size**, from heap locality. A single sample
-is not a margin: the first 200k measurement said 2.91s and a second at a different depth said 5.31s.
-Judge a page size by the WORST observed page, not the mean.
-
-Whole-account projection for that account: ~40 pages at ~4.1s average ≈ **165s**, none of them near
-the ceiling. That is slower in total than the ~64s single statement would have been — but that
-statement never completed. Bounded-and-finishing beats fast-and-cancelled.
-
-**The counts run against a REPLICA** (`DATABASE_READONLY_URL`, falling back to `DATABASE_URL` when
-unset), with `jit=off` on the pool — JIT is pure overhead for an index-probe-bound query and cost
-107ms of a 326ms count for a 1,300-object account. This cluster's primary has been stalled by a
-read-storm before.
-
-A maintained counter — a delta ledger folded into a per-bucket rollup — is the real long-term answer
-and is written up in todo.md. Chunking is what makes the current design work until then; recounting
-is O(objects) forever, and that bucket only grows.
+**The read runs against a REPLICA** (`DATABASE_READONLY_URL`, falling back to `DATABASE_URL`), with
+`jit=off` on the pool. The counter is WRITTEN on the primary by the usage-rollup worker, so replica
+lag is one more small increment of staleness on a figure that is already a
+`HIPPIUS_PLANS_LOOP_SLEEP`-old estimate by design.
 
 ⚠️ **The refresh interval IS the enforcement lag, in both directions.** An account can overshoot its
 quota by one cycle's worth of uploads, and a customer who deletes data to get back under stays
 refused until the next cycle sees it. Nothing on the request path recomputes.
 
-A count failing for ANY account fails the whole cycle and keeps the previous roll: publishing a
-partial answer would write `used_bytes=0` for the accounts we could not count, silently handing them
+A read failing for ANY account fails the whole cycle and keeps the previous roll: publishing a
+partial answer would write `used_bytes=0` for the accounts we could not read, silently handing them
 unlimited headroom.
 
 **Only accounts billed as a plan are written.** A row needs `billing == "plan"` and a plan name.
@@ -241,6 +224,73 @@ mock-hippius-api and into production.
 `replicas` must stay 1 — two replicas would not corrupt anything (last `RENAME` wins) but would
 double the upstream load for nothing.
 
+## Usage rollup (storage counter)
+
+[run_usage_rollup_in_loop.py](run_usage_rollup_in_loop.py). The only thing that turns the
+trigger-fed delta ledger into the per-bucket counter the plans-cacher reads.
+
+```
+objects / object_versions  --5 row triggers, INSERT only-->  storage_delta_ledger
+                                                                     |
+                        COMPACT: DELETE ... RETURNING, fold, add     v
+                                                              bucket_storage_usage
+                                                                     |
+                             account total = SUM over live buckets  <-+
+```
+
+Two jobs in one loop:
+
+| Job | Interval | What it does |
+|---|---|---|
+| **Compact** | `HIPPIUS_USAGE_ROLLUP_LOOP_SLEEP` (5s) | Claims `HIPPIUS_USAGE_ROLLUP_BATCH_SIZE` (5000) ledger rows with `DELETE ... RETURNING` and adds them to the counter. |
+| **Reconcile** | `HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS` (3600s) | Fully recomputes `HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE` (25) live buckets, oldest-recomputed first, and exports the correction as **drift**. |
+
+**Compaction is exactly-once by construction.** The rows leave the ledger in the same transaction
+that adds them to the counter, so a crash puts them back and a second compactor can only see rows
+nobody has taken. There is no `GREATEST(0, ...)` anywhere in the fold: clamping an upsert breaks
+decrements, because `EXCLUDED.bytes_used` carries the clamped value into the `DO UPDATE` arm and
+floors every decrement at zero. The counter is allowed to go negative; the READ path clamps and
+reports.
+
+⚠️ **Expected drift is ZERO.** The triggers are maintained against `get_account_storage_bytes.sql`
+and asserted against it write-path by write-path in
+`tests/integration/test_storage_usage_rollup.py`. So a non-zero
+`storage_rollup_drifted_buckets_total` is not noise to tune out — it means a write path is moving
+bytes without emitting a delta, or a statement is repointing `current_object_version` and editing
+the outgoing version at the same time. **Alert on it.** Same for
+`storage_rollup_negative_buckets`, which is only reachable if a decrement was recorded without its
+increment.
+
+**A recompute and a compaction must not overlap**, or the recompute's `SET` can silently discard a
+delta the compactor has already consumed — permanently, and in a way that keeps the drift metric
+non-zero forever, destroying the one signal that says the ledger is wrong. A global advisory lock
+enforces it: the compactor uses `pg_try_advisory_xact_lock` and skips the cycle, the recompute waits.
+The recompute itself drains the bucket's pending ledger rows and aggregates the truth in ONE
+statement, therefore in ONE snapshot, so a write landing mid-recompute is counted exactly once.
+
+**Why a separate worker rather than a second loop in the plans-cacher.** The plans-cacher's pool is
+`DATABASE_READONLY_URL`, a read replica, because its work must not run on the primary. Compaction
+WRITES. And the rollup's freshness wants seconds while the scrape wants ten minutes. Splitting them
+also means the ledger keeps draining while api.hippius.com is down.
+
+**This pod being down is not an outage, but it IS a silently frozen billing number.** Nothing on the
+request path reads the rollup and the ledger is insert-only, so it accumulates losslessly. What
+stops is the counter moving: plan accounts keep the usage figure from the last fold, so where
+enforcement is on, a customer who deletes data stays refused. Alert on
+`storage_rollup_ledger_lag_seconds`, not on pod restarts.
+
+`replicas` must stay 1. Two would not corrupt anything — the claim is transactional — but they
+would contend on the same batch for no throughput and reconcile the same buckets twice.
+
+### Backfill
+
+[../hippius_s3/scripts/backfill_bucket_storage_usage.py](../hippius_s3/scripts/backfill_bucket_storage_usage.py),
+k8s Job at [../k8s/backfill-bucket-storage-usage-job.yaml](../k8s/backfill-bucket-storage-usage-job.yaml).
+Defaults to a dry run. Safe to run concurrently with live traffic and safe to run twice: one bucket
+per transaction, each recompute SETS rather than adds, and `backfilled_at` is only set after a
+complete pass — so a run that dies part way through degrades to the pre-existing behaviour (the
+plans-cacher keeps its previous roll) rather than to a wrong bill.
+
 ## Migrator
 
 [run_migrator_once.py](run_migrator_once.py). Subprocess wrapper around [../hippius_s3/scripts/migrate_objects.py](../hippius_s3/scripts/migrate_objects.py). Runs as a K8s Job; exits on completion.
@@ -256,4 +306,3 @@ double the upstream load for nothing.
 - **Graceful shutdown**: on SIGTERM / KeyboardInterrupt, workers cancel inflight tasks and gather-with-exceptions before closing DB + Redis. See [downloader.py:496-508](../hippius_s3/workers/downloader.py).
 - **Retry mover runs on every pod**: `_retry_mover` ([run_arion_uploader_in_loop.py:133](run_arion_uploader_in_loop.py)) polls `{backend}_upload_retries` every 2s on each of the 10 uploader replicas. `move_due_upload_retries` claims due members with a server-side Lua `ZREM`-then-`LPUSH`, so exactly one pod re-enqueues each member; changing it back to a read-then-move re-introduces N-fold retry amplification. The unpin and download movers still have that race.
 - **Uploader retry budget**: `HIPPIUS_UPLOADER_MAX_ATTEMPTS=7`, `HIPPIUS_UPLOADER_BACKOFF_BASE_MS=500`, `HIPPIUS_UPLOADER_BACKOFF_MAX_MS=60000` — shipped in both [.env.defaults](../.env.defaults) and [k8s/base/configmap-defaults.yaml](../k8s/base/configmap-defaults.yaml), matching the [config.py](../hippius_s3/config.py) defaults. That is ~63s of tolerance (0.5, 1, 2, 4, 8, 16, 32s) before the request goes to the upload DLQ, which is manual-recovery only. This queue is the **only** retry layer for transport errors — `retry_on_error` in [arion_service.py](../hippius_s3/services/arion_service.py) deliberately does not catch them, because retrying in both layers multiplies into ~24 requests at an already-failing backend.
-

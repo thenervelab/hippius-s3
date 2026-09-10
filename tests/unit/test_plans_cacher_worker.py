@@ -125,21 +125,24 @@ def api_client_returning(**methods: object) -> MagicMock:
     return MagicMock(return_value=ctx)
 
 
-_BUCKET_OF = "bucket-of-"
-
-
 class FakePool:
     """asyncpg pool stand-in returning a fixed usage per account.
 
-    Models the two-step chunked count: `fetch` lists the account's buckets, then `fetchrow` walks
-    that bucket in keyset pages. Each account gets ONE synthetic bucket that returns its whole usage
-    in a single SHORT page, which is the terminating case of the walk. The multi-page path is
-    covered directly against usage_service in tests/unit/test_usage_service.py.
+    Models the maintained-rollup read: ONE indexed SUM over bucket_storage_usage per account,
+    carrying the guard flags usage_service acts on. `ready=False` is what a not-yet-backfilled
+    rollup looks like. The guards themselves are covered directly in
+    tests/unit/test_usage_service.py.
     """
 
-    def __init__(self, usage: dict[str, int] | None = None, fail: Exception | None = None) -> None:
+    def __init__(
+        self,
+        usage: dict[str, int] | None = None,
+        fail: Exception | None = None,
+        ready: bool = True,
+    ) -> None:
         self.usage = usage or {}
         self.fail = fail
+        self.ready = ready
         self.acquired = 0
 
     def acquire(self):
@@ -155,17 +158,15 @@ class FakePool:
 
         return _Ctx()
 
-    async def fetch(self, _query: str, account_id: str, timeout: float | None = None):
+    async def fetchrow(self, _query: str, account_id: str, timeout: float | None = None):
         if self.fail:
             raise self.fail
-        return [{"bucket_id": f"{_BUCKET_OF}{account_id}"}]
-
-    async def fetchrow(self, _query: str, bucket_id: str, _cursor: str, page_size: int, timeout: float | None = None):
-        if self.fail:
-            raise self.fail
-        account_id = str(bucket_id).removeprefix(_BUCKET_OF)
-        # rows_seen < page_size ends the walk after one page.
-        return {"rows_seen": 1, "last_key": "k", "bytes_used": self.usage.get(account_id, 0)}
+        return {
+            "bytes_used": self.usage.get(account_id, 0),
+            "negative_buckets": 0,
+            "missing_buckets": 0,
+            "ready": self.ready,
+        }
 
 
 def page(**overrides: object) -> S3PlanAccountsResponse:
@@ -500,10 +501,10 @@ async def test_a_cold_start_with_no_subscribers_completes_the_cycle() -> None:
 
 
 @pytest.mark.asyncio
-async def test_usage_is_counted_by_us_and_attached_to_every_account() -> None:
-    """Upstream reports a max quota but no usage, so the worker counts it. `used_bytes` must come
-    from our count and `storage_limit_bytes` from upstream -- swapping them would give every account
-    a quota equal to what it stores."""
+async def test_usage_is_read_from_the_rollup_and_attached_to_every_account() -> None:
+    """Upstream reports a max quota but no usage, so the worker supplies it. `used_bytes` must come
+    from our own rollup and `storage_limit_bytes` from upstream -- swapping them would give every
+    account a quota equal to what it stores."""
     redis = FakeRedis()
     pool = FakePool(usage={ACCT_BUSINESS: 7 * TB})
     api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
@@ -518,8 +519,8 @@ async def test_usage_is_counted_by_us_and_attached_to_every_account() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_usage_count_failure_publishes_nothing() -> None:
-    """Publishing a partial answer would write used_bytes=0 for the accounts we failed to count,
+async def test_a_usage_read_failure_publishes_nothing() -> None:
+    """Publishing a partial answer would write used_bytes=0 for the accounts we failed to read,
     silently handing them unlimited headroom. Keep the previous roll instead."""
     redis = FakeRedis()
     api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
@@ -533,16 +534,36 @@ async def test_a_usage_count_failure_publishes_nothing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_usage_counting_is_bounded_by_the_configured_concurrency() -> None:
-    """Unbounded fan-out over a few tens of aggregates could become the heaviest thing on the
-    primary; one serial pass would let a single huge account set the pace for the cycle."""
+async def test_an_unbackfilled_rollup_publishes_nothing() -> None:
+    """The rollup exists from the migration but holds DELTAS until the backfill has run.
+
+    Serving those as totals would under-report every account that existed before the migration --
+    unlimited headroom for exactly the customers most likely to be near their quota. The read
+    raises, the cycle fails, and the previous roll keeps serving until the backfill Job completes.
+    """
+    redis = FakeRedis()
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
+
+    with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
+        assert await pc.run_cycle(redis, FakePool(usage={ACCT_BUSINESS: 7 * TB}, ready=False)) is False
+
+    assert "hippius_s3_plan_accounts" not in redis.hashes
+
+
+@pytest.mark.asyncio
+async def test_usage_reads_are_bounded_by_the_configured_concurrency() -> None:
+    """The pool IS the limiter, so one acquisition per account is the observable contract.
+
+    Cheap insurance now that the read is a small indexed SUM rather than the O(objects) aggregate
+    this bound was originally sized for, but a second knob in front of the pool could only ever
+    disagree with it."""
     accounts = {_addr(i): {"plan": "pro", "storage_limit_bytes": TB} for i in range(20)}
     pool = FakePool()
 
     await pc._attach_usage(pool, accounts)
 
     assert all("used_bytes" in row for row in accounts.values())
-    assert pool.acquired == 20, "one connection acquisition per account, serialised by the semaphore"
+    assert pool.acquired == 20, "one connection acquisition per account, serialised by the pool"
 
 
 def test_an_address_in_the_wrong_network_prefix_is_dropped() -> None:
