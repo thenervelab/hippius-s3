@@ -1443,6 +1443,22 @@ spec:
             - sh
             - -c
             - until nc -z postgres-rw 5432; do echo waiting for services; sleep 5; done
+        # D2: gate on DB migrations, same as every other worker. This one needs it MORE than most:
+        # its whole job is calling functions that a migration creates, so a pod that starts first
+        # raises immediately. Observed on the staging rollout --
+        # `UndefinedFunctionError: function storage_usage_rollup_lock_key() does not exist` -- which
+        # self-healed on the next tick but is exactly the failure this gate exists to prevent.
+        - name: wait-for-migrations
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          command:
+            - python
+            - scripts/wait_for_migrations.py
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
       containers:
         - name: usage-rollup
           image: ghcr.io/thenervelab/hippius-s3/workers:latest
