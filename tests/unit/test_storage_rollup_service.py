@@ -25,8 +25,15 @@ class FakeTransaction:
 class FakeConn:
     """Answers the two calls compact_once makes, and records what it was asked."""
 
-    def __init__(self, *, lock: bool = True, batches: list[dict[str, int]] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        lock: bool = True,
+        batches: list[dict[str, int]] | None = None,
+        ready: bool = True,
+    ) -> None:
         self.lock = lock
+        self.ready = ready
         self.batches = batches or []
         self.queries: list[str] = []
         self.rows: list[Any] = []
@@ -36,6 +43,9 @@ class FakeConn:
 
     async def fetchval(self, query: str, *_args: Any, **_kwargs: Any) -> Any:
         self.queries.append(query)
+        # Two different fetchval callers: the advisory-lock probe and the backfilled-yet? probe.
+        if "backfilled_at" in query:
+            return self.ready
         return self.lock
 
     async def fetchrow(self, query: str, *_args: Any, **_kwargs: Any) -> dict[str, int]:
@@ -133,3 +143,53 @@ async def test_reconcile_logs_every_drifting_bucket(caplog: pytest.LogCaptureFix
     assert caplog.text.count("STORAGE_ROLLUP_DRIFT") == 1
     assert str(drifting) in caplog.text
     assert str(clean) not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_seeding_before_the_backfill_is_not_reported_as_drift(caplog: pytest.LogCaptureFixture) -> None:
+    """Before the backfill EVERY counter is 0 while truth is the bucket's whole contents, so every
+    recompute moves the number. Calling that drift fires once per bucket across the estate, blames a
+    write path that is behaving correctly, and trains whoever reads the log to ignore the one alert
+    this design depends on.
+
+    Observed on the staging rollout: 22 of the first 25 reconciled buckets logged as drift, every one
+    of them correct behaviour.
+    """
+    bucket = uuid.uuid4()
+    conn = FakeConn(ready=False)
+    conn.rows = [{"bucket_id": bucket}]
+
+    async def fetchrow(query: str, *_args: Any, **_kwargs: Any) -> dict[str, int]:
+        conn.queries.append(query)
+        return {"bytes_before": 0, "bytes_after": 24}
+
+    conn.fetchrow = fetchrow  # type: ignore[method-assign]
+
+    with caplog.at_level("INFO"):
+        results = await storage_rollup_service.reconcile_buckets(conn, limit=10, timeout=60.0)
+
+    assert [r.drift_bytes for r in results] == [24], "the delta is still measured and returned"
+    assert "STORAGE_ROLLUP_DRIFT" not in caplog.text, "must not claim drift before the rollup is seeded"
+    assert "STORAGE_ROLLUP_SEEDING" in caplog.text
+    assert str(bucket) in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_drift_is_still_loud_once_the_backfill_has_run(caplog: pytest.LogCaptureFixture) -> None:
+    """The quietening is conditional, not a downgrade: after seeding, expected drift is ZERO and a
+    drifting bucket is a defect that must still name itself at ERROR."""
+    bucket = uuid.uuid4()
+    conn = FakeConn(ready=True)
+    conn.rows = [{"bucket_id": bucket}]
+
+    async def fetchrow(query: str, *_args: Any, **_kwargs: Any) -> dict[str, int]:
+        conn.queries.append(query)
+        return {"bytes_before": 500, "bytes_after": 900}
+
+    conn.fetchrow = fetchrow  # type: ignore[method-assign]
+
+    with caplog.at_level("INFO"):
+        await storage_rollup_service.reconcile_buckets(conn, limit=10, timeout=60.0)
+
+    assert "STORAGE_ROLLUP_DRIFT" in caplog.text
+    assert "STORAGE_ROLLUP_SEEDING" not in caplog.text

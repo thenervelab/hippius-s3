@@ -140,20 +140,37 @@ async def reconcile_buckets(
 
     Serial, not concurrent: these are the heaviest aggregates in the schema and the whole point of
     the rollup is that nothing has to wait for them. A pass that takes a while is fine.
+
+    DRIFT IS ONLY DRIFT ONCE THE ROLLUP IS SEEDED. Before the backfill every counter is 0 while
+    ground truth is the bucket's whole contents, so each recompute moves the number by the bucket's
+    full size. That is seeding, not a defect: reporting it as drift fires once per bucket across the
+    whole estate, blames a write path that is behaving perfectly, and teaches whoever reads the log
+    to ignore the one alert this design depends on. Observed on the staging rollout -- 22 of the
+    first 25 buckets reported as drift, every one of them correct behaviour.
     """
+    ready = bool(await conn.fetchval(get_query("get_storage_usage_rollup_ready")))
     rows = await conn.fetch(get_query("list_buckets_for_usage_reconcile"), limit)
 
     results: list[RecomputeResult] = []
     for row in rows:
         result = await recompute_bucket(conn, row["bucket_id"], timeout)
         results.append(result)
-        if result.drift_bytes:
+        if not result.drift_bytes:
+            continue
+
+        if ready:
             logger.error(
                 f"STORAGE_ROLLUP_DRIFT bucket={result.bucket_id} "
                 f"was={result.bytes_before} truth={result.bytes_after} "
                 f"drift={result.drift_bytes}; a write path is moving bytes without emitting a "
                 f"delta, or a statement is repointing current_object_version and editing the "
                 f"outgoing version at the same time."
+            )
+        else:
+            logger.info(
+                f"STORAGE_ROLLUP_SEEDING bucket={result.bucket_id} "
+                f"was={result.bytes_before} truth={result.bytes_after}; the rollup is not "
+                f"backfilled yet, so this is the reconciler seeding a counter rather than drift."
             )
 
     return results

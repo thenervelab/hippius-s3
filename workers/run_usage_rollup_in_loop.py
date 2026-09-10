@@ -98,12 +98,15 @@ async def run_cycle(pool: asyncpg.Pool, reconcile: bool) -> bool:
                     config.usage_reconcile_buckets_per_cycle,
                     config.usage_reconcile_timeout_seconds,
                 )
-                drifted = [r for r in results if r.drift_bytes]
+                changed = [r for r in results if r.drift_bytes]
                 for result in results:
                     collector.record_storage_rollup_recompute(result.drift_bytes)
+                # "changed", not "drift": before the backfill every recompute legitimately moves a
+                # counter off zero, and calling that drift here would contradict the per-bucket
+                # lines the service now emits. reconcile_buckets owns the interpretation.
                 logger.info(
-                    f"usage-rollup reconciled {len(results)} bucket(s), {len(drifted)} with drift"
-                    + (f" totalling {sum(r.drift_bytes for r in drifted)} bytes" if drifted else "")
+                    f"usage-rollup reconciled {len(results)} bucket(s), {len(changed)} changed"
+                    + (f" totalling {sum(r.drift_bytes for r in changed)} bytes" if changed else "")
                 )
 
         collector.record_storage_rollup_cycle(success=True)
