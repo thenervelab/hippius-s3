@@ -305,13 +305,30 @@ class Config:
     # Ledger rows claimed per fold. The claim is one transaction, so this bounds how long the
     # rollup rows are locked and how much WAL one fold writes; the loop just runs more batches.
     usage_rollup_batch_size: int = env("HIPPIUS_USAGE_ROLLUP_BATCH_SIZE:5000", convert=int)
-    # Live buckets fully recomputed per reconcile pass. Each one is a full aggregate over its
-    # objects -- the cost the rollup exists to avoid -- so this is deliberately small and serial.
-    # At 25 buckets an hour a ~46k-bucket estate takes months to cycle, which is the right trade:
-    # the reconciler is a drift ALARM, not the mechanism that keeps the number right.
-    usage_reconcile_buckets_per_cycle: int = env("HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE:25", convert=int)
-    # How often a reconcile pass runs.
-    usage_reconcile_interval_seconds: int = env("HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS:3600", convert=int)
+    # Live buckets fully recomputed per reconcile pass, and how often a pass runs. Together these
+    # set how long a full sweep of the estate takes, which is the ONLY bound on how long a bucket
+    # can carry a wrong number.
+    #
+    # 25/hour was far too slow, and the reasoning behind it ("the reconciler is an alarm, not the
+    # mechanism") does not survive the drift being an OVER-count: at ~46k buckets a full pass took
+    # ~77 days, so a hot-key customer could be over-billed for two months before anything noticed.
+    # An alarm nobody hears for 77 days is not an alarm.
+    #
+    # 200 every 300s = 2,400 buckets/hour, so a full sweep is ~19 hours. Justified against the
+    # measured cost of one recompute_bucket_storage_usage(): 0.8ms for an empty bucket, 1.0ms at 10
+    # objects, 1.3ms at 100, 8.1ms at 1000 (median, laptop Postgres, so pessimistic per-op relative
+    # to the primary but without its load). A 200-bucket pass is therefore ~0.2-0.5s of primary
+    # work per 300s cycle -- a ~0.1% duty cycle -- and the estate is overwhelmingly small buckets.
+    #
+    # The skew is what keeps this modest rather than higher. One prod bucket holds millions of
+    # objects and takes ~64s on its own; the queue is least-recently-recomputed, so it lands in one
+    # cycle per sweep and that cycle runs ~21% busy. Recompute holds a GLOBAL advisory lock, so the
+    # compactor skips (pg_TRY_) while it runs -- harmless, the ledger is insert-only and a skipped
+    # fold only adds latency, but it is the reason not to simply crank this to a full sweep per
+    # hour. Going materially faster wants the outlier bucket on its own cadence, or a per-bucket
+    # lock instead of the global one, first.
+    usage_reconcile_buckets_per_cycle: int = env("HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE:200", convert=int)
+    usage_reconcile_interval_seconds: int = env("HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS:300", convert=int)
     # Server-side bound on ONE bucket recompute. The largest prod bucket takes ~64s, so this has to
     # clear that or the reconciler could never verify the one bucket that matters most.
     usage_reconcile_timeout_seconds: float = env("HIPPIUS_USAGE_RECONCILE_TIMEOUT_SECONDS:300.0", convert=float)

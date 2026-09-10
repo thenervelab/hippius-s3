@@ -161,6 +161,17 @@ DELETE, plus `object_versions` AFTER UPDATE / AFTER DELETE. Pinned by
 4. **Never repoint `objects.current_object_version` AND edit the outgoing version in one statement.**
    AFTER ROW triggers all fire at end-of-statement and would each see the other's finished work. Use
    two statements, as `soft_delete_object_version` + `repoint_current_version_after_delete` do.
+5. **Lock the `objects` row BEFORE any `object_versions` row.** The objects trigger reads the
+   outgoing and incoming version sizes under `FOR NO KEY UPDATE` while its statement already holds
+   the objects row, so its order is objects → object_versions on every overwrite. The other order
+   closes a cycle and Postgres breaks it by failing a customer's request (verified: 40P01).
+   `lock_object_and_get_version.sql` (`FOR UPDATE OF o`) is the pattern; the versioned-DELETE
+   transaction and `abort_cleanup_orphan_version.sql` both follow it. Guarded statically by
+   `tests/unit/test_storage_usage_lock_order.py` and demonstrated in
+   `test_taking_the_version_row_before_the_objects_row_deadlocks`. Note that rule 4's "one
+   statement" framing is NOT sufficient on its own — the same hazard exists ACROSS transactions,
+   which is what the locking read exists to close (see
+   `20260911090000_storage_usage_lock_outgoing_version.sql`).
 
 Correctness is asserted, write path by write path, against `get_account_storage_bytes.sql` — the
 canonical definition — in `tests/integration/test_storage_usage_rollup.py`. The reconciler in

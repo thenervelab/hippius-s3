@@ -30,12 +30,17 @@
 -- drifts, at any concurrency -- that was the bisection that located this.
 --
 -- WHY MARKING THE HELPERS VOLATILE DOES NOT FIX IT, since that is the obvious first idea and it
--- was tried: the reserve's UPDATE hits `objects` and the finalize's UPDATE hits `object_versions`
--- -- different rows in different tables. No lock conflict means no EvalPlanQual re-read, so the
--- trigger's lookup stays pinned to the firing statement's snapshot no matter what the function's
--- volatility says. (A forced lock conflict on the objects row DOES see the commit, which is why a
--- deterministic two-transaction interleaving reports "correct" and disagrees with a concurrency
--- stress. Both results are real; they measure different things.)
+-- was tried: nothing about the read was stale to begin with. This migration originally explained
+-- the mechanism as a pinned snapshot; THAT EXPLANATION IS WRONG, corrected in
+-- 20260911090000_storage_usage_lock_outgoing_version.sql and measured directly there. An AFTER ROW
+-- trigger's reads take a FRESH snapshot when the trigger fires, even a plain SELECT, even when the
+-- firing statement spent time blocked on a row lock. The defect is purely a MISSING LOCK: the
+-- reserve's UPDATE hits `objects` and the finalize's UPDATE hits `object_versions` -- different rows
+-- in different tables -- so nothing made the two serialise, and "fresh" only ever meant "whatever
+-- happened to be committed at that instant". Volatility cannot substitute for the lock.
+--
+-- THIS FIX IS ALSO INCOMPLETE: it locks only the OUTGOING version. The incoming read has the same
+-- defect mirrored, and it UNDER-counts. 20260911090000 locks both sides.
 --
 -- So the constraint documented in 20260910120000 -- "never repoint current_object_version AND edit
 -- the outgoing version in one STATEMENT" -- was too narrow. The real hazard is ACROSS
@@ -59,7 +64,10 @@
 -- well as by inspection -- a six-path adversarial probe over 2,880 operations on one contended
 -- object found zero deadlocks, and a control that deliberately injects the reverse order produces
 -- 236, so that zero is a real zero rather than an insensitive test.
--- tests/unit/test_sql_lock_order.py fails if a new transaction breaks the invariant.
+-- tests/unit/test_storage_usage_lock_order.py fails if a new transaction breaks the invariant.
+-- (One path DID break it, undetected by that first scan: abort_cleanup_orphan_version.sql locked
+-- the version row and then updated `objects` inside ONE statement, which a per-transaction scan
+-- cannot see. Fixed in 20260911090000's changeset.)
 CREATE OR REPLACE FUNCTION storage_usage_objects_update_trigger()
 RETURNS trigger
 LANGUAGE plpgsql

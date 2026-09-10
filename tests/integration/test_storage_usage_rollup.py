@@ -16,6 +16,7 @@ reachable on DATABASE_URL.
 """
 
 import asyncio
+import contextlib
 import datetime
 import json
 import os
@@ -530,9 +531,7 @@ async def test_janitor_hard_delete_of_a_soft_deleted_object(pg_tx: asyncpg.Conne
     await _compact(pg_tx)
 
     # hard_delete_object re-checks a 1h grace window under its own row lock, so age the row.
-    await pg_tx.execute(
-        "UPDATE objects SET deleted_at = now() - INTERVAL '48 hours' WHERE object_id = $1", object_id
-    )
+    await pg_tx.execute("UPDATE objects SET deleted_at = now() - INTERVAL '48 hours' WHERE object_id = $1", object_id)
     assert await pg_tx.execute(get_query("hard_delete_object"), object_id) == "DELETE 1"
 
     assert await _ledger_rows(pg_tx, bucket_id) == []
@@ -1263,71 +1262,506 @@ async def test_a_pathological_size_cannot_abort_a_customer_write(pg_tx: asyncpg.
         assert -(2**63) <= delta <= 2**63 - 1
 
 
-async def test_same_key_overwrites_in_separate_transactions_do_not_over_count(
+# --------------------------------------------------------------------------------------------
+# The two-step PUT under concurrency. THE bug this rollup shipped with.
+#
+# A PUT is TWO transactions (hippius_s3/writer/object_writer.py): the reserve points
+# current_object_version at a version whose size_bytes is 0, then -- after streaming the whole
+# body, which can take minutes -- a separate transaction sets the real size. The objects trigger
+# computed its decrement by looking up the OUTGOING version's size, and between another writer's
+# reserve and its finalize that size is still 0. So an overwrite subtracted 0, while the outgoing
+# version's own finalize had already added its full size (it was still current when it ran). Every
+# version ever written was added exactly once and never subtracted: on a three-way race of
+# 1000/2000/3000 bytes the ledger read 6000 on every run against a truth of whichever version won.
+#
+# The concurrency tests above did not catch it for one reason: they wrap reserve and finalize in ONE
+# transaction, which holds the objects row across both and serialises the writers by accident. The
+# production path does not. Everything in this section runs the un-wrapped, two-transaction shape.
+#
+# See 20260911090000_storage_usage_lock_outgoing_version.sql.
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("concurrency", [1, 4, 16, 32])
+async def test_same_key_concurrent_two_step_puts_do_not_over_count(
     committed_pool: CommittedPool,
+    concurrency: int,
 ) -> None:
-    """The regression for the concurrent-overwrite over-count, in PRODUCTION's transaction shape.
+    """The regression test. Un-wrapped two-step PUTs of ONE key, at four concurrencies.
 
-    THE DISTINCTION THAT MATTERS. test_parallel_overwrites_of_the_same_key_converge wraps the
-    reserve and the finalize in ONE transaction, which serialises the whole PUT on the objects row
-    lock and cannot expose this bug -- which is exactly why it passed while the counter was
-    over-billing in production. object_writer.py commits the reserve and the finalize SEPARATELY
-    (object_writer.py:255 and :470), because the streamed body sits between them and no connection
-    may be held across it. So `_put` is called WITHOUT a surrounding transaction here, on purpose.
-    Wrap it and this test stops testing anything.
+    SIZES MUST VARY. An equal-size overwrite nets to zero and emits no ledger row at all (the
+    zero-delta guard returns early), so a same-key test at constant size passes against the broken
+    trigger and proves nothing at all.
 
-    Without the FOR NO KEY UPDATE in storage_usage_objects_update_trigger (migration
-    20260910180000) each version is added by its own finalize and never subtracted, because the
-    successor's reserve computed the decrement from a size that was still 0 in its snapshot.
-    Measured before the fix: +686,080 at concurrency 4 and +3,132,416 at 16.
-
-    Sizes MUST vary: an equal-size overwrite nets to zero and emits no ledger row at all, so a
-    constant-size version of this test would pass against the bug.
+    Asserted against get_account_storage_bytes.sql, never against a constant: which writer wins is a
+    race, and "the counter agrees with the canonical query" is the entire claim.
     """
     acct = await committed_pool.new_account()
     bucket_id = await committed_pool.new_bucket(acct)
 
-    async def overwrite(size: int) -> None:
+    sizes = [1024 * (i + 1) for i in range(concurrency)]
+
+    async def put(size: int) -> None:
+        # NO conn.transaction(): reserve and finalize commit separately, as production does.
         async with committed_pool.acquire() as conn:
             await _put(conn, bucket_id, "hot", size)
 
     for _ in range(4):
-        await asyncio.gather(*(overwrite(s) for s in (1024, 8192, 65536, 4096, 16384, 2048)))
+        await asyncio.gather(*(put(s) for s in sizes))
 
     async with committed_pool.acquire() as conn:
-        await _compact(conn)
-        # Asserted against the canonical query, never against a constant: which writer wins is a
-        # race, and only the survivor's bytes may be counted.
-        assert await _raw_rollup(conn, acct) == await _oracle(conn, acct)
+        await _assert_matches_oracle(conn, acct)
 
 
-async def test_reserve_racing_a_finalize_of_the_outgoing_version(committed_pool: CommittedPool) -> None:
-    """The exact interleaving, rather than a stress that reaches it by luck.
+async def test_a_reserve_waits_for_an_uncommitted_finalize_of_the_outgoing_version(
+    committed_pool: CommittedPool,
+) -> None:
+    """The mechanism, forced open so there is no race to lose.
 
-    A reserve of a new version runs while the OUTGOING version's finalize is still in flight. The
-    reserve's decrement must reflect the outgoing version's FINAL size, not the 0 it was reserved
-    at -- which is what the row lock forces.
+    The finalize of v1 is held UNCOMMITTED. Its trigger has already added v1's bytes -- v1 was still
+    current when it ran. A reserve then arrives to point the key at v2, and to be right it must
+    subtract v1's real size. It can only know that size by waiting: without the lock it reads the
+    pre-finalize 0, subtracts nothing, and v1's bytes stay on the bill forever.
+
+    Two assertions, because either alone is weak: the reserve BLOCKS, and the total is right after.
     """
     acct = await committed_pool.new_account()
     bucket_id = await committed_pool.new_bucket(acct)
 
-    # Repeated, because a two-way race hits the window only some of the time -- a single attempt
-    # passes against the bug often enough to be worthless as a regression test.
-    for round_index in range(12):
-        async with committed_pool.acquire() as conn:
-            first = await _reserve(conn, bucket_id, "hot")
+    async with committed_pool.acquire() as conn:
+        row = await _reserve(conn, bucket_id, "hot")
+        object_id, version = row["object_id"], row["current_object_version"]
 
-        async def finalize_first(row: asyncpg.Record = first) -> None:
-            async with committed_pool.acquire() as conn:
-                await _finalize(conn, row["object_id"], row["current_object_version"], 7000 + round_index)
+    finalizer = await committed_pool.pool.acquire()
+    reserver = await committed_pool.pool.acquire()
+    try:
+        tx = finalizer.transaction()
+        await tx.start()
+        await _finalize(finalizer, object_id, version, 1000)
 
-        async def reserve_second() -> None:
-            async with committed_pool.acquire() as conn:
-                row = await _reserve(conn, bucket_id, "hot")
-                await _finalize(conn, row["object_id"], row["current_object_version"], 300 + round_index)
+        task = asyncio.create_task(_reserve(reserver, bucket_id, "hot"))
+        # Long enough for the reserve to reach the lock and stop there.
+        await asyncio.sleep(0.4)
+        assert not task.done(), "the reserve did not wait for the finalize; the size it subtracts is stale"
 
-        await asyncio.gather(finalize_first(), reserve_second())
+        await tx.commit()
+        await task
+    finally:
+        await committed_pool.pool.release(reserver)
+        await committed_pool.pool.release(finalizer)
 
     async with committed_pool.acquire() as conn:
-        await _compact(conn)
-        assert await _raw_rollup(conn, acct) == await _oracle(conn, acct)
+        # v2 is current and empty, so the truth is 0 -- and the counter must say 0, not 1000.
+        assert await _assert_matches_oracle(conn, acct) == 0
+
+
+async def test_a_repoint_onto_an_existing_version_waits_for_its_uncommitted_finalize(
+    committed_pool: CommittedPool,
+) -> None:
+    """The mirror of the above, on the INCOMING side, which under-counts rather than over-counts.
+
+    The objects trigger reads TWO version sizes: the outgoing one to subtract and the incoming one
+    to add. Locking only the outgoing one leaves this: a statement that repoints current onto an
+    ALREADY-EXISTING version whose size is being written right now adds the pre-write size.
+
+    abort_cleanup_orphan_version is that statement -- it repoints DOWN onto an existing lower
+    version -- and its own comment documents the collision ("a CompleteMultipartUpload of a LOWER
+    in-flight version committing after this statement's snapshot is invisible").
+
+    Measured without the incoming lock: truth 1000, ledger 0.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async with committed_pool.acquire() as conn:
+        first = await _reserve(conn, bucket_id, "k")
+        object_id, low_version = first["object_id"], first["current_object_version"]
+        second = await _reserve(conn, bucket_id, "k")
+        reserved_version = second["current_object_version"]
+
+    finalizer = await committed_pool.pool.acquire()
+    aborter = await committed_pool.pool.acquire()
+    try:
+        tx = finalizer.transaction()
+        await tx.start()
+        # The lower version completes while it is NOT current, so its own trigger emits nothing --
+        # the repoint is the only thing that can ever count these bytes.
+        await _finalize(finalizer, object_id, low_version, 1000)
+
+        task = asyncio.create_task(
+            aborter.fetchrow(get_query("abort_cleanup_orphan_version"), object_id, reserved_version)
+        )
+        await asyncio.sleep(0.4)
+        assert not task.done(), "the repoint did not wait; the size it adds for the incoming version is stale"
+
+        await tx.commit()
+        await task
+    finally:
+        await committed_pool.pool.release(aborter)
+        await committed_pool.pool.release(finalizer)
+
+    async with committed_pool.acquire() as conn:
+        assert (
+            await conn.fetchval("SELECT current_object_version FROM objects WHERE object_id = $1", object_id)
+            == low_version
+        )
+        assert await _assert_matches_oracle(conn, acct) == 1000
+
+
+async def test_an_append_racing_a_repoint_is_counted_at_its_appended_size(
+    committed_pool: CommittedPool,
+) -> None:
+    """S4 append is the OTHER path that sets a size after the fact, and it had the same exposure.
+
+    `SET size_bytes = size_bytes + $N` on the already-current version. Forced open rather than
+    raced: the append is held uncommitted while the reserve arrives. Without the lock the reserve
+    subtracts the pre-append size and the appended bytes are billed forever.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async with committed_pool.acquire() as conn:
+        object_id = await _put(conn, bucket_id, "log", 1000)
+        version = await conn.fetchval("SELECT current_object_version FROM objects WHERE object_id = $1", object_id)
+
+    appender = await committed_pool.pool.acquire()
+    reserver = await committed_pool.pool.acquire()
+    try:
+        tx = appender.transaction()
+        await tx.start()
+        await appender.execute(
+            "UPDATE object_versions SET size_bytes = size_bytes + $1, append_version = append_version + 1"
+            " WHERE object_id = $2 AND object_version = $3 AND deleted_at IS NULL",
+            5000,
+            object_id,
+            version,
+        )
+
+        task = asyncio.create_task(_reserve(reserver, bucket_id, "log"))
+        await asyncio.sleep(0.4)
+        assert not task.done(), "the reserve did not wait for the append; it will subtract a stale size"
+
+        await tx.commit()
+        await task
+    finally:
+        await committed_pool.pool.release(reserver)
+        await committed_pool.pool.release(appender)
+
+    async with committed_pool.acquire() as conn:
+        assert await _assert_matches_oracle(conn, acct) == 0
+
+
+async def test_concurrent_appends_alone_are_exact(committed_pool: CommittedPool) -> None:
+    """The other half of the append claim, and the reason the append path needs no change of its own.
+
+    Appends that race only each other contend on ONE version row, so they serialise themselves, and
+    the trigger computes NEW.size_bytes - OLD.size_bytes from its own tuple -- there is no cross-row
+    read of a size to go stale. Measured clean at concurrency 4/16/32 both before and after the fix.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async with committed_pool.acquire() as conn:
+        object_id = await _put(conn, bucket_id, "log", 100)
+        version = await conn.fetchval("SELECT current_object_version FROM objects WHERE object_id = $1", object_id)
+
+    deltas = [10 * (i + 1) for i in range(16)]
+
+    async def append(size: int) -> None:
+        async with committed_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE object_versions SET size_bytes = size_bytes + $1, append_version = append_version + 1"
+                " WHERE object_id = $2 AND object_version = $3 AND deleted_at IS NULL",
+                size,
+                object_id,
+                version,
+            )
+
+    await asyncio.gather(*(append(d) for d in deltas))
+
+    async with committed_pool.acquire() as conn:
+        assert await _assert_matches_oracle(conn, acct) == 100 + sum(deltas)
+
+
+@pytest.mark.parametrize("concurrency", [4, 16])
+async def test_mpu_completion_alone_under_concurrency_converges(
+    committed_pool: CommittedPool,
+    concurrency: int,
+) -> None:
+    """MPU initiate is a repoint onto a fresh zero-size version; Complete sets the size after.
+
+    So the MPU pair has the two-step shape on its own, with no simple PUT involved -- and it drifted
+    on its own, badly (measured +13.7M at concurrency 32 against the shipped triggers).
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async def mpu(size: int) -> None:
+        async with committed_pool.acquire() as conn:
+            await _mpu(conn, bucket_id, "big", size)
+
+    for _ in range(4):
+        await asyncio.gather(*(mpu(4096 * (i + 1)) for i in range(concurrency)))
+
+    async with committed_pool.acquire() as conn:
+        await _assert_matches_oracle(conn, acct)
+
+
+@pytest.mark.parametrize("concurrency", [4, 16])
+async def test_two_step_puts_racing_a_soft_delete_converge(
+    committed_pool: CommittedPool,
+    concurrency: int,
+) -> None:
+    """Overwrites and whole-key soft-deletes of ONE key, interleaved, production shape.
+
+    The objects trigger also fires on a deleted_at change, and there OLD and NEW name the SAME
+    version -- which a concurrent finalize can be resizing right now. That side needs the lock too.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async def put(size: int) -> None:
+        async with committed_pool.acquire() as conn:
+            await _put(conn, bucket_id, "churn", size)
+
+    async def soft_delete() -> None:
+        async with committed_pool.acquire() as conn:
+            await conn.execute(get_query("soft_delete_object"), bucket_id, "churn")
+
+    for _ in range(4):
+        await asyncio.gather(*(put(1024 * (i + 1)) if i % 3 else soft_delete() for i in range(concurrency)))
+
+    async with committed_pool.acquire() as conn:
+        await _assert_matches_oracle(conn, acct)
+
+
+@pytest.mark.parametrize("concurrency", [4, 16])
+async def test_two_step_puts_racing_a_delete_marker_converge(
+    committed_pool: CommittedPool,
+    concurrency: int,
+) -> None:
+    """A delete marker is a new current version carrying is_delete_marker, so it repoints too."""
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async def put(size: int) -> None:
+        async with committed_pool.acquire() as conn:
+            await _put(conn, bucket_id, "marked", size)
+
+    async def marker() -> None:
+        async with committed_pool.acquire() as conn:
+            await conn.execute(get_query("insert_delete_marker"), bucket_id, "marked")
+
+    for _ in range(4):
+        await asyncio.gather(*(put(1024 * (i + 1)) if i % 4 else marker() for i in range(concurrency)))
+
+    async with committed_pool.acquire() as conn:
+        await _assert_matches_oracle(conn, acct)
+
+
+@pytest.mark.parametrize("concurrency", [4, 16])
+async def test_aborted_puts_racing_overwrites_converge(
+    committed_pool: CommittedPool,
+    concurrency: int,
+) -> None:
+    """A PUT that dies mid-stream leaves current_object_version on a row stranded at size 0.
+
+    That orphan must be worth exactly nothing -- including when it is the version an overwrite is
+    reading to compute its decrement, which is the case that broke.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async def aborted() -> None:
+        async with committed_pool.acquire() as conn:
+            await _reserve(conn, bucket_id, "orphan")
+
+    async def put(size: int) -> None:
+        async with committed_pool.acquire() as conn:
+            await _put(conn, bucket_id, "orphan", size)
+
+    for _ in range(4):
+        await asyncio.gather(*(aborted() if i % 3 == 0 else put(1024 * (i + 1)) for i in range(concurrency)))
+
+    async with committed_pool.acquire() as conn:
+        await _assert_matches_oracle(conn, acct)
+
+
+# --------------------------------------------------------------------------------------------
+# Lock order: objects BEFORE object_versions, everywhere, or deadlock.
+# --------------------------------------------------------------------------------------------
+
+
+async def test_taking_the_version_row_before_the_objects_row_deadlocks(
+    committed_pool: CommittedPool,
+) -> None:
+    """WHY the lock-order invariant exists, demonstrated rather than asserted in a comment.
+
+    The objects trigger runs while its statement holds the objects row and now locks the version
+    rows, so its order is objects -> object_versions. A transaction taking them the other way round
+    closes a cycle, and Postgres resolves a cycle by failing somebody's request.
+
+    Pinned as a test because the invariant is invisible from either end: nothing about
+    `UPDATE object_versions ...; UPDATE objects ...` looks like it touches billing.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async with committed_pool.acquire() as conn:
+        object_id = await _put(conn, bucket_id, "k", 1000)
+        version = await conn.fetchval("SELECT current_object_version FROM objects WHERE object_id = $1", object_id)
+
+    offender = await committed_pool.pool.acquire()
+    overwriter = await committed_pool.pool.acquire()
+    try:
+        await offender.execute("BEGIN")
+        # The forbidden order: version row first.
+        await offender.fetch(
+            "SELECT 1 FROM object_versions WHERE object_id = $1 AND object_version = $2 FOR UPDATE",
+            object_id,
+            version,
+        )
+
+        # A plain overwrite: locks the objects row, then its trigger wants the version row.
+        overwrite = asyncio.create_task(_reserve(overwriter, bucket_id, "k"))
+        await asyncio.sleep(0.4)
+        assert not overwrite.done()
+
+        # And now the offender wants the objects row the overwrite is holding.
+        offending = asyncio.create_task(
+            offender.execute("UPDATE objects SET current_object_version = $2 WHERE object_id = $1", object_id, version)
+        )
+
+        deadlocked = False
+        for task in (offending, overwrite):
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=15)
+            except asyncpg.DeadlockDetectedError:
+                deadlocked = True
+            except asyncio.TimeoutError:
+                pass
+
+        assert deadlocked, "expected Postgres to break the cycle; the ordering rule may have stopped mattering"
+    finally:
+        for conn_ in (offender, overwriter):
+            with contextlib.suppress(Exception):
+                await conn_.execute("ROLLBACK")
+            await committed_pool.pool.release(conn_)
+
+
+async def test_abort_cleanup_locks_the_objects_row_before_the_version_row(
+    committed_pool: CommittedPool,
+) -> None:
+    """abort_cleanup_orphan_version is ONE statement, so a per-transaction audit cannot see its order.
+
+    Its CAS locks the reserved version row FOR UPDATE and then updates `objects`. Written in the
+    natural order that is version -> objects, the forbidden one, and it deadlocks against a
+    concurrent overwrite of the same key (verified: 40P01). It now takes the objects row in a
+    leading CTE, joined by a data dependency so the planner cannot reorder it -- an unreferenced
+    plain CTE is not evaluated at all.
+
+    Proven by holding the objects row and asking whether the blocked statement has ALREADY taken the
+    version row. If it has, it is holding a version while waiting for objects, which is the cycle.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async with committed_pool.acquire() as conn:
+        first = await _reserve(conn, bucket_id, "k")
+        object_id = first["object_id"]
+        second = await _reserve(conn, bucket_id, "k")
+        reserved_version = second["current_object_version"]
+
+    holder = await committed_pool.pool.acquire()
+    aborter = await committed_pool.pool.acquire()
+    prober = await committed_pool.pool.acquire()
+    try:
+        await holder.execute("BEGIN")
+        await holder.fetch("SELECT 1 FROM objects WHERE object_id = $1 FOR NO KEY UPDATE", object_id)
+
+        await aborter.execute("BEGIN")
+        abort = asyncio.create_task(
+            aborter.fetchrow(get_query("abort_cleanup_orphan_version"), object_id, reserved_version)
+        )
+        await asyncio.sleep(0.4)
+        assert not abort.done(), "the abort did not block on the objects row, so this proves nothing"
+
+        await prober.execute("BEGIN")
+        version_row_is_free = True
+        try:
+            await prober.fetch(
+                "SELECT 1 FROM object_versions WHERE object_id = $1 AND object_version = $2 FOR UPDATE NOWAIT",
+                object_id,
+                reserved_version,
+            )
+        except asyncpg.LockNotAvailableError:
+            version_row_is_free = False
+        await prober.execute("ROLLBACK")
+
+        assert version_row_is_free, (
+            "abort_cleanup_orphan_version holds the version row while waiting for the objects row -- "
+            "the forbidden order, which deadlocks against a concurrent overwrite"
+        )
+
+        await holder.execute("ROLLBACK")
+        with contextlib.suppress(asyncpg.PostgresError):
+            await abort
+    finally:
+        for conn_ in (holder, aborter, prober):
+            with contextlib.suppress(Exception):
+                await conn_.execute("ROLLBACK")
+            await committed_pool.pool.release(conn_)
+
+
+@pytest.mark.parametrize("concurrency", [4, 16])
+async def test_abort_multipart_racing_an_overwrite_does_not_deadlock(
+    committed_pool: CommittedPool,
+    concurrency: int,
+) -> None:
+    """The real abort statement against real overwrites: no exception, and the counter still agrees.
+
+    A deadlock here is a 500 on a customer request, so the assertion is on the exceptions as much as
+    on the bytes.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async def put(size: int) -> None:
+        async with committed_pool.acquire() as conn:
+            await _put(conn, bucket_id, "aborty", size)
+
+    async def abort() -> None:
+        async with committed_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT object_id, current_object_version FROM objects"
+                " WHERE bucket_id = $1 AND object_key = $2 AND deleted_at IS NULL",
+                bucket_id,
+                "aborty",
+            )
+            if row:
+                await conn.fetchrow(
+                    get_query("abort_cleanup_orphan_version"), row["object_id"], row["current_object_version"]
+                )
+
+    for _ in range(6):
+        work = [abort() if i % 3 == 0 else put(1024 * (i + 1)) for i in range(concurrency)]
+        outcomes = await asyncio.gather(*work, return_exceptions=True)
+        raised = [o for o in outcomes if isinstance(o, BaseException)]
+        assert not raised, f"concurrent abort and overwrite raised {raised}"
+
+    async with committed_pool.acquire() as conn:
+        await _assert_matches_oracle(conn, acct)
+
+
+async def test_the_locking_read_helper_is_not_stable(pg_conn: asyncpg.Connection) -> None:
+    """storage_usage_version_bytes_locked must stay VOLATILE.
+
+    It takes a row lock, so it is not repeatable and the planner must not be free to fold, cache or
+    elide the call. Marking it STABLE would also re-pin it to the calling snapshot, which is the
+    exact shape the bug had. `v` is VOLATILE, `s` STABLE, `i` IMMUTABLE in pg_proc.
+    """
+    # provolatile is Postgres's internal "char" type, which asyncpg hands back as bytes.
+    volatility = await pg_conn.fetchval(
+        "SELECT provolatile::text FROM pg_proc WHERE proname = 'storage_usage_version_bytes_locked'"
+    )
+    assert volatility == "v"
