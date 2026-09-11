@@ -1412,8 +1412,10 @@ spec:
 # not on pod restarts.
 #
 # Writes, so it needs the PRIMARY (DATABASE_URL) — unlike the plans-cacher, which reads a replica.
-# No PVC. No wait-for-migrations init container: the tables it needs come from the migration, and
-# an early start just no-ops until they exist.
+# No PVC. It DOES carry a wait-for-migrations init container: the "early start just no-ops"
+# reasoning was wrong -- compact_once calls storage_usage_rollup_lock_key() on its first cycle and
+# crash-looped against a schema without it during the staging rollout. Pinned by
+# tests/unit/test_k8s_worker_migration_gate.py::test_usage_rollup_specifically_gates.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -1421,6 +1423,14 @@ metadata:
 
 spec:
   replicas: 1
+  # Recreate, like the other single-instance workers. Default RollingUpdate on replicas: 1 gives
+  # maxSurge 1 / maxUnavailable 0, so EVERY deploy briefly runs two pods -- and while correctness
+  # holds (compaction is serialised by pg_try_advisory_xact_lock, the DELETE ... RETURNING claim is
+  # exactly-once, and recompute is an idempotent SET), both reconcilers would pick the same queue
+  # head and serialise on the global advisory lock, doubling the heaviest aggregate in the schema
+  # for no reason.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: usage-rollup

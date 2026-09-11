@@ -322,11 +322,16 @@ class Config:
     # can carry a wrong number.
     #
     # 25/hour was far too slow, and the reasoning behind it ("the reconciler is an alarm, not the
-    # mechanism") does not survive the drift being an OVER-count: at ~46k buckets a full pass took
-    # ~77 days, so a hot-key customer could be over-billed for two months before anything noticed.
-    # An alarm nobody hears for 77 days is not an alarm.
+    # mechanism") does not survive the drift being an OVER-count: a hot-key customer could be
+    # over-billed for weeks before anything noticed. An alarm nobody hears is not an alarm.
     #
-    # 200 every 300s = 2,400 buckets/hour, so a full sweep is ~19 hours. Justified against the
+    # SWEEP ARITHMETIC, corrected -- an earlier version of this comment priced it against the
+    # ~48k TOTAL buckets and got ~19 hours. list_buckets_for_usage_reconcile.sql filters
+    # `deleted_at IS NULL`, and production has 3,334 LIVE buckets out of 48,077. So 200 every 300s
+    # = 2,400/hour is a full sweep in about **1.4 hours**, not 19 -- and the old 25/hour was ~5.5
+    # days per pass rather than the 77 days that figure implied. Better than claimed in both
+    # directions, but worth having right: someone tuning this should not reason from a number that
+    # is 13x off. Justified against the
     # measured cost of one recompute_bucket_storage_usage(): 0.8ms for an empty bucket, 1.0ms at 10
     # objects, 1.3ms at 100, 8.1ms at 1000 (median, laptop Postgres, so pessimistic per-op relative
     # to the primary but without its load). A 200-bucket pass is therefore ~0.2-0.5s of primary

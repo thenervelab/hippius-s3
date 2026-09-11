@@ -158,6 +158,15 @@ class FakePool:
 
         return _Ctx()
 
+    async def fetchval(self, _query: str, *_args: object):
+        """The readiness probe refresh_plan_roll_once now makes BEFORE scraping upstream.
+
+        Deliberately not affected by `fail`, which models a USAGE read failure: the point of that
+        fixture is that the scrape happens and then the per-account read raises, so the probe must
+        let it through to keep that case meaningful.
+        """
+        return self.ready
+
     async def fetchrow(self, _query: str, account_id: str, timeout: float | None = None):
         if self.fail:
             raise self.fail
@@ -542,12 +551,22 @@ async def test_an_unbackfilled_rollup_publishes_nothing() -> None:
     raises, the cycle fails, and the previous roll keeps serving until the backfill Job completes.
     """
     redis = FakeRedis()
-    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
+    scrape = AsyncMock(return_value=page())
+    api = api_client_returning(get_s3_plan_accounts=scrape)
 
     with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
         assert await pc.run_cycle(redis, FakePool(usage={ACCT_BUSINESS: 7 * TB}, ready=False)) is False
 
     assert "hippius_s3_plan_accounts" not in redis.hashes
+    # AND it does not scrape at all. The readiness probe is one local SELECT and it runs FIRST,
+    # because the usage read that raises is at the END of a full paginated fetch: every pre-backfill
+    # cycle used to pull the whole roll upstream and throw it away. With the failed-cycle retry
+    # sleeping 60s rather than plans_loop_sleep, that ran the rollout window at roughly 10x the
+    # steady-state request rate against an endpoint we do not own.
+    assert scrape.await_count == 0, (
+        "the upstream plans endpoint was scraped even though the rollup cannot be read; the "
+        "readiness probe must come before the fetch"
+    )
 
 
 @pytest.mark.asyncio

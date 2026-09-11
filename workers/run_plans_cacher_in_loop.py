@@ -190,6 +190,20 @@ async def refresh_plan_roll_once(redis_client: Redis, pool: asyncpg.Pool) -> tup
     untouched, and the cycle is recorded as a failure. Publishing what we had so far would drop the
     accounts on the unfetched pages to pay-as-you-go and 402 them on their next upload.
     """
+    # Ask the CHEAP question first. _attach_usage raises StorageRollupNotBackfilled until the
+    # backfill has run, and it runs AFTER the whole paginated scrape -- so every pre-backfill cycle
+    # used to do the full upstream fetch and then throw it away. Combined with the failed-cycle
+    # retry sleeping 60s instead of plans_loop_sleep, that put the rollout window at roughly 10x the
+    # steady-state request rate against an endpoint we do not own, precisely when the rollup is not
+    # usable anyway. One local SELECT now decides it.
+    if not await usage_service.rollup_is_ready(pool):
+        raise usage_service.StorageRollupNotBackfilled(
+            "bucket_storage_usage has not been backfilled (storage_usage_rollup_state.backfilled_at "
+            "is NULL), so its rows are deltas rather than totals. Skipping the upstream scrape "
+            "entirely rather than fetching a roll that cannot be published. Run "
+            "hippius_s3/scripts/backfill_bucket_storage_usage.py."
+        )
+
     accounts: dict[str, dict[str, Any]] = {}
     catalog: dict[str, dict[str, Any]] = {}
     next_url: str | None = None

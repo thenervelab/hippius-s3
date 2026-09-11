@@ -110,13 +110,14 @@ async def recompute_bucket(
     SET rather than ADD is what makes running this twice, or concurrently with live writes, safe:
     each run overwrites with the truth as of its own snapshot instead of accumulating.
 
-    `timeout` is asyncpg's own. It is NOT sufficient on its own: whichever of it and the server's
-    statement_timeout is SHORTER is the one that fires, and production sets a 1-minute
-    statement_timeout for the application role. Callers must therefore raise statement_timeout on
-    the connection they hand in -- the usage-rollup pool and the backfill script both do, and
-    tests/unit/test_storage_rollup_service.py pins it. This is the ONE expensive statement in the
-    whole mechanism -- for the largest prod bucket it is the aggregate the rollup exists to stop
-    running every cycle -- so it is bounded explicitly at both layers.
+    `timeout` is asyncpg's own, which cancels client-side and best-effort. Callers ALSO set
+    statement_timeout on the connection they hand in, so the backend enforces its own bound: the
+    usage-rollup pool and the backfill script both do, pinned by
+    tests/unit/test_recompute_statement_timeout.py. Production's own statement_timeout is 0, so
+    without that this aggregate is unbounded on the primary -- and whichever of the two limits is
+    shorter is the one that fires, so they are set together deliberately. This is the ONE expensive
+    statement in the whole mechanism: for the largest prod bucket it is the aggregate the rollup
+    exists to stop running every cycle.
     """
     row = await conn.fetchrow(get_query("recompute_bucket_storage_usage"), bucket_id, timeout=timeout)
     return RecomputeResult(
@@ -157,7 +158,28 @@ async def reconcile_buckets(
 
     results: list[RecomputeResult] = []
     for row in rows:
-        result = await recompute_bucket(conn, row["bucket_id"], timeout)
+        # PER-BUCKET ISOLATION, and one of the few places in this codebase where catching is
+        # correct rather than lazy. The queue is `ORDER BY recomputed_at ASC NULLS FIRST` and
+        # recompute_bucket_storage_usage() only stamps recomputed_at on success, so a bucket that
+        # raises stays the queue HEAD forever. Letting that raise abandons the rest of the pass and
+        # the reconciler then re-attempts the same bucket every cycle and never verifies another
+        # one again -- silently losing the only drift detector this design has, which is the single
+        # worst outcome available here. One wasted bucket per cycle is the right trade.
+        #
+        # It is logged at ERROR and fails the cycle metric, so it is loud; nothing is swallowed.
+        try:
+            result = await recompute_bucket(conn, row["bucket_id"], timeout)
+        except Exception as e:
+            logger.error(
+                f"STORAGE_ROLLUP_RECOMPUTE_FAILED bucket={row['bucket_id']}: {type(e).__name__}: {e}. "
+                f"This bucket stays at the head of the least-recently-recomputed queue and will be "
+                f"retried next cycle; the rest of this pass continues. If it repeats, that bucket is "
+                f"never being verified -- check whether its aggregate exceeds "
+                f"HIPPIUS_USAGE_RECONCILE_TIMEOUT_SECONDS.",
+                exc_info=True,
+            )
+            continue
+
         results.append(result)
         if not result.drift_bytes:
             continue
