@@ -468,6 +468,14 @@ class ObjectWriter:
         ):
             async with acquire_with_timeout(self.pool, self.config.db_pool_acquire_timeout) as conn:
                 async with conn.transaction():
+                    # FIRST, before anything in this transaction touches object_versions: take the
+                    # objects row. The INSERTs further down carry object_id FKs, which Postgres
+                    # services with an implicit `objects ... FOR KEY SHARE` at that point -- so
+                    # without this line the transaction's lock order is object_versions -> objects
+                    # and it deadlocks against a concurrent same-key reserve, whose trigger locks
+                    # the outgoing version while holding the objects row. See the query's header.
+                    await conn.execute(get_query("lock_object_row_by_id"), object_id)
+
                     # Until this UPDATE sets non-empty size/md5 the version is invisible to downloads.
                     await conn.execute(
                         get_query("update_object_version_metadata"),
@@ -1040,6 +1048,11 @@ class ObjectWriter:
         upload_id = None
 
         async with self.pool.acquire() as conn, conn.transaction():
+            # objects BEFORE object_versions, for the same reason as the simple-PUT tail: the
+            # multipart_uploads / parts INSERTs below reach `objects` through their object_id FKs,
+            # after this transaction already holds its version row. See lock_object_row_by_id.sql.
+            await conn.execute(get_query("lock_object_row_by_id"), object_id)
+
             # deleted_at IS NULL: a versioned DELETE can tombstone this version between the
             # unlocked read of current_object_version above and this lock. Appending onto a
             # tombstone returns 200 for bytes no read path will ever serve (every resolver filters

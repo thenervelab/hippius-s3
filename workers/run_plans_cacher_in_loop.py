@@ -4,14 +4,20 @@
     GET /api/s3/plans/accounts/?page=1&page_size=500
 
 One endpoint carries both halves — `plans` is the catalog, `results` is the paginated per-account
-roll — so this is a single loop, polled every HIPPIUS_PLANS_LOOP_SLEEP seconds (default 600).
+roll — so this is a single loop, polled every HIPPIUS_PLANS_LOOP_SLEEP seconds (default 120).
 
-Upstream reports each account's MAX QUOTA but not its usage, so this worker also computes the usage
-itself: one SUM per account that is actually on a plan, run here in the background rather than on
-anyone's upload. There are only a few tens of such accounts, so a cycle is a few seconds of work
-spread over HIPPIUS_PLANS_USAGE_CONCURRENCY connections. That cardinality is the whole reason there
-is no rollup table and no triggers — a maintained counter would buy nothing here except a second
-source of truth to keep in step.
+Upstream reports each account's MAX QUOTA but not its usage, so this worker also fills the usage in:
+one indexed SUM per plan account over `bucket_storage_usage`, the counter that Postgres triggers and
+the usage-rollup worker maintain (see 20260910120000_storage_usage_rollup.sql). Sub-millisecond, and
+flat in the number of objects an account owns.
+
+It used to compute that number outright, per bucket, in keyset pages, on the premise that there are
+only a few tens of plan accounts. Account cardinality was never the problem: ONE account owning ONE
+multi-million-object bucket costs minutes of replica work per cycle, forever, to rediscover a figure
+that moved by a handful of objects. The full scan now happens once, as a backfill.
+
+Before that backfill has run the usage read RAISES and the cycle publishes nothing, so the previous
+roll keeps serving. See hippius_s3/scripts/backfill_bucket_storage_usage.py.
 
 The refresh interval IS the enforcement lag, in both directions: an account can overshoot by one
 cycle's worth of uploads, and a customer who deletes data stays refused until the next cycle sees
@@ -148,15 +154,17 @@ def _parse_page(page: S3PlanAccountsResponse) -> tuple[dict[str, dict[str, Any]]
 async def _attach_usage(pool: asyncpg.Pool, accounts: dict[str, dict[str, Any]]) -> None:
     """Fill in `used_bytes` for every account, in parallel, mutating `accounts` in place.
 
-    Each count is O(objects the account owns) -- sub-second for a typical account, seconds for the
-    largest. Bounded concurrency rather than one serial pass, so a single 11.8M-object account does
-    not set the pace for the whole cycle; and bounded rather than unbounded, so a few tens of
-    simultaneous aggregates cannot become the heaviest thing running on the primary.
+    Each read is an indexed SUM over bucket_storage_usage -- a MAINTAINED counter, sub-millisecond,
+    and independent of how many objects the account owns. It used to be an O(objects) keyset walk of
+    every bucket, which for one account holding a multi-million-object bucket was minutes of replica
+    work EVERY cycle to rediscover a number that had barely moved. The bounded concurrency below is
+    now cheap insurance rather than the thing that makes a cycle finish.
 
     A failure for ANY account propagates. refresh_plan_roll_once then publishes nothing and the
     previous roll keeps serving, which is the right trade: publishing a partial answer would mean
     writing used_bytes=0 for the accounts we failed to count, silently handing them unlimited
-    headroom until the next cycle.
+    headroom until the next cycle. That is also what happens before the rollup has been backfilled
+    -- get_account_storage_bytes raises rather than serve deltas as if they were totals.
     """
 
     async def count(account_id: str) -> tuple[str, int]:
@@ -168,7 +176,6 @@ async def _attach_usage(pool: asyncpg.Pool, accounts: dict[str, dict[str, Any]])
                 conn,
                 account_id,
                 timeout=config.plans_usage_timeout_seconds,
-                page_size=config.plans_usage_page_size,
             )
 
     for account_id, used in await asyncio.gather(*(count(a) for a in accounts)):
@@ -183,6 +190,20 @@ async def refresh_plan_roll_once(redis_client: Redis, pool: asyncpg.Pool) -> tup
     untouched, and the cycle is recorded as a failure. Publishing what we had so far would drop the
     accounts on the unfetched pages to pay-as-you-go and 402 them on their next upload.
     """
+    # Ask the CHEAP question first. _attach_usage raises StorageRollupNotBackfilled until the
+    # backfill has run, and it runs AFTER the whole paginated scrape -- so every pre-backfill cycle
+    # used to do the full upstream fetch and then throw it away. Combined with the failed-cycle
+    # retry sleeping 60s instead of plans_loop_sleep, that put the rollout window at roughly 10x the
+    # steady-state request rate against an endpoint we do not own, precisely when the rollup is not
+    # usable anyway. One local SELECT now decides it.
+    if not await usage_service.rollup_is_ready(pool):
+        raise usage_service.StorageRollupNotBackfilled(
+            "bucket_storage_usage has not been backfilled (storage_usage_rollup_state.backfilled_at "
+            "is NULL), so its rows are deltas rather than totals. Skipping the upstream scrape "
+            "entirely rather than fetching a roll that cannot be published. Run "
+            "hippius_s3/scripts/backfill_bucket_storage_usage.py."
+        )
+
     accounts: dict[str, dict[str, Any]] = {}
     catalog: dict[str, dict[str, Any]] = {}
     next_url: str | None = None
@@ -263,20 +284,18 @@ async def run_cycle(redis_client: Redis, pool: asyncpg.Pool) -> bool:
 
 async def run_plans_cacher_loop() -> None:
     redis_client = Redis.from_url(config.redis_accounts_url)
-    # READ-ONLY DSN. These counts are aggregates over the largest tables in the schema, run on a
-    # timer with nobody waiting, so they belong nowhere near the primary — on this cluster a
-    # read-storm has stalled it before and triggered a failover. Falls back to DATABASE_URL when
-    # unset, so local dev and e2e are unaffected. A replica may cancel a long query under recovery
-    # conflict rather than let it lag replay; run_cycle already treats that as a failed cycle and
-    # keeps the previous roll serving, which is the behaviour we want.
+    # READ-ONLY DSN. Kept even though the usage read is now a small indexed SUM: this worker reads
+    # and never writes, it runs on a timer with nobody waiting, and on this cluster a read-storm has
+    # stalled the primary before and triggered a failover. Falls back to DATABASE_URL when unset, so
+    # local dev and e2e are unaffected. The rollup is written on the PRIMARY by the usage-rollup
+    # worker, so replica lag is one more small increment of staleness on a figure that is already a
+    # HIPPIUS_PLANS_LOOP_SLEEP-old estimate by design.
     #
-    # Sized to the usage concurrency and no larger: this worker's only DB work is those counts, and
+    # Sized to the usage concurrency and no larger: this worker's only DB work is those reads, and
     # an oversized pool here is idle backends against Postgres max_connections for nothing.
-    # jit=off for the whole pool. This worker runs nothing but the storage counts, and JIT is pure
-    # overhead for them: it fires because the planner's cost estimate is inflated (see the
-    # n_distinct migration), then spends 107ms of a 326ms count for a 1,300-object account compiling
-    # expressions for a query that is index-probe bound, not expression bound. Measured 20-35% off
-    # small accounts for free.
+    # jit=off for the whole pool. JIT is pure overhead for an index-probe-bound query -- it cost
+    # 107ms of a 326ms count for a 1,300-object account back when this scanned, and there is even
+    # less for it to earn now.
     pool = await asyncpg.create_pool(
         config.database_readonly_url,
         min_size=1,
@@ -286,8 +305,8 @@ async def run_plans_cacher_loop() -> None:
     initialize_metrics_collector()
 
     logger.info(
-        f"Starting plans-cacher: polling every {config.plans_loop_sleep}s, counting usage over "
-        f"{config.plans_usage_concurrency} connections. Caching is unconditional — it does not "
+        f"Starting plans-cacher: polling every {config.plans_loop_sleep}s, reading usage from the "
+        f"rollup over {config.plans_usage_concurrency} connections. Caching is unconditional — it does not "
         f"depend on whether plan enforcement is enabled."
     )
 

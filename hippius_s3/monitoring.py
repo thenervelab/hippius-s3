@@ -609,6 +609,46 @@ class MetricsCollector:
             name="plans_cache_age_seconds", description="Age of the cached plan maps", unit="s"
         )
 
+        # Storage-usage rollup. `storage_rollup_drift_bytes` is the one that matters: the rollup is
+        # maintained by triggers against get_account_storage_bytes.sql, so a reconcile pass that
+        # finds ANY drift has found a write path moving bytes without emitting a delta. Expected
+        # value is exactly zero, which is what makes it a usable alarm.
+        self.storage_rollup_drift_bytes = self.meter.create_histogram(
+            name="storage_rollup_drift_bytes",
+            description="Absolute correction a bucket recompute applied to bucket_storage_usage",
+            unit="By",
+        )
+        self.storage_rollup_drifted_buckets_total = self.meter.create_counter(
+            name="storage_rollup_drifted_buckets_total",
+            description="Buckets whose recompute found a non-zero correction",
+            unit="1",
+        )
+        self.storage_rollup_reconciled_total = self.meter.create_counter(
+            name="storage_rollup_reconciled_total", description="Buckets recomputed by the reconciler", unit="1"
+        )
+        self.storage_rollup_compacted_rows_total = self.meter.create_counter(
+            name="storage_rollup_compacted_rows_total",
+            description="Ledger rows folded into bucket_storage_usage",
+            unit="1",
+        )
+        # Compactor lag. Both should sit near zero; a rising pair means the counter has frozen while
+        # still being served, which is a wrong bill rather than an outage and so has no other signal.
+        self.storage_rollup_ledger_depth = self.meter.create_histogram(
+            name="storage_rollup_ledger_depth", description="Unfolded rows in storage_delta_ledger", unit="1"
+        )
+        self.storage_rollup_ledger_lag_seconds = self.meter.create_histogram(
+            name="storage_rollup_ledger_lag_seconds", description="Age of the oldest unfolded ledger row", unit="s"
+        )
+        # A counter below zero is only reachable if a decrement was recorded without its increment.
+        self.storage_rollup_negative_buckets = self.meter.create_histogram(
+            name="storage_rollup_negative_buckets",
+            description="Buckets whose maintained byte counter has gone negative",
+            unit="1",
+        )
+        self.storage_rollup_cycles_total = self.meter.create_counter(
+            name="storage_rollup_cycles_total", description="Usage-rollup worker cycles, by success", unit="1"
+        )
+
         self.cachet_health_checks_total = self.meter.create_counter(
             name="cachet_health_checks_total", description="Gateway health checks run by the cachet worker", unit="1"
         )
@@ -1034,6 +1074,24 @@ class MetricsCollector:
     def record_plans_cache_age(self, age_seconds: float) -> None:
         self.plans_cache_age_seconds.record(age_seconds)
 
+    def record_storage_rollup_compaction(self, rows: int) -> None:
+        if rows:
+            self.storage_rollup_compacted_rows_total.add(rows)
+
+    def record_storage_rollup_recompute(self, drift_bytes: int) -> None:
+        self.storage_rollup_reconciled_total.add(1)
+        self.storage_rollup_drift_bytes.record(abs(drift_bytes))
+        if drift_bytes:
+            self.storage_rollup_drifted_buckets_total.add(1)
+
+    def record_storage_rollup_ledger(self, depth: int, lag_seconds: int, negative_buckets: int) -> None:
+        self.storage_rollup_ledger_depth.record(depth)
+        self.storage_rollup_ledger_lag_seconds.record(lag_seconds)
+        self.storage_rollup_negative_buckets.record(negative_buckets)
+
+    def record_storage_rollup_cycle(self, success: bool) -> None:
+        self.storage_rollup_cycles_total.add(1, attributes={"success": str(success).lower()})
+
     def record_cachet_check(self, status: str, update_success: bool) -> None:
         self.cachet_health_checks_total.add(1, attributes={"status": status})
         self.cachet_updates_total.add(1, attributes={"success": str(update_success).lower()})
@@ -1148,6 +1206,18 @@ class NullMetricsCollector:
         pass
 
     def record_plans_cache_age(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_storage_rollup_compaction(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_storage_rollup_recompute(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_storage_rollup_ledger(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_storage_rollup_cycle(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_account_cacher_cycle(self, *args: object, **kwargs: object) -> None:
