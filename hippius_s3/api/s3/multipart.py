@@ -24,7 +24,9 @@ from starlette.requests import ClientDisconnect
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import InvalidContentMD5
 from hippius_s3.api.s3.common import format_s3_timestamp
+from hippius_s3.api.s3.common import parse_content_md5
 from hippius_s3.api.s3.copy_helpers import parse_copy_source
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.errors import s3_error_response
@@ -45,6 +47,7 @@ from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.writer.types import BadDigest
 from hippius_s3.xml_helpers import add_subelement
 from hippius_s3.xml_helpers import create_element
 from hippius_s3.xml_helpers import parse_untrusted_xml
@@ -581,6 +584,15 @@ async def upload_part(
             status_code=400,
         )
 
+    # Content-MD5 digests the request body, so it applies to a regular UploadPart only; an
+    # UploadPartCopy carries no body. Parsed before the body is read; matched by the writer.
+    expected_md5: bytes | None = None
+    if not request.headers.get("x-amz-copy-source"):
+        try:
+            expected_md5 = parse_content_md5(request.headers.get("content-md5"))
+        except InvalidContentMD5:
+            return errors.invalid_digest_response()
+
     # Check if the multipart upload exists
     ongoing_multipart_upload = await pool.fetchrow(
         get_query("get_multipart_upload"),
@@ -842,7 +854,13 @@ async def upload_part(
                 account_address=request.state.main_account_id,
                 part_number=int(part_number),
                 body_iter=body_iter,
+                expected_md5=expected_md5,
             )
+        except BadDigest as exc:
+            # The writer discarded this attempt before publishing it; any earlier upload of this
+            # part number is untouched.
+            logger.info(f"UploadPart {part_number} for upload {upload_id} rejected: {exc}")
+            return errors.bad_digest_response()
         except ClientDisconnect:
             logger.warning(f"Client disconnected during part {part_number} upload for upload {upload_id}")
 

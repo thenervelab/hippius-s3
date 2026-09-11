@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import hashlib
 import uuid
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +13,7 @@ from starlette.datastructures import Headers
 
 from hippius_s3.api.s3.objects import put_object_endpoint
 from hippius_s3.api.s3.objects.put_object_endpoint import handle_put_object
+from hippius_s3.writer.types import BadDigest
 from hippius_s3.writer.types import PutResult
 from tests.unit._fake_pool import make_fake_pool
 
@@ -314,3 +317,69 @@ async def test_created_flag_tracks_allocated_version(monkeypatch: Any, object_ve
     assert resp.status_code == 200
     assert resp.headers.get("x-amz-version-id") == str(object_version)
     assert getattr(req.state, "ats_object_created", False) is flag_set
+
+
+def _patch_writer_capture(monkeypatch: Any, captured: dict[str, Any], raise_exc: Exception | None = None) -> None:
+    async def fake_put(self: Any, **kw: Any) -> PutResult:
+        captured.update(kw)
+        if raise_exc is not None:
+            raise raise_exc
+        return PutResult(
+            object_id=str(uuid.uuid4()), etag="etag", size_bytes=3, upload_id=str(uuid.uuid4()), object_version=2
+        )
+
+    async def fake_persist_address(*_a: Any, **_kw: Any) -> None:
+        return None
+
+    monkeypatch.setattr(put_object_endpoint.ObjectWriter, "put_simple_stream_full", fake_put)
+    monkeypatch.setattr(put_object_endpoint, "set_object_version_address", fake_persist_address)
+
+
+async def _put_with_headers(monkeypatch: Any, headers: dict[str, str], raise_exc: Exception | None = None) -> Any:
+    captured: dict[str, Any] = {}
+    _patch_writer_capture(monkeypatch, captured, raise_exc)
+    req = _fake_request(headers)
+    req.state.bucket_id = str(uuid.uuid4())
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="k/o.bin",
+        request=req,
+        pool=make_fake_pool(_bucket_present_router),
+        redis_client=_FakeRedis(nx_result=None),
+    )
+    return resp, captured
+
+
+@pytest.mark.asyncio
+async def test_malformed_content_md5_is_invalid_digest_before_the_body_is_read(monkeypatch: Any) -> None:
+    resp, captured = await _put_with_headers(monkeypatch, {"Content-MD5": hashlib.md5(b"x").hexdigest()})
+    assert resp.status_code == 400
+    assert b"<Code>InvalidDigest</Code>" in resp.body
+    assert captured == {}, "the writer must not run for a malformed Content-MD5"
+
+
+@pytest.mark.asyncio
+async def test_content_md5_is_handed_to_the_writer_as_raw_bytes(monkeypatch: Any) -> None:
+    digest = hashlib.md5(b"body").digest()
+    resp, captured = await _put_with_headers(monkeypatch, {"Content-MD5": base64.b64encode(digest).decode()})
+    assert resp.status_code == 200
+    assert captured["expected_md5"] == digest
+
+
+@pytest.mark.asyncio
+async def test_no_content_md5_means_no_check(monkeypatch: Any) -> None:
+    resp, captured = await _put_with_headers(monkeypatch, {})
+    assert resp.status_code == 200
+    assert captured["expected_md5"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_mismatch_is_bad_digest(monkeypatch: Any) -> None:
+    digest = hashlib.md5(b"claimed").digest()
+    resp, _ = await _put_with_headers(
+        monkeypatch,
+        {"Content-MD5": base64.b64encode(digest).decode()},
+        raise_exc=BadDigest(expected=digest, actual=hashlib.md5(b"received").digest()),
+    )
+    assert resp.status_code == 400
+    assert b"<Code>BadDigest</Code>" in resp.body
