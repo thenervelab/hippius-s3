@@ -51,6 +51,20 @@
 -- and the db-migrations Job's backoffLimit is the retry. SET LOCAL rather than SET because dbmate
 -- applies every pending migration over ONE connection and a session-scoped SET would leak into the
 -- next migration.
+-- LOCK LEVELS, MEASURED on PG 18.1 (prod and staging both) rather than assumed, because an
+-- earlier version of this header said "CREATE TRIGGER takes ACCESS EXCLUSIVE" and that is wrong:
+--
+--     CREATE TRIGGER                     -> ShareRowExclusiveLock   (blocks writes, NOT reads)
+--     DROP TRIGGER IF EXISTS (absent)    -> no lock at all
+--     DROP TRIGGER IF EXISTS (present)   -> AccessExclusiveLock     (blocks reads and writes)
+--
+-- On a FIRST apply -- which is every apply, since a lock_timeout abort rolls back the whole file
+-- including its schema_migrations row -- none of these triggers exist yet, so the DROP guards take
+-- nothing and only CREATE TRIGGER's SHARE ROW EXCLUSIVE applies. GET and ListObjects are therefore
+-- never blocked by this migration; writes to objects/object_versions pause for the milliseconds the
+-- catalog update takes. The SET LOCAL below still matters: prod runs with lock_timeout = 0, so
+-- without it a wait behind a long transaction would queue the write path indefinitely.
+
 SET LOCAL lock_timeout = '3s';
 
 -- The ledger. Insert-only, drained by the compactor, so steady-state size is one compaction batch.
@@ -501,6 +515,8 @@ DROP FUNCTION IF EXISTS storage_usage_emit(uuid, bigint);
 DROP FUNCTION IF EXISTS storage_usage_bucket_of_object(uuid);
 DROP FUNCTION IF EXISTS storage_usage_version_is_current(uuid, bigint);
 DROP FUNCTION IF EXISTS storage_usage_version_bytes(uuid, bigint);
+-- Created in the up half above; was orphaned by every down path until now.
+DROP FUNCTION IF EXISTS storage_usage_narrow(numeric);
 DROP FUNCTION IF EXISTS storage_usage_rollup_lock_key();
 
 DROP TABLE IF EXISTS storage_usage_rollup_state;
