@@ -154,13 +154,14 @@ def _append_entry(
         add_subelement(entry, "ETag", f'"{row["md5_hash"] or ""}"')
         add_subelement(entry, "Size", str(row["size_bytes"]))
         add_subelement(entry, "StorageClass", "STANDARD")
+    # Same contract as ListObjects: <ArionHash> carries the hash Arion registered the version
+    # under, when there is exactly one. A delete marker has no content, so it never has one — the
+    # two listings must not disagree about the same version.
+    arion_hash = "" if is_marker else (row["arion_hash"] or "")
+    if arion_hash:
+        add_subelement(entry, "ArionHash", arion_hash)
     owner = add_subelement(entry, "Owner")
-    # Same contract as ListObjects: the console reads Owner.ID as the Arion file hash, so a
-    # version that has a plaintext BLAKE3 surfaces it and one that doesn't falls back to the
-    # account id. A delete marker has no content, so it always carries the account id — the two
-    # listings must not disagree about the same version.
-    file_hash = "" if is_marker else (row["body_blake3"] or "")
-    add_subelement(owner, "ID", file_hash or bucket_owner)
+    add_subelement(owner, "ID", arion_hash or bucket_owner)
     add_subelement(owner, "DisplayName", bucket_owner)
 
 

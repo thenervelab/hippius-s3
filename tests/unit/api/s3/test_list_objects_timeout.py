@@ -50,6 +50,7 @@ def _row(key: str) -> dict[str, Any]:
         "multipart": False,
         "status": "uploaded",
         "body_blake3": None,
+        "arion_hash": None,
     }
 
 

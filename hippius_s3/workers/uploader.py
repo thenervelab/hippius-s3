@@ -190,6 +190,8 @@ class Uploader:
                 f"chunks={len(all_chunk_cids)} duration={total_duration:.2f}s"
             )
 
+            await self._record_object_arion_hash(payload.object_id, int(payload.object_version or 1))
+
             span.set_attribute("result.chunks_uploaded", len(all_chunk_cids))
             span.set_attribute("result.duration_s", total_duration)
 
@@ -201,6 +203,42 @@ class Uploader:
             )
 
             return all_chunk_cids
+
+    def _arion_hash_of(self, upload_result: Any) -> str | None:
+        """The hash Arion registered this chunk under, or None for a non-Arion backend.
+
+        Not ``upload_result.id``: that is HCFS's file_id (its path hash), which only HCFS knows.
+        HCFS returns the real one as ``arion_hash``; servers that predate that field return the same
+        value as ``upload_id`` (``cid`` here), which falls back to the S3 hash — the BLAKE3 of the same
+        ciphertext, so identical to what Arion content-addresses it by.
+        """
+        if self.backend_name != "arion":
+            return None
+        explicit = getattr(upload_result, "arion_hash", None)
+        if explicit is not None:
+            # An empty value is HCFS saying it has no Arion copy; upload_id would then be the S3 hash.
+            return str(explicit) or None
+        value = getattr(upload_result, "cid", None)
+        return str(value) if value else None
+
+    async def _record_object_arion_hash(self, object_id: str, object_version: int) -> None:
+        """Surface the chunk's Arion hash on the version once it is stored as a single chunk.
+
+        Best effort: the chunks are already on Arion, and failing here would requeue an upload that
+        succeeded just to redo a display column.
+        """
+        if self.backend_name != "arion":
+            return
+        try:
+            async with self._acquire_conn() as conn:
+                await conn.execute(
+                    get_query("update_object_version_arion_hash"),
+                    object_id,
+                    object_version,
+                    self.backend_name,
+                )
+        except Exception:
+            logger.warning(f"Failed to record arion_hash object_id={object_id} version={object_version}", exc_info=True)
 
     async def _upload_chunks(
         self,
@@ -374,10 +412,11 @@ class Uploader:
                         )
 
                         file_hash = str(chunk_upload_result.id)
+                        arion_hash = self._arion_hash_of(chunk_upload_result)
                         logger.info(
                             f"Uploaded chunk: backend={self.backend_name} object_id={object_id} part={part_number} "
                             f"chunk={ci} file_id={file_hash} upload_id={chunk_upload_result.cid} "
-                            f"status={chunk_upload_result.status}"
+                            f"arion_hash={arion_hash} status={chunk_upload_result.status}"
                         )
 
                         async with self._acquire_conn() as conn:
@@ -387,6 +426,7 @@ class Uploader:
                                 int(ci),
                                 self.backend_name,
                                 file_hash,
+                                arion_hash,
                             )
                         return ci, file_hash
 

@@ -168,6 +168,9 @@ async def list_objects(
                 "object_key": obj["object_key"],
                 "ipfs_cid": obj["ipfs_cid"],
                 "body_blake3": obj["body_blake3"],
+                # The id Arion, the validator and the explorer know. NOT body_blake3, which is the
+                # plaintext digest. NULL until uploaded, and for multi-chunk versions.
+                "arion_hash": obj["arion_hash"],
                 "size_bytes": obj["size_bytes"],
                 "content_type": obj["content_type"],
                 "created_at": obj["created_at"].isoformat(),
@@ -233,6 +236,7 @@ async def recent_uploads(
             "md5_hash": row["md5_hash"],
             "ipfs_cid": row["ipfs_cid"],
             "body_blake3": row["body_blake3"],
+            "arion_hash": row["arion_hash"],
             "uploaded_at": row["uploaded_at"].isoformat() if row["uploaded_at"] is not None else None,
         }
         for row in rows

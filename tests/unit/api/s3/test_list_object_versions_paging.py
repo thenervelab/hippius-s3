@@ -32,6 +32,7 @@ def _row(key: str, version: int, current: int, *, marker: bool = False) -> dict[
         "size_bytes": 0 if marker else 11,
         "md5_hash": None if marker else "abc",
         "body_blake3": None,
+        "arion_hash": None,
         "last_modified": TS,
         "current_object_version": current,
     }

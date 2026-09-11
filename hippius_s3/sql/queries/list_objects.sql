@@ -28,7 +28,8 @@ SELECT o.object_id,
        o.md5_hash,
        o.status,
        o.multipart,
-       o.body_blake3
+       o.body_blake3,
+       o.arion_hash
 FROM (
     (
         SELECT o.object_id,
@@ -39,7 +40,8 @@ FROM (
                ov.md5_hash,
                ov.status,
                ov.multipart,
-               ov.body_blake3
+               ov.body_blake3,
+               ov.arion_hash
         FROM objects o
         CROSS JOIN LATERAL (
             -- Skip incomplete multipart placeholders (InitiateMultipartUpload without Complete)
@@ -49,7 +51,8 @@ FROM (
                    v.status,
                    v.multipart,
                    v.is_delete_marker,
-                   v.body_blake3
+                   v.body_blake3,
+                   v.arion_hash
             FROM object_versions v
             WHERE v.object_id = o.object_id
               AND v.object_version <= o.current_object_version
@@ -92,7 +95,8 @@ FROM (
                ov.md5_hash,
                ov.status,
                ov.multipart,
-               ov.body_blake3
+               ov.body_blake3,
+               ov.arion_hash
         FROM object_names n
         JOIN objects o ON o.object_id = n.object_id AND o.deleted_at IS NULL
         CROSS JOIN LATERAL (
@@ -102,7 +106,8 @@ FROM (
                    v.status,
                    v.multipart,
                    v.is_delete_marker,
-                   v.body_blake3
+                   v.body_blake3,
+                   v.arion_hash
             FROM object_versions v
             WHERE v.object_id = o.object_id
               AND v.object_version <= o.current_object_version

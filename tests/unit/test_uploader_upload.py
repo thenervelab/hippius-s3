@@ -182,10 +182,12 @@ async def test_upload_stores_backend_identifier_in_chunk_backend(mock_config, mo
 
         assert insert_call is not None
         args = insert_call.args
-        # insert_chunk_backend takes: query, part_id, chunk_index, backend, backend_identifier
-        assert len(args) == 5
+        # insert_chunk_backend takes: query, part_id, chunk_index, backend, backend_identifier, arion_hash
+        assert len(args) == 6
         assert args[3] == "arion"
         assert args[4] == "file-uuid-999"
+        # Not the file_id: HCFS's upload_id is the hash Arion registered the chunk under.
+        assert args[5] == "QmTestCID"
 
 
 @pytest.mark.asyncio
@@ -762,3 +764,21 @@ async def test_part_chunk_upload_failure_propagates(mock_config, mock_db_pool, m
                 object_version=1,
                 account_ss58="5FakeTestAccountAddress123456789012345678901234",
             )
+
+
+@pytest.mark.parametrize(
+    ("arion_hash", "expected"),
+    [
+        ("37e055f0" * 8, "37e055f0" * 8),  # HCFS names the hash explicitly
+        (None, "up-hash"),  # older HCFS: upload_id carries the same value
+        ("", None),  # HCFS has no Arion copy; upload_id would be the S3 hash
+    ],
+)
+def test_arion_hash_comes_from_hcfs_not_the_file_id(mock_config, mock_db_pool, arion_hash, expected):
+    from hippius_s3.services.arion_service import UploadResponse as ArionUploadResponse
+
+    uploader = Uploader(
+        mock_db_pool, FakeRedis(), FakeRedis(), mock_config, backend_name="arion", backend_client=MagicMock()
+    )
+    result = ArionUploadResponse(upload_id="up-hash", timestamp=0, file_id="129107a0" * 8, arion_hash=arion_hash)
+    assert uploader._arion_hash_of(result) == expected

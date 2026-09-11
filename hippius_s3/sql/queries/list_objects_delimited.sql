@@ -192,13 +192,14 @@ SELECT
     m.md5_hash,
     m.created_at,
     m.body_blake3,
+    m.arion_hash,
     w.next_boundary
 FROM walk w
 LEFT JOIN LATERAL (
-    SELECT o.created_at, ov.size_bytes, ov.md5_hash, ov.body_blake3
+    SELECT o.created_at, ov.size_bytes, ov.md5_hash, ov.body_blake3, ov.arion_hash
     FROM objects o
     CROSS JOIN LATERAL (
-        SELECT v.size_bytes, v.md5_hash, v.body_blake3
+        SELECT v.size_bytes, v.md5_hash, v.body_blake3, v.arion_hash
         FROM object_versions v
         WHERE v.object_id = o.object_id
           AND v.object_version <= o.current_object_version

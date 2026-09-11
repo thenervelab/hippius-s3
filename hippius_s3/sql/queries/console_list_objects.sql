@@ -6,6 +6,7 @@
 SELECT o.object_id, o.bucket_id, o.object_key, o.current_object_version,
        COALESCE(c.cid, ov.ipfs_cid) as ipfs_cid,
        ov.body_blake3,
+       ov.arion_hash,
        ov.size_bytes, ov.content_type, o.created_at, ov.md5_hash,
        ov.status, b.bucket_name, ov.multipart
 FROM (
