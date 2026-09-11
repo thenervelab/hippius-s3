@@ -164,3 +164,24 @@ def test_create_only_complete_multipart_upload_creates_a_new_key(
         IfNoneMatch="*",
     )
     assert boto3_client.get_object(Bucket=bucket, Key="big.bin")["Body"].read() == part
+
+
+def test_etag_valued_if_none_match_on_put_is_not_implemented(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    """S3 supports only "*" on writes. Anything else must be refused, not silently ignored (which is
+    how a write-once client overwrites) — and it proves the header reaches the API through the
+    gateway untouched rather than being consumed by the GET-side conditional/caching middleware."""
+    bucket = unique_bucket_name("inm-etag")
+    cleanup_buckets(bucket)
+    boto3_client.create_bucket(Bucket=bucket)
+    boto3_client.put_object(Bucket=bucket, Key="k", Body=b"existing")
+
+    with pytest.raises(ClientError) as exc:
+        boto3_client.put_object(Bucket=bucket, Key="k", Body=b"new", IfNoneMatch='"5d41402abc4b2a76b9719d911017c592"')
+
+    assert _status(exc.value) == 501
+    assert boto3_client.get_object(Bucket=bucket, Key="k")["Body"].read() == b"existing"
