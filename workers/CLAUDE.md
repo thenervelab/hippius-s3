@@ -79,7 +79,7 @@ Config:
 [run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py). One poll loop against one endpoint:
 
 ```
-GET /api/s3/plans/accounts/?page=1&page_size=500     every HIPPIUS_PLANS_LOOP_SLEEP (600s)
+GET /api/s3/plans/accounts/?page=1&page_size=500     every HIPPIUS_PLANS_LOOP_SLEEP (120s)
 ```
 
 It carries both halves — `plans` is the catalog, `results` is the paginated account roll — and is
@@ -243,7 +243,7 @@ Two jobs in one loop:
 | Job | Interval | What it does |
 |---|---|---|
 | **Compact** | `HIPPIUS_USAGE_ROLLUP_LOOP_SLEEP` (5s) | Claims `HIPPIUS_USAGE_ROLLUP_BATCH_SIZE` (5000) ledger rows with `DELETE ... RETURNING` and adds them to the counter. |
-| **Reconcile** | `HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS` (3600s) | Fully recomputes `HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE` (25) live buckets, oldest-recomputed first, and exports the correction as **drift**. |
+| **Reconcile** | `HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS` (300s) | Fully recomputes `HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE` (200) live buckets, oldest-recomputed first, and exports the correction as **drift**. ~19h for a full sweep, which is the only bound on how long a bucket can carry a wrong number — see the rate justification in [config.py](../hippius_s3/config.py). |
 
 **Compaction is exactly-once by construction.** The rows leave the ledger in the same transaction
 that adds them to the counter, so a crash puts them back and a second compactor can only see rows
@@ -270,7 +270,7 @@ statement, therefore in ONE snapshot, so a write landing mid-recompute is counte
 
 **Why a separate worker rather than a second loop in the plans-cacher.** The plans-cacher's pool is
 `DATABASE_READONLY_URL`, a read replica, because its work must not run on the primary. Compaction
-WRITES. And the rollup's freshness wants seconds while the scrape wants ten minutes. Splitting them
+WRITES. And the rollup's freshness wants seconds while the scrape wants minutes. Splitting them
 also means the ledger keeps draining while api.hippius.com is down.
 
 **This pod being down is not an outage, but it IS a silently frozen billing number.** Nothing on the

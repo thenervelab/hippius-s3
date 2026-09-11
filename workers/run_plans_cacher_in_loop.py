@@ -4,7 +4,7 @@
     GET /api/s3/plans/accounts/?page=1&page_size=500
 
 One endpoint carries both halves — `plans` is the catalog, `results` is the paginated per-account
-roll — so this is a single loop, polled every HIPPIUS_PLANS_LOOP_SLEEP seconds (default 600).
+roll — so this is a single loop, polled every HIPPIUS_PLANS_LOOP_SLEEP seconds (default 120).
 
 Upstream reports each account's MAX QUOTA but not its usage, so this worker also fills the usage in:
 one indexed SUM per plan account over `bucket_storage_usage`, the counter that Postgres triggers and
