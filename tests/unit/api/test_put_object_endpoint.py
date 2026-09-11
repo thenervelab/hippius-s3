@@ -383,3 +383,27 @@ async def test_digest_mismatch_is_bad_digest(monkeypatch: Any) -> None:
     )
     assert resp.status_code == 400
     assert b"<Code>BadDigest</Code>" in resp.body
+
+
+@pytest.mark.asyncio
+async def test_malformed_content_md5_drains_the_body_before_answering(monkeypatch: Any) -> None:
+    """An early answer with the body still pending poisons the kept-alive connection: the client's
+    next request on it fails with a bare 400."""
+    read: list[bytes] = []
+
+    def stream() -> Any:
+        async def gen() -> Any:
+            for c in (b"a", b"b"):
+                read.append(c)
+                yield c
+
+        return gen()
+
+    captured: dict[str, Any] = {}
+    _patch_writer_capture(monkeypatch, captured)
+    req = _fake_request({"Content-MD5": "not-base64!!"})
+    req.state.bucket_id = str(uuid.uuid4())
+    req.stream = stream
+    resp = await handle_put_object("bkt", "k", req, make_fake_pool(_bucket_present_router), _FakeRedis(nx_result=None))
+    assert resp.status_code == 400
+    assert read == [b"a", b"b"]

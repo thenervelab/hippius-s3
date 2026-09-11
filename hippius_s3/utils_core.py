@@ -120,6 +120,23 @@ async def iter_request_body(request: Request) -> AsyncIterator[bytes]:
             yield data
 
 
+async def drain_request_body(request: Request) -> None:
+    """Read and discard whatever is left of the request body, before an early response.
+
+    Answering a request whose body is still pending poisons a kept-alive connection: the unread
+    bytes — or, under ``Expect: 100-continue``, the body the client goes on to send — are parsed as
+    the start of the next request, so the client's NEXT call on that connection fails with a bare
+    400 that never reaches the app. Reading the stream also sends the interim 100 Continue. Same
+    reason as extensions.append._drain. An already-consumed stream or a departed client is fine:
+    there is nothing left to poison.
+    """
+    try:
+        async for _ in request.stream():
+            pass
+    except Exception:
+        return
+
+
 async def get_request_body(request: Request) -> bytes:
     """
     Get request body (fully buffered) while honoring AWS chunked encoding.

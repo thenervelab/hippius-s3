@@ -93,3 +93,22 @@ async def test_upload_part_copy_ignores_content_md5(monkeypatch: Any) -> None:
     req = _request({"Content-MD5": "@@not-base64@@", "x-amz-copy-source": "/"})
     resp = await multipart.upload_part(req, pool)
     assert b"InvalidDigest" not in resp.body
+
+
+@pytest.mark.asyncio
+async def test_malformed_content_md5_drains_the_body_before_answering(monkeypatch: Any) -> None:
+    read: list[bytes] = []
+
+    def stream() -> Any:
+        async def gen() -> Any:
+            read.append(b"part")
+            yield b"part"
+
+        return gen()
+
+    _patch_part_stream(monkeypatch, {})
+    req = _request({"Content-MD5": "@@not-base64@@"})
+    req.stream = stream
+    resp = await multipart.upload_part(req, _pool())
+    assert resp.status_code == 400
+    assert read == [b"part"]

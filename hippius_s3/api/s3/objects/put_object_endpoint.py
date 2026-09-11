@@ -85,6 +85,7 @@ async def handle_put_object(
         try:
             expected_md5 = parse_content_md5(request.headers.get("content-md5"))
         except InvalidContentMD5:
+            await utils.drain_request_body(request)
             return errors.invalid_digest_response()
 
         # Detect S4 append semantics via metadata (header-only, no DB).
