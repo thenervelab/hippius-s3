@@ -99,15 +99,13 @@ async def main_async(args: argparse.Namespace) -> int:
             # asked the question a different way could answer differently from the apply it is
             # meant to predict, which is the one thing a dry run must not do -- and it would be a
             # third copy of an aggregate that already exists twice.
-            if args.apply:
-                result = await storage_rollup_service.recompute_bucket(conn, bucket_id, args.timeout)
-            else:
-                tx = conn.transaction()
-                await tx.start()
-                try:
-                    result = await storage_rollup_service.recompute_bucket(conn, bucket_id, args.timeout)
-                finally:
-                    await tx.rollback()
+            # ONE path for both modes, which is what makes the dry run's arithmetic provably the
+            # apply's: only the disposition of the transaction differs. On an exception the script
+            # dies and the connection closes, which rolls back -- no try/finally needed.
+            tx = conn.transaction()
+            await tx.start()
+            result = await storage_rollup_service.recompute_bucket(conn, bucket_id, args.timeout)
+            await (tx.commit() if args.apply else tx.rollback())
             before, after = result.bytes_before, result.bytes_after
 
             total_bytes += after
@@ -146,8 +144,8 @@ def main() -> int:
         type=float,
         default=600.0,
         help="bound on ONE bucket's aggregate, applied as the connection's statement_timeout AND as "
-        "asyncpg's own (default 600s; the largest prod bucket takes well over the 60s the server "
-        "otherwise imposes)",
+        "asyncpg's own (default 600s; production's own server-side statement_timeout is 0, so this "
+        "is the only bound. The slowest measured bucket exceeds 30s)",
     )
     parser.add_argument(
         "--sleep-ms",

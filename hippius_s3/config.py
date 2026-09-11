@@ -286,9 +286,13 @@ class Config:
     # one paginated GET per cycle against an endpoint we do not own. That is the number to watch if
     # this is shortened further, not the database.
     plans_loop_sleep: int = env("HIPPIUS_PLANS_LOOP_SLEEP:120", convert=int)
-    # How many per-account storage counts the plans-cacher runs at once. Sized for a few tens of
-    # plan accounts: enough that one very large account does not set the pace for the cycle, small
-    # enough that these aggregates never become the heaviest thing on the primary.
+    # How many per-account usage reads the plans-cacher runs at once. Both halves of this knob's
+    # original rationale are gone: the read is no longer an aggregate that one huge account could
+    # pace the cycle with (it is an indexed SUM over bucket_storage_usage, ~1ms of database time,
+    # measured 11.3ms wall for the largest account's 2,024 buckets) and it no longer runs on the
+    # primary (database_readonly_url). It survives only as the pool's size, and with plan accounts
+    # in the low single digits the concurrency is academic. If plan adoption grows, prefer one
+    # grouped query over N round trips to raising this.
     plans_usage_concurrency: int = env("HIPPIUS_PLANS_USAGE_CONCURRENCY:4", convert=int)
     # Server-side bound on the per-account usage read. That read is now an indexed SUM over
     # bucket_storage_usage and returns in sub-milliseconds, so this is a stuck-connection guard
@@ -337,17 +341,23 @@ class Config:
     # to the primary but without its load). A 200-bucket pass is therefore ~0.2-0.5s of primary
     # work per 300s cycle -- a ~0.1% duty cycle -- and the estate is overwhelmingly small buckets.
     #
-    # The skew is what keeps this modest rather than higher. One prod bucket holds millions of
-    # objects and takes ~64s on its own; the queue is least-recently-recomputed, so it lands in one
-    # cycle per sweep and that cycle runs ~21% busy. Recompute holds a GLOBAL advisory lock, so the
+    # The skew is what keeps this modest rather than higher. A read-only simulation of the whole
+    # estate on the replica measured a median of 9.7ms and p99 of 10.7ms per bucket, with the
+    # slowest COMPLETED bucket at 22.5s and seven buckets exceeding 30s -- those seven could not be
+    # timed because the replica cancels a query past max_standby_streaming_delay, so their true cost
+    # is only bounded below. An earlier measurement of the largest put it near 64s. Treat "tens of
+    # seconds" as the figure; the queue is least-recently-recomputed, so it lands in one cycle per
+    # sweep. Recompute holds a GLOBAL advisory lock, so the
     # compactor skips (pg_TRY_) while it runs -- harmless, the ledger is insert-only and a skipped
     # fold only adds latency, but it is the reason not to simply crank this to a full sweep per
     # hour. Going materially faster wants the outlier bucket on its own cadence, or a per-bucket
     # lock instead of the global one, first.
     usage_reconcile_buckets_per_cycle: int = env("HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE:200", convert=int)
     usage_reconcile_interval_seconds: int = env("HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS:300", convert=int)
-    # Server-side bound on ONE bucket recompute. The largest prod bucket takes ~64s, so this has to
-    # clear that or the reconciler could never verify the one bucket that matters most.
+    # Server-side bound on ONE bucket recompute, applied as the pool's statement_timeout (prod's own
+    # is 0, so this is the only bound). It has to clear the largest bucket -- tens of seconds, see
+    # above -- by a wide margin, or the reconciler could never verify the one bucket that matters
+    # most, and a bucket that always times out becomes the permanent head of the recompute queue.
     usage_reconcile_timeout_seconds: float = env("HIPPIUS_USAGE_RECONCILE_TIMEOUT_SECONDS:300.0", convert=float)
 
     # ATS (Apache Traffic Server) reverse-proxy cache endpoints (CSV). When ATS_CACHE_ENDPOINT is unset,

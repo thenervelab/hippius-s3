@@ -1,5 +1,15 @@
 -- migrate:up
 
+-- ⚠️ PARTIALLY SUPERSEDED. The two trigger bodies here are overwritten verbatim by
+-- 20260912090000_restore_version_lock_after_put_order_fix.sql -- read that file for the shipped
+-- definitions. What SURVIVES from this file, and what makes it load-bearing rather than skippable,
+-- is `storage_usage_version_bytes_locked(uuid, bigint)`: 20260912090000's bodies CALL that function
+-- and do not define it, so this migration cannot be squashed away.
+--
+-- The header below is still the full explanation of WHY the lock exists and why FOR NO KEY UPDATE
+-- is the right strength. 20260912090000 explains only why it had to be reinstated after the
+-- FK-implied deadlock it exposed.
+
 -- FIX: the rollup over-counted every superseded version under concurrent overwrites of one key.
 --
 -- WHAT WENT WRONG. A PUT is TWO transactions (hippius_s3/writer/object_writer.py): the reserve

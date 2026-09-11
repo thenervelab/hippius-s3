@@ -5,7 +5,7 @@
 --
 -- WHY. get_account_storage_bytes.sql is the canonical definition of billable storage and it is
 -- O(objects the account owns). One prod plan account owns a single bucket holding millions of live
--- objects, where that aggregate takes ~64s; the plans-cacher's chunked walk got it under the 30s
+-- objects, where that aggregate takes tens of seconds (see MEASURED below); the plans-cacher's chunked walk got it under the 30s
 -- per-statement ceilings but still spends minutes of replica work every 10 minutes recomputing a
 -- number that moved by a handful of objects. That cost only grows with the bucket. Every other
 -- object store maintains this number incrementally instead (Ceph RGW caches per-bucket stats,
@@ -44,9 +44,10 @@
 -- Seed it with hippius_s3/scripts/backfill_bucket_storage_usage.py (k8s Job manifest at
 -- k8s/backfill-bucket-storage-usage-job.yaml).
 --
--- LOCKING. `CREATE TRIGGER` takes ACCESS EXCLUSIVE on the table. It is metadata-only (no rewrite,
--- so table size is irrelevant), but a long-running reader can make it WAIT while holding that
--- lock, which stalls the whole data plane behind it. SET LOCAL lock_timeout fails the migration
+-- LOCKING. `CREATE TRIGGER` takes SHARE ROW EXCLUSIVE -- see the measured block below; it blocks
+-- WRITES but not reads. It is metadata-only (no rewrite, so table size is irrelevant), but a
+-- long-running writer can make it WAIT while queueing everything behind it, and prod runs with
+-- lock_timeout = 0. SET LOCAL lock_timeout fails the migration
 -- fast instead; the whole migration is one transaction so a timeout leaves nothing partial behind,
 -- and the db-migrations Job's backoffLimit is the retry. SET LOCAL rather than SET because dbmate
 -- applies every pending migration over ONE connection and a session-scoped SET would leak into the

@@ -8,10 +8,18 @@
 --
 -- count(*) over the ledger is a full scan, which is fine: the ledger is drained continuously and
 -- steady-state size is one batch. If it is ever big enough for this to hurt, the number it returns
--- is itself the alert.
+-- is itself the alert. Depth and lag come from ONE aggregate rather than two subqueries, so the
+-- ledger is scanned once per call instead of twice.
+--
+-- `negative_buckets` is a full scan of bucket_storage_usage (no index on bytes_used, and a partial
+-- one would be the fix if this ever needs 5-second resolution). That is why the caller runs this on
+-- the reconcile cadence rather than every compaction cycle -- see run_usage_rollup_in_loop.
 SELECT
-    (SELECT count(*) FROM storage_delta_ledger)::bigint AS depth,
-    COALESCE((
-        SELECT EXTRACT(EPOCH FROM (now() - min(l.created_at)))::bigint FROM storage_delta_ledger l
-    ), 0)::bigint AS oldest_age_seconds,
+    ledger.depth::bigint AS depth,
+    ledger.oldest_age_seconds::bigint AS oldest_age_seconds,
     (SELECT count(*) FROM bucket_storage_usage WHERE bytes_used < 0)::bigint AS negative_buckets
+FROM (
+    SELECT count(*) AS depth,
+           COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at)))::bigint, 0) AS oldest_age_seconds
+    FROM storage_delta_ledger
+) AS ledger
