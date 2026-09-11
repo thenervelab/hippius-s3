@@ -27,6 +27,7 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from hippius_s3.db_retry import retry_on_object_version_conflict
 from hippius_s3.services import storage_rollup_service
 from hippius_s3.utils import get_query
 
@@ -70,21 +71,35 @@ async def _reserve(
     size: int = 0,
     multipart: bool = False,
 ) -> asyncpg.Record:
-    """The reserve half of a PUT / MPU initiate: one statement, objects + object_versions."""
+    """The reserve half of a PUT / MPU initiate: one statement, objects + object_versions.
+
+    Wrapped in retry_on_object_version_conflict because EVERY production reserve is -- object_writer,
+    multipart, repositories/objects and delete_object_endpoint all go through it. Calling the raw
+    query here made this helper unfaithful to the shipped path, and the difference is observable:
+    the upsert allocates the next version as GREATEST(current_object_version, MAX(object_version))+1,
+    whose MAX() floor is snapshot-stale under READ COMMITTED, so a concurrent statement that moves
+    versions (abort_cleanup_orphan_version repointing current DOWN) can hand back a colliding
+    version and raise object_versions_pkey. Production retries that one constraint and converges;
+    the unwrapped helper surfaced it as a test failure roughly one run in five.
+    """
     query = "upsert_object_multipart" if multipart else "upsert_object_basic"
-    return await conn.fetchrow(
-        get_query(query),
-        uuid.uuid4(),
-        bucket_id,
-        key,
-        CT,
-        json.dumps({}),
-        None,
-        size,
-        _now(),
-        5,
-        ["arion"],
-    )
+
+    async def _reserve_once() -> asyncpg.Record:
+        return await conn.fetchrow(
+            get_query(query),
+            uuid.uuid4(),
+            bucket_id,
+            key,
+            CT,
+            json.dumps({}),
+            None,
+            size,
+            _now(),
+            5,
+            ["arion"],
+        )
+
+    return await retry_on_object_version_conflict(_reserve_once)
 
 
 async def _finalize(conn: asyncpg.Connection, object_id: uuid.UUID, version: int, size: int) -> None:
