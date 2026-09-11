@@ -68,7 +68,15 @@ async def _bucket_ids(conn: asyncpg.Connection) -> list[uuid.UUID]:
 
 async def main_async(args: argparse.Namespace) -> int:
     config = get_config()
-    conn = await asyncpg.connect(config.database_url)
+    # RAISE statement_timeout, or the big buckets can never be seeded. Production sets a 1-minute
+    # server-side statement_timeout for the application role, and the largest bucket's aggregate
+    # takes longer than that. asyncpg's own `timeout=` cannot help: whichever limit is SHORTER
+    # fires, and the server's was. The result was a backfill that aborts on that bucket every time
+    # -- safely, since backfilled_at is only set after a complete pass, but permanently.
+    conn = await asyncpg.connect(
+        config.database_url,
+        server_settings={"statement_timeout": f"{int(args.timeout * 1000)}"},
+    )
 
     try:
         bucket_ids = await _bucket_ids(conn)
@@ -128,7 +136,9 @@ def main() -> int:
         "--timeout",
         type=float,
         default=600.0,
-        help="server-side bound on ONE bucket's aggregate (default 600s; the largest prod bucket is ~64s)",
+        help="bound on ONE bucket's aggregate, applied as the connection's statement_timeout AND as "
+        "asyncpg's own (default 600s; the largest prod bucket takes well over the 60s the server "
+        "otherwise imposes)",
     )
     parser.add_argument(
         "--sleep-ms",

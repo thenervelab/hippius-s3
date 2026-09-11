@@ -110,9 +110,13 @@ async def recompute_bucket(
     SET rather than ADD is what makes running this twice, or concurrently with live writes, safe:
     each run overwrites with the truth as of its own snapshot instead of accumulating.
 
-    `timeout` is asyncpg's own so a cancellation lands server-side. This is the ONE expensive
-    statement in the whole mechanism -- for the largest prod bucket it is the ~64s aggregate the
-    rollup exists to stop running every cycle -- so it is bounded explicitly.
+    `timeout` is asyncpg's own. It is NOT sufficient on its own: whichever of it and the server's
+    statement_timeout is SHORTER is the one that fires, and production sets a 1-minute
+    statement_timeout for the application role. Callers must therefore raise statement_timeout on
+    the connection they hand in -- the usage-rollup pool and the backfill script both do, and
+    tests/unit/test_storage_rollup_service.py pins it. This is the ONE expensive statement in the
+    whole mechanism -- for the largest prod bucket it is the aggregate the rollup exists to stop
+    running every cycle -- so it is bounded explicitly at both layers.
     """
     row = await conn.fetchrow(get_query("recompute_bucket_storage_usage"), bucket_id, timeout=timeout)
     return RecomputeResult(

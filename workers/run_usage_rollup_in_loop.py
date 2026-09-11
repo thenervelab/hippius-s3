@@ -121,7 +121,19 @@ async def run_usage_rollup_loop() -> None:
     # PRIMARY, not the replica the plans-cacher uses: this worker writes. Two connections is
     # plenty -- the work is serial by design and an oversized pool here is idle backends against
     # max_connections for nothing.
-    pool = await asyncpg.create_pool(config.database_url, min_size=1, max_size=2)
+    #
+    # statement_timeout is raised on this pool because production sets a 1-minute one for the
+    # application role and the largest bucket's recompute takes longer. Whichever limit is SHORTER
+    # fires, so asyncpg's own `timeout=` never got a chance -- the reconciler would have failed its
+    # cycle every time that bucket came up in the queue, i.e. the one bucket most worth verifying
+    # would have been the one bucket it could never verify. It also covers the compactor's
+    # DELETE ... RETURNING on this pool, which is a bounded batch and wants the same headroom.
+    pool = await asyncpg.create_pool(
+        config.database_url,
+        min_size=1,
+        max_size=2,
+        server_settings={"statement_timeout": f"{int(config.usage_reconcile_timeout_seconds * 1000)}"},
+    )
     initialize_metrics_collector()
 
     logger.info(
