@@ -17,6 +17,8 @@ from starlette.requests import ClientDisconnect
 from hippius_s3 import utils
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import UnsupportedConditionalWrite
+from hippius_s3.api.s3.common import parse_write_if_none_match
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
@@ -28,6 +30,7 @@ from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.writer.types import PreconditionFailed
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +79,13 @@ async def handle_put_object(
         lock_rejection = validate_lock_intent(request)
         if lock_rejection is not None:
             return lock_rejection
+
+        # Conditional create (If-None-Match: *). Header-only, so it is refused before any DB work or
+        # body read; the existence check itself runs inside the writer's reserve transaction.
+        try:
+            if_none_match = parse_write_if_none_match(request.headers.get("if-none-match"))
+        except UnsupportedConditionalWrite:
+            return errors.conditional_write_not_implemented_response()
 
         # Detect S4 append semantics via metadata (header-only, no DB).
         meta_append = request.headers.get("x-amz-meta-append", "").lower() == "true"
@@ -126,6 +136,13 @@ async def handle_put_object(
             # Append is handled here, where `bucket` is known non-None (meta_append forces
             # needs_bucket_row, so the row was fetched above) and handle_append requires the full row.
             if meta_append:
+                if if_none_match:
+                    # An append only ever modifies an existing object, which is exactly what a
+                    # create-only write forbids. If the key is absent, append answers NoSuchKey.
+                    async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
+                        state = await conn.fetchrow(get_query("conditional_write_state"), bucket_id, object_key)
+                    if state is not None and state["exists_live"]:
+                        return errors.precondition_failed_response()
                 return await handle_append(
                     request,
                     pool,
@@ -188,6 +205,7 @@ async def handle_put_object(
                 metadata=metadata,
                 storage_version=config.target_storage_version,
                 body_iter=utils.iter_request_body(request),
+                if_none_match=if_none_match,
             )
 
             set_span_attributes(
@@ -291,6 +309,12 @@ async def handle_put_object(
                 "x-amz-version-id": str(int(put_res.object_version)),
             },
         )
+
+    except PreconditionFailed:
+        # Refused at reserve (nothing was written) or at finalize (our version was never made
+        # serveable). Either way the key still serves what it held before this request.
+        logger.info("PutObject %s/%s: If-None-Match: * and the key exists", bucket_name, object_key)
+        return errors.precondition_failed_response()
 
     except ClientDisconnect:
         # iter_request_body drives request.stream(), which raises when the peer goes away mid-body

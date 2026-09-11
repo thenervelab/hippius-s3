@@ -24,7 +24,9 @@ from starlette.requests import ClientDisconnect
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import UnsupportedConditionalWrite
 from hippius_s3.api.s3.common import format_s3_timestamp
+from hippius_s3.api.s3.common import parse_write_if_none_match
 from hippius_s3.api.s3.copy_helpers import parse_copy_source
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.errors import s3_error_response
@@ -45,6 +47,7 @@ from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.writer.types import PreconditionFailed
 from hippius_s3.xml_helpers import add_subelement
 from hippius_s3.xml_helpers import create_element
 from hippius_s3.xml_helpers import parse_untrusted_xml
@@ -1190,6 +1193,11 @@ async def complete_multipart_upload(
     db: dependencies.DBConnection,
 ) -> Response:
     """Internal implementation of multipart upload completion logic."""
+    # Conditional create (If-None-Match: *) — S3 evaluates it at completion, not at initiate.
+    try:
+        if_none_match = parse_write_if_none_match(request.headers.get("if-none-match"))
+    except UnsupportedConditionalWrite:
+        return errors.conditional_write_not_implemented_response()
     try:
         # Validate the multipart upload exists
         multipart_upload = await db.fetchrow(get_query("get_multipart_upload"), upload_id)
@@ -1342,20 +1350,26 @@ async def complete_multipart_upload(
             redis_client=request.app.state.redis_client,
             fs_store=request.app.state.fs_store,
         )
-        complete_res = await writer.mpu_complete(
-            bucket_name=bucket_name,
-            object_id=str(object_id),
-            object_key=object_key,
-            upload_id=str(upload_id),
-            object_version=int(object_version),
-            address=request.state.main_account_id,
-            # B1: the client's <Part> selection — the final object (bytes + ETag + size) reflects
-            # only these; a strict subset is recorded so the reader excludes the unlisted parts.
-            selected_parts=[pn for pn, _ in part_info],
-            # MPU-3: reuse the parts rows already fetched (and ETag-validated) above so mpu_complete
-            # doesn't re-read the parts table for the combined ETag and total size.
-            db_parts=db_parts,
-        )
+        try:
+            complete_res = await writer.mpu_complete(
+                bucket_name=bucket_name,
+                object_id=str(object_id),
+                object_key=object_key,
+                upload_id=str(upload_id),
+                object_version=int(object_version),
+                address=request.state.main_account_id,
+                # B1: the client's <Part> selection — the final object (bytes + ETag + size) reflects
+                # only these; a strict subset is recorded so the reader excludes the unlisted parts.
+                selected_parts=[pn for pn, _ in part_info],
+                # MPU-3: reuse the parts rows already fetched (and ETag-validated) above so mpu_complete
+                # doesn't re-read the parts table for the combined ETag and total size.
+                db_parts=db_parts,
+                if_none_match=if_none_match,
+            )
+        except PreconditionFailed:
+            # Nothing was committed: the upload stays open and can be aborted, as on S3.
+            logger.info(f"CompleteMultipartUpload {bucket_name}/{object_key}: If-None-Match: * and the key exists")
+            return errors.precondition_failed_response()
 
         # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It
         # persists the main-account address (the upload identity); the Rust drain reads

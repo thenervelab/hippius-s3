@@ -142,3 +142,21 @@ def build_headers(
                 if k != "ipfs" and not isinstance(v, dict):
                     headers[f"x-amz-meta-{k}"] = str(v)
     return headers
+
+
+class UnsupportedConditionalWrite(ValueError):
+    """An If-None-Match value on a write other than "*", which S3 does not implement."""
+
+
+def parse_write_if_none_match(header_value: str | None) -> bool:
+    """If-None-Match on PutObject / CompleteMultipartUpload: True for "*" (create only if absent).
+
+    S3 supports only "*" on writes. Any other value — including an ETag, which is meaningful on GET
+    but not here — raises UnsupportedConditionalWrite, answered with 501 NotImplemented rather than
+    silently ignored: ignoring it is exactly how a write-once client ends up overwriting.
+    """
+    if header_value is None:
+        return False
+    if header_value.strip() == "*":
+        return True
+    raise UnsupportedConditionalWrite(header_value)

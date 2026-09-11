@@ -11,6 +11,7 @@ from starlette.datastructures import Headers
 
 from hippius_s3.api.s3.objects import put_object_endpoint
 from hippius_s3.api.s3.objects.put_object_endpoint import handle_put_object
+from hippius_s3.writer.types import PreconditionFailed
 from hippius_s3.writer.types import PutResult
 from tests.unit._fake_pool import make_fake_pool
 
@@ -314,3 +315,90 @@ async def test_created_flag_tracks_allocated_version(monkeypatch: Any, object_ve
     assert resp.status_code == 200
     assert resp.headers.get("x-amz-version-id") == str(object_version)
     assert getattr(req.state, "ats_object_created", False) is flag_set
+
+
+def _patch_writer_capture(monkeypatch: Any, captured: dict[str, Any], raise_exc: Exception | None = None) -> None:
+    async def fake_put(self: Any, **kw: Any) -> PutResult:
+        captured.update(kw)
+        if raise_exc is not None:
+            raise raise_exc
+        return PutResult(
+            object_id=str(uuid.uuid4()), etag="etag", size_bytes=3, upload_id=str(uuid.uuid4()), object_version=1
+        )
+
+    async def fake_persist_address(*_a: Any, **_kw: Any) -> None:
+        return None
+
+    monkeypatch.setattr(put_object_endpoint.ObjectWriter, "put_simple_stream_full", fake_put)
+    monkeypatch.setattr(put_object_endpoint, "set_object_version_address", fake_persist_address)
+
+
+async def _put(monkeypatch: Any, headers: dict[str, str], raise_exc: Exception | None = None) -> Any:
+    captured: dict[str, Any] = {}
+    _patch_writer_capture(monkeypatch, captured, raise_exc)
+    req = _fake_request(headers)
+    req.state.bucket_id = str(uuid.uuid4())
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="audit.log",
+        request=req,
+        pool=make_fake_pool(_bucket_present_router),
+        redis_client=_FakeRedis(nx_result=None),
+    )
+    return resp, captured
+
+
+@pytest.mark.asyncio
+async def test_if_none_match_star_makes_the_write_create_only(monkeypatch: Any) -> None:
+    resp, captured = await _put(monkeypatch, {"If-None-Match": "*"})
+    assert resp.status_code == 200
+    assert captured["if_none_match"] is True
+
+
+@pytest.mark.asyncio
+async def test_no_if_none_match_is_an_ordinary_overwrite(monkeypatch: Any) -> None:
+    resp, captured = await _put(monkeypatch, {})
+    assert resp.status_code == 200
+    assert captured["if_none_match"] is False
+
+
+@pytest.mark.asyncio
+async def test_existing_key_is_precondition_failed(monkeypatch: Any) -> None:
+    resp, _ = await _put(monkeypatch, {"If-None-Match": "*"}, raise_exc=PreconditionFailed())
+    assert resp.status_code == 412
+    assert b"<Code>PreconditionFailed</Code>" in resp.body
+    assert b"<Condition>If-None-Match</Condition>" in resp.body
+
+
+@pytest.mark.asyncio
+async def test_etag_valued_if_none_match_is_not_implemented_rather_than_ignored(monkeypatch: Any) -> None:
+    resp, captured = await _put(monkeypatch, {"If-None-Match": '"5d41402abc4b2a76b9719d911017c592"'})
+    assert resp.status_code == 501
+    assert b"<Code>NotImplemented</Code>" in resp.body
+    assert captured == {}, "the write must not run"
+
+
+@pytest.mark.asyncio
+async def test_create_only_append_to_an_existing_key_is_refused(monkeypatch: Any) -> None:
+    def router(method: str, query: str, args: tuple) -> Any:
+        if "Get bucket by name" in (query or ""):
+            return {"bucket_id": str(uuid.uuid4()), "bucket_name": "bkt", "main_account_id": "acct-main"}
+        if "exists_live" in (query or ""):
+            return {"exists_live": True, "baseline": 4}
+        return None
+
+    append_calls: list[Any] = []
+
+    async def fake_append(*a: Any, **kw: Any) -> Any:
+        append_calls.append(kw)
+
+    monkeypatch.setattr(put_object_endpoint, "handle_append", fake_append)
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="audit.log",
+        request=_fake_request({"If-None-Match": "*", "x-amz-meta-append": "true"}),
+        pool=make_fake_pool(router),
+        redis_client=_FakeRedis(nx_result=None),
+    )
+    assert resp.status_code == 412
+    assert append_calls == []
