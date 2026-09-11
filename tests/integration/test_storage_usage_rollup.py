@@ -1765,3 +1765,141 @@ async def test_the_locking_read_helper_is_not_stable(pg_conn: asyncpg.Connection
         "SELECT provolatile::text FROM pg_proc WHERE proname = 'storage_usage_version_bytes_locked'"
     )
     assert volatility == "v"
+
+
+# --------------------------------------------------------------------------------------------
+# The real PUT tail transaction. Everything above this line used a reserve+finalize helper that
+# does NOT insert the parts / multipart_uploads rows -- and that omission is why an adversarial
+# probe over 2,880 operations reported zero deadlocks while the hot path deadlocked 24% of the
+# time at concurrency 32. These tests drive the statement set object_writer actually issues.
+# --------------------------------------------------------------------------------------------
+
+
+async def _real_put_tail(
+    conn: asyncpg.Connection,
+    bucket_id: uuid.UUID,
+    key: str,
+    object_id: uuid.UUID,
+    version: int,
+    size: int,
+    *,
+    lock_objects_first: bool,
+) -> None:
+    """object_writer's tail transaction, statement for statement.
+
+    The two INSERTs carry object_id FKs, which Postgres services with an implicit
+    `objects ... FOR KEY SHARE` at the point of the INSERT -- i.e. AFTER the UPDATE below has
+    already taken the object_versions row. Without the leading objects lock the transaction's
+    order is object_versions -> objects, which closes a cycle against a concurrent reserve.
+    """
+    async with conn.transaction():
+        if lock_objects_first:
+            await conn.execute(get_query("lock_object_row_by_id"), object_id)
+        await _finalize(conn, object_id, version, size)
+        upload_id = uuid.uuid4()
+        await conn.execute(
+            "INSERT INTO multipart_uploads(upload_id, bucket_id, object_key, content_type,"
+            " metadata, initiated_at, object_id, is_completed)"
+            " VALUES($1, $2, $3, $4, $5, NOW(), $6, false)",
+            upload_id,
+            bucket_id,
+            key,
+            CT,
+            json.dumps({}),
+            object_id,
+        )
+        await conn.execute(
+            "INSERT INTO parts(part_id, upload_id, part_number, size_bytes, etag, uploaded_at,"
+            " object_id, chunk_size_bytes, object_version)"
+            " VALUES($1, $2, 1, $3, 'e', NOW(), $4, 4194304, $5)",
+            uuid.uuid4(),
+            upload_id,
+            size,
+            object_id,
+            version,
+        )
+
+
+@pytest.mark.parametrize("concurrency", [8, 32])
+async def test_concurrent_same_key_puts_with_the_real_statement_set_do_not_deadlock(
+    committed_pool: CommittedPool, concurrency: int
+) -> None:
+    """Zero deadlocks AND zero drift. Both, because fixing either alone is easy and wrong.
+
+    Measured without the leading objects lock: 4/48 deadlocks at c=8 and 46/192 at c=32. Each one
+    is a 500 returned after the whole request body was received and staged, and db_retry only
+    retries object_versions_pkey, so nothing absorbs it.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+    sizes = [1024, 4096, 16384, 65536]
+
+    async def one_put(index: int) -> None:
+        async with committed_pool.acquire() as conn:
+            row = await _reserve(conn, bucket_id, "hot")
+        async with committed_pool.acquire() as conn:
+            await _real_put_tail(
+                conn,
+                bucket_id,
+                "hot",
+                row["object_id"],
+                row["current_object_version"],
+                sizes[index % len(sizes)],
+                lock_objects_first=True,
+            )
+
+    results = await asyncio.gather(*(one_put(i) for i in range(concurrency)), return_exceptions=True)
+
+    deadlocks = [r for r in results if isinstance(r, asyncpg.DeadlockDetectedError)]
+    assert not deadlocks, (
+        f"{len(deadlocks)}/{concurrency} concurrent same-key PUTs deadlocked. The tail transaction "
+        f"must take the objects row BEFORE object_versions -- the parts/multipart_uploads INSERTs "
+        f"reach objects through their FKs. See lock_object_row_by_id.sql."
+    )
+    other = [r for r in results if isinstance(r, BaseException)]
+    assert not other, f"unexpected failures: {other}"
+
+    async with committed_pool.acquire() as conn:
+        await _compact(conn)
+        await _assert_matches_oracle(conn, acct)
+
+
+async def test_the_objects_lock_is_taken_before_the_version_row_in_the_put_tail(
+    committed_pool: CommittedPool,
+) -> None:
+    """Deterministic companion to the stress test above: prove the ORDER, not just the outcome.
+
+    A stress test that happens to pass proves nothing about why. This pins the mechanism: with the
+    leading lock the tail transaction blocks on a concurrent reserve's objects row instead of
+    acquiring its version row first and deadlocking.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async with committed_pool.acquire() as conn:
+        row = await _reserve(conn, bucket_id, "hot")
+    object_id, version = row["object_id"], row["current_object_version"]
+
+    async with committed_pool.acquire() as holder:
+        async with holder.transaction():
+            # Hold the objects row the way a concurrent reserve does.
+            await holder.execute("SELECT 1 FROM objects WHERE object_id = $1 FOR UPDATE", object_id)
+
+            async def tail() -> None:
+                async with committed_pool.acquire() as conn:
+                    await _real_put_tail(conn, bucket_id, "hot", object_id, version, 4096, lock_objects_first=True)
+
+            task = asyncio.create_task(tail())
+            await asyncio.sleep(0.6)
+            blocked = not task.done()
+
+        await task
+
+    assert blocked, (
+        "the tail transaction did not wait on the objects row, so it is not taking that lock first "
+        "-- which is exactly the ordering that deadlocks under concurrency"
+    )
+
+    async with committed_pool.acquire() as conn:
+        await _compact(conn)
+        assert await _assert_matches_oracle(conn, acct) == 4096

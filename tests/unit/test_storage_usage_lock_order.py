@@ -9,10 +9,26 @@ Verified, not theorised: injecting the forbidden order against a concurrent rese
 DeadlockDetectedError (40P01). See
 tests/integration/test_storage_usage_rollup.py::test_taking_the_version_row_before_the_objects_row_deadlocks.
 
-Every current path conforms, and two of them do so deliberately -- lock_object_and_get_version.sql
-(`FOR UPDATE OF o`) and abort_cleanup_orphan_version.sql (a leading objects-locking CTE). This test
-exists so the NEXT one does too, because nothing about `UPDATE object_versions ...` followed by
-`UPDATE objects ...` looks like it touches billing.
+Every current path conforms, and four of them do so deliberately: lock_object_and_get_version.sql
+(`FOR UPDATE OF o`), abort_cleanup_orphan_version.sql (a leading objects-locking CTE), and the
+simple-PUT tail and S4 append reserve transactions (a leading lock_object_row_by_id.sql).
+
+AN EARLIER VERSION OF THIS GUARD WAS GREEN WHILE THE PUT HOT PATH DEADLOCKED 24% OF THE TIME at
+concurrency 32, so it is worth saying exactly what it now catches that it did not:
+
+  1. A lock on `objects` taken through a FOREIGN KEY. `INSERT INTO parts` and
+     `INSERT INTO multipart_uploads` both carry an object_id FK, and Postgres services each with an
+     implicit `objects ... FOR KEY SHARE` at the point of the INSERT. No SQL in the transaction
+     named `objects`, so the old classifier saw only the `UPDATE object_versions` before it.
+  2. `SELECT ... FROM object_versions ... FOR UPDATE`, which holds that row exactly as an UPDATE
+     does. The append reserve opens with one.
+  3. SQL behind ONE level of function call. `ensure_upload_row` and `upsert_part_placeholder` are
+     helpers; a walk of the `async with conn.transaction():` body alone never sees their statements.
+
+The lesson that generalises: a static guard reports "no offenders" both when the code is correct and
+when the guard cannot see the code. Hence the two self-check tests below -- and the integration
+tests that drive the REAL statement set, since the probe that missed this used a reserve+finalize
+helper with no parts/multipart_uploads INSERT and so never took the FK lock at all.
 """
 
 import ast
@@ -26,18 +42,36 @@ _QUERIES = _ROOT / "hippius_s3" / "sql" / "queries"
 # `\bobjects\b` cannot match "object_versions", so these stay disjoint.
 _WRITES_VERSIONS = re.compile(r"\b(?:UPDATE|DELETE\s+FROM|INSERT\s+INTO)\s+object_versions\b", re.I)
 _WRITES_OBJECTS = re.compile(r"\b(?:UPDATE|DELETE\s+FROM|INSERT\s+INTO)\s+objects\b", re.I)
-_LOCKS_OBJECTS = re.compile(r"\bFROM\s+objects\b[\s\S]*?\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b", re.I)
+_LOCKS_OBJECTS = re.compile(r"\bFROM\s+objects\b[\s\S]*?\bFOR\s+(?:NO\s+)?(?:KEY\s+)?(?:UPDATE|SHARE)\b", re.I)
+# A SELECT ... FOR UPDATE on object_versions holds that row just as an UPDATE does. Missing this
+# is half of why the S4 append reserve slipped past an earlier version of this guard.
+_LOCKS_VERSIONS = re.compile(r"\bFROM\s+object_versions\b[\s\S]*?\bFOR\s+(?:NO\s+)?(?:KEY\s+)?(?:UPDATE|SHARE)\b", re.I)
+
+# Tables whose rows carry a FOREIGN KEY to objects(object_id). Postgres services each such INSERT
+# with an implicit `SELECT 1 FROM ONLY objects x WHERE object_id = $1 FOR KEY SHARE OF x`, issued at
+# the point of the INSERT -- so writing one of these IS taking the objects row lock, even though no
+# SQL in the transaction names `objects`. That invisible acquisition is the entire reason the
+# simple-PUT tail transaction deadlocked against a concurrent reserve while this guard was green.
+# Keep in step with `\d objects` / the FK list in the schema.
+_FK_TO_OBJECTS = ("parts", "multipart_uploads", "object_names", "object_acls")
+_IMPLIES_OBJECTS_LOCK = re.compile(
+    r"\bINSERT\s+INTO\s+(?:" + "|".join(_FK_TO_OBJECTS) + r")\b|"
+    r"\bUPDATE\s+(?:" + "|".join(_FK_TO_OBJECTS) + r")\b[\s\S]*?\bobject_id\b",
+    re.I,
+)
 
 
 def _classify(sql: str) -> str | None:
-    """'objects' if the statement locks or writes the objects row, 'versions' if only versions.
+    """'objects' if the statement locks the objects row (directly OR via an FK), 'versions' if only
+    an object_versions row.
 
     An UPDATE/INSERT/DELETE on `objects` IS an objects row lock, so it counts the same as an
-    explicit FOR UPDATE: either way the transaction holds that row from then on.
+    explicit FOR UPDATE: either way the transaction holds that row from then on. So is an INSERT
+    into any table with an object_id FK -- see _FK_TO_OBJECTS.
     """
-    if _LOCKS_OBJECTS.search(sql) or _WRITES_OBJECTS.search(sql):
+    if _LOCKS_OBJECTS.search(sql) or _WRITES_OBJECTS.search(sql) or _IMPLIES_OBJECTS_LOCK.search(sql):
         return "objects"
-    if _WRITES_VERSIONS.search(sql):
+    if _WRITES_VERSIONS.search(sql) or _LOCKS_VERSIONS.search(sql):
         return "versions"
     return None
 
@@ -46,8 +80,20 @@ def _query_kinds() -> dict[str, str]:
     return {p.stem: kind for p in _QUERIES.glob("*.sql") if (kind := _classify(p.read_text())) is not None}
 
 
-def _events(node: ast.AST, kinds: dict[str, str]) -> list[tuple[int, str, str]]:
-    """Every objects/object_versions touch inside a subtree, in source order."""
+def _events(
+    node: ast.AST,
+    kinds: dict[str, str],
+    helpers: dict[str, str] | None = None,
+) -> list[tuple[int, str, str]]:
+    """Every objects/object_versions touch inside a subtree, in source order.
+
+    `helpers` maps a called function's name to the lock class its own body takes. Without it this
+    walk sees only SQL written inline in the transaction block, and the two statements that made the
+    simple-PUT tail transaction deadlock -- `ensure_upload_row` and `upsert_part_placeholder` --
+    live behind exactly such a call. A guard that cannot follow one level of indirection is a guard
+    that passes while the hot path deadlocks, which is what happened.
+    """
+    helpers = helpers or {}
     found: list[tuple[int, str, str]] = []
     for child in ast.walk(node):
         # get_query("name")
@@ -62,6 +108,11 @@ def _events(node: ast.AST, kinds: dict[str, str]) -> list[tuple[int, str, str]]:
             name = child.args[0].value
             if name in kinds:
                 found.append((child.lineno, kinds[name], name))
+        # A call to a helper whose own body takes one of these locks.
+        elif isinstance(child, ast.Call):
+            fname = child.func.attr if isinstance(child.func, ast.Attribute) else getattr(child.func, "id", None)
+            if fname in helpers:
+                found.append((child.lineno, helpers[fname], f"{fname}()"))
         # An inline SQL string literal.
         elif isinstance(child, ast.Constant) and isinstance(child.value, str):
             kind = _classify(child.value)
@@ -70,9 +121,31 @@ def _events(node: ast.AST, kinds: dict[str, str]) -> list[tuple[int, str, str]]:
     return sorted(found)
 
 
+def _helper_lock_classes(kinds: dict[str, str]) -> dict[str, str]:
+    """Function name -> the lock class its body takes, for every function in the app sources.
+
+    One level deep and name-keyed rather than import-resolved: enough to see through
+    `ensure_upload_row` / `upsert_part_placeholder`, and it errs toward reporting a lock rather
+    than missing one. A same-named function elsewhere can only make this guard stricter.
+    """
+    classes: dict[str, str] = {}
+    roots = [_ROOT / "hippius_s3", _ROOT / "workers", _ROOT / "cacher"]
+    for path in sorted(p for root in roots if root.is_dir() for p in root.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            found = {kind for _, kind, _ in _events(node, kinds)}
+            if "objects" in found:
+                classes[node.name] = "objects"
+            elif "versions" in found:
+                classes.setdefault(node.name, "versions")
+    return classes
+
+
 def _transaction_blocks() -> list[tuple[Path, int, list[tuple[int, str, str]]]]:
     """Every `async with ... transaction()` block, with the table touches inside it."""
     kinds = _query_kinds()
+    helpers = _helper_lock_classes(kinds)
     blocks: list[tuple[Path, int, list[tuple[int, str, str]]]] = []
 
     roots = [_ROOT / "hippius_s3", _ROOT / "workers", _ROOT / "cacher"]
@@ -88,7 +161,7 @@ def _transaction_blocks() -> list[tuple[Path, int, list[tuple[int, str, str]]]]:
             )
             if not opens_transaction:
                 continue
-            events = [e for stmt in node.body for e in _events(stmt, kinds)]
+            events = [e for stmt in node.body for e in _events(stmt, kinds, helpers)]
             if events:
                 blocks.append((path, node.lineno, events))
     return blocks

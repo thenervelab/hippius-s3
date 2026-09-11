@@ -1,0 +1,34 @@
+-- Take the `objects` row lock BEFORE this transaction touches any `object_versions` row.
+--
+-- WHY THIS EXISTS. The storage-usage trigger on `objects` reads the outgoing and incoming version
+-- sizes under FOR NO KEY UPDATE while its statement already holds the objects row, so an overwrite's
+-- lock order is objects -> object_versions. A transaction that takes them the other way round closes
+-- a cycle and Postgres breaks it by failing somebody's request.
+--
+-- The transactions that needed this did NOT name `objects` anywhere. They reached it through a
+-- FOREIGN KEY: `INSERT INTO parts` and `INSERT INTO multipart_uploads` both carry an `object_id`
+-- FK, and Postgres services each with an implicit
+--
+--     SELECT 1 FROM ONLY objects x WHERE object_id = $1 FOR KEY SHARE OF x
+--
+-- issued at the point of the INSERT -- i.e. AFTER the `UPDATE object_versions` that precedes it in
+-- the same transaction. So the simple-PUT tail transaction and the S4 append reserve were both
+-- object_versions -> objects, invisibly, and deadlocked against any concurrent same-key reserve.
+-- Reproduced deterministically; the control without the trigger's lock waits instead of deadlocking.
+--
+-- FOR KEY SHARE, not something stronger, on purpose. This statement exists to fix the ORDER in which
+-- two locks are taken, not to add exclusion: KEY SHARE is exactly what the FK below would have taken
+-- anyway, so acquiring it early introduces no conflict that the transaction did not already have. It
+-- still conflicts with the reserve's exclusive lock on the objects row, which is what makes the
+-- ordering actually hold. Taking FOR UPDATE here would serialise every concurrent PUT to one key
+-- behind one another for no billing benefit.
+--
+-- Returns no row if the object does not exist (or was hard-deleted concurrently). Callers that have
+-- already reserved the version treat that as a lost race and let the transaction fail on its own
+-- FK; there is nothing to lock and nothing to protect.
+--
+-- Parameters: $1: object_id (uuid)
+SELECT object_id
+FROM objects
+WHERE object_id = $1
+FOR KEY SHARE
