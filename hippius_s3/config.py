@@ -329,30 +329,41 @@ class Config:
     # mechanism") does not survive the drift being an OVER-count: a hot-key customer could be
     # over-billed for weeks before anything noticed. An alarm nobody hears is not an alarm.
     #
-    # SWEEP ARITHMETIC, corrected -- an earlier version of this comment priced it against the
-    # ~48k TOTAL buckets and got ~19 hours. list_buckets_for_usage_reconcile.sql filters
-    # `deleted_at IS NULL`, and production has 3,334 LIVE buckets out of 48,077. So 200 every 300s
-    # = 2,400/hour is a full sweep in about **1.4 hours**, not 19 -- and the old 25/hour was ~5.5
-    # days per pass rather than the 77 days that figure implied. Better than claimed in both
-    # directions, but worth having right: someone tuning this should not reason from a number that
-    # is 13x off. Justified against the
-    # measured cost of one recompute_bucket_storage_usage(): 0.8ms for an empty bucket, 1.0ms at 10
-    # objects, 1.3ms at 100, 8.1ms at 1000 (median, laptop Postgres, so pessimistic per-op relative
-    # to the primary but without its load). A 200-bucket pass is therefore ~0.2-0.5s of primary
-    # work per 300s cycle -- a ~0.1% duty cycle -- and the estate is overwhelmingly small buckets.
+    # SWEEP ARITHMETIC. list_buckets_for_usage_reconcile.sql filters `deleted_at IS NULL`, and
+    # production has ~3,350 LIVE buckets out of ~48,200 -- so price this against the live count, not
+    # the total. At 50 per 300s that is 600/hour and a full sweep in about 5.6 hours.
     #
-    # The skew is what keeps this modest rather than higher. A read-only simulation of the whole
-    # estate on the replica measured a median of 9.7ms and p99 of 10.7ms per bucket, with the
-    # slowest COMPLETED bucket at 22.5s and seven buckets exceeding 30s -- those seven could not be
-    # timed because the replica cancels a query past max_standby_streaming_delay, so their true cost
-    # is only bounded below. An earlier measurement of the largest put it near 64s. Treat "tens of
-    # seconds" as the figure; the queue is least-recently-recomputed, so it lands in one cycle per
-    # sweep. Recompute holds a GLOBAL advisory lock, so the
-    # compactor skips (pg_TRY_) while it runs -- harmless, the ledger is insert-only and a skipped
-    # fold only adds latency, but it is the reason not to simply crank this to a full sweep per
-    # hour. Going materially faster wants the outlier bucket on its own cadence, or a per-bucket
-    # lock instead of the global one, first.
-    usage_reconcile_buckets_per_cycle: int = env("HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE:200", convert=int)
+    # WHY 50 AND NOT 200. An earlier version of this comment claimed "~0.2-0.5s of primary work per
+    # 300s cycle -- a ~0.1% duty cycle", extrapolated from per-bucket costs measured on a laptop
+    # (0.8ms empty, 8.1ms at 1000 objects). THAT WAS WRONG BY ONE TO TWO ORDERS OF MAGNITUDE.
+    # Measured on the production replica instead:
+    #
+    #   * a random 200-live-bucket pass, COLD: 35.9s wall, 9.77 GiB of buffer traffic
+    #     (2.88 GiB physical). Warm, the same sample's slowest bucket drops to 0.7s -- so the number
+    #     that matters is the cold one, and a reconciler sweeping least-recently-recomputed buckets
+    #     is cold by construction.
+    #   * the aggregate costs ~6 buffers per object, and the estate averages ~50k objects per live
+    #     bucket (167M objects / 3,350 buckets).
+    #   * the largest bucket (7.8M live objects) was CANCELLED by the replica at 38.7s having
+    #     already read 270 GiB logical / 44 GiB physical without finishing. Extrapolated: ~55s warm,
+    #     ~60 GiB physical.
+    #
+    # So a 200-bucket pass is a 4-23% duty cycle, not 0.1%, and it runs on the PRIMARY -- this
+    # worker writes, and recompute must share one snapshot with the ledger rows it discards, so it
+    # cannot use the replica the way the read path does. A recurring ~60 GiB physical read on this
+    # primary is the same order as the janitor read-storm that stalled it and triggered a failover
+    # (see database_readonly_url below). At 200/300s the largest bucket would be re-scanned every
+    # ~84 minutes, forever; at 50 it is every ~5.6 hours.
+    #
+    # The reconciler is a drift ALARM, not the mechanism that keeps the number right -- the
+    # compactor does that continuously. A 5.6-hour sweep is ample for an alarm and is worth far more
+    # than the extra load a 1.4-hour sweep costs. Going faster wants the handful of outlier buckets
+    # on their own cadence first, which is the real fix.
+    #
+    # Recompute holds a GLOBAL advisory lock, so the compactor skips (pg_TRY_) while it runs. That
+    # is harmless -- the ledger is insert-only, prod inserts ~1-3 rows/s, and a 55s hold costs the
+    # ledger ~165 rows -- but it is another reason not to crank this.
+    usage_reconcile_buckets_per_cycle: int = env("HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE:50", convert=int)
     usage_reconcile_interval_seconds: int = env("HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS:300", convert=int)
     # Server-side bound on ONE bucket recompute, applied as the pool's statement_timeout (prod's own
     # is 0, so this is the only bound). It has to clear the largest bucket -- tens of seconds, see

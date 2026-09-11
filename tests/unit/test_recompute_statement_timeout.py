@@ -60,8 +60,8 @@ def test_the_usage_rollup_pool_raises_statement_timeout() -> None:
 
     assert settings is not None, "the usage-rollup pool passes no server_settings at all"
     assert "statement_timeout" in settings, (
-        "the usage-rollup pool does not raise statement_timeout, so the reconciler will be killed "
-        "by the server's own limit on exactly the largest bucket -- see this module's docstring"
+        "the usage-rollup pool does not set statement_timeout, so the largest bucket's aggregate is "
+        "UNBOUNDED on the primary -- see this module's docstring"
     )
     assert "usage_reconcile_timeout_seconds" in settings["statement_timeout"], (
         "statement_timeout should be derived from config.usage_reconcile_timeout_seconds so the two "
@@ -74,8 +74,8 @@ def test_the_backfill_connection_raises_statement_timeout() -> None:
 
     assert settings is not None, "the backfill connection passes no server_settings at all"
     assert "statement_timeout" in settings, (
-        "the backfill does not raise statement_timeout, so it aborts on the largest bucket every "
-        "run and backfilled_at can never be set"
+        "the backfill does not set statement_timeout, so one wedged bucket can hold a snapshot and "
+        "the rollup's global advisory lock on the primary indefinitely"
     )
     assert "timeout" in settings["statement_timeout"], (
         "statement_timeout should be derived from --timeout so one flag moves both bounds; "
@@ -107,7 +107,7 @@ def test_the_timeout_is_rendered_as_milliseconds(seconds: float) -> None:
     assert int(rendered) >= 60_000
 
 
-def test_backfill_default_timeout_clears_the_production_server_limit() -> None:
+def test_backfill_default_timeout_leaves_room_for_the_largest_bucket() -> None:
     """A default under a minute would make the bound tighter than the work, not a safety net.
 
     Production's server-side statement_timeout is 0, so this value IS the only bound; the largest
@@ -130,5 +130,6 @@ def test_backfill_default_timeout_clears_the_production_server_limit() -> None:
     assert defaults, "could not find the --timeout default"
     assert defaults[0] > 60.0, (
         f"--timeout defaults to {defaults[0]}s, which is too close to the measured cost of the "
-        "largest buckets (~22s measured, several over 30s) to be a safety net rather than a limit"
+        "largest buckets (tens of seconds; the biggest was still running at 38.7s when the replica "
+        "cancelled it) to be a safety net rather than a limit"
     )
