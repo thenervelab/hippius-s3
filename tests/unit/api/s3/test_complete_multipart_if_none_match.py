@@ -45,7 +45,10 @@ def _request(headers: dict[str, str]) -> Any:
     return SimpleNamespace(
         headers=Headers(headers),
         state=SimpleNamespace(main_account_id="acct-main"),
-        app=SimpleNamespace(state=SimpleNamespace(postgres_pool=AsyncMock(), redis_client=AsyncMock(), fs_store=None)),
+        # A stand-in store, not None: None makes ObjectWriter build the configured on-disk cache.
+        app=SimpleNamespace(
+            state=SimpleNamespace(postgres_pool=AsyncMock(), redis_client=AsyncMock(), fs_store=SimpleNamespace())
+        ),
     )
 
 

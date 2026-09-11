@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import uuid
+from types import SimpleNamespace
 from typing import Any
 from typing import AsyncIterator
 
@@ -396,7 +397,9 @@ class _CompletePool:
 
 
 async def _complete(pool: _CompletePool, if_none_match: bool) -> Any:
-    writer = ObjectWriter(pool=pool, redis_client=DummyRedis(), fs_store=None)
+    # A stand-in store, not None: None makes ObjectWriter build the configured on-disk cache
+    # (/var/lib/hippius by default), which CI runners cannot create. mpu_complete never touches it.
+    writer = ObjectWriter(pool=pool, redis_client=DummyRedis(), fs_store=SimpleNamespace())
     return await writer.mpu_complete(
         bucket_name="bkt",
         object_id=str(uuid.uuid4()),
