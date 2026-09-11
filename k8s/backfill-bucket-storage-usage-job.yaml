@@ -46,21 +46,32 @@ spec:
       restartPolicy: Never
       containers:
         - name: backfill
+          # PIN THIS to the short SHA the target environment is actually running before you apply.
+          # `latest` is pushed to the SAME GHCR repo by BOTH the staging and production deploy
+          # workflows, and this Job sits outside kustomize so `kustomize edit set image` never
+          # rewrites it — so `latest` here means "whichever environment deployed most recently",
+          # which for a production backfill could be a staging build. Read the running tag with:
+          #   kubectl -n <ns> get ds api-local -o jsonpath='{.spec.template.spec.containers[0].image}'
           image: ghcr.io/thenervelab/hippius-s3/api:latest
           imagePullPolicy: Always
+          # The WHOLE secret, not just DATABASE_URL. get_config() hard-requires six more
+          # secret-only vars with no defaults (FRONTEND_HMAC_SECRET, HIPPIUS_AUTH_ENCRYPTION_KEY,
+          # HIPPIUS_SERVICE_KEY, ARION_SERVICE_KEY, ARION_BEARER_TOKEN, REDIS_URL) and the image
+          # ships no .env to fall back on, so a DATABASE_URL-only Job died in config parsing before
+          # running a single line -- and with backoffLimit: 0 it died once and stayed dead. That
+          # would have failed rollout step 2 AFTER step 1 had already put the environment into the
+          # degraded pre-backfill state. Matches backfill-superseded-unpins-job.yaml.
+          #
+          # The secret's own DATABASE_URL already points at the primary (postgres-nvme-rw), which is
+          # required: this writes, and its aggregate must share one snapshot with the ledger rows it
+          # discards, so a replica cannot serve it.
           envFrom:
+            - secretRef:
+                name: hippius-s3-secrets
             - configMapRef:
                 name: hippius-s3-defaults
             - configMapRef:
                 name: hippius-s3-environment
-          env:
-            # The PRIMARY. This writes, and the aggregate must be consistent with the ledger rows it
-            # discards in the same snapshot — a replica cannot do either.
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: DATABASE_URL
           command:
             - python
             - -m

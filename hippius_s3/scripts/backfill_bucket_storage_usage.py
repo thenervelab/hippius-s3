@@ -68,11 +68,20 @@ async def _bucket_ids(conn: asyncpg.Connection) -> list[uuid.UUID]:
 
 async def main_async(args: argparse.Namespace) -> int:
     config = get_config()
-    # RAISE statement_timeout, or the big buckets can never be seeded. Production sets a 1-minute
-    # server-side statement_timeout for the application role, and the largest bucket's aggregate
-    # takes longer than that. asyncpg's own `timeout=` cannot help: whichever limit is SHORTER
-    # fires, and the server's was. The result was a backfill that aborts on that bucket every time
-    # -- safely, since backfilled_at is only set after a complete pass, but permanently.
+    # BOUND the aggregate server-side. asyncpg's own `timeout=` cancels by sending a cancel
+    # request -- client-driven and best-effort -- whereas statement_timeout is enforced by the
+    # backend itself and is authoritative.
+    #
+    # This IMPOSES a bound rather than raising a too-tight one: production's statement_timeout is 0,
+    # UNBOUNDED. The premise this was first written on (a 1-minute server-side limit) was WRONG --
+    # it came from a precheck script that SET the value itself and then read its own setting back.
+    # Measured properly: `source = default`, `reset_val = 0`, no per-database or per-role rolconfig,
+    # on both prod and staging.
+    #
+    # It still matters: an unbounded full aggregate over a 165 GB / 91 GB table pair on the PRIMARY
+    # is exactly the read-storm shape that has stalled this cluster and triggered a failover before
+    # (see config.py's note on database_readonly_url). A backfill that hangs on one bucket forever
+    # is worse than one that gives up on it and reports.
     conn = await asyncpg.connect(
         config.database_url,
         server_settings={"statement_timeout": f"{int(args.timeout * 1000)}"},

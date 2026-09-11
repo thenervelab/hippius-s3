@@ -161,6 +161,12 @@ END;
 $$;
 
 -- migrate:down
+--
+-- NOTE: this restores migration 20260910120000's UNLOCKED bodies, i.e. it reverts 20260910180000
+-- (the outgoing-only lock) as well as this file. That is deliberate and is the safe direction --
+-- the half-fixed intermediate state over-bills AND carries the lock-order constraint -- but it
+-- means a single-step rollback of this file leaves 20260910180000 recorded as applied while its
+-- effect is gone. Roll both back, or forward-fix instead.
 
 SET LOCAL lock_timeout = '3s';
 

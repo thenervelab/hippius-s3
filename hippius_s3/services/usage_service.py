@@ -33,6 +33,17 @@ class StorageRollupNotBackfilled(RuntimeError):
     """The rollup exists but has not been seeded, so its numbers are not totals."""
 
 
+async def rollup_is_ready(db: Any) -> bool:
+    """Whether the backfill has run, i.e. whether the counters are totals rather than deltas.
+
+    One indexed single-row SELECT. Exists so a caller can ask BEFORE doing expensive work it would
+    have to throw away: the plans-cacher's usage read raises at the END of a full paginated upstream
+    scrape, so every pre-backfill cycle fetched the whole roll and discarded it.
+    """
+    async with db.acquire() as conn:
+        return bool(await conn.fetchval(get_query("get_storage_usage_rollup_ready")))
+
+
 async def get_account_storage_bytes(
     db: Any,
     main_account_id: str,

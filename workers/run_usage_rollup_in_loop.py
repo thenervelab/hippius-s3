@@ -122,12 +122,15 @@ async def run_usage_rollup_loop() -> None:
     # plenty -- the work is serial by design and an oversized pool here is idle backends against
     # max_connections for nothing.
     #
-    # statement_timeout is raised on this pool because production sets a 1-minute one for the
-    # application role and the largest bucket's recompute takes longer. Whichever limit is SHORTER
-    # fires, so asyncpg's own `timeout=` never got a chance -- the reconciler would have failed its
-    # cycle every time that bucket came up in the queue, i.e. the one bucket most worth verifying
-    # would have been the one bucket it could never verify. It also covers the compactor's
-    # DELETE ... RETURNING on this pool, which is a bounded batch and wants the same headroom.
+    # statement_timeout is set on this pool so the recompute is bounded BY THE SERVER rather than
+    # only by asyncpg's client-side cancel, which is best-effort. It imposes a bound where there was
+    # none: production's statement_timeout is 0, unbounded (the "1-minute server limit" this was
+    # first justified with was a measurement error -- a precheck script SET it and read its own
+    # value back). The reason it still matters is that recompute_bucket_storage_usage is a full
+    # aggregate on the PRIMARY, the read-storm shape that has caused a failover here before, and an
+    # unbounded one can hold a snapshot and the global advisory lock indefinitely. It also covers
+    # the compactor's DELETE ... RETURNING on this pool, which is a bounded batch and wants the
+    # same headroom.
     pool = await asyncpg.create_pool(
         config.database_url,
         min_size=1,

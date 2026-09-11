@@ -1,21 +1,23 @@
 """Every connection that runs a bucket recompute must raise `statement_timeout` itself.
 
-recompute_bucket_storage_usage() is a full aggregate over one bucket. Production sets a 1-minute
-server-side statement_timeout for the application role, and the largest bucket takes longer than
-that, so the server kills it. asyncpg's own `timeout=` cannot rescue it: whichever of the two
-limits is SHORTER is the one that fires, and the server's was.
+recompute_bucket_storage_usage() is a full aggregate over one bucket, on the PRIMARY. Both callers
+must bound it server-side, not only with asyncpg's `timeout=` -- that cancels by sending a cancel
+request, client-driven and best-effort, whereas statement_timeout is enforced by the backend.
 
-The consequences were both silent-ish and permanent:
-  * the backfill aborts on that bucket every run, so `backfilled_at` is never set and the rollout
-    cannot complete -- safe, because the flag is written only after a complete pass, but stuck;
-  * the reconciler fails its cycle whenever that bucket reaches the head of the
-    least-recently-recomputed queue, so the single bucket most worth verifying is the one bucket it
-    can never verify.
+CORRECTION, because the original version of this module asserted otherwise: production's
+statement_timeout is 0, UNBOUNDED. The "1-minute server-side limit" it was written against was a
+measurement error -- a precheck script SET the value itself and then read its own setting back.
+Measured properly on both prod and staging: `source = default`, `reset_val = 0`, and no
+per-database or per-role rolconfig anywhere.
 
-Neither shows up on staging, which has no bucket anywhere near 60s -- so a test is the only thing
-that keeps this from regressing. It asserts on the CONNECTION SETUP rather than on behaviour,
-because the behaviour only diverges against a specific server configuration we cannot reproduce
-in-process.
+So these connections IMPOSE a bound rather than raise a too-tight one. That is still worth a test:
+an unbounded full aggregate over a 165 GB / 91 GB table pair on the primary is the read-storm shape
+that has stalled this cluster and forced a failover before, and recompute holds the rollup's global
+advisory lock while it runs -- so an unbounded one pauses the compactor indefinitely and the
+reconciler makes no further progress.
+
+It asserts on the CONNECTION SETUP rather than on behaviour, because the behaviour only diverges
+against a server configuration that cannot be reproduced in-process.
 """
 
 from __future__ import annotations
@@ -106,7 +108,12 @@ def test_the_timeout_is_rendered_as_milliseconds(seconds: float) -> None:
 
 
 def test_backfill_default_timeout_clears_the_production_server_limit() -> None:
-    """The default has to exceed prod's 1-minute statement_timeout, or the fix changes nothing."""
+    """A default under a minute would make the bound tighter than the work, not a safety net.
+
+    Production's server-side statement_timeout is 0, so this value IS the only bound; the largest
+    measured bucket aggregate is ~22s with several above 30s, so anything near that would start
+    failing legitimate recomputes.
+    """
     source = (_ROOT / "hippius_s3/scripts/backfill_bucket_storage_usage.py").read_text()
     tree = ast.parse(source)
 
@@ -122,6 +129,6 @@ def test_backfill_default_timeout_clears_the_production_server_limit() -> None:
 
     assert defaults, "could not find the --timeout default"
     assert defaults[0] > 60.0, (
-        f"--timeout defaults to {defaults[0]}s, which does not clear production's 60s server-side "
-        "statement_timeout -- raising it on the connection would then be pointless"
+        f"--timeout defaults to {defaults[0]}s, which is too close to the measured cost of the "
+        "largest buckets (~22s measured, several over 30s) to be a safety net rather than a limit"
     )
