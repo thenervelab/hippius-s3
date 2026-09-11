@@ -155,7 +155,13 @@ def _recording_client(access_key: str, secret: str, checksum_calculation: str, s
     )
 
     def record(request: Any, **_kw: Any) -> None:
-        sent.append({str(k).lower(): str(v) for k, v in request.headers.items()})
+        # botocore keeps some header values as bytes; str() would record them as "b'...'".
+        sent.append(
+            {
+                str(k).lower(): v.decode("latin-1") if isinstance(v, bytes) else str(v)
+                for k, v in request.headers.items()
+            }
+        )
 
     client.meta.events.register("before-send.s3.PutObject", record)
     client.meta.events.register("before-send.s3.UploadPart", record)
