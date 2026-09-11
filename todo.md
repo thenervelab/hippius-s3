@@ -284,11 +284,10 @@ sub-millisecond we could now afford a live read on every request, which would al
 admits a row on `billing == "plan"` plus a plan name, and does NOT consult `active`.
 
 It did originally, on the reading that a lapsed subscription is distinguished only by that flag. The
-live payload said otherwise: `active: false` on **every row** it serves, zero exceptions across the
-two days the endpoint has been up — including the sole real subscriber, whose row carried a real
-subscription id and a `next_charge` date in the FUTURE. A
-cancelled subscription has no future charge date, so the field is not carrying that meaning; it
-looks simply unpopulated. Requiring it admitted nobody, making the gate permanently inert and
+live payload said otherwise: `active: false` on **every row** it serves, zero exceptions — including
+rows that carry a populated subscription id and a `next_charge` date in the FUTURE. A cancelled
+subscription has no future charge date, so the field is not carrying that meaning; it looks simply
+unpopulated. Requiring it admitted nobody, making the gate permanently inert and
 unobservable even in shadow mode.
 
 **Measured blast radius**: exactly ONE row in 3069 carries `billing == "plan"`.
