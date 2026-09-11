@@ -1,0 +1,56 @@
+# One-off backfill of chunk_backend.arion_hash / object_versions.arion_hash from HCFS file_records.
+# See hippius_s3/scripts/backfill_arion_hash.py. Needs migration 20260911120000 applied and an API
+# image that contains the script (i.e. deploy the arion_hash release first).
+#
+# IMPORTANT: namespace below is hardcoded to production. Edit for staging.
+#
+# 1. Give the job read access to the HCFS database. The HCFS secret lives in another namespace and
+#    its host (postgres-rw) is namespace-local, so copy it with the host pointed at the read-only
+#    service in hippius-arion:
+#      kubectl -n hippius-arion get secret hcfs-secrets -o jsonpath='{.data.database-url}' | base64 -d \
+#        | sed -E 's#@postgres-(rw|ro|r)(:|/)#@postgres-ro.hippius-arion.svc.cluster.local\2#' \
+#        | xargs -I{} kubectl -n hippius-s3-prod create secret generic hcfs-readonly-db --from-literal=database-url={}
+# 2. Dry run (the default below). Check the DONE line: matched vs missing_in_hcfs / empty_in_hcfs.
+#      kubectl create -f k8s/backfill-arion-hash-job.yaml
+#      kubectl -n hippius-s3-prod logs job/backfill-arion-hash --follow
+# 3. Real run: delete the job, remove "--dry-run" from args, create again. Safe to stop and re-run;
+#    it only touches rows whose arion_hash is still NULL (resume with --start-after <last_chunk_id>).
+# 4. Clean up:  kubectl -n hippius-s3-prod delete secret hcfs-readonly-db
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backfill-arion-hash
+  namespace: hippius-s3-prod
+  labels:
+    app: backfill-arion-hash
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: backfill-arion-hash
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backfill
+          image: ghcr.io/thenervelab/hippius-s3/api:latest
+          command: ["python", "-m", "hippius_s3.scripts.backfill_arion_hash"]
+          args: ["--dry-run", "--batch-size", "1000"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            - name: HCFS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hcfs-readonly-db
+                  key: database-url
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
