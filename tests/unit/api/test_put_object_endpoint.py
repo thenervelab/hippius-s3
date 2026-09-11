@@ -402,3 +402,60 @@ async def test_create_only_append_to_an_existing_key_is_refused(monkeypatch: Any
     )
     assert resp.status_code == 412
     assert append_calls == []
+
+
+class _BodyStream:
+    """request.stream() stand-in that records how much of the body the endpoint read."""
+
+    def __init__(self, *chunks: bytes) -> None:
+        self.chunks = list(chunks)
+        self.read: list[bytes] = []
+
+    def __call__(self) -> Any:
+        async def gen() -> Any:
+            for c in self.chunks:
+                self.read.append(c)
+                yield c
+
+        return gen()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_if_none_match_drains_the_body_before_answering(monkeypatch: Any) -> None:
+    """An early answer with the body still pending poisons the kept-alive connection: the client's
+    next request on it fails with a bare 400 (seen in e2e as a GET after a refused PUT)."""
+    captured: dict[str, Any] = {}
+    _patch_writer_capture(monkeypatch, captured)
+    req = _fake_request({"If-None-Match": "etag"})
+    req.stream = body = _BodyStream(b"part-1", b"part-2")
+    resp = await handle_put_object("bkt", "k", req, make_fake_pool(_bucket_present_router), _FakeRedis(nx_result=None))
+    assert resp.status_code == 501
+    assert body.read == [b"part-1", b"part-2"]
+
+
+@pytest.mark.asyncio
+async def test_reserve_time_refusal_drains_the_body_before_answering(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    _patch_writer_capture(monkeypatch, captured, raise_exc=PreconditionFailed())
+    req = _fake_request({"If-None-Match": "*"})
+    req.state.bucket_id = str(uuid.uuid4())
+    req.stream = body = _BodyStream(b"unread body")
+    resp = await handle_put_object("bkt", "k", req, make_fake_pool(_bucket_present_router), _FakeRedis(nx_result=None))
+    assert resp.status_code == 412
+    assert body.read == [b"unread body"]
+
+
+@pytest.mark.asyncio
+async def test_create_only_append_refusal_drains_the_body_before_answering(monkeypatch: Any) -> None:
+    def router(method: str, query: str, args: tuple) -> Any:
+        if "Get bucket by name" in (query or ""):
+            return {"bucket_id": str(uuid.uuid4()), "bucket_name": "bkt", "main_account_id": "acct-main"}
+        if "exists_live" in (query or ""):
+            return {"exists_live": True, "baseline": 1}
+        return None
+
+    req = _fake_request({"If-None-Match": "*", "x-amz-meta-append": "true"})
+    req.stream = body = _BodyStream(b"delta")
+    resp = await handle_put_object("bkt", "k", req, make_fake_pool(router), _FakeRedis(nx_result=None))
+    assert resp.status_code == 412
+    assert body.read == [b"delta"]

@@ -103,3 +103,22 @@ async def test_no_header_is_an_ordinary_completion(monkeypatch: Any) -> None:
     resp = await multipart.complete_multipart_upload("bkt", "big.bin", "up-1", _request({}), _db())
     assert resp.status_code == 200
     assert captured["if_none_match"] is False
+
+
+@pytest.mark.asyncio
+async def test_unsupported_value_drains_the_body_before_answering(monkeypatch: Any) -> None:
+    read: list[bytes] = []
+
+    def stream() -> Any:
+        async def gen() -> Any:
+            read.append(BODY)
+            yield BODY
+
+        return gen()
+
+    _patch(monkeypatch, {})
+    req = _request({"If-None-Match": "etag"})
+    req.stream = stream
+    resp = await multipart.complete_multipart_upload("bkt", "big.bin", "up-1", req, _db())
+    assert resp.status_code == 501
+    assert read == [BODY]

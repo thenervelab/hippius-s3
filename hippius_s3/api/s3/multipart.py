@@ -1197,6 +1197,7 @@ async def complete_multipart_upload(
     try:
         if_none_match = parse_write_if_none_match(request.headers.get("if-none-match"))
     except UnsupportedConditionalWrite:
+        await utils.drain_request_body(request)
         return errors.conditional_write_not_implemented_response()
     try:
         # Validate the multipart upload exists

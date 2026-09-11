@@ -85,6 +85,7 @@ async def handle_put_object(
         try:
             if_none_match = parse_write_if_none_match(request.headers.get("if-none-match"))
         except UnsupportedConditionalWrite:
+            await utils.drain_request_body(request)
             return errors.conditional_write_not_implemented_response()
 
         # Detect S4 append semantics via metadata (header-only, no DB).
@@ -142,6 +143,7 @@ async def handle_put_object(
                     async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
                         state = await conn.fetchrow(get_query("conditional_write_state"), bucket_id, object_key)
                     if state is not None and state["exists_live"]:
+                        await utils.drain_request_body(request)
                         return errors.precondition_failed_response()
                 return await handle_append(
                     request,
@@ -314,6 +316,8 @@ async def handle_put_object(
         # Refused at reserve (nothing was written) or at finalize (our version was never made
         # serveable). Either way the key still serves what it held before this request.
         logger.info("PutObject %s/%s: If-None-Match: * and the key exists", bucket_name, object_key)
+        # Refused at reserve, the body is still unread; at finalize it is already consumed (no-op).
+        await utils.drain_request_body(request)
         return errors.precondition_failed_response()
 
     except ClientDisconnect:
