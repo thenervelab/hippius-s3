@@ -1,8 +1,8 @@
-"""The real PUT writer with Content-MD5 against real Postgres.
+"""The real PUT and append writers with Content-MD5 against real Postgres.
 
-Drives ObjectWriter.put_simple_stream_full end to end — real reserve/tail transactions, real FS chunk
-store — with only the bucket KEK lookup stubbed (it lives in a separate keystore/KMS), and checks what
-a HEAD would serve afterwards.
+Drives ObjectWriter.put_simple_stream_full and ObjectWriter.append_stream end to end — real
+reserve/tail transactions, real FS chunk store — with only the bucket KEK lookup stubbed (it lives in
+a separate keystore/KMS), and checks what a HEAD would serve afterwards.
 """
 
 from __future__ import annotations
@@ -50,7 +50,13 @@ async def env(tmp_path: Any, monkeypatch: Any) -> AsyncGenerator[dict[str, Any],
     async def fake_kek(*, bucket_id: str) -> tuple[Any, bytes]:
         return uuid.uuid4(), b"\x01" * 32
 
+    # The append path unwraps the DEK the PUT already wrapped, so it reads the KEK back BY ID
+    # (get_bucket_kek_bytes) instead of creating one — same key bytes, or the unwrap fails.
+    async def fake_kek_by_id(*, bucket_id: str, kek_id: Any) -> bytes:
+        return b"\x01" * 32
+
     monkeypatch.setattr("hippius_s3.services.kek_service.get_or_create_active_bucket_kek", fake_kek)
+    monkeypatch.setattr("hippius_s3.services.kek_service.get_bucket_kek_bytes", fake_kek_by_id)
 
     account = f"5MD5W{uuid.uuid4().hex[:12]}"
     bucket_id = uuid.uuid4()
@@ -104,6 +110,46 @@ async def _served(env: dict[str, Any], key: str) -> tuple[str, int] | None:
     return None if row is None else (str(row["md5_hash"]), int(row["size_bytes"]))
 
 
+async def _append(
+    env: dict[str, Any],
+    key: str,
+    data: bytes,
+    expected_version: int,
+    expected_md5: bytes | None = None,
+) -> Any:
+    return await env["writer"].append_stream(
+        bucket_id=env["bucket_id"],
+        bucket_name=env["bucket_name"],
+        object_key=key,
+        expected_version=expected_version,
+        account_address="acct",
+        body_iter=_body(data),
+        expected_md5=expected_md5,
+    )
+
+
+async def _live_version(env: dict[str, Any], key: str) -> dict[str, int]:
+    """Append version, size and part count of the version an append would extend."""
+    row = await env["pool"].fetchrow(
+        """
+        SELECT v.append_version,
+               v.size_bytes,
+               (SELECT count(*) FROM parts p WHERE p.object_id = v.object_id AND p.object_version = v.object_version)
+                   AS part_count
+          FROM object_versions v
+          JOIN objects o ON o.object_id = v.object_id AND o.current_object_version = v.object_version
+         WHERE o.bucket_id = $1 AND o.object_key = $2
+        """,
+        uuid.UUID(env["bucket_id"]),
+        key,
+    )
+    return {
+        "append_version": int(row["append_version"]),
+        "size_bytes": int(row["size_bytes"]),
+        "part_count": int(row["part_count"]),
+    }
+
+
 async def test_matching_digest_is_stored(env: dict[str, Any]) -> None:
     await _put(env, "k", b"record", expected_md5=hashlib.md5(b"record").digest())
     assert await _served(env, "k") == (hashlib.md5(b"record").hexdigest(), len(b"record"))
@@ -140,3 +186,47 @@ async def test_a_correct_retry_after_a_bad_digest_lands(env: dict[str, Any]) -> 
         await _put(env, "k", b"payload", expected_md5=hashlib.md5(b"typo").digest())
     await _put(env, "k", b"payload", expected_md5=hashlib.md5(b"payload").digest())
     assert await _served(env, "k") == (hashlib.md5(b"payload").hexdigest(), len(b"payload"))
+
+
+async def test_matching_digest_on_an_append_lands(env: dict[str, Any]) -> None:
+    await _put(env, "k", b"base")
+    before = await _live_version(env, "k")
+
+    await _append(env, "k", b"-one", before["append_version"], expected_md5=hashlib.md5(b"-one").digest())
+
+    after = await _live_version(env, "k")
+    assert after["size_bytes"] == len(b"base-one")
+    assert after["part_count"] == before["part_count"] + 1
+
+
+async def test_bad_digest_on_an_append_leaves_the_live_version_untouched(env: dict[str, Any]) -> None:
+    # Unlike a rejected PUT, which only ever abandons a version of its own, a rejected append is
+    # refused against the version the key is CURRENTLY serving: a leaked reservation would land a
+    # part row on live, servable data.
+    await _put(env, "k", b"base")
+    await _append(env, "k", b"-one", 0, expected_md5=hashlib.md5(b"-one").digest())
+    before = await _live_version(env, "k")
+    served = await _served(env, "k")
+
+    with pytest.raises(BadDigest):
+        await _append(env, "k", b"-two", before["append_version"], expected_md5=hashlib.md5(b"typo").digest())
+
+    # No extra part row on the live version, CAS counter not moved, nothing added to the size.
+    assert await _live_version(env, "k") == before
+    assert await _served(env, "k") == served
+
+
+async def test_a_correct_append_retry_after_a_bad_digest_lands(env: dict[str, Any]) -> None:
+    await _put(env, "k", b"base")
+    before = await _live_version(env, "k")
+
+    with pytest.raises(BadDigest):
+        await _append(env, "k", b"-delta", before["append_version"], expected_md5=hashlib.md5(b"typo").digest())
+
+    # Same expected_version as the rejected attempt: the CAS counter must not have moved, and the
+    # part number the rejection reserved must be free again.
+    await _append(env, "k", b"-delta", before["append_version"], expected_md5=hashlib.md5(b"-delta").digest())
+
+    after = await _live_version(env, "k")
+    assert after["size_bytes"] == len(b"base-delta")
+    assert after["part_count"] == before["part_count"] + 1

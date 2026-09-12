@@ -584,16 +584,6 @@ async def upload_part(
             status_code=400,
         )
 
-    # Content-MD5 digests the request body, so it applies to a regular UploadPart only; an
-    # UploadPartCopy carries no body. Parsed before the body is read; matched by the writer.
-    expected_md5: bytes | None = None
-    if not request.headers.get("x-amz-copy-source"):
-        try:
-            expected_md5 = parse_content_md5(request.headers.get("content-md5"))
-        except InvalidContentMD5:
-            await utils.drain_request_body(request)
-            return errors.invalid_digest_response()
-
     # Check if the multipart upload exists
     ongoing_multipart_upload = await pool.fetchrow(
         get_query("get_multipart_upload"),
@@ -612,6 +602,17 @@ async def upload_part(
             "The specified multipart upload has already been completed",
             status_code=400,
         )
+
+    # Content-MD5 digests the request body, so it applies to a regular UploadPart only; an
+    # UploadPartCopy carries no body. Parsed before the body is read; matched by the writer.
+    # Kept after the upload lookup so an unknown uploadId is NoSuchUpload, as on S3, rather than
+    # InvalidDigest — both are answered before any byte of the body is read.
+    expected_md5: bytes | None = None
+    if not request.headers.get("x-amz-copy-source"):
+        try:
+            expected_md5 = parse_content_md5(request.headers.get("content-md5"))
+        except InvalidContentMD5:
+            return await utils.respond_before_body(request, errors.invalid_digest_response())
 
     # Get object_id and current_object_version from multipart upload
     object_id = ongoing_multipart_upload["object_id"]

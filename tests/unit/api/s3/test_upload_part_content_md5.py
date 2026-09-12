@@ -58,8 +58,21 @@ async def test_malformed_content_md5_is_invalid_digest(monkeypatch: Any) -> None
 
     assert resp.status_code == 400
     assert b"<Code>InvalidDigest</Code>" in resp.body
+    assert captured == {}  # rejected before the body is read
+
+
+@pytest.mark.asyncio
+async def test_unknown_upload_id_beats_a_malformed_digest(monkeypatch: Any) -> None:
+    """S3 answers NoSuchUpload for an uploadId that does not exist, whatever the digest looks like."""
+    captured: dict[str, Any] = {}
+    _patch_part_stream(monkeypatch, captured)
+    pool = SimpleNamespace(fetchrow=AsyncMock(return_value=None))
+
+    resp = await multipart.upload_part(_request({"Content-MD5": "@@not-base64@@"}), pool)
+
+    assert resp.status_code == 404
+    assert b"<Code>NoSuchUpload</Code>" in resp.body
     assert captured == {}
-    pool.fetchrow.assert_not_called()  # rejected before any DB work or body read
 
 
 @pytest.mark.asyncio
