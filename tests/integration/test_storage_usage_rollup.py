@@ -1918,3 +1918,118 @@ async def test_the_objects_lock_is_taken_before_the_version_row_in_the_put_tail(
     async with committed_pool.acquire() as conn:
         await _compact(conn)
         assert await _assert_matches_oracle(conn, acct) == 4096
+
+
+# --------------------------------------------------------------------------------------------
+# Known-issue fixes. Each of these was a real defect found in review; the test states the defect
+# so a future change that reintroduces it fails with the reason rather than a bare mismatch.
+# --------------------------------------------------------------------------------------------
+
+
+async def test_a_negative_bucket_does_not_net_against_a_positive_one(pg_tx: asyncpg.Connection) -> None:
+    """The clamp must be PER BUCKET, not on the account total.
+
+    With GREATEST(0, SUM(...)) at the account level, one bucket at -3 GB and another at +10 GB
+    reports 7 GB: the account is silently UNDER-billed and the clamp never fires, so nothing
+    indicates anything is wrong. Clamping each bucket first fails in the safe direction (over-
+    reporting the broken bucket as 0) while `negative_buckets` still flags it for the reconciler.
+    """
+    acct = await _seed_account(pg_tx)
+    good = await _seed_bucket(pg_tx, acct)
+    bad = await _seed_bucket(pg_tx, acct)
+
+    await pg_tx.execute(
+        "INSERT INTO bucket_storage_usage(bucket_id, bytes_used, updated_at) VALUES($1, $2, now())",
+        good,
+        10_000,
+    )
+    await pg_tx.execute(
+        "INSERT INTO bucket_storage_usage(bucket_id, bytes_used, updated_at) VALUES($1, $2, now())",
+        bad,
+        -3_000,
+    )
+
+    row = await pg_tx.fetchrow(get_query("get_account_storage_bytes_rollup"), acct)
+
+    assert row["bytes_used"] == 10_000, (
+        f"got {row['bytes_used']}: the negative bucket netted against the positive one. Clamp per "
+        f"bucket -- SUM(GREATEST(0, bsu.bytes_used)) -- not on the total."
+    )
+    assert row["negative_buckets"] == 1, "the negative bucket must still be reported"
+
+
+async def test_a_negative_counter_on_a_soft_deleted_bucket_is_not_reported(
+    pg_tx: asyncpg.Connection,
+) -> None:
+    """Otherwise it alarms forever and nothing can ever clear it.
+
+    get_storage_delta_ledger_stats counted `bytes_used < 0` across ALL of bucket_storage_usage with
+    no liveness filter, while list_buckets_for_usage_reconcile only recomputes LIVE buckets. So a
+    negative counter on a soft-deleted bucket is unreachable by the repair path while being counted
+    by the alarm -- STORAGE_ROLLUP_NEGATIVE at ERROR on every cycle, permanently, which is precisely
+    how you teach an operator to ignore the one alert this design depends on.
+
+    A soft-deleted bucket's total is read by nobody (every read path joins `deleted_at IS NULL`), so
+    its counter being wrong has no billing consequence and must not alarm.
+    """
+    acct = await _seed_account(pg_tx)
+    live = await _seed_bucket(pg_tx, acct)
+    dead = await _seed_bucket(pg_tx, acct, deleted=True)
+
+    for bucket_id, value in ((live, 5_000), (dead, -9_000)):
+        await pg_tx.execute(
+            "INSERT INTO bucket_storage_usage(bucket_id, bytes_used, updated_at) VALUES($1, $2, now())",
+            bucket_id,
+            value,
+        )
+
+    stats = await storage_rollup_service.ledger_stats(pg_tx)
+
+    assert stats.negative_buckets == 0, (
+        "a negative counter on a soft-deleted bucket was reported. The reconciler only sweeps live "
+        "buckets, so this alarm can never be cleared -- filter the stat on buckets.deleted_at IS NULL."
+    )
+
+    # And a LIVE one must still be caught, or the fix has traded a false positive for a false negative.
+    await pg_tx.execute("UPDATE bucket_storage_usage SET bytes_used = -1 WHERE bucket_id = $1", live)
+    assert (await storage_rollup_service.ledger_stats(pg_tx)).negative_buckets == 1
+
+
+async def test_the_two_rollup_tables_carry_queue_shaped_storage_parameters(
+    pg_conn: asyncpg.Connection,
+) -> None:
+    """A queue and a hot-updated counter both need non-default autovacuum settings.
+
+    `storage_delta_ledger` is append-at-the-tail, bulk-DELETE-the-head: the default
+    autovacuum_vacuum_scale_factor of 0.2 is proportional to a table that is *supposed* to stay
+    near-empty, so it triggers constantly on a tiny absolute number of dead tuples -- and production
+    runs autovacuum_max_workers = 3 against 168M-row tables, so a small table grabbing a worker slot
+    every few seconds is stolen capacity from where it matters. A flat threshold is the right shape
+    for a queue.
+
+    `bucket_storage_usage` takes one UPDATE per active bucket per fold. At fillfactor 100 every one
+    of those needs a new page once the page is full, so the table and its PK index bloat and HOT
+    updates are impossible. Leaving headroom keeps the new row tuple on the same page.
+
+    Neither matters at prod's current ~1-3 ledger rows/s, which is why this is cheap insurance
+    rather than a fix -- but both get worse with load, and neither can be changed under load
+    without an ACCESS EXCLUSIVE moment.
+    """
+    rows = await pg_conn.fetch(
+        "SELECT relname, COALESCE(reloptions, '{}') AS opts FROM pg_class"
+        " WHERE relname IN ('storage_delta_ledger', 'bucket_storage_usage')"
+    )
+    opts = {r["relname"]: " ".join(r["opts"]) for r in rows}
+
+    assert set(opts) == {"storage_delta_ledger", "bucket_storage_usage"}, f"tables missing: {opts}"
+
+    assert "autovacuum_vacuum_threshold" in opts["storage_delta_ledger"], (
+        f"storage_delta_ledger has no flat autovacuum threshold: {opts['storage_delta_ledger']!r}"
+    )
+    assert "autovacuum_vacuum_scale_factor=0" in opts["storage_delta_ledger"].replace(" ", ""), (
+        "the proportional scale factor must be disabled on a queue table, or the flat threshold "
+        f"never governs: {opts['storage_delta_ledger']!r}"
+    )
+    assert "fillfactor" in opts["bucket_storage_usage"], (
+        f"bucket_storage_usage needs page headroom for HOT updates: {opts['bucket_storage_usage']!r}"
+    )

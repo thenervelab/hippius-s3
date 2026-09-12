@@ -30,7 +30,12 @@
 --
 -- Parameters: $1: main_account_id (SS58)
 SELECT
-    GREATEST(0, COALESCE(SUM(bsu.bytes_used), 0))::bigint AS bytes_used,
+    -- Clamp PER BUCKET, not on the total. GREATEST(0, SUM(...)) let a negative bucket net against
+    -- a positive one -- one at -3 GB and one at +10 GB reported 7 GB, silently UNDER-billing with
+    -- the clamp never firing, so nothing indicated anything was wrong. Per bucket, a broken counter
+    -- reads as 0: the account is over-reported relative to that one bucket, which is the safe
+    -- direction, and `negative_buckets` below still flags it for the reconciler to repair.
+    COALESCE(SUM(GREATEST(0, bsu.bytes_used)), 0)::bigint AS bytes_used,
     COALESCE(SUM(CASE WHEN bsu.bytes_used < 0 THEN 1 ELSE 0 END), 0)::bigint AS negative_buckets,
     COALESCE(SUM(CASE WHEN bsu.bucket_id IS NULL THEN 1 ELSE 0 END), 0)::bigint AS missing_buckets,
     COALESCE((SELECT s.backfilled_at IS NOT NULL FROM storage_usage_rollup_state s), false) AS ready

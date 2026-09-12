@@ -17,7 +17,18 @@
 SELECT
     ledger.depth::bigint AS depth,
     ledger.oldest_age_seconds::bigint AS oldest_age_seconds,
-    (SELECT count(*) FROM bucket_storage_usage WHERE bytes_used < 0)::bigint AS negative_buckets
+    -- LIVE buckets only, because only live buckets can be REPAIRED:
+    -- list_buckets_for_usage_reconcile filters `deleted_at IS NULL`. Counting soft-deleted buckets
+    -- here meant a negative counter on one alarmed at ERROR on every cycle, forever, with no path
+    -- that could ever clear it -- which is how you train an operator to ignore the one alert this
+    -- design depends on. A soft-deleted bucket's total is read by nobody (every read path joins
+    -- `deleted_at IS NULL`), so its counter being wrong has no billing consequence.
+    (
+        SELECT count(*)
+        FROM bucket_storage_usage bsu
+        JOIN buckets b ON b.bucket_id = bsu.bucket_id AND b.deleted_at IS NULL
+        WHERE bsu.bytes_used < 0
+    )::bigint AS negative_buckets
 FROM (
     SELECT count(*) AS depth,
            COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at)))::bigint, 0) AS oldest_age_seconds

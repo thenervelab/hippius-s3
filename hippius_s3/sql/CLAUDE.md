@@ -153,6 +153,12 @@ DELETE, plus `object_versions` AFTER UPDATE / AFTER DELETE. Pinned by
    then `ENABLE TRIGGER` and recompute the affected buckets with
    `SELECT recompute_bucket_storage_usage(bucket_id)`. Leaving them enabled writes one ledger row per
    changed row; disabling them without recomputing leaves the counter silently wrong.
+   ⚠️ **`DISABLE TRIGGER` takes ACCESS EXCLUSIVE, which blocks READS as well as writes** — every GET
+   and ListObjects on the estate — and prod runs `lock_timeout = 0`, so it waits and queues everything
+   behind it. Always wrap it in `BEGIN; SET LOCAL lock_timeout = '3s'; ... COMMIT;` and ask first
+   whether the job is big enough to be worth it (the triggers cost one INSERT per billable-byte
+   statement, ~1-3/s in prod). Procedure:
+   [docs/runbooks/storage-usage-rollup.md](../../docs/runbooks/storage-usage-rollup.md).
 2. **`TRUNCATE` does not fire row triggers at all.** A truncate of either table leaves every counter
    at its pre-truncate value with nothing to correct it. Recompute every bucket afterwards.
 3. **Create an objects row and its first object_versions row in the SAME statement**, as all three
