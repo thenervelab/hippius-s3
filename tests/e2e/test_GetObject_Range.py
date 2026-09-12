@@ -588,8 +588,13 @@ def test_get_object_range_concurrent_appends(
     assert r.status_code == 206
     assert r.content == base
 
-    # Wait for appends to complete
-    thread.join(timeout=1.0)
+    # Wait for appends to complete. The worker does 3 x (0.1s sleep + a CAS PUT + a HEAD) = six
+    # HTTP round trips through the whole stack, so a 1.0s budget was never enough to be reliable --
+    # and join() returning on TIMEOUT is silent, so the assertions below then ran against a
+    # half-finished worker and reported "APPEND1/APPEND2 missing" as if appends had been lost.
+    # Assert the thread actually finished rather than inferring it.
+    thread.join(timeout=30.0)
+    assert not thread.is_alive(), "the append worker did not finish; the assertions below would be meaningless"
 
     # Now request a range that covers the appended content
     whole_content = base + b"APPEND0\nAPPEND1\nAPPEND2\n"

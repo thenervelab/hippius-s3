@@ -32,7 +32,7 @@ metadata:
     mode: dryrun
 spec:
   backoffLimit: 0
-  # The estate's largest bucket alone is a ~64s aggregate and there are tens of thousands of
+  # The estate's largest bucket alone is an aggregate of tens of seconds, and there are tens of thousands of
   # buckets. Killing the Job part way through is harmless — nothing is marked backfilled until a
   # complete pass finishes, and a re-run converges rather than double-counting.
   activeDeadlineSeconds: 43200

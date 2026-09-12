@@ -76,16 +76,24 @@ async def run_cycle(pool: asyncpg.Pool, reconcile: bool) -> bool:
             compaction = await storage_rollup_service.compact_until_drained(conn, config.usage_rollup_batch_size)
             collector.record_storage_rollup_compaction(compaction.rows_claimed)
 
-            stats = await storage_rollup_service.ledger_stats(conn)
-            collector.record_storage_rollup_ledger(stats.depth, stats.oldest_age_seconds, stats.negative_buckets)
+            # On the RECONCILE cadence, not every compaction cycle. ledger_stats scans the whole
+            # ledger and -- because bytes_used carries no index -- all of bucket_storage_usage,
+            # which is ~48k rows in production. At a 5s loop that was ~17,300 full scans a day on
+            # the PRIMARY to read a number that is expected to be zero forever. Nothing acts on
+            # these inside five minutes: they drive a metric and an alert, so the reconcile interval
+            # is the right resolution. Compaction itself still runs every cycle.
+            stats = None
+            if reconcile:
+                stats = await storage_rollup_service.ledger_stats(conn)
+                collector.record_storage_rollup_ledger(stats.depth, stats.oldest_age_seconds, stats.negative_buckets)
 
-            if compaction.rows_claimed or stats.depth:
+            if compaction.rows_claimed or (stats and stats.depth):
                 logger.info(
                     f"usage-rollup compacted {compaction.rows_claimed} ledger row(s) over "
-                    f"{compaction.buckets_folded} bucket(s); depth={stats.depth} "
-                    f"lag={stats.oldest_age_seconds}s"
+                    f"{compaction.buckets_folded} bucket(s)"
+                    + (f"; depth={stats.depth} lag={stats.oldest_age_seconds}s" if stats else "")
                 )
-            if stats.negative_buckets:
+            if stats and stats.negative_buckets:
                 logger.error(
                     f"STORAGE_ROLLUP_NEGATIVE {stats.negative_buckets} bucket(s) hold a negative "
                     f"byte counter. A decrement was recorded without its increment; the reconciler "

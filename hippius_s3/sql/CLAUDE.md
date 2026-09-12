@@ -165,13 +165,31 @@ DELETE, plus `object_versions` AFTER UPDATE / AFTER DELETE. Pinned by
    outgoing and incoming version sizes under `FOR NO KEY UPDATE` while its statement already holds
    the objects row, so its order is objects → object_versions on every overwrite. The other order
    closes a cycle and Postgres breaks it by failing a customer's request (verified: 40P01).
-   `lock_object_and_get_version.sql` (`FOR UPDATE OF o`) is the pattern; the versioned-DELETE
-   transaction and `abort_cleanup_orphan_version.sql` both follow it. Guarded statically by
-   `tests/unit/test_storage_usage_lock_order.py` and demonstrated in
-   `test_taking_the_version_row_before_the_objects_row_deadlocks`. Note that rule 4's "one
-   statement" framing is NOT sufficient on its own — the same hazard exists ACROSS transactions,
-   which is what the locking read exists to close (see
-   `20260911090000_storage_usage_lock_outgoing_version.sql`).
+   ⚠️ **THE RULE APPLIES EVEN WHEN YOUR SQL NEVER NAMES `objects`.** A transaction reaches that row
+   through any `object_id` FOREIGN KEY: `INSERT INTO parts` and `INSERT INTO multipart_uploads` are
+   each serviced by an implicit `SELECT 1 FROM ONLY objects x WHERE object_id = $1 FOR KEY SHARE OF
+   x`, issued at the INSERT — so an `UPDATE object_versions` earlier in the same transaction puts
+   you in the forbidden order invisibly. That is not hypothetical: it is how the simple-PUT tail and
+   the S4 append reserve came to deadlock **46 of 192 concurrent same-key overwrites**, each a 500
+   returned after the whole body had been staged. Reading this rule and concluding "my transaction
+   doesn't touch `objects`" is exactly the mistake that shipped.
+
+   `lock_object_row_by_id.sql` is the fix for that shape — call it FIRST, as
+   `writer/object_writer.py` now does in both transactions. `lock_object_and_get_version.sql`
+   (`FOR UPDATE OF o`) is the pattern where you also need the version; the versioned-DELETE
+   transaction and `abort_cleanup_orphan_version.sql` follow it.
+
+   The current trigger bodies live in
+   `20260912090000_restore_version_lock_after_put_order_fix.sql`, not in the earlier three
+   migrations that also define them.
+
+   Guarded statically by `tests/unit/test_storage_usage_lock_order.py`, which understands
+   FK-implied locks, `SELECT ... FOR UPDATE` on `object_versions`, and SQL one level behind a helper
+   call — it was blind to all three when this bug shipped. Demonstrated in
+   `test_taking_the_version_row_before_the_objects_row_deadlocks` and
+   `test_concurrent_same_key_puts_with_the_real_statement_set_do_not_deadlock`. Note that rule 4's
+   "one statement" framing is NOT sufficient on its own — the same hazard exists ACROSS
+   transactions, which is what the locking read exists to close.
 
 Correctness is asserted, write path by write path, against `get_account_storage_bytes.sql` — the
 canonical definition — in `tests/integration/test_storage_usage_rollup.py`. The reconciler in
