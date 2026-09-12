@@ -11,6 +11,7 @@ Two things are being pinned here that nothing else pins:
 
 import json
 import logging
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -398,9 +399,7 @@ async def test_a_write_cannot_escape_the_quota_by_adding_a_query_param(
     over-quota account store unlimited data by appending it — and exempting anything with an
     uploadId would exempt the part uploads that carry the bytes. Both must stay gated.
     """
-    app, _ = build_app(
-        plan_config, monkeypatch, plan_id="pro", storage_bytes=1 * GB, used=500 * GB
-    )
+    app, _ = build_app(plan_config, monkeypatch, plan_id="pro", storage_bytes=1 * GB, used=500 * GB)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.put(path + params, content=b"x" * 5, headers={"content-length": "5"})
@@ -412,9 +411,7 @@ async def test_a_write_cannot_escape_the_quota_by_adding_a_query_param(
 async def test_completing_a_multipart_upload_is_never_refused(plan_config: Any, monkeypatch: Any) -> None:
     """The parts are already stored and already passed this gate individually. Refusing the commit
     reclaims nothing and strands them, with no path forward for the customer."""
-    app, _ = build_app(
-        plan_config, monkeypatch, plan_id="pro", storage_bytes=1 * GB, used=500 * GB
-    )
+    app, _ = build_app(plan_config, monkeypatch, plan_id="pro", storage_bytes=1 * GB, used=500 * GB)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(
@@ -446,10 +443,252 @@ async def test_object_metadata_operations_are_not_quota_gated(
 
 
 @pytest.mark.asyncio
-async def test_a_plain_object_write_is_still_gated_when_over_quota(
-    plan_config: Any, monkeypatch: Any
-) -> None:
+async def test_a_plain_object_write_is_still_gated_when_over_quota(plan_config: Any, monkeypatch: Any) -> None:
     """The counterweight to the exemptions above: none of them may leak into the ordinary write."""
     app, _ = build_app(plan_config, monkeypatch, plan_id="pro", storage_bytes=1 * GB, used=500 * GB)
 
     assert (await put(app)).status_code == 402
+
+
+# --------------------------------------------------------------------------------------------
+# WHOSE quota, and HOW MANY BYTES. Two review findings, both decided by the product owner:
+#   * a write into someone else's bucket is billed to THE BUCKET OWNER, so the owner's quota is
+#     the one that governs -- not the caller's;
+#   * a server-side copy has no request body, so its size must come from the SOURCE OBJECT.
+# --------------------------------------------------------------------------------------------
+
+
+class PerAccountPlanRedis:
+    """Serves a DIFFERENT plan per account, so a test can tell which account was evaluated.
+
+    The original PlanRedis ignores the hash field and answers with one plan for everybody, which
+    cannot distinguish "checked the caller" from "checked the owner" -- the whole point here.
+    """
+
+    def __init__(self, plans: dict[str, tuple[str, int, int]]) -> None:
+        # account -> (plan_id, storage_limit_bytes, used_bytes)
+        self._plans = plans
+        self.asked: list[str] = []
+
+    async def hget(self, key: str, field: str) -> bytes | None:
+        if key != "hippius_s3_plan_accounts":
+            return None
+        self.asked.append(field)
+        entry = self._plans.get(field)
+        if entry is None:
+            return None
+        plan_id, limit, used = entry
+        return json.dumps({"plan": plan_id, "storage_limit_bytes": limit, "used_bytes": used}).encode()
+
+    async def get(self, key: str) -> bytes | None:
+        return None
+
+    async def set(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+class StubACLService:
+    """`acl_service.get_bucket_owner_and_id` is already Redis-cached per bucket name in production,
+    which is what makes resolving the owner on this path affordable."""
+
+    def __init__(self, owner_by_bucket: dict[str, str]) -> None:
+        self._owners = owner_by_bucket
+        self.asked: list[str] = []
+
+    async def get_bucket_owner_and_id(self, bucket: str) -> Any:
+        self.asked.append(bucket)
+        owner = self._owners.get(bucket)
+        if owner is None:
+            return None
+        return SimpleNamespace(owner_id=owner, bucket_id="00000000-0000-0000-0000-000000000000", is_cache_warm=False)
+
+
+class StubPool:
+    """Enough asyncpg surface for the copy-source size lookup."""
+
+    def __init__(self, size: int | None) -> None:
+        self._size = size
+        self.queries: list[str] = []
+
+    def acquire(self) -> Any:
+        pool = self
+
+        class _Ctx:
+            async def __aenter__(self) -> Any:
+                return pool
+
+            async def __aexit__(self, *exc: object) -> bool:
+                return False
+
+        return _Ctx()
+
+    async def fetchval(self, query: str, *args: object) -> int | None:
+        self.queries.append(query)
+        return self._size
+
+
+def build_owner_app(
+    config: Any,
+    monkeypatch: Any,
+    *,
+    plans: dict[str, tuple[str, int, int]],
+    owner_by_bucket: dict[str, str],
+    copy_source_size: int | None = None,
+) -> tuple[FastAPI, PerAccountPlanRedis, StubACLService]:
+    from hippius_s3.gateway.middlewares import account as account_module
+    from hippius_s3.gateway.middlewares.account import account_middleware
+
+    monkeypatch.setattr("hippius_s3.gateway.middlewares.account.config", config)
+
+    async def fake_fetch(address: str, redis_client: Any, substrate_url: str) -> HippiusAccount:
+        return HippiusAccount(id=address, main_account=address, has_credits=True, upload=True, delete=True)
+
+    monkeypatch.setattr(account_module, "fetch_account_by_main_address", fake_fetch)
+
+    redis = PerAccountPlanRedis(plans)
+    acl = StubACLService(owner_by_bucket)
+
+    app = FastAPI()
+    app.state.redis_accounts_client = redis
+    app.state.arion_client = MockArionService(allow_upload=True)
+    app.state.acl_service = acl
+    app.state.postgres_pool = StubPool(copy_source_size)
+
+    @app.api_route("/{bucket}/{key:path}", methods=["GET", "PUT", "POST", "DELETE", "HEAD"])
+    async def endpoint(request: Request) -> dict[str, Any]:
+        return {"ok": True}
+
+    async def inject(request: Request, call_next: Any) -> Any:
+        request.state.auth_method = "access_key"
+        request.state.account_address = CALLER
+        return await call_next(request)
+
+    app.middleware("http")(account_middleware)
+    app.middleware("http")(inject)
+    return app, redis, acl
+
+
+CALLER = "5CallerAccountAddressForPlanGateTests000000000000000"
+OWNER = "5OwnerAccountAddressForPlanGateTests00000000000000000"
+
+
+@pytest.mark.asyncio
+async def test_a_write_into_someone_elses_bucket_is_gated_on_the_owners_quota(
+    plan_config: Any, monkeypatch: Any
+) -> None:
+    """The bytes land on the owner's counter, so the owner's limit is the one that must govern.
+
+    Keying on the CALLER let a third party with a WRITE grant push the owner past their plan
+    without limit, because the owner's quota was never consulted.
+    """
+    app, redis, acl = build_owner_app(
+        plan_config,
+        monkeypatch,
+        plans={
+            CALLER: ("pro", 100 * GB, 0),  # caller has room to spare
+            OWNER: ("pro", 10 * GB, 10 * GB),  # owner is full
+        },
+        owner_by_bucket={"owned-elsewhere": OWNER},
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.put("/owned-elsewhere/k", content=b"x" * 5, headers={"content-length": "5"})
+
+    assert r.status_code == 402, (
+        f"got {r.status_code}: the write was admitted because the CALLER has headroom. The bytes go "
+        f"on the owner's counter, so the owner's quota must be the one evaluated."
+    )
+    assert OWNER in redis.asked, f"the owner's plan was never looked up; asked for {redis.asked}"
+    assert acl.asked == ["owned-elsewhere"], "the bucket owner was not resolved"
+
+
+@pytest.mark.asyncio
+async def test_a_caller_over_their_own_quota_can_still_write_to_a_bucket_with_room(
+    plan_config: Any, monkeypatch: Any
+) -> None:
+    """The mirror case, and the reason this is a correctness fix rather than a tightening.
+
+    A delegate at their own limit was being refused a write that consumes none of their quota.
+    """
+    app, _redis, _acl = build_owner_app(
+        plan_config,
+        monkeypatch,
+        plans={
+            CALLER: ("pro", 10 * GB, 10 * GB),  # caller is full
+            OWNER: ("pro", 100 * GB, 0),  # owner has room
+        },
+        owner_by_bucket={"owned-elsewhere": OWNER},
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.put("/owned-elsewhere/k", content=b"x" * 5, headers={"content-length": "5"})
+
+    assert r.status_code == 200, f"got {r.status_code}: the caller's own full quota wrongly blocked this"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_bucket_falls_back_to_the_caller(plan_config: Any, monkeypatch: Any) -> None:
+    """CreateBucket, and any bucket that does not exist yet, have no owner to key on.
+
+    The caller is about to become the owner, so the caller's quota is the right one -- and a
+    request for a bucket that genuinely does not exist will 404 downstream anyway.
+    """
+    app, redis, _acl = build_owner_app(
+        plan_config,
+        monkeypatch,
+        plans={CALLER: ("pro", 10 * GB, 10 * GB)},
+        owner_by_bucket={},
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.put("/brand-new-bucket/k", content=b"x" * 5, headers={"content-length": "5"})
+
+    assert r.status_code == 402, "with no owner to resolve, the caller's quota must still be enforced"
+    assert CALLER in redis.asked
+
+
+@pytest.mark.asyncio
+async def test_a_server_side_copy_is_gated_on_the_source_objects_size(plan_config: Any, monkeypatch: Any) -> None:
+    """CopyObject has NO request body, so Content-Length is 0 and the quota check was free.
+
+    A copy can materialise terabytes. The size is knowable up front -- it is the source object's
+    current version -- so resolve it instead of trusting a header that cannot carry it.
+    """
+    app, _redis, _acl = build_owner_app(
+        plan_config,
+        monkeypatch,
+        plans={CALLER: ("pro", 10 * GB, 9 * GB)},  # 1 GB of headroom
+        owner_by_bucket={"mine": CALLER},
+        copy_source_size=5 * GB,  # the copy would need 5
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.put(
+            "/mine/dest",
+            headers={"content-length": "0", "x-amz-copy-source": "/mine/source-object"},
+        )
+
+    assert r.status_code == 402, (
+        f"got {r.status_code}: a 5 GB copy was admitted against 1 GB of headroom because the "
+        f"request body is empty. Resolve the source object's size."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_copy_that_fits_is_allowed(plan_config: Any, monkeypatch: Any) -> None:
+    """The fix must not refuse copies that genuinely fit, or it is just a different bug."""
+    app, _redis, _acl = build_owner_app(
+        plan_config,
+        monkeypatch,
+        plans={CALLER: ("pro", 10 * GB, 1 * GB)},
+        owner_by_bucket={"mine": CALLER},
+        copy_source_size=2 * GB,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.put(
+            "/mine/dest",
+            headers={"content-length": "0", "x-amz-copy-source": "/mine/source-object"},
+        )
+
+    assert r.status_code == 200, f"got {r.status_code}: a copy that fits inside the quota was refused"

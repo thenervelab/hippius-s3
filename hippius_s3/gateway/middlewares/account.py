@@ -10,6 +10,7 @@ from fastapi import Response
 from starlette import status
 
 from hippius_s3.config import get_config
+from hippius_s3.gateway.middlewares.acl import parse_copy_source
 from hippius_s3.gateway.middlewares.acl import parse_s3_path
 from hippius_s3.gateway.services import plan_gate
 from hippius_s3.gateway.services.account_service import fetch_account_by_main_address
@@ -27,6 +28,7 @@ from hippius_s3.services.arion_service import CanUploadResponse
 from hippius_s3.services.plans_cache import PlanQuota
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.service_accounts import is_service_account
+from hippius_s3.utils import get_query
 
 
 config = get_config()
@@ -235,6 +237,77 @@ def _log_plan_shadow(
     )
 
 
+async def _billed_account(
+    request: Request,
+    caller: str,
+    logger: logging.Logger | logging.LoggerAdapter,
+) -> str:
+    """The account whose quota governs this write: THE BUCKET OWNER, falling back to the caller.
+
+    The counter is per BUCKET and an account total sums the buckets it owns, so a write into
+    someone else's bucket lands on the OWNER's number -- that is the billing model. Keying the gate
+    on the caller therefore checked the wrong account in both directions: a third party holding a
+    cross-account WRITE grant could push the owner past their plan without the owner's quota ever
+    being consulted, and a delegate at their own limit was refused a write that consumed none of it.
+
+    `get_bucket_owner_and_id` is the same lookup acl_middleware uses one layer down and is already
+    Redis-cached per bucket name (TTL 600s on redis-acl), so this costs a cache hit rather than a
+    query on the request path.
+
+    Falls back to the caller when there is no bucket in play or the bucket does not exist yet --
+    CreateBucket, where the caller is about to BECOME the owner -- and when the lookup itself fails,
+    because refusing a write over an ACL-cache hiccup would be a worse failure than billing the
+    caller for one cycle.
+    """
+    bucket = first_path_segment(request)
+    if not bucket:
+        return caller
+
+    acl_service = getattr(request.app.state, "acl_service", None)
+    if acl_service is None:
+        return caller
+
+    try:
+        lookup = await acl_service.get_bucket_owner_and_id(bucket)
+    except Exception as e:
+        logger.warning(f"PLAN_OWNER lookup failed for bucket={bucket}: {e}; billing the caller instead")
+        return caller
+
+    owner = getattr(lookup, "owner_id", None) if lookup is not None else None
+    return owner or caller
+
+
+async def _incoming_bytes(request: Request) -> int:
+    """Bytes this request will add, resolving a server-side copy from its SOURCE object.
+
+    CopyObject and UploadPartCopy carry no request body, so `_declared_content_length` reads 0 and
+    the quota check was free -- a multi-terabyte copy passed a gate with a gigabyte of headroom.
+    Unlike a streaming PUT, a copy's size IS knowable before the work starts, so there is no excuse
+    for guessing: it is the source object's current version.
+
+    A source we cannot resolve returns the declared length rather than refusing. The handler is
+    about to 404 that copy anyway, and inventing a size here would refuse it with a quota error
+    instead of the truth.
+    """
+    declared = _declared_content_length(request)
+    copy_source = request.headers.get("x-amz-copy-source")
+    if not copy_source:
+        return declared
+
+    src_bucket, src_key = parse_copy_source(copy_source)
+    if not src_bucket or not src_key:
+        return declared
+
+    pool = getattr(request.app.state, "postgres_pool", None)
+    if pool is None:
+        return declared
+
+    async with pool.acquire() as conn:
+        size = await conn.fetchval(get_query("get_current_version_size_by_path"), src_bucket, src_key)
+
+    return int(size) if size is not None else declared
+
+
 async def _check_plan_quota(
     request: Request,
     logger: logging.Logger | logging.LoggerAdapter,
@@ -247,6 +320,11 @@ async def _check_plan_quota(
     could not be consulted, or because HIPPIUS_ENABLE_BILLING_PLANS is off.
     """
     redis_accounts = request.app.state.redis_accounts_client
+
+    # WHOSE quota. The bucket owner's, not the caller's -- the bytes land on the owner's counter.
+    # See _billed_account. For the overwhelmingly common case (writing to your own bucket) these are
+    # the same string and this is a cache hit.
+    account_address = await _billed_account(request, account_address, logger)
 
     # The plan lookup consults our own state (one redis-accounts HGET; there is no database work on
     # this path). Failing to reach a verdict is not worth failing a customer's upload over, so it
@@ -268,7 +346,7 @@ async def _check_plan_quota(
             get_metrics_collector().record_plan_gate(outcome="allow")
             return True, None
 
-        decision = plan_gate.evaluate_quota(quota, _declared_content_length(request))
+        decision = plan_gate.evaluate_quota(quota, await _incoming_bytes(request))
     except plan_gate.PlanLookupUnavailable as e:
         logger.warning(f"PLAN_LOOKUP unavailable account={account_address}: {e}; falling back to pay-as-you-go")
         get_metrics_collector().record_plan_gate(outcome="unavailable")
