@@ -8,7 +8,9 @@ from unittest.mock import MagicMock
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 from starlette.datastructures import Headers
+from starlette.responses import Response
 
+from hippius_s3.api.s3.extensions import append as append_module
 from hippius_s3.api.s3.objects import put_object_endpoint
 from hippius_s3.api.s3.objects.put_object_endpoint import handle_put_object
 from hippius_s3.writer.types import PreconditionFailed
@@ -379,18 +381,23 @@ async def test_etag_valued_if_none_match_is_not_implemented_rather_than_ignored(
 
 
 @pytest.mark.asyncio
-async def test_create_only_append_to_an_existing_key_is_refused(monkeypatch: Any) -> None:
+async def test_create_only_append_is_judged_inside_append_not_by_a_loose_read(monkeypatch: Any) -> None:
+    # The endpoint must NOT pre-check on its own connection: a key created between such a read and
+    # the append would be modified under a create-only header. append_stream decides under the same
+    # row lock as the version CAS instead, so all the endpoint does is carry the flag down.
+    seen_queries: list[str] = []
+
     def router(method: str, query: str, args: tuple) -> Any:
+        seen_queries.append(query or "")
         if "Get bucket by name" in (query or ""):
             return {"bucket_id": str(uuid.uuid4()), "bucket_name": "bkt", "main_account_id": "acct-main"}
-        if "exists_live" in (query or ""):
-            return {"exists_live": True, "baseline": 4}
         return None
 
     append_calls: list[Any] = []
 
     async def fake_append(*a: Any, **kw: Any) -> Any:
         append_calls.append(kw)
+        return Response(status_code=200)
 
     monkeypatch.setattr(put_object_endpoint, "handle_append", fake_append)
     resp = await handle_put_object(
@@ -400,8 +407,9 @@ async def test_create_only_append_to_an_existing_key_is_refused(monkeypatch: Any
         pool=make_fake_pool(router),
         redis_client=_FakeRedis(nx_result=None),
     )
-    assert resp.status_code == 412
-    assert append_calls == []
+    assert resp.status_code == 200
+    assert append_calls[0]["if_none_match"] is True
+    assert not any("exists_live" in q for q in seen_queries), "no unlocked pre-check may run"
 
 
 class _BodyStream:
@@ -446,16 +454,33 @@ async def test_reserve_time_refusal_drains_the_body_before_answering(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_create_only_append_refusal_drains_the_body_before_answering(monkeypatch: Any) -> None:
-    def router(method: str, query: str, args: tuple) -> Any:
-        if "Get bucket by name" in (query or ""):
-            return {"bucket_id": str(uuid.uuid4()), "bucket_name": "bkt", "main_account_id": "acct-main"}
-        if "exists_live" in (query or ""):
-            return {"exists_live": True, "baseline": 1}
-        return None
+async def test_create_only_append_on_an_existing_key_is_412_with_the_body_drained(monkeypatch: Any) -> None:
+    # handle_append's own `finally: _drain(body_iter)` covers the refusal, so the connection stays
+    # reusable even though the writer rejected the append before consuming the delta.
+    read: list[bytes] = []
 
-    req = _fake_request({"If-None-Match": "*", "x-amz-meta-append": "true"})
-    req.stream = body = _BodyStream(b"delta")
-    resp = await handle_put_object("bkt", "k", req, make_fake_pool(router), _FakeRedis(nx_result=None))
+    async def body_iter() -> Any:
+        for chunk in (b"delta-1", b"delta-2"):
+            read.append(chunk)
+            yield chunk
+
+    async def refuse(self: Any, **kw: Any) -> Any:
+        assert kw["if_none_match"] is True
+        raise PreconditionFailed()
+
+    monkeypatch.setattr(append_module.ObjectWriter, "append_stream", refuse)
+    req = _fake_request({"If-None-Match": "*", "x-amz-meta-append": "true", "x-amz-meta-append-if-version": "3"})
+    resp = await append_module.handle_append(
+        req,
+        make_fake_pool(lambda *a: None),
+        _FakeRedis(nx_result=None),
+        bucket={"bucket_id": str(uuid.uuid4())},
+        bucket_id=str(uuid.uuid4()),
+        bucket_name="bkt",
+        object_key="audit.log",
+        body_iter=body_iter(),
+        if_none_match=True,
+    )
     assert resp.status_code == 412
-    assert body.read == [b"delta"]
+    assert b"<Code>PreconditionFailed</Code>" in resp.body
+    assert read == [b"delta-1", b"delta-2"]

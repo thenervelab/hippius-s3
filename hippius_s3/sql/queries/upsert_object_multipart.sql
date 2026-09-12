@@ -1,4 +1,26 @@
-WITH dropped AS (
+WITH prev AS (
+  -- Did this key already serve an object BEFORE this initiate? Read in the same statement as the
+  -- upsert below, so it sees the pre-update row: DO UPDATE clears deleted_at, after which a key that
+  -- was soft-deleted is indistinguishable from one that was live. CompleteMultipartUpload's
+  -- If-None-Match: * needs that distinction and cannot recover it later, so it is captured here and
+  -- carried on multipart_uploads.key_existed_at_initiate. Same "serveable" predicate as
+  -- conditional_write_state: a version is invisible until its finalizing UPDATE writes size/md5.
+  SELECT COALESCE((
+    SELECT NOT v.is_delete_marker
+    FROM objects o
+    CROSS JOIN LATERAL (
+      SELECT v.is_delete_marker
+      FROM object_versions v
+      WHERE v.object_id = o.object_id
+        AND v.object_version <= o.current_object_version
+        AND v.deleted_at IS NULL
+        AND (v.is_delete_marker OR v.size_bytes > 0 OR (v.md5_hash IS NOT NULL AND v.md5_hash != ''))
+      ORDER BY v.object_version DESC
+      LIMIT 1
+    ) v
+    WHERE o.object_id = resolve_object_id($2::uuid, $3)
+  ), FALSE) AS existed_live
+), dropped AS (
   DELETE FROM object_names
   WHERE bucket_id = $2 AND object_key = $3
   RETURNING object_id
@@ -79,6 +101,8 @@ SELECT
   u.created_at,
   iv.status,
   iv.multipart,
-  iv.storage_version
+  iv.storage_version,
+  p.existed_live
 FROM upserted u
 JOIN ins_version iv ON iv.object_id = u.object_id AND iv.object_version = u.current_object_version
+CROSS JOIN prev p

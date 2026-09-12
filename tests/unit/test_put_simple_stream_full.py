@@ -396,7 +396,7 @@ class _CompletePool:
         return self._ctx(self._conn)
 
 
-async def _complete(pool: _CompletePool, if_none_match: bool) -> Any:
+async def _complete(pool: _CompletePool, if_none_match: bool, key_existed_at_initiate: bool = False) -> Any:
     # A stand-in store, not None: None makes ObjectWriter build the configured on-disk cache
     # (/var/lib/hippius by default), which CI runners cannot create. mpu_complete never touches it.
     writer = ObjectWriter(pool=pool, redis_client=DummyRedis(), fs_store=SimpleNamespace())
@@ -409,6 +409,7 @@ async def _complete(pool: _CompletePool, if_none_match: bool) -> Any:
         address="acct",
         db_parts=[{"part_number": 1, "etag": "0" * 32, "size_bytes": 5}],
         if_none_match=if_none_match,
+        key_existed_at_initiate=key_existed_at_initiate,
     )
 
 
@@ -428,6 +429,23 @@ async def test_create_only_complete_of_a_new_key_completes() -> None:
     res = await _complete(pool, if_none_match=True)
     assert res.size_bytes == 5
     assert any("is_completed = TRUE" in q for _, q in pool.calls)
+
+
+@pytest.mark.asyncio
+async def test_create_only_complete_refuses_a_key_that_existed_at_initiate() -> None:
+    # No version ABOVE ours ever appeared, so the SQL re-check is clean — the key existed before the
+    # upload started and initiate cleared its soft delete, which only the recorded flag still knows.
+    pool = _CompletePool(conflict=False)
+    with pytest.raises(PreconditionFailed):
+        await _complete(pool, if_none_match=True, key_existed_at_initiate=True)
+    assert not any("is_completed = TRUE" in q for _, q in pool.calls), "the upload must stay open"
+
+
+@pytest.mark.asyncio
+async def test_key_existed_at_initiate_is_ignored_without_the_header() -> None:
+    pool = _CompletePool(conflict=False)
+    res = await _complete(pool, if_none_match=False, key_existed_at_initiate=True)
+    assert res.size_bytes == 5
 
 
 @pytest.mark.asyncio

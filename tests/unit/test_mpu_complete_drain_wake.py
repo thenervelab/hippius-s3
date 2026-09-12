@@ -55,6 +55,7 @@ class _FakeDb:
                 "object_key": "k",
                 "is_completed": False,
                 "current_object_version": _POINTER_VERSION,
+                "key_existed_at_initiate": False,
             }
         if query == "get_bucket_by_name":
             return {"bucket_id": "bkt-1"}

@@ -958,6 +958,7 @@ class ObjectWriter:
         selected_parts: list[int] | None = None,
         db_parts: list[Any] | None = None,
         if_none_match: bool = False,
+        key_existed_at_initiate: bool = False,
     ) -> CompleteResult:
         # B1: S3 allows completing with a SUBSET of the uploaded parts. `selected_parts` is the
         # client's <Part> list (already validated exists+ETag-matches by the endpoint); the final
@@ -1024,8 +1025,14 @@ class ObjectWriter:
                 # objects row first (lock order objects -> object_versions), exclusively, so a
                 # concurrent PUT tail or completion is either fully visible to the check or not begun.
                 # Raising rolls back: the upload stays open (is_completed FALSE) and can be aborted.
+                #
+                # Two judgements, like the PutObject path: the key's existence when this upload was
+                # initiated (recorded then, because initiate clears a soft delete and destroys the
+                # evidence), OR a version that appeared above ours while the upload was open.
                 await conn.execute(get_query("lock_object_row_for_update"), object_id)
-                if await conn.fetchval(get_query("mpu_conditional_conflict"), object_id, int(object_version)):
+                if key_existed_at_initiate or await conn.fetchval(
+                    get_query("mpu_conditional_conflict"), object_id, int(object_version)
+                ):
                     raise PreconditionFailed()
             # Update object_versions (record the completed subset so the reader filters to it).
             await conn.execute(
@@ -1062,6 +1069,7 @@ class ObjectWriter:
         expected_version: int,
         account_address: str,
         body_iter: AsyncIterator[bytes],
+        if_none_match: bool = False,
     ) -> dict:
         """Append bytes with CAS, cache write-through, and enqueue (streaming)."""
         row = await self.pool.fetchrow(
@@ -1110,6 +1118,11 @@ class ObjectWriter:
             )
             if not locked:
                 raise ObjectNotFound("NoSuchKey")
+            if if_none_match:
+                # Create-only, judged under the same lock the CAS uses rather than by a read before
+                # the call: reaching here means the key exists and is live (an absent or tombstoned
+                # one raised ObjectNotFound above), which is exactly what If-None-Match: * forbids.
+                raise PreconditionFailed()
             current_version = int(locked["append_version"])
             if expected_version != current_version:
                 raise AppendPreconditionFailed(current_version)

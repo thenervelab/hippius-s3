@@ -24,10 +24,15 @@ BODY = (
 )
 
 
-def _db() -> Any:
+def _db(key_existed_at_initiate: bool = False) -> Any:
     object_id = str(uuid.uuid4())
     rows = {
-        get_query("get_multipart_upload"): {"object_id": object_id, "is_completed": False, "current_object_version": 1},
+        get_query("get_multipart_upload"): {
+            "object_id": object_id,
+            "is_completed": False,
+            "current_object_version": 1,
+            "key_existed_at_initiate": key_existed_at_initiate,
+        },
         get_query("get_bucket_by_name"): {"bucket_id": str(uuid.uuid4())},
         get_query("get_multipart_version_by_upload"): {"object_version": 1},
     }
@@ -74,6 +79,27 @@ async def test_star_is_passed_to_the_writer(monkeypatch: Any) -> None:
     resp = await multipart.complete_multipart_upload("bkt", "big.bin", "up-1", _request({"If-None-Match": "*"}), _db())
     assert resp.status_code == 200
     assert captured["if_none_match"] is True
+
+
+@pytest.mark.asyncio
+async def test_key_existed_at_initiate_is_carried_to_the_writer(monkeypatch: Any) -> None:
+    # The completion cannot re-derive it: initiate already cleared any soft delete on the key.
+    captured: dict[str, Any] = {}
+    _patch(monkeypatch, captured)
+    resp = await multipart.complete_multipart_upload(
+        "bkt", "big.bin", "up-1", _request({"If-None-Match": "*"}), _db(key_existed_at_initiate=True)
+    )
+    assert resp.status_code == 200  # the fake writer does not judge; the flag reaching it is the point
+    assert captured["key_existed_at_initiate"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_key_absent_at_initiate_is_not_reported_as_existing(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    _patch(monkeypatch, captured)
+    resp = await multipart.complete_multipart_upload("bkt", "big.bin", "up-1", _request({"If-None-Match": "*"}), _db())
+    assert resp.status_code == 200
+    assert captured["key_existed_at_initiate"] is False
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import datetime
+from datetime import timezone
 from typing import AsyncGenerator
 
 import asyncpg
@@ -174,20 +176,79 @@ async def test_finalize_conflict_ignores_our_own_version(db: tuple[asyncpg.Conne
 
 
 @pytest.mark.parametrize(
-    ("versions", "expected"),
+    ("versions", "ours", "expected"),
     [
-        ([LIVE, PLACEHOLDER], True),  # key already served v1
-        ([LIVE, MARKER, PLACEHOLDER], False),  # newest other version is a delete marker
-        ([PLACEHOLDER], False),  # only our own version
+        # Only versions ABOVE ours are judged here. What the key held when the upload was initiated
+        # is decided at initiate (multipart_uploads.key_existed_at_initiate), because by completion
+        # time the initiate has already cleared any soft delete on the objects row.
+        ([PLACEHOLDER, LIVE], 1, True),  # someone created the key while our upload was open
+        ([PLACEHOLDER, LIVE, MARKER], 1, False),  # ...and deleted it again: newest above is a marker
+        ([PLACEHOLDER, PLACEHOLDER], 1, False),  # the other writer is still in flight
+        ([LIVE, PLACEHOLDER], 2, False),  # v1 predates our upload: judged at initiate, not here
+        ([LIVE, MARKER, PLACEHOLDER], 3, False),  # nothing above ours at all
+        ([PLACEHOLDER], 1, False),  # only our own version
     ],
 )
 async def test_multipart_completion_conflict(
-    db: tuple[asyncpg.Connection, uuid.UUID], versions: list[str], expected: bool
+    db: tuple[asyncpg.Connection, uuid.UUID], versions: list[str], ours: int, expected: bool
 ) -> None:
     conn, bucket_id = db
     object_id = await _object(conn, bucket_id, "k", versions)
-    ours = len(versions)
     assert await conn.fetchval(get_query("mpu_conditional_conflict"), object_id, ours) is expected
+
+
+# --- what the multipart reserve records about the key it is about to un-delete --------------------
+
+
+async def _initiate(conn: asyncpg.Connection, bucket_id: uuid.UUID, key: str) -> bool:
+    """upsert_object_multipart, as InitiateMultipartUpload runs it; returns its existed_live verdict."""
+    row = await conn.fetchrow(
+        get_query("upsert_object_multipart"),
+        uuid.uuid4(),
+        bucket_id,
+        key,
+        "application/octet-stream",
+        "{}",
+        "",
+        0,
+        datetime.now(timezone.utc),
+        5,
+        ["arion"],
+    )
+    assert row is not None
+    return bool(row["existed_live"])
+
+
+@pytest.mark.parametrize(
+    ("versions", "soft_deleted", "expected"),
+    [
+        ([LIVE], False, True),  # a live key: a create-only completion must be refused
+        ([LIVE], True, False),  # soft-deleted: the key does not exist, however live the row looks after
+        ([MARKER], False, False),  # newest version is a delete marker
+        ([PLACEHOLDER], False, False),  # nothing serveable yet
+    ],
+)
+async def test_multipart_reserve_records_existence_before_it_clears_the_soft_delete(
+    db: tuple[asyncpg.Connection, uuid.UUID], versions: list[str], soft_deleted: bool, expected: bool
+) -> None:
+    conn, bucket_id = db
+    await _object(conn, bucket_id, "k", versions, soft_deleted=soft_deleted)
+
+    assert await _initiate(conn, bucket_id, "k") is expected
+
+    # The same read AFTER the upsert can no longer tell: the initiate has cleared deleted_at, which is
+    # exactly why the verdict is captured in the statement that clears it.
+    state = await conn.fetchrow(get_query("conditional_write_state"), bucket_id, "k")
+    assert state is not None
+    if soft_deleted:
+        assert state["exists_live"] is True, "post-initiate the key looks live — the recorded flag is the only truth"
+
+
+async def test_multipart_reserve_on_a_brand_new_key_reports_absent(
+    db: tuple[asyncpg.Connection, uuid.UUID],
+) -> None:
+    conn, bucket_id = db
+    assert await _initiate(conn, bucket_id, "never-seen") is False
 
 
 # --- the race, replayed step by step with the real reserve query ---------------------------------

@@ -85,8 +85,7 @@ async def handle_put_object(
         try:
             if_none_match = parse_write_if_none_match(request.headers.get("if-none-match"))
         except UnsupportedConditionalWrite:
-            await utils.drain_request_body(request)
-            return errors.conditional_write_not_implemented_response()
+            return await utils.respond_before_body(request, errors.conditional_write_not_implemented_response())
 
         # Detect S4 append semantics via metadata (header-only, no DB).
         meta_append = request.headers.get("x-amz-meta-append", "").lower() == "true"
@@ -137,14 +136,9 @@ async def handle_put_object(
             # Append is handled here, where `bucket` is known non-None (meta_append forces
             # needs_bucket_row, so the row was fetched above) and handle_append requires the full row.
             if meta_append:
-                if if_none_match:
-                    # An append only ever modifies an existing object, which is exactly what a
-                    # create-only write forbids. If the key is absent, append answers NoSuchKey.
-                    async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
-                        state = await conn.fetchrow(get_query("conditional_write_state"), bucket_id, object_key)
-                    if state is not None and state["exists_live"]:
-                        await utils.drain_request_body(request)
-                        return errors.precondition_failed_response()
+                # if_none_match is judged inside append's own locked CAS transaction, not by a read
+                # here: a key created between an unlocked pre-check and the append would be modified
+                # under a create-only header — the very violation this is meant to stop.
                 return await handle_append(
                     request,
                     pool,
@@ -154,6 +148,7 @@ async def handle_put_object(
                     bucket_name=bucket_name,
                     object_key=object_key,
                     body_iter=utils.iter_request_body(request),
+                    if_none_match=if_none_match,
                 )
         else:
             bucket_id = forwarded_bucket_id
@@ -317,8 +312,7 @@ async def handle_put_object(
         # serveable). Either way the key still serves what it held before this request.
         logger.info("PutObject %s/%s: If-None-Match: * and the key exists", bucket_name, object_key)
         # Refused at reserve, the body is still unread; at finalize it is already consumed (no-op).
-        await utils.drain_request_body(request)
-        return errors.precondition_failed_response()
+        return await utils.respond_before_body(request, errors.precondition_failed_response())
 
     except ClientDisconnect:
         # iter_request_body drives request.stream(), which raises when the peer goes away mid-body

@@ -138,6 +138,42 @@ async def test_unconditional_put_still_overwrites(env: dict[str, Any]) -> None:
     assert await _served_md5(env, "k") == hashlib.md5(b"two").hexdigest()
 
 
+async def test_create_only_racing_an_unconditional_finalize(env: dict[str, Any]) -> None:
+    """The race the lock escalation actually exists for: the conditional tail takes the objects row
+    FOR UPDATE while an ordinary tail takes KEY SHARE on it, and the two must not deadlock.
+
+    Both reserve before either streams, so the conditional writer is not refused at reserve and the
+    two tails contend. The unconditional write always lands — nothing may refuse it. The conditional
+    one may land or be refused, but ONLY with PreconditionFailed: a 40P01 deadlock (or anything else)
+    here is the regression this asserts against.
+    """
+    for attempt in range(6):
+        key = f"mixed-{attempt}"
+        gate = asyncio.Event()
+        cond = asyncio.create_task(_put(env, key, b"conditional", create_only=True, gate=gate))
+        plain = asyncio.create_task(_put(env, key, b"plain", create_only=False, gate=gate))
+
+        for _ in range(200):
+            reserved = await env["pool"].fetchval(
+                "SELECT count(*) FROM object_versions v JOIN objects o ON o.object_id = v.object_id "
+                "WHERE o.bucket_id = $1 AND o.object_key = $2",
+                uuid.UUID(env["bucket_id"]),
+                key,
+            )
+            if reserved == 2:
+                break
+            await asyncio.sleep(0.05)
+        gate.set()
+
+        cond_res, plain_res = await asyncio.gather(cond, plain, return_exceptions=True)
+
+        assert not isinstance(plain_res, BaseException), f"the unconditional write must land: {plain_res!r}"
+        assert not isinstance(cond_res, BaseException) or isinstance(cond_res, PreconditionFailed), (
+            f"the conditional write may only fail with PreconditionFailed, got {cond_res!r}"
+        )
+        assert await _served_md5(env, key) is not None
+
+
 async def test_concurrent_create_only_writers_have_exactly_one_winner(env: dict[str, Any]) -> None:
     """All eight reserve before any of them streams (the gate), so none is refused at reserve and
     the outcome rests entirely on the finalize-time re-check under the exclusive row lock."""

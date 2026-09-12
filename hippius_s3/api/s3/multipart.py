@@ -507,6 +507,9 @@ async def initiate_multipart_upload(
             json.dumps(metadata),
             datetime.fromtimestamp(file_mtime, timezone.utc) if file_mtime is not None else None,
             uuid.UUID(object_id),
+            # Captured by the reserve above, BEFORE its upsert cleared any soft delete on the key.
+            # CompleteMultipartUpload's If-None-Match: * cannot re-derive it later.
+            bool(upsert_result["existed_live"]),
         )
 
         root = create_element("InitiateMultipartUploadResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
@@ -1197,8 +1200,7 @@ async def complete_multipart_upload(
     try:
         if_none_match = parse_write_if_none_match(request.headers.get("if-none-match"))
     except UnsupportedConditionalWrite:
-        await utils.drain_request_body(request)
-        return errors.conditional_write_not_implemented_response()
+        return await utils.respond_before_body(request, errors.conditional_write_not_implemented_response())
     try:
         # Validate the multipart upload exists
         multipart_upload = await db.fetchrow(get_query("get_multipart_upload"), upload_id)
@@ -1366,6 +1368,7 @@ async def complete_multipart_upload(
                 # doesn't re-read the parts table for the combined ETag and total size.
                 db_parts=db_parts,
                 if_none_match=if_none_match,
+                key_existed_at_initiate=bool(multipart_upload["key_existed_at_initiate"]),
             )
         except PreconditionFailed:
             # Nothing was committed: the upload stays open and can be aborted, as on S3.
