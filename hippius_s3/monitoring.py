@@ -605,7 +605,11 @@ class MetricsCollector:
         )
         # Age of the cached maps. The caches deliberately have no TTL so an upstream outage cannot
         # delete them, which means staleness is invisible unless it is measured here.
-        self.plans_cache_age_seconds = self.meter.create_histogram(
+        # A GAUGE, not a histogram: this is a point-in-time reading sampled once per cycle and the
+        # alert on it needs the CURRENT value. A histogram exports only _bucket/_count/_sum, so a
+        # rule would have to use _sum/_count -- the MEAN over a window, which averages away the
+        # very spike being alerted on. Same reasoning for the three rollup gauges below.
+        self.plans_cache_age_seconds = self.meter.create_gauge(
             name="plans_cache_age_seconds", description="Age of the cached plan maps", unit="s"
         )
 
@@ -633,14 +637,14 @@ class MetricsCollector:
         )
         # Compactor lag. Both should sit near zero; a rising pair means the counter has frozen while
         # still being served, which is a wrong bill rather than an outage and so has no other signal.
-        self.storage_rollup_ledger_depth = self.meter.create_histogram(
+        self.storage_rollup_ledger_depth = self.meter.create_gauge(
             name="storage_rollup_ledger_depth", description="Unfolded rows in storage_delta_ledger", unit="1"
         )
-        self.storage_rollup_ledger_lag_seconds = self.meter.create_histogram(
+        self.storage_rollup_ledger_lag_seconds = self.meter.create_gauge(
             name="storage_rollup_ledger_lag_seconds", description="Age of the oldest unfolded ledger row", unit="s"
         )
         # A counter below zero is only reachable if a decrement was recorded without its increment.
-        self.storage_rollup_negative_buckets = self.meter.create_histogram(
+        self.storage_rollup_negative_buckets = self.meter.create_gauge(
             name="storage_rollup_negative_buckets",
             description="Buckets whose maintained byte counter has gone negative",
             unit="1",
@@ -1072,7 +1076,7 @@ class MetricsCollector:
             self.plans_cacher_entries_total.add(entries)
 
     def record_plans_cache_age(self, age_seconds: float) -> None:
-        self.plans_cache_age_seconds.record(age_seconds)
+        self.plans_cache_age_seconds.set(age_seconds)
 
     def record_storage_rollup_compaction(self, rows: int) -> None:
         if rows:
@@ -1085,9 +1089,9 @@ class MetricsCollector:
             self.storage_rollup_drifted_buckets_total.add(1)
 
     def record_storage_rollup_ledger(self, depth: int, lag_seconds: int, negative_buckets: int) -> None:
-        self.storage_rollup_ledger_depth.record(depth)
-        self.storage_rollup_ledger_lag_seconds.record(lag_seconds)
-        self.storage_rollup_negative_buckets.record(negative_buckets)
+        self.storage_rollup_ledger_depth.set(depth)
+        self.storage_rollup_ledger_lag_seconds.set(lag_seconds)
+        self.storage_rollup_negative_buckets.set(negative_buckets)
 
     def record_storage_rollup_cycle(self, success: bool) -> None:
         self.storage_rollup_cycles_total.add(1, attributes={"success": str(success).lower()})
