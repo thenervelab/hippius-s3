@@ -28,6 +28,7 @@ from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.writer.types import AppendPreconditionFailed
 from hippius_s3.writer.types import EmptyAppendError
 from hippius_s3.writer.types import ObjectNotFound
+from hippius_s3.writer.types import PreconditionFailed
 
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ async def handle_append(
     bucket_name: str,
     object_key: str,
     body_iter: AsyncIterator[bytes],
+    if_none_match: bool = False,
 ) -> Response:
     """Handle append PUT with ETag CAS and atomic update.
 
@@ -131,7 +133,13 @@ async def handle_append(
                 expected_version=int(expected_version),
                 account_address=request.state.main_account_id,
                 body_iter=body_iter,
+                if_none_match=if_none_match,
             )
+        except PreconditionFailed:
+            # If-None-Match: * on a key that exists, judged under append's own object lock. Nothing
+            # was appended. A key that does NOT exist raises ObjectNotFound below instead, so a
+            # create-only append is always an error — see docs/s4.md.
+            return errors.precondition_failed_response()
         except AppendPreconditionFailed as exc:
             return errors.s3_error_response(
                 code="PreconditionFailed",

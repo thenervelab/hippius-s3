@@ -56,3 +56,7 @@ class ObjectNotFound(Exception):
 
 class EmptyAppendError(Exception):
     pass
+
+
+class PreconditionFailed(Exception):
+    """A conditional write (If-None-Match: *) found the key already existing."""

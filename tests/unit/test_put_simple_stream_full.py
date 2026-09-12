@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import uuid
+from types import SimpleNamespace
 from typing import Any
 from typing import AsyncIterator
 
@@ -10,6 +11,7 @@ from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import PoolAcquireTimeout
 from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.writer.types import PreconditionFailed
 from tests.unit._fake_pool import make_fake_pool
 
 
@@ -268,3 +270,186 @@ async def test_meta_written_to_fs_once(counting_writer: Any) -> None:
     writer, fs_store = counting_writer
     await _run(writer, b"hello world")
     assert fs_store.meta_calls == [1], f"meta written {len(fs_store.meta_calls)} times, expected once"
+
+
+def _conditional_router(*, exists_live: bool, baseline: int = 3, conflict: bool = False) -> Any:
+    def router(method: str, query: str, args: tuple) -> Any:
+        q = query or ""
+        if method == "fetchrow" and "exists_live" in q:
+            return {"exists_live": exists_live, "baseline": baseline}
+        if method == "fetchval" and "Tail re-check for PutObject" in q:
+            return conflict
+        return None
+
+    return router
+
+
+async def _run_create_only(writer: ObjectWriter, consumed: list[bytes]) -> Any:
+    async def body() -> AsyncIterator[bytes]:
+        consumed.append(b"read")
+        yield b"payload"
+
+    return await writer.put_simple_stream_full(
+        bucket_id=str(uuid.uuid4()),
+        bucket_name="bkt",
+        object_id=str(uuid.uuid4()),
+        object_key="audit.log",
+        account_address="acct",
+        content_type="text/plain",
+        metadata={},
+        body_iter=body(),
+        if_none_match=True,
+    )
+
+
+def _queries(pool: Any, needle: str) -> list[dict]:
+    return [e for e in pool.events if needle in (e.get("query") or "")]
+
+
+@pytest.mark.asyncio
+async def test_create_only_put_refuses_an_existing_key_before_reading_the_body(patched_writer: Any) -> None:
+    writer, pool, captured = patched_writer
+    pool._router = _conditional_router(exists_live=True)
+    consumed: list[bytes] = []
+
+    with pytest.raises(PreconditionFailed):
+        await _run_create_only(writer, consumed)
+
+    assert consumed == [], "the body must not be read once the key is known to exist"
+    assert "head_conn" not in captured, "no version may be reserved"
+    assert pool.acquire_count == 1
+    lock = _queries(pool, "Serialize conditional writes")
+    assert lock and lock[0]["in_txn"], "the key lock must be taken inside the reserve transaction"
+
+
+@pytest.mark.asyncio
+async def test_create_only_put_loses_a_race_detected_at_finalize(patched_writer: Any) -> None:
+    writer, pool, captured = patched_writer
+    pool._router = _conditional_router(exists_live=False, baseline=3, conflict=True)
+
+    with pytest.raises(PreconditionFailed):
+        await _run_create_only(writer, [])
+
+    assert "tail_conn_ensure" not in captured, "a lost race must not finalize anything"
+    assert not _queries(pool, "body_blake3 = $8"), "the version must stay unserveable"
+    check = _queries(pool, "Tail re-check for PutObject")[0]
+    assert check["args"][1:] == (1, 3), "re-check must exclude our version and count only above the baseline"
+    assert _queries(pool, "Exclusive variant of lock_object_row_by_id")
+
+
+@pytest.mark.asyncio
+async def test_create_only_put_of_a_new_key_succeeds(patched_writer: Any) -> None:
+    writer, pool, _ = patched_writer
+    pool._router = _conditional_router(exists_live=False, conflict=False)
+
+    res = await _run_create_only(writer, [])
+
+    assert res.size_bytes == len(b"payload")
+    assert _queries(pool, "Exclusive variant of lock_object_row_by_id")
+    assert not _queries(pool, "FOR KEY SHARE"), "the conditional tail takes the exclusive lock instead"
+
+
+@pytest.mark.asyncio
+async def test_unconditional_put_is_unchanged(patched_writer: Any) -> None:
+    """Regression guard: no conditional queries, and the tail keeps the non-serializing KEY SHARE lock."""
+    writer, pool, _ = patched_writer
+    await _run(writer, b"data")
+    assert not _queries(pool, "exists_live")
+    assert not _queries(pool, "Tail re-check for PutObject")
+    assert not _queries(pool, "Exclusive variant of lock_object_row_by_id")
+    assert _queries(pool, "FOR KEY SHARE")
+
+
+class _CompletePool:
+    """Just enough of an asyncpg pool for mpu_complete: `async with pool.acquire() as conn, conn.transaction()`."""
+
+    def __init__(self, conflict: bool) -> None:
+        self.conflict = conflict
+        self.calls: list[tuple[str, str]] = []
+        pool = self
+
+        class _Conn:
+            def transaction(self) -> Any:
+                return _Ctx(None)
+
+            async def execute(self, query: str, *args: Any) -> None:
+                pool.calls.append(("execute", query))
+
+            async def fetchval(self, query: str, *args: Any) -> Any:
+                pool.calls.append(("fetchval", query))
+                return pool.conflict
+
+        class _Ctx:
+            def __init__(self, value: Any) -> None:
+                self.value = value
+
+            async def __aenter__(self) -> Any:
+                return self.value
+
+            async def __aexit__(self, *exc: Any) -> None:
+                return None
+
+        self._conn = _Conn()
+        self._ctx = _Ctx
+
+    def acquire(self) -> Any:
+        return self._ctx(self._conn)
+
+
+async def _complete(pool: _CompletePool, if_none_match: bool, key_existed_at_initiate: bool = False) -> Any:
+    # A stand-in store, not None: None makes ObjectWriter build the configured on-disk cache
+    # (/var/lib/hippius by default), which CI runners cannot create. mpu_complete never touches it.
+    writer = ObjectWriter(pool=pool, redis_client=DummyRedis(), fs_store=SimpleNamespace())
+    return await writer.mpu_complete(
+        bucket_name="bkt",
+        object_id=str(uuid.uuid4()),
+        object_key="big.bin",
+        upload_id=str(uuid.uuid4()),
+        object_version=2,
+        address="acct",
+        db_parts=[{"part_number": 1, "etag": "0" * 32, "size_bytes": 5}],
+        if_none_match=if_none_match,
+        key_existed_at_initiate=key_existed_at_initiate,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_only_complete_refuses_an_existing_key() -> None:
+    pool = _CompletePool(conflict=True)
+    with pytest.raises(PreconditionFailed):
+        await _complete(pool, if_none_match=True)
+    assert "Exclusive variant" in pool.calls[0][1], "objects row must be locked first"
+    assert not any("is_completed = TRUE" in q for _, q in pool.calls), "the upload must stay open"
+    assert not any("completed_part_numbers" in q for _, q in pool.calls)
+
+
+@pytest.mark.asyncio
+async def test_create_only_complete_of_a_new_key_completes() -> None:
+    pool = _CompletePool(conflict=False)
+    res = await _complete(pool, if_none_match=True)
+    assert res.size_bytes == 5
+    assert any("is_completed = TRUE" in q for _, q in pool.calls)
+
+
+@pytest.mark.asyncio
+async def test_create_only_complete_refuses_a_key_that_existed_at_initiate() -> None:
+    # No version ABOVE ours ever appeared, so the SQL re-check is clean — the key existed before the
+    # upload started and initiate cleared its soft delete, which only the recorded flag still knows.
+    pool = _CompletePool(conflict=False)
+    with pytest.raises(PreconditionFailed):
+        await _complete(pool, if_none_match=True, key_existed_at_initiate=True)
+    assert not any("is_completed = TRUE" in q for _, q in pool.calls), "the upload must stay open"
+
+
+@pytest.mark.asyncio
+async def test_key_existed_at_initiate_is_ignored_without_the_header() -> None:
+    pool = _CompletePool(conflict=False)
+    res = await _complete(pool, if_none_match=False, key_existed_at_initiate=True)
+    assert res.size_bytes == 5
+
+
+@pytest.mark.asyncio
+async def test_unconditional_complete_skips_the_check() -> None:
+    pool = _CompletePool(conflict=True)
+    await _complete(pool, if_none_match=False)
+    assert not any("Exclusive variant" in q or "CompleteMultipartUpload If-None-Match" in q for _, q in pool.calls)

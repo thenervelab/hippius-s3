@@ -8,9 +8,12 @@ from unittest.mock import MagicMock
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 from starlette.datastructures import Headers
+from starlette.responses import Response
 
+from hippius_s3.api.s3.extensions import append as append_module
 from hippius_s3.api.s3.objects import put_object_endpoint
 from hippius_s3.api.s3.objects.put_object_endpoint import handle_put_object
+from hippius_s3.writer.types import PreconditionFailed
 from hippius_s3.writer.types import PutResult
 from tests.unit._fake_pool import make_fake_pool
 
@@ -314,3 +317,170 @@ async def test_created_flag_tracks_allocated_version(monkeypatch: Any, object_ve
     assert resp.status_code == 200
     assert resp.headers.get("x-amz-version-id") == str(object_version)
     assert getattr(req.state, "ats_object_created", False) is flag_set
+
+
+def _patch_writer_capture(monkeypatch: Any, captured: dict[str, Any], raise_exc: Exception | None = None) -> None:
+    async def fake_put(self: Any, **kw: Any) -> PutResult:
+        captured.update(kw)
+        if raise_exc is not None:
+            raise raise_exc
+        return PutResult(
+            object_id=str(uuid.uuid4()), etag="etag", size_bytes=3, upload_id=str(uuid.uuid4()), object_version=1
+        )
+
+    async def fake_persist_address(*_a: Any, **_kw: Any) -> None:
+        return None
+
+    monkeypatch.setattr(put_object_endpoint.ObjectWriter, "put_simple_stream_full", fake_put)
+    monkeypatch.setattr(put_object_endpoint, "set_object_version_address", fake_persist_address)
+
+
+async def _put(monkeypatch: Any, headers: dict[str, str], raise_exc: Exception | None = None) -> Any:
+    captured: dict[str, Any] = {}
+    _patch_writer_capture(monkeypatch, captured, raise_exc)
+    req = _fake_request(headers)
+    req.state.bucket_id = str(uuid.uuid4())
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="audit.log",
+        request=req,
+        pool=make_fake_pool(_bucket_present_router),
+        redis_client=_FakeRedis(nx_result=None),
+    )
+    return resp, captured
+
+
+@pytest.mark.asyncio
+async def test_if_none_match_star_makes_the_write_create_only(monkeypatch: Any) -> None:
+    resp, captured = await _put(monkeypatch, {"If-None-Match": "*"})
+    assert resp.status_code == 200
+    assert captured["if_none_match"] is True
+
+
+@pytest.mark.asyncio
+async def test_no_if_none_match_is_an_ordinary_overwrite(monkeypatch: Any) -> None:
+    resp, captured = await _put(monkeypatch, {})
+    assert resp.status_code == 200
+    assert captured["if_none_match"] is False
+
+
+@pytest.mark.asyncio
+async def test_existing_key_is_precondition_failed(monkeypatch: Any) -> None:
+    resp, _ = await _put(monkeypatch, {"If-None-Match": "*"}, raise_exc=PreconditionFailed())
+    assert resp.status_code == 412
+    assert b"<Code>PreconditionFailed</Code>" in resp.body
+    assert b"<Condition>If-None-Match</Condition>" in resp.body
+
+
+@pytest.mark.asyncio
+async def test_etag_valued_if_none_match_is_not_implemented_rather_than_ignored(monkeypatch: Any) -> None:
+    resp, captured = await _put(monkeypatch, {"If-None-Match": '"5d41402abc4b2a76b9719d911017c592"'})
+    assert resp.status_code == 501
+    assert b"<Code>NotImplemented</Code>" in resp.body
+    assert captured == {}, "the write must not run"
+
+
+@pytest.mark.asyncio
+async def test_create_only_append_is_judged_inside_append_not_by_a_loose_read(monkeypatch: Any) -> None:
+    # The endpoint must NOT pre-check on its own connection: a key created between such a read and
+    # the append would be modified under a create-only header. append_stream decides under the same
+    # row lock as the version CAS instead, so all the endpoint does is carry the flag down.
+    seen_queries: list[str] = []
+
+    def router(method: str, query: str, args: tuple) -> Any:
+        seen_queries.append(query or "")
+        if "Get bucket by name" in (query or ""):
+            return {"bucket_id": str(uuid.uuid4()), "bucket_name": "bkt", "main_account_id": "acct-main"}
+        return None
+
+    append_calls: list[Any] = []
+
+    async def fake_append(*a: Any, **kw: Any) -> Any:
+        append_calls.append(kw)
+        return Response(status_code=200)
+
+    monkeypatch.setattr(put_object_endpoint, "handle_append", fake_append)
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="audit.log",
+        request=_fake_request({"If-None-Match": "*", "x-amz-meta-append": "true"}),
+        pool=make_fake_pool(router),
+        redis_client=_FakeRedis(nx_result=None),
+    )
+    assert resp.status_code == 200
+    assert append_calls[0]["if_none_match"] is True
+    assert not any("exists_live" in q for q in seen_queries), "no unlocked pre-check may run"
+
+
+class _BodyStream:
+    """request.stream() stand-in that records how much of the body the endpoint read."""
+
+    def __init__(self, *chunks: bytes) -> None:
+        self.chunks = list(chunks)
+        self.read: list[bytes] = []
+
+    def __call__(self) -> Any:
+        async def gen() -> Any:
+            for c in self.chunks:
+                self.read.append(c)
+                yield c
+
+        return gen()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_if_none_match_drains_the_body_before_answering(monkeypatch: Any) -> None:
+    """An early answer with the body still pending poisons the kept-alive connection: the client's
+    next request on it fails with a bare 400 (seen in e2e as a GET after a refused PUT)."""
+    captured: dict[str, Any] = {}
+    _patch_writer_capture(monkeypatch, captured)
+    req = _fake_request({"If-None-Match": "etag"})
+    req.stream = body = _BodyStream(b"part-1", b"part-2")
+    resp = await handle_put_object("bkt", "k", req, make_fake_pool(_bucket_present_router), _FakeRedis(nx_result=None))
+    assert resp.status_code == 501
+    assert body.read == [b"part-1", b"part-2"]
+
+
+@pytest.mark.asyncio
+async def test_reserve_time_refusal_drains_the_body_before_answering(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    _patch_writer_capture(monkeypatch, captured, raise_exc=PreconditionFailed())
+    req = _fake_request({"If-None-Match": "*"})
+    req.state.bucket_id = str(uuid.uuid4())
+    req.stream = body = _BodyStream(b"unread body")
+    resp = await handle_put_object("bkt", "k", req, make_fake_pool(_bucket_present_router), _FakeRedis(nx_result=None))
+    assert resp.status_code == 412
+    assert body.read == [b"unread body"]
+
+
+@pytest.mark.asyncio
+async def test_create_only_append_on_an_existing_key_is_412_with_the_body_drained(monkeypatch: Any) -> None:
+    # handle_append's own `finally: _drain(body_iter)` covers the refusal, so the connection stays
+    # reusable even though the writer rejected the append before consuming the delta.
+    read: list[bytes] = []
+
+    async def body_iter() -> Any:
+        for chunk in (b"delta-1", b"delta-2"):
+            read.append(chunk)
+            yield chunk
+
+    async def refuse(self: Any, **kw: Any) -> Any:
+        assert kw["if_none_match"] is True
+        raise PreconditionFailed()
+
+    monkeypatch.setattr(append_module.ObjectWriter, "append_stream", refuse)
+    req = _fake_request({"If-None-Match": "*", "x-amz-meta-append": "true", "x-amz-meta-append-if-version": "3"})
+    resp = await append_module.handle_append(
+        req,
+        make_fake_pool(lambda *a: None),
+        _FakeRedis(nx_result=None),
+        bucket={"bucket_id": str(uuid.uuid4())},
+        bucket_id=str(uuid.uuid4()),
+        bucket_name="bkt",
+        object_key="audit.log",
+        body_iter=body_iter(),
+        if_none_match=True,
+    )
+    assert resp.status_code == 412
+    assert b"<Code>PreconditionFailed</Code>" in resp.body
+    assert read == [b"delta-1", b"delta-2"]

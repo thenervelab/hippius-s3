@@ -241,3 +241,23 @@ def map_read_path_exception(exc: BaseException) -> Response | None:
             status_code=501,
         )
     return None
+
+
+def precondition_failed_response() -> Response:
+    """If-None-Match: * on a write, and the key already exists."""
+    return s3_error_response(
+        "PreconditionFailed",
+        "At least one of the pre-conditions you specified did not hold",
+        status_code=412,
+        Condition="If-None-Match",
+    )
+
+
+def conditional_write_not_implemented_response() -> Response:
+    """If-None-Match on a write with a value other than "*"."""
+    return s3_error_response(
+        "NotImplemented",
+        "A header you provided implies functionality that is not implemented",
+        status_code=501,
+        Header="If-None-Match",
+    )

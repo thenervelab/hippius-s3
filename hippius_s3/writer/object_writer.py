@@ -39,6 +39,7 @@ from hippius_s3.writer.types import CompleteResult
 from hippius_s3.writer.types import EmptyAppendError
 from hippius_s3.writer.types import ObjectNotFound
 from hippius_s3.writer.types import PartResult
+from hippius_s3.writer.types import PreconditionFailed
 from hippius_s3.writer.types import PutResult
 from hippius_s3.writer.write_through_writer import WriteThroughPartsWriter
 
@@ -198,12 +199,16 @@ class ObjectWriter:
         metadata: dict[str, Any],
         storage_version: int | None = None,
         body_iter: AsyncIterator[bytes],
+        if_none_match: bool = False,
     ) -> PutResult:
         """Upsert destination object and write content (single-part) using a streaming iterator.
 
         - Consumes an AsyncIterator[bytes] and encrypts/writes chunk-by-chunk to cache.
         - Keeps peak memory bounded to configured chunk size.
         - Uses server-side keys; seed phrases are not required.
+        - ``if_none_match`` (If-None-Match: *) makes the write create-only: PreconditionFailed if the
+          key already exists at reserve time (before the body is read), or if another writer made it
+          exist while this one streamed (re-checked under an exclusive row lock at finalize).
         """
         chunk_size = self.config.object_chunk_size_bytes
         ttl = self.config.cache_ttl_seconds
@@ -236,6 +241,9 @@ class ObjectWriter:
         # window where a concurrent GET could see a bumped current_object_version with NULL
         # kek_id/wrapped_dek and 500 with v5_missing_envelope_metadata.
         candidate_object_id = object_id
+        # Newest serveable version the key had at reserve time; the finalize re-check only counts
+        # versions above it. Set inside _reserve_version, which can re-run on a version collision.
+        conditional_baseline = 0
         with tracer.start_as_current_span(
             "put_simple_stream_full.reserve_version",
             attributes={
@@ -252,10 +260,20 @@ class ObjectWriter:
             # fresh transaction — a fresh snapshot re-reads the committed MAX and resolves it.
             # Bounded — a persistent collision is a real error and must surface.
             async def _reserve_version() -> tuple[str, int]:
+                nonlocal conditional_baseline
                 async with (
                     acquire_with_timeout(self.pool, self.config.db_pool_acquire_timeout) as conn,
                     conn.transaction(),
                 ):
+                    if if_none_match:
+                        # Lock the key's row, then judge it, then reserve — all in this transaction,
+                        # so no other reserve of the key can slip in between check and reserve.
+                        # Refusing here costs the client nothing: the body has not been read.
+                        await conn.execute(get_query("lock_object_by_key_for_update"), bucket_id, object_key)
+                        state = await conn.fetchrow(get_query("conditional_write_state"), bucket_id, object_key)
+                        if state is not None and state["exists_live"]:
+                            raise PreconditionFailed()
+                        conditional_baseline = int(state["baseline"]) if state is not None else 0
                     reserve_row = await upsert_object_basic(
                         conn,
                         object_id=candidate_object_id,
@@ -474,7 +492,20 @@ class ObjectWriter:
                     # without this line the transaction's lock order is object_versions -> objects
                     # and it deadlocks against a concurrent same-key reserve, whose trigger locks
                     # the outgoing version while holding the objects row. See the query's header.
-                    await conn.execute(get_query("lock_object_row_by_id"), object_id)
+                    if if_none_match:
+                        # Exclusive, and re-checked under it: two conditional writers can both pass the
+                        # reserve-time check while neither has finalized, and the first to get here wins.
+                        # Raising rolls this transaction back, leaving our version an inert placeholder.
+                        await conn.execute(get_query("lock_object_row_for_update"), object_id)
+                        if await conn.fetchval(
+                            get_query("conditional_write_conflict"),
+                            object_id,
+                            int(object_version),
+                            int(conditional_baseline),
+                        ):
+                            raise PreconditionFailed()
+                    else:
+                        await conn.execute(get_query("lock_object_row_by_id"), object_id)
 
                     # Until this UPDATE sets non-empty size/md5 the version is invisible to downloads.
                     await conn.execute(
@@ -926,6 +957,8 @@ class ObjectWriter:
         address: str,
         selected_parts: list[int] | None = None,
         db_parts: list[Any] | None = None,
+        if_none_match: bool = False,
+        key_existed_at_initiate: bool = False,
     ) -> CompleteResult:
         # B1: S3 allows completing with a SUBSET of the uploaded parts. `selected_parts` is the
         # client's <Part> list (already validated exists+ETag-matches by the endpoint); the final
@@ -988,6 +1021,19 @@ class ObjectWriter:
             )
 
         async with self.pool.acquire() as conn, conn.transaction():
+            if if_none_match:
+                # objects row first (lock order objects -> object_versions), exclusively, so a
+                # concurrent PUT tail or completion is either fully visible to the check or not begun.
+                # Raising rolls back: the upload stays open (is_completed FALSE) and can be aborted.
+                #
+                # Two judgements, like the PutObject path: the key's existence when this upload was
+                # initiated (recorded then, because initiate clears a soft delete and destroys the
+                # evidence), OR a version that appeared above ours while the upload was open.
+                await conn.execute(get_query("lock_object_row_for_update"), object_id)
+                if key_existed_at_initiate or await conn.fetchval(
+                    get_query("mpu_conditional_conflict"), object_id, int(object_version)
+                ):
+                    raise PreconditionFailed()
             # Update object_versions (record the completed subset so the reader filters to it).
             await conn.execute(
                 """
@@ -1023,6 +1069,7 @@ class ObjectWriter:
         expected_version: int,
         account_address: str,
         body_iter: AsyncIterator[bytes],
+        if_none_match: bool = False,
     ) -> dict:
         """Append bytes with CAS, cache write-through, and enqueue (streaming)."""
         row = await self.pool.fetchrow(
@@ -1071,6 +1118,11 @@ class ObjectWriter:
             )
             if not locked:
                 raise ObjectNotFound("NoSuchKey")
+            if if_none_match:
+                # Create-only, judged under the same lock the CAS uses rather than by a read before
+                # the call: reaching here means the key exists and is live (an absent or tombstoned
+                # one raised ObjectNotFound above), which is exactly what If-None-Match: * forbids.
+                raise PreconditionFailed()
             current_version = int(locked["append_version"])
             if expected_version != current_version:
                 raise AppendPreconditionFailed(current_version)
