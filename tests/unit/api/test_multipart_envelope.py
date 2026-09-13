@@ -58,6 +58,8 @@ class _FakeDb:
             return {
                 "object_id": OBJECT_ID,
                 "current_object_version": self.current_version,
+                # Captured pre-upsert by the real query; carried onto the multipart_uploads row.
+                "existed_live": False,
             }
         return None
 

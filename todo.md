@@ -404,6 +404,20 @@ No strong opinion here — needs a benchmark before we touch anything.
 
 Same file, line 177-179: CORS configuration is similarly acknowledged and ignored. Intentional per the commit history, but worth flagging: if we ever do want to surface bucket-level CORS, this is where it lives today.
 
+### P2 — Create-only (`If-None-Match: *`) is refused, not implemented, on CopyObject
+
+**File**: [hippius_s3/api/s3/objects/copy_object_endpoint.py](hippius_s3/api/s3/objects/copy_object_endpoint.py). A copy is a write to the destination key, so the header carries the same create-only intent PutObject honours — but none of the three copy paths (same-bucket alias, v5 fast path, streaming) lands the destination through the conditional reserve/finalize the PUT writer uses. Rather than ignore the header (which is how a write-once client silently gets an overwritten object) the endpoint answers 501 NotImplemented for every value, `*` included.
+
+**Proposed**: route the destination write of all three copy paths through a shared conditional reserve so `If-None-Match: *` can be honoured, then drop the 501. Until then the refusal is the honest answer; a client that wants write-once semantics on a copy has to PUT instead.
+
+### P2 — An aborted MPU still resurrects a soft-deleted key
+
+**File**: [hippius_s3/sql/queries/upsert_object_multipart.sql](hippius_s3/sql/queries/upsert_object_multipart.sql). InitiateMultipartUpload's upsert sets `deleted_at = NULL` on the `objects` row, so starting an MPU on a soft-deleted key immediately makes the key's *pre-delete* content readable again — and if the upload is then abandoned or aborted, it stays that way. Pre-existing, and independent of conditional writes.
+
+Conditional completion no longer depends on that state: `multipart_uploads.key_existed_at_initiate` records what the key looked like *before* the upsert cleared the evidence, so a create-only MPU over a soft-deleted key completes (correct — a soft-deleted key does not exist) instead of being refused and leaving the old content exposed.
+
+**Proposed**: defer the un-delete from initiate to completion, so an in-flight MPU never makes a deleted key visible. Blocked on one thing: while the row stays soft-deleted it is a candidate for the hard-delete ring ([find_objects_ready_for_hard_delete.sql](hippius_s3/sql/queries/find_objects_ready_for_hard_delete.sql), 1h grace + all `chunk_backend` rows deleted), so a multi-hour MPU could have its object row hard-deleted mid-upload. Deferring needs an "open upload" exclusion in that ring, which is a query with a documented read-storm history — measure before touching it.
+
 ### P2 — Pre-check race on PUT overwrite object_id selection
 
 **File**: [hippius_s3/api/s3/objects/put_object_endpoint.py:105-108](hippius_s3/api/s3/objects/put_object_endpoint.py):

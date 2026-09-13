@@ -58,6 +58,10 @@ class EmptyAppendError(Exception):
     pass
 
 
+class PreconditionFailed(Exception):
+    """A conditional write (If-None-Match: *) found the key already existing."""
+
+
 class BadDigest(Exception):
     """The MD5 of the body the writer received does not match the client's Content-MD5."""
 

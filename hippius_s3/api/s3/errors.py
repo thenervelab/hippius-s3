@@ -243,6 +243,26 @@ def map_read_path_exception(exc: BaseException) -> Response | None:
     return None
 
 
+def precondition_failed_response() -> Response:
+    """If-None-Match: * on a write, and the key already exists."""
+    return s3_error_response(
+        "PreconditionFailed",
+        "At least one of the pre-conditions you specified did not hold",
+        status_code=412,
+        Condition="If-None-Match",
+    )
+
+
+def conditional_write_not_implemented_response() -> Response:
+    """If-None-Match on a write with a value other than "*"."""
+    return s3_error_response(
+        "NotImplemented",
+        "A header you provided implies functionality that is not implemented",
+        status_code=501,
+        Header="If-None-Match",
+    )
+
+
 def invalid_digest_response() -> Response:
     """Content-MD5 was present but not a base64-encoded 16-byte digest."""
     return s3_error_response("InvalidDigest", "The Content-MD5 you specified was not valid.", status_code=400)
