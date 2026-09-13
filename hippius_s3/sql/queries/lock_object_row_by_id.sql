@@ -23,6 +23,14 @@
 -- ordering actually hold. Taking FOR UPDATE here would serialise every concurrent PUT to one key
 -- behind one another for no billing benefit.
 --
+-- WHY FOR KEY SHARE IS ENOUGH, which is load-bearing and not obvious: KEY SHARE conflicts only
+-- with FOR UPDATE / FOR NO KEY UPDATE. It establishes the ordering because `upsert_object_basic` is
+-- an `INSERT ... ON CONFLICT DO UPDATE` whose SET list includes object_key, so PG takes
+-- LockTupleExclusive (= FOR UPDATE) on the objects row. If that ever became a plain UPDATE of
+-- non-key columns it would take FOR NO KEY UPDATE, which KEY SHARE still conflicts with -- and if
+-- it stopped conflicting, the FK's own KEY SHARE would not conflict either, so there would be no
+-- cycle to order. Self-consistent in both directions, but check this if you change that statement.
+--
 -- Returns no row if the object does not exist (or was hard-deleted concurrently). Callers that have
 -- already reserved the version treat that as a lost race and let the transaction fail on its own
 -- FK; there is nothing to lock and nothing to protect.

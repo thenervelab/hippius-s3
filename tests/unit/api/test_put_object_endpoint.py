@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import hashlib
 import uuid
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +15,7 @@ from starlette.responses import Response
 from hippius_s3.api.s3.extensions import append as append_module
 from hippius_s3.api.s3.objects import put_object_endpoint
 from hippius_s3.api.s3.objects.put_object_endpoint import handle_put_object
+from hippius_s3.writer.types import BadDigest
 from hippius_s3.writer.types import PreconditionFailed
 from hippius_s3.writer.types import PutResult
 from tests.unit._fake_pool import make_fake_pool
@@ -325,7 +328,7 @@ def _patch_writer_capture(monkeypatch: Any, captured: dict[str, Any], raise_exc:
         if raise_exc is not None:
             raise raise_exc
         return PutResult(
-            object_id=str(uuid.uuid4()), etag="etag", size_bytes=3, upload_id=str(uuid.uuid4()), object_version=1
+            object_id=str(uuid.uuid4()), etag="etag", size_bytes=3, upload_id=str(uuid.uuid4()), object_version=2
         )
 
     async def fake_persist_address(*_a: Any, **_kw: Any) -> None:
@@ -335,14 +338,14 @@ def _patch_writer_capture(monkeypatch: Any, captured: dict[str, Any], raise_exc:
     monkeypatch.setattr(put_object_endpoint, "set_object_version_address", fake_persist_address)
 
 
-async def _put(monkeypatch: Any, headers: dict[str, str], raise_exc: Exception | None = None) -> Any:
+async def _put_with_headers(monkeypatch: Any, headers: dict[str, str], raise_exc: Exception | None = None) -> Any:
     captured: dict[str, Any] = {}
     _patch_writer_capture(monkeypatch, captured, raise_exc)
     req = _fake_request(headers)
     req.state.bucket_id = str(uuid.uuid4())
     resp = await handle_put_object(
         bucket_name="bkt",
-        object_key="audit.log",
+        object_key="k/o.bin",
         request=req,
         pool=make_fake_pool(_bucket_present_router),
         redis_client=_FakeRedis(nx_result=None),
@@ -352,21 +355,21 @@ async def _put(monkeypatch: Any, headers: dict[str, str], raise_exc: Exception |
 
 @pytest.mark.asyncio
 async def test_if_none_match_star_makes_the_write_create_only(monkeypatch: Any) -> None:
-    resp, captured = await _put(monkeypatch, {"If-None-Match": "*"})
+    resp, captured = await _put_with_headers(monkeypatch, {"If-None-Match": "*"})
     assert resp.status_code == 200
     assert captured["if_none_match"] is True
 
 
 @pytest.mark.asyncio
 async def test_no_if_none_match_is_an_ordinary_overwrite(monkeypatch: Any) -> None:
-    resp, captured = await _put(monkeypatch, {})
+    resp, captured = await _put_with_headers(monkeypatch, {})
     assert resp.status_code == 200
     assert captured["if_none_match"] is False
 
 
 @pytest.mark.asyncio
 async def test_existing_key_is_precondition_failed(monkeypatch: Any) -> None:
-    resp, _ = await _put(monkeypatch, {"If-None-Match": "*"}, raise_exc=PreconditionFailed())
+    resp, _ = await _put_with_headers(monkeypatch, {"If-None-Match": "*"}, raise_exc=PreconditionFailed())
     assert resp.status_code == 412
     assert b"<Code>PreconditionFailed</Code>" in resp.body
     assert b"<Condition>If-None-Match</Condition>" in resp.body
@@ -374,7 +377,7 @@ async def test_existing_key_is_precondition_failed(monkeypatch: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_etag_valued_if_none_match_is_not_implemented_rather_than_ignored(monkeypatch: Any) -> None:
-    resp, captured = await _put(monkeypatch, {"If-None-Match": '"5d41402abc4b2a76b9719d911017c592"'})
+    resp, captured = await _put_with_headers(monkeypatch, {"If-None-Match": '"5d41402abc4b2a76b9719d911017c592"'})
     assert resp.status_code == 501
     assert b"<Code>NotImplemented</Code>" in resp.body
     assert captured == {}, "the write must not run"
@@ -426,6 +429,55 @@ class _BodyStream:
                 yield c
 
         return gen()
+
+
+@pytest.mark.asyncio
+async def test_malformed_content_md5_is_invalid_digest_before_the_body_is_read(monkeypatch: Any) -> None:
+    resp, captured = await _put_with_headers(monkeypatch, {"Content-MD5": hashlib.md5(b"x").hexdigest()})
+    assert resp.status_code == 400
+    assert b"<Code>InvalidDigest</Code>" in resp.body
+    assert captured == {}, "the writer must not run for a malformed Content-MD5"
+
+
+@pytest.mark.asyncio
+async def test_content_md5_is_handed_to_the_writer_as_raw_bytes(monkeypatch: Any) -> None:
+    digest = hashlib.md5(b"body").digest()
+    resp, captured = await _put_with_headers(monkeypatch, {"Content-MD5": base64.b64encode(digest).decode()})
+    assert resp.status_code == 200
+    assert captured["expected_md5"] == digest
+
+
+@pytest.mark.asyncio
+async def test_no_content_md5_means_no_check(monkeypatch: Any) -> None:
+    resp, captured = await _put_with_headers(monkeypatch, {})
+    assert resp.status_code == 200
+    assert captured["expected_md5"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_mismatch_is_bad_digest(monkeypatch: Any) -> None:
+    digest = hashlib.md5(b"claimed").digest()
+    resp, _ = await _put_with_headers(
+        monkeypatch,
+        {"Content-MD5": base64.b64encode(digest).decode()},
+        raise_exc=BadDigest(expected=digest, actual=hashlib.md5(b"received").digest()),
+    )
+    assert resp.status_code == 400
+    assert b"<Code>BadDigest</Code>" in resp.body
+
+
+@pytest.mark.asyncio
+async def test_malformed_content_md5_drains_the_body_before_answering(monkeypatch: Any) -> None:
+    """An early answer with the body still pending poisons the kept-alive connection: the client's
+    next request on it fails with a bare 400."""
+    captured: dict[str, Any] = {}
+    _patch_writer_capture(monkeypatch, captured)
+    req = _fake_request({"Content-MD5": "not-base64!!"})
+    req.state.bucket_id = str(uuid.uuid4())
+    req.stream = body = _BodyStream(b"a", b"b")
+    resp = await handle_put_object("bkt", "k", req, make_fake_pool(_bucket_present_router), _FakeRedis(nx_result=None))
+    assert resp.status_code == 400
+    assert body.read == [b"a", b"b"]
 
 
 @pytest.mark.asyncio

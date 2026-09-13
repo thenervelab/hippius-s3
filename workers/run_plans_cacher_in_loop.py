@@ -196,13 +196,7 @@ async def refresh_plan_roll_once(redis_client: Redis, pool: asyncpg.Pool) -> tup
     # retry sleeping 60s instead of plans_loop_sleep, that put the rollout window at roughly 10x the
     # steady-state request rate against an endpoint we do not own, precisely when the rollup is not
     # usable anyway. One local SELECT now decides it.
-    if not await usage_service.rollup_is_ready(pool):
-        raise usage_service.StorageRollupNotBackfilled(
-            "bucket_storage_usage has not been backfilled (storage_usage_rollup_state.backfilled_at "
-            "is NULL), so its rows are deltas rather than totals. Skipping the upstream scrape "
-            "entirely rather than fetching a roll that cannot be published. Run "
-            "hippius_s3/scripts/backfill_bucket_storage_usage.py."
-        )
+    await usage_service.require_rollup_ready(pool)
 
     accounts: dict[str, dict[str, Any]] = {}
     catalog: dict[str, dict[str, Any]] = {}

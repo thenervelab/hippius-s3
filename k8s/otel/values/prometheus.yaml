@@ -60,3 +60,144 @@ extraScrapeConfigs: |
         target_label: pod
       - source_labels: [__meta_kubernetes_pod_label_cnpg_io_cluster]
         target_label: cnpg_cluster
+
+# Alerting rules. The chart renders this into the prometheus-server ConfigMap key
+# `alerting_rules.yml`, which the server already loads via `rule_files: /etc/config/alerting_rules.yml`
+# -- so no new infrastructure, just content where the wiring already points. Before these, that key
+# was 3 bytes and `/api/v1/rules` returned zero groups: nothing in the cluster alerted on anything.
+#
+# alertmanager is disabled in this release, so these surface as firing alerts in the Prometheus UI
+# and via Grafana's alert list rather than as pages. That is a deliberate first step -- a rule that
+# exists and is visible beats a promise in a comment -- but routing is the obvious follow-up.
+#
+# Pinned by tests/unit/test_rollup_alerting.py, which parses this YAML and fails if a rule
+# references a metric hippius_s3/monitoring.py does not emit. A rule over a non-existent series is
+# never true, so it looks healthy in the UI and protects nothing.
+serverFiles:
+  alerting_rules.yml:
+    groups:
+      - name: hippius-s3-storage-rollup
+        rules:
+          # THE ONE THAT CATCHES THE STATED FAILURE MODE. The design says "alert on
+          # storage_rollup_ledger_lag_seconds, not on pod restarts" -- but these are push-based
+          # recordings from inside the worker loop, so a worker that is DOWN emits nothing and a
+          # `lag > N` rule has no series to evaluate. Absence is what detects it. A frozen counter
+          # is a WRONG BILL rather than an outage, and nothing else in the system notices.
+          - alert: StorageRollupWorkerSilent
+            expr: absent_over_time(storage_rollup_cycles_total[15m])
+            for: 5m
+            labels:
+              severity: critical
+              component: usage-rollup
+            annotations:
+              summary: "usage-rollup has produced no cycles for 15m"
+              description: >-
+                The worker is down, crash-looping, or wedged. Every plan account's usage figure is
+                frozen at its last fold, so a customer who deleted data stays refused where
+                enforcement is on, and one who is filling up is not refused at all.
+
+          # Drift is expected to be EXACTLY zero once backfilled. Non-zero means a write path is
+          # moving bytes without emitting a delta -- and it is the only signal that would catch a
+          # sibling of the over-count bug this feature already shipped once.
+          - alert: StorageRollupDrift
+            expr: increase(storage_rollup_drifted_buckets_total[1h]) > 0
+            for: 10m
+            labels:
+              severity: warning
+              component: usage-rollup
+            annotations:
+              summary: "the rollup disagrees with the canonical storage count"
+              description: >-
+                A reconcile pass corrected at least one bucket in the last hour. Check the
+                STORAGE_ROLLUP_DRIFT log lines for the bucket ids. Before the backfill has run this
+                is expected and is logged as STORAGE_ROLLUP_SEEDING instead, so this firing means
+                the estate is seeded and something is genuinely unaccounted for.
+
+          # The compactor is alive but not keeping up: the ledger is insert-only, so this is pure
+          # staleness of the billed number rather than data loss.
+          - alert: StorageRollupLedgerLagging
+            expr: storage_rollup_ledger_lag_seconds > 900
+            for: 15m
+            labels:
+              severity: warning
+              component: usage-rollup
+            annotations:
+              summary: "oldest unfolded ledger row is over 15 minutes old"
+              description: >-
+                Compaction is running but behind. Usage figures are stale by at least this much on
+                top of the plans-cacher poll interval. Check whether a long recompute is holding the
+                rollup's global advisory lock.
+
+          # Only reachable if a decrement was recorded without its increment, i.e. a real defect in
+          # the trigger set. The reconciler repairs the value but not the cause.
+          - alert: StorageRollupNegativeCounter
+            expr: storage_rollup_negative_buckets > 0
+            for: 15m
+            labels:
+              severity: warning
+              component: usage-rollup
+            annotations:
+              summary: "a maintained byte counter has gone negative"
+              description: >-
+                Under-billing, and a genuine trigger defect. Note a negative counter on a
+                SOFT-DELETED bucket is unreachable by the reconciler, so this can latch on forever
+                -- check bucket liveness before hunting a live write path.
+
+      - name: hippius-s3-billing-plans
+        rules:
+          # The quota gate serves this cache. Stale means plan accounts keep the usage figure from
+          # that timestamp, so a customer who freed space stays refused.
+          - alert: PlansCacheStale
+            expr: plans_cache_age_seconds > 900
+            for: 10m
+            labels:
+              severity: critical
+              component: plans-cacher
+            annotations:
+              summary: "the plan map is over 15 minutes stale"
+              description: >-
+                The plans-cacher cannot publish. It keeps serving the last known good roll, so this
+                is not an outage -- but where enforcement is on, quotas and used_bytes are frozen.
+
+          - alert: PlansCacherSilent
+            expr: absent_over_time(plans_cacher_cycles_total[15m])
+            for: 5m
+            labels:
+              severity: critical
+              component: plans-cacher
+            annotations:
+              summary: "plans-cacher has produced no cycles for 15m"
+              description: >-
+                Nothing is refreshing the plan map. Pairs with PlansCacheStale, which measures the
+                consequence; this one names the cause.
+
+          # The gate could not reach its own state and fell back to pay-as-you-go. For a plan
+          # customer holding no substrate credits that fallback is a 402, so this is
+          # customer-visible refusal rather than a soft degrade.
+          - alert: PlanGateUnavailable
+            expr: increase(plan_gate_total{outcome="unavailable"}[15m]) > 0
+            for: 5m
+            labels:
+              severity: critical
+              component: plan-gate
+            annotations:
+              summary: "the plan quota gate could not resolve a plan"
+              description: >-
+                Falls through to the credit path, which a plan-only account cannot satisfy. Check
+                redis-accounts reachability.
+
+          # Denials are the gate working as designed, so this is deliberately a warning and
+          # deliberately rate-based: a spike after a deploy or a flag flip is the signal that
+          # matters, not the steady state.
+          - alert: PlanGateDenialSpike
+            expr: increase(plan_gate_total{outcome="deny"}[15m]) > 50
+            for: 10m
+            labels:
+              severity: warning
+              component: plan-gate
+            annotations:
+              summary: "plan quota denials are elevated"
+              description: >-
+                Either a customer is genuinely over quota, or the usage figure is wrong. Cross-check
+                against StorageRollupDrift and PlansCacheStale before telling a customer they are
+                full.

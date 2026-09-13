@@ -1,5 +1,12 @@
 -- migrate:up
 
+-- ⚠️ SUPERSEDED BY 20260912090000_restore_version_lock_after_put_order_fix.sql, which holds the
+-- trigger bodies that actually ship. Read that file for the current definitions. This one is
+-- retained, and worth reading, for the INSTRUMENTED TRACE below and for the two theories it
+-- disproves -- a pinned snapshot, and marking the helpers VOLATILE. Both are the obvious cheap
+-- fixes, both were tried, and neither works; that reasoning has nowhere else to live. It is also
+-- an INCOMPLETE fix in its own right: it locks only the outgoing version. See the note at the end.
+
 -- Stop the storage counter over-billing under concurrent overwrites of the same object key.
 --
 -- THE BUG. `bucket_storage_usage` drifted UPWARD whenever two writers overwrote one key at the

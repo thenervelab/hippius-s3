@@ -26,6 +26,7 @@ from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.writer.types import AppendPreconditionFailed
+from hippius_s3.writer.types import BadDigest
 from hippius_s3.writer.types import EmptyAppendError
 from hippius_s3.writer.types import ObjectNotFound
 from hippius_s3.writer.types import PreconditionFailed
@@ -65,6 +66,7 @@ async def handle_append(
     object_key: str,
     body_iter: AsyncIterator[bytes],
     if_none_match: bool = False,
+    expected_md5: bytes | None = None,
 ) -> Response:
     """Handle append PUT with ETag CAS and atomic update.
 
@@ -134,12 +136,16 @@ async def handle_append(
                 account_address=request.state.main_account_id,
                 body_iter=body_iter,
                 if_none_match=if_none_match,
+                expected_md5=expected_md5,
             )
         except PreconditionFailed:
             # If-None-Match: * on a key that exists, judged under append's own object lock. Nothing
             # was appended. A key that does NOT exist raises ObjectNotFound below instead, so a
             # create-only append is always an error — see docs/s4.md.
             return errors.precondition_failed_response()
+        except BadDigest:
+            # Content-MD5 covers this request's body, i.e. the appended bytes.
+            return errors.bad_digest_response()
         except AppendPreconditionFailed as exc:
             return errors.s3_error_response(
                 code="PreconditionFailed",

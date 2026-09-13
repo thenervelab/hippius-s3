@@ -203,7 +203,7 @@ on — flipping the flag on the api is then a config change, not a cold-cache ev
 
 **This pod being down is not an outage.** Neither hash has a TTL and `redis-accounts` is
 `noeviction` + AOF, so the last known good roll keeps serving through an api.hippius.com outage and
-across a Redis restart. Alert on `plans_cache_age_seconds`, not on pod restarts.
+across a Redis restart. Alert on `plans_cache_age_seconds`, not on pod restarts. CAVEAT: a value threshold on that gauge cannot fire for the failure it is named for -- a worker that is DOWN emits nothing at all, and `depth` is sampled right after a drain so it reads ~0 by construction. The alert that works is ABSENCE: no `storage_rollup_cycles_total` samples for N minutes. There are currently zero alert rules loaded cluster-wide, so this is a promise with nothing behind it.
 
 Three invariants, all in [hippius_s3/services/plans_cache.py](../hippius_s3/services/plans_cache.py),
 each of which exists to stop the same failure — silently demoting plan customers to pay-as-you-go
@@ -243,7 +243,7 @@ Two jobs in one loop:
 | Job | Interval | What it does |
 |---|---|---|
 | **Compact** | `HIPPIUS_USAGE_ROLLUP_LOOP_SLEEP` (5s) | Claims `HIPPIUS_USAGE_ROLLUP_BATCH_SIZE` (5000) ledger rows with `DELETE ... RETURNING` and adds them to the counter. |
-| **Reconcile** | `HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS` (300s) | Fully recomputes `HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE` (200) live buckets, oldest-recomputed first, and exports the correction as **drift**. ~19h for a full sweep, which is the only bound on how long a bucket can carry a wrong number — see the rate justification in [config.py](../hippius_s3/config.py). |
+| **Reconcile** | `HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS` (300s) | Fully recomputes `HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE` (50) live buckets, oldest-recomputed first, and exports the correction as **drift**. ~5.6h for a full sweep over prod's ~3,350 live buckets, which is the only bound on how long a bucket can carry a wrong number. These are the heaviest aggregates in the schema and they run on the PRIMARY — a cold 200-bucket pass measured 35.9s / 9.8 GiB of buffer traffic, which is why the rate is 50 and not 200. Read the justification in [config.py](../hippius_s3/config.py) before changing either number. |
 
 **Compaction is exactly-once by construction.** The rows leave the ledger in the same transaction
 that adds them to the counter, so a crash puts them back and a second compactor can only see rows

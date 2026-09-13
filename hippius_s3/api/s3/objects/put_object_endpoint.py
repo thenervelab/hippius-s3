@@ -17,7 +17,9 @@ from starlette.requests import ClientDisconnect
 from hippius_s3 import utils
 from hippius_s3.api.middlewares.tracing import set_span_attributes
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import InvalidContentMD5
 from hippius_s3.api.s3.common import UnsupportedConditionalWrite
+from hippius_s3.api.s3.common import parse_content_md5
 from hippius_s3.api.s3.common import parse_write_if_none_match
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.extensions.append import handle_append
@@ -30,6 +32,7 @@ from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.writer.types import BadDigest
 from hippius_s3.writer.types import PreconditionFailed
 
 
@@ -79,6 +82,13 @@ async def handle_put_object(
         lock_rejection = validate_lock_intent(request)
         if lock_rejection is not None:
             return lock_rejection
+
+        # Content-MD5 (RFC 1864). Parsed before the body is read, so a malformed header costs no
+        # upload; whether it MATCHES is only known once the writer has hashed the body.
+        try:
+            expected_md5 = parse_content_md5(request.headers.get("content-md5"))
+        except InvalidContentMD5:
+            return await utils.respond_before_body(request, errors.invalid_digest_response())
 
         # Conditional create (If-None-Match: *). Header-only, so it is refused before any DB work or
         # body read; the existence check itself runs inside the writer's reserve transaction.
@@ -149,6 +159,7 @@ async def handle_put_object(
                     object_key=object_key,
                     body_iter=utils.iter_request_body(request),
                     if_none_match=if_none_match,
+                    expected_md5=expected_md5,
                 )
         else:
             bucket_id = forwarded_bucket_id
@@ -203,6 +214,7 @@ async def handle_put_object(
                 storage_version=config.target_storage_version,
                 body_iter=utils.iter_request_body(request),
                 if_none_match=if_none_match,
+                expected_md5=expected_md5,
             )
 
             set_span_attributes(
@@ -313,6 +325,12 @@ async def handle_put_object(
         logger.info("PutObject %s/%s: If-None-Match: * and the key exists", bucket_name, object_key)
         # Refused at reserve, the body is still unread; at finalize it is already consumed (no-op).
         return await utils.respond_before_body(request, errors.precondition_failed_response())
+
+    except BadDigest as exc:
+        # Same end state as a disconnect: the reserved version was never finalized, so the key still
+        # serves what it held before this request.
+        logger.info("PutObject %s/%s rejected: %s", bucket_name, object_key, exc)
+        return errors.bad_digest_response()
 
     except ClientDisconnect:
         # iter_request_body drives request.stream(), which raises when the peer goes away mid-body
