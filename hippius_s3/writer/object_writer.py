@@ -35,6 +35,7 @@ from hippius_s3.utils import get_query
 from hippius_s3.writer.db import ensure_upload_row
 from hippius_s3.writer.db import upsert_object_basic
 from hippius_s3.writer.types import AppendPreconditionFailed
+from hippius_s3.writer.types import BadDigest
 from hippius_s3.writer.types import CompleteResult
 from hippius_s3.writer.types import EmptyAppendError
 from hippius_s3.writer.types import ObjectNotFound
@@ -198,6 +199,7 @@ class ObjectWriter:
         metadata: dict[str, Any],
         storage_version: int | None = None,
         body_iter: AsyncIterator[bytes],
+        expected_md5: bytes | None = None,
     ) -> PutResult:
         """Upsert destination object and write content (single-part) using a streaming iterator.
 
@@ -435,6 +437,12 @@ class ObjectWriter:
                     with contextlib.suppress(BaseException):
                         await consumer_task
 
+        # Content-MD5: refuse before anything makes this version visible. It stays in the inert
+        # placeholder shape a disconnected PUT leaves (size/md5 unset, no FS meta), so reads keep
+        # resolving to whatever the key held before, and the orphan sweep reclaims it.
+        if expected_md5 is not None and hasher.digest() != expected_md5:
+            raise BadDigest(expected=expected_md5, actual=hasher.digest())
+
         # Write FS meta BEFORE making this version visible in DB.
         # The download query skips versions with size=0/md5='', so the version
         # only becomes serveable after update_object_version_metadata sets size/md5.
@@ -645,6 +653,7 @@ class ObjectWriter:
         part_number: int,
         body_iter: AsyncIterator[bytes],
         max_size_bytes: int | None = None,
+        expected_md5: bytes | None = None,
     ) -> PartResult:
         chunk_size = self.config.object_chunk_size_bytes
         ttl = self.config.cache_ttl_seconds
@@ -826,6 +835,11 @@ class ObjectWriter:
             await consumer_task
             if consumer_error:
                 raise consumer_error
+
+            if expected_md5 is not None and hasher.digest() != expected_md5:
+                # Before publish, so the `finally` below discards this attempt's staged set and the
+                # part keeps whatever an earlier attempt published.
+                raise BadDigest(expected=expected_md5, actual=hasher.digest())
 
             # Publishing renames this attempt's staged set onto the canonical chunk names,
             # trims any stale tail, and writes meta.json — one operation under a per-part lock,
@@ -1023,8 +1037,14 @@ class ObjectWriter:
         expected_version: int,
         account_address: str,
         body_iter: AsyncIterator[bytes],
+        expected_md5: bytes | None = None,
     ) -> dict:
-        """Append bytes with CAS, cache write-through, and enqueue (streaming)."""
+        """Append bytes with CAS, cache write-through, and enqueue (streaming).
+
+        ``expected_md5`` is the request's Content-MD5, i.e. the digest of the appended bytes. A
+        mismatch raises BadDigest from the part stream before the delta part is published, and the
+        part row reserved for it is deleted like on any other part-stream failure.
+        """
         row = await self.pool.fetchrow(
             """
             SELECT o.object_id, o.current_object_version AS cov
@@ -1207,6 +1227,7 @@ class ObjectWriter:
                 part_number=int(next_part),
                 body_iter=body_iter,
                 max_size_bytes=0,
+                expected_md5=expected_md5,
             )
         except ValueError as exc:
             await _delete_part_row()

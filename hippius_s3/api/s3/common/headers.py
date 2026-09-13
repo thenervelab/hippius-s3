@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 from typing import Any
@@ -142,3 +144,26 @@ def build_headers(
                 if k != "ipfs" and not isinstance(v, dict):
                     headers[f"x-amz-meta-{k}"] = str(v)
     return headers
+
+
+class InvalidContentMD5(ValueError):
+    """A Content-MD5 header that is present but is not the base64 of a 16-byte digest."""
+
+
+def parse_content_md5(header_value: str | None) -> bytes | None:
+    """Decode a Content-MD5 header (RFC 1864: base64 of the 16-byte MD5 of the request body).
+
+    Returns None when the header is absent. Raises InvalidContentMD5 when it is present but malformed,
+    which S3 answers with 400 InvalidDigest — a different error from a well-formed digest that simply
+    does not match the body (400 BadDigest), which only the writer can detect once it has read the body.
+    """
+    if header_value is None:
+        return None
+    value = header_value.strip()
+    try:
+        digest = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise InvalidContentMD5(value) from exc
+    if len(digest) != 16:
+        raise InvalidContentMD5(value)
+    return digest

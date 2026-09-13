@@ -1,5 +1,6 @@
 """Utility functions for the Hippius S3 service."""
 
+import asyncio
 import dataclasses
 import functools
 import logging
@@ -17,6 +18,7 @@ from typing import TypeVar
 
 import asyncpg
 from fastapi import Request
+from starlette.responses import Response
 
 
 T = TypeVar("T")
@@ -118,6 +120,51 @@ async def iter_request_body(request: Request) -> AsyncIterator[bytes]:
         del buffer[:2]
         if data:
             yield data
+
+
+DRAIN_MAX_BYTES = 8 * 1024 * 1024
+DRAIN_TIMEOUT_SECONDS = 10.0
+
+
+async def _read_body_to_end(request: Request, limit: int) -> bool:
+    read = 0
+    async for chunk in request.stream():
+        read += len(chunk)
+        if read > limit:
+            return False
+    return True
+
+
+async def drain_request_body(request: Request) -> bool:
+    """Read and discard whatever is left of the request body, before an early response.
+
+    Answering a request whose body is still pending poisons a kept-alive connection: the unread
+    bytes — or, under ``Expect: 100-continue``, the body the client goes on to send — are parsed as
+    the start of the next request, so the client's NEXT call on that connection fails with a bare
+    400 that never reaches the app. Reading the stream also sends the interim 100 Continue. Same
+    reason as extensions.append._drain.
+
+    Returns False when the body was NOT fully consumed: declared larger than DRAIN_MAX_BYTES, still
+    arriving after DRAIN_TIMEOUT_SECONDS, or the client vanished. A request we have already decided
+    to reject must never cost us a whole multi-GB ingest, so past that point the caller closes the
+    connection instead of draining it — see respond_before_body.
+    """
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > DRAIN_MAX_BYTES:
+        return False
+    try:
+        return await asyncio.wait_for(_read_body_to_end(request, DRAIN_MAX_BYTES), DRAIN_TIMEOUT_SECONDS)
+    except Exception:
+        # Best-effort: a disconnect or a timeout mid-drain leaves a partially consumed stream, which
+        # is exactly the poison case — the caller closes the connection on False, so it cannot be reused.
+        return False
+
+
+async def respond_before_body(request: Request, response: Response) -> Response:
+    """Answer a request whose body was never read: drain it when that is cheap, else close."""
+    if not await drain_request_body(request):
+        response.headers["connection"] = "close"
+    return response
 
 
 async def get_request_body(request: Request) -> bytes:

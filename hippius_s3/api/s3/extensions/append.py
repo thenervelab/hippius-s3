@@ -26,6 +26,7 @@ from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.writer.types import AppendPreconditionFailed
+from hippius_s3.writer.types import BadDigest
 from hippius_s3.writer.types import EmptyAppendError
 from hippius_s3.writer.types import ObjectNotFound
 
@@ -63,6 +64,7 @@ async def handle_append(
     bucket_name: str,
     object_key: str,
     body_iter: AsyncIterator[bytes],
+    expected_md5: bytes | None = None,
 ) -> Response:
     """Handle append PUT with ETag CAS and atomic update.
 
@@ -131,7 +133,11 @@ async def handle_append(
                 expected_version=int(expected_version),
                 account_address=request.state.main_account_id,
                 body_iter=body_iter,
+                expected_md5=expected_md5,
             )
+        except BadDigest:
+            # Content-MD5 covers this request's body, i.e. the appended bytes.
+            return errors.bad_digest_response()
         except AppendPreconditionFailed as exc:
             return errors.s3_error_response(
                 code="PreconditionFailed",

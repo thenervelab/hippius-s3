@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import hashlib
 import uuid
 from typing import Any
 from typing import AsyncIterator
@@ -10,6 +11,7 @@ from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import PoolAcquireTimeout
 from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.writer.types import BadDigest
 from tests.unit._fake_pool import make_fake_pool
 
 
@@ -268,3 +270,38 @@ async def test_meta_written_to_fs_once(counting_writer: Any) -> None:
     writer, fs_store = counting_writer
     await _run(writer, b"hello world")
     assert fs_store.meta_calls == [1], f"meta written {len(fs_store.meta_calls)} times, expected once"
+
+
+async def _run_with_md5(writer: ObjectWriter, expected_md5: bytes, *pieces: bytes) -> Any:
+    return await writer.put_simple_stream_full(
+        bucket_id=str(uuid.uuid4()),
+        bucket_name="bkt",
+        object_id=str(uuid.uuid4()),
+        object_key="k/obj.json",
+        account_address="acct",
+        content_type="application/json",
+        metadata={},
+        body_iter=_body(*pieces),
+        expected_md5=expected_md5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_matching_content_md5_is_accepted(patched_writer: Any) -> None:
+    writer, _pool, _ = patched_writer
+    res = await _run_with_md5(writer, hashlib.md5(b"hello world").digest(), b"hello ", b"world")
+    assert res.etag == hashlib.md5(b"hello world").hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_mismatched_content_md5_never_finalizes_the_version(patched_writer: Any, tmp_path: Any) -> None:
+    """The reserve ran, but nothing that makes the version serveable may: no tail transaction (so
+    size/md5 stay unset and reads keep serving the previous version) and no FS meta."""
+    writer, pool, captured = patched_writer
+    with pytest.raises(BadDigest):
+        await _run_with_md5(writer, hashlib.md5(b"something else").digest(), b"hello world")
+
+    assert pool.acquire_count == 1, "only the head (reserve) scope may run"
+    assert "tail_conn_ensure" not in captured
+    assert not any("body_blake3 = $8" in (e.get("query") or "") for e in pool.events), "version was finalized"
+    assert list(tmp_path.rglob("meta.json")) == [], "FS meta was written for a rejected body"

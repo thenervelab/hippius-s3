@@ -56,3 +56,12 @@ class ObjectNotFound(Exception):
 
 class EmptyAppendError(Exception):
     pass
+
+
+class BadDigest(Exception):
+    """The MD5 of the body the writer received does not match the client's Content-MD5."""
+
+    def __init__(self, *, expected: bytes, actual: bytes) -> None:
+        super().__init__(f"Content-MD5 mismatch: expected {expected.hex()}, received {actual.hex()}")
+        self.expected = expected
+        self.actual = actual

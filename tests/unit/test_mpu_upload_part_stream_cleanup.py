@@ -1,3 +1,4 @@
+import hashlib
 import uuid
 from pathlib import Path
 from typing import AsyncIterator
@@ -7,6 +8,7 @@ import pytest
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.config import get_config
 from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.writer.types import BadDigest
 
 
 @pytest.mark.asyncio
@@ -131,3 +133,77 @@ async def test_mpu_part_uses_passed_bucket_id_no_internal_query(tmp_path, monkey
         )
     finally:
         cfg.object_chunk_size_bytes, cfg.max_multipart_part_size, cfg.cache_ttl_seconds = saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matches", [True, False])
+async def test_mpu_part_content_md5(tmp_path, monkeypatch, matches):
+    """A part whose body matches its Content-MD5 is published; one that doesn't raises BadDigest
+    before publish, so no meta.json, no readable chunks and no parts row."""
+    cfg = get_config()
+    monkeypatch.setattr("hippius_s3.writer.object_writer.get_config", lambda: cfg)
+
+    placeholders: list[dict] = []
+
+    async def fake_placeholder(_db, **kw):
+        placeholders.append(kw)
+
+    async def fake_persist_hash(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr("hippius_s3.writer.object_writer.upsert_part_placeholder", fake_placeholder)
+    monkeypatch.setattr("hippius_s3.writer.object_writer.persist_version_hash", fake_persist_hash)
+
+    class DummyPool:
+        async def fetchrow(self, *_args, **_kwargs):
+            return None
+
+        async def fetchval(self, *_args, **_kwargs):
+            return None
+
+        async def execute(self, *_args, **_kwargs):
+            return None
+
+    class DummyRedis:
+        async def delete(self, *_args, **_kwargs):
+            return 1
+
+        async def setex(self, *_args, **_kwargs):
+            return None
+
+    async def fake_ensure_dek(*_args, **_kwargs) -> bytes:
+        return b"\x00" * 32
+
+    body = b"part body bytes"
+    expected = hashlib.md5(body if matches else b"different bytes").digest()
+
+    async def body_iter() -> AsyncIterator[bytes]:
+        yield body
+
+    object_id = str(uuid.uuid4())
+    fs_store = FileSystemPartsStore(str(tmp_path))
+    writer = ObjectWriter(pool=DummyPool(), redis_client=DummyRedis(), fs_store=fs_store)
+    monkeypatch.setattr(writer, "_ensure_and_get_v5_dek", fake_ensure_dek)
+
+    kwargs = {
+        "upload_id": "upload",
+        "object_id": object_id,
+        "object_version": 1,
+        "bucket_name": "bucket",
+        "bucket_id": "bucket",
+        "account_address": "acct",
+        "part_number": 1,
+        "body_iter": body_iter(),
+        "expected_md5": expected,
+    }
+    if matches:
+        res = await writer.mpu_upload_part_stream(**kwargs)
+        assert res.etag == hashlib.md5(body).hexdigest()
+        assert await fs_store.get_meta(object_id, 1, 1) is not None
+        assert len(placeholders) == 1
+    else:
+        with pytest.raises(BadDigest):
+            await writer.mpu_upload_part_stream(**kwargs)
+        assert not (Path(fs_store.part_path(object_id, 1, 1)) / "meta.json").exists()
+        assert await fs_store.get_chunk(object_id, 1, 1, 0) is None
+        assert placeholders == [], "a rejected part must not get a parts row"
