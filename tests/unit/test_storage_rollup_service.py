@@ -193,3 +193,39 @@ async def test_drift_is_still_loud_once_the_backfill_has_run(caplog: pytest.LogC
 
     assert "STORAGE_ROLLUP_DRIFT" in caplog.text
     assert "STORAGE_ROLLUP_SEEDING" not in caplog.text
+
+
+def test_pre_backfill_seeding_is_not_reported_as_drift_to_the_metrics() -> None:
+    """The seeding-vs-drift distinction has to hold for the METRIC, not just the log line.
+
+    #512 fixed the log: before the backfill every recompute legitimately moves a counter off zero,
+    so it is logged as STORAGE_ROLLUP_SEEDING at INFO rather than STORAGE_ROLLUP_DRIFT at ERROR.
+    But `record_storage_rollup_recompute` increments `storage_rollup_drifted_buckets_total` on ANY
+    non-zero drift_bytes, so the metric did not get the same treatment -- and the alert added in
+    this release is `increase(storage_rollup_drifted_buckets_total[1h]) > 0`.
+
+    On a production rollout that fires from the first reconcile pass and keeps firing for the whole
+    pre-backfill window, which is precisely the cry-wolf failure the log fix existed to prevent.
+    Whichever half is left ungated makes the other pointless.
+    """
+    seeding = storage_rollup_service.RecomputeResult(
+        bucket_id=uuid.uuid4(), bytes_before=0, bytes_after=1_000_000, seeding=True
+    )
+    real = storage_rollup_service.RecomputeResult(
+        bucket_id=uuid.uuid4(), bytes_before=1_000_000, bytes_after=1_000_500, seeding=False
+    )
+
+    assert seeding.drift_bytes == 1_000_000, "the raw delta is still reported, for the seeding log"
+    assert not seeding.counts_as_drift, (
+        "a pre-backfill seeding recompute was flagged as drift; the alert would fire for the whole rollout window"
+    )
+    assert real.counts_as_drift, "a post-backfill correction must still count as drift"
+
+
+def test_a_zero_delta_is_never_drift_either_way() -> None:
+    """The steady state: every bucket already correct, nothing reported, on both paths."""
+    for seeding in (True, False):
+        result = storage_rollup_service.RecomputeResult(
+            bucket_id=uuid.uuid4(), bytes_before=4096, bytes_after=4096, seeding=seeding
+        )
+        assert not result.counts_as_drift

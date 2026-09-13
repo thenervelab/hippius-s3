@@ -101,7 +101,7 @@ the plans-cacher — quota from upstream, usage counted by that worker in the ba
 therefore a single Redis `HGET` and a pure comparison, with no database work on the request path.
 
 The cost, stated plainly: usage is only as fresh as the last refresh
-(`HIPPIUS_PLANS_LOOP_SLEEP`, 10 min), and a denial is **not** re-checked live. A customer who
+(`HIPPIUS_PLANS_LOOP_SLEEP`, **2 min**), and a denial is **not** re-checked live. A customer who
 deletes data to get back under quota stays refused until the next cycle. The refresh interval is the
 only lever on that, and the 402 message says so.
 

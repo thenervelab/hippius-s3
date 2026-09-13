@@ -13,6 +13,7 @@ Three operations, in increasing cost:
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import uuid
 from dataclasses import dataclass
@@ -47,11 +48,28 @@ class RecomputeResult:
     bucket_id: uuid.UUID
     bytes_before: int
     bytes_after: int
+    # Whether this recompute ran BEFORE the backfill, i.e. whether a non-zero delta means "this
+    # counter was never seeded" rather than "a write path is unaccounted for". Carried per result so
+    # each one is self-describing at the point the metric is recorded; it is a per-PASS fact that
+    # reconcile_buckets stamps onto every row it returns.
+    seeding: bool = False
 
     @property
     def drift_bytes(self) -> int:
         """How wrong the counter was. Expected ZERO -- anything else is an unaccounted write path."""
         return self.bytes_after - self.bytes_before
+
+    @property
+    def counts_as_drift(self) -> bool:
+        """Whether this should reach the drift METRIC, and so the drift alert.
+
+        The seeding-vs-drift distinction has to hold for the metric, not only the log. Before the
+        backfill every recompute legitimately moves a counter off zero, so counting those as drift
+        makes `increase(storage_rollup_drifted_buckets_total[1h]) > 0` fire from the first reconcile
+        pass and keep firing for the whole pre-backfill window -- the exact cry-wolf failure the log
+        gating was added to prevent. Gating one half and not the other makes both pointless.
+        """
+        return bool(self.drift_bytes) and not self.seeding
 
 
 async def compact_once(conn: Any, batch_size: int) -> CompactionResult:
@@ -180,6 +198,7 @@ async def reconcile_buckets(
             )
             continue
 
+        result = dataclasses.replace(result, seeding=not ready)
         results.append(result)
         if not result.drift_bytes:
             continue
