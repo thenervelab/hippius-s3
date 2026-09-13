@@ -2033,3 +2033,80 @@ async def test_the_two_rollup_tables_carry_queue_shaped_storage_parameters(
     assert "fillfactor" in opts["bucket_storage_usage"], (
         f"bucket_storage_usage needs page headroom for HOT updates: {opts['bucket_storage_usage']!r}"
     )
+
+
+async def test_an_mpu_initiate_over_an_existing_key_then_a_failed_conditional_complete(
+    pg_tx: asyncpg.Connection,
+) -> None:
+    """#523's If-None-Match on CompleteMultipartUpload interacts with the counter. Prove it converges.
+
+    The sequence nobody had tested, and the reason it looked risky: InitiateMultipartUpload over an
+    existing key is a REPOINT -- upsert_object_multipart points current_object_version at a fresh
+    zero-size version, so the objects UPDATE trigger emits a full decrement of the outgoing version.
+    If the completion then fails its If-None-Match check, multipart.py returns 412 and "nothing was
+    committed", so that decrement is never balanced by a completion adding the size back.
+
+    The question is whether the counter is left disagreeing with ground truth. It is not: the oracle
+    counts only `current_object_version`, which IS the empty placeholder, so truth is also 0. Both
+    sides move together and the rollup's invariant holds.
+
+    Written because the reasoning above is exactly the kind that is right until it isn't -- the
+    decrement and the truth definition are in different files, changed by different people.
+    """
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+
+    # A live object worth 5000 bytes.
+    await _put(pg_tx, bucket_id, "conditional", 5000)
+    await _compact(pg_tx)
+    assert await _assert_matches_oracle(pg_tx, acct) == 5000
+
+    # MPU initiate over the SAME key: repoints current onto a fresh zero-size version.
+    await _reserve(pg_tx, bucket_id, "conditional", multipart=True)
+    await _compact(pg_tx)
+
+    # The completion fails its precondition, so nothing further is written. Counter must still agree
+    # with the canonical query -- both now see the empty placeholder as current.
+    assert await _assert_matches_oracle(pg_tx, acct) == 0, (
+        "the counter disagrees with get_account_storage_bytes.sql after an initiate whose completion "
+        "was refused; the initiate's decrement was not matched by the truth definition"
+    )
+
+    # And it recovers: a later successful completion of that version adds the real size back.
+    row = await pg_tx.fetchrow(
+        "SELECT object_id, current_object_version FROM objects WHERE bucket_id = $1 AND object_key = $2",
+        bucket_id,
+        "conditional",
+    )
+    await pg_tx.execute(
+        "UPDATE object_versions SET md5_hash = 'etag-1', size_bytes = 9000, last_modified = NOW(),"
+        " status = 'publishing' WHERE object_id = $1 AND object_version = $2",
+        row["object_id"],
+        row["current_object_version"],
+    )
+    await _compact(pg_tx)
+    assert await _assert_matches_oracle(pg_tx, acct) == 9000
+
+
+async def test_the_mpu_upsert_still_creates_the_objects_row_and_its_version_in_one_statement(
+    pg_tx: asyncpg.Connection,
+) -> None:
+    """Rule 3 of hippius_s3/sql/CLAUDE.md, re-asserted because #523 reworked this exact query.
+
+    upsert_object_multipart is one of the four allocators the trigger design depends on. Split the
+    objects INSERT from the object_versions INSERT across two statements and the objects INSERT
+    trigger finds no version yet -- and there is deliberately NO object_versions INSERT trigger to
+    catch up, so the write emits NOTHING and the bucket silently under-counts until the next
+    reconcile. The conditional-write rework added a `prev` CTE and an `object_names` DELETE to this
+    statement, so the property is worth re-proving rather than assuming.
+    """
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+
+    # A NEW key, initiated at a non-zero size so a missed emit would show as a zero.
+    await _reserve(pg_tx, bucket_id, "fresh-mpu", size=7000, multipart=True)
+
+    assert await _ledger_rows(pg_tx, bucket_id) == [7000], (
+        "the MPU upsert emitted no delta for a new object, which means the objects row and its first "
+        "version are no longer created in the same statement"
+    )
