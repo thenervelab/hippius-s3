@@ -336,7 +336,7 @@ middleware chain or resolving the bucket owner twice. Size it first with a cross
 ### P1 — Billing plans: nothing accumulates bytes admitted between refreshes
 
 Every request compares against the same cached `used_bytes` until the next plans-cacher cycle, so
-within a 10-minute window the quota bounds nothing: an account at 9.9/10 TiB can issue an unbounded
+within one refresh window the quota bounds nothing: an account at 9.9/10 TiB can issue an unbounded
 number of 100 GiB PUTs, each of which individually "fits". With concurrent clients that is
 effectively unlimited, not "one cycle's worth".
 
@@ -348,11 +348,28 @@ time.
 
 ### P2 — Billing plans: enforcement lags by one refresh interval, in both directions
 
-Usage is counted by the plans-cacher every `HIPPIUS_PLANS_LOOP_SLEEP` (10 min), and nothing on the
+Usage is counted by the plans-cacher every `HIPPIUS_PLANS_LOOP_SLEEP` (**2 min** since #515; this
+figure IS the bound on overshoot, so keep it accurate), and nothing on the
 request path recomputes. So an account can overshoot its quota by one cycle's worth of uploads, and
 — the sharper edge — a customer who deletes data to get back under stays refused until the next
 cycle. The 402 message says as much, but the real levers are the interval itself, or re-checking on
-the denial path (deliberately not done: it would put an unbounded query in front of a live upload).
+the denial path.
+
+**That second lever is now viable and this entry's old reasoning is stale.** It used to say
+"deliberately not done: it would put an unbounded query in front of a live upload" — true when usage
+meant an O(objects) aggregate, false since the rollup: the read is one indexed SUM, measured at
+~1ms of database time (11.3ms wall for the largest account's 2,024 buckets). A live read on the
+DENIAL path only — allow stays a pure cache hit — closes the sharper half of this: a customer who
+just deleted data stops being refused for a full cycle. Bound it with the asyncpg timeout already
+threaded through, and keep it well inside **1 second**, because botocore waits exactly
+`wait_for_read(sock, 1)` for a `100-continue` and curl's `CURLOPT_EXPECT_100_TIMEOUT_MS` is also
+1000ms — blow that budget and the client gives up waiting and sends the body anyway.
+
+Prior art, for whoever picks this up: OpenStack Nova replaced its reserve/commit/rollback quota
+ledger with exactly "count at the point of the operation, then recheck" and documented why the
+ledger had to go — it "required being very thorough to keep track of everything … producing
+hard-to-find bugs" and drifted out of sync when services died mid-operation. Do not build a
+reservation table here; our drain-direct pipeline has the same mid-operation death case.
 
 ### P2 — Billing plans: an overwrite is charged as if it were additive
 
