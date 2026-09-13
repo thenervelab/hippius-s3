@@ -237,6 +237,38 @@ at 50/300s over the 3,353 live buckets (of 49,047 total), so a handful of clean 
 
 ---
 
+## Step 3.6 — Activate the alerts (MANUAL — nothing in CI does this)
+
+⚠️ **The 8 alerting rules live in `k8s/otel/values/prometheus.yaml`, and no workflow applies that
+file.** `k8s/otel/install.sh` is run by hand. Verified: `grep -rn "k8s/otel" .github/workflows/`
+returns nothing, and the live `prometheus-server` ConfigMap key `alerting_rules.yml` still contains
+`{}`.
+
+So merging the release does **not** give you the alerts. Until this step runs,
+`/api/v1/rules` returns zero groups and none of the safety net described in
+[storage-usage-rollup.md](storage-usage-rollup.md) exists.
+
+```bash
+# from the repo root, against the monitoring namespace
+helm upgrade --install prometheus prometheus-community/prometheus \
+  -n monitoring -f k8s/otel/values/prometheus.yaml
+```
+
+Then confirm they loaded — this is the check, not the helm exit code:
+
+```bash
+kubectl -n monitoring port-forward svc/prometheus-server 9090:80 &
+curl -s localhost:9090/api/v1/rules | python3 -c "import json,sys; \
+  print(len(json.load(sys.stdin)['data']['groups']), 'groups')"
+```
+
+Expect **2 groups / 8 rules**. `promtool check rules` was run against this file during development
+(SUCCESS, 8 rules), so a load failure means the helm values did not reach the ConfigMap, not that
+the PromQL is wrong.
+
+`alertmanager` is disabled in this release, so these surface as firing alerts in the Prometheus UI
+and Grafana's alert list — they do not page anyone. Routing is a separate piece of work.
+
 ## Step 4 — Confirm pay-as-you-go is untouched
 
 Before touching the flag, prove the release changed nothing for the accounts that are actually live.
