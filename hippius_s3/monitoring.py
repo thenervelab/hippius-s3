@@ -1082,10 +1082,15 @@ class MetricsCollector:
         if rows:
             self.storage_rollup_compacted_rows_total.add(rows)
 
-    def record_storage_rollup_recompute(self, drift_bytes: int) -> None:
+    def record_storage_rollup_recompute(self, drift_bytes: int, counts_as_drift: bool = True) -> None:
+        """`counts_as_drift` is False for a PRE-BACKFILL seeding recompute.
+
+        Without it, seeding increments the drift counter and the StorageRollupDrift alert fires for
+        the entire rollout window -- see RecomputeResult.counts_as_drift.
+        """
         self.storage_rollup_reconciled_total.add(1)
         self.storage_rollup_drift_bytes.record(abs(drift_bytes))
-        if drift_bytes:
+        if counts_as_drift:
             self.storage_rollup_drifted_buckets_total.add(1)
 
     def record_storage_rollup_ledger(self, depth: int, lag_seconds: int, negative_buckets: int) -> None:
