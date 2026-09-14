@@ -131,7 +131,11 @@ serverFiles:
           # Only reachable if a decrement was recorded without its increment, i.e. a real defect in
           # the trigger set. The reconciler repairs the value but not the cause.
           - alert: StorageRollupNegativeCounter
-            expr: storage_rollup_negative_buckets > 0
+            # _ratio, not the bare instrument name: the OTel->Prometheus exporter appends it to a
+            # GAUGE declared unit="1" (monitoring.py). Counters (unit="1" too) and unit="s" gauges
+            # keep their names, which is why only this rule and the ledger-depth gauge are affected.
+            # Change the instrument's unit and you must change this expr.
+            expr: storage_rollup_negative_buckets_ratio > 0
             for: 15m
             labels:
               severity: warning

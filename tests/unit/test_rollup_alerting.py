@@ -73,9 +73,11 @@ def test_every_metric_referenced_by_a_rule_is_actually_emitted() -> None:
 
     for rule in _all_rules():
         expr = rule["expr"]
-        # Metric-shaped identifiers, minus PromQL functions/keywords and the histogram suffixes.
+        # Metric-shaped identifiers, minus PromQL functions/keywords and the exporter's suffixes:
+        # _bucket/_count/_sum on histograms, and _ratio on a unit="1" gauge (see the EXPORTED-name
+        # test below -- that suffix is why this check alone was not enough).
         for token in set(re.findall(r"\b([a-z_][a-z0-9_]{6,})\b", expr)):
-            base = re.sub(r"_(bucket|count|sum)$", "", token)
+            base = re.sub(r"_(bucket|count|sum|ratio)$", "", token)
             if base in {"absent_over_time", "increase", "changes", "success", "outcome", "namespace", "exported_job"}:
                 continue
             if base.startswith(("storage_rollup", "plans_cach", "plan_gate")) and base not in monitoring:
@@ -84,6 +86,45 @@ def test_every_metric_referenced_by_a_rule_is_actually_emitted() -> None:
     assert not unknown, (
         "these rules reference metrics that hippius_s3/monitoring.py does not define, so they can "
         "never fire:\n  " + "\n  ".join(unknown)
+    )
+
+
+def _gauge_units() -> dict[str, str]:
+    """Every create_gauge in monitoring.py, mapped name -> declared unit."""
+    monitoring = _MONITORING.read_text()
+    units: dict[str, str] = {}
+    for block in re.findall(r"create_gauge\((.*?)\)\n", monitoring, re.DOTALL):
+        name = re.search(r'name="([a-z0-9_]+)"', block)
+        unit = re.search(r'unit="([^"]*)"', block)
+        if name and unit:
+            units[name.group(1)] = unit.group(1)
+    return units
+
+
+def test_rules_use_the_EXPORTED_gauge_name_not_the_instrument_name() -> None:
+    """The OTel->Prometheus exporter appends `_ratio` to a GAUGE declared unit="1".
+
+    Checking the rule's metric against monitoring.py's *instrument* name passes while the rule is
+    silently dead, because the series Prometheus actually stores is the suffixed one. That is how
+    StorageRollupNegativeCounter shipped pointing at `storage_rollup_negative_buckets` when only
+    `storage_rollup_negative_buckets_ratio` exists -- found on prod 2026-09-14, after the unit test
+    that was supposed to cover exactly this had passed.
+    """
+    units = _gauge_units()
+    assert units, "parsed no create_gauge declarations -- this guard would vacuously pass"
+
+    dimensionless = {name for name, unit in units.items() if unit == "1"}
+    assert dimensionless, "no unit='1' gauges found; if that is deliberate, delete this test"
+
+    broken: list[str] = []
+    for rule in _all_rules():
+        for token in set(re.findall(r"\b([a-z_][a-z0-9_]{6,})\b", rule["expr"])):
+            if token in dimensionless:
+                broken.append(f"{rule['alert']}: {token} -> should be {token}_ratio")
+
+    assert not broken, (
+        "these rules name a unit='1' GAUGE by its instrument name, but Prometheus stores it with a "
+        "_ratio suffix, so the rule can never fire:\n  " + "\n  ".join(broken)
     )
 
 

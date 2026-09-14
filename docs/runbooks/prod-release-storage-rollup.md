@@ -177,10 +177,30 @@ All zeros. A non-zero count means a pod is still on step A's image — check the
 
 ---
 
-## Step 3 — The backfill (manual, ~15–20 minutes)
+## Step 3 — The backfill (manual, ~1 hour per pass)
 
 Nothing in CI/CD runs this: `k8s/backfill-bucket-storage-usage-job.yaml` is in no kustomization and
 neither deploy workflow applies it. Verified.
+
+**3.0 Turn the reconciler off first. Not optional — skipping this makes the backfill 40x slower.**
+
+```bash
+kubectl -n hippius-s3-prod set env deploy/usage-rollup HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE=0
+```
+
+`recompute_bucket_storage_usage()` serialises on **one global** advisory lock
+(`hashtext('hippius.storage_usage_rollup')`, no bucket scoping), and the reconciler calls the same
+function. Worse, its candidate queue is `ORDER BY bsu.recomputed_at ASC NULLS FIRST` — precisely the
+un-seeded buckets the backfill is walking — so the two fight over the same queue head doing
+duplicate work, and with `RECONCILE_TIMEOUT_SECONDS=300` a single reconcile pass can hold the lock
+for most of its 300s interval.
+
+Measured on prod, 2026-09-14: **19 buckets/min with the reconciler on, 790/min with it off.** The
+run was on track for ~43 hours; it finished in about one. `BUCKETS_PER_CYCLE=0` makes
+`list_buckets_for_usage_reconcile.sql` return no rows, so reconciliation no-ops while **compaction
+in the same worker keeps running** — that is why this is an env flip and not a scale-to-zero.
+
+Re-enable it in step 3.5, once `backfilled_at` is set.
 
 **3.1 Pin the image and namespace.** Two edits, both required:
 
@@ -209,10 +229,18 @@ went `0 -> truth`.
 must match the dry run's exactly — on staging they were byte-identical
 (`7,169,666,663,189` both times).
 
-Expect **~15–20 minutes** for the ~49k buckets it walks (it covers soft-deleted ones too). Safe under live traffic and safe to re-run: one bucket
+Expect **~1 hour** for the ~49k buckets it walks (it covers soft-deleted ones too), with step 3.0
+done. Measured on prod 2026-09-14: dry run 49,447 buckets in 64 min; apply comparable. Safe under
+live traffic and safe to re-run: one bucket
 per transaction, recompute SETS rather than adds, and `backfilled_at` is written **only after a
 complete pass** — so an interrupted backfill degrades to the pre-rollup behaviour, never to a wrong
 bill. It will pause on the largest bucket (millions of objects, tens of seconds); that is expected.
+
+Ledger depth goes **sawtooth** while this runs — it climbs for a minute or two while one large
+bucket holds the advisory lock, then drains to ~0 the instant that bucket commits. Peaks of a few
+hundred rows are normal and are not a compaction stall. Measured on prod 2026-09-14 the worst
+oldest-row age was **293s**, comfortably under `StorageRollupLedgerLagging`'s 900s threshold — so
+this does not by itself trip an alert, but do not read a rising depth mid-backfill as a fault.
 
 **3.4 Verify:**
 
@@ -225,7 +253,16 @@ SELECT count(*) FROM bucket_storage_usage WHERE bytes_used < 0;    -- expect 0
 The plans-cacher should publish within ~2 minutes (its poll interval) and `PlansCacheStale` should
 clear. On staging it recovered **13 seconds** after `backfilled_at` was set.
 
-**3.5 Let the reconciler confirm it.** Watch `usage-rollup` for a few cycles:
+**3.5 Turn the reconciler back on, then let it confirm the result.**
+
+```bash
+kubectl -n hippius-s3-prod set env deploy/usage-rollup HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE-
+```
+
+The trailing `-` removes the step-3.0 override so the value falls back to the `hippius-s3-defaults`
+ConfigMap (50). Do not skip this: while it is 0 there is **no drift detector and no negative-counter
+repair** — the two things step 5 relies on to tell a real refusal from a broken counter. Watch
+`usage-rollup` for a few cycles:
 
 ```
 usage-rollup reconciled 50 bucket(s), 0 changed
