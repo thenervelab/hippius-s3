@@ -160,3 +160,20 @@ spec:
   resources:
     requests:
       storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: usage-rollup
+spec:
+  template:
+    spec:
+      containers:
+        - name: usage-rollup
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

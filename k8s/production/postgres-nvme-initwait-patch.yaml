@@ -103,6 +103,20 @@ spec:
             - -c
             - until nc -z postgres-nvme-rw 5432 && nc -z redis-accounts 6379; do echo waiting for services; sleep 5; done
 ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: usage-rollup
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: wait-for-services
+          command:
+            - sh
+            - -c
+            - until nc -z postgres-nvme-rw 5432; do echo waiting for services; sleep 5; done
+---
 apiVersion: batch/v1
 kind: Job
 metadata:

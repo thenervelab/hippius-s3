@@ -76,5 +76,8 @@ async def ensure_upload_row(
         json.dumps(metadata),
         datetime.now(timezone.utc),
         uuid.UUID(object_id),
+        # key_existed_at_initiate: only CompleteMultipartUpload's If-None-Match reads it, and this
+        # row is the structural one a simple PUT or an append creates — it is never completed.
+        False,
     )
     return str(row["upload_id"]) if row else str(new_upload_id)

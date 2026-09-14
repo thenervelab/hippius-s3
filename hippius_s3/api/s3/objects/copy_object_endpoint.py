@@ -92,6 +92,16 @@ async def handle_copy_object(
         lock_rejection = validate_lock_intent(request)
         if lock_rejection is not None:
             return lock_rejection
+
+        # A copy is a write to the destination key, so an If-None-Match on it means the same
+        # create-only intent PutObject honours — and silently ignoring it is exactly how a
+        # write-once client ends up with an overwritten object. The copy paths (alias, v5 fast
+        # path, streaming) each land the destination their own way, none of them under the
+        # conditional reserve/finalize the PUT writer uses, so the create-only semantics are not
+        # implemented here yet. Refuse rather than ignore, for EVERY value including "*".
+        if request.headers.get("if-none-match") is not None:
+            return errors.conditional_write_not_implemented_response()
+
         lock_intent = lock_for_new_version(request)
         assert not isinstance(lock_intent, Response)  # validate_lock_intent already returned it
 

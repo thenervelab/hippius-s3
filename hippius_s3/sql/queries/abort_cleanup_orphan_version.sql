@@ -24,14 +24,28 @@
 -- object_versions and never advances current_object_version — it assumes initiate did. Fixing
 -- that is the real repair; this query cannot do better than its snapshot for rows it does not own.
 -- Params: $1 object_id (uuid), $2 object_version (bigint)
-WITH locked AS (
+WITH lock_object AS (
+    -- LOCK ORDER, not correctness: the objects row must be locked BEFORE the object_versions row.
+    -- The storage-usage trigger on `objects` takes FOR NO KEY UPDATE on the outgoing version while
+    -- the statement holds the objects row (see 20260911090000_storage_usage_lock_outgoing_version
+    -- .sql), so a transaction that locked the version first and then updated `objects` -- which is
+    -- what this statement used to do -- could deadlock against a concurrent overwrite of the same
+    -- key. Every other path that touches both already locks `objects` first
+    -- (lock_object_and_get_version.sql); this one now matches.
+    SELECT object_id FROM objects WHERE object_id = $1 FOR NO KEY UPDATE
+),
+locked AS (
     -- EvalPlanQual refreshes only the UPDATE's own target row in `objects`, so a bare EXISTS on
     -- object_versions would keep the statement-start snapshot and miss a CompleteMultipartUpload
     -- of this version landing mid-statement (an SDK retrying a Complete it thinks timed out issues
     -- exactly that pair). FOR UPDATE makes the reserved-check a real compare-and-swap.
+    --
+    -- Reads object_id THROUGH lock_object rather than from $1, so the two CTEs have a real data
+    -- dependency and Postgres cannot evaluate this one first. An unreferenced plain CTE is not
+    -- evaluated at all, and declaration order alone does not order evaluation.
     SELECT ov.object_version
     FROM object_versions ov
-    WHERE ov.object_id = $1
+    WHERE ov.object_id = (SELECT l.object_id FROM lock_object l)
       AND ov.object_version = $2
       AND ov.size_bytes <= 0
       AND (ov.md5_hash IS NULL OR ov.md5_hash = '')

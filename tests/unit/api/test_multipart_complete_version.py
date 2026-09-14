@@ -36,7 +36,12 @@ class _FakeDb:
 
     async def fetchrow(self, query: str, *args: Any) -> Any:
         if query == "get_multipart_upload":
-            return {"object_id": "obj-1", "is_completed": False, "current_object_version": self.current_version}
+            return {
+                "object_id": "obj-1",
+                "is_completed": False,
+                "current_object_version": self.current_version,
+                "key_existed_at_initiate": False,
+            }
         if query == "get_bucket_by_name":
             return {"bucket_id": "bkt-1"}
         if query == "get_multipart_version_by_upload":

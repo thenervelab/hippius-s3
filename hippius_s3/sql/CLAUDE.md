@@ -104,6 +104,104 @@ ALTER TABLE object_versions
 
 See [analysis.md](../../analysis.md) for the full fix plan.
 
+## Storage-usage rollup: the only triggers in this schema that move a billed number
+
+⚠️ **If you are reading `writer/object_writer.py` or `objects/delete_object_endpoint.py` and wondering
+why an account's usage figure changed without any code doing it, this is why.** Five row triggers on
+`objects` and `object_versions` maintain a per-bucket byte counter. Nothing in the application calls
+them and nothing in the application can opt out of them.
+
+Defined in [migrations/20260910120000_storage_usage_rollup.sql](migrations/20260910120000_storage_usage_rollup.sql),
+which carries the full reasoning. The short version:
+
+```
+objects / object_versions  --5 row triggers, INSERT only-->  storage_delta_ledger
+                                                                     |
+                    usage-rollup worker: DELETE ... RETURNING, fold   v
+                                                              bucket_storage_usage
+                                                                     |
+                            account total = SUM over live buckets  <--+
+```
+
+| Table | What it is |
+|---|---|
+| `storage_delta_ledger` | Insert-only queue of `(bucket_id, delta_bytes)`. Drained continuously. |
+| `bucket_storage_usage` | The counter. One row per bucket. **Unclamped — CAN go negative.** |
+| `storage_usage_rollup_state` | `backfilled_at`. NULL means the counter is deltas, not totals. |
+
+**Why triggers, against the house style.** ~26 statements move billable bytes, and three of the
+heaviest paths (`nuke_user.py`, `purge_buckets.py`, the janitor's `hard_delete_object`) move them
+through `ON DELETE CASCADE` — no SQL in those paths names `object_versions` at all. A helper the
+application must remember to call cannot see a cascade, and would be forgotten by the 27th path.
+
+**The exact trigger set, and why not one more.** `objects` AFTER INSERT / AFTER UPDATE / **BEFORE**
+DELETE, plus `object_versions` AFTER UPDATE / AFTER DELETE. Pinned by
+`tests/integration/test_storage_usage_rollup.py::test_trigger_set_is_exactly_as_designed`.
+
+- **There is deliberately NO INSERT trigger on `object_versions`.** `upsert_object_basic` is ONE
+  statement whose CTEs both upsert `objects` and insert `object_versions`; the objects trigger
+  already counts the new version, so adding the missing-looking one bills every PUT twice.
+- The `objects` DELETE trigger is **BEFORE**, uniquely. `ON DELETE CASCADE` is an AFTER trigger named
+  `RI_ConstraintTrigger_*`, AFTER ROW triggers fire in name order, and `RI_` beats any lowercase
+  name — so an AFTER trigger would find every version row already gone and never decrement.
+- **No trigger on `buckets`.** Liveness and ownership are applied at READ time by joining `buckets`,
+  so soft-deleting or transferring a bucket needs no counter maintenance.
+
+**Rules for anything that touches these tables in bulk:**
+
+1. `ALTER TABLE ... DISABLE TRIGGER` before a bulk migration over `object_versions` or `objects`,
+   then `ENABLE TRIGGER` and recompute the affected buckets with
+   `SELECT recompute_bucket_storage_usage(bucket_id)`. Leaving them enabled writes one ledger row per
+   changed row; disabling them without recomputing leaves the counter silently wrong.
+   ⚠️ **`DISABLE TRIGGER` takes ACCESS EXCLUSIVE, which blocks READS as well as writes** — every GET
+   and ListObjects on the estate — and prod runs `lock_timeout = 0`, so it waits and queues everything
+   behind it. Always wrap it in `BEGIN; SET LOCAL lock_timeout = '3s'; ... COMMIT;` and ask first
+   whether the job is big enough to be worth it (the triggers cost one INSERT per billable-byte
+   statement, ~1-3/s in prod). Procedure:
+   [docs/runbooks/storage-usage-rollup.md](../../docs/runbooks/storage-usage-rollup.md).
+2. **`TRUNCATE` does not fire row triggers at all.** A truncate of either table leaves every counter
+   at its pre-truncate value with nothing to correct it. Recompute every bucket afterwards.
+3. **Create an objects row and its first object_versions row in the SAME statement**, as all three
+   `upsert_object_*` queries do. Split across statements, the objects INSERT trigger finds no version
+   yet and there is no version INSERT trigger to catch up.
+4. **Never repoint `objects.current_object_version` AND edit the outgoing version in one statement.**
+   AFTER ROW triggers all fire at end-of-statement and would each see the other's finished work. Use
+   two statements, as `soft_delete_object_version` + `repoint_current_version_after_delete` do.
+5. **Lock the `objects` row BEFORE any `object_versions` row.** The objects trigger reads the
+   outgoing and incoming version sizes under `FOR NO KEY UPDATE` while its statement already holds
+   the objects row, so its order is objects → object_versions on every overwrite. The other order
+   closes a cycle and Postgres breaks it by failing a customer's request (verified: 40P01).
+   ⚠️ **THE RULE APPLIES EVEN WHEN YOUR SQL NEVER NAMES `objects`.** A transaction reaches that row
+   through any `object_id` FOREIGN KEY: `INSERT INTO parts` and `INSERT INTO multipart_uploads` are
+   each serviced by an implicit `SELECT 1 FROM ONLY objects x WHERE object_id = $1 FOR KEY SHARE OF
+   x`, issued at the INSERT — so an `UPDATE object_versions` earlier in the same transaction puts
+   you in the forbidden order invisibly. That is not hypothetical: it is how the simple-PUT tail and
+   the S4 append reserve came to deadlock **46 of 192 concurrent same-key overwrites**, each a 500
+   returned after the whole body had been staged. Reading this rule and concluding "my transaction
+   doesn't touch `objects`" is exactly the mistake that shipped.
+
+   `lock_object_row_by_id.sql` is the fix for that shape — call it FIRST, as
+   `writer/object_writer.py` now does in both transactions. `lock_object_and_get_version.sql`
+   (`FOR UPDATE OF o`) is the pattern where you also need the version; the versioned-DELETE
+   transaction and `abort_cleanup_orphan_version.sql` follow it.
+
+   The current trigger bodies live in
+   `20260912090000_restore_version_lock_after_put_order_fix.sql`, not in the earlier three
+   migrations that also define them.
+
+   Guarded statically by `tests/unit/test_storage_usage_lock_order.py`, which understands
+   FK-implied locks, `SELECT ... FOR UPDATE` on `object_versions`, and SQL one level behind a helper
+   call — it was blind to all three when this bug shipped. Demonstrated in
+   `test_taking_the_version_row_before_the_objects_row_deadlocks` and
+   `test_concurrent_same_key_puts_with_the_real_statement_set_do_not_deadlock`. Note that rule 4's
+   "one statement" framing is NOT sufficient on its own — the same hazard exists ACROSS
+   transactions, which is what the locking read exists to close.
+
+Correctness is asserted, write path by write path, against `get_account_storage_bytes.sql` — the
+canonical definition — in `tests/integration/test_storage_usage_rollup.py`. The reconciler in
+`workers/run_usage_rollup_in_loop.py` re-checks it in production and exports drift, which is
+expected to be exactly zero.
+
 ## Where to find things
 
 | Want... | Look at... |
@@ -113,4 +211,3 @@ See [analysis.md](../../analysis.md) for the full fix plan.
 | Add a query | [queries/CLAUDE.md](queries/CLAUDE.md) |
 | Query loader | `hippius_s3.utils.get_query` |
 | Repository wrapper | [../repositories/](../repositories/) |
-
