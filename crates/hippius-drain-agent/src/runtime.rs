@@ -1240,6 +1240,18 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
                             // benefit visible — and what would show F1 returning.
                             snapshot.record_scan(ScanWorker::Reconcile, report.scanned, started.elapsed());
                             snapshot.record_reconciled(report.recovered);
+                            // Both are parts the reconciler ACTED on. `promoted_copies` in
+                            // particular is the 2026-08-27 population (read-promoted legacy
+                            // parts) and must stay visible: silently classified, it is a
+                            // part that is never drained, with no other trace.
+                            if report.recovered > 0 || report.promoted_copies > 0 {
+                                tracing::info!(
+                                    recovered = report.recovered,
+                                    promoted_copies = report.promoted_copies,
+                                    adopted = report.adopted,
+                                    "reconcile recorded parts the landed queue did not deliver",
+                                );
+                            }
                         }
                         Err(err) => tracing::warn!(error = %err, "reconcile cycle failed"),
                     }

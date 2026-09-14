@@ -1586,11 +1586,16 @@ mod tests {
         // context again, and a never-ready row at the head of the oldest-first ring starves
         // every part behind it (the 2026-08-27 prod block). It surfaces the moment the address
         // lands — CompleteMultipartUpload — with no wake or defer bookkeeping.
+        seed_object_version(&pool, &part, None, Some(0), Some("")).await; // an in-flight MPU: no address yet
         assert!(
             store.list_replicated_unenqueued_parts(10).await.unwrap().is_empty(),
             "a replicated part whose address is still NULL is not offered to the enqueue sweep",
         );
-        seed_object_version(&pool, &part, Some("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"), Some(1), None).await;
+        sqlx::query("UPDATE object_versions SET address = $1")
+            .bind("addr")
+            .execute(&pool)
+            .await
+            .unwrap();
         let worklist = store.list_replicated_unenqueued_parts(10).await.unwrap();
         assert!(
             worklist.contains(&part),
@@ -1661,14 +1666,7 @@ mod tests {
         }
         // The worklist only offers parts whose version has an address; the fake enqueuer, not
         // the DB, is what makes part 1's inline enqueue not-ready here.
-        seed_object_version(
-            &pool,
-            &part_at(5, 1),
-            Some("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"),
-            Some(1),
-            None,
-        )
-        .await;
+        seed_object_version(&pool, &part_at(5, 1), Some("addr"), Some(1), None).await;
 
         let token = CancellationToken::new();
         let drained = drain_until_empty(&ceph, &ssd, &store, &DeferPartOneEnqueuer, None, None, &token, 1)

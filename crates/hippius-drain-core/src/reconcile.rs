@@ -13,8 +13,11 @@
 //! the drain entirely (no replication row was ever written for it). Recording such a part
 //! sends it through a pointless re-copy and then parks it on the enqueue-sweep worklist
 //! forever (a pre-cutover version has no `address`, so it can never be published). The
-//! residency row is the exact signature — an ingested part gets its residency only inside
-//! `drain_part`, after its replication row exists — so the reconciler skips them.
+//! residency row is the signature — an ingested part gets its residency only inside
+//! `drain_part`, after its replication row exists — so the reconciler leaves such a part
+//! alone. Cache ownership keys on residency, not on a replication row: the evictor and
+//! `node_cache_bytes` treat a resident part with no row as the read-promoted copy it is
+//! (see [`crate::ssd_evict`]), so nothing needs recording for it to be reclaimed.
 //!
 //! Like [`crate::drain_part`], the orchestrator here is I/O-free: it is generic over
 //! a [`PartScan`] discovery seam and a [`PartLandingLog`] store seam, so it is tested
@@ -38,9 +41,9 @@ pub struct ReconcileReport {
     /// Had no row and were recorded as pending (a recovered missing trigger).
     pub recovered: u64,
     /// Had no row but a residency row for this node — a read-promoted copy of an object
-    /// the drain never owned (see the module docs). Left alone: the evictor owns the copy,
-    /// and recording it would strand it on the enqueue-sweep worklist.
-    pub promoted_skipped: u64,
+    /// the drain never owned (see the module docs). Left alone: the evictor owns it, and
+    /// the drain has nothing to do for it.
+    pub promoted_copies: u64,
     /// Were a legacy NULL-node `pending` row this node adopted (stamped its `node_id`)
     /// so node-scoped `claim_part` can drain them (G2). Distinct from `recovered`
     /// (which had no row at all) and `already_pending` (already node-owned).
@@ -80,7 +83,7 @@ impl ReconcileReport {
     #[must_use]
     pub fn categorized(&self) -> u64 {
         self.recovered
-            .saturating_add(self.promoted_skipped)
+            .saturating_add(self.promoted_copies)
             .saturating_add(self.adopted)
             .saturating_add(self.already_pending)
             .saturating_add(self.in_flight)
@@ -188,13 +191,9 @@ pub trait PartLandingLog: Send + Sync {
 
     /// Which of `parts` hold a `cephor_ssd_residency` row for THIS node. Only asked about
     /// row-less parts, so the answer is "which of these are read-promoted copies" (see the
-    /// module docs). The default — nothing is resident — keeps the pre-existing behaviour
-    /// for stores that track no residency (the in-memory fakes); the Postgres
-    /// [`Store`](crate::Store) overrides it with a chunked `UNNEST` query.
-    fn resident_here(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashSet<PartKey>, Self::Error>> + Send {
-        let _ = parts;
-        async move { Ok(HashSet::new()) }
-    }
+    /// module docs). Required rather than defaulted: a store that answered "none" here would
+    /// re-introduce the 2026-08-27 regression silently.
+    fn resident_here(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashSet<PartKey>, Self::Error>> + Send;
 }
 
 /// Reconciles the SSD cache against the landing log over the api part layout.
@@ -222,15 +221,15 @@ where
     let keys: Vec<PartKey> = parts.iter().map(|discovered| discovered.part.clone()).collect();
     let statuses = log.statuses(&keys).await.map_err(ReconcileError::log)?;
     // Residency is consulted for the row-less parts only — the promoted-copy question is
-    // meaningless for a part the drain already knows, and that keeps the second batched read
-    // proportional to the (small) recovery candidate set rather than the whole shard.
+    // meaningless for a part the drain already knows — so this second batched read is sized by
+    // the promoted copies currently on the disk plus any genuinely lost triggers, not the shard.
     let unknown: Vec<PartKey> = keys.iter().filter(|key| !statuses.contains_key(*key)).cloned().collect();
     let promoted = log.resident_here(&unknown).await.map_err(ReconcileError::log)?;
     let mut report = ReconcileReport::default();
     for discovered in &parts {
         report.scanned += 1;
         match statuses.get(&discovered.part) {
-            None if promoted.contains(&discovered.part) => report.promoted_skipped += 1,
+            None if promoted.contains(&discovered.part) => report.promoted_copies += 1,
             None => {
                 log.record_landed(&discovered.part).await.map_err(ReconcileError::log)?;
                 report.recovered += 1;
@@ -384,13 +383,9 @@ mod part_tests {
     }
 
     #[tokio::test]
-    async fn a_read_promoted_copy_is_skipped_not_recovered() {
-        // The 2026-08-27 prod regression: promote-on-read lands legacy parts (no replication
-        // row — the object predates the drain) on the SSD with meta.json, and the reconciler
-        // recorded every one as a lost trigger. They then drained, committed `replicated`, and
-        // could never be enqueued (no address), so they filled the head of the enqueue sweep's
-        // oldest-first worklist and starved every real MPU part behind them. A residency row
-        // with no replication row is exactly a promoted copy; it must be counted and left alone.
+    async fn a_read_promoted_copy_is_left_alone_not_recovered() {
+        // The promoted-copy rule from the module docs: a residency row with no replication row
+        // is a read-promoted copy, counted and never recorded as pending.
         let promoted = part_at(UUID_A, 5, 1);
         let scan = FakePartScan {
             parts: vec![discovered(UUID_A, 5, 1), discovered(UUID_B, 1, 1)],
@@ -398,7 +393,7 @@ mod part_tests {
         };
         let log = FakePartLog::with_promoted(&promoted);
         let report = reconcile_parts(&scan, &log).await.unwrap();
-        assert_eq!(report.promoted_skipped, 1, "the promoted copy is counted, not recorded");
+        assert_eq!(report.promoted_copies, 1, "the promoted copy is counted as such");
         assert_eq!(report.recovered, 1, "the genuinely row-less part is still recovered");
         assert_eq!(report.scanned, report.categorized());
         assert_eq!(
@@ -499,7 +494,7 @@ mod part_tests {
             ReconcileReport {
                 scanned: 6,
                 recovered: 1,
-                promoted_skipped: 0,
+                promoted_copies: 0,
                 adopted: 0,
                 already_pending: 1,
                 in_flight: 1,
