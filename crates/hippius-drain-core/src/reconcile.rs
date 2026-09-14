@@ -7,6 +7,15 @@
 //! `pending`, so the normal claim/drain pipeline picks it up. Recording is
 //! idempotent, so reconciling repeatedly is safe.
 //!
+//! One class of row-less part is NOT a lost trigger: a read-promoted copy. The api's
+//! promote-on-read writes a pool-served part onto this node's SSD — meta and all — after
+//! claiming a `cephor_ssd_residency` row for it, and the object it belongs to may predate
+//! the drain entirely (no replication row was ever written for it). Recording such a part
+//! sends it through a pointless re-copy and then parks it on the enqueue-sweep worklist
+//! forever (a pre-cutover version has no `address`, so it can never be published). The
+//! residency row is the exact signature — an ingested part gets its residency only inside
+//! `drain_part`, after its replication row exists — so the reconciler skips them.
+//!
 //! Like [`crate::drain_part`], the orchestrator here is I/O-free: it is generic over
 //! a [`PartScan`] discovery seam and a [`PartLandingLog`] store seam, so it is tested
 //! with in-memory fakes and the real `tokio`/Postgres impls live at the edges
@@ -16,17 +25,22 @@ use crate::apipart::PartKey;
 use crate::state::ReplicationState;
 use core::future::Future;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
 use thiserror::Error;
 
 /// What one reconcile pass found, tallied by the part's prior status. `scanned`
-/// always equals the sum of the five category counts.
+/// always equals the sum of the category counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
     /// Parts seen on SSD.
     pub scanned: u64,
     /// Had no row and were recorded as pending (a recovered missing trigger).
     pub recovered: u64,
+    /// Had no row but a residency row for this node — a read-promoted copy of an object
+    /// the drain never owned (see the module docs). Left alone: the evictor owns the copy,
+    /// and recording it would strand it on the enqueue-sweep worklist.
+    pub promoted_skipped: u64,
     /// Were a legacy NULL-node `pending` row this node adopted (stamped its `node_id`)
     /// so node-scoped `claim_part` can drain them (G2). Distinct from `recovered`
     /// (which had no row at all) and `already_pending` (already node-owned).
@@ -66,6 +80,7 @@ impl ReconcileReport {
     #[must_use]
     pub fn categorized(&self) -> u64 {
         self.recovered
+            .saturating_add(self.promoted_skipped)
             .saturating_add(self.adopted)
             .saturating_add(self.already_pending)
             .saturating_add(self.in_flight)
@@ -170,6 +185,16 @@ pub trait PartLandingLog: Send + Sync {
     /// is left untouched UNLESS it is a NULL-node row, which it adopts to this node —
     /// so the reconciler can both recover a dropped trigger and adopt a legacy row.
     fn record_landed(&self, part: &PartKey) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Which of `parts` hold a `cephor_ssd_residency` row for THIS node. Only asked about
+    /// row-less parts, so the answer is "which of these are read-promoted copies" (see the
+    /// module docs). The default — nothing is resident — keeps the pre-existing behaviour
+    /// for stores that track no residency (the in-memory fakes); the Postgres
+    /// [`Store`](crate::Store) overrides it with a chunked `UNNEST` query.
+    fn resident_here(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashSet<PartKey>, Self::Error>> + Send {
+        let _ = parts;
+        async move { Ok(HashSet::new()) }
+    }
 }
 
 /// Reconciles the SSD cache against the landing log over the api part layout.
@@ -196,10 +221,16 @@ where
     // only hit on the None / adoptable arms (the minority), not the common already-known row.
     let keys: Vec<PartKey> = parts.iter().map(|discovered| discovered.part.clone()).collect();
     let statuses = log.statuses(&keys).await.map_err(ReconcileError::log)?;
+    // Residency is consulted for the row-less parts only — the promoted-copy question is
+    // meaningless for a part the drain already knows, and that keeps the second batched read
+    // proportional to the (small) recovery candidate set rather than the whole shard.
+    let unknown: Vec<PartKey> = keys.iter().filter(|key| !statuses.contains_key(*key)).cloned().collect();
+    let promoted = log.resident_here(&unknown).await.map_err(ReconcileError::log)?;
     let mut report = ReconcileReport::default();
     for discovered in &parts {
         report.scanned += 1;
         match statuses.get(&discovered.part) {
+            None if promoted.contains(&discovered.part) => report.promoted_skipped += 1,
             None => {
                 log.record_landed(&discovered.part).await.map_err(ReconcileError::log)?;
                 report.recovered += 1;
@@ -236,6 +267,7 @@ mod part_tests {
     use core::future::Future;
     use core::str::FromStr;
     use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::io;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -277,6 +309,8 @@ mod part_tests {
     struct FakePartLog {
         statuses: Mutex<HashMap<String, PartStatus>>,
         recorded: Mutex<Vec<String>>,
+        /// Parts holding a residency row for "this node" — read-promoted copies.
+        resident: Mutex<HashSet<String>>,
         fail_status: bool,
     }
 
@@ -312,6 +346,14 @@ mod part_tests {
             log
         }
 
+        /// A log with NO replication row for `part` but a residency row on this node — the
+        /// signature of a read-promoted copy of an object the drain never owned.
+        fn with_promoted(part: &PartKey) -> Self {
+            let log = FakePartLog::default();
+            log.resident.lock().unwrap().insert(part_key_string(part));
+            log
+        }
+
         fn recorded_parts(&self) -> Vec<String> {
             self.recorded.lock().unwrap().clone()
         }
@@ -333,6 +375,37 @@ mod part_tests {
             self.recorded.lock().unwrap().push(part_key_string(part));
             async move { Ok(()) }
         }
+
+        fn resident_here(&self, parts: &[PartKey]) -> impl Future<Output = Result<HashSet<PartKey>, io::Error>> + Send {
+            let resident = self.resident.lock().unwrap();
+            let found: HashSet<PartKey> = parts.iter().filter(|p| resident.contains(&part_key_string(p))).cloned().collect();
+            async move { Ok(found) }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_promoted_copy_is_skipped_not_recovered() {
+        // The 2026-08-27 prod regression: promote-on-read lands legacy parts (no replication
+        // row — the object predates the drain) on the SSD with meta.json, and the reconciler
+        // recorded every one as a lost trigger. They then drained, committed `replicated`, and
+        // could never be enqueued (no address), so they filled the head of the enqueue sweep's
+        // oldest-first worklist and starved every real MPU part behind them. A residency row
+        // with no replication row is exactly a promoted copy; it must be counted and left alone.
+        let promoted = part_at(UUID_A, 5, 1);
+        let scan = FakePartScan {
+            parts: vec![discovered(UUID_A, 5, 1), discovered(UUID_B, 1, 1)],
+            fail: false,
+        };
+        let log = FakePartLog::with_promoted(&promoted);
+        let report = reconcile_parts(&scan, &log).await.unwrap();
+        assert_eq!(report.promoted_skipped, 1, "the promoted copy is counted, not recorded");
+        assert_eq!(report.recovered, 1, "the genuinely row-less part is still recovered");
+        assert_eq!(report.scanned, report.categorized());
+        assert_eq!(
+            log.recorded_parts(),
+            vec![part_key_string(&part_at(UUID_B, 1, 1))],
+            "only the un-promoted part was recorded as pending",
+        );
     }
 
     #[tokio::test]
@@ -426,6 +499,7 @@ mod part_tests {
             ReconcileReport {
                 scanned: 6,
                 recovered: 1,
+                promoted_skipped: 0,
                 adopted: 0,
                 already_pending: 1,
                 in_flight: 1,

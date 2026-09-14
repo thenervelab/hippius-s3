@@ -1544,7 +1544,8 @@ mod tests {
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
-        let store = Store::from_pool(pool);
+        create_object_versions_table(&pool).await;
+        let store = Store::from_pool(pool.clone());
         let snapshot = SnapshotCell::new();
         let enforcer = Arc::new(Mutex::new(Enforcer::new(
             CircuitBreaker::new(BreakerConfig {
@@ -1581,10 +1582,19 @@ mod tests {
             ssd_dir.path().join(part.relative_dir()).exists(),
             "the SSD copy is retained as the read tier; the uploader reads from the shared pool",
         );
+        // Not on the worklist YET: with no address the sweep could only load the same not-ready
+        // context again, and a never-ready row at the head of the oldest-first ring starves
+        // every part behind it (the 2026-08-27 prod block). It surfaces the moment the address
+        // lands — CompleteMultipartUpload — with no wake or defer bookkeeping.
+        assert!(
+            store.list_replicated_unenqueued_parts(10).await.unwrap().is_empty(),
+            "a replicated part whose address is still NULL is not offered to the enqueue sweep",
+        );
+        seed_object_version(&pool, &part, Some("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"), Some(1), None).await;
         let worklist = store.list_replicated_unenqueued_parts(10).await.unwrap();
         assert!(
             worklist.contains(&part),
-            "the un-enqueued replicated part is on the enqueue-sweep worklist",
+            "once the address is written the un-enqueued replicated part is on the enqueue-sweep worklist",
         );
 
         // The breaker (threshold 1) never saw a failure, so a fresh drain is still
@@ -1644,10 +1654,21 @@ mod tests {
         let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
-        let store = Store::from_pool(pool);
+        create_object_versions_table(&pool).await;
+        let store = Store::from_pool(pool.clone());
         for number in 1..=3_u32 {
             seed_part(ssd_dir.path(), &store, &part_at(5, number), &[b"backlog part"]).await;
         }
+        // The worklist only offers parts whose version has an address; the fake enqueuer, not
+        // the DB, is what makes part 1's inline enqueue not-ready here.
+        seed_object_version(
+            &pool,
+            &part_at(5, 1),
+            Some("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"),
+            Some(1),
+            None,
+        )
+        .await;
 
         let token = CancellationToken::new();
         let drained = drain_until_empty(&ceph, &ssd, &store, &DeferPartOneEnqueuer, None, None, &token, 1)
