@@ -22,7 +22,7 @@ These are plain scripts — no special setup beyond the venv:
 
 ```bash
 source .venv/bin/activate
-python scripts/wait_for_migrations.py --help
+python scripts/retryable-mpu.py --help
 ```
 
 If a script takes a DB URL, it reads from `DATABASE_URL` or a `--dsn` flag; if it takes an S3 endpoint, it uses `boto3` with standard AWS env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL`).

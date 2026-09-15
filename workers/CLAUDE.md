@@ -58,7 +58,6 @@ The FS-walk phases are **parallel, sharded, and budgeted** so a cycle always com
 - `fs_cache_age_bucket_parts{age_bucket=...}`
 - `fs_janitor_deleted_total` / `fs_janitor_tmp_deleted_total`
 
-
 ## Account cacher
 
 [run_account_cacher_in_loop.py](run_account_cacher_in_loop.py). Polls Substrate for account state (free/reserved balance, credits, bandwidth) and mirrors into `redis-accounts`. Cache TTL set by the cacher, not clients. `CACHER_LOOP_SLEEP=60`.
@@ -296,7 +295,6 @@ Defaults to a dry run. Safe to run concurrently with live traffic and safe to ru
 per transaction, each recompute SETS rather than adds, and `backfilled_at` is only set after a
 complete pass — so a run that dies part way through degrades to the pre-existing behaviour (the
 plans-cacher keeps its previous roll) rather than to a wrong bill.
-
 
 ## Cachet health check
 

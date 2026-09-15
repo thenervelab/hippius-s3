@@ -14,7 +14,7 @@ Background workers that process async operations via Redis queues. Each worker r
 
 ### Scaling Notes
 
-The uploader and unpinner must run as single instances to avoid exceeding Hippius blockchain rate limits (they create substrate transactions). The downloader only reads from Arion and Redis, so it can be safely replicated for higher throughput.
+The uploader and unpinner must run as single instances to avoid exceeding Hippius blockchain rate limits (they create substrate transactions).
 
 ## Data Flow
 

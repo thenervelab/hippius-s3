@@ -8,13 +8,9 @@ Pure unit tests. No external services — mocks for DB, Redis, Arion, KMS. Fast;
 tests/unit/
 ├── cache/                     # FS store + parts cache + notifier
 ├── gateway/                   # SigV4, auth, ACL scope
-├── workers/                   # uploader, downloader, unpinner, janitor
 ├── writer/                    # object_writer, chunker, write_through
 ├── services/                  # crypto, envelope, KEK, arion
-├── test_download_coalescing.py       # Coalescing lock key format, single-enqueuer
 ├── test_janitor_hot_retention.py     # Absolute no-deletion under non-replication
-├── test_downloader_batching.py       # Chunk/part batching
-├── test_inflight_pool_behaviour.py   # Downloader inflight reaping
 └── conftest.py
 ```
 
@@ -37,18 +33,15 @@ pytest tests/unit/cache -xvs
 
 ## Tests worth knowing about
 
-- [test_download_coalescing.py](test_download_coalescing.py) — validates the Redis lock key format (`download_in_progress:{object_id}:v:{ov}:part:{pn}`), the lock TTL (`DOWNLOAD_COALESCE_LOCK_TTL`, default 600s — [config.py:289](../../hippius_s3/config.py); the test injects a `120` fixture value and asserts the lock's `EX` matches it), and the "only first streamer enqueues" invariant. Catches regressions in the format that cause streamers to hang waiting for downloaders holding a differently-shaped lock.
 - [test_janitor_hot_retention.py](test_janitor_hot_retention.py) — exercises the absolute "no-deletion-of-non-replicated-data" invariant, including the critical-pressure ERROR-log-and-refuse branch.
-- [test_downloader_batching.py](test_downloader_batching.py) — per-part chunk batching + per-request part batching. Prevents OOM regressions from the May 2026 MPU fix (PR #147).
-- [test_inflight_pool_behaviour.py](test_inflight_pool_behaviour.py) — downloader inflight task reaping and reconnect-on-error logic.
 
 ## Running specific suites
 
 ```bash
 pytest tests/unit/cache -xvs              # FS store, RedisObjectPartsCache, ChunkNotifier
 pytest tests/unit/gateway -xvs            # SigV4, ACL scope, auth
-pytest tests/unit/workers -xvs            # Uploader/downloader/unpinner
-pytest tests/unit/writer -xvs             # ObjectWriter + chunker + write-through
+pytest tests/unit -k "uploader or unpinner" -xvs   # Uploader/unpinner
+pytest tests/unit/writer -xvs             # ObjectWriter + write-through
 ```
 
 ## New tests

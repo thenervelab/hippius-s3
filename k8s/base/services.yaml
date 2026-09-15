@@ -3,8 +3,11 @@ kind: Service
 metadata:
   name: api
 spec:
+  # The api-local DaemonSet is the whole serving fleet since the drain-direct cutover (the
+  # pool-backed api Deployment is gone). A full swap by design: a pool-backed api pod writes
+  # to CephFS, which the drain never scans, so there is no safe hybrid to route to.
   selector:
-    app: api
+    app: api-local
   # Site-pinning: prefer the api pod on the CALLER's node, falling back gracefully to any
   # healthy pod (beta, default-on in our v1.34 — KEP-3015). Deliberately NOT
   # internalTrafficPolicy: Local, which has no fallback and blackholes one node at a time
@@ -23,7 +26,8 @@ metadata:
   name: gateway
 spec:
   selector:
-    app: api
+    app: api-local
+    hippius.io/edge: "true"
   # Same node-local preference as the api Service above (this is its alias).
   trafficDistribution: PreferSameNode
   ports:

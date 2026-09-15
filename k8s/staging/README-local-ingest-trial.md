@@ -17,7 +17,7 @@ self-enqueues at PUT; uploads complete e2e via the drain.
 | `drain-agent-daemonset.yaml` | The per-node `hippius-drain` agent — drains each node's local SSD → CephFS pool. Selects the ingest label + a hostname allow-list. |
 | `drain-allocator-deployment.yaml` | The singleton (leader-elected) drain budget allocator. |
 
-Untouched / still on ceph: `gateway`, `arion-uploader/downloader/unpinner`, `janitor`, the
+Untouched / still on ceph: `gateway`, `arion-uploader/unpinner`, `janitor`, the
 auxiliary worker stack, the shared configmap, `object-cache-pvc`.
 
 ## Storage: hostPath, self-provisioning (no manual node prep)

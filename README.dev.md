@@ -105,7 +105,7 @@ Services that come up:
 | `redis-queues` | 6382 | Work queues + pub/sub. |
 | `redis-rate-limiting` | 6383 | Rate limit counters. |
 | `redis-acl` | 6384 | ACL cache. |
-| Arion worker pods | — | Uploader, downloader, unpinner, janitor. |
+| Arion worker pods | — | Uploader, unpinner, purger, janitor. |
 
 Database migrations run automatically on API container start (see [hippius_s3/scripts/migrate.py](hippius_s3/scripts/migrate.py)).
 
@@ -250,7 +250,7 @@ This is slow (~3 minutes). Avoid unless the base image actually changed.
 ```bash
 pytest tests/unit -v                                      # all unit
 pytest tests/unit/cache -xvs                              # just cache tests, verbose
-pytest tests/unit/test_download_coalescing.py -xvs        # single file
+pytest tests/unit/test_janitor_hot_retention.py -xvs      # single file
 pytest tests/unit -k coalesc                              # match by keyword
 pytest tests/unit -k "not slow" -v                        # exclude slow ones
 
@@ -284,7 +284,6 @@ E2E tests with `@pytest.mark.local` or `hippius_cache`/`hippius_headers` markers
 
 These paths have good coverage already — match their patterns:
 
-- [tests/unit/test_download_coalescing.py](tests/unit/test_download_coalescing.py) — lock-key format, single-enqueuer invariant.
 - [tests/unit/test_janitor_hot_retention.py](tests/unit/test_janitor_hot_retention.py) — no-deletion invariant under non-replication.
 - [tests/e2e/test_GetObject_Range.py](tests/e2e/test_GetObject_Range.py) — range requests against FS cache.
 - [tests/e2e/test_DLQ_Requeue.py](tests/e2e/test_DLQ_Requeue.py) — full fail-then-requeue cycle.
@@ -456,7 +455,7 @@ Say you're adding a `reconciler` worker that compares DB state with Arion state 
 1. Get the ray id from client or from error tracking (Sentry, if wired).
 2. Check structured logs in Loki: `{service="api"} |= "<ray_id>"`.
 3. Open Tempo with the same ray id for the span timeline.
-4. If it's a `DownloadNotReadyError`, the downloader is slow or stuck — check `arion_download_requests` queue depth.
+4. Cold reads stream from the backend in-process (there is no download queue). A `ChunkUnavailableError` means the backend fetch could not get a slot in time — check `chunk_reads_by_tier_total{tier="backend"}` and the api-local logs.
 5If it's a timeout, check if it's upstream (Arion, KMS, chain API).
 
 ### 6.7 Requeue a failed upload
@@ -475,15 +474,15 @@ python -m hippius_s3.scripts.dlq_requeue requeue-all --queue arion_upload_reques
 
 ### 6.8 Run a one-shot migration as a k8s Job
 
-Example: the Arion identifier migration:
+Example: the Arion hash backfill:
 
 ```bash
 # Locally
-python -m hippius_s3.scripts.migrate_arion_identifiers --dry-run
+python -m hippius_s3.scripts.backfill_arion_hash --help
 
 # In k8s (staging)
-kubectl -n hippius-s3-staging apply -f k8s/migrate-arion-identifiers-job.yaml
-kubectl -n hippius-s3-staging logs -f job/migrate-arion-identifiers
+kubectl -n hippius-s3-staging apply -f k8s/backfill-arion-hash-job.yaml
+kubectl -n hippius-s3-staging logs -f job/backfill-arion-hash
 ```
 
 ---
@@ -604,7 +603,7 @@ The download-coalescing lock has a typo somewhere. The lock key format MUST be e
 download_in_progress:{object_id}:v:{object_version}:part:{part_number}
 ```
 
-— no leading/trailing spaces, no zero-padding, int-cast the version and part number. If the streamer sets lock key X and the downloader deletes lock key Y, everyone waits forever. See [tests/unit/test_download_coalescing.py](tests/unit/test_download_coalescing.py).
+— this lock and the downloader that released it are gone (cold reads stream from the backend in-process since 2026-09); the key format is kept here only so old dashboards and logs still make sense.
 
 ### 9.5 "My chunks don't decrypt"
 
@@ -631,7 +630,7 @@ If something "was deleted", check whether it was actually replicated. If not, it
 Three possibilities:
 - `ARION_SERVICE_KEY` / `ARION_BEARER_TOKEN` missing or wrong.
 - Arion is rate-limiting; check your `X-Hippius-Bypass-Rate-Limiting` header logic.
-- The `backend_identifier` you're looking up is stale — see the [migrate_arion_identifiers.py](hippius_s3/scripts/migrate_arion_identifiers.py) script.
+- The `backend_identifier` you're looking up is stale — see [backfill_arion_hash.py](hippius_s3/scripts/backfill_arion_hash.py).
 
 ---
 
@@ -686,7 +685,6 @@ Don't optimize based on intuition. Measure, change, re-measure.
 - **Object version** — one row per PUT/overwrite/append on an object. The `current_object_version` pointer on `objects` points at the live one.
 - **Part** — in MPU, one of the component parts. In simple PUT, there's still a part (part_number=1).
 - **Part chunk** — a chunk within a part. Chunk size defaults to 4 MiB but is stored per-part in the DB.
-- **Pub/sub chunk notification** — Redis pub/sub on `notify:{chunk_key}`. Used by streamers to wake up when a downloader lands a chunk.
 - **Ray id** — `X-Ray-ID` correlation id, generated at the gateway, propagated everywhere.
 - **S4** — Hippius's S3 extension with atomic append. Spec at [docs/s4.md](docs/s4.md).
 - **SigV4** — AWS Signature Version 4. The signing scheme we accept for S3 requests.

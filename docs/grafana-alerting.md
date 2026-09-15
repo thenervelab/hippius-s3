@@ -119,6 +119,4 @@ it fired immediately and never stopped.
    (`_dlq_queues`) now gauges every backend upload DLQ (`{backend}_upload_requests:dlq`
    derived from `config.upload_backends`) **plus** `unpin_requests:dlq`, so a full ovh or
    unpin DLQ is no longer invisible. (Previously only `arion_upload_requests:dlq` was polled.)
-6. **`downloader_duration_seconds` uses millisecond buckets while recording
-   seconds**, so `histogram_quantile` is pure interpolation. (The prior `downloader.py:317`
-   line cite has drifted — re-locate the histogram recording before quoting a line.)
+6. ~~`downloader_duration_seconds` bucket mismatch~~ — the downloader and its histogram were removed in 2026-09.

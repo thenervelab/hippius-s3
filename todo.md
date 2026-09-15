@@ -42,10 +42,10 @@ If you're new here, read [CLAUDE.md](CLAUDE.md) first for the architectural map.
                                   ┌──────────────┐              ┌────────────────────────┐
                                   │ Janitor      │              │ Workers                │
                                   │ hot retention│              │ Arion uploader         │
-                                  │ disk pressure│◀──chunk_backend──│ Arion downloader    │
-                                  │ modes        │              │ Arion unpinner         │
-                                  └──────────────┘              │ orphan_checker         │
-                                                                │ account_cacher         │
+                                  │ disk pressure│◀──chunk_backend──│ Arion unpinner      │
+                                  │ modes        │              │ purger                 │
+                                  └──────────────┘              │ account_cacher         │
+                                                                │ usage_rollup           │
                                                                 └────────┬───────────────┘
                                                                          │
                                                                          ▼
@@ -173,13 +173,7 @@ Add `increase(drain_parts_written_off_servable_total[1h]) > 0` to hippius-otel. 
 
 ### P1 — Meta.json rewrites on concurrent upload + download
 
-**What**: Upload writes `meta.json` once after all chunks ([object_writer.py:420](hippius_s3/writer/object_writer.py), [object_writer.py:~865 `mpu_upload_part_stream`](hippius_s3/writer/object_writer.py)). Downloader writes `meta.json` **eagerly** per part at the start of processing ([hippius_s3/workers/downloader.py:49-91](hippius_s3/workers/downloader.py)). For an object that was just uploaded and is immediately read via a cold-miss downloader path, the meta is written twice with identical content.
-
-**Why it's safe today**: atomic rename, identical payload, last-write-wins.
-
-**Why it matters**: extra FS ops on hot read paths. Not huge but easy to avoid.
-
-**Proposed**: in `downloader._write_part_meta_from_db`, `await fs_store.get_meta(...)` first and skip the write if present (already done in [downloader.py:256-269](hippius_s3/workers/downloader.py) — good). The only rewrite window is if the meta is *missing* — which is the only time we want it. So: probably a non-issue in the current code, but worth verifying with a trace/counter that rewrites are ≈0 in prod.
+Obsolete since 2026-09: the downloader is gone, so nothing but the writer touches `meta.json` any more.
 
 ### P1 — `execute_v5_fast_path_copy` latent risk
 
@@ -498,8 +492,7 @@ Both middleware modules were deleted in the gateway/api merge PR: they were neve
 - **Atomicity**: writes go to `.tmp.<uuid>` and `os.replace` to final ([fs_store.py:92, 123-131](hippius_s3/cache/fs_store.py)). No locks needed; content is deterministic.
 - **Readiness**: `get_chunk` returns None unless `meta.json` exists AND the chunk file exists ([fs_store.py:168-173](hippius_s3/cache/fs_store.py)). Eager meta from the downloader ([workers/downloader.py:49-91](hippius_s3/workers/downloader.py)) enables per-chunk visibility during partial fills.
 - **Hot retention**: every successful read calls `os.utime` on the chunk and the meta ([fs_store.py:183-186](hippius_s3/cache/fs_store.py)). Janitor's hot-retention check reads those mtimes.
-- **Coordination**: `ChunkNotifier` ([hippius_s3/cache/notifier.py](hippius_s3/cache/notifier.py)) publishes `notify:{chunk_key}` on `redis-queues` when a downloader lands a chunk. Streamers subscribe + re-check on each notification. Fast-path (FS hit) bypasses pub/sub entirely.
-- **Coalescing**: `build_stream_context` ([hippius_s3/services/object_reader.py:77-104](hippius_s3/services/object_reader.py)) uses `SET NX EX <DOWNLOAD_COALESCE_LOCK_TTL>` (default 600) on `download_in_progress:{object_id}:v:{ov}:part:{pn}` so N simultaneous readers of a cold object only cause one backend fetch. Lock is released by the downloader when the part lands ([workers/downloader.py:286-292](hippius_s3/workers/downloader.py)). TTL covers crashed-downloader case.
+- **Coordination / coalescing**: gone with the download pipeline (2026-09). Cold reads stream from the backend in-process ([hippius_s3/reader/backend_fetch.py](hippius_s3/reader/backend_fetch.py)); nothing is written back to any cache tier.
 
 ### 4.2 How the janitor works today (high level)
 
@@ -551,9 +544,7 @@ This section covers only the **local FS bytes**. The worse half — superseded v
 
 ### 5.3 Partial-fill meta consistency
 
-The downloader writes `meta.json` before the chunks land ([downloader.py:49-91](hippius_s3/workers/downloader.py)). A reader seeing `meta.json` cannot assume "part is complete" on the download path — only on the upload path. `wait_for_chunk` ([cache/notifier.py:61](hippius_s3/cache/notifier.py)) handles this correctly by re-checking after subscribe, but any new code should **not** gate on `meta.json` presence alone.
-
-**Proposed**: document this invariant explicitly in [hippius_s3/cache/CLAUDE.md](hippius_s3/cache/CLAUDE.md) (already in the rewrite list). Consider a small marker like `.complete` for the upload path only, so a downstream tool can distinguish.
+Obsolete since 2026-09: the downloader that wrote `meta.json` before its chunks is gone; the writer writes it last, so a visible `meta.json` means a complete part.
 
 ### 5.4 Mixed-deploy window after a cache refactor
 
