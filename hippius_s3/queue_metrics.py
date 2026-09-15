@@ -50,7 +50,6 @@ def build_queue_key_sets(config: Config) -> tuple[list[str], list[str]]:
     """
     kinds = (
         ("upload", config.upload_backends),
-        ("download", config.download_backends),
         ("unpin", config.delete_backends),
     )
     lists: list[str] = []

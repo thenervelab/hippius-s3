@@ -82,7 +82,7 @@ Returns a `StreamContext(plan, object_version, storage_version, source, key_byte
 3. Rewrap the DEK under the destination AAD via `rewrap_encryption_envelope`.
 4. Update `object_versions` with the new `kek_id`/`wrapped_dek`.
 
-**Latent risk if re-enabled for MPU**: the new object_id has `chunk_backend` rows pointing at the backend, but no FS cache entries. First GET on the destination will trigger the downloader to fetch from Arion (correct), but every read is cold until the FS cache fills. Acceptable but worth benchmarking. More critically, **streamer reads would hang** on `wait_for_chunk` if someone manually truncates `chunk_backend` or if the source's backend identifier has been unpinned. Guard this path carefully if scope is widened.
+**Latent risk if re-enabled for MPU**: the new object_id has `chunk_backend` rows pointing at the backend, but no FS cache entries. First GET on the destination fetches from Arion into memory (correct), and every read stays cold since Arion-served bytes are never cached. More critically, **streamer reads would 503** (`ChunkUnavailableError`) if someone manually truncates `chunk_backend` or if the source's backend identifier has been unpinned. Guard this path carefully if scope is widened.
 
 See [todo.md](../../todo.md) P1.
 

@@ -43,19 +43,6 @@ class Chunk(BaseModel):
     id: int
 
 
-class PartChunkSpec(BaseModel):
-    index: int
-    # CID is required for legacy (IPFS-backed) objects but intentionally optional
-    # for storage_version>=4 where chunks are addressed by deterministic keys.
-    cid: str | None = None
-    cipher_size_bytes: int | None = None
-
-
-class PartToDownload(BaseModel):
-    part_number: int
-    chunks: list[PartChunkSpec]
-
-
 class RetryableRequest(BaseModel):
     # Important: queue payloads are persisted. We must tolerate older/newer producers
     # sending fields that this version of the code doesn't know about.
@@ -102,28 +89,6 @@ class UnpinChainRequest(RetryableRequest):
     def name(self) -> str:
         ident = self.cid or self.object_id
         return f"unpin::{ident}::{self.address}::{self.object_id}"
-
-
-class DownloadChainRequest(RetryableRequest):
-    object_id: str
-    object_version: int
-    object_key: str
-    bucket_name: str
-    # Deprecated: retained for backward compatibility with older queued payloads.
-    # Workers no longer depend on storage_version to populate the chunk cache.
-    object_storage_version: int | None = None
-    address: str
-    subaccount: str
-    substrate_url: str
-    size: int
-    multipart: bool
-    chunks: list[PartToDownload]
-    expire_at: float | None = None
-    download_backends: list[str] | None = None  # Set by API at enqueue time
-
-    @property
-    def name(self) -> str:
-        return f"download::{self.request_id}::{self.object_id}::{self.address}"
 
 
 def upload_queue_name(backend: str, node_id: str | None = None) -> str:
@@ -386,102 +351,6 @@ async def move_due_unpin_retries(
     return await _claim_due_retries(
         zset_key=_unpin_retry_zset(backend_name),
         target_queue=f"{backend_name}_unpin_requests",
-        now_ts=now_ts,
-        max_items=max_items,
-    )
-
-
-async def enqueue_download_request(payload: DownloadChainRequest) -> None:
-    """Add a download request to per-backend download queues."""
-    client = get_queue_client()
-
-    config = get_config()
-    effective = compute_effective_backends(
-        payload.download_backends,
-        config.download_backends,
-        context={
-            "request_id": payload.request_id,
-            "object_id": payload.object_id,
-            "object_version": payload.object_version,
-            "bucket_name": payload.bucket_name,
-            "object_key": payload.object_key,
-        },
-        raise_on_empty=False,
-    )
-    if payload.download_backends is not None and effective is None:
-        logger.error(
-            "All requested download backends disallowed by config; not enqueuing. requested=%s allowed=%s context=%s",
-            payload.download_backends,
-            config.download_backends,
-            {
-                "request_id": payload.request_id,
-                "object_id": payload.object_id,
-                "object_version": payload.object_version,
-            },
-        )
-        return
-    payload.download_backends = effective or config.download_backends
-
-    raw = payload.model_dump_json()
-    queue_names = [f"{b}_download_requests" for b in payload.download_backends]
-
-    for qname in queue_names:
-        await client.lpush(qname, raw)  # ty: ignore[invalid-await]
-
-    logger.info(f"Enqueued download request {payload.name=} queues={queue_names}")
-
-
-async def dequeue_download_request(queue_name: str) -> DownloadChainRequest | None:
-    """Get the next download request from a backend-specific download queue."""
-    client = get_queue_client()
-    result = await client.brpop(_normalize_queue_name(queue_name), timeout=5)  # ty: ignore[invalid-await, invalid-argument-type]
-    if result:
-        _, queue_data = result
-        return DownloadChainRequest.model_validate_json(queue_data)
-    return None
-
-
-# Per-backend download retry handling (mirrors the upload retry ZSET above)
-
-
-def _download_retry_zset(backend: str) -> str:
-    return f"{backend}_download_retries"
-
-
-async def enqueue_download_retry_request(
-    payload: DownloadChainRequest,
-    *,
-    backend_name: str,
-    delay_seconds: float,
-    last_error: str | None = None,
-) -> None:
-    client = get_queue_client()
-    if payload.request_id is None:
-        payload.request_id = uuid.uuid4().hex
-    payload.attempts = int((payload.attempts or 0) + 1)
-    payload.last_error = last_error
-    if payload.first_enqueued_at is None:
-        payload.first_enqueued_at = time.time()
-    next_ts = time.time() + max(0.0, float(delay_seconds))
-    member = payload.model_dump_json()
-    zset_key = _download_retry_zset(backend_name)
-    await client.zadd(zset_key, {member: next_ts})
-    logger.info(
-        f"Scheduled download retry for {payload.name=} backend={backend_name} "
-        f"attempts={payload.attempts} next_at={int(next_ts)}"
-    )
-
-
-async def move_due_download_retries(
-    *,
-    backend_name: str,
-    now_ts: float | None = None,
-    max_items: int = 64,
-) -> int:
-    """Move due retry items back to the backend's download queue. Returns number moved."""
-    return await _claim_due_retries(
-        zset_key=_download_retry_zset(backend_name),
-        target_queue=f"{backend_name}_download_requests",
         now_ts=now_ts,
         max_items=max_items,
     )

@@ -158,8 +158,6 @@ const DEFAULT_READINESS_FILE: &str = "/tmp/hippius-drain-agent.ready";
 pub struct Config {
     /// Postgres connection URL for the central state store.
     pub database_url: String,
-    /// Root of the shared `CephFS` pool mount — the drain destination.
-    pub pool_root: PathBuf,
     /// Root of the local SSD ingest cache — the drain source.
     pub ssd_root: PathBuf,
     /// Drain-worker poll floor.
@@ -390,7 +388,6 @@ impl Config {
     fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         Ok(Self {
             database_url: required(&get, "CEPHOR_DATABASE_URL")?,
-            pool_root: required_path(&get, "CEPHOR_POOL_ROOT")?,
             ssd_root: required_path(&get, "CEPHOR_SSD_ROOT")?,
             drain_poll: duration_secs(&get, "CEPHOR_DRAIN_POLL_SECS", DEFAULT_DRAIN_POLL)?,
             reconcile_poll: duration_secs(&get, "CEPHOR_RECONCILE_POLL_SECS", DEFAULT_RECONCILE_POLL)?,
@@ -566,7 +563,6 @@ mod tests {
     fn required_only() -> Vec<(&'static str, &'static str)> {
         vec![
             ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
-            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
             ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
             ("CEPHOR_NODE_ID", "node-7"),
             ("REDIS_QUEUES_URL", "redis://localhost:6382/0"),
@@ -577,7 +573,6 @@ mod tests {
     fn reads_required_vars_and_defaults_the_rest() {
         let config = Config::from_lookup(lookup(&required_only())).unwrap();
         assert_eq!(config.database_url, "postgres://localhost/cephor");
-        assert_eq!(config.pool_root, PathBuf::from("/mnt/pool"));
         assert_eq!(config.ssd_root, PathBuf::from("/mnt/ssd"));
         assert_eq!(config.drain_poll, DEFAULT_DRAIN_POLL);
     }
@@ -612,11 +607,7 @@ mod tests {
 
     #[test]
     fn a_missing_node_id_reports_it() {
-        let pairs = vec![
-            ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
-            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
-            ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
-        ];
+        let pairs = vec![("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"), ("CEPHOR_SSD_ROOT", "/mnt/ssd")];
         let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
         assert!(matches!(err, ConfigError::Missing("CEPHOR_NODE_ID")));
     }
@@ -626,7 +617,6 @@ mod tests {
         // Non-empty (passes the required check) but not a valid identifier.
         let pairs = vec![
             ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
-            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
             ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
             ("CEPHOR_NODE_ID", "   "),
         ];
@@ -750,24 +740,9 @@ mod tests {
     }
 
     #[test]
-    fn a_whitespace_pool_root_is_rejected() {
-        // Non-empty (passes the bare is_empty check) but blank: a whitespace path
-        // would silently resolve to a junk directory, so it is treated as missing.
-        let pairs = vec![
-            ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
-            ("CEPHOR_POOL_ROOT", "  \t "),
-            ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
-            ("CEPHOR_NODE_ID", "node-7"),
-        ];
-        let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
-        assert!(matches!(err, ConfigError::Missing("CEPHOR_POOL_ROOT")));
-    }
-
-    #[test]
     fn a_whitespace_ssd_root_is_rejected() {
         let pairs = vec![
             ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
-            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
             ("CEPHOR_SSD_ROOT", "   "),
             ("CEPHOR_NODE_ID", "node-7"),
         ];
@@ -777,18 +752,14 @@ mod tests {
 
     #[test]
     fn a_missing_required_var_reports_which_one() {
-        let pairs = vec![("CEPHOR_POOL_ROOT", "/mnt/pool"), ("CEPHOR_SSD_ROOT", "/mnt/ssd")];
+        let pairs = vec![("CEPHOR_SSD_ROOT", "/mnt/ssd")];
         let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
         assert!(matches!(err, ConfigError::Missing("CEPHOR_DATABASE_URL")));
     }
 
     #[test]
     fn an_empty_required_var_is_treated_as_missing() {
-        let pairs = vec![
-            ("CEPHOR_DATABASE_URL", ""),
-            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
-            ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
-        ];
+        let pairs = vec![("CEPHOR_DATABASE_URL", ""), ("CEPHOR_SSD_ROOT", "/mnt/ssd")];
         let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
         assert!(matches!(err, ConfigError::Missing("CEPHOR_DATABASE_URL")));
     }
@@ -826,7 +797,6 @@ mod tests {
     fn a_missing_redis_url_is_reported() {
         let pairs = vec![
             ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
-            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
             ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
             ("CEPHOR_NODE_ID", "node-7"),
         ];

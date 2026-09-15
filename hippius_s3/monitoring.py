@@ -360,24 +360,6 @@ class MetricsCollector:
             unit="1",
         )
 
-        self.downloader_requests_total = self.meter.create_counter(
-            name="downloader_requests_total",
-            description="Total downloader requests processed",
-            unit="1",
-        )
-
-        self.downloader_duration = self.meter.create_histogram(
-            name="downloader_duration_seconds",
-            description="Duration of downloader processing",
-            unit="s",
-        )
-
-        self.downloader_chunks_fetched = self.meter.create_counter(
-            name="downloader_chunks_fetched_total",
-            description="Total chunks fetched from backends",
-            unit="1",
-        )
-
         self.unpinner_duration = self.meter.create_histogram(
             name="unpinner_duration_seconds",
             description="Duration of unpinner processing",
@@ -928,26 +910,6 @@ class MetricsCollector:
             if duration is not None:
                 self.unpinner_duration.record(duration, attributes=attributes)
 
-    def record_downloader_operation(
-        self,
-        backend: str,
-        success: bool,
-        duration: Optional[float] = None,
-        num_chunks: int = 0,
-    ) -> None:
-        attributes = {
-            "backend": backend,
-            "success": str(success).lower(),
-        }
-
-        self.downloader_requests_total.add(1, attributes=attributes)
-
-        if num_chunks > 0:
-            self.downloader_chunks_fetched.add(num_chunks, attributes=attributes)
-
-        if duration is not None:
-            self.downloader_duration.record(duration, attributes=attributes)
-
     def record_gateway_overhead(
         self,
         duration: float,
@@ -1173,9 +1135,6 @@ class NullMetricsCollector:
         pass
 
     def record_unpinner_operation(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_downloader_operation(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_gateway_overhead(self, *args: object, **kwargs: object) -> None:

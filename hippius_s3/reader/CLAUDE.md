@@ -2,7 +2,7 @@
 
 Download pipeline. Given a planned set of chunks, stream decrypted bytes back to the client.
 
-The orchestration layer above this is [`services/object_reader.py`](../services/object_reader.py) — it decides cache vs pipeline, unwraps the DEK, and enqueues to the downloader if needed. This dir is purely the streaming mechanics.
+The orchestration layer above this is [`services/object_reader.py`](../services/object_reader.py) — it decides cache vs pipeline, unwraps the DEK, and resolves each chunk's backend location. This dir is purely the streaming mechanics — including the backend tier itself ([backend_fetch.py](backend_fetch.py)).
 
 ## Files
 
@@ -72,23 +72,18 @@ rationale: [../cache/CLAUDE.md](../cache/CLAUDE.md) "Invalidating a chunk that f
 
 `maybe_slice(pt, slice_start, slice_end_excl)` ([decrypter.py:55](decrypter.py)) trims plaintext for Range requests.
 
-## `wait_for_chunk`
+## Chunk fetch order
 
-Called by `stream_plan` via `obj_cache`. Implementation in [../cache/object_parts.py:275](../cache/object_parts.py) delegating to [../cache/notifier.py:61](../cache/notifier.py).
+`stream_plan` reads each chunk from `obj_cache.get_chunk` — this node's SSD, then a peer's, then the pool (`DualFileSystemPartsStore`) — and on a miss calls the `fetch_missing` callback `object_reader.make_fetch_missing` builds for the request:
 
-- Fast path: `fs_store.get_chunk` returns bytes → yield immediately.
-- Slow path: subscribe to `notify:{chunk_key}` pub/sub, re-check (race guard), wait on message, re-fetch, retry once on transient miss.
-- Timeout: `cache_ttl_seconds` (default 3600) — if nothing publishes within that, raises, handled by API's global exception handler as 503 SlowDown.
-
-## Interactions with the downloader worker
-
-When `build_stream_context` in [../services/object_reader.py](../services/object_reader.py) determines `source="pipeline"`, it enqueues a `DownloadChainRequest` on `arion_download_requests`. The downloader ([../workers/downloader.py:94](../workers/downloader.py)) fulfills it chunk-by-chunk, publishing notifications after each write. The streamer here just waits on those notifications via `wait_for_chunk`.
-
-**Coalescing**: multiple simultaneous GETs on the same cold part only enqueue once thanks to the `download_in_progress:...` lock in `build_stream_context`. Readers that lose the race still receive chunks via the shared pub/sub.
+- The chunk's backend locations were resolved in `build_stream_context` (one batched `chunk_backend` query per download backend, only when the plan had a miss) and closed over — the body never touches the DB.
+- [backend_fetch.py](backend_fetch.py) pulls the ciphertext from the first location that serves it into memory (one `ArionClient` per process, `HIPPIUS_READ_BACKEND_FETCH_CONCURRENCY` in flight per pod, `HIPPIUS_READ_BACKEND_FETCH_ATTEMPTS` bounded retries per location; a permanent error moves to the next location). The bytes are decrypted here and yielded — never written to any cache.
+- A chunk with no location yet (its part is inside the upload window on another node) can only come from a peer: the local tiers are re-polled for `HIPPIUS_READ_MISSING_CHUNK_WAIT_SECONDS`, then `ChunkUnavailableError` — the first-chunk peek maps it to a retryable 503, a mid-stream one ends the stream.
+- Every chunk is bounded by `chunk_timeout` (`HIPPIUS_STREAM_CHUNK_TIMEOUT_SECONDS`).
 
 ## Gotchas
 
 - **Range requests still fetch full chunks from Arion** — see [todo.md](../../todo.md) section 3.3 for the range-aware backend fetch idea.
-- **Client disconnect mid-stream** is handled correctly — the `finally` block in `stream_plan` cancels pending prefetch tasks. But if the client disconnects while waiting on pub/sub for a slow backend, the downloader still finishes its write (good — the chunk stays in cache for the next reader).
+- **Client disconnect mid-stream** is handled correctly — the `finally` block in `stream_plan` cancels pending prefetch tasks, including in-flight backend fetches.
 - **`key_bytes` is None for legacy unencrypted objects** — `decrypt_chunk_if_needed` passes the ciphertext through unchanged in that case. New writes are always v5 encrypted (enforced by `require_supported_storage_version`).
 

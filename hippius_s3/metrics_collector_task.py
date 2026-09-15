@@ -83,8 +83,6 @@ class BackgroundMetricsCollector:
     LIST_QUEUES = [
         "arion_upload_requests",
         "ovh_upload_requests",
-        "arion_download_requests",
-        "ovh_download_requests",
         "arion_unpin_requests",
         "ovh_unpin_requests",
         "substrate_requests",
