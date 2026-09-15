@@ -34,7 +34,7 @@ _DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:54
 # The shipped query before the per-arm limit landed. Kept as a semantic oracle, not as a suggestion.
 REFERENCE_LIST_OBJECTS = """
 SELECT o.object_id, o.object_key, ov.size_bytes, ov.content_type, o.created_at, ov.md5_hash,
-       ov.status, ov.multipart, ov.body_blake3
+       ov.status, ov.multipart, ov.body_blake3, ov.arion_hash
 FROM (
     SELECT o.object_id, o.object_key, o.created_at, o.current_object_version, o.bucket_id
     FROM objects o
@@ -54,7 +54,7 @@ FROM (
 ) o,
      LATERAL (
          SELECT v.size_bytes, v.content_type, v.md5_hash, v.status, v.multipart, v.is_delete_marker,
-                v.body_blake3
+                v.body_blake3, v.arion_hash
          FROM object_versions v
          WHERE v.object_id = o.object_id
            AND v.object_version <= o.current_object_version
@@ -76,7 +76,7 @@ LIMIT $4::int
 # whether a key is listed at all runs above the union. Pinned as a mutant, never as an alternative.
 UNSAFE_LIST_OBJECTS = """
 SELECT o.object_id, o.object_key, ov.size_bytes, ov.content_type, o.created_at, ov.md5_hash,
-       ov.status, ov.multipart, ov.body_blake3
+       ov.status, ov.multipart, ov.body_blake3, ov.arion_hash
 FROM (
     (SELECT o.object_id, o.object_key, o.created_at, o.current_object_version
      FROM objects o
@@ -97,7 +97,7 @@ FROM (
 ) o,
      LATERAL (
          SELECT v.size_bytes, v.content_type, v.md5_hash, v.status, v.multipart, v.is_delete_marker,
-                v.body_blake3
+                v.body_blake3, v.arion_hash
          FROM object_versions v
          WHERE v.object_id = o.object_id
            AND v.object_version <= o.current_object_version
@@ -113,7 +113,7 @@ LIMIT $4::int
 
 REFERENCE_LIST_OBJECT_VERSIONS = """
 SELECT o.object_key, ov.object_version, ov.is_delete_marker, ov.size_bytes, ov.md5_hash,
-       ov.body_blake3, COALESCE(ov.last_modified, ov.created_at) AS last_modified,
+       ov.body_blake3, ov.arion_hash, COALESCE(ov.last_modified, ov.created_at) AS last_modified,
        o.current_object_version
 FROM (
     SELECT o.object_id, o.object_key, o.current_object_version, o.bucket_id
