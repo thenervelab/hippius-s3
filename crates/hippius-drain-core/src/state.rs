@@ -10,9 +10,15 @@ use crate::units::ByteRate;
 pub enum ReplicationState {
     /// On SSD, not yet draining.
     Pending,
-    /// Claimed by an agent and copying to `CephFS`.
+    /// Claimed by an agent: completeness-checked, hashed, and being handed to the uploader.
     Draining,
-    /// Durable on `CephFS` and verified; the SSD copy may be unlinked.
+    /// Handed to the node-local backend uploader (its `UploadChainRequest` is published);
+    /// the SSD copy is the ONLY copy until the backend acks, so it is never evicted.
+    /// Flipped to `Replicated` by the uploader once every chunk has a live backend row, or by
+    /// the drain's upload sweep from `chunk_backend` coverage (the DB-authoritative backstop).
+    Uploading,
+    /// Every chunk has a live backend (`chunk_backend`) row; the SSD copy is read-tier cache
+    /// the evictor may unlink.
     Replicated,
     /// Drain abandoned after exhausting retries (reconciled to a client error).
     Failed,

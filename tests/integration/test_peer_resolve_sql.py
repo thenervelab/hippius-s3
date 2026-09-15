@@ -308,6 +308,23 @@ async def test_a_corrupt_part_resolves_to_the_claimant_whose_ssd_is_the_last_goo
     assert sizes == {0: 100}
 
 
+async def test_an_uploading_part_resolves_to_the_ingest_node_for_the_whole_upload_window(
+    conn: asyncpg.Connection,
+) -> None:
+    """'uploading' is the drain-to-uploader hand-off: the part is published to the node's own
+    uploader and its SSD copy is the ONLY copy until the backend acks it (the evictor keys on
+    'replicated'). That window is as long as the upload takes — past the 60s fresh-part hint on
+    a large part or a backlog — so the status row, not the hint, must keep naming the holder,
+    or every wrong-node read in that window falls through every tier and 503s."""
+    object_id = str(uuid.uuid4())
+    await _seed(conn, object_id=object_id, sizes=[100, 40], resident_on=None, status="uploading", claimed_by=PEER)
+
+    owner, sizes = await _fetcher(conn)._resolve_part(object_id, 1, 3)
+
+    assert owner == PEER
+    assert sizes == {0: 100, 1: 40}
+
+
 async def test_a_failed_part_still_resolves_to_no_peer(conn: asyncpg.Connection) -> None:
     """'failed' is terminal: the drain may have reclaimed the SSD copy (residency deleted in
     the same statement that stamps reclaimed_at), so the claimant is not a promise anymore.

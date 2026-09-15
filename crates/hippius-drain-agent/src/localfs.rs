@@ -1,34 +1,24 @@
 //! Real filesystem implementations of the drain/GC contracts over POSIX mounts.
 //!
-//! [`LocalFs`] is the durable `CephFS` pool (a POSIX mount); [`LocalSsd`] is the
-//! node-local ingest cache. The drain replicates the api's part layout
-//! `<root>/<object_id>/v<version>/part_<n>/` path-preservingly: [`LocalSsd`]
-//! implements [`PartSource`]/[`PartScan`] (list, locate, hash, scan, unlink a
-//! part) and [`LocalFs`] implements [`PartPool`] (persist chunk/meta, hash,
-//! remove). The crash-safety guarantee the drain depends on lives in
-//! [`copy_into`]: it streams+hashes the bytes, `fdatasync`s the temp, atomically
-//! renames within the part folder, and (once per part, via `finalize_part`) fsyncs
-//! the folder so a power loss never leaves a torn file. Both also
-//! implement the GC-only [`CephFs`]/[`SsdCache`] `remove_object` reclaim (by
-//! `<object_id>` folder).
+//! [`LocalSsd`] is the node-local ingest cache, laid out as the api's part layout
+//! `<root>/<object_id>/v<version>/part_<n>/`. It implements [`PartSource`]/[`PartScan`]
+//! (list, locate, hash, scan, unlink a part) for the drain, plus the reclaim/evict
+//! seams. There is no pool side any more: the drain hands parts to the node-local
+//! uploader, which reads this same tree.
 
 use core::future::Future;
 use hippius_drain_core::{
-    CephFs, ChunkIndex, DiscoveredPart, FailedGrace, FileId, FreeSpaceProbe, META_FILE_NAME, OrphanGrace, PartKey, PartMeta, PartPool, PartRemover,
-    PartScan, PartSource, SsdCache, chunk_file_name, parse_part_dir,
+    ChunkIndex, DiscoveredPart, FailedGrace, FreeSpaceProbe, META_FILE_NAME, OrphanGrace, PartKey, PartMeta, PartRemover, PartScan, PartSource,
+    chunk_file_name, parse_part_dir,
 };
 use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
-use std::hash::BuildHasher;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 
 /// Streaming hash read buffer. Bounds memory so multi-gigabyte chunks are never
 /// read whole into memory just to hash them.
@@ -36,26 +26,6 @@ use tokio::io::AsyncWriteExt;
 // buffer means ~128 dispatches per 4 MiB chunk copy + ~64 for the readback hash; 1 MiB cuts that
 // ~16x. Peak memory is bounded by drain concurrency × this buffer (a few MiB at the default).
 const HASH_BUF_BYTES: usize = 1 << 20;
-
-/// Confine an identifier to a single path component beneath a root.
-///
-/// Both the file id (a folder) and the chunk key (a filename) are externally
-/// derived, and treating either as a path is the classic traversal hole. Reject
-/// the relative specials, every path separator, and embedded NUL so a crafted id
-/// like `../etc/passwd` can never escape the pool/cache root. This is the
-/// path-traversal guard the drain and GC paths share, applied to each component.
-fn safe_component(raw: &str) -> io::Result<&str> {
-    let rejected = raw.is_empty() || raw == "." || raw == ".." || raw.contains('/') || raw.contains('\\') || raw.contains('\0');
-    if rejected {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unsafe path component {raw:?}")));
-    }
-    Ok(raw)
-}
-
-/// The confined `<root>/<file_id>` folder that holds one file's chunks.
-fn object_dir(root: &Path, file: &FileId) -> io::Result<PathBuf> {
-    Ok(root.join(safe_component(file.as_str())?))
-}
 
 /// Lowercase-hex encode bytes (the on-wire form of a content hash).
 fn hex_lower(bytes: &[u8]) -> String {
@@ -67,78 +37,6 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
     }
     out
-}
-
-/// Fsync a directory so a freshly-renamed entry inside it survives a crash.
-///
-/// Opening the directory and `sync_all`-ing its descriptor flushes the directory
-/// entry, not file data. The design flags this as the weakest crash-safety joint
-/// (some network mounts handle directory fsync differently); errors propagate
-/// rather than being swallowed, and real `CephFS` behavior is measured on staging.
-async fn sync_parent_dir(dir: &Path) -> io::Result<()> {
-    let handle = fs::File::open(dir).await?;
-    handle.sync_all().await
-}
-
-/// Removes a half-written `.tmp-*` file unless the persist that created it
-/// reached its atomic rename. The drop runs on an early `?` return *and* on
-/// future cancellation (a dropped persist future) — the latter an explicit
-/// error-path cleanup cannot reach.
-///
-/// The unlink is synchronous because [`Drop`] cannot `.await`; a single unlink
-/// is cheap, and per the leak-safety rule a leaked temp is only wasted space (the
-/// scan skips `.tmp-*`, and the next persist overwrites it), never a correctness
-/// failure — so best-effort `Drop` cleanup is the right tool and must not panic.
-struct TmpGuard {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl TmpGuard {
-    /// Arms cleanup for `path` (the temp file a persist is about to write).
-    fn arm(path: PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-
-    /// Disarms the guard once the rename has consumed the temp, so the success
-    /// path performs no unlink. Mirrors the drop-guard `dismiss` idiom.
-    fn dismiss(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TmpGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            // Best-effort: a failure leaves the temp as harmless wasted space,
-            // reclaimed by the next persist's overwrite. Never panic in Drop.
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// The durable shared `CephFS` pool, rooted at a POSIX mount directory.
-#[derive(Debug, Clone)]
-pub struct LocalFs {
-    root: PathBuf,
-}
-
-impl LocalFs {
-    /// Roots the pool at `root` (the `CephFS` mount point).
-    #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-}
-
-impl CephFs for LocalFs {
-    async fn remove_object(&self, file: &FileId) -> io::Result<()> {
-        // GC reclaim: remove the file's whole folder. `remove_dir_all` is NOT
-        // idempotent (NotFound when already absent) and may report
-        // DirectoryNotEmpty under a concurrent writer; the raw result is returned
-        // so [`hippius_drain_core::gc`] can classify both into a GC outcome.
-        fs::remove_dir_all(object_dir(&self.root, file)?).await
-    }
 }
 
 /// The node-local SSD ingest cache, rooted at a directory.
@@ -328,22 +226,13 @@ impl LocalSsd {
     }
 }
 
-impl SsdCache for LocalSsd {
-    async fn remove_object(&self, file: &FileId) -> io::Result<()> {
-        // GC reclaim of the file's SSD folder; raw result for the GC classifier
-        // (see [`CephFs::remove_object`]).
-        fs::remove_dir_all(object_dir(&self.root, file)?).await
-    }
-}
-
 // ---- api part layout: drain a whole part path-preservingly SSD <-> CephFS ----
 
 /// The confined `<root>/<object>/v<version>/part_<n>` directory of one part.
 ///
 /// [`PartKey::relative_dir`] is built from a validated UUID object id and formatted
 /// numeric version/part segments, so it carries no separator, `..`, or NUL — joining
-/// it onto `root` cannot escape the part folder. This is the part-layout analogue of
-/// the per-component `safe_component` guard the chunk paths apply.
+/// it onto `root` cannot escape the part folder.
 fn part_dir(root: &Path, part: &PartKey) -> PathBuf {
     root.join(part.relative_dir())
 }
@@ -364,82 +253,6 @@ async fn hash_file(path: &Path) -> io::Result<String> {
     Ok(hex_lower(hasher.finalize().as_slice()))
 }
 
-/// Streams `source` into `dest`, computing the SHA-256 of the bytes in the same pass so the
-/// copy needs no second read to verify (the audit's hash-once win), and `fdatasync`s `dest`
-/// — [`File::sync_data`] skips the atime/mtime metadata flush a `sync_all` would force.
-/// Bounded by [`HASH_BUF_BYTES`] so a multi-gigabyte chunk is never read whole into memory.
-async fn stream_copy_hash(source: &Path, dest: &Path) -> io::Result<String> {
-    let mut reader = fs::File::open(source).await?;
-    let mut writer = fs::File::create(dest).await?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0_u8; HASH_BUF_BYTES];
-    loop {
-        let read = reader.read(&mut buf).await?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-        writer.write_all(&buf[..read]).await?;
-    }
-    writer.flush().await?;
-    writer.sync_data().await?;
-    Ok(hex_lower(hasher.finalize().as_slice()))
-}
-
-/// A monotonic per-process counter that makes each write temp unique WITHIN a process —
-/// so two tasks persisting the SAME `name` concurrently never share a temp file (C11).
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// A per-process random nonce that makes write temps unique ACROSS processes. `pid` alone
-/// is not enough: two agent pods overlapping on one SSD mount during a rolling update
-/// commonly both run as pid 1, so both would emit `.tmp-<name>.1.0` for their first write
-/// and tear each other's copy (the post-copy SHA re-verify catches the tear, but this makes
-/// it impossible). Sourced from `RandomState`, whose `new()` is "initialized with random
-/// keys" and whose two instances are documented "unlikely to produce the same result for the
-/// same values" — process-unique entropy with no added dependency. Computed once on first use.
-static TEMP_NONCE: LazyLock<u64> = LazyLock::new(|| std::collections::hash_map::RandomState::new().hash_one(0u8));
-
-/// The write-temp name for `name`: the agent's `.tmp-` prefix (recognized by
-/// [`is_temp_name`] and the orphan sweep) plus a `pid.nonce.counter` suffix — the
-/// per-process [`TEMP_NONCE`] separates overlapping pods and the [`TEMP_SEQ`] counter
-/// separates concurrent writers in one process, so no two persists share a temp path.
-fn temp_name(name: &str) -> String {
-    format!(
-        ".tmp-{name}.{}.{:x}.{}",
-        std::process::id(),
-        *TEMP_NONCE,
-        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-/// Atomically place `source`'s bytes into `dir` as `name`, returning the lowercase-hex
-/// SHA-256 of the bytes streamed during the copy: stream into a temp inside `dir`
-/// (`fdatasync`'d), rename into place, then — only when `sync_dir` is set — fsync `dir`.
-/// A crash leaves either no file or the complete one. The temp is suffixed per-writer
-/// ([`temp_name`]), so two tasks draining the SAME part concurrently — a re-claim after a
-/// lease lapses under slow Ceph, which the single-writer claim does NOT prevent (`claim_seq`
-/// fences the COMMIT, not the in-flight copy) — write to distinct temps; last rename wins,
-/// harmless since the bytes are deterministic per (part, chunk).
-///
-/// The directory fsync is deferred (`sync_dir = false` for chunks + meta) so the whole
-/// part costs ONE dir-fsync via [`sync_parent_dir`], not one per file — the caller drives
-/// it through `PartPool::finalize_part` after every rename lands.
-async fn copy_into(dir: &Path, name: &str, source: &Path, sync_dir: bool) -> io::Result<String> {
-    let dest = dir.join(name);
-    let tmp = dir.join(temp_name(name));
-    fs::create_dir_all(dir).await?;
-    // Arm temp cleanup before the copy: any failure or cancellation before the rename
-    // must not leave a `.tmp-*` orphan in the pool (the drop-guard idiom, RfR ch.1).
-    let guard = TmpGuard::arm(tmp.clone());
-    let hash = stream_copy_hash(source, &tmp).await?;
-    fs::rename(&tmp, &dest).await?;
-    guard.dismiss();
-    if sync_dir {
-        sync_parent_dir(dir).await?;
-    }
-    Ok(hash)
-}
-
 /// Remove a part's whole directory; an already-absent dir is `Ok` (idempotent, so a
 /// re-drive after a crash still converges). Used by the pool corrupt-copy cleanup;
 /// the SSD-source unlink goes through [`remove_part_dir_exclusive`] instead.
@@ -447,6 +260,7 @@ async fn copy_into(dir: &Path, name: &str, source: &Path, sync_dir: bool) -> io:
 /// Removes ONLY the part dir. The now-empty `v<version>/`/`<object_id>/` parents are left
 /// for [`LocalSsd::sweep_empty_shells`], deliberately — see that method for why pruning them
 /// inline is unsafe.
+#[cfg(test)]
 async fn remove_part_dir(root: &Path, part: &PartKey) -> io::Result<()> {
     match fs::remove_dir_all(part_dir(root, part)).await {
         Ok(()) => Ok(()),
@@ -690,45 +504,6 @@ impl PartSource for LocalSsd {
     }
 }
 
-impl PartPool for LocalFs {
-    async fn persist_chunk(&self, source: &Path, part: &PartKey, index: ChunkIndex) -> io::Result<String> {
-        // sync_dir=false: the per-part dir fsync is batched into finalize_part below.
-        copy_into(&part_dir(&self.root, part), &chunk_file_name(index), source, false).await
-    }
-
-    async fn persist_meta(&self, source: &Path, part: &PartKey) -> io::Result<()> {
-        // sync_dir=false: meta's dir entry flushes with the chunks' in the single finalize.
-        copy_into(&part_dir(&self.root, part), META_FILE_NAME, source, false).await.map(|_| ())
-    }
-
-    async fn finalize_part(&self, part: &PartKey) -> io::Result<()> {
-        // Fsync the part dir first (all chunk + meta renames become durable together —
-        // Task 1's batched fsync), THEN each ancestor up to the pool root. A part-dir fsync
-        // alone leaves the part reachable only via parent dir entries a crash could still
-        // lose (the new version/object dirs this drain just created), so the ancestor walk
-        // is what makes "committed => durably reachable on CephFS" hold — not merely
-        // "chunks fsynced". Fsyncing an already-durable dir is a near-noop, so the extra
-        // two/three syncs are negligible next to the per-chunk data fsyncs.
-        let part_path = part_dir(&self.root, part);
-        let version_path = part_path.parent().unwrap_or(self.root.as_path());
-        let object_path = version_path.parent().unwrap_or(self.root.as_path());
-        sync_parent_dir(&part_path).await?;
-        sync_parent_dir(version_path).await?;
-        sync_parent_dir(object_path).await?;
-        sync_parent_dir(self.root.as_path()).await
-    }
-
-    async fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> io::Result<String> {
-        // Re-reads the pooled file from disk — independent of the SSD-source hash — so
-        // drain_part's source==pool comparison catches a torn copy (audit flag, slice 1).
-        hash_file(&part_dir(&self.root, part).join(chunk_file_name(index))).await
-    }
-
-    async fn remove_part(&self, part: &PartKey) -> io::Result<()> {
-        remove_part_dir(&self.root, part).await
-    }
-}
-
 /// Walks one `<root>/<object>` dir, descending into its version dirs.
 async fn scan_object_dir(path: &Path, object: &str, out: &mut Vec<DiscoveredPart>) -> io::Result<()> {
     let mut versions = match fs::read_dir(path).await {
@@ -839,39 +614,13 @@ impl FreeSpaceProbe for LocalSsd {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{LocalSsd, TEMP_NONCE, TmpGuard, hex_lower, is_temp_name, part_dir, remove_part_dir, safe_component, temp_name};
+    use super::{LocalSsd, hex_lower, part_dir, remove_part_dir};
     use core::str::FromStr;
     use core::time::Duration;
-    use hippius_drain_core::{FailedGrace, FileId, ObjectId, OrphanGrace, PartKey, PartNumber, SsdCache, Version};
+    use hippius_drain_core::{FailedGrace, ObjectId, OrphanGrace, PartKey, PartNumber, Version};
     use proptest::prelude::*;
-    use std::io;
     use std::path::Path;
     use tempfile::TempDir;
-
-    fn fid(raw: &str) -> FileId {
-        FileId::from_str(raw).unwrap()
-    }
-
-    #[test]
-    fn temp_name_is_unique_per_writer_and_still_recognized_as_a_temp() {
-        // C11: two persists of the SAME name must get DISTINCT temp files. Sharing one temp
-        // is a real tear risk when a lapsed lease under slow Ceph lets two tasks drain one
-        // part at once (claim_seq fences the commit, not the in-flight copy).
-        let a = temp_name("chunk_0.bin");
-        let b = temp_name("chunk_0.bin");
-        assert_ne!(a, b, "two temps for the same name must differ");
-        for t in [&a, &b] {
-            assert!(t.starts_with(".tmp-"), "keeps the agent temp prefix: {t}");
-            assert!(is_temp_name(t), "the orphan sweep still recognizes it as a temp: {t}");
-        }
-        // The process nonce is constant within a run (only the trailing counter advances), so
-        // the two names differ only in the final field — the cross-process separator is stable.
-        let nonce = format!(".{:x}.", *TEMP_NONCE);
-        assert!(
-            a.contains(&nonce) && b.contains(&nonce),
-            "both carry the stable per-process nonce: {a} {b}"
-        );
-    }
 
     // `root_is_available` gates the terminal missing-source write-off. Its whole job is
     // to tell "this part vanished" apart from "the ingest volume vanished", because both
@@ -921,26 +670,6 @@ mod tests {
     // NB: the remaining arm — empty AND a real mount point, i.e. a fully-drained node
     // whose orphan rows SHOULD still be written off — needs an actual mount and so is
     // not unit-testable here. It is the `parent_meta.dev() != meta.dev()` branch.
-
-    #[tokio::test]
-    async fn remove_object_deletes_the_whole_file_folder_and_surfaces_absence() {
-        let pool_dir = TempDir::new().unwrap();
-        let folder = pool_dir.path().join("file-7");
-        std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(folder.join("chunk-a"), b"a").unwrap();
-        std::fs::write(folder.join("chunk-b"), b"b").unwrap();
-
-        let ssd = LocalSsd::new(pool_dir.path());
-
-        // First reclaim removes the whole folder.
-        ssd.remove_object(&fid("file-7")).await.unwrap();
-        assert!(!folder.exists(), "the file's folder and all its chunks are gone");
-
-        // `remove_dir_all` is non-idempotent: a second reclaim surfaces NotFound,
-        // which the GC layer (hippius_drain_core::gc) classifies as AlreadyGone.
-        let err = ssd.remove_object(&fid("file-7")).await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
-    }
 
     fn part(uuid: &str, version: u32, number: u32) -> PartKey {
         PartKey::new(ObjectId::from_str(uuid).unwrap(), Version::new(version), PartNumber::new(number))
@@ -1162,50 +891,7 @@ mod tests {
         assert!(total_swept > 0, "the sweep must have been actively removing, or this proves nothing");
     }
 
-    #[test]
-    fn tmp_guard_unlinks_when_armed_and_preserves_when_dismissed() {
-        let dir = TempDir::new().unwrap();
-
-        // Armed: dropping the guard removes the file.
-        let armed_path = dir.path().join(".tmp-armed");
-        std::fs::write(&armed_path, b"x").unwrap();
-        drop(TmpGuard::arm(armed_path.clone()));
-        assert!(!armed_path.exists(), "an armed guard unlinks on drop");
-
-        // Dismissed: the success path keeps the file (the rename owns it).
-        let kept_path = dir.path().join(".tmp-kept");
-        std::fs::write(&kept_path, b"x").unwrap();
-        TmpGuard::arm(kept_path.clone()).dismiss();
-        assert!(kept_path.exists(), "a dismissed guard leaves the file in place");
-    }
-
-    #[test]
-    fn safe_component_rejects_traversal_and_separators() {
-        for bad in ["", "..", ".", "a/b", "../x", "/abs", "a\\b", "a/../b", "a\0b"] {
-            assert!(safe_component(bad).is_err(), "{bad:?} must be rejected");
-        }
-        for ok in ["abc", "deadbeef", "a-b_c", "a..b"] {
-            assert_eq!(safe_component(ok).unwrap(), ok);
-        }
-    }
-
     proptest! {
-        /// Any safe component joins to a path whose parent is exactly the root —
-        /// it never escapes.
-        #[test]
-        fn safe_components_stay_directly_under_root(s in "[0-9a-f]{1,64}") {
-            let root = Path::new("/pool");
-            let joined = root.join(safe_component(&s).unwrap());
-            prop_assert_eq!(joined.parent(), Some(root));
-        }
-
-        /// Any component bearing a separator is rejected, never normalized.
-        #[test]
-        fn components_with_a_separator_are_rejected(prefix in "[a-z]{1,6}", suffix in "[a-z]{1,6}") {
-            let raw = format!("{prefix}/{suffix}");
-            prop_assert!(safe_component(&raw).is_err());
-        }
-
         /// `hex_lower` round-trips: decoding the hex recovers the original bytes,
         /// and the output is always twice the input length.
         #[test]
@@ -1223,13 +909,13 @@ mod tests {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod part_tests {
-    use super::{LocalFs, LocalSsd, hex_lower, is_staged_name, is_temp_name, list_chunk_indices, parse_chunk_index, temp_name};
+    use super::{LocalSsd, hex_lower, is_staged_name, is_temp_name, list_chunk_indices, parse_chunk_index};
     use core::future::Future;
     use core::str::FromStr;
     use hippius_drain_core::{
-        ChunkIndex, ClaimedPart, DrainOutcome, FailedGrace, META_FILE_NAME, ObjectId, OrphanGrace, PartDigest, PartDrainError, PartKey, PartNumber,
-        PartPool, PartRemover, PartReplicationStore, PartScan, PartSource, PartVerified, RelandVerdict, ReplicationState, UploadEnqueuer, Version,
-        chunk_file_name, drain_part, observed_part_digest, parse_part_dir, part_digest, verdict_for_reland,
+        ChunkIndex, ClaimedPart, DrainOutcome, EnqueueOutcome, FailedGrace, META_FILE_NAME, ObjectId, OrphanGrace, PartDigest, PartDrainError,
+        PartKey, PartNumber, PartRemover, PartReplicationStore, PartScan, PartSource, PartVerified, RelandVerdict, ReplicationState, UploadEnqueuer,
+        Version, chunk_file_name, drain_part, observed_part_digest, parse_part_dir, part_digest, verdict_for_reland,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -1240,12 +926,12 @@ mod part_tests {
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
 
-    /// A no-op upload enqueuer for the localfs drain test.
+    /// An always-publishing upload enqueuer for the localfs drain test.
     struct NoopEnqueuer;
     impl UploadEnqueuer for NoopEnqueuer {
         type Error = io::Error;
-        async fn enqueue(&self, _part: &PartKey) -> Result<(), io::Error> {
-            Ok(())
+        async fn enqueue(&self, _part: &PartKey) -> Result<EnqueueOutcome, io::Error> {
+            Ok(EnqueueOutcome::Published)
         }
     }
 
@@ -1311,12 +997,12 @@ mod part_tests {
         }
 
         // Residency accounting is the Postgres store's job; this in-memory double only
-        // exercises the drain's copy/verify/commit ordering.
+        // exercises the drain's gate/hash/commit ordering.
         async fn mark_resident(&self, _part: &PartKey, _bytes: u64) -> Result<(), io::Error> {
             Ok(())
         }
 
-        fn mark_replicated(
+        fn mark_uploading(
             &self,
             part: &ClaimedPart,
             _proof: &PartVerified,
@@ -1325,40 +1011,10 @@ mod part_tests {
             let key = Self::key(part.part());
             let digest = digest.clone();
             async move {
-                self.status.lock().unwrap().insert(key.clone(), ReplicationState::Replicated);
+                self.status.lock().unwrap().insert(key.clone(), ReplicationState::Uploading);
                 self.committed_digest.lock().unwrap().insert(key, digest);
                 Ok(())
             }
-        }
-
-        async fn mark_upload_enqueued(&self, _part: &PartKey) -> Result<(), io::Error> {
-            // The localfs drain tests assert the SSD/pool copy + commit; the upload_enqueued_at
-            // stamp is exercised by the core partdrain tests + the store integration tests.
-            Ok(())
-        }
-
-        fn mark_failed(&self, part: &ClaimedPart, _reason: &str) -> impl Future<Output = Result<(), io::Error>> + Send {
-            let key = Self::key(part.part());
-            async move {
-                self.status.lock().unwrap().insert(key, ReplicationState::Failed);
-                Ok(())
-            }
-        }
-
-        fn mark_corrupt(&self, part: &ClaimedPart, _reason: &str) -> impl Future<Output = Result<(), io::Error>> + Send {
-            let key = Self::key(part.part());
-            async move {
-                self.status.lock().unwrap().insert(key, ReplicationState::Corrupt);
-                Ok(())
-            }
-        }
-
-        fn is_version_servable(&self, _part: &PartKey) -> impl Future<Output = Result<bool, io::Error>> + Send {
-            // The e2e drain tests exercise the happy/abandoned paths; an unservable default keeps
-            // a mismatch on the `Failed` path (the R4 servable→Corrupt branch is unit-tested in
-            // partdrain against a servable fake).
-            let servable = false;
-            async move { Ok(servable) }
         }
     }
 
@@ -1452,51 +1108,6 @@ mod part_tests {
     }
 
     #[tokio::test]
-    async fn persist_chunk_lands_a_verifiable_copy_and_persist_meta_lands_the_marker() {
-        let ssd_dir = TempDir::new().unwrap();
-        let pool_dir = TempDir::new().unwrap();
-        let part = part_key(5, 1);
-        let content = b"durable chunk bytes";
-        seed_ssd_part(ssd_dir.path(), &part, &[(0, content)]);
-
-        let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
-        let source = ssd.chunk_source(&part, ChunkIndex::new(0)).unwrap();
-        let copy_hash = ceph.persist_chunk(&source, &part, ChunkIndex::new(0)).await.unwrap();
-        // The hash-once win: persist_chunk returns the SHA computed during the copy stream,
-        // so the drain needs no separate readback of the source to verify.
-        assert_eq!(copy_hash, sha256_hex(content), "persist_chunk returns the copy-time hash");
-
-        let pooled = pool_dir.path().join(part.relative_dir()).join("chunk_0.bin");
-        assert_eq!(std::fs::read(&pooled).unwrap(), content, "the pooled bytes match the source");
-
-        let meta = ssd.meta_source(&part).unwrap();
-        ceph.persist_meta(&meta, &part).await.unwrap();
-        // One dir-fsync for the whole part: after it, every chunk + meta is durably present.
-        ceph.finalize_part(&part).await.unwrap();
-        assert!(pool_dir.path().join(part.relative_dir()).join("meta.json").exists(), "meta marker landed");
-        assert_eq!(
-            ceph.chunk_hash(&part, ChunkIndex::new(0)).await.unwrap(),
-            sha256_hex(content),
-            "the pooled chunk is durable + verifiable after finalize",
-        );
-    }
-
-    #[tokio::test]
-    async fn pool_remove_part_drops_a_corrupt_pool_copy_idempotently() {
-        let pool_dir = TempDir::new().unwrap();
-        let part = part_key(5, 1);
-        let dir = pool_dir.path().join(part.relative_dir());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("chunk_0.bin"), b"corrupt").unwrap();
-
-        let ceph = LocalFs::new(pool_dir.path());
-        ceph.remove_part(&part).await.unwrap();
-        assert!(!dir.exists(), "the corrupt pool part dir is removed");
-        ceph.remove_part(&part).await.unwrap(); // idempotent
-    }
-
-    #[tokio::test]
     async fn scan_discovers_complete_parts_and_skips_incomplete_and_junk() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
@@ -1564,35 +1175,29 @@ mod part_tests {
     }
 
     #[tokio::test]
-    async fn end_to_end_part_drain_copies_verifies_commits_and_retains() {
+    async fn end_to_end_part_drain_hashes_real_files_commits_uploading_and_retains() {
         let ssd_dir = TempDir::new().unwrap();
-        let pool_dir = TempDir::new().unwrap();
         let part = part_key(5, 1);
         seed_ssd_part(ssd_dir.path(), &part, &[(0, b"chunk zero"), (1, b"chunk one!")]);
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = MemPartStore::default();
         store.set(&part, ReplicationState::Pending);
         let claim = ClaimedPart::new(part.clone(), 0);
 
-        let outcome = drain_part(&ceph, &ssd, &store, &NoopEnqueuer, &claim).await.unwrap();
+        let outcome = drain_part(&ssd, &store, &NoopEnqueuer, &claim).await.unwrap();
 
-        let pool_part = pool_dir.path().join(part.relative_dir());
-        let ssd_part = ssd_dir.path().join(part.relative_dir());
-        assert_eq!(outcome, DrainOutcome::Replicated);
-        assert_eq!(
-            std::fs::read(pool_part.join("chunk_0.bin")).unwrap(),
-            b"chunk zero",
-            "pool holds the durable copy"
-        );
-        assert!(pool_part.join("chunk_1.bin").exists());
-        assert!(pool_part.join("meta.json").exists(), "meta marker copied last");
+        assert_eq!(outcome, DrainOutcome::Enqueued);
         assert!(
-            ssd_part.exists(),
-            "the SSD copy is retained as this node's read tier once a verified pool copy exists",
+            ssd_dir.path().join(part.relative_dir()).exists(),
+            "the SSD copy is retained: it is what the uploader reads, and this node's read tier after",
         );
-        assert_eq!(store.status_of(&part), Some(ReplicationState::Replicated));
+        assert_eq!(store.status_of(&part), Some(ReplicationState::Uploading));
+        assert_eq!(
+            store.committed_digest(&part),
+            Some(part_digest(&[sha256_hex(b"chunk zero"), sha256_hex(b"chunk one!")])),
+            "the commit records the digest of the real bytes handed over",
+        );
     }
 
     #[tokio::test]
@@ -1601,24 +1206,15 @@ mod part_tests {
         // digest folded from the copy-time hashes inside drain_part is byte-identical to the one
         // `observed_part_digest` derives by re-reading the same part off LocalSsd. If the two
         // sides ever disagree — a different chunk order, a different hash rendering — every
-        // re-landing would read as diverged and the fleet would re-copy itself.
+        // re-landing would read as diverged and the fleet would re-upload itself.
         let ssd_dir = TempDir::new().unwrap();
-        let pool_dir = TempDir::new().unwrap();
         let part = part_key(5, 1);
         seed_ssd_part(ssd_dir.path(), &part, &[(0, b"chunk zero"), (1, b"chunk one!")]);
 
         let ssd = LocalSsd::new(ssd_dir.path());
         let store = MemPartStore::default();
         store.set(&part, ReplicationState::Pending);
-        drain_part(
-            &LocalFs::new(pool_dir.path()),
-            &ssd,
-            &store,
-            &NoopEnqueuer,
-            &ClaimedPart::new(part.clone(), 0),
-        )
-        .await
-        .unwrap();
+        drain_part(&ssd, &store, &NoopEnqueuer, &ClaimedPart::new(part.clone(), 0)).await.unwrap();
 
         let committed = store.committed_digest(&part).unwrap();
         let observed = observed_part_digest(&ssd, &part).await.unwrap();
@@ -1641,22 +1237,13 @@ mod part_tests {
         // committed. Same length on purpose — a size check would not catch this, which is why
         // the divergence has to be a content hash.
         let ssd_dir = TempDir::new().unwrap();
-        let pool_dir = TempDir::new().unwrap();
         let part = part_key(5, 1);
         seed_ssd_part(ssd_dir.path(), &part, &[(0, b"attempt one")]);
 
         let ssd = LocalSsd::new(ssd_dir.path());
         let store = MemPartStore::default();
         store.set(&part, ReplicationState::Pending);
-        drain_part(
-            &LocalFs::new(pool_dir.path()),
-            &ssd,
-            &store,
-            &NoopEnqueuer,
-            &ClaimedPart::new(part.clone(), 0),
-        )
-        .await
-        .unwrap();
+        drain_part(&ssd, &store, &NoopEnqueuer, &ClaimedPart::new(part.clone(), 0)).await.unwrap();
         let committed = store.committed_digest(&part).unwrap();
 
         std::fs::write(ssd_dir.path().join(part.relative_dir()).join("chunk_0.bin"), b"attempt two").unwrap();
@@ -1693,9 +1280,8 @@ mod part_tests {
     async fn end_to_end_drain_of_a_part_whose_meta_overdeclares_defers_and_keeps_the_ssd_copy() {
         // WI-1 against the real FS: meta claims 2 chunks but only chunk 0 is on disk (a
         // chunk removed after meta landed). The drain must defer with the SSD copy intact
-        // and nothing committed to the pool.
+        // and nothing committed.
         let ssd_dir = TempDir::new().unwrap();
-        let pool_dir = TempDir::new().unwrap();
         let part = part_key(5, 1);
         seed_ssd_part(ssd_dir.path(), &part, &[(0, b"only chunk")]);
         // Overwrite the (matching) meta with one that over-declares num_chunks.
@@ -1706,42 +1292,18 @@ mod part_tests {
         .unwrap();
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = MemPartStore::default();
         store.set(&part, ReplicationState::Pending);
         let claim = ClaimedPart::new(part.clone(), 0);
 
-        let err = drain_part(&ceph, &ssd, &store, &NoopEnqueuer, &claim).await.unwrap_err();
+        let err = drain_part(&ssd, &store, &NoopEnqueuer, &claim).await.unwrap_err();
 
         assert!(
             matches!(err, PartDrainError::IncompleteSource { declared: 2, present: 1 }),
             "got: {err:?}"
         );
         assert!(ssd_dir.path().join(part.relative_dir()).exists(), "SSD copy kept");
-        assert!(!pool_dir.path().join(part.relative_dir()).exists(), "nothing committed to the pool");
         assert_eq!(store.status_of(&part), Some(ReplicationState::Pending));
-    }
-
-    #[tokio::test]
-    async fn finalize_part_fsyncs_the_new_part_version_and_object_dirs() {
-        // WI-15: finalize walks the fresh object/version/part dir chain (created by the
-        // first drain of a new object). It must succeed against a freshly-created deep tree
-        // and be a cheap no-op on a second call over the now-durable tree.
-        let ssd_dir = TempDir::new().unwrap();
-        let pool_dir = TempDir::new().unwrap();
-        let part = part_key(5, 1);
-        seed_ssd_part(ssd_dir.path(), &part, &[(0, b"bytes")]);
-        let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
-        let source = ssd.chunk_source(&part, ChunkIndex::new(0)).unwrap();
-        ceph.persist_chunk(&source, &part, ChunkIndex::new(0)).await.unwrap();
-        ceph.persist_meta(&ssd.meta_source(&part).unwrap(), &part).await.unwrap();
-
-        ceph.finalize_part(&part).await.unwrap();
-        let part_path = pool_dir.path().join(part.relative_dir());
-        assert!(part_path.join("chunk_0.bin").exists() && part_path.join("meta.json").exists());
-        // A second finalize over an already-durable tree is a cheap no-op, not an error.
-        ceph.finalize_part(&part).await.unwrap();
     }
 
     #[tokio::test]
@@ -1984,11 +1546,5 @@ mod part_tests {
             assert!(!is_staged_name(name), "a write temp must not get the staged grace: {name}");
             assert_eq!(parse_chunk_index(OsStr::new(name)), None, "a write temp must not be counted: {name}");
         }
-
-        let prefix = temps["agent_prefix"].as_str().unwrap();
-        assert!(
-            temp_name("chunk_0.bin").starts_with(prefix),
-            "this crate's own temp prefix drifted from the golden"
-        );
     }
 }

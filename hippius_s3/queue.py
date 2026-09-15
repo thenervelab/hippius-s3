@@ -43,19 +43,6 @@ class Chunk(BaseModel):
     id: int
 
 
-class PartChunkSpec(BaseModel):
-    index: int
-    # CID is required for legacy (IPFS-backed) objects but intentionally optional
-    # for storage_version>=4 where chunks are addressed by deterministic keys.
-    cid: str | None = None
-    cipher_size_bytes: int | None = None
-
-
-class PartToDownload(BaseModel):
-    part_number: int
-    chunks: list[PartChunkSpec]
-
-
 class RetryableRequest(BaseModel):
     # Important: queue payloads are persisted. We must tolerate older/newer producers
     # sending fields that this version of the code doesn't know about.
@@ -77,6 +64,11 @@ class UploadChainRequest(RetryableRequest):
     chunks: list[Chunk]
     upload_id: str | None = None
     upload_backends: list[str] | None = None  # Set by API at enqueue time
+    # The ingest node whose SSD holds the part. The drain publishes to that node's queue
+    # (`upload_queue_name`), and only the uploader pod on that node can read the bytes, so a
+    # retry or a DLQ re-queue must route by this too. None = a pool-era request (the bytes are
+    # in the shared pool; the global queue).
+    node_id: str | None = None
     bypass_billing: bool = False
 
     @property
@@ -99,33 +91,25 @@ class UnpinChainRequest(RetryableRequest):
         return f"unpin::{ident}::{self.address}::{self.object_id}"
 
 
-class DownloadChainRequest(RetryableRequest):
-    object_id: str
-    object_version: int
-    object_key: str
-    bucket_name: str
-    # Deprecated: retained for backward compatibility with older queued payloads.
-    # Workers no longer depend on storage_version to populate the chunk cache.
-    object_storage_version: int | None = None
-    address: str
-    subaccount: str
-    substrate_url: str
-    size: int
-    multipart: bool
-    chunks: list[PartToDownload]
-    expire_at: float | None = None
-    download_backends: list[str] | None = None  # Set by API at enqueue time
+def upload_queue_name(backend: str, node_id: str | None = None) -> str:
+    """The list a backend's upload requests are pushed to.
 
-    @property
-    def name(self) -> str:
-        return f"download::{self.request_id}::{self.object_id}::{self.address}"
+    Node-scoped when the part's bytes are on one ingest node's SSD (the uploader DaemonSet pod
+    on that node is the only consumer), global when they are in the shared pool (the
+    pool-reading uploader Deployment). Mirrors the Rust producer's `upload_queue_name` in
+    crates/hippius-drain-agent/src/enqueue.rs — a drift strands requests on a list nobody reads.
+    """
+    if node_id:
+        return f"{backend}_upload_requests:{node_id}"
+    return f"{backend}_upload_requests"
 
 
 async def enqueue_upload_to_backends(request: UploadChainRequest) -> None:
     """Enqueue upload request to per-backend upload queues.
 
     Reads backends from ``request.upload_backends``; falls back to
-    ``config.upload_backends`` when the field is not set.
+    ``config.upload_backends`` when the field is not set. Routes by ``request.node_id`` so a
+    DLQ re-queue lands back on the node that holds the bytes.
     """
     client = get_queue_client()
     if request.request_id is None:
@@ -152,9 +136,8 @@ async def enqueue_upload_to_backends(request: UploadChainRequest) -> None:
 
     raw = request.model_dump_json()
     for backend in request.upload_backends:
-        queue_name = f"{backend}_upload_requests"
-        await client.lpush(queue_name, raw)  # ty: ignore[invalid-await]
-    logger.info(f"Enqueued upload request {request.name=} backends={request.upload_backends}")
+        await client.lpush(upload_queue_name(backend, request.node_id), raw)  # ty: ignore[invalid-await]
+    logger.info(f"Enqueued upload request {request.name=} backends={request.upload_backends} node_id={request.node_id}")
 
 
 async def enqueue_upload_request(payload: UploadChainRequest) -> None:
@@ -177,7 +160,11 @@ async def dequeue_upload_request(queue_name: str) -> UploadChainRequest | None:
 # Per-backend retry handling (ZSET with score = next_attempt_unix_ts)
 
 
-def _upload_retry_zset(backend: str) -> str:
+def _upload_retry_zset(backend: str, node_id: str | None = None) -> str:
+    # Scoped like the work queue: a retry for a node-local part must come back on that node's
+    # queue, and only that node's mover may claim it.
+    if node_id:
+        return f"{backend}_upload_retries:{node_id}"
     return f"{backend}_upload_retries"
 
 
@@ -197,10 +184,11 @@ async def enqueue_retry_request(
         payload.first_enqueued_at = time.time()
     next_ts = time.time() + max(0.0, float(delay_seconds))
     member = payload.model_dump_json()
-    zset_key = _upload_retry_zset(backend_name)
+    zset_key = _upload_retry_zset(backend_name, payload.node_id)
     await client.zadd(zset_key, {member: next_ts})
     logger.info(
-        f"Scheduled retry for {payload.name=} backend={backend_name} attempts={payload.attempts} next_at={int(next_ts)}"
+        f"Scheduled retry for {payload.name=} backend={backend_name} node_id={payload.node_id} "
+        f"attempts={payload.attempts} next_at={int(next_ts)}"
     )
 
 
@@ -244,13 +232,17 @@ async def _claim_due_retries(*, zset_key: str, target_queue: str, now_ts: float 
 async def move_due_upload_retries(
     *,
     backend_name: str,
+    node_id: str | None = None,
     now_ts: float | None = None,
     max_items: int = 64,
 ) -> int:
-    """Move due retry items back to the backend's upload queue. Returns number moved."""
+    """Move due retry items back to the backend's upload queue (this node's, when node-scoped).
+
+    Returns number moved.
+    """
     return await _claim_due_retries(
-        zset_key=_upload_retry_zset(backend_name),
-        target_queue=f"{backend_name}_upload_requests",
+        zset_key=_upload_retry_zset(backend_name, node_id),
+        target_queue=upload_queue_name(backend_name, node_id),
         now_ts=now_ts,
         max_items=max_items,
     )
@@ -359,102 +351,6 @@ async def move_due_unpin_retries(
     return await _claim_due_retries(
         zset_key=_unpin_retry_zset(backend_name),
         target_queue=f"{backend_name}_unpin_requests",
-        now_ts=now_ts,
-        max_items=max_items,
-    )
-
-
-async def enqueue_download_request(payload: DownloadChainRequest) -> None:
-    """Add a download request to per-backend download queues."""
-    client = get_queue_client()
-
-    config = get_config()
-    effective = compute_effective_backends(
-        payload.download_backends,
-        config.download_backends,
-        context={
-            "request_id": payload.request_id,
-            "object_id": payload.object_id,
-            "object_version": payload.object_version,
-            "bucket_name": payload.bucket_name,
-            "object_key": payload.object_key,
-        },
-        raise_on_empty=False,
-    )
-    if payload.download_backends is not None and effective is None:
-        logger.error(
-            "All requested download backends disallowed by config; not enqueuing. requested=%s allowed=%s context=%s",
-            payload.download_backends,
-            config.download_backends,
-            {
-                "request_id": payload.request_id,
-                "object_id": payload.object_id,
-                "object_version": payload.object_version,
-            },
-        )
-        return
-    payload.download_backends = effective or config.download_backends
-
-    raw = payload.model_dump_json()
-    queue_names = [f"{b}_download_requests" for b in payload.download_backends]
-
-    for qname in queue_names:
-        await client.lpush(qname, raw)  # ty: ignore[invalid-await]
-
-    logger.info(f"Enqueued download request {payload.name=} queues={queue_names}")
-
-
-async def dequeue_download_request(queue_name: str) -> DownloadChainRequest | None:
-    """Get the next download request from a backend-specific download queue."""
-    client = get_queue_client()
-    result = await client.brpop(_normalize_queue_name(queue_name), timeout=5)  # ty: ignore[invalid-await, invalid-argument-type]
-    if result:
-        _, queue_data = result
-        return DownloadChainRequest.model_validate_json(queue_data)
-    return None
-
-
-# Per-backend download retry handling (mirrors the upload retry ZSET above)
-
-
-def _download_retry_zset(backend: str) -> str:
-    return f"{backend}_download_retries"
-
-
-async def enqueue_download_retry_request(
-    payload: DownloadChainRequest,
-    *,
-    backend_name: str,
-    delay_seconds: float,
-    last_error: str | None = None,
-) -> None:
-    client = get_queue_client()
-    if payload.request_id is None:
-        payload.request_id = uuid.uuid4().hex
-    payload.attempts = int((payload.attempts or 0) + 1)
-    payload.last_error = last_error
-    if payload.first_enqueued_at is None:
-        payload.first_enqueued_at = time.time()
-    next_ts = time.time() + max(0.0, float(delay_seconds))
-    member = payload.model_dump_json()
-    zset_key = _download_retry_zset(backend_name)
-    await client.zadd(zset_key, {member: next_ts})
-    logger.info(
-        f"Scheduled download retry for {payload.name=} backend={backend_name} "
-        f"attempts={payload.attempts} next_at={int(next_ts)}"
-    )
-
-
-async def move_due_download_retries(
-    *,
-    backend_name: str,
-    now_ts: float | None = None,
-    max_items: int = 64,
-) -> int:
-    """Move due retry items back to the backend's download queue. Returns number moved."""
-    return await _claim_due_retries(
-        zset_key=_download_retry_zset(backend_name),
-        target_queue=f"{backend_name}_download_requests",
         now_ts=now_ts,
         max_items=max_items,
     )

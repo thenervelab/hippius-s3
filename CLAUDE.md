@@ -16,8 +16,8 @@ What makes this stack different from a normal S3 proxy:
 
 1. **Server-side envelope encryption with OVH KMS.** Every object chunk is AES-256-GCM encrypted with a per-object-version DEK; the DEK is wrapped by a per-bucket KEK; KEK is wrapped by an OVH KMS master key reachable only via mTLS from our API pods. Decryption therefore cannot be done on the client — every read flows through our API for decryption.
 2. **One FastAPI service** (the 2026-08 gateway/api merge): the former gateway's middleware chain (auth, ACL, validation, audit, purge) and the S3 handlers run in a single app — [hippius_s3/main.py `factory()`](hippius_s3/main.py). There is no internal forwarding hop and no trusted-header contract; auth state flows through `request.state`, and the ordering that makes that safe is pinned by [tests/unit/gateway/test_middleware_order.py](tests/unit/gateway/test_middleware_order.py).
-3. **Filesystem-first cache.** Chunk data lives on a shared NVMe/CephFS volume (`/var/lib/hippius/object_cache`). Redis is used for pub/sub chunk-ready notifications and for work queues — **not** for chunk storage. This is new as of 2026-04-21 (the old Redis download cache is gone — see [todo.md](todo.md)). On ingest nodes there is additionally a node-local NVMe tier read before the pool — see [hippius_s3/cache/CLAUDE.md](hippius_s3/cache/CLAUDE.md); it is **staging-only**, behind `HIPPIUS_PEER_FETCH_ENABLED` / `HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ`.
-4. **Async backend writes (drain-direct).** Client PUT returns success once data hits the node SSD cache + DB row. The API does **not** enqueue the backend upload; it persists the version address. A Rust drain-agent replicates the part SSD→Ceph and then LPUSHes the `UploadChainRequest` itself, so the arion-uploader only ever dequeues Ceph-ready data. Replication state lives in the drain's `cephor_replication_status` (`pending → draining → replicated | failed | corrupt`, where `corrupt` is a live object whose pool copy failed verification — its SSD copy is the last good source and is never reclaimed); `object_versions.status` no longer progresses through `uploading/uploaded/published`.
+3. **Filesystem-first cache.** Chunk data lives on a shared NVMe/CephFS volume (`/var/lib/hippius/object_cache`). Redis is used for work queues and the drain's coordination keys — **not** for chunk storage, and (since the direct-to-Arion read path) no longer for chunk-ready pub/sub. This is new as of 2026-04-21 (the old Redis download cache is gone — see [todo.md](todo.md)). On ingest nodes there is additionally a node-local NVMe tier read before the pool — see [hippius_s3/cache/CLAUDE.md](hippius_s3/cache/CLAUDE.md); it is **staging-only**, behind `HIPPIUS_PEER_FETCH_ENABLED` / `HIPPIUS_OBJECT_CACHE_PROMOTE_ON_READ`.
+4. **Async backend writes (drain-direct).** Client PUT returns success once data hits the node SSD cache + DB row. The API does **not** enqueue the backend upload; it persists the version address. A Rust drain-agent on the same node verifies the part is whole on SSD, records its content digest, LPUSHes the `UploadChainRequest` to the **node-scoped** queue `arion_upload_requests:<node>`, and commits the row `uploading`. The `arion-uploader-local` DaemonSet pod on that node reads the chunks straight off the NVMe, uploads to Arion, and flips the row `replicated` — only then may the evictor unlink the SSD copy. Replication state lives in the drain's `cephor_replication_status` (`pending → draining → uploading → replicated | failed`; `replicated` means "on the backend"). The drain's `upload_sweep` is the DB-authoritative backstop: it confirms `uploading` rows from `chunk_backend` coverage, re-publishes ones that sat too long (bounded by `upload_attempts`), and retires ones whose object was deleted. The CephFS pool is no longer written by the drain; the base `arion-uploader` Deployment keeps draining the global queue for pool-era rows until the pool is decommissioned (PR 2). `object_versions.status` no longer progresses through `uploading/uploaded/published`.
 5. **S4 append extension.** On top of standard S3 we support atomic O(delta) appends with compare-and-swap semantics, spec at [docs/s4.md](docs/s4.md).
 
 The pipeline is deliberately split so the user-facing path (gateway + API) is fast and bounded in memory, while slow/brittle work (Arion uploads, chain publishing, cleanup) is pushed to workers that can retry independently.
@@ -37,9 +37,9 @@ The pipeline is deliberately split so the user-facing path (gateway + API) is fa
 │   │   └── s3/              # buckets/, objects/, multipart.py, extensions/append.py
 │   ├── writer/              # Upload pipeline: object_writer, chunker, write_through_writer
 │   ├── reader/              # Read pipeline: planner, streamer, decrypter
-│   ├── cache/               # FileSystemPartsStore, RedisObjectPartsCache, ChunkNotifier
+│   ├── cache/               # FileSystemPartsStore, RedisObjectPartsCache, DualFileSystemPartsStore, peers
 │   ├── services/            # crypto, KMS, Arion client, Hippius API, copy, audit, ACL helper
-│   ├── workers/             # Core worker loops (uploader, downloader, unpinner)
+│   ├── workers/             # Core worker loops (uploader, unpinner)
 │   ├── dlq/                 # Dead-letter queue implementations (upload, unpin)
 │   ├── repositories/        # Database access layer
 │   ├── sql/                 # Migrations (migrations/) and parameterized queries (queries/)
@@ -80,7 +80,7 @@ A **subsystem index** with links to per-directory `CLAUDE.md` files is in sectio
    - **Update object_versions** with final size/md5 ([object_writer.py:442](hippius_s3/writer/object_writer.py)). Until this runs, the download query skips the version — it's reserved but not serveable.
    - **Return**. Client sees 200 OK.
 8. **Persist version address** ([put_object_endpoint.py:186-200 `set_object_version_address`](hippius_s3/api/s3/objects/put_object_endpoint.py)). No upload is enqueued on the write path (drain-direct cutover) — the API records the main-account address and returns.
-9. **Rust drain-agent** replicates the part SSD→Ceph, then LPUSHes the `UploadChainRequest` to `arion_upload_requests` itself (sole producer). The **Arion uploader worker** ([workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py)) then dequeues the (Ceph-ready) request, reads chunks, uploads to Arion, records `chunk_backend` rows, and publishes to the Hippius chain via [hippius_s3/services/hippius_api_service.py](hippius_s3/services/hippius_api_service.py).
+9. **Rust drain-agent** gates the part (every declared chunk present), hashes it, LPUSHes the `UploadChainRequest` to `arion_upload_requests:<node>` (sole producer; a part whose version has no `address` yet — an in-flight MPU — is deferred until `CompleteMultipartUpload` wakes it), then commits the row `uploading`. The **node-local Arion uploader** ([workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py) with `NODE_NAME` set) dequeues its node's requests, reads the chunks off the NVMe, uploads to Arion, records `chunk_backend` rows, flips the drain row `replicated` (`confirm_replication_status_uploaded.sql`), and publishes to the Hippius chain via [hippius_s3/services/hippius_api_service.py](hippius_s3/services/hippius_api_service.py).
 
 ### 3.2 GET (full object or Range)
 
@@ -88,24 +88,20 @@ A **subsystem index** with links to per-directory `CLAUDE.md` files is in sectio
 2. **GetObject endpoint** → [hippius_s3/services/object_reader.py `build_stream_context`](hippius_s3/services/object_reader.py):
    - Read parts list from DB.
    - Build chunk plan ([hippius_s3/reader/planner.py](hippius_s3/reader/planner.py)) — maps Range bytes to (part_number, chunk_index, slice_start, slice_end).
-   - **Batch-check** every needed chunk on FS in one pass ([object_reader.py:67](hippius_s3/services/object_reader.py) via `chunks_exist_batch`).
-   - If all present → `source="cache"`; stream directly.
-   - If any missing → `source="pipeline"`:
-     - **Coalesce**: per (object, version, part), try `SET NX EX <DOWNLOAD_COALESCE_LOCK_TTL>` (default 600) on `download_in_progress:{object_id}:v:{ov}:part:{pn}` ([object_reader.py:87-104](hippius_s3/services/object_reader.py)). If you lose the race, skip the enqueue; another streamer is already fetching and you'll wait on pub/sub.
-     - If you won, build a `DownloadChainRequest` with optional per-chunk CIDs and enqueue to `arion_download_requests` ([object_reader.py:146-165](hippius_s3/services/object_reader.py)).
-   - **Unwrap DEK** from DB (`kek_id`, `wrapped_dek`) via [hippius_s3/services/envelope_service.py](hippius_s3/services/envelope_service.py). If the current version is mid-write (envelope missing), fall back to version-1 ([object_reader.py:177-220](hippius_s3/services/object_reader.py)).
-3. **Stream plan** ([hippius_s3/reader/streamer.py:18](hippius_s3/reader/streamer.py)):
-   - Configurable prefetch depth (runtime default **16** via `HTTP_STREAM_PREFETCH_CHUNKS`; the streamer function-param fallback is 0) overlaps FS/Arion fetch with IO. Note: it does not yet overlap the on-loop decrypt (RD-2).
-   - For each chunk: `obj_cache.wait_for_chunk` → fast path reads from FS; slow path subscribes to `notify:{chunk_key}` pub/sub and re-reads on notification ([hippius_s3/cache/notifier.py:61](hippius_s3/cache/notifier.py)).
-   - Decrypt ([reader/decrypter.py](hippius_s3/reader/decrypter.py)), optionally slice for Range, yield.
-4. **Downloader worker** ([hippius_s3/workers/downloader.py:94](hippius_s3/workers/downloader.py)) handles `DownloadChainRequest`:
-   - Writes `meta.json` **eagerly** from DB parts rows ([downloader.py:49-91](hippius_s3/workers/downloader.py)) so partial-range fills are readable per-chunk as they land.
-   - For each chunk: check FS (maybe another worker filled it) → look up `backend_identifier` in `chunk_backend` → fetch from Arion → `fs_store.set_chunk` → `obj_cache.notify_chunk`.
-   - Releases the coalesce lock on part completion ([downloader.py:286-292](hippius_s3/workers/downloader.py)) — key format **must match** the streamer's exactly.
+   - **Batch-check** every needed chunk on the local tiers in one pass (`chunks_exist_batch`).
+   - If all present → `source="cache"`.
+   - If any missing → `source="pipeline"`: resolve every chunk's **backend location** (`chunk_backend.backend_identifier`, one batched query per download backend) while the request still owns `db`, and carry them on the `StreamContext.locations`. Nothing is enqueued and no lock is taken — the downloader, the coalesce lock and the `notify:*` wait are gone from the read path.
+   - **Unwrap DEK** from DB (`kek_id`, `wrapped_dek`) via [hippius_s3/services/envelope_service.py](hippius_s3/services/envelope_service.py). If the current version is mid-write (envelope missing), fall back to the highest serveable version below it (and resolve *that* version's locations).
+3. **Stream plan** ([hippius_s3/reader/streamer.py](hippius_s3/reader/streamer.py)):
+   - Configurable prefetch depth (runtime default **16** via `HTTP_STREAM_PREFETCH_CHUNKS`; the streamer function-param fallback is 0) overlaps fetch with decrypt + response IO — on a cold read it is also the per-request backend parallelism.
+   - For each chunk: `obj_cache.get_chunk` walks this node's NVMe → a peer's NVMe → the pool; on a miss, `fetch_missing` ([hippius_s3/reader/backend_fetch.py](hippius_s3/reader/backend_fetch.py)) pulls the ciphertext **from Arion into memory** by its recorded location (one `ArionClient` per process, `HIPPIUS_READ_BACKEND_FETCH_CONCURRENCY` in flight per pod, `HIPPIUS_READ_BACKEND_FETCH_ATTEMPTS` bounded retries per location). Arion-served bytes are **never written to any cache** — no pool fill, no NVMe promotion (peer-served chunks still promote).
+   - A chunk with no location yet (its part is inside the upload window on another node) can only come from a peer: the local tiers are re-polled for `HIPPIUS_READ_MISSING_CHUNK_WAIT_SECONDS`, then the request fails with a retryable 503 (`ChunkUnavailableError` → `DownloadNotReadyError` at the first-chunk peek; a mid-stream one ends the stream). Each chunk is bounded by `HIPPIUS_STREAM_CHUNK_TIMEOUT_SECONDS`.
+   - Decrypt ([reader/decrypter.py](hippius_s3/reader/decrypter.py)) in-process, optionally slice for Range, yield.
+4. `UploadPartCopy` and streaming `CopyObject` read their source through the same `stream_object` path. There is no download worker any more.
 
 ### 3.3 Range request specifics
 
-The planner ([reader/planner.py](hippius_s3/reader/planner.py)) only includes chunks that intersect the requested range, and sets `slice_start`/`slice_end_excl` on the first and last to trim plaintext. The downloader, when invoked for a Range miss, fetches **full chunks** (not byte ranges) from Arion — there is no `BackendClient.download_range` yet. See [todo.md](todo.md) for this optimization.
+The planner ([reader/planner.py](hippius_s3/reader/planner.py)) only includes chunks that intersect the requested range, and sets `slice_start`/`slice_end_excl` on the first and last to trim plaintext. A Range miss fetches exactly those chunks from Arion — **full chunks** (not byte ranges); there is no `download_range` on the backend client yet.
 
 ---
 
@@ -151,7 +147,7 @@ Chunk ciphertext     (AES-256-GCM per chunk; AAD binds bucket_id:object_id:versi
 ```
 
 - **Atomic writes**: each worker writes to a unique `.tmp.<uuid4>` file and `os.replace`s onto the final path ([hippius_s3/cache/fs_store.py:92](hippius_s3/cache/fs_store.py), [fs_store.py:123-131](hippius_s3/cache/fs_store.py)). Concurrent writers of the same chunk are safe — content is deterministic per (object_id, version, part, chunk_index), so last rename wins is harmless.
-- **Meta is the readiness signal**: `get_chunk` returns `None` if `meta.json` is missing ([fs_store.py:168](hippius_s3/cache/fs_store.py)) — even if the chunk file exists. Uploaders write meta **last** (after all chunks); downloaders write meta **first** (so per-chunk visibility works as chunks land).
+- **Meta is the readiness signal**: `get_chunk` returns `None` if `meta.json` is missing ([fs_store.py:168](hippius_s3/cache/fs_store.py)) — even if the chunk file exists. Writers (ingest, promotion) write meta **last**, after every chunk.
 - **Hot retention via read-recency tracking**: reads no longer `os.utime` the files — the per-read atime touch was removed (dead on read-only mounts, an MDS metadata write elsewhere). Instead a successful read records recency via `tracker.note_read(...)` into `fs_cache_inventory.last_access_at` ([fs_store.py:180-195](hippius_s3/cache/fs_store.py)). Janitor uses `last_access_at` to keep hot parts on NVMe for `HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS` (default 4h). `os.utime` still applies on the set/touch write paths, so stat atime now reflects write recency only.
 - **UUID coercion**: asyncpg may hand back `UUID` objects OR strings. `_safe_object_id` handles both ([fs_store.py:48-62](hippius_s3/cache/fs_store.py)) and rejects anything else to prevent path traversal.
 
@@ -177,13 +173,13 @@ Five separate services for blast-radius isolation:
 |---|---|---|---|
 | `redis` | 6379 | General cache / short-lived state | Ephemeral |
 | `redis-accounts` | 6380 | Account credit cache | Persistent (AOF) |
-| `redis-queues` | 6382 | Work queues + chunk pub/sub notifications | Persistent, 1GB, LRU |
+| `redis-queues` | 6382 | Work queues (upload/unpin lists, retry ZSETs, DLQs) + drain coordination keys | Persistent, 1GB, LRU |
 | `redis-rate-limiting` | 6383 | Rate limit counters | Ephemeral, 1GB |
 | `redis-acl` | 6384 | ACL cache | Ephemeral, 2GB, LRU |
 
 **Not in the table any more**: the old 32GB `redis-download-cache` (6385), decommissioned 2026-04-21 with the FS-cache migration; and `redis-chain` (6381), decommissioned 2026-06-30 — it was wired up but never read or written by any code path. If you spot a reference to `REDIS_DOWNLOAD_CACHE_URL` or `REDIS_CHAIN_URL`, it's stale.
 
-The `ChunkNotifier` pub/sub ([hippius_s3/cache/notifier.py:46-49](hippius_s3/cache/notifier.py)) publishes to `notify:{chunk_key}` on `redis-queues`. Streamers subscribe + re-check on each notification.
+The upload lists are **node-scoped** since the direct-to-Arion cutover: the drain publishes to `arion_upload_requests:<node>` (read only by that node's `arion-uploader-local` pod) and the global `arion_upload_requests` remains for pool-era parts. Both shapes are gauged (`queue_depth{queue=...}`, discovered per sample) — a node list nobody reads is exactly the backlog to watch for.
 
 ### 5.4 Postgres schema (high level)
 
@@ -234,15 +230,15 @@ Canonicalization uses `request.scope["raw_path"]` (bytes) rather than `request.u
 
 ### Download / streaming pipeline
 - [hippius_s3/reader/CLAUDE.md](hippius_s3/reader/CLAUDE.md) — planner, streamer, decrypter.
-- [hippius_s3/services/object_reader.py `build_stream_context`](hippius_s3/services/object_reader.py) — cache-vs-pipeline decision + download coalescing.
+- [hippius_s3/services/object_reader.py `build_stream_context`](hippius_s3/services/object_reader.py) — cache-vs-pipeline decision + backend location resolution; [hippius_s3/reader/backend_fetch.py](hippius_s3/reader/backend_fetch.py) — the in-memory backend tier.
 
-### Cache & pub/sub
-- [hippius_s3/cache/CLAUDE.md](hippius_s3/cache/CLAUDE.md) — `FileSystemPartsStore`, `RedisObjectPartsCache`, `ChunkNotifier`, `DualFileSystemPartsStore`.
+### Cache tiers
+- [hippius_s3/cache/CLAUDE.md](hippius_s3/cache/CLAUDE.md) — `FileSystemPartsStore`, `RedisObjectPartsCache`, `DualFileSystemPartsStore`, the peer tier.
 
 ### Workers
-- [hippius_s3/workers/CLAUDE.md](hippius_s3/workers/CLAUDE.md) — core logic (uploader, downloader, unpinner).
+- [hippius_s3/workers/CLAUDE.md](hippius_s3/workers/CLAUDE.md) — core logic (uploader, unpinner).
 - [workers/CLAUDE.md](workers/CLAUDE.md) — entry-point loops and janitor.
-- Entry scripts: [workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py), [workers/run_arion_downloader_in_loop.py](workers/run_arion_downloader_in_loop.py), [workers/run_arion_unpinner_in_loop.py](workers/run_arion_unpinner_in_loop.py), [workers/run_janitor_in_loop.py](workers/run_janitor_in_loop.py), [workers/run_orphan_checker_in_loop.py](workers/run_orphan_checker_in_loop.py), [workers/run_account_cacher_in_loop.py](workers/run_account_cacher_in_loop.py), [workers/run_migrator_once.py](workers/run_migrator_once.py), [workers/cachet_health_check.py](workers/cachet_health_check.py).
+- Entry scripts: [workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py), [workers/run_arion_unpinner_in_loop.py](workers/run_arion_unpinner_in_loop.py), [workers/run_janitor_in_loop.py](workers/run_janitor_in_loop.py), [workers/run_orphan_checker_in_loop.py](workers/run_orphan_checker_in_loop.py), [workers/run_account_cacher_in_loop.py](workers/run_account_cacher_in_loop.py), [workers/run_migrator_once.py](workers/run_migrator_once.py), [workers/cachet_health_check.py](workers/cachet_health_check.py).
 
 ### Business services
 - [hippius_s3/services/CLAUDE.md](hippius_s3/services/CLAUDE.md) — all service modules.
@@ -275,7 +271,7 @@ Config is a typed dataclass: [hippius_s3/config.py](hippius_s3/config.py). Value
 | `DATABASE_URL` | — | Postgres connection string (required). |
 | `HIPPIUS_KEYSTORE_DATABASE_URL` | `DATABASE_URL` | Separate keystore DB, falls back. |
 | `REDIS_URL` | — | Main Redis (:6379). |
-| `REDIS_QUEUES_URL` | `:6382` | Queue + pub/sub Redis. Persistent. |
+| `REDIS_QUEUES_URL` | `:6382` | Queue Redis. Persistent. |
 | `REDIS_ACCOUNTS_URL` | `:6380` | Account cache. Persistent. |
 | `REDIS_RATE_LIMITING_URL` | `:6383` | Rate limit counters. |
 | `REDIS_ACL_URL` | `:6384` | ACL cache. |
@@ -294,10 +290,9 @@ Config is a typed dataclass: [hippius_s3/config.py](hippius_s3/config.py). Value
 | `HIPPIUS_CHUNK_SIZE_BYTES` | `4194304` (4 MiB) | Must be consistent across upload/download code paths. |
 | `HIPPIUS_CACHE_TTL` | `3600` | Pub/sub wait timeout. |
 | `HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS` | `14400` (4h) | Janitor keeps recently-read parts. |
-| `DOWNLOAD_COALESCE_LOCK_TTL` | `600` | Lock expiry guards downloader crashes. |
-| `DOWNLOADER_SEMAPHORE` | `20` | Concurrent chunk fetches per DCR. |
-| `DOWNLOADER_MAX_INFLIGHT` | `10` | Concurrent `DownloadChainRequest`s per pod. |
-| `DOWNLOADER_CHUNK_RETRIES` | `3` | Per-chunk retry attempts. |
+| `HIPPIUS_READ_BACKEND_FETCH_CONCURRENCY` | `32` | Backend chunk fetches in flight per api pod (cold reads). |
+| `HIPPIUS_READ_BACKEND_FETCH_ATTEMPTS` | `3` | Retries per backend location on a transient error. |
+| `HIPPIUS_READ_MISSING_CHUNK_WAIT_SECONDS` | `10` | Re-poll of the local tiers for a chunk no backend holds yet, before a 503. |
 
 ### Backend routing
 
@@ -340,7 +335,7 @@ pytest tests/integration -v
 pytest tests/e2e -v
 
 # Targeted tests relevant to recent changes
-pytest tests/unit/test_download_coalescing.py -xvs
+pytest tests/unit/services/test_stream_from_backend.py tests/unit/reader/test_backend_fetch.py -xvs
 pytest tests/unit/test_janitor_hot_retention.py -xvs
 pytest tests/unit/cache -xvs
 pytest tests/e2e/test_GetObject_Range.py -xvs
@@ -420,7 +415,7 @@ The pod's container has no `wget`/`curl`, so always port-forward and curl from y
 
 **Namespaces of interest:** `hippius-s3-prod`, `hippius-s3-staging`, `hippius-arion`, `hippius-arion-staging`, `hippius-indexer`.
 
-**`app` values in `hippius-s3-prod`:** `gateway`, `api`, `arion-uploader`, `arion-downloader`, `arion-unpinner`, `janitor`, `account-cacher`, `cachet-health-checker`, 1`redis-queues`, `redis-accounts`, `otel-collector`.
+**`app` values in `hippius-s3-prod`:** `gateway`, `api`, `arion-uploader`, `arion-uploader-local`, `arion-unpinner`, `janitor`, `account-cacher`, `cachet-health-checker`, 1`redis-queues`, `redis-accounts`, `otel-collector`.
 
 **Run a query (LogQL):**
 ```bash

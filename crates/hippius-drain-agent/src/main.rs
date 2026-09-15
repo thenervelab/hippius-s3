@@ -9,7 +9,7 @@
 use hippius_drain_agent::config::{Config, ConfigError};
 use hippius_drain_agent::enqueue::RedisEnqueuer;
 use hippius_drain_agent::landed::LandedQueue;
-use hippius_drain_agent::localfs::{LocalFs, LocalSsd};
+use hippius_drain_agent::localfs::LocalSsd;
 use hippius_drain_agent::runtime::{AgentRuntime, RateControl, default_enforcer};
 use hippius_drain_agent::supervisor::{RunReport, ShutdownTrigger};
 use hippius_drain_core::{Bytes, Coordinator, DEFAULT_REDIS_TIMEOUT, Store, StoreError};
@@ -77,7 +77,18 @@ async fn main() -> Result<ExitCode, StartupError> {
     // Enqueue to upload ∪ backup backends — the SAME union the janitor's replication gate
     // requires before it will reclaim a part (C10). Pushing only to upload_backends would
     // strand any configured backup backend as required-but-never-enqueued.
-    let enqueuer = Arc::new(RedisEnqueuer::new(Arc::clone(&store), redis.clone(), config.enqueue_backends()));
+    // Node-scoped: a part the drain hands over is on THIS node's SSD, so its request goes to
+    // the queue only this node's uploader pod reads.
+    let enqueuer = Arc::new(RedisEnqueuer::node_scoped(
+        Arc::clone(&store),
+        redis.clone(),
+        config.enqueue_backends(),
+        config.node_id.as_str(),
+    ));
+    // The legacy enqueue sweep's pool-era rows have their bytes in the shared pool, not on any
+    // one SSD: those go to the global queue the pool-reading uploader Deployment drains.
+    // TODO: delete with the pool (PR 2).
+    let pool_enqueuer = Arc::new(RedisEnqueuer::pool(Arc::clone(&store), redis.clone(), config.enqueue_backends()));
 
     // The Redis-backed coordinator: the heartbeat worker upserts this node's state under
     // `heartbeat_ttl`, and the allocation-pull worker reads its budget. The agent never
@@ -95,13 +106,8 @@ async fn main() -> Result<ExitCode, StartupError> {
         Bytes::new(config.max_drain_rate.get()),
         config.drain_concurrency,
     )));
-    let runtime = AgentRuntime::new(
-        Arc::new(LocalFs::new(&config.pool_root)),
-        Arc::new(LocalSsd::new(&config.ssd_root)),
-        store,
-        enqueuer,
-        config.runtime_config(),
-    );
+    let runtime =
+        AgentRuntime::new(Arc::new(LocalSsd::new(&config.ssd_root)), store, enqueuer, config.runtime_config()).with_pool_enqueuer(pool_enqueuer);
 
     // Built after the runtime because the allocation pull publishes this node's eviction
     // reserve into the runtime's snapshot, which the evictor worker reads on its own poll.
@@ -132,7 +138,6 @@ async fn main() -> Result<ExitCode, StartupError> {
     let metrics = hippius_drain_agent::metrics::init("hippius-drain-agent", &runtime.snapshot(), Some(&enforcer));
 
     tracing::info!(
-        pool_root = %config.pool_root.display(),
         ssd_root = %config.ssd_root.display(),
         upload_backends = ?config.upload_backends,
         backup_backends = ?config.backup_backends,

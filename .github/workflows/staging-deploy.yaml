@@ -309,6 +309,10 @@ jobs:
           ARION_SSL="${{ secrets.HIPPIUS_ARION_VERIFY_SSL }}"
           sed -i "s|HIPPIUS_ARION_BASE_URL_PLACEHOLDER|${ARION_URL:-https://arion.hippius.com/}|g" k8s/base/workers-deployments.yaml
           sed -i "s|HIPPIUS_ARION_VERIFY_SSL_PLACEHOLDER|${ARION_SSL:-true}|g" k8s/base/workers-deployments.yaml
+          # The node-local uploader DaemonSet carries the same placeholders (same worker image +
+          # env, scoped to one node's queue).
+          sed -i "s|HIPPIUS_ARION_BASE_URL_PLACEHOLDER|${ARION_URL:-https://arion.hippius.com/}|g" k8s/staging/arion-uploader-local-daemonset.yaml
+          sed -i "s|HIPPIUS_ARION_VERIFY_SSL_PLACEHOLDER|${ARION_SSL:-true}|g" k8s/staging/arion-uploader-local-daemonset.yaml
 
       - name: Substitute Sentry DSN
         run: |
@@ -411,8 +415,27 @@ jobs:
           # SigV4 against it. Old header-trusting pods receiving public traffic (an auth
           # bypass) is prevented by the label either way.
           kubectl delete deployment/gateway -n hippius-s3-staging --ignore-not-found=true
-          kubectl rollout status deployment/arion-downloader -n hippius-s3-staging --timeout=10m
+          # The download pipeline is gone (reads stream from the backend in-process); prune its
+          # Deployment the same way — `apply -k` never deletes a removed resource, and a
+          # lingering downloader would keep an RW pool mount and a Postgres pool open for
+          # a queue nothing publishes to. Idempotent after the first deploy.
+          kubectl delete deployment/arion-downloader -n hippius-s3-staging --ignore-not-found=true
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
+          # The node-local uploader must be Ready BEFORE the drain image rolls: the drain
+          # publishes to `arion_upload_requests:<node>`, which only this DaemonSet reads. Same
+          # partial-roll policy as drain-agent below (>= 1 Ready; warn on partial, fail on zero).
+          if ! kubectl rollout status daemonset/arion-uploader-local -n hippius-s3-staging --timeout=10m; then
+            ready=$(kubectl get ds arion-uploader-local -n hippius-s3-staging -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+            desired=$(kubectl get ds arion-uploader-local -n hippius-s3-staging -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+            if [ "${ready:-0}" -ge 1 ]; then
+              echo "::warning::arion-uploader-local rolled ${ready}/${desired} (a labeled node is likely at pod capacity); proceeding"
+            else
+              echo "::error::arion-uploader-local has zero Ready pods (${ready}/${desired})"
+              kubectl get ds arion-uploader-local -n hippius-s3-staging -o wide || true
+              kubectl get pods -l app=arion-uploader-local -n hippius-s3-staging -o wide || true
+              exit 1
+            fi
+          fi
           # Drain stack, allocator-first: the allocator applies the cephor_* migrations
           # on startup, so confirm it is Ready (strict) before the per-node agent DaemonSet.
           kubectl rollout status deployment/drain-allocator -n hippius-s3-staging --timeout=5m

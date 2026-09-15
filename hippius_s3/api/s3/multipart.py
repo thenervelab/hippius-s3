@@ -697,22 +697,12 @@ async def upload_part(
                 status_code=405,
             )
 
-        # Read source via reader pipeline to obtain plaintext when needed
-        # Read plaintext via reader pipeline (parts → plan → stream decrypt)
-        try:
-            from hippius_s3.queue import DownloadChainRequest  # local import
-            from hippius_s3.queue import PartChunkSpec  # local import
-            from hippius_s3.queue import PartToDownload  # local import
-            from hippius_s3.queue import enqueue_download_request  # local import
-            from hippius_s3.reader.db_meta import read_parts_list  # local import to avoid cycles
-            from hippius_s3.reader.planner import build_chunk_plan  # local import
-            from hippius_s3.reader.streamer import stream_plan  # local import
-        except Exception:
-            return s3_error_response("InternalError", "Reader pipeline unavailable", status_code=500)
+        # Read the source's plaintext through the reader pipeline (parts → plan → local tiers, then
+        # the backend into memory, decrypted here) — the same path a GET takes.
+        from hippius_s3.services.object_reader import stream_object  # local import to avoid cycles
 
         object_id_str = str(source_obj["object_id"])
         src_ver = int(source_obj.get("object_version") or 1)
-        parts = await read_parts_list(pool, object_id_str, src_ver)
         rng = None
         source_size = int(source_obj.get("size_bytes") or 0)
         if range_start is not None and range_end is not None:
@@ -723,72 +713,11 @@ async def upload_part(
             from hippius_s3.reader.types import RangeRequest  # local import
 
             rng = RangeRequest(start=int(range_start), end=int(range_end))
-        plan = await build_chunk_plan(pool, object_id_str, parts, rng, object_version=src_ver)
 
-        # Enqueue downloader for any missing chunk indices in cache. CP-2: one batched existence
-        # check (off-loop, meta-gated) instead of a serial per-chunk stat, matching the GET path.
-        # Lifespan-built cache: it holds the standalone queues client that `stream_plan` below
-        # needs for chunk-ready pub/sub. See the note in copy_helpers.handle_streaming_copy.
-        obj_cache = request.app.state.obj_cache
-        checks = [(int(it.part_number), int(it.chunk_index)) for it in plan]
-        exist_flags = await obj_cache.chunks_exist_batch(object_id_str, src_ver, checks)
-        indices_by_part: dict[int, list[int]] = {}
-        for it, present in zip(plan, exist_flags, strict=True):
-            if not present:
-                indices_by_part.setdefault(int(it.part_number), []).append(int(it.chunk_index))
-        if indices_by_part:
-            dl_parts: list[PartToDownload] = []
-            for pn, idxs in indices_by_part.items():
-                try:
-                    rows = await pool.fetch(
-                        get_query("get_part_chunks_by_object_and_number"),
-                        object_id_str,
-                        src_ver,
-                        int(pn),
-                    )
-                    all_entries = [(int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []]
-                    chunk_specs: list[PartChunkSpec] = []
-                    include = {int(i) for i in idxs}
-                    for ci, cid, clen in all_entries:
-                        if int(ci) in include:
-                            chunk_specs.append(
-                                PartChunkSpec(
-                                    index=int(ci),
-                                    cid=str(cid),
-                                    cipher_size_bytes=int(clen) if clen is not None else None,
-                                )
-                            )
-                    if not chunk_specs:
-                        continue
-                    dl_parts.append(PartToDownload(part_number=int(pn), chunks=chunk_specs))
-                except Exception:
-                    continue
-            req = DownloadChainRequest(
-                request_id=f"{object_id_str}::upload_part_copy",
-                object_id=object_id_str,
-                object_version=src_ver,
-                object_storage_version=int(source_obj.get("storage_version") or 0),
-                object_key=source_object_key,
-                bucket_name=source_bucket_name,
-                address=request.state.main_account_id,
-                subaccount=request.state.main_account_id,
-                substrate_url=config.substrate_url,
-                size=int(source_obj.get("size_bytes") or 0),
-                multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
-                chunks=dl_parts,
-            )
-            await enqueue_download_request(req)
-
-        # Stream plaintext bytes
         raw_storage_version = source_obj.get("storage_version")
         if raw_storage_version is None:
             return s3_error_response("InternalError", "Missing storage version", status_code=500)
         storage_version = require_supported_storage_version(int(raw_storage_version))
-        bucket_id = str(source_obj.get("bucket_id") or "")
-        suite_id = str(
-            source_obj.get("enc_suite_id") or ("hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy")
-        )
-        key_bytes: bytes | None = None
         expected_size = (
             int(range_end - range_start + 1)
             if range_start is not None and range_end is not None
@@ -800,36 +729,30 @@ async def upload_part(
                 "UploadPartCopy source is too large to buffer in memory",
                 status_code=413,
             )
-        if storage_version >= 5:
-            from hippius_s3.services.envelope_service import unwrap_dek
-            from hippius_s3.services.kek_service import get_bucket_kek_bytes
-
-            kek_id = source_obj.get("kek_id")
-            wrapped_dek = source_obj.get("wrapped_dek")
-            if not bucket_id or not kek_id or not wrapped_dek:
-                return s3_error_response("InternalError", "Missing v5 envelope metadata", status_code=500)
-            kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
-            aad = f"hippius-dek:{bucket_id}:{object_id_str}:{src_ver}".encode("utf-8")
-            key_bytes = unwrap_dek(kek=kek_bytes, wrapped_dek=bytes(wrapped_dek), aad=aad)
-        else:
-            from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
-
-            key_bytes = await get_or_create_encryption_key_bytes(
-                main_account_id=request.state.main_account_id,
-                bucket_name=source_bucket_name,
-            )
-        chunks_iter = stream_plan(
-            obj_cache=obj_cache,
-            object_id=object_id_str,
-            object_version=src_ver,
-            plan=plan,
-            storage_version=storage_version,
-            key_bytes=key_bytes,
-            suite_id=suite_id,
-            bucket_id=bucket_id,
-            upload_id="",
+        if not source_obj.get("bucket_id") or not source_obj.get("kek_id") or not source_obj.get("wrapped_dek"):
+            return s3_error_response("InternalError", "Missing v5 envelope metadata", status_code=500)
+        # bound_first_chunk: a source that cannot be served yet fails fast with a retryable 503
+        # before any destination bytes are staged.
+        chunks_iter = await stream_object(
+            pool,
+            request.app.state.redis_client,
+            request.app.state.obj_cache,
+            {
+                "object_id": object_id_str,
+                "object_version": src_ver,
+                "storage_version": storage_version,
+                "bucket_id": str(source_obj.get("bucket_id") or ""),
+                "bucket_name": source_bucket_name,
+                "object_key": source_object_key,
+                "size_bytes": source_size,
+                "multipart": bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
+                "enc_suite_id": source_obj.get("enc_suite_id"),
+                "kek_id": source_obj.get("kek_id"),
+                "wrapped_dek": source_obj.get("wrapped_dek"),
+            },
+            rng=rng,
             address=request.state.main_account_id,
-            bucket_name=source_bucket_name,
+            bound_first_chunk=True,
         )
         body_iter: AsyncIterator[bytes] = chunks_iter
     else:

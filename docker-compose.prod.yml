@@ -15,12 +15,6 @@ services:
       - .:/app
       - /cache/hippius/object_cache:/var/lib/hippius/object_cache
 
-  arion-downloader:
-    volumes:
-      - /cache/hippius/object_cache:/var/lib/hippius/object_cache
-    deploy:
-      replicas: 5
-
   janitor:
     volumes:
       - .:/app

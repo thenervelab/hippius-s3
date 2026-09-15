@@ -82,6 +82,16 @@ async def main() -> None:
                 skipped_no_cache += 1
                 continue
 
+            # A part the drain handed to a node-local uploader is on that node's SSD, which the
+            # global-queue uploader cannot read; the drain's upload sweep re-drives it itself.
+            if await db.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM cephor_replication_status "
+                "WHERE object_id = $1 AND version = 1 AND status = 'uploading')",
+                object_id,
+            ):
+                logger.info(f"Skipping {bucket_name}/{object_key}: the drain's upload sweep owns it (uploading)")
+                continue
+
             payload = UploadChainRequest(
                 address=address,
                 bucket_name=bucket_name,

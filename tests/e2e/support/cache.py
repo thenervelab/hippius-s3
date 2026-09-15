@@ -195,14 +195,6 @@ def clear_object_cache(
             if part_dir.exists():
                 shutil.rmtree(part_dir, ignore_errors=True)
 
-    # Best-effort: remove the download-in-progress coalescing locks so a
-    # subsequent miss re-enqueues instead of waiting for a phantom worker.
-    try:
-        r = redis.Redis.from_url(redis_url)
-        for pn in parts:
-            r.delete(f"download_in_progress:{object_id}:v:{object_version}:part:{int(pn)}")
-    except Exception:
-        pass
 
 
 def read_part_from_cache(

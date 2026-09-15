@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hippius_s3.cache.notifier import ChunkNotReadyError
+from hippius_s3.reader.backend_fetch import ChunkUnavailableError
 from hippius_s3.services import object_reader
 
 
@@ -61,8 +61,8 @@ async def test_read_response_terminal_miss_raises_download_not_ready() -> None:
     """Terminal miss on the first-chunk peek → DownloadNotReadyError (503), not a bare 500."""
 
     async def _terminal_miss():
-        # Mirrors ChunkNotifier.wait_for_chunk's terminal branch: notified, re-fetched, still gone.
-        raise ChunkNotReadyError("Chunk missing after pub/sub notification: obj:x:v:1:part:0:chunk:0")
+        # Mirrors the backend fetcher exhausting every location: nothing local, nothing on a backend.
+        raise ChunkUnavailableError("no backend served the chunk (locations tried: 1)")
         yield b"unreachable"  # pragma: no cover — makes this an async generator
 
     cfg = SimpleNamespace(
@@ -80,7 +80,7 @@ async def test_stream_object_bound_peek_terminal_miss_raises_download_not_ready(
     """The stream_object bound-first-chunk peek (streaming CopyObject source) maps the miss the same."""
 
     async def _terminal_miss():
-        raise ChunkNotReadyError("Chunk missing after pub/sub notification: obj:x:v:1:part:0:chunk:0")
+        raise ChunkUnavailableError("no backend served the chunk (locations tried: 1)")
         yield b"unreachable"  # pragma: no cover
 
     cfg = SimpleNamespace(

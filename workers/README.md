@@ -7,14 +7,11 @@ Background workers that process async operations via Redis queues. Each worker r
 | Worker | Entry Point | Queue | Scaling | Purpose |
 |--------|------------|-------|---------|---------|
 | Arion Uploader | `run_arion_uploader_in_loop.py` | `arion_upload_requests` | Single instance | Upload chunks to Arion backend |
-| Arion Downloader | `run_arion_downloader_in_loop.py` | `arion_download_requests` | Horizontal | Download chunks from Arion |
 | Arion Unpinner | `run_arion_unpinner_in_loop.py` | `arion_unpin_requests` | Single instance | Delete chunks from Arion |
 | Janitor | `run_janitor_in_loop.py` | N/A (polling) | Single instance | FS cache cleanup at `/var/lib/hippius/object_cache` |
 | Account Cacher | `run_account_cacher_in_loop.py` | N/A (scheduled) | Single instance | Warm account credit cache in Redis |
 | Orphan Checker | `run_orphan_checker_in_loop.py` | N/A (scheduled) | Single instance | Detect blockchain orphan files, enqueue cleanup |
 | Migrator | `run_migrator_once.py` | N/A (one-shot) | One-shot | Run DB migrations on startup, then exit |
-| Downloader (v2) | `run_downloader_in_loop.py` | `arion_download_requests` | Horizontal | Backend-agnostic downloader entry point |
-| Unpinner (v2) | `run_unpinner_in_loop.py` | `{backend}_unpin_requests` | Single instance | Backend-agnostic unpin entry point |
 | MPU Reaper | `run_mpu_reaper_in_loop.py` | N/A (polling) | Single instance | Reaps abandoned in-flight multipart uploads |
 
 ### Scaling Notes
@@ -25,7 +22,7 @@ The uploader and unpinner must run as single instances to avoid exceeding Hippiu
 
 **Upload path (drain-direct, s3-2.1)**: Client write → API write pipeline → chunks to the **api-local SSD** FS cache (the API no longer enqueues the backend upload at PUT/MPU-complete) → the Rust **drain-agent** replicates each part SSD→CephFS and `LPUSH`es one `UploadChainRequest` per part to `arion_upload_requests` (sole producer) → Arion uploader dequeues → uploads to Arion → publishes to Hippius blockchain
 
-**Download path**: Client read → API read pipeline → check FS cache → cache miss enqueues to Redis → Arion downloader fetches from Arion → caches locally → streams to client
+**Download path**: Client read → API read pipeline → local NVMe → peer node → pool → on a miss the API fetches the chunk from Arion into memory, decrypts and streams it (nothing is written back)
 
 **Delete path**: Client delete → API marks `deleted=true` in `chunk_backend` table → enqueues unpin request → Arion unpinner removes from Arion backend
 
