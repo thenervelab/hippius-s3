@@ -8,7 +8,6 @@
 use crate::runtime::{EvictionPolicy, HeartbeatConfig, RuntimeConfig};
 use core::str::FromStr;
 use hippius_drain_core::{ByteRate, NodeId};
-use std::num::NonZeroU64;
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -453,7 +452,10 @@ impl Config {
             evict_max_pass: duration_secs(&get, "CEPHOR_EVICT_MAX_PASS_SECS", DEFAULT_EVICT_MAX_PASS)?,
             // Zero means "no budget", not a zero-byte cache: an explicit 0 must read as the
             // disk gate, the same as unset, so the knob can be neutralised in a manifest.
-            evict_cache_budget_bytes: NonZeroU64::new(u64_or(&get, "CEPHOR_EVICT_CACHE_BUDGET_BYTES", 0)?).map(NonZeroU64::get),
+            evict_cache_budget_bytes: {
+                let bytes = u64_or(&get, "CEPHOR_EVICT_CACHE_BUDGET_BYTES", 0)?;
+                (bytes > 0).then_some(bytes)
+            },
             landed_poll: duration_secs(&get, "CEPHOR_LANDED_POLL_SECS", DEFAULT_LANDED_POLL)?,
             failed_reclaim_poll: duration_secs(&get, "CEPHOR_FAILED_RECLAIM_POLL_SECS", DEFAULT_FAILED_RECLAIM_POLL)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),

@@ -80,19 +80,20 @@ pub fn disk_usage(path: &Path) -> io::Result<DiskUsage> {
 ///
 /// Same shape as [`disk_usage`] so the reserve/headroom arithmetic downstream cannot tell the
 /// two apart. A cache already past its budget reads as a full disk (zero free), not as a
-/// negative one.
-///
-/// # Errors
-///
-/// [`io::Error`] only if the used fraction fails validation, which `used_fraction` rules out.
-pub fn budget_usage(budget: u64, resident: u64) -> io::Result<DiskUsage> {
+/// negative one. `pressure` is filled for the shape only — it is the virtual disk's fill, NOT
+/// the node's SSD pressure, and must never reach the `drain_ssd_pressure` gauge (the heartbeat
+/// keeps reading the real disk for that).
+#[must_use]
+pub fn budget_usage(budget: u64, resident: u64) -> DiskUsage {
     let free = budget.saturating_sub(resident);
-    let pressure = DiskPressure::from_fraction(used_fraction(budget, free)).map_err(io::Error::other)?;
-    Ok(DiskUsage {
+    // `used_fraction` is total over its whole domain (property-tested below), so the only
+    // failure `from_fraction` guards against cannot occur; full is the fail-safe reading anyway.
+    let pressure = DiskPressure::from_fraction(used_fraction(budget, free)).unwrap_or(DiskPressure::FULL);
+    DiskUsage {
         pressure,
         free_bytes: free,
         total_bytes: budget,
-    })
+    }
 }
 
 /// Widens a platform-dependent-width `statvfs` count to `u64`.
@@ -103,7 +104,8 @@ fn widen(value: impl Into<u64>) -> u64 {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{disk_usage, used_fraction};
+    use super::{budget_usage, disk_usage, used_fraction};
+    use hippius_drain_core::DiskPressure;
     use proptest::prelude::*;
     use std::path::Path;
 
@@ -139,6 +141,16 @@ mod tests {
         assert!((0.0..=1.0).contains(&fraction), "pressure is a fraction, got {fraction}");
         assert!(usage.free_bytes > 0, "a live filesystem has free space");
         assert!(usage.total_bytes >= usage.free_bytes, "free space cannot exceed the disk");
+    }
+
+    #[test]
+    fn a_budget_reads_as_a_disk_of_its_own_size_and_never_goes_negative() {
+        let under = budget_usage(6_000, 1_500);
+        assert_eq!((under.total_bytes, under.free_bytes), (6_000, 4_500));
+        assert_eq!(under.pressure.bps(), 2_500, "a quarter used");
+        let over = budget_usage(6_000, 9_000);
+        assert_eq!(over.free_bytes, 0, "past the budget is a full disk, not a negative one");
+        assert_eq!(over.pressure, DiskPressure::FULL);
     }
 
     #[test]

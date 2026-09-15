@@ -389,6 +389,11 @@ pub struct EvictionPolicy {
     /// space on a filesystem — see [`CacheBudgetProbe`] for why that is the only signal that
     /// means anything on a disk the agent does not own. `None` (the shipped default) probes
     /// the disk with `statvfs`.
+    ///
+    /// A shim for nodes whose ingest dir is not their own disk (staging), not a second
+    /// production policy: the budget is a hand-picked constant, the api's promotion gate cannot
+    /// express it (see [`published_promote_floor`]), and every probe under it is a residency
+    /// `SUM` rather than a `statvfs`.
     pub cache_budget_bytes: Option<u64>,
 }
 
@@ -405,8 +410,9 @@ pub struct EvictionPolicy {
 /// reserve/headroom arithmetic untouched: eviction arms when the cache exceeds
 /// `budget × (1 − reserve)` and frees back to `budget × (1 − reserve − headroom)`.
 ///
-/// Re-probed between eviction pages like the disk probe is, so a pass converges on what the
-/// residency table says after each `mark_evicted` rather than on the sum it started with.
+/// Every probe — the pass's initial one and the re-probe after each eviction page — is one
+/// residency `SUM` for this node. Sized for a small tier: on a node retaining millions of parts
+/// that aggregate per page is not free, which is one more reason this stays a shim.
 struct CacheBudgetProbe<'a> {
     store: &'a Store,
     node: &'a str,
@@ -416,11 +422,28 @@ struct CacheBudgetProbe<'a> {
 impl CacheBudgetProbe<'_> {
     async fn usage(&self) -> io::Result<DiskUsage> {
         let resident = self.store.node_cache_bytes(self.node).await.map_err(io::Error::other)?;
-        budget_usage(self.budget, resident)
+        Ok(budget_usage(self.budget, resident))
     }
 }
 
-impl FreeSpaceProbe for CacheBudgetProbe<'_> {
+/// The occupancy signal one eviction pass runs against, chosen once per pass so the initial
+/// target and every re-probe come from the same source. Two probes that could be chosen
+/// independently is how a pass would arm on the budget and then page against `statvfs`.
+enum EvictProbe<'a> {
+    Disk(&'a LocalSsd),
+    Budget(CacheBudgetProbe<'a>),
+}
+
+impl EvictProbe<'_> {
+    async fn usage(&self) -> io::Result<DiskUsage> {
+        match self {
+            Self::Disk(ssd) => ssd.usage().await,
+            Self::Budget(probe) => probe.usage().await,
+        }
+    }
+}
+
+impl FreeSpaceProbe for EvictProbe<'_> {
     type Error = io::Error;
 
     async fn free_bytes(&self) -> io::Result<u64> {
@@ -490,6 +513,13 @@ fn resolved_reserve_permille(policy: EvictionPolicy, allocated_reserve_permille:
 /// reads an absent key as "signal unavailable" and falls back to its own static floor — which
 /// is the honest answer when there is no live control loop to track.
 fn published_promote_floor(policy: EvictionPolicy, allocated_reserve_permille: Option<u16>) -> Option<u16> {
+    // Under a byte budget the band is held in bytes of retained cache, which the api's gate —
+    // a permille of the REAL mount's free space — cannot express. Publishing the permille floor
+    // anyway would describe a band the evictor is not holding, the exact disagreement this
+    // publication exists to remove; letting the key lapse hands the api its static floor.
+    if policy.cache_budget_bytes.is_some() {
+        return None;
+    }
     let reserve = resolved_reserve_permille(policy, allocated_reserve_permille);
     let floor = promote_floor_permille(reserve, policy.headroom_permille);
     let target = reserve.saturating_add(policy.headroom_permille);
@@ -533,28 +563,16 @@ impl PromoteFloorPublisher {
 async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, policy: EvictionPolicy, floor: Option<&PromoteFloorPublisher>) {
     // The budget probe needs a node to sum residency for; a store without one (the allocator's)
     // has no read tier to bound, and probing the real disk for it would be the wrong signal too.
-    let budget = policy
-        .cache_budget_bytes
-        .zip(store.node_id())
-        .map(|(budget, node)| CacheBudgetProbe { store, node, budget });
-    let probed = if let Some(probe) = &budget {
-        probe
-            .usage()
-            .await
-            .map_err(|err| tracing::warn!(error = %err, "eviction cache-budget probe failed"))
-    } else {
-        let root = ssd.root().to_path_buf();
-        // statvfs blocks — same rule as the heartbeat probe (axiom r4r_ch10_01).
-        match tokio::task::spawn_blocking(move || disk_usage(&root)).await {
-            Ok(usage) => usage.map_err(|err| tracing::warn!(error = %err, "eviction disk probe failed")),
-            Err(err) => {
-                tracing::warn!(error = %err, "eviction disk probe task panicked");
-                Err(())
-            }
-        }
+    let probe = match policy.cache_budget_bytes.zip(store.node_id()) {
+        Some((budget, node)) => EvictProbe::Budget(CacheBudgetProbe { store, node, budget }),
+        None => EvictProbe::Disk(ssd),
     };
-    let Ok(usage) = probed else {
-        return;
+    let usage = match probe.usage().await {
+        Ok(usage) => usage,
+        Err(err) => {
+            tracing::warn!(error = %err, "eviction occupancy probe failed");
+            return;
+        }
     };
 
     // None means the allocator has not published a reserve for this node (pre-Phase-4
@@ -573,11 +591,7 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
         page: policy.batch,
         max_duration: policy.max_pass,
     };
-    let outcome = match &budget {
-        Some(probe) => evict_to_target(store, ssd, probe, &SystemClock, target, pass).await,
-        None => evict_to_target(store, ssd, ssd, &SystemClock, target, pass).await,
-    };
-    match outcome {
+    match evict_to_target(store, ssd, &probe, &SystemClock, target, pass).await {
         Ok(report) => {
             snapshot.record_evicted(report.evicted, report.freed_bytes);
             snapshot.record_evict_blocked_unreplicated(report.skipped_unreplicated);
@@ -2064,6 +2078,17 @@ mod tests {
         // hippius-drain-allocator's AllocConfig) — so it inverted for every reserve >= 175 and
         // said nothing. Exhaustive over the shipped range rather than sampled: 251 values is
         // cheaper than a proptest run and proves the property outright.
+        assert_eq!(
+            published_promote_floor(
+                EvictionPolicy {
+                    cache_budget_bytes: Some(6_000_000_000),
+                    ..shipped_policy()
+                },
+                None
+            ),
+            None,
+            "a byte budget holds a band the api's permille gate cannot express, so nothing is published"
+        );
         for reserve in 150_u16..=400 {
             let floor = published_promote_floor(
                 EvictionPolicy {
