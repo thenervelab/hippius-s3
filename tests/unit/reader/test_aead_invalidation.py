@@ -30,7 +30,6 @@ from nacl.exceptions import CryptoError
 
 from hippius_s3.cache.dual_fs_store import DualFileSystemPartsStore
 from hippius_s3.cache.fs_store import FileSystemPartsStore
-from hippius_s3.cache.notifier import ChunkNotReadyError
 from hippius_s3.reader import streamer
 from hippius_s3.reader.types import ChunkPlanItem
 from hippius_s3.services.crypto_service import CryptoService
@@ -48,12 +47,6 @@ PLAINTEXT = (b"alpha-chunk", b"beta-chunk")
 # serves. Both mean the same thing: the bytes on this disk are not the chunk.
 POISON_TAG = b"poison" * 8
 POISON_SHORT = b"short"
-
-
-@pytest.fixture(autouse=True)
-def _per_chunk_wait_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Pin the wait path so these tests exercise invalidation, not subscription wiring.
-    monkeypatch.setattr(streamer, "_single_subscription_enabled", lambda: False)
 
 
 def _ct(plaintext: bytes, *, part: int, index: int) -> bytes:
@@ -114,23 +107,12 @@ class _StoreCache:
         self.fs = store
         self.fetches: list[tuple[int, int]] = []
 
-    async def wait_for_chunk(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        chunk_index: int,
-        *,
-        timeout: float | None = None,  # noqa: ASYNC109
-    ) -> bytes:
+    async def get_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bytes | None:
         key = (int(part_number), int(chunk_index))
         self.fetches.append(key)
         if self.fetches.count(key) >= self.RUNAWAY_AFTER:
             raise AssertionError(f"runaway retry: chunk {key} fetched {self.fetches.count(key)} times")
-        data = await self.fs.get_chunk(object_id, int(object_version), int(part_number), int(chunk_index))
-        if data is None:
-            raise ChunkNotReadyError(f"no chunk {part_number}/{chunk_index}")
-        return data
+        return await self.fs.get_chunk(object_id, int(object_version), int(part_number), int(chunk_index))
 
 
 async def _read(cache: _StoreCache, *, prefetch: int, key: bytes = KEY, n: int = len(PLAINTEXT)) -> bytes:

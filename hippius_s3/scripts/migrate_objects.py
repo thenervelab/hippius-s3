@@ -22,6 +22,7 @@ from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import enqueue_upload_request
 from hippius_s3.reader.streamer import stream_plan
 from hippius_s3.services.object_reader import build_stream_context
+from hippius_s3.services.object_reader import make_fetch_missing
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import ensure_upload_row
 from hippius_s3.writer.object_writer import ObjectWriter
@@ -304,6 +305,7 @@ async def migrate_one(
                 upload_id=ctx.upload_id,
                 address=address,
                 bucket_name=bucket_name,
+                fetch_missing=make_fetch_missing(ctx, obj_cache, object_id=object_id, address=address),
             )
             # Accumulate bytes for this part
             buf = bytearray()

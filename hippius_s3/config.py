@@ -574,6 +574,17 @@ class Config:
     # 600s (A5) so a legitimately slow multi-chunk part download does not expire
     # the lock mid-flight and let a second streamer enqueue a duplicate DCR.
     download_coalesce_lock_ttl_seconds: int = env("DOWNLOAD_COALESCE_LOCK_TTL:600", convert=int)
+    # The read path's own backend fetch (hippius_s3/reader/backend_fetch.py): on a cache miss the
+    # api pulls the chunk from the backend into memory and decrypts it in-process — no downloader,
+    # no pool write. One concurrency budget per pod across every in-flight GET, like the uploader's
+    # arion_upload_concurrency; a transient backend error is retried this many times per location.
+    read_backend_fetch_concurrency: int = env("HIPPIUS_READ_BACKEND_FETCH_CONCURRENCY:32", convert=int)
+    read_backend_fetch_attempts: int = env("HIPPIUS_READ_BACKEND_FETCH_ATTEMPTS:3", convert=int)
+    # A chunk on no backend yet (its part is inside the upload window on another node) can only
+    # come from a peer. When the peer tier misses too, re-poll the local tiers this long before
+    # giving up with a retryable 503, so a briefly-shed peer fetch (a saturated peer) recovers
+    # without the client retrying.
+    read_missing_chunk_wait_seconds: float = env("HIPPIUS_READ_MISSING_CHUNK_WAIT_SECONDS:10", convert=float)
     # DB-1: config-driven downloader Postgres pool (was hardcoded min=2/max=20). Audit
     # Σ(replicas × pool_max) across roles against Postgres max_connections before raising.
     downloader_db_pool_min: int = env("HIPPIUS_DOWNLOADER_DB_POOL_MIN:2", convert=int)

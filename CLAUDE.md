@@ -88,24 +88,20 @@ A **subsystem index** with links to per-directory `CLAUDE.md` files is in sectio
 2. **GetObject endpoint** → [hippius_s3/services/object_reader.py `build_stream_context`](hippius_s3/services/object_reader.py):
    - Read parts list from DB.
    - Build chunk plan ([hippius_s3/reader/planner.py](hippius_s3/reader/planner.py)) — maps Range bytes to (part_number, chunk_index, slice_start, slice_end).
-   - **Batch-check** every needed chunk on FS in one pass ([object_reader.py:67](hippius_s3/services/object_reader.py) via `chunks_exist_batch`).
-   - If all present → `source="cache"`; stream directly.
-   - If any missing → `source="pipeline"`:
-     - **Coalesce**: per (object, version, part), try `SET NX EX <DOWNLOAD_COALESCE_LOCK_TTL>` (default 600) on `download_in_progress:{object_id}:v:{ov}:part:{pn}` ([object_reader.py:87-104](hippius_s3/services/object_reader.py)). If you lose the race, skip the enqueue; another streamer is already fetching and you'll wait on pub/sub.
-     - If you won, build a `DownloadChainRequest` with optional per-chunk CIDs and enqueue to `arion_download_requests` ([object_reader.py:146-165](hippius_s3/services/object_reader.py)).
-   - **Unwrap DEK** from DB (`kek_id`, `wrapped_dek`) via [hippius_s3/services/envelope_service.py](hippius_s3/services/envelope_service.py). If the current version is mid-write (envelope missing), fall back to version-1 ([object_reader.py:177-220](hippius_s3/services/object_reader.py)).
-3. **Stream plan** ([hippius_s3/reader/streamer.py:18](hippius_s3/reader/streamer.py)):
-   - Configurable prefetch depth (runtime default **16** via `HTTP_STREAM_PREFETCH_CHUNKS`; the streamer function-param fallback is 0) overlaps FS/Arion fetch with IO. Note: it does not yet overlap the on-loop decrypt (RD-2).
-   - For each chunk: `obj_cache.wait_for_chunk` → fast path reads from FS; slow path subscribes to `notify:{chunk_key}` pub/sub and re-reads on notification ([hippius_s3/cache/notifier.py:61](hippius_s3/cache/notifier.py)).
-   - Decrypt ([reader/decrypter.py](hippius_s3/reader/decrypter.py)), optionally slice for Range, yield.
-4. **Downloader worker** ([hippius_s3/workers/downloader.py:94](hippius_s3/workers/downloader.py)) handles `DownloadChainRequest`:
-   - Writes `meta.json` **eagerly** from DB parts rows ([downloader.py:49-91](hippius_s3/workers/downloader.py)) so partial-range fills are readable per-chunk as they land.
-   - For each chunk: check FS (maybe another worker filled it) → look up `backend_identifier` in `chunk_backend` → fetch from Arion → `fs_store.set_chunk` → `obj_cache.notify_chunk`.
-   - Releases the coalesce lock on part completion ([downloader.py:286-292](hippius_s3/workers/downloader.py)) — key format **must match** the streamer's exactly.
+   - **Batch-check** every needed chunk on the local tiers in one pass (`chunks_exist_batch`).
+   - If all present → `source="cache"`.
+   - If any missing → `source="pipeline"`: resolve every chunk's **backend location** (`chunk_backend.backend_identifier`, one batched query per download backend) while the request still owns `db`, and carry them on the `StreamContext.locations`. Nothing is enqueued and no lock is taken — the downloader, the coalesce lock and the `notify:*` wait are gone from the read path.
+   - **Unwrap DEK** from DB (`kek_id`, `wrapped_dek`) via [hippius_s3/services/envelope_service.py](hippius_s3/services/envelope_service.py). If the current version is mid-write (envelope missing), fall back to the highest serveable version below it (and resolve *that* version's locations).
+3. **Stream plan** ([hippius_s3/reader/streamer.py](hippius_s3/reader/streamer.py)):
+   - Configurable prefetch depth (runtime default **16** via `HTTP_STREAM_PREFETCH_CHUNKS`; the streamer function-param fallback is 0) overlaps fetch with decrypt + response IO — on a cold read it is also the per-request backend parallelism.
+   - For each chunk: `obj_cache.get_chunk` walks this node's NVMe → a peer's NVMe → the pool; on a miss, `fetch_missing` ([hippius_s3/reader/backend_fetch.py](hippius_s3/reader/backend_fetch.py)) pulls the ciphertext **from Arion into memory** by its recorded location (one `ArionClient` per process, `HIPPIUS_READ_BACKEND_FETCH_CONCURRENCY` in flight per pod, `HIPPIUS_READ_BACKEND_FETCH_ATTEMPTS` bounded retries per location). Arion-served bytes are **never written to any cache** — no pool fill, no NVMe promotion (peer-served chunks still promote).
+   - A chunk with no location yet (its part is inside the upload window on another node) can only come from a peer: the local tiers are re-polled for `HIPPIUS_READ_MISSING_CHUNK_WAIT_SECONDS`, then the request fails with a retryable 503 (`ChunkUnavailableError` → `DownloadNotReadyError` at the first-chunk peek; a mid-stream one ends the stream). Each chunk is bounded by `HIPPIUS_STREAM_CHUNK_TIMEOUT_SECONDS`.
+   - Decrypt ([reader/decrypter.py](hippius_s3/reader/decrypter.py)) in-process, optionally slice for Range, yield.
+4. `UploadPartCopy` and streaming `CopyObject` read their source through the same `stream_object` path. The **downloader worker** and `DownloadChainRequest` still exist but nothing enqueues to them; they go with the pool (PR 2).
 
 ### 3.3 Range request specifics
 
-The planner ([reader/planner.py](hippius_s3/reader/planner.py)) only includes chunks that intersect the requested range, and sets `slice_start`/`slice_end_excl` on the first and last to trim plaintext. The downloader, when invoked for a Range miss, fetches **full chunks** (not byte ranges) from Arion — there is no `BackendClient.download_range` yet. See [todo.md](todo.md) for this optimization.
+The planner ([reader/planner.py](hippius_s3/reader/planner.py)) only includes chunks that intersect the requested range, and sets `slice_start`/`slice_end_excl` on the first and last to trim plaintext. A Range miss fetches exactly those chunks from Arion — **full chunks** (not byte ranges); there is no `download_range` on the backend client yet.
 
 ---
 

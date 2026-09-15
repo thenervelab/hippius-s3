@@ -300,10 +300,10 @@ async def test_fallback_logs_warning(caplog):
 
 
 @pytest.mark.asyncio
-async def test_cold_fallback_enqueues_download():
-    """Regression (A1): a cold read of the fallback version (chunks NOT on FS) must enqueue a
-    DownloadChainRequest. Previously the fallback returned a `pipeline` source without enqueuing
-    anything, so the streamer hung on pub/sub until the wait timed out."""
+async def test_cold_fallback_resolves_the_fallback_versions_backend_locations():
+    """Regression (A1): a cold read of the fallback version (chunks NOT on FS) must carry the
+    backend locations of the version actually served (v4), or the body would have nowhere to
+    fetch v4's chunks from and the read would fail at the first-chunk peek."""
     with (
         _PATCHES[0] as m0,
         _PATCHES[1] as m1,
@@ -312,36 +312,31 @@ async def test_cold_fallback_enqueues_download():
         _PATCHES[4] as m4,
         _PATCHES[5] as m5,
         _PATCHES[6] as m6,
-        patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock) as m_enqueue,
-        patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=["arion"]
+        ) as m_backends,
     ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
-        m3.return_value.download_coalesce_lock_ttl_seconds = 120
-        m3.return_value.substrate_url = ""
 
         prev_info = _make_info(object_version=4, kek_id="kek-1", wrapped_dek=b"\x00" * 32)
         db = FakeDB(fetchrow_returns=prev_info)
+        db.fetch = AsyncMock(return_value=[{"part_number": 1, "chunk_index": 0, "backend_identifier": "id-v4"}])
         obj_cache = FakeObjCache([False])  # fallback version's chunk is cold (not on FS)
         info = _make_info(object_version=5, kek_id=None, wrapped_dek=None)
 
-        redis = AsyncMock()
-        redis.set = AsyncMock(return_value=True)
-
         from hippius_s3.services.object_reader import build_stream_context
 
-        ctx = await build_stream_context(db, redis, obj_cache, info, rng=None, address="addr1")
+        ctx = await build_stream_context(db, None, obj_cache, info, rng=None, address="addr1")
 
         assert ctx.object_version == 4
         assert ctx.source == "pipeline"
-        # The download must be enqueued for the version actually served (v4). Before the fix the
-        # fallback enqueued nothing, so the streamer waited on v4 chunks that were never fetched.
-        enqueued_versions = [call.args[0].object_version for call in m_enqueue.await_args_list]
-        assert 4 in enqueued_versions, "the fallback version must be enqueued for download"
+        assert ctx.locations == {(1, 0): (("arion", "id-v4"),)}
+        assert m_backends.await_args.args[1:] == ("obj-1", 4), "locations are resolved for the version served, not v5"
 
 
 @pytest.mark.asyncio
-async def test_warm_fallback_does_not_enqueue():
-    """A warm fallback (chunks already on FS) must NOT enqueue — no wasted download work."""
+async def test_warm_fallback_resolves_no_locations():
+    """A warm fallback (chunks already on FS) pays for no location lookup — the body never needs one."""
     with (
         _PATCHES[0] as m0,
         _PATCHES[1] as m1,
@@ -350,12 +345,11 @@ async def test_warm_fallback_does_not_enqueue():
         _PATCHES[4] as m4,
         _PATCHES[5] as m5,
         _PATCHES[6] as m6,
-        patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock) as m_enqueue,
-        patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=["arion"]
+        ) as m_backends,
     ):
         _apply_patches([m0, m1, m2, m3, m4, m5, m6])
-        m3.return_value.download_coalesce_lock_ttl_seconds = 120
-        m3.return_value.substrate_url = ""
 
         prev_info = _make_info(object_version=4, kek_id="kek-1", wrapped_dek=b"\x00" * 32)
         db = FakeDB(fetchrow_returns=prev_info)
@@ -368,43 +362,8 @@ async def test_warm_fallback_does_not_enqueue():
 
         assert ctx.object_version == 4
         assert ctx.source == "cache"
-        m_enqueue.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_cold_fallback_with_none_redis_does_not_crash():
-    """A cold fallback read with redis=None (unit callers) must not crash on redis.set — the
-    coalesce lock's try/except fails open (behaves as acquired), so the download is still enqueued.
-    The main read path relies on this same fail-open behavior for redis=None."""
-    with (
-        _PATCHES[0] as m0,
-        _PATCHES[1] as m1,
-        _PATCHES[2] as m2,
-        _PATCHES[3] as m3,
-        _PATCHES[4] as m4,
-        _PATCHES[5] as m5,
-        _PATCHES[6] as m6,
-        patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock) as m_enqueue,
-        patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=[]),
-    ):
-        _apply_patches([m0, m1, m2, m3, m4, m5, m6])
-        m3.return_value.download_coalesce_lock_ttl_seconds = 120
-        m3.return_value.substrate_url = ""
-
-        prev_info = _make_info(object_version=4, kek_id="kek-1", wrapped_dek=b"\x00" * 32)
-        db = FakeDB(fetchrow_returns=prev_info)
-        obj_cache = FakeObjCache([False])  # cold
-        info = _make_info(object_version=5, kek_id=None, wrapped_dek=None)
-
-        from hippius_s3.services.object_reader import build_stream_context
-
-        ctx = await build_stream_context(db, None, obj_cache, info, rng=None, address="addr1")
-
-        assert ctx.object_version == 4
-        assert ctx.source == "pipeline"
-        # fail-open on the None redis.set: the fallback version is still enqueued (no crash)
-        enqueued_versions = [call.args[0].object_version for call in m_enqueue.await_args_list]
-        assert 4 in enqueued_versions
+        assert ctx.locations == {}
+        m_backends.assert_not_awaited()
 
 
 @pytest.mark.asyncio
