@@ -177,12 +177,15 @@ impl RelandVerdict {
 /// shape `eviction_target` and `check_shared_disk` already use, and the one that matters here
 /// because the agent's own store tests need a live Postgres.
 ///
-/// `Corrupt` deliberately reads as [`NotDrained`](RelandVerdict::NotDrained): a corrupt part is
-/// already owned by the bounded re-drive worker, and re-driving it from here would bypass the
-/// `corrupt_attempts` cap that stops an unrecoverable pool copy looping forever.
+/// A part reads as drained once it has been handed to the uploader (`Uploading`) or acked by
+/// the backend (`Replicated`): in both a rewrite of the SSD bytes diverges from what was (or is
+/// being) uploaded, so both re-drive. `Corrupt` deliberately reads as
+/// [`NotDrained`](RelandVerdict::NotDrained): a corrupt part is already owned by the bounded
+/// re-drive worker, and re-driving it from here would bypass the `corrupt_attempts` cap that
+/// stops an unrecoverable pool copy looping forever.
 #[must_use]
 pub fn verdict_for_reland(state: ReplicationState, stored: Option<&PartDigest>, observed: &PartDigest) -> RelandVerdict {
-    if state != ReplicationState::Replicated {
+    if !matches!(state, ReplicationState::Uploading | ReplicationState::Replicated) {
         return RelandVerdict::NotDrained;
     }
     match stored {
@@ -445,11 +448,12 @@ mod tests {
     }
 
     #[test]
-    fn only_a_replicated_part_can_diverge() {
-        // A part that has not committed has nothing stale on the pool: whatever the drain
-        // eventually copies is whatever is on disk then. Corrupt is excluded for a different
+    fn only_a_handed_over_part_can_diverge() {
+        // A part that has not committed has nothing stale in flight: whatever the drain
+        // eventually hands over is whatever is on disk then. Corrupt is excluded for a different
         // reason — `redrive_corrupt_parts` owns it, and its attempt cap is what stops an
-        // unrecoverable pool copy looping forever.
+        // unrecoverable pool copy looping forever. Both `Uploading` (the uploader may be
+        // reading the old bytes right now) and `Replicated` (the backend holds them) diverge.
         let stored = part_digest(&["old"]);
         let observed = part_digest(&["new"]);
         for state in [
@@ -461,6 +465,13 @@ mod tests {
             let verdict = verdict_for_reland(state, Some(&stored), &observed);
             assert_eq!(verdict, RelandVerdict::NotDrained, "{state:?} has nothing committed to re-drive");
             assert!(!verdict.redrives());
+        }
+        for state in [ReplicationState::Uploading, ReplicationState::Replicated] {
+            assert_eq!(
+                verdict_for_reland(state, Some(&stored), &observed),
+                RelandVerdict::Diverged,
+                "{state:?} re-drives"
+            );
         }
     }
 

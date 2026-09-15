@@ -26,6 +26,9 @@ resources:
   # and the per-ingest-node drain agent DaemonSet. Both use the `drain` image.
   - drain-allocator-deployment.yaml
   - drain-agent-daemonset.yaml
+  # The node-local uploader: consumes arion_upload_requests:<node> and reads the node's local
+  # ingest dir. Must be Ready before the drain image that publishes to node queues rolls.
+  - arion-uploader-local-daemonset.yaml
   # Auto-aborts abandoned multipart uploads so the drain stops re-deferring their
   # never-finalized parts (uses the `workers` image; DB + redis-queues only).
   - mpu-reaper-deployment.yaml

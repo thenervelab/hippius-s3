@@ -1,29 +1,35 @@
 //! The per-**part** crash-safe drain state machine and its I/O contracts.
 //!
-//! This is the hippius-s3 re-homing of [`crate::drain`]: the api's unit is a *part*
-//! (`<object_id>/v<version>/part_<n>/` holding `chunk_<i>.bin` files and a
-//! `meta.json` marker), not a content-addressed chunk, so the drain copies the whole
-//! part tree path-preservingly from SSD to `CephFS`. Like `drain`, this module holds
-//! only the contracts ([`PartSource`], [`PartPool`], [`PartReplicationStore`]) and
-//! the pure async orchestration ([`drain_part`]); the `tokio`/`sha2` impls live in
-//! `hippius-drain-agent`, and tests drive it with in-memory fakes.
+//! The api's unit is a *part* (`<object_id>/v<version>/part_<n>/` holding `chunk_<i>.bin`
+//! files and a `meta.json` marker) on the node-local SSD. Draining a part no longer copies
+//! it anywhere: the drain verifies the SSD part is whole, records its content digest, and
+//! hands it to the node-local backend uploader, which reads the same SSD and uploads to Arion.
+//! This module holds only the contracts ([`PartSource`], [`PartReplicationStore`],
+//! [`UploadEnqueuer`]) and the pure async orchestration ([`drain_part`]); the `tokio`/`sha2`
+//! impls live in `hippius-drain-agent`, and tests drive it with in-memory fakes.
 //!
 //! # The ordering that must not change
 //!
-//! `persist every chunk (copy+fsync+rename) → byte-verify each copy → persist
-//! meta.json LAST → commit Replicated → (best-effort) enqueue the backend upload →
-//! unlink the SSD part`. `meta.json` is the reader's readiness gate, so writing it
-//! last means a reader never sees a half-copied part on `CephFS`; and the SSD copy —
-//! the only durable one until the pool copy is complete and committed — is unlinked
-//! only on the post-commit `Ok` path. [`PartVerified`] makes "commit before verify" a
-//! compile error.
+//! `completeness gate → hash every chunk → publish the backend upload → claim residency →
+//! commit Uploading`. The publish comes BEFORE the commit, so the hand-off is at-least-once: a
+//! crash between the two leaves the part `draining`, the claim lease lapses, and a re-drain
+//! publishes it again (the Python uploader is idempotent — `chunk_backend ON CONFLICT`). The
+//! reverse order could commit a part nobody was ever told to upload, and an `uploading` row
+//! pins its SSD copy against eviction forever.
 //!
-//! The commit is DECOUPLED from the backend enqueue: `mark_replicated` fires as soon as
-//! the verified copy is durable on the pool, and the address-gated
-//! [`UploadEnqueuer::enqueue`] runs afterward, best-effort. An in-flight MPU part (address
-//! NULL until `CompleteMultipartUpload`) therefore reaches `Replicated` on the first drain
-//! instead of deferring + re-copying every poll; the agent's enqueue sweep publishes its
-//! backend upload once the address lands.
+//! `Uploading` is NOT terminal for this crate: the uploader flips it to `Replicated` once every
+//! chunk has a live backend row, and the agent's upload sweep does the same from `chunk_backend`
+//! coverage (the DB-authoritative backstop), re-publishing a row that sits `uploading` too long.
+//! Only a `Replicated` part is read-tier cache the evictor may unlink — the SSD copy of an
+//! `uploading` part is the only copy there is.
+//!
+//! A part whose `object_versions.address` is not written yet (an in-flight MPU before
+//! `CompleteMultipartUpload`) cannot be published: the enqueuer reports
+//! [`EnqueueOutcome::NotReady`] and the part is DEFERRED — nothing is committed, nothing is
+//! hashed twice. `CompleteMultipartUpload` clears the deferral, so the part is re-claimed
+//! promptly once it can be published. Deferring is cheap now that a drain copies nothing; the
+//! decoupled-commit shape the pool needed (commit first, publish later from a sweep) is what
+//! let never-publishable rows pile up at the head of that sweep's worklist.
 
 use crate::apipart::{ChunkIndex, PartKey, PartMeta};
 use crate::enforce::BreakerSignal;
@@ -33,37 +39,22 @@ use core::future::Future;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-/// How many times a chunk's copy+verify is retried before the part is marked `Failed`.
-/// A byte mismatch is usually a transient torn write on the slowest tier; a small
-/// bounded retry recovers it without terminally discarding a healthy part, and an
-/// exhausted retry is real corruption. Kept small so a genuinely-bad chunk fails promptly.
-const CHUNK_COPY_ATTEMPTS: u32 = 3;
-
-/// Which durability checkpoint an I/O error struck, for diagnostics — and, for the breaker,
-/// which SIDE raised it. The `Ssd*` steps touch the node-local SSD; the rest touch the
-/// shared `CephFS` pool, so only the latter are evidence of pool unhealth (see
-/// [`PartDrainError::is_ceph_write_failure`]).
+/// Which step an I/O error struck, for diagnostics. Every step touches the node-local SSD;
+/// nothing in the drain writes to shared storage any more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainStep {
     /// Reading the local SSD source — listing chunks, the part meta, or opening a
-    /// chunk/meta source. A failure here is local-disk unhealth, NOT `CephFS`-write
-    /// unhealth, so it must never trip the node-global Ceph breaker.
+    /// chunk/meta source.
     SsdRead,
-    /// Copying, fsync, and atomic rename onto `CephFS`.
-    Persist,
-    /// Re-hashing a `CephFS` copy.
+    /// Hashing a chunk's bytes off the SSD for the content digest.
     Hash,
-    /// Removing a corrupt `CephFS` copy after a verify mismatch.
-    Cleanup,
 }
 
 impl core::fmt::Display for DrainStep {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::SsdRead => "ssd_read",
-            Self::Persist => "persist",
             Self::Hash => "hash",
-            Self::Cleanup => "cleanup",
         })
     }
 }
@@ -71,12 +62,24 @@ impl core::fmt::Display for DrainStep {
 /// What a successful drain accomplished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainOutcome {
-    /// The part was copied, verified, committed, and the SSD copy unlinked.
-    Replicated,
-    /// A prior run had already committed this part; this call only ensured the SSD
-    /// copy was unlinked. An idempotent no-op recovering a crash that struck between
-    /// commit and unlink.
-    AlreadyReplicated,
+    /// The part was verified whole, hashed, its backend upload published, and the row
+    /// committed `Uploading`. The SSD copy is retained — it is what the uploader reads.
+    Enqueued,
+    /// A prior run already handed this part to the uploader (`Uploading`) or the backend has
+    /// it (`Replicated`); nothing to do. An idempotent no-op recovering a claim re-won after
+    /// a crash that struck after the commit.
+    AlreadyEnqueued,
+}
+
+/// What the enqueuer did with a part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    /// The backend `UploadChainRequest` was published.
+    Published,
+    /// The part cannot be published yet: its `object_versions.address` is still NULL (an
+    /// in-flight MPU) or the version row is absent. Not a failure — the drain defers the part
+    /// and `CompleteMultipartUpload` wakes it.
+    NotReady,
 }
 
 /// A part claimed for draining by exactly one agent.
@@ -93,7 +96,7 @@ impl ClaimedPart {
     /// Binds a claim to its part and the fencing token the store stamped on it.
     ///
     /// `claim_seq` is an opaque, per-claim monotonic token the store returns from
-    /// `claim_part`; the commit (`mark_replicated`) is guarded by it so a claim
+    /// `claim_part`; the commit (`mark_uploading`) is guarded by it so a claim
     /// re-won after lease expiry fences the stale original claimer. Off-store callers
     /// (unit tests of the drain pipeline that never touch Postgres) pass any value.
     #[must_use]
@@ -114,23 +117,22 @@ impl ClaimedPart {
     }
 }
 
-/// Proof that every chunk of a part was copied to `CephFS` and verified byte-equal
-/// to its SSD source.
+/// Proof that every chunk the part's `meta.json` declares is present on SSD and was hashed
+/// into the digest being committed.
 ///
 /// The unit field is private, so — the sealed-marker idiom — no code outside this
-/// module can construct a `PartVerified`. Its only constructor is the verify loop in
-/// [`drain_part`]. Because [`PartReplicationStore::mark_replicated`] demands
-/// `&PartVerified`, committing `Replicated` without a passing verification does not
-/// type-check.
+/// module can construct a `PartVerified`. Its only constructor is the gate + hash loop in
+/// [`drain_part`]. Because [`PartReplicationStore::mark_uploading`] demands
+/// `&PartVerified`, committing a truncated or unhashed part does not type-check.
 #[derive(Debug)]
 pub struct PartVerified(());
 
 impl PartVerified {
     /// Test-only constructor so the in-crate Postgres `PartReplicationStore` tests
-    /// can supply the proof `mark_replicated` demands. Crate-private and gated to the
+    /// can supply the proof `mark_uploading` demands. Crate-private and gated to the
     /// `pg` store-test configuration (mirroring [`crate::Verified::for_test`]), so the
-    /// external unforgeability seal — no `PartVerified` outside this module's verify
-    /// loop — is untouched.
+    /// external unforgeability seal — no `PartVerified` outside this module's loop — is
+    /// untouched.
     #[cfg(all(test, feature = "pg"))]
     pub(crate) fn for_test() -> Self {
         Self(())
@@ -164,9 +166,9 @@ pub trait PartSource: Send + Sync {
     /// As [`chunk_source`](PartSource::chunk_source).
     fn meta_source(&self, part: &PartKey) -> std::io::Result<PathBuf>;
 
-    /// Parse the part's `meta.json` manifest from SSD, so the drain can assert the copied
+    /// Parse the part's `meta.json` manifest from SSD, so the drain can assert the on-disk
     /// chunk set matches the declared `num_chunks` before it commits — a part whose chunks
-    /// were partly removed after its meta landed must never drain a truncated object.
+    /// were partly removed after its meta landed must never be handed to the uploader.
     ///
     /// # Errors
     ///
@@ -174,42 +176,30 @@ pub trait PartSource: Send + Sync {
     /// not-ready deferral), or `InvalidData` if it is malformed.
     fn part_meta(&self, part: &PartKey) -> impl Future<Output = std::io::Result<PartMeta>> + Send;
 
-    /// The lowercase-hex content hash of one source chunk (to verify the copy).
+    /// The lowercase-hex content hash of one source chunk.
     fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> impl Future<Output = std::io::Result<String>> + Send;
 }
 
-/// The durable shared `CephFS` pool a part is drained *to*.
+/// The shared `CephFS` pool the drain USED to copy parts into.
 ///
-/// [`persist_chunk`](PartPool::persist_chunk) and [`persist_meta`](PartPool::persist_meta)
-/// must be crash-atomic: once either returns `Ok`, a power loss leaves the complete
-/// file, never a torn one.
+/// No longer consulted by [`drain_part`]: the uploader reads the node's SSD directly. Kept
+/// only until the pool is unmounted (PR 2), for the agent's `LocalFs` impl and its tests.
+// TODO: delete with the pool (PR 2).
 pub trait PartPool: Send + Sync {
     /// Durably copy `source` into the pool at the part's `chunk_<index>.bin`,
     /// returning the lowercase-hex SHA-256 of the bytes streamed during the copy.
-    /// The copy fsyncs the chunk file (`fdatasync`) but NOT the parent dir — the
-    /// single per-part dir-fsync is deferred to [`finalize_part`](PartPool::finalize_part),
-    /// so a 64-chunk part costs one dir-fsync, not 64.
     fn persist_chunk(&self, source: &Path, part: &PartKey, index: ChunkIndex) -> impl Future<Output = std::io::Result<String>> + Send;
 
-    /// Durably copy `source` into the pool at the part's `meta.json`. Called LAST,
-    /// after every chunk is verified, so a reader's meta gate flips only when the
-    /// whole part is durably present. Like [`persist_chunk`](PartPool::persist_chunk)
-    /// it does not fsync the dir — [`finalize_part`](PartPool::finalize_part) does.
+    /// Durably copy `source` into the pool at the part's `meta.json`.
     fn persist_meta(&self, source: &Path, part: &PartKey) -> impl Future<Output = std::io::Result<()>> + Send;
 
-    /// Fsync the part's directory once, after every chunk + meta has been renamed
-    /// into place, so all those directory entries become durable together. Meta is
-    /// renamed before this call, so chunks+meta flush atomically when the dir entry
-    /// flushes — a crash before this leaves the part `draining` (re-drained), losing
-    /// no durability since `mark_replicated` only commits after it succeeds.
+    /// Fsync the part's directory once, after every chunk + meta has been renamed into place.
     fn finalize_part(&self, part: &PartKey) -> impl Future<Output = std::io::Result<()>> + Send;
 
-    /// The lowercase-hex content hash of one pooled chunk (to verify the copy).
+    /// The lowercase-hex content hash of one pooled chunk.
     fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> impl Future<Output = std::io::Result<String>> + Send;
 
-    /// Remove a corrupt part's pool dir after a verify mismatch — the copy was
-    /// persisted but never committed, so deleting it is safe and leaves the SSD
-    /// source intact. Idempotent.
+    /// Remove a part's pool dir. Idempotent.
     fn remove_part(&self, part: &PartKey) -> impl Future<Output = std::io::Result<()>> + Send;
 }
 
@@ -221,77 +211,49 @@ pub trait PartReplicationStore: Send + Sync {
     /// The part's current replication state, or `None` when the store has no row.
     fn status(&self, part: &PartKey) -> impl Future<Output = Result<Option<ReplicationState>, Self::Error>> + Send;
 
-    /// Commit the part as `Replicated`. The unforgeable `&PartVerified` proves the
-    /// copy was verified, so this cannot be called before verification.
+    /// Commit the part as `Uploading`: its backend upload has been published and the uploader
+    /// now owns the next transition. The unforgeable `&PartVerified` proves the SSD part was
+    /// whole and hashed, so this cannot be called on a truncated part.
     ///
-    /// `digest` records WHAT was committed — the fold of the per-chunk hashes the verify loop
-    /// already produced. It is written by the same statement as the status, not a follow-up,
-    /// so there is no window in which a part reads `replicated` with a stale or absent digest
-    /// (which [`crate::verdict_for_reland`] would then have to treat as unverifiable).
-    fn mark_replicated(&self, part: &ClaimedPart, proof: &PartVerified, digest: &PartDigest) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    /// `digest` records WHAT was handed over — the fold of the per-chunk hashes. It is written
+    /// by the same statement as the status, not a follow-up, so there is no window in which a
+    /// part reads `uploading` with a stale or absent digest (which [`crate::verdict_for_reland`]
+    /// would then have to treat as unverifiable).
+    fn mark_uploading(&self, part: &ClaimedPart, proof: &PartVerified, digest: &PartDigest) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Record that this node is KEEPING the part's SSD copy to serve reads, with its size for
-    /// the evictor's accounting.
+    /// Record that this node is KEEPING the part's SSD copy, with its size for the evictor's
+    /// accounting.
     ///
     /// Called just BEFORE the commit, not after, and the order matters. The part is already on
     /// the disk, so recording residency first means a crash between the two leaves a residency
     /// row for a still-`draining` part — which the eviction worklist's status guard refuses, and
-    /// which the next successful commit simply overwrites. (Nothing DELETES it if the part never
-    /// commits: the reclaimer touches only the disk, never `cephor_ssd_residency` — see
-    /// `Store::drop_residency` for why that dead row is inert.) The reverse order could commit a
-    /// part whose residency was never recorded: a copy on the disk that no evictor can see and no
-    /// `cache_bytes` sum counts, leaking space until the node fills.
+    /// which the next successful commit simply overwrites. The reverse order could commit a
+    /// part whose residency was never recorded: a copy on the disk that no evictor can see and
+    /// no `cache_bytes` sum counts, leaking space until the node fills. (The residency row only
+    /// becomes evictable once the uploader flips the part `replicated`.)
     fn mark_resident(&self, part: &PartKey, bytes: u64) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Stamp that this part's backend `UploadChainRequest` has been published (sets
-    /// `upload_enqueued_at`). Called after a successful enqueue — inline in [`drain_part`]
-    /// for the common ready case, and by the agent's enqueue sweep for parts whose address
-    /// was not finalized at drain time. Keyed on `status = 'replicated'` and idempotent, so
-    /// a re-stamp (a re-drive or a sweep racing the inline enqueue) is a harmless no-op.
-    fn mark_upload_enqueued(&self, part: &PartKey) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Record that the part's drain failed (e.g. a byte-mismatch on copy).
-    fn mark_failed(&self, part: &ClaimedPart, reason: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Record that the part's drain hit a persistent byte-mismatch on a still-SERVABLE object
-    /// — the pool copy is corrupt but the SSD copy is the last good source (R4). Distinct from
-    /// [`mark_failed`](Self::mark_failed): a `corrupt` part is never reclaimed and is re-driven,
-    /// where a `failed` part is an abandoned upload safe to reclaim.
-    fn mark_corrupt(&self, part: &ClaimedPart, reason: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Whether the part's `object_versions` row is still SERVABLE — the discriminator between a
-    /// corrupt-live object ([`mark_corrupt`](Self::mark_corrupt)) and an abandoned upload
-    /// ([`mark_failed`](Self::mark_failed)) at the moment a persistent `ChunkMismatch` is
-    /// detected. Same predicate as the reclaim gate's `servable_parts` and the janitor's
-    /// unservable predicate: address set OR a real size OR an md5.
-    fn is_version_servable(&self, part: &PartKey) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 }
 
-/// Publishes the per-part backend upload request once the part is durably on the pool.
+/// Publishes the per-part backend upload request to the node-local uploader.
 ///
-/// Called by [`drain_part`] **after** `mark_replicated` commits (the Ceph copy is durable
-/// and the SSD source is about to be freed) — a **best-effort** publish that does NOT gate
-/// the commit. When the upload context is not ready yet (an in-progress MPU whose
-/// `object_versions.address` is still NULL) the impl returns an error and the part is left
-/// with `upload_enqueued_at` NULL; the agent's **enqueue sweep** re-publishes it once the
-/// address lands. Enqueue is idempotent at the consumer (the backend uploader dedups via
-/// `chunk_backend ON CONFLICT`), so the inline publish racing the sweep is harmless.
-///
-/// This decouples the Ceph-commit from the address-gated enqueue: an MPU part reaches
-/// `replicated` as soon as it is verified on the pool, instead of deferring + re-copying
-/// every poll until `CompleteMultipartUpload`.
+/// Called by [`drain_part`] **before** `mark_uploading` commits, so the hand-off is
+/// at-least-once (see the module docs). The impl loads the request fields from the app schema
+/// and pushes to the queue; when the upload context is not ready yet (an in-progress MPU whose
+/// `object_versions.address` is still NULL) it reports [`EnqueueOutcome::NotReady`] rather than
+/// an error, and the drain defers the part. A genuine failure (the queue is unreachable) is an
+/// `Err`, and is likewise a deferral: nothing was committed, so a later re-drain retries.
 ///
 /// The trait is storage-generic (takes only a [`PartKey`]); the concrete impl lives in
 /// the agent, which loads the request fields from the store and pushes to Redis — so
 /// `hippius-drain-core` stays free of Redis and the app schema.
 pub trait UploadEnqueuer: Send + Sync {
-    /// Impl-specific failure. In [`drain_part`] it is logged and swallowed (the enqueue
-    /// sweep retries); it never fails the drain.
+    /// Impl-specific failure — the publish itself failed (not "not ready", which is an
+    /// [`EnqueueOutcome`]).
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Enqueue the part's backend upload request(s). Idempotent at the consumer, so a
-    /// retry after a transient failure (or the sweep re-publishing) is safe.
-    fn enqueue(&self, part: &PartKey) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    /// Publish the part's backend upload request. Idempotent at the consumer, so a
+    /// re-publish after a crash between publish and commit is safe.
+    fn enqueue(&self, part: &PartKey) -> impl Future<Output = Result<EnqueueOutcome, Self::Error>> + Send;
 }
 
 /// A part-drain failure. Every variant leaves the SSD copy intact, so a failed
@@ -308,26 +270,13 @@ pub enum PartDrainError {
         #[source]
         source: std::io::Error,
     },
-    /// A pooled chunk's bytes did not match its SSD source — the copy is corrupt.
-    /// The part is marked `Failed`, the partial pool copy is removed, and the SSD
-    /// copy is left intact.
-    #[error("chunk {index} copy mismatch: source {source_hash}, pool {pool_hash}")]
-    ChunkMismatch {
-        /// The chunk whose copy did not match.
-        index: ChunkIndex,
-        /// The hash of the SSD source bytes.
-        source_hash: Box<str>,
-        /// The hash of the pooled copy.
-        pool_hash: Box<str>,
-    },
     /// The replication store rejected a state transition; nothing was unlinked.
     #[error("replication store rejected the drain")]
     Store(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The SSD part's `meta.json` declares more (or different) chunks than are present on
     /// disk — the part is incomplete (its chunks were partly removed after meta landed, or
-    /// an ingest crash left it torn). It is NOT committed and NOT unlinked; the SSD copy is
-    /// left intact and the part is deferred for a later re-drain. Benign for the breaker:
-    /// an SSD-source shortfall is not a `CephFS`-write failure.
+    /// an ingest crash left it torn). It is NOT committed; the SSD copy is left intact and
+    /// the part is deferred for a later re-drain.
     #[error("part is incomplete: meta declares {declared} chunks but {present} are present on SSD")]
     IncompleteSource {
         /// The `num_chunks` the meta declared.
@@ -335,6 +284,14 @@ pub enum PartDrainError {
         /// The number of `chunk_<i>.bin` files actually present on SSD.
         present: u32,
     },
+    /// The part cannot be published yet — its version has no `address` (an in-flight MPU).
+    /// Nothing was committed; the part is deferred and `CompleteMultipartUpload` wakes it.
+    #[error("upload context not ready (object_versions.address is NULL); deferred")]
+    NotReady,
+    /// Publishing the backend upload request failed (the queue is unreachable). Nothing was
+    /// committed; the part is deferred and a later re-drain re-publishes.
+    #[error("publishing the backend upload request failed")]
+    Enqueue(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl PartDrainError {
@@ -343,69 +300,31 @@ impl PartDrainError {
         Self::Store(Box::new(err))
     }
 
-    /// Whether this failure is a benign deferral rather than a Ceph-write failure — the
-    /// part could not be drained *right now* for a reason that is NOT evidence of `CephFS`
-    /// unhealth, so the caller must neither trip the node-global Ceph breaker nor count
-    /// it as a failure; the part is backed off and a later re-drain retries it.
+    /// Box an enqueuer-specific error into [`PartDrainError::Enqueue`].
+    fn enqueue<E: std::error::Error + Send + Sync + 'static>(err: E) -> Self {
+        Self::Enqueue(Box::new(err))
+    }
+
+    /// Whether this failure is a benign deferral — the part could not be drained *right now*
+    /// for a reason that is not evidence of node unhealth, so the caller backs it off
+    /// (`defer_part`, exponential) instead of releasing it to the head of the claim ring where
+    /// it would be re-claimed every poll and starve the parts behind it (the 2026-07-26
+    /// head-of-line incident).
     ///
-    /// Two cases:
-    /// - [`IncompleteSource`](Self::IncompleteSource): the SSD part's chunks were partly
-    ///   removed after its meta landed (a torn/aborted ingest); it is not whole yet.
+    /// - [`NotReady`](Self::NotReady): the address is not written yet; Complete wakes it.
+    /// - [`Enqueue`](Self::Enqueue): the queue is unreachable; nothing would fare better now.
+    /// - [`IncompleteSource`](Self::IncompleteSource): the SSD part is not whole yet.
     /// - [`Io`](Self::Io) with [`ErrorKind::NotFound`](std::io::ErrorKind::NotFound): the
     ///   SSD source/part vanished mid-drain — an overwrite, a concurrent clean, or a part
-    ///   another cycle already drained and unlinked. The pool is healthy; there is simply
-    ///   nothing to copy. Any OTHER `Io` error (`EIO`, `ENOTCONN`, permission, no-space…)
-    ///   is a genuine write failure and still trips the breaker.
-    ///
-    /// (A not-ready backend enqueue is no longer a deferral: the drain commits `Replicated`
-    /// first and the enqueue is best-effort, retried by the agent's enqueue sweep.)
-    ///
-    /// Scoped by `ErrorKind`, not by which side raised it: in principle a pool-side
-    /// `ENOENT` (the pool dir removed between `create_dir_all` and the file write) would
-    /// also read as benign, but nothing removes an actively-draining part's pool dir, and
-    /// a real degrading `CephFS` mount surfaces as `ENOTCONN`/`EIO` (kind `Other`), not
-    /// `NotFound` — so a genuine pool failure still trips the breaker. The source-open vs
-    /// pool-write `ENOENT` distinction is now expressible via [`DrainStep::SsdRead`] (added
-    /// for the breaker fix); this benign check stays step-agnostic on purpose, since nothing
-    /// removes an actively-draining pool dir, so a Ceph-side `ENOENT` cannot arise in practice.
+    ///   another cycle already drained. Any OTHER `Io` error (`EIO`, permission…) is a local
+    ///   disk fault, and a [`Store`](Self::Store) error is a Postgres blip; both release
+    ///   promptly rather than back off, since neither is a property of the part.
     #[must_use]
     pub fn is_benign_deferral(&self) -> bool {
         match self {
-            Self::IncompleteSource { .. } => true,
+            Self::IncompleteSource { .. } | Self::NotReady | Self::Enqueue(_) => true,
             Self::Io { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
-            _ => false,
-        }
-    }
-
-    /// Whether this failure is genuine evidence of `CephFS`-write unhealth — the only
-    /// class that should trip the node-global Ceph breaker. True for a real pool I/O error
-    /// (a non-ENOENT `Io` on a Ceph-side step — `Persist`/`Hash`/`Cleanup`) and a chunk
-    /// byte-mismatch (a torn/corrupt pool write).
-    ///
-    /// An `Io` on an SSD-side step (`SsdRead` reading the local source, or `Unlink` removing
-    /// it after commit) is excluded WHATEVER the errno: a local-disk fault is not pool
-    /// unhealth, so it must not halt draining of a healthy pool from every OTHER part on the
-    /// node — it defers this part instead (`breaker_signal_for` maps a non-benign,
-    /// non-Ceph error to [`BreakerSignal::Deferred`]). A `Store`/claim-coordination error
-    /// (Postgres-domain) is likewise excluded, and `IncompleteSource` is a benign
-    /// deferral (see [`is_benign_deferral`](Self::is_benign_deferral)).
-    #[must_use]
-    pub fn is_ceph_write_failure(&self) -> bool {
-        match self {
-            // SSD-side step (local-disk unhealth, whatever the errno — the fix for the
-            // `Persist`-overload where a local SSD-read EIO tripped the node-global Ceph
-            // breaker), plus the non-Ceph domains (Postgres store/claim, incomplete
-            // source): none is evidence of pool unhealth. Matched BEFORE the general `Io`
-            // arm so an SSD-side `Io` is caught here first.
-            Self::Io {
-                step: DrainStep::SsdRead, ..
-            }
-            | Self::Store(_)
-            | Self::IncompleteSource { .. } => false,
-            // Any remaining `Io` is a Ceph-side step (`Persist`/`Hash`/`Cleanup`): a non-ENOENT
-            // error is genuine pool unhealth.
-            Self::Io { source, .. } => source.kind() != std::io::ErrorKind::NotFound,
-            Self::ChunkMismatch { .. } => true,
+            Self::Store(_) => false,
         }
     }
 
@@ -415,56 +334,55 @@ impl PartDrainError {
     }
 }
 
-/// The circuit-breaker signal for a completed drain outcome — the one place that decides
-/// which failures count as `CephFS` unhealth. `Ok` succeeds; a benign deferral (vanished
-/// source / incomplete part) AND a store/claim-coordination error both leave the breaker
-/// untouched ([`BreakerSignal::Deferred`]); only a genuine Ceph-write failure trips it.
-/// Lives with the error type (not the agent) so the policy is unit-testable and the agent
-/// worker is a thin caller.
+/// The circuit-breaker signal for a completed drain outcome. `Ok` succeeds; every failure is a
+/// deferral — the drain writes to no shared storage any more, so no drain error is evidence of
+/// pool unhealth and none may open the node-global breaker. Lives with the error type (not the
+/// agent) so the policy is unit-testable and the agent worker is a thin caller.
 #[must_use]
 pub fn breaker_signal_for(result: &Result<DrainOutcome, PartDrainError>) -> BreakerSignal {
     match result {
         Ok(_) => BreakerSignal::CephSuccess,
-        Err(err) if err.is_benign_deferral() => BreakerSignal::Deferred,
-        Err(err) if err.is_ceph_write_failure() => BreakerSignal::CephFailure,
         Err(_) => BreakerSignal::Deferred,
     }
 }
 
-/// Drains one claimed part from local SSD to the `CephFS` pool, crash-safely.
+/// Drains one claimed part: verifies it is whole on SSD, records its content digest, publishes
+/// its backend upload, and commits `Uploading`.
 ///
 /// Implements the module-level ordering; each step is idempotent, so a crash at any
-/// point leaves a state a later re-drain recovers from, and the SSD part is removed
-/// only after a durable, verified, committed pool copy exists.
+/// point leaves a state a later re-drain recovers from. The SSD copy is never touched.
 ///
 /// # Errors
 ///
-/// - [`PartDrainError::Io`] if listing, persisting, hashing, or unlinking fails.
-/// - [`PartDrainError::ChunkMismatch`] if a pooled chunk does not match its source
-///   (the part is marked `Failed` first).
+/// - [`PartDrainError::Io`] if listing, reading the meta, or hashing fails.
+/// - [`PartDrainError::IncompleteSource`] if the on-disk chunk set is not the declared one.
+/// - [`PartDrainError::NotReady`] / [`PartDrainError::Enqueue`] if the upload could not be
+///   published (deferred).
 /// - [`PartDrainError::Store`] if a store transition fails.
-pub async fn drain_part<F, S, R, E>(ceph: &F, ssd: &S, store: &R, enqueuer: &E, claim: &ClaimedPart) -> Result<DrainOutcome, PartDrainError>
+pub async fn drain_part<S, R, E>(ssd: &S, store: &R, enqueuer: &E, claim: &ClaimedPart) -> Result<DrainOutcome, PartDrainError>
 where
-    F: PartPool,
     S: PartSource,
     R: PartReplicationStore,
     E: UploadEnqueuer,
 {
     let part = claim.part();
 
-    // Idempotent fast path: a prior run already committed this part, so the pool copy is
-    // durable and there is nothing left to do. The SSD copy is deliberately left in place —
-    // it is this node's read tier, and the evictor reclaims it on a free-space policy.
-    if store.status(part).await.map_err(PartDrainError::store)? == Some(ReplicationState::Replicated) {
-        return Ok(DrainOutcome::AlreadyReplicated);
+    // Idempotent fast path: a prior run already handed this part over (or the backend has it),
+    // so re-publishing would only duplicate work at the uploader. The SSD copy is left in
+    // place — it is what the uploader reads, and afterwards this node's read tier.
+    if matches!(
+        store.status(part).await.map_err(PartDrainError::store)?,
+        Some(ReplicationState::Uploading | ReplicationState::Replicated)
+    ) {
+        return Ok(DrainOutcome::AlreadyEnqueued);
     }
 
     let chunks = ssd.list_chunks(part).await.map_err(PartDrainError::io(DrainStep::SsdRead))?;
 
     // Completeness gate: meta.json is the api's part-complete marker, but a part whose
     // chunks were partly removed after meta landed still scans as "has files". Read the
-    // manifest and assert the on-disk set is EXACTLY {0..num_chunks} before copying, so a
-    // truncated part is deferred (SSD copy intact) rather than committed + unlinked. Since
+    // manifest and assert the on-disk set is EXACTLY {0..num_chunks} before handing the part
+    // to the uploader, so a truncated part is deferred rather than uploaded short. Since
     // list_chunks returns ascending indices, the enumerate check also rejects a hole (e.g.
     // {0,1,3} against num_chunks=3), not just a short count.
     let meta = ssd.part_meta(part).await.map_err(PartDrainError::io(DrainStep::SsdRead))?;
@@ -477,124 +395,43 @@ where
         });
     }
 
-    // Copy every chunk, hashing it ONCE during the copy stream, then verify EVERY chunk by
-    // re-reading the pooled copy and comparing. Parts are PATH-addressed (no self-verifying
-    // content address) and there is no re-drive after a Replicated commit, so an unread
-    // interior chunk could commit a torn pool write. A byte mismatch is usually a transient
-    // torn write on the slowest tier, so the copy+verify is retried up to
-    // CHUNK_COPY_ATTEMPTS times before terminally failing; a re-persist is idempotent (a
-    // fresh tmp + atomic rename). An exhausted retry marks the part Failed, drops the
-    // partial pool copy, and leaves the SSD source intact — never commit it.
-    // The verified hash of each chunk, in the order copied, folded into the part's content
-    // digest at commit. Free: `persist_chunk` already returns the hash of the bytes it streamed
-    // off SSD, so recording WHAT was committed costs one Vec and no extra read (B-2).
-    let mut committed_hashes: Vec<String> = Vec::with_capacity(chunks.len());
+    // The digest of what is being handed over, folded from every chunk's hash in index order.
+    // It is what a later landed announcement for this same key is compared against: an
+    // `UploadPart` retry that lands DIFFERENT bytes under the same (object, version, part) is
+    // legal S3, and without the digest nothing could tell "announced again" from "written
+    // again" (B-2). One full SSD read per part; the pool copy used to get this for free.
+    let mut hashes: Vec<String> = Vec::with_capacity(chunks.len());
     for index in &chunks {
-        let index = *index;
-        let source = ssd.chunk_source(part, index).map_err(PartDrainError::io(DrainStep::SsdRead))?;
-        let mut mismatch: Option<(String, String)> = None;
-        let mut verified_hash: Option<String> = None;
-        for _ in 0..CHUNK_COPY_ATTEMPTS {
-            let copy_hash = ceph
-                .persist_chunk(&source, part, index)
-                .await
-                .map_err(PartDrainError::io(DrainStep::Persist))?;
-            let pool_hash = ceph.chunk_hash(part, index).await.map_err(PartDrainError::io(DrainStep::Hash))?;
-            if pool_hash == copy_hash {
-                mismatch = None;
-                verified_hash = Some(copy_hash);
-                break;
-            }
-            mismatch = Some((copy_hash, pool_hash));
-        }
-        if let Some((source_hash, pool_hash)) = mismatch {
-            // R4: a persistent byte-mismatch means the POOL copy is corrupt. If the object is
-            // still servable, this SSD part is its last good source — mark it `corrupt` (held
-            // + re-driven), NOT `failed` (which the reclaim would eventually delete as debris).
-            // An unservable version (abandoned/in-flight upload) is the ordinary `failed` case.
-            // The servability read is on the rare mismatch path only, so it never touches the
-            // happy drain path.
-            if store.is_version_servable(part).await.map_err(PartDrainError::store)? {
-                store
-                    .mark_corrupt(claim, "chunk copy byte mismatch on a servable object")
-                    .await
-                    .map_err(PartDrainError::store)?;
-            } else {
-                store
-                    .mark_failed(claim, "chunk copy byte mismatch")
-                    .await
-                    .map_err(PartDrainError::store)?;
-            }
-            ceph.remove_part(part).await.map_err(PartDrainError::io(DrainStep::Cleanup))?;
-            return Err(PartDrainError::ChunkMismatch {
-                index,
-                source_hash: source_hash.into_boxed_str(),
-                pool_hash: pool_hash.into_boxed_str(),
-            });
-        }
-        // Unreachable unless the retry loop exits without either outcome, which the two arms
-        // above make impossible; pushing the empty string rather than unwrapping keeps the
-        // drain panic-free at the cost of a digest that simply will not match a later read.
-        committed_hashes.push(verified_hash.unwrap_or_default());
+        hashes.push(ssd.chunk_hash(part, *index).await.map_err(PartDrainError::io(DrainStep::Hash))?);
     }
-
-    // Persist meta LAST — only now, with every chunk durably copied and byte-verified,
-    // may the reader's `meta.json` gate flip on the pool copy.
-    let meta_source = ssd.meta_source(part).map_err(PartDrainError::io(DrainStep::SsdRead))?;
-    ceph.persist_meta(&meta_source, part)
-        .await
-        .map_err(PartDrainError::io(DrainStep::Persist))?;
-    // ONE dir-fsync for the whole part, now that every chunk + meta is renamed into place
-    // (Task 1: batch the fsync). Precedes commit/enqueue so the pool copy is durable before
-    // the SSD source can be removed.
-    ceph.finalize_part(part).await.map_err(PartDrainError::io(DrainStep::Persist))?;
     let verified = PartVerified(());
 
-    // Claim the SSD copy as read-tier cache BEFORE committing — see `mark_resident`. The size
+    // Publish BEFORE committing (at-least-once, see the module docs). Not-ready is the
+    // in-flight-MPU case and is a deferral, not a failure: nothing below runs, so the part
+    // carries no residency row and no digest until it can actually be published.
+    match enqueuer.enqueue(part).await.map_err(PartDrainError::enqueue)? {
+        EnqueueOutcome::Published => {}
+        EnqueueOutcome::NotReady => return Err(PartDrainError::NotReady),
+    }
+
+    // Claim the SSD copy as this node's cache BEFORE committing — see `mark_resident`. The size
     // comes from the manifest already read for the completeness gate, so this costs no extra
     // I/O and never has to join `parts` on the drain path.
     store.mark_resident(part, meta.size_bytes).await.map_err(PartDrainError::store)?;
 
-    // Commit Replicated as soon as the verified copy is durable on the pool — the Ceph
-    // commit is DECOUPLED from the address-gated backend enqueue. The digest of what was
-    // copied goes in the SAME statement, so no committed part is ever unverifiable (B-2).
     store
-        .mark_replicated(claim, &verified, &part_digest(&committed_hashes))
+        .mark_uploading(claim, &verified, &part_digest(&hashes))
         .await
         .map_err(PartDrainError::store)?;
 
-    // Best-effort backend enqueue, decoupled from the commit. For a simple PUT or a completed
-    // MPU the address is ready, so this publishes the UploadChainRequest and stamps
-    // `upload_enqueued_at` inline. For an in-flight MPU the address is still NULL and the enqueue
-    // errors — the part stays `replicated` with `upload_enqueued_at` NULL, and the agent's enqueue
-    // sweep re-publishes it once CompleteMultipartUpload writes the address (idempotent at the
-    // consumer). A not-ready/failed enqueue is intentionally swallowed here: it must NEVER
-    // un-commit the part or fail the drain. Before this change an MPU part deferred and re-copied
-    // its whole self to the pool on every poll until the object completed; now it copies once.
-    if enqueuer.enqueue(part).await.is_ok() {
-        store.mark_upload_enqueued(part).await.map_err(PartDrainError::store)?;
-    }
-
-    // The SSD copy is RETAINED, not unlinked. Draining a part means "a verified copy now
-    // exists on the pool", not "the local copy is surplus": local NVMe serves a GET at
-    // ~705 MB/s / ~6 ms per chunk against the pool's ~94 MB/s / ~40 ms, so throwing the copy
-    // away at commit was discarding the fast tier the moment it became safe to keep. Space is
-    // reclaimed by the evictor on a free-space policy instead (`crate::evict_to_target`), which is
-    // why `mark_resident` above is issued BEFORE the commit and as its OWN statement — the commit
-    // writes only `status`/`corrupt_attempts`/`updated_at` and never touches residency. The window
-    // that ordering opens, a residency row against a still-`draining` part, is invisible to the
-    // evictor: `Store::evictable_parts` joins the replication row and filters `status =
-    // 'replicated'`, so nothing can unlink a part whose only durable copy is still the SSD one.
-    // That is what makes the order a correctness property rather than a preference — see
-    // `PartReplicationStore::mark_resident` for why the reverse leaks instead.
-    Ok(DrainOutcome::Replicated)
+    Ok(DrainOutcome::Enqueued)
 }
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::{
-        ClaimedPart, DrainOutcome, DrainStep, PartDrainError, PartPool, PartReplicationStore, PartSource, PartVerified, UploadEnqueuer,
+        ClaimedPart, DrainOutcome, DrainStep, EnqueueOutcome, PartDrainError, PartReplicationStore, PartSource, PartVerified, UploadEnqueuer,
         breaker_signal_for, drain_part,
     };
     use crate::apipart::{ChunkIndex, ObjectId, PartKey, PartMeta, PartNumber, Version};
@@ -606,167 +443,83 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::io;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     const UUID: &str = "466916c0-d61b-4518-b81b-9576b574270a";
 
     #[test]
-    fn is_benign_deferral_spares_the_breaker_only_for_incomplete_and_vanished_source() {
-        // ENOENT reading the SSD source (overwrite / concurrent clean / already drained)
-        // is benign — the pool is healthy, there is just nothing to copy. It must NOT trip
-        // the node-global Ceph breaker.
-        let vanished = PartDrainError::Io {
-            step: DrainStep::SsdRead,
-            source: io::Error::from(io::ErrorKind::NotFound),
-        };
-        assert!(vanished.is_benign_deferral(), "a vanished SSD source (ENOENT) is a benign deferral");
-
-        // An incomplete SSD part (chunks removed after meta landed) is benign — the pool
-        // is healthy; the part just isn't whole yet. It defers, not trips the breaker.
-        let incomplete = PartDrainError::IncompleteSource { declared: 3, present: 2 };
-        assert!(incomplete.is_benign_deferral(), "an incomplete SSD part is a benign deferral");
-
-        // Every OTHER I/O error is a genuine Ceph-write failure and MUST still trip the
-        // breaker — the whole point of the breaker is to react to a degrading pool.
+    fn benign_deferrals_are_the_part_specific_waits_not_the_node_faults() {
+        // Deferred (backed off): the part itself is not ready — its address is unwritten, the
+        // queue is down, it is not whole yet, or it vanished. Released promptly: a local disk
+        // fault or a store blip, neither of which is a property of the part.
+        assert!(PartDrainError::NotReady.is_benign_deferral(), "an unwritten address is a deferral");
+        assert!(
+            PartDrainError::enqueue(io::Error::other("redis down")).is_benign_deferral(),
+            "an unreachable queue is a deferral"
+        );
+        assert!(
+            PartDrainError::IncompleteSource { declared: 3, present: 2 }.is_benign_deferral(),
+            "an incomplete SSD part is a deferral"
+        );
+        assert!(
+            PartDrainError::Io {
+                step: DrainStep::SsdRead,
+                source: io::Error::from(io::ErrorKind::NotFound),
+            }
+            .is_benign_deferral(),
+            "a vanished SSD source (ENOENT) is a deferral"
+        );
         for kind in [
             io::ErrorKind::PermissionDenied,
             io::ErrorKind::BrokenPipe,
             io::ErrorKind::TimedOut,
-            io::ErrorKind::Other, // e.g. a raw EIO / ENOTCONN from a sick CephFS mount
+            io::ErrorKind::Other,
         ] {
-            let real = PartDrainError::Io {
-                step: DrainStep::Persist,
-                source: io::Error::from(kind),
-            };
-            assert!(!real.is_benign_deferral(), "a real I/O error ({kind:?}) must still trip the breaker");
-        }
-
-        // A byte-mismatch corruption and a store rejection are not deferrals either.
-        let mismatch = PartDrainError::ChunkMismatch {
-            index: ChunkIndex::new(0),
-            source_hash: "aaa".into(),
-            pool_hash: "bbb".into(),
-        };
-        assert!(!mismatch.is_benign_deferral(), "a chunk byte-mismatch is not a benign deferral");
-        let store_err = PartDrainError::store(io::Error::from(io::ErrorKind::Other));
-        assert!(!store_err.is_benign_deferral(), "a store rejection is not a benign deferral");
-    }
-
-    #[test]
-    fn is_ceph_write_failure_only_for_real_pool_io_and_mismatch() {
-        // WI-10: only genuine Ceph-write faults trip the node-global breaker. A real pool
-        // I/O error and a byte-mismatch do; a store/claim error, an ENOENT vanished source,
-        // and an incomplete SSD part do NOT (they are not evidence the pool is unhealthy).
-        let real_io = PartDrainError::Io {
-            step: DrainStep::Persist,
-            source: io::Error::from(io::ErrorKind::Other),
-        };
-        assert!(real_io.is_ceph_write_failure(), "a real pool I/O error is a Ceph-write failure");
-        let mismatch = PartDrainError::ChunkMismatch {
-            index: ChunkIndex::new(0),
-            source_hash: "aaa".into(),
-            pool_hash: "bbb".into(),
-        };
-        assert!(mismatch.is_ceph_write_failure(), "a torn-copy byte mismatch is a Ceph-write failure");
-
-        let vanished = PartDrainError::Io {
-            step: DrainStep::SsdRead,
-            source: io::Error::from(io::ErrorKind::NotFound),
-        };
-        assert!(!vanished.is_ceph_write_failure(), "an ENOENT vanished source is not a Ceph failure");
-        let store_err = PartDrainError::store(io::Error::from(io::ErrorKind::Other));
-        assert!(
-            !store_err.is_ceph_write_failure(),
-            "a store/claim error is a Postgres-domain fault, not Ceph"
-        );
-        let incomplete = PartDrainError::IncompleteSource { declared: 3, present: 2 };
-        assert!(!incomplete.is_ceph_write_failure(), "an incomplete SSD part is not a Ceph failure");
-
-        // C13: a NON-ENOENT I/O error on an SSD-side step (a local-disk EIO reading the source,
-        // or an unlink failure after commit) is local-disk unhealth, NOT a Ceph-write failure —
-        // it must NOT trip the node-global Ceph breaker. This is the `Persist`-overload bug: the
-        // same steps used to be tagged `Persist` (Ceph-write), so a local SSD-read EIO wrongly
-        // tripped the breaker and wedged draining of a healthy pool.
-        for step in [DrainStep::SsdRead] {
-            for kind in [io::ErrorKind::Other, io::ErrorKind::PermissionDenied, io::ErrorKind::TimedOut] {
-                let ssd_io = PartDrainError::Io {
-                    step,
-                    source: io::Error::from(kind),
-                };
-                assert!(
-                    !ssd_io.is_ceph_write_failure(),
-                    "an SSD-side I/O error ({step:?}, {kind:?}) is local-disk unhealth, not a Ceph failure",
-                );
-            }
-        }
-        // A non-ENOENT I/O error on each Ceph-side step DOES trip the breaker.
-        for step in [DrainStep::Persist, DrainStep::Hash, DrainStep::Cleanup] {
-            let ceph_io = PartDrainError::Io {
-                step,
-                source: io::Error::from(io::ErrorKind::Other),
-            };
             assert!(
-                ceph_io.is_ceph_write_failure(),
-                "a real pool I/O error on a Ceph-side step ({step:?}) is a Ceph-write failure",
+                !PartDrainError::Io {
+                    step: DrainStep::Hash,
+                    source: io::Error::from(kind),
+                }
+                .is_benign_deferral(),
+                "a real local I/O error ({kind:?}) releases promptly"
             );
         }
+        assert!(
+            !PartDrainError::store(io::Error::from(io::ErrorKind::Other)).is_benign_deferral(),
+            "a store rejection releases promptly"
+        );
     }
 
     #[test]
-    fn breaker_signal_classifies_the_three_domains() {
-        // WI-10: Ok -> success; benign deferrals AND store/claim errors -> Deferred
-        // (breaker untouched); only a genuine Ceph-write failure -> CephFailure.
-        assert_eq!(breaker_signal_for(&Ok(DrainOutcome::Replicated)), BreakerSignal::CephSuccess);
-        assert_eq!(
-            breaker_signal_for(&Err(PartDrainError::Io {
-                step: DrainStep::SsdRead,
-                source: io::Error::from(io::ErrorKind::NotFound),
-            })),
-            BreakerSignal::Deferred,
-            "a vanished SSD source (ENOENT) does not trip the breaker",
-        );
-        assert_eq!(
-            breaker_signal_for(&Err(PartDrainError::IncompleteSource { declared: 3, present: 2 })),
-            BreakerSignal::Deferred,
-            "an incomplete part does not trip the breaker",
-        );
-        assert_eq!(
-            breaker_signal_for(&Err(PartDrainError::store(io::Error::from(io::ErrorKind::Other)))),
-            BreakerSignal::Deferred,
-            "a store/claim error (PG blip) must NOT trip the Ceph breaker",
-        );
-        assert_eq!(
-            breaker_signal_for(&Err(PartDrainError::Io {
-                step: DrainStep::Persist,
+    fn no_drain_error_opens_the_breaker() {
+        // The drain writes to no shared storage, so nothing it hits is evidence of pool
+        // unhealth. Ok succeeds; everything else is a deferral for the breaker.
+        assert_eq!(breaker_signal_for(&Ok(DrainOutcome::Enqueued)), BreakerSignal::CephSuccess);
+        for err in [
+            PartDrainError::NotReady,
+            PartDrainError::enqueue(io::Error::other("redis down")),
+            PartDrainError::IncompleteSource { declared: 3, present: 2 },
+            PartDrainError::store(io::Error::from(io::ErrorKind::Other)),
+            PartDrainError::Io {
+                step: DrainStep::Hash,
                 source: io::Error::from(io::ErrorKind::Other),
-            })),
-            BreakerSignal::CephFailure,
-            "a real pool I/O error trips the breaker",
-        );
-        // C13: a local SSD-read EIO defers the part, it does NOT trip the Ceph breaker.
-        assert_eq!(
-            breaker_signal_for(&Err(PartDrainError::Io {
-                step: DrainStep::SsdRead,
-                source: io::Error::from(io::ErrorKind::Other),
-            })),
-            BreakerSignal::Deferred,
-            "a local SSD-read EIO defers the part, it must NOT trip the Ceph breaker",
-        );
+            },
+        ] {
+            assert_eq!(breaker_signal_for(&Err(err)), BreakerSignal::Deferred);
+        }
     }
 
-    /// The step (if any) at which the fakes inject an I/O failure.
+    /// The step (if any) at which the fakes inject a failure.
     #[derive(Default, Clone, Copy, PartialEq, Eq)]
     enum Fault {
         #[default]
         None,
         ListChunks,
-        PersistChunk,
-        PersistMeta,
         SourceHash,
-        PoolHash,
-        Cleanup,
         Commit,
+        /// The publish itself fails (the queue is unreachable).
+        Enqueue,
     }
 
     /// One part's contents: chunk index -> content hash, and whether meta landed.
@@ -780,34 +533,18 @@ mod tests {
         declared_chunks: Option<u32>,
     }
 
-    /// The shared in-memory world. A chunk maps to the content hash its bytes would
-    /// produce — an honest copy keeps the same hash; a corrupt persist rewrites it.
+    /// The shared in-memory world.
     #[derive(Default)]
     struct World {
         ssd: HashMap<String, PartState>,
-        pool: HashMap<String, PartState>,
         status: HashMap<String, ReplicationState>,
-        /// Parts claimed as read-tier cache (`mark_resident`), and the size recorded for each.
+        /// Parts claimed as this node's cache (`mark_resident`), and the size recorded for each.
         resident: HashMap<String, u64>,
         fault: Fault,
-        corrupt_persist: bool,
-        /// Specific chunk indices a persist corrupts (in addition to `corrupt_persist`),
-        /// so a test can corrupt only an interior chunk vs. a sampled endpoint.
-        corrupt_chunks: std::collections::HashSet<u32>,
-        /// Chunk index -> how many more persist attempts corrupt it, then succeed. Models a
-        /// TRANSIENT torn write recovered by the bounded copy-retry (decremented per persist).
-        corrupt_attempts: HashMap<u32, u32>,
-        /// When set, the upload enqueue fails (address not ready / Redis blip) — the
-        /// decoupled enqueue is best-effort, so the drain still commits and the sweep retries.
-        enqueue_fault: bool,
-        /// Parts the enqueuer was asked to enqueue, in order.
+        /// When set, the enqueuer reports `NotReady` (the address is not written yet).
+        not_ready: bool,
+        /// Parts the enqueuer published, in order.
         enqueued: Vec<String>,
-        /// Parts stamped `upload_enqueued_at` via `mark_upload_enqueued`, in order — set only
-        /// after a successful inline enqueue.
-        upload_stamped: Vec<String>,
-        /// When set, `is_version_servable` returns true, so a persistent mismatch marks the
-        /// part `Corrupt` (R4) instead of `Failed`. Default false = the abandoned-upload shape.
-        servable: bool,
         /// The content digest recorded by each commit — the store column `content_sha256`,
         /// which a later re-landing compares against to detect a rewritten part (B-2).
         committed_digest: HashMap<String, PartDigest>,
@@ -848,28 +585,9 @@ mod tests {
             self
         }
 
-        fn corrupt_persist(self) -> Self {
-            self.world.lock().unwrap().corrupt_persist = true;
-            self
-        }
-
-        /// Mark the object servable, so a persistent mismatch marks the part `Corrupt` (R4)
-        /// rather than `Failed` (the abandoned-upload default).
-        fn servable(self) -> Self {
-            self.world.lock().unwrap().servable = true;
-            self
-        }
-
-        /// Corrupt the persisted copy of one specific chunk index only.
-        fn corrupt_chunk(self, index: u32) -> Self {
-            self.world.lock().unwrap().corrupt_chunks.insert(index);
-            self
-        }
-
-        /// Corrupt chunk `index`'s persisted copy for its first `times` persist attempts,
-        /// then let it succeed — a transient torn write the bounded retry should recover.
-        fn corrupt_chunk_for(self, index: u32, times: u32) -> Self {
-            self.world.lock().unwrap().corrupt_attempts.insert(index, times);
+        /// The address is not written yet: the enqueuer reports `NotReady`.
+        fn not_ready(self) -> Self {
+            self.world.lock().unwrap().not_ready = true;
             self
         }
 
@@ -882,24 +600,14 @@ mod tests {
             self
         }
 
-        fn enqueue_fault(self) -> Self {
-            self.world.lock().unwrap().enqueue_fault = true;
-            self
-        }
-
         fn enqueued(&self) -> Vec<String> {
             self.world.lock().unwrap().enqueued.clone()
-        }
-
-        fn upload_stamped(&self) -> Vec<String> {
-            self.world.lock().unwrap().upload_stamped.clone()
         }
 
         fn clear_faults(&self) {
             let mut world = self.world.lock().unwrap();
             world.fault = Fault::None;
-            world.corrupt_persist = false;
-            world.corrupt_chunks.clear();
+            world.not_ready = false;
         }
 
         fn status_of(&self, part: &PartKey) -> Option<ReplicationState> {
@@ -910,8 +618,8 @@ mod tests {
             self.world.lock().unwrap().ssd.contains_key(&key_of(part))
         }
 
-        fn pool_part(&self, part: &PartKey) -> Option<PartState> {
-            self.world.lock().unwrap().pool.get(&key_of(part)).cloned()
+        fn resident_bytes(&self, part: &PartKey) -> Option<u64> {
+            self.world.lock().unwrap().resident.get(&key_of(part)).copied()
         }
 
         /// The digest recorded by the last commit (the `content_sha256` column).
@@ -935,6 +643,11 @@ mod tests {
         /// existed (the legacy-backfill case).
         fn forget_committed_digest(&self, part: &PartKey) {
             self.world.lock().unwrap().committed_digest.remove(&key_of(part));
+        }
+
+        /// The uploader's side of the hand-off: every chunk has a live backend row now.
+        fn backend_acked(&self, part: &PartKey) {
+            self.world.lock().unwrap().status.insert(key_of(part), ReplicationState::Replicated);
         }
 
         /// The landed-announcement handler, modelling `Store::redrive_diverged_part`'s guarded
@@ -1008,85 +721,6 @@ mod tests {
         }
     }
 
-    impl PartPool for Fakes {
-        fn persist_chunk(&self, _source: &Path, part: &PartKey, index: ChunkIndex) -> impl Future<Output = io::Result<String>> + Send {
-            let part = part.clone();
-            async move {
-                let mut world = self.world.lock().unwrap();
-                if world.fault == Fault::PersistChunk {
-                    return Err(io::Error::other("persist chunk failed"));
-                }
-                let corrupt_static = world.corrupt_persist || world.corrupt_chunks.contains(&index.get());
-                let transient_left = world.corrupt_attempts.get(&index.get()).copied().unwrap_or(0);
-                if transient_left > 0 {
-                    world.corrupt_attempts.insert(index.get(), transient_left - 1);
-                }
-                let corrupt = corrupt_static || transient_left > 0;
-                let source_hash = world
-                    .ssd
-                    .get(&key_of(&part))
-                    .and_then(|s| s.chunks.get(&index.get()).cloned())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no ssd source"))?;
-                // A corrupt persist writes different bytes (hash) than the source. The
-                // returned hash is the copy-time (source) hash either way — mirrors the
-                // real localfs, where the copy streams + hashes the source while a torn
-                // write only diverges on the pool re-read.
-                let written = if corrupt {
-                    format!("corrupt-{}", index.get())
-                } else {
-                    source_hash.clone()
-                };
-                world.pool.entry(key_of(&part)).or_default().chunks.insert(index.get(), written);
-                Ok(source_hash)
-            }
-        }
-
-        fn persist_meta(&self, _source: &Path, part: &PartKey) -> impl Future<Output = io::Result<()>> + Send {
-            let part = part.clone();
-            async move {
-                let mut world = self.world.lock().unwrap();
-                if world.fault == Fault::PersistMeta {
-                    return Err(io::Error::other("persist meta failed"));
-                }
-                world.pool.entry(key_of(&part)).or_default().has_meta = true;
-                Ok(())
-            }
-        }
-
-        async fn finalize_part(&self, _part: &PartKey) -> io::Result<()> {
-            // The in-memory pool needs no fsync; the real localfs dir-fsync is exercised
-            // by the e2e + localfs tests.
-            Ok(())
-        }
-
-        fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> impl Future<Output = io::Result<String>> + Send {
-            let part = part.clone();
-            async move {
-                let world = self.world.lock().unwrap();
-                if world.fault == Fault::PoolHash {
-                    return Err(io::Error::other("pool hash failed"));
-                }
-                world
-                    .pool
-                    .get(&key_of(&part))
-                    .and_then(|s| s.chunks.get(&index.get()).cloned())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no pool chunk"))
-            }
-        }
-
-        fn remove_part(&self, part: &PartKey) -> impl Future<Output = io::Result<()>> + Send {
-            let part = part.clone();
-            async move {
-                let mut world = self.world.lock().unwrap();
-                if world.fault == Fault::Cleanup {
-                    return Err(io::Error::other("pool cleanup failed"));
-                }
-                world.pool.remove(&key_of(&part));
-                Ok(())
-            }
-        }
-    }
-
     impl PartReplicationStore for Fakes {
         type Error = io::Error;
 
@@ -1103,7 +737,7 @@ mod tests {
             }
         }
 
-        fn mark_replicated(
+        fn mark_uploading(
             &self,
             part: &ClaimedPart,
             _proof: &PartVerified,
@@ -1116,54 +750,28 @@ mod tests {
                 if world.fault == Fault::Commit {
                     return Err(io::Error::other("commit failed"));
                 }
-                world.status.insert(key.clone(), ReplicationState::Replicated);
+                world.status.insert(key.clone(), ReplicationState::Uploading);
                 world.committed_digest.insert(key, digest);
                 Ok(())
             }
-        }
-
-        fn mark_upload_enqueued(&self, part: &PartKey) -> impl Future<Output = Result<(), io::Error>> + Send {
-            let key = key_of(part);
-            async move {
-                self.world.lock().unwrap().upload_stamped.push(key);
-                Ok(())
-            }
-        }
-
-        fn mark_failed(&self, part: &ClaimedPart, _reason: &str) -> impl Future<Output = Result<(), io::Error>> + Send {
-            let key = key_of(part.part());
-            async move {
-                self.world.lock().unwrap().status.insert(key, ReplicationState::Failed);
-                Ok(())
-            }
-        }
-
-        fn mark_corrupt(&self, part: &ClaimedPart, _reason: &str) -> impl Future<Output = Result<(), io::Error>> + Send {
-            let key = key_of(part.part());
-            async move {
-                self.world.lock().unwrap().status.insert(key, ReplicationState::Corrupt);
-                Ok(())
-            }
-        }
-
-        fn is_version_servable(&self, _part: &PartKey) -> impl Future<Output = Result<bool, io::Error>> + Send {
-            let servable = self.world.lock().unwrap().servable;
-            async move { Ok(servable) }
         }
     }
 
     impl UploadEnqueuer for Fakes {
         type Error = io::Error;
 
-        fn enqueue(&self, part: &PartKey) -> impl Future<Output = Result<(), io::Error>> + Send {
+        fn enqueue(&self, part: &PartKey) -> impl Future<Output = Result<EnqueueOutcome, io::Error>> + Send {
             let key = key_of(part);
             async move {
                 let mut world = self.world.lock().unwrap();
-                if world.enqueue_fault {
+                if world.fault == Fault::Enqueue {
                     return Err(io::Error::other("enqueue failed"));
                 }
+                if world.not_ready {
+                    return Ok(EnqueueOutcome::NotReady);
+                }
                 world.enqueued.push(key);
-                Ok(())
+                Ok(EnqueueOutcome::Published)
             }
         }
     }
@@ -1174,91 +782,247 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn happy_path_copies_every_chunk_then_meta_then_commits_and_retains_the_ssd_copy() {
+    async fn happy_path_hashes_publishes_claims_residency_and_commits_uploading() {
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]);
 
-        let outcome = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        let outcome = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
 
-        assert_eq!(outcome, DrainOutcome::Replicated);
-        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Replicated));
-        let pooled = fakes.pool_part(&part).expect("part landed on CephFS");
-        assert_eq!(pooled.chunks.get(&0).map(String::as_str), Some("h0"));
-        assert_eq!(pooled.chunks.get(&1).map(String::as_str), Some("h1"));
-        assert!(pooled.has_meta, "meta.json written");
+        assert_eq!(outcome, DrainOutcome::Enqueued);
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Uploading));
+        assert_eq!(fakes.enqueued(), vec![key_of(&part)], "the backend upload was published");
+        assert_eq!(fakes.resident_bytes(&part), Some(4), "the SSD copy is claimed as this node's cache");
+        assert!(fakes.committed_digest(&part).is_some(), "the commit records what was handed over");
         assert!(
             fakes.ssd_has(&part),
-            "the SSD copy is RETAINED to serve reads; the evictor owns it now, not the drain",
-        );
-        assert_eq!(fakes.enqueued(), vec![key_of(&part)], "the backend upload was enqueued");
-        assert_eq!(
-            fakes.upload_stamped(),
-            vec![key_of(&part)],
-            "a successful inline enqueue stamps upload_enqueued_at",
+            "the SSD copy is RETAINED: it is what the uploader reads, and afterwards the read tier",
         );
     }
 
     #[tokio::test]
-    async fn a_replicated_part_whose_ssd_content_is_replaced_is_redriven_and_the_pool_gets_the_new_bytes() {
-        // B-2, the regression this whole module exists for. An `UploadPart` retry may land
-        // DIFFERENT bytes under the same (object, version, part) key before Complete. Attempt
-        // one drains to `replicated`; attempt two overwrites the SSD. Nothing used to re-drive
-        // the row, so the pool kept attempt one's ciphertext — which AEAD-verifies cleanly
-        // under the unchanged DEK/AAD, making it silent wrong plaintext rather than an error.
+    async fn a_not_ready_publish_defers_without_committing_or_claiming_residency() {
+        // An in-flight MPU: the address is not written until CompleteMultipartUpload. Nothing
+        // is committed — no residency row, no digest, no status change — so the part carries
+        // no state the evictor or the reland check could act on before it is publishable.
         let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "attempt1-c0"), (1, "attempt1-c1")]);
-        drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
-        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Replicated));
+        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).not_ready();
 
-        fakes.reupload_ssd(&part, &[(0, "attempt2-c0"), (1, "attempt2-c1")]);
-        let verdict = fakes.handle_reland(&part).await;
+        let err = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
 
-        assert_eq!(verdict, RelandVerdict::Diverged, "a rewritten part's digest no longer matches");
-        assert_eq!(
-            fakes.status_of(&part),
-            Some(ReplicationState::Pending),
-            "a diverged part returns to the drainable set",
-        );
+        assert!(matches!(err, PartDrainError::NotReady));
+        assert!(err.is_benign_deferral(), "deferred with backoff, not released to the claim head");
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Pending), "nothing was committed");
+        assert!(fakes.enqueued().is_empty());
+        assert_eq!(fakes.resident_bytes(&part), None, "no residency claim for a part not handed over");
+        assert!(fakes.committed_digest(&part).is_none());
 
-        drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
-        let pooled = fakes.pool_part(&part).expect("the re-drive re-copied the part");
-        assert_eq!(
-            pooled.chunks.get(&0).map(String::as_str),
-            Some("attempt2-c0"),
-            "the pool must hold the SECOND attempt's bytes, not the first's",
-        );
-        assert_eq!(pooled.chunks.get(&1).map(String::as_str), Some("attempt2-c1"));
+        // Complete writes the address; the re-drain publishes and commits.
+        fakes.clear_faults();
+        assert_eq!(drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap(), DrainOutcome::Enqueued);
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Uploading));
     }
 
     #[tokio::test]
-    async fn a_replicated_part_whose_content_is_unchanged_is_not_redriven() {
+    async fn a_failed_publish_defers_without_committing() {
+        // The queue is unreachable. The publish comes before the commit, so a failed publish
+        // leaves nothing to unwind: the part stays pending and a later re-drain retries.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0")]).fault(Fault::Enqueue);
+
+        let err = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+
+        assert!(matches!(err, PartDrainError::Enqueue(_)));
+        assert!(err.is_benign_deferral());
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Pending));
+        assert_eq!(fakes.resident_bytes(&part), None);
+    }
+
+    #[tokio::test]
+    async fn an_already_handed_over_part_is_a_noop_that_does_not_republish() {
+        // Both `Uploading` (the uploader owns it) and `Replicated` (the backend has it) are
+        // done from the drain's point of view; a re-claim after a post-commit crash must not
+        // publish a second request or touch the retained SSD copy.
+        for prior in [ReplicationState::Uploading, ReplicationState::Replicated] {
+            let part = part();
+            let fakes = Fakes::seeded(&part, &[(0, "h0")]);
+            fakes.world.lock().unwrap().status.insert(key_of(&part), prior);
+
+            let outcome = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+
+            assert_eq!(outcome, DrainOutcome::AlreadyEnqueued);
+            assert_eq!(fakes.status_of(&part), Some(prior), "the state is left as it was");
+            assert!(fakes.enqueued().is_empty(), "no duplicate publish for a {prior:?} part");
+            assert!(fakes.ssd_has(&part));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_part_defers_without_publishing_or_committing() {
+        // meta.json declares 3 chunks but only 2 landed (an ingest crash, or chunks removed
+        // after meta): the part must not be handed to the uploader short. Deferred, SSD intact.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).declare_chunks(3);
+
+        let err = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+
+        assert!(matches!(err, PartDrainError::IncompleteSource { declared: 3, present: 2 }));
+        assert!(err.is_benign_deferral());
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Pending));
+        assert!(fakes.enqueued().is_empty(), "an incomplete part is never published");
+        assert!(fakes.ssd_has(&part));
+    }
+
+    #[tokio::test]
+    async fn a_missing_interior_index_is_caught_even_when_the_count_matches() {
+        // {0, 2} against num_chunks=2: the count matches but chunk 1 is missing. The gate
+        // checks the exact index set, not just the count.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0"), (2, "h2")]).declare_chunks(2);
+
+        let err = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+
+        assert!(matches!(err, PartDrainError::IncompleteSource { declared: 2, present: 2 }));
+        assert!(fakes.enqueued().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_source_hash_failure_never_publishes() {
+        // The digest is computed BEFORE the publish, so a part whose bytes cannot be read is
+        // never handed to an uploader that would fail on the same read.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0")]).fault(Fault::SourceHash);
+
+        let err = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+
+        assert!(matches!(err, PartDrainError::Io { step: DrainStep::Hash, .. }));
+        assert!(fakes.enqueued().is_empty());
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Pending));
+    }
+
+    #[tokio::test]
+    async fn a_vanished_source_is_a_benign_deferral() {
+        let part = part();
+        let fakes = Fakes::default(); // no SSD part at all
+        fakes.world.lock().unwrap().status.insert(key_of(&part), ReplicationState::Pending);
+
+        let err = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            PartDrainError::Io {
+                step: DrainStep::SsdRead,
+                ..
+            }
+        ));
+        assert!(err.is_benign_deferral(), "ENOENT on the source is not node unhealth");
+    }
+
+    #[tokio::test]
+    async fn crash_after_publish_before_commit_republishes_on_the_redrive() {
+        // The at-least-once hand-off: the publish succeeded, the commit failed (a store blip,
+        // or the agent died in between). The part stays claimable; the re-drain publishes
+        // AGAIN and then commits. The duplicate is the uploader's to dedup (chunk_backend ON
+        // CONFLICT) — the alternative, commit-then-publish, could commit a part nobody uploads.
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0")]).fault(Fault::Commit);
+
+        let err = drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
+        assert!(matches!(err, PartDrainError::Store(_)));
+        assert_eq!(fakes.enqueued(), vec![key_of(&part)], "the publish happened before the failed commit");
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Pending));
+        assert!(fakes.ssd_has(&part), "a failed commit never touches the SSD copy");
+
+        fakes.clear_faults();
+        assert_eq!(drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap(), DrainOutcome::Enqueued);
+        assert_eq!(fakes.enqueued(), vec![key_of(&part), key_of(&part)], "re-published, not skipped");
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Uploading));
+    }
+
+    #[tokio::test]
+    async fn draining_twice_is_idempotent() {
+        let part = part();
+        let fakes = Fakes::seeded(&part, &[(0, "h0")]);
+
+        assert_eq!(drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap(), DrainOutcome::Enqueued);
+        assert_eq!(
+            drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap(),
+            DrainOutcome::AlreadyEnqueued
+        );
+        assert_eq!(fakes.enqueued().len(), 1, "one publish for one hand-off");
+    }
+
+    #[tokio::test]
+    async fn a_handed_over_part_whose_ssd_content_is_replaced_is_redriven_and_republished() {
+        // B-2, the regression the digest exists for. An `UploadPart` retry may land DIFFERENT
+        // bytes under the same (object, version, part) key before Complete. Attempt one is
+        // handed over; attempt two overwrites the SSD. Nothing used to re-drive the row, so
+        // the backend kept attempt one's ciphertext — which AEAD-verifies cleanly under the
+        // unchanged DEK/AAD, making it silent wrong plaintext rather than an error. Whether the
+        // uploader has already acked (Replicated) or not (Uploading), a diverged digest returns
+        // the part to the drainable set and the re-drain publishes the new bytes.
+        for ack_first in [false, true] {
+            let part = part();
+            let fakes = Fakes::seeded(&part, &[(0, "attempt1-c0"), (1, "attempt1-c1")]);
+            drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+            if ack_first {
+                fakes.backend_acked(&part);
+            }
+
+            fakes.reupload_ssd(&part, &[(0, "attempt2-c0"), (1, "attempt2-c1")]);
+            let verdict = fakes.handle_reland(&part).await;
+
+            assert_eq!(
+                verdict,
+                RelandVerdict::Diverged,
+                "a rewritten part's digest no longer matches (acked={ack_first})"
+            );
+            assert_eq!(
+                fakes.status_of(&part),
+                Some(ReplicationState::Pending),
+                "a diverged part returns to the drainable set"
+            );
+
+            drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+            assert_eq!(fakes.enqueued().len(), 2, "the re-drive publishes the SECOND attempt's bytes");
+            assert_ne!(
+                fakes.committed_digest(&part),
+                Some(crate::redrive::part_digest(&["attempt1-c0".to_owned(), "attempt1-c1".to_owned()])),
+                "the recorded digest is the new content's",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handed_over_part_whose_content_is_unchanged_is_not_redriven() {
         // The common path, and the one that would be catastrophic to get wrong: a duplicate
-        // announcement, or the reconciler backstop racing the fast path, must not re-copy the
-        // node's whole shard to Ceph. The digest is what distinguishes "announced again" from
+        // announcement, or the reconciler backstop racing the fast path, must not re-upload
+        // the node's whole shard. The digest is what distinguishes "announced again" from
         // "written again"; without it the only options are re-drive everything or nothing.
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]);
-        drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
 
-        let verdict = fakes.handle_reland(&part).await;
-
-        assert_eq!(verdict, RelandVerdict::Unchanged);
+        assert_eq!(fakes.handle_reland(&part).await, RelandVerdict::Unchanged);
         assert_eq!(
             fakes.status_of(&part),
-            Some(ReplicationState::Replicated),
-            "an unchanged part stays committed — no re-copy, no eviction churn",
+            Some(ReplicationState::Uploading),
+            "an unchanged part stays handed over"
         );
+
+        fakes.backend_acked(&part);
+        assert_eq!(fakes.handle_reland(&part).await, RelandVerdict::Unchanged);
+        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Replicated));
     }
 
     #[tokio::test]
-    async fn a_replicated_part_with_no_recorded_digest_is_redriven_rather_than_assumed_intact() {
+    async fn a_handed_over_part_with_no_recorded_digest_is_redriven_rather_than_assumed_intact() {
         // Decision on NULL: a part committed before content digests shipped cannot be compared.
         // "Unknown" must not resolve to "fine" on an integrity check, so a re-landing of such a
         // part re-drives. It costs nothing at deploy because it is only ever evaluated when an
-        // announcement arrives for an already-`replicated` part — a rewrite, by construction.
+        // announcement arrives for an already-committed part — a rewrite, by construction.
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0")]);
-        drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
         fakes.forget_committed_digest(&part);
 
         let verdict = fakes.handle_reland(&part).await;
@@ -1271,11 +1035,11 @@ mod tests {
     #[tokio::test]
     async fn a_redrive_is_idempotent_and_does_not_loop_on_a_repeatedly_announced_part() {
         // A re-drive must not spin. The second announcement for the SAME rewrite finds the row
-        // already `pending` (not `replicated`), so it is a no-op; and once the re-drive commits,
+        // already `pending` (not handed over), so it is a no-op; and once the re-drive commits,
         // the freshly-recorded digest matches the disk, so further announcements read Unchanged.
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "v1")]);
-        drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
         fakes.reupload_ssd(&part, &[(0, "v2")]);
 
         assert_eq!(fakes.handle_reland(&part).await, RelandVerdict::Diverged);
@@ -1285,7 +1049,7 @@ mod tests {
             "a duplicate announcement for an already re-driven part changes nothing",
         );
 
-        drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
+        drain_part(&fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
         assert_eq!(
             fakes.handle_reland(&part).await,
             RelandVerdict::Unchanged,
@@ -1295,9 +1059,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_corrupt_part_is_left_to_the_bounded_redrive_worker() {
-        // A `corrupt` part is already owned by `redrive_corrupt_parts`, which caps attempts so
-        // an unrecoverable pool copy cannot loop forever. Re-driving it from the announcement
-        // path would bypass that cap — the same reason the reconciler refuses to re-record it.
+        // A `corrupt` part is owned by `redrive_corrupt_parts`, which caps attempts. Re-driving
+        // it from the announcement path would bypass that cap — the same reason the reconciler
+        // refuses to re-record it.
         let part = part();
         let fakes = Fakes::seeded(&part, &[(0, "h0")]);
         fakes.world.lock().unwrap().status.insert(key_of(&part), ReplicationState::Corrupt);
@@ -1313,238 +1077,15 @@ mod tests {
         // even though every remaining chunk hash is identical.
         let part = part();
         let full = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]);
-        drain_part(&full, &full, &full, &full, &claim(&part)).await.unwrap();
+        drain_part(&full, &full, &full, &claim(&part)).await.unwrap();
 
         let truncated = Fakes::seeded(&part, &[(0, "h0")]);
-        drain_part(&truncated, &truncated, &truncated, &truncated, &claim(&part)).await.unwrap();
+        drain_part(&truncated, &truncated, &truncated, &claim(&part)).await.unwrap();
 
         assert_ne!(
             full.committed_digest(&part),
             truncated.committed_digest(&part),
             "a truncated chunk set must not alias the full one",
         );
-    }
-
-    #[tokio::test]
-    async fn a_not_ready_enqueue_still_commits_replicated_and_leaves_it_unstamped() {
-        // Decoupled commit: if the backend enqueue is not ready (an in-flight MPU whose
-        // address is NULL) the drain STILL commits Replicated — the part is Ceph-durable now,
-        // and the agent's enqueue sweep re-publishes the backend upload once the address
-        // lands. upload_enqueued_at stays unstamped so the sweep knows this part is still
-        // outstanding. (The old behavior deferred + re-copied here.)
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).enqueue_fault();
-
-        let outcome = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
-
-        assert_eq!(outcome, DrainOutcome::Replicated, "a not-ready enqueue does not fail the drain");
-        assert_eq!(
-            fakes.status_of(&part),
-            Some(ReplicationState::Replicated),
-            "the Ceph commit is decoupled from the enqueue",
-        );
-        assert!(fakes.ssd_has(&part), "the SSD copy is retained regardless of the enqueue outcome");
-        assert!(
-            fakes.upload_stamped().is_empty(),
-            "a not-ready enqueue leaves upload_enqueued_at NULL for the sweep to pick up",
-        );
-        assert!(
-            fakes.pool_part(&part).is_some_and(|p| p.has_meta),
-            "the verified part is durable on the pool",
-        );
-    }
-
-    #[tokio::test]
-    async fn an_already_replicated_part_is_a_noop_that_keeps_its_retained_copy() {
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0")]);
-        fakes.world.lock().unwrap().status.insert(key_of(&part), ReplicationState::Replicated);
-
-        let outcome = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
-
-        assert_eq!(outcome, DrainOutcome::AlreadyReplicated);
-        assert!(
-            fakes.ssd_has(&part),
-            "a committed part's SSD copy is its read tier, not a crash-orphan to reclaim",
-        );
-        assert!(fakes.pool_part(&part).is_none(), "no redundant re-copy to the pool");
-    }
-
-    #[tokio::test]
-    async fn a_corrupt_chunk_copy_marks_failed_and_preserves_the_ssd_copy() {
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).corrupt_persist();
-
-        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
-
-        assert!(matches!(err, PartDrainError::ChunkMismatch { index, .. } if index == ChunkIndex::new(0)));
-        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Failed));
-        assert!(fakes.ssd_has(&part), "corrupt drain must NOT delete the SSD copy");
-        assert!(fakes.pool_part(&part).is_none(), "the corrupt, never-committed pool copy is removed");
-    }
-
-    #[tokio::test]
-    async fn a_corrupt_chunk_on_a_servable_object_marks_corrupt_not_failed() {
-        // R4: the same persistent mismatch, but the object is still SERVABLE — so this SSD part
-        // is the last good source of a live object. It must be marked `Corrupt` (held + re-driven),
-        // NOT `Failed` (which the reclaim would eventually delete as abandoned-upload debris). The
-        // SSD copy is preserved and the corrupt pool copy is removed, exactly as the Failed path.
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).corrupt_persist().servable();
-
-        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
-
-        assert!(matches!(err, PartDrainError::ChunkMismatch { index, .. } if index == ChunkIndex::new(0)));
-        assert_eq!(
-            fakes.status_of(&part),
-            Some(ReplicationState::Corrupt),
-            "a servable object's part is held Corrupt"
-        );
-        assert!(fakes.ssd_has(&part), "the last good SSD source must NOT be deleted");
-        assert!(fakes.pool_part(&part).is_none(), "the corrupt pool copy is still removed");
-    }
-
-    #[tokio::test]
-    async fn a_corrupt_last_chunk_is_caught_by_full_readback() {
-        // Every chunk is re-read and verified; a persistently torn LAST chunk trips ChunkMismatch.
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1"), (2, "h2")]).corrupt_chunk(2);
-
-        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
-
-        assert!(matches!(err, PartDrainError::ChunkMismatch { index, .. } if index == ChunkIndex::new(2)));
-        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Failed));
-        assert!(fakes.ssd_has(&part), "corrupt drain must NOT delete the SSD copy");
-    }
-
-    #[tokio::test]
-    async fn a_corrupt_interior_chunk_is_caught_by_full_readback() {
-        // WI-2: every chunk is re-read from the pool, not just the endpoints, so a
-        // persistently torn INTERIOR chunk is caught and the part is failed with its SSD
-        // copy intact — never committed.
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1"), (2, "h2")]).corrupt_chunk(1);
-
-        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
-
-        assert!(matches!(err, PartDrainError::ChunkMismatch { index, .. } if index == ChunkIndex::new(1)));
-        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Failed));
-        assert!(fakes.ssd_has(&part), "a corrupt interior drain must NOT delete the SSD copy");
-        assert!(fakes.pool_part(&part).is_none(), "the partial pool copy was dropped");
-    }
-
-    #[tokio::test]
-    async fn a_transient_torn_copy_is_recovered_by_the_bounded_retry() {
-        // WI-3: chunk 1's copy tears on its first two persist attempts, then succeeds
-        // within CHUNK_COPY_ATTEMPTS. The drain must recover and commit, not fail.
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).corrupt_chunk_for(1, 2);
-
-        let outcome = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
-
-        assert_eq!(outcome, DrainOutcome::Replicated, "a transient torn copy retries to success");
-        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Replicated));
-        let pooled = fakes.pool_part(&part).expect("part landed on CephFS");
-        assert_eq!(
-            pooled.chunks.get(&1).map(String::as_str),
-            Some("h1"),
-            "the retry landed the correct bytes"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_incomplete_part_defers_without_committing_or_unlinking() {
-        // WI-1: meta declares 3 chunks but only 0,1 are on SSD. The drain must defer
-        // (benign) — never commit, never unlink — so the only complete copy is not lost.
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).declare_chunks(3);
-
-        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
-
-        assert!(
-            matches!(err, PartDrainError::IncompleteSource { declared: 3, present: 2 }),
-            "got: {err:?}"
-        );
-        assert!(
-            err.is_benign_deferral(),
-            "an incomplete SSD part is a benign deferral, not a Ceph failure"
-        );
-        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Pending), "must NOT commit");
-        assert!(fakes.ssd_has(&part), "must NOT unlink the SSD copy");
-        assert!(fakes.pool_part(&part).is_none(), "nothing was copied to the pool");
-    }
-
-    #[tokio::test]
-    async fn a_missing_interior_index_is_caught_even_when_the_count_matches() {
-        // The set {0,1,3} has the same count as num_chunks=3 but a hole at 2 — the
-        // contiguity check must still reject it.
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1"), (3, "h3")]).declare_chunks(3);
-
-        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
-
-        assert!(
-            matches!(err, PartDrainError::IncompleteSource { declared: 3, present: 3 }),
-            "got: {err:?}"
-        );
-        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Pending), "a hole must NOT commit");
-    }
-
-    #[tokio::test]
-    async fn meta_is_persisted_only_after_every_chunk_is_verified() {
-        // If a chunk copy fails, meta must NOT have been written — a reader's meta
-        // gate must never flip on a partially-copied part.
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).fault(Fault::PersistChunk);
-
-        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
-
-        assert!(matches!(
-            err,
-            PartDrainError::Io {
-                step: DrainStep::Persist,
-                ..
-            }
-        ));
-        assert!(!fakes.pool_part(&part).is_some_and(|p| p.has_meta), "meta must not precede chunk copies");
-    }
-
-    #[tokio::test]
-    async fn commit_failure_never_unlinks_the_ssd_copy() {
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0")]).fault(Fault::Commit);
-
-        let err = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap_err();
-
-        assert!(matches!(err, PartDrainError::Store(_)));
-        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Pending), "commit did not take");
-        assert!(fakes.ssd_has(&part), "SSD copy preserved when commit fails");
-    }
-
-    #[tokio::test]
-    async fn crash_before_commit_then_redrive_completes_the_drain() {
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0"), (1, "h1")]).fault(Fault::Commit);
-        assert!(drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.is_err());
-        assert!(fakes.ssd_has(&part), "interrupted drain kept the SSD copy");
-
-        fakes.clear_faults();
-        let outcome = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
-
-        assert_eq!(outcome, DrainOutcome::Replicated);
-        assert!(fakes.ssd_has(&part), "the re-drive commits and retains, same as a clean drain");
-        assert_eq!(fakes.status_of(&part), Some(ReplicationState::Replicated));
-    }
-
-    #[tokio::test]
-    async fn draining_twice_is_idempotent() {
-        let part = part();
-        let fakes = Fakes::seeded(&part, &[(0, "h0")]);
-
-        let first = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
-        let second = drain_part(&fakes, &fakes, &fakes, &fakes, &claim(&part)).await.unwrap();
-
-        assert_eq!(first, DrainOutcome::Replicated);
-        assert_eq!(second, DrainOutcome::AlreadyReplicated);
     }
 }

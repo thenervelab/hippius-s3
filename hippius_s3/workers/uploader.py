@@ -269,10 +269,30 @@ class Uploader:
                     object_id, int(object_version), result.part_number, ttl=self.config.cache_ttl_seconds
                 )
 
+            await self._confirm_uploaded(object_id, int(object_version), [r.part_number for r in all_results])
+
             all_cids = []
             for result in all_results:
                 all_cids.extend(result.cids)
             return all_cids
+
+    async def _confirm_uploaded(self, object_id: str, object_version: int, part_numbers: List[int]) -> None:
+        """Flip the drain's `uploading` rows to `replicated` for the parts just uploaded.
+
+        Only after every chunk's chunk_backend row is written (the caller awaits the whole
+        fan-out first): `replicated` is what lets the drain's evictor unlink the SSD copy, so
+        flipping early would let it discard the only copy of a part the backend does not hold
+        yet. Guarded on `uploading` in the SQL, so the legacy pool-reading uploader (whose rows
+        are already `replicated`) and a re-driven row (back to `pending`) are untouched.
+        """
+        async with self._acquire_conn() as conn:
+            for part_number in part_numbers:
+                await conn.execute(
+                    get_query("confirm_replication_status_uploaded"),
+                    str(object_id),
+                    int(object_version),
+                    int(part_number),
+                )
 
     async def _upload_single_chunk(
         self,

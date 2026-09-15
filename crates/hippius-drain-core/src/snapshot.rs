@@ -218,6 +218,17 @@ pub struct AgentSnapshot {
     /// records the total alongside, so `written_off_servable <= written_off` always.
     /// Out of [`error_bps`](Self::error_bps) for the same reason as the total.
     pub written_off_servable: u64,
+    /// `uploading` parts the upload sweep flipped to `replicated` from `chunk_backend`
+    /// coverage — the uploader's own flip was lost (a crash between its last chunk row and
+    /// the flip). Expect near zero; the sweep is the backstop, not the common path.
+    pub uploads_confirmed: u64,
+    /// `uploading` parts the upload sweep re-published after they sat past the re-drive
+    /// window without full coverage (a lost queue entry, an uploader that died mid-part).
+    /// A sustained rate means requests are being lost between the drain and the uploader.
+    pub uploads_redriven: u64,
+    /// `uploading` parts retired because their object was deleted before the upload completed
+    /// (flipped `replicated` with nothing to upload, so the evictor may free the SSD copy).
+    pub uploads_abandoned: u64,
 }
 
 impl AgentSnapshot {
@@ -250,6 +261,13 @@ pub struct SnapshotCell {
     drained: AtomicU64,
     failed: AtomicU64,
     deferred: AtomicU64,
+    uploads_confirmed: AtomicU64,
+    uploads_redriven: AtomicU64,
+    uploads_abandoned: AtomicU64,
+    /// Gauge: `uploading` parts on this node that exhausted their re-publish budget and are
+    /// still not on the backend — each is a part whose only copy is this SSD and whose upload
+    /// keeps not completing. The "uploads stuck" alert.
+    uploads_exhausted: AtomicU64,
     reconciler_recovered: AtomicU64,
     reconcile_scan_parts: AtomicU64,
     reconcile_scan_ms: AtomicU64,
@@ -368,6 +386,23 @@ impl SnapshotCell {
     /// Adds `n` to the reconciler-recovered total.
     pub fn record_reconciled(&self, n: u64) {
         self.reconciler_recovered.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records one upload-sweep pass: parts confirmed from coverage, re-published, and
+    /// retired as deleted, plus the current count of parts past their re-publish budget (a
+    /// gauge: `store`, not add).
+    pub fn record_upload_sweep(&self, confirmed: u64, redriven: u64, abandoned: u64, exhausted: u64) {
+        self.uploads_confirmed.fetch_add(confirmed, Ordering::Relaxed);
+        self.uploads_redriven.fetch_add(redriven, Ordering::Relaxed);
+        self.uploads_abandoned.fetch_add(abandoned, Ordering::Relaxed);
+        self.uploads_exhausted.store(exhausted, Ordering::Relaxed);
+    }
+
+    /// The last-recorded count of `uploading` parts past their re-publish budget (the
+    /// `drain_uploads_exhausted` gauge).
+    #[must_use]
+    pub fn uploads_exhausted(&self) -> u64 {
+        self.uploads_exhausted.load(Ordering::Relaxed)
     }
 
     /// Records one SSD walk against the worker that performed it.
@@ -664,6 +699,9 @@ impl SnapshotCell {
             throttled: self.throttled.load(Ordering::Relaxed),
             written_off: self.written_off.load(Ordering::Relaxed),
             written_off_servable: self.written_off_servable.load(Ordering::Relaxed),
+            uploads_confirmed: self.uploads_confirmed.load(Ordering::Relaxed),
+            uploads_redriven: self.uploads_redriven.load(Ordering::Relaxed),
+            uploads_abandoned: self.uploads_abandoned.load(Ordering::Relaxed),
         }
     }
 }
@@ -879,6 +917,9 @@ mod tests {
                 throttled: 9,
                 written_off: 0,
                 written_off_servable: 0,
+                uploads_confirmed: 0,
+                uploads_redriven: 0,
+                uploads_abandoned: 0,
             },
         );
     }
@@ -989,6 +1030,9 @@ mod tests {
             throttled: 0,
             written_off: 0,
             written_off_servable: 0,
+            uploads_confirmed: 0,
+            uploads_redriven: 0,
+            uploads_abandoned: 0,
         };
         assert_eq!(snapshot.error_bps(), 10_000);
     }
@@ -1015,6 +1059,9 @@ mod tests {
             throttled: 0,
             written_off: 0,
             written_off_servable: 0,
+            uploads_confirmed: 0,
+            uploads_redriven: 0,
+            uploads_abandoned: 0,
         };
         // 3 failed attempts of 10 total attempts = 30%, i.e. 3000 basis points.
         assert_eq!(snapshot.error_bps(), 3000);
