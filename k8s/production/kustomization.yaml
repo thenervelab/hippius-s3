@@ -27,6 +27,10 @@ resources:
   - api-local-deployments-production.yaml
   - drain-allocator-deployment.yaml   # singleton; owns the cephor_* schema (deploy first)
   - drain-agent-daemonset.yaml        # one per labelled ingest node
+  # The node-local uploader: consumes arion_upload_requests:<node> and reads the node's NVMe.
+  # Must be Ready BEFORE the drain image that publishes to node queues rolls, or those
+  # queues fill with nobody reading them (the base arion-uploader only reads the global one).
+  - arion-uploader-local-daemonset.yaml
   - mpu-reaper-deployment.yaml
 
 patches:

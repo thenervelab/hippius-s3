@@ -50,8 +50,8 @@ pub struct ReconcileReport {
     pub adopted: u64,
     /// Already pending and node-owned — a worker will claim them.
     pub already_pending: u64,
-    /// Already draining: a live claim in flight, or a stale orphan that
-    /// `claim_part` re-claims once its claim outlives the lease (the H1 path).
+    /// Already draining (a live claim in flight, or a stale orphan that `claim_part` re-claims
+    /// once its claim outlives the lease — the H1 path) or uploading (handed to the uploader).
     pub in_flight: u64,
     /// Already replicated and still on SSD — since retention, the normal resting state of every
     /// drained part (the read tier), not debris. Counted for visibility; the evictor owns the
@@ -244,7 +244,9 @@ where
             }
             Some(status) => match status.state {
                 ReplicationState::Pending => report.already_pending += 1,
-                ReplicationState::Draining => report.in_flight += 1,
+                // Uploading is in flight too: handed to the uploader, whose ack (or the upload
+                // sweep) moves it on. Nothing for the reconciler to trigger.
+                ReplicationState::Draining | ReplicationState::Uploading => report.in_flight += 1,
                 ReplicationState::Replicated => report.replicated_orphan += 1,
                 ReplicationState::Failed => report.failed += 1,
                 // Held corrupt (R4): the re-drive worker owns the failed→pending decision, so

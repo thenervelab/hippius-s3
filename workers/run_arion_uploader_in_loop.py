@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -23,6 +24,7 @@ from hippius_s3.monitoring import initialize_metrics_collector
 from hippius_s3.queue import dequeue_upload_request
 from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.queue import move_due_upload_retries
+from hippius_s3.queue import upload_queue_name
 from hippius_s3.redis_utils import with_redis_retry
 from hippius_s3.sentry import init_sentry
 from hippius_s3.services.arion_service import ArionClient
@@ -53,11 +55,13 @@ async def _handle_upload(uploader, db_pool, upload_request) -> None:
     ray_id_context.set(ray_id)
     worker_logger = get_logger_with_ray_id(__name__, ray_id)
 
-    # Drain-direct (s3-2.1 PR-11): the drain only enqueues a part AFTER it's replicated to
-    # ceph, so a dequeued request is always ceph-ready — no defer-gate needed.
+    # The drain publishes a part only once it is whole on the SSD this pod reads (node-scoped
+    # queue) or durable in the pool (the legacy global queue), so a dequeued request is always
+    # readable — no defer-gate needed.
     worker_logger.info(
         f"Processing Arion upload request object_id={upload_request.object_id} "
-        f"chunks={len(upload_request.chunks)} attempts={upload_request.attempts or 0}"
+        f"chunks={len(upload_request.chunks)} attempts={upload_request.attempts or 0} "
+        f"node_id={upload_request.node_id}"
     )
     with tracer.start_as_current_span(
         "uploader.job",
@@ -122,10 +126,13 @@ async def run_arion_uploader_loop():
         db_pool, redis_client, redis_queues_client, config, backend_name="arion", backend_client=arion_client
     )
 
-    queue_name = "arion_upload_requests"
+    # NODE_NAME set (the DaemonSet on an ingest node): consume only this node's queue, since the
+    # parts on it live on this node's SSD. Unset (the pool-reading Deployment): the global queue.
+    node_name = os.getenv("NODE_NAME") or None
+    queue_name = upload_queue_name("arion", node_name)
     max_inflight = max(1, int(config.uploader_max_inflight))
     logger.info(
-        f"Starting Arion uploader service (max_inflight={max_inflight} "
+        f"Starting Arion uploader service (queue={queue_name} max_inflight={max_inflight} "
         f"arion_concurrency={config.arion_upload_concurrency} db_pool_max={pool_max})"
     )
 
@@ -139,7 +146,9 @@ async def run_arion_uploader_loop():
                 # client returned here is unused — don't reassign the shared var (the main
                 # loop owns it; concurrent reassignment would be a race).
                 moved, _ = await with_redis_retry(
-                    lambda rc: move_due_upload_retries(backend_name="arion", now_ts=time.time(), max_items=256),
+                    lambda rc: move_due_upload_retries(
+                        backend_name="arion", node_id=node_name, now_ts=time.time(), max_items=256
+                    ),
                     redis_queues_client,
                     config.redis_queues_url,
                     "move due retries",

@@ -1227,9 +1227,9 @@ mod part_tests {
     use core::future::Future;
     use core::str::FromStr;
     use hippius_drain_core::{
-        ChunkIndex, ClaimedPart, DrainOutcome, FailedGrace, META_FILE_NAME, ObjectId, OrphanGrace, PartDigest, PartDrainError, PartKey, PartNumber,
-        PartPool, PartRemover, PartReplicationStore, PartScan, PartSource, PartVerified, RelandVerdict, ReplicationState, UploadEnqueuer, Version,
-        chunk_file_name, drain_part, observed_part_digest, parse_part_dir, part_digest, verdict_for_reland,
+        ChunkIndex, ClaimedPart, DrainOutcome, EnqueueOutcome, FailedGrace, META_FILE_NAME, ObjectId, OrphanGrace, PartDigest, PartDrainError,
+        PartKey, PartNumber, PartPool, PartRemover, PartReplicationStore, PartScan, PartSource, PartVerified, RelandVerdict, ReplicationState,
+        UploadEnqueuer, Version, chunk_file_name, drain_part, observed_part_digest, parse_part_dir, part_digest, verdict_for_reland,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -1240,12 +1240,12 @@ mod part_tests {
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
 
-    /// A no-op upload enqueuer for the localfs drain test.
+    /// An always-publishing upload enqueuer for the localfs drain test.
     struct NoopEnqueuer;
     impl UploadEnqueuer for NoopEnqueuer {
         type Error = io::Error;
-        async fn enqueue(&self, _part: &PartKey) -> Result<(), io::Error> {
-            Ok(())
+        async fn enqueue(&self, _part: &PartKey) -> Result<EnqueueOutcome, io::Error> {
+            Ok(EnqueueOutcome::Published)
         }
     }
 
@@ -1311,12 +1311,12 @@ mod part_tests {
         }
 
         // Residency accounting is the Postgres store's job; this in-memory double only
-        // exercises the drain's copy/verify/commit ordering.
+        // exercises the drain's gate/hash/commit ordering.
         async fn mark_resident(&self, _part: &PartKey, _bytes: u64) -> Result<(), io::Error> {
             Ok(())
         }
 
-        fn mark_replicated(
+        fn mark_uploading(
             &self,
             part: &ClaimedPart,
             _proof: &PartVerified,
@@ -1325,40 +1325,10 @@ mod part_tests {
             let key = Self::key(part.part());
             let digest = digest.clone();
             async move {
-                self.status.lock().unwrap().insert(key.clone(), ReplicationState::Replicated);
+                self.status.lock().unwrap().insert(key.clone(), ReplicationState::Uploading);
                 self.committed_digest.lock().unwrap().insert(key, digest);
                 Ok(())
             }
-        }
-
-        async fn mark_upload_enqueued(&self, _part: &PartKey) -> Result<(), io::Error> {
-            // The localfs drain tests assert the SSD/pool copy + commit; the upload_enqueued_at
-            // stamp is exercised by the core partdrain tests + the store integration tests.
-            Ok(())
-        }
-
-        fn mark_failed(&self, part: &ClaimedPart, _reason: &str) -> impl Future<Output = Result<(), io::Error>> + Send {
-            let key = Self::key(part.part());
-            async move {
-                self.status.lock().unwrap().insert(key, ReplicationState::Failed);
-                Ok(())
-            }
-        }
-
-        fn mark_corrupt(&self, part: &ClaimedPart, _reason: &str) -> impl Future<Output = Result<(), io::Error>> + Send {
-            let key = Self::key(part.part());
-            async move {
-                self.status.lock().unwrap().insert(key, ReplicationState::Corrupt);
-                Ok(())
-            }
-        }
-
-        fn is_version_servable(&self, _part: &PartKey) -> impl Future<Output = Result<bool, io::Error>> + Send {
-            // The e2e drain tests exercise the happy/abandoned paths; an unservable default keeps
-            // a mismatch on the `Failed` path (the R4 servable→Corrupt branch is unit-tested in
-            // partdrain against a servable fake).
-            let servable = false;
-            async move { Ok(servable) }
         }
     }
 
@@ -1459,8 +1429,8 @@ mod part_tests {
         let content = b"durable chunk bytes";
         seed_ssd_part(ssd_dir.path(), &part, &[(0, content)]);
 
-        let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
+        let ssd = LocalSsd::new(ssd_dir.path());
         let source = ssd.chunk_source(&part, ChunkIndex::new(0)).unwrap();
         let copy_hash = ceph.persist_chunk(&source, &part, ChunkIndex::new(0)).await.unwrap();
         // The hash-once win: persist_chunk returns the SHA computed during the copy stream,
@@ -1564,35 +1534,29 @@ mod part_tests {
     }
 
     #[tokio::test]
-    async fn end_to_end_part_drain_copies_verifies_commits_and_retains() {
+    async fn end_to_end_part_drain_hashes_real_files_commits_uploading_and_retains() {
         let ssd_dir = TempDir::new().unwrap();
-        let pool_dir = TempDir::new().unwrap();
         let part = part_key(5, 1);
         seed_ssd_part(ssd_dir.path(), &part, &[(0, b"chunk zero"), (1, b"chunk one!")]);
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = MemPartStore::default();
         store.set(&part, ReplicationState::Pending);
         let claim = ClaimedPart::new(part.clone(), 0);
 
-        let outcome = drain_part(&ceph, &ssd, &store, &NoopEnqueuer, &claim).await.unwrap();
+        let outcome = drain_part(&ssd, &store, &NoopEnqueuer, &claim).await.unwrap();
 
-        let pool_part = pool_dir.path().join(part.relative_dir());
-        let ssd_part = ssd_dir.path().join(part.relative_dir());
-        assert_eq!(outcome, DrainOutcome::Replicated);
-        assert_eq!(
-            std::fs::read(pool_part.join("chunk_0.bin")).unwrap(),
-            b"chunk zero",
-            "pool holds the durable copy"
-        );
-        assert!(pool_part.join("chunk_1.bin").exists());
-        assert!(pool_part.join("meta.json").exists(), "meta marker copied last");
+        assert_eq!(outcome, DrainOutcome::Enqueued);
         assert!(
-            ssd_part.exists(),
-            "the SSD copy is retained as this node's read tier once a verified pool copy exists",
+            ssd_dir.path().join(part.relative_dir()).exists(),
+            "the SSD copy is retained: it is what the uploader reads, and this node's read tier after",
         );
-        assert_eq!(store.status_of(&part), Some(ReplicationState::Replicated));
+        assert_eq!(store.status_of(&part), Some(ReplicationState::Uploading));
+        assert_eq!(
+            store.committed_digest(&part),
+            Some(part_digest(&[sha256_hex(b"chunk zero"), sha256_hex(b"chunk one!")])),
+            "the commit records the digest of the real bytes handed over",
+        );
     }
 
     #[tokio::test]
@@ -1601,24 +1565,15 @@ mod part_tests {
         // digest folded from the copy-time hashes inside drain_part is byte-identical to the one
         // `observed_part_digest` derives by re-reading the same part off LocalSsd. If the two
         // sides ever disagree — a different chunk order, a different hash rendering — every
-        // re-landing would read as diverged and the fleet would re-copy itself.
+        // re-landing would read as diverged and the fleet would re-upload itself.
         let ssd_dir = TempDir::new().unwrap();
-        let pool_dir = TempDir::new().unwrap();
         let part = part_key(5, 1);
         seed_ssd_part(ssd_dir.path(), &part, &[(0, b"chunk zero"), (1, b"chunk one!")]);
 
         let ssd = LocalSsd::new(ssd_dir.path());
         let store = MemPartStore::default();
         store.set(&part, ReplicationState::Pending);
-        drain_part(
-            &LocalFs::new(pool_dir.path()),
-            &ssd,
-            &store,
-            &NoopEnqueuer,
-            &ClaimedPart::new(part.clone(), 0),
-        )
-        .await
-        .unwrap();
+        drain_part(&ssd, &store, &NoopEnqueuer, &ClaimedPart::new(part.clone(), 0)).await.unwrap();
 
         let committed = store.committed_digest(&part).unwrap();
         let observed = observed_part_digest(&ssd, &part).await.unwrap();
@@ -1641,22 +1596,13 @@ mod part_tests {
         // committed. Same length on purpose — a size check would not catch this, which is why
         // the divergence has to be a content hash.
         let ssd_dir = TempDir::new().unwrap();
-        let pool_dir = TempDir::new().unwrap();
         let part = part_key(5, 1);
         seed_ssd_part(ssd_dir.path(), &part, &[(0, b"attempt one")]);
 
         let ssd = LocalSsd::new(ssd_dir.path());
         let store = MemPartStore::default();
         store.set(&part, ReplicationState::Pending);
-        drain_part(
-            &LocalFs::new(pool_dir.path()),
-            &ssd,
-            &store,
-            &NoopEnqueuer,
-            &ClaimedPart::new(part.clone(), 0),
-        )
-        .await
-        .unwrap();
+        drain_part(&ssd, &store, &NoopEnqueuer, &ClaimedPart::new(part.clone(), 0)).await.unwrap();
         let committed = store.committed_digest(&part).unwrap();
 
         std::fs::write(ssd_dir.path().join(part.relative_dir()).join("chunk_0.bin"), b"attempt two").unwrap();
@@ -1693,9 +1639,8 @@ mod part_tests {
     async fn end_to_end_drain_of_a_part_whose_meta_overdeclares_defers_and_keeps_the_ssd_copy() {
         // WI-1 against the real FS: meta claims 2 chunks but only chunk 0 is on disk (a
         // chunk removed after meta landed). The drain must defer with the SSD copy intact
-        // and nothing committed to the pool.
+        // and nothing committed.
         let ssd_dir = TempDir::new().unwrap();
-        let pool_dir = TempDir::new().unwrap();
         let part = part_key(5, 1);
         seed_ssd_part(ssd_dir.path(), &part, &[(0, b"only chunk")]);
         // Overwrite the (matching) meta with one that over-declares num_chunks.
@@ -1706,19 +1651,17 @@ mod part_tests {
         .unwrap();
 
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = MemPartStore::default();
         store.set(&part, ReplicationState::Pending);
         let claim = ClaimedPart::new(part.clone(), 0);
 
-        let err = drain_part(&ceph, &ssd, &store, &NoopEnqueuer, &claim).await.unwrap_err();
+        let err = drain_part(&ssd, &store, &NoopEnqueuer, &claim).await.unwrap_err();
 
         assert!(
             matches!(err, PartDrainError::IncompleteSource { declared: 2, present: 1 }),
             "got: {err:?}"
         );
         assert!(ssd_dir.path().join(part.relative_dir()).exists(), "SSD copy kept");
-        assert!(!pool_dir.path().join(part.relative_dir()).exists(), "nothing committed to the pool");
         assert_eq!(store.status_of(&part), Some(ReplicationState::Pending));
     }
 
@@ -1731,8 +1674,8 @@ mod part_tests {
         let pool_dir = TempDir::new().unwrap();
         let part = part_key(5, 1);
         seed_ssd_part(ssd_dir.path(), &part, &[(0, b"bytes")]);
-        let ssd = LocalSsd::new(ssd_dir.path());
         let ceph = LocalFs::new(pool_dir.path());
+        let ssd = LocalSsd::new(ssd_dir.path());
         let source = ssd.chunk_source(&part, ChunkIndex::new(0)).unwrap();
         ceph.persist_chunk(&source, &part, ChunkIndex::new(0)).await.unwrap();
         ceph.persist_meta(&ssd.meta_source(&part).unwrap(), &part).await.unwrap();

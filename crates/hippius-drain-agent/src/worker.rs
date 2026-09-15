@@ -6,12 +6,12 @@
 //! loop, cancellation, and trigger wiring around this are the supervisor's job (see
 //! [`crate::runtime`]); here each call is a single, independently-testable step.
 
-use crate::localfs::{LocalFs, LocalSsd};
+use crate::localfs::LocalSsd;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use hippius_drain_core::{
-    BreakerSignal, ClaimedPart, DenyReason, DrainDecision, DrainOutcome, Enforcer, MissingSourceOutcome, PartDrainError, PartKey,
-    PartReplicationStore, PartSource, SnapshotCell, Store, StoreError, UploadEnqueuer, breaker_signal_for, drain_part,
+    BreakerSignal, ClaimedPart, DenyReason, DrainDecision, DrainOutcome, Enforcer, MissingSourceOutcome, PartDrainError, PartKey, PartSource,
+    SnapshotCell, Store, StoreError, UploadEnqueuer, breaker_signal_for, drain_part,
 };
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -269,7 +269,6 @@ async fn report_write_off(store: &Store, claim: &ClaimedPart, snapshot: Option<&
 /// [`DrainCycleError::Claim`] if the claim/release/defer query fails;
 /// [`DrainCycleError::Drain`] if the copy/verify/commit/unlink sequence fails.
 pub async fn drain_next<E: UploadEnqueuer>(
-    ceph: &LocalFs,
     ssd: &LocalSsd,
     store: &Store,
     enqueuer: &E,
@@ -343,7 +342,7 @@ pub async fn drain_next<E: UploadEnqueuer>(
     // below releases via `record_outcome` and then dismisses the guard.
     let permit = enforcer.map(PermitGuard::new);
     let started = Instant::now();
-    let result = drain_part(ceph, ssd, store, enqueuer, &claim).await;
+    let result = drain_part(ssd, store, enqueuer, &claim).await;
     let elapsed = started.elapsed();
     // Classify the drain outcome once, for both the breaker and the metrics. A benign
     // deferral (`PartDrainError::is_benign_deferral`) is NOT evidence of Ceph unhealth,
@@ -463,12 +462,7 @@ pub struct BurstTally {
 /// # Errors
 ///
 /// The first [`DrainCycleError`] a cycle hits (after the in-flight set has drained).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the drain seams (pool/ssd/store/enqueuer/enforcer/snapshot) + token + concurrency are each distinct injected collaborators; bundling them would just hide the wiring"
-)]
 pub async fn drain_until_empty<E: UploadEnqueuer>(
-    ceph: &LocalFs,
     ssd: &LocalSsd,
     store: &Store,
     enqueuer: &E,
@@ -491,7 +485,7 @@ pub async fn drain_until_empty<E: UploadEnqueuer>(
             refill = false;
             break;
         }
-        inflight.push(drain_next(ceph, ssd, store, enqueuer, enforcer, snapshot));
+        inflight.push(drain_next(ssd, store, enqueuer, enforcer, snapshot));
     }
 
     // Pushing into a FuturesUnordered while iterating it is supported; the `.next()`
@@ -527,7 +521,7 @@ pub async fn drain_until_empty<E: UploadEnqueuer>(
             }
         };
         if keep_claiming && refill && !token.is_cancelled() {
-            inflight.push(drain_next(ceph, ssd, store, enqueuer, enforcer, snapshot));
+            inflight.push(drain_next(ssd, store, enqueuer, enforcer, snapshot));
         } else {
             refill = false;
         }
@@ -543,12 +537,12 @@ pub async fn drain_until_empty<E: UploadEnqueuer>(
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::PermitGuard;
-    use super::{ClaimOutcome, drain_next, drain_until_empty};
-    use crate::localfs::{LocalFs, LocalSsd};
+    use super::{ClaimOutcome, DrainCycleError, drain_next, drain_until_empty};
+    use crate::localfs::LocalSsd;
     use core::str::FromStr;
     use hippius_drain_core::{
-        BreakerConfig, BreakerSignal, ByteRate, Bytes, CircuitBreaker, ConcurrencyLimiter, DrainDecision, DrainOutcome, Enforcer, ObjectId, PartKey,
-        PartNumber, PartReplicationStore, ReplicationState, SnapshotCell, Store, TokenBucket, UploadEnqueuer, Version,
+        BreakerConfig, BreakerSignal, ByteRate, Bytes, CircuitBreaker, ConcurrencyLimiter, DrainDecision, DrainOutcome, Enforcer, EnqueueOutcome,
+        ObjectId, PartKey, PartNumber, PartReplicationStore, ReplicationState, SnapshotCell, Store, TokenBucket, UploadEnqueuer, Version,
     };
     use sqlx::postgres::PgPool;
     use std::path::Path;
@@ -596,36 +590,36 @@ mod tests {
         store.record_landed_part(part).await.unwrap();
     }
 
-    /// A no-op upload enqueuer — the drain tests assert claim/copy/commit, not the
-    /// Redis fan-out (that's covered by the core partdrain tests + the enqueue module).
+    /// An always-publishing upload enqueuer — the drain tests assert claim/hash/commit, not
+    /// the Redis fan-out (that's covered by the core partdrain tests + the enqueue module).
     struct NoopEnqueuer;
     impl UploadEnqueuer for NoopEnqueuer {
         type Error = std::io::Error;
-        async fn enqueue(&self, _part: &PartKey) -> Result<(), std::io::Error> {
-            Ok(())
+        async fn enqueue(&self, _part: &PartKey) -> Result<EnqueueOutcome, std::io::Error> {
+            Ok(EnqueueOutcome::Published)
         }
     }
 
-    /// An enqueuer that always defers — to exercise the post-write deferral path
-    /// (`PartDrainError::Enqueue`): the Ceph copy succeeds, then the enqueue fails.
+    /// An enqueuer that is never ready (the address is not written) — the in-flight-MPU
+    /// deferral path.
     struct DeferringEnqueuer;
     impl UploadEnqueuer for DeferringEnqueuer {
         type Error = std::io::Error;
-        async fn enqueue(&self, _part: &PartKey) -> Result<(), std::io::Error> {
-            Err(std::io::Error::other("upload context not ready; will retry"))
+        async fn enqueue(&self, _part: &PartKey) -> Result<EnqueueOutcome, std::io::Error> {
+            Ok(EnqueueOutcome::NotReady)
         }
     }
 
-    /// Defers part number 1 (not ready) but enqueues every other part — to exercise that
-    /// a not-ready part does not stop the burst and starve the ready parts behind it.
+    /// Not ready for part number 1 but publishes every other part — to exercise that a
+    /// not-ready part does not stop the burst and starve the ready parts behind it.
     struct DeferPartOneEnqueuer;
     impl UploadEnqueuer for DeferPartOneEnqueuer {
         type Error = std::io::Error;
-        async fn enqueue(&self, part: &PartKey) -> Result<(), std::io::Error> {
+        async fn enqueue(&self, part: &PartKey) -> Result<EnqueueOutcome, std::io::Error> {
             if part.part().get() == 1 {
-                Err(std::io::Error::other("upload context not ready; will retry"))
+                Ok(EnqueueOutcome::NotReady)
             } else {
-                Ok(())
+                Ok(EnqueueOutcome::Published)
             }
         }
     }
@@ -698,41 +692,27 @@ mod tests {
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
     async fn drain_next_claims_then_drains_a_pending_part(pool: PgPool) {
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let part = part_at(5, 1);
         seed_part(ssd_dir.path(), &store, &part, &[b"hello cephor part", b"second chunk"]).await;
 
-        // One ungated cycle claims it and drains it end-to-end.
-        let outcome = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, None).await.unwrap();
-        assert_eq!(outcome, ClaimOutcome::Drained(DrainOutcome::Replicated));
+        // One ungated cycle claims it and hands it to the uploader end-to-end.
+        let outcome = drain_next(&ssd, &store, &NoopEnqueuer, None, None).await.unwrap();
+        assert_eq!(outcome, ClaimOutcome::Drained(DrainOutcome::Enqueued));
 
-        // The SSD part is freed only after the verified, committed pool copy exists.
         let ssd_part = ssd_dir.path().join(part.relative_dir());
-        let pool_part = pool_dir.path().join(part.relative_dir());
-        assert!(ssd_part.exists(), "a verified drain RETAINS the SSD part to serve reads");
-        assert_eq!(
-            std::fs::read(pool_part.join("chunk_0.bin")).unwrap(),
-            b"hello cephor part",
-            "the pool holds the durable copy"
-        );
-        assert!(pool_part.join("meta.json").exists(), "the meta marker landed last");
+        assert!(ssd_part.exists(), "the SSD part is RETAINED: it is what the uploader reads");
+        assert_eq!(status_of(&store, &part).await, Some(ReplicationState::Uploading));
 
         // Nothing else is pending: the next cycle is a no-op.
-        assert_eq!(
-            drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, None).await.unwrap(),
-            ClaimOutcome::Idle
-        );
+        assert_eq!(drain_next(&ssd, &store, &NoopEnqueuer, None, None).await.unwrap(), ClaimOutcome::Idle);
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
     async fn an_exhausted_budget_throttles_and_returns_the_part(pool: PgPool) {
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let part = part_at(5, 1);
         seed_part(ssd_dir.path(), &store, &part, &[b"throttled part bytes"]).await;
@@ -742,9 +722,7 @@ mod tests {
         let empty = enforcer_with(0);
         let snapshot = SnapshotCell::new();
         assert_eq!(
-            drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&empty), Some(&snapshot))
-                .await
-                .unwrap(),
+            drain_next(&ssd, &store, &NoopEnqueuer, Some(&empty), Some(&snapshot)).await.unwrap(),
             ClaimOutcome::Idle
         );
         assert!(ssd_part.exists(), "a throttled drain leaves the SSD part untouched");
@@ -762,8 +740,8 @@ mod tests {
         // With an ample budget, the same part drains.
         let ample = enforcer_with(1_000_000);
         assert_eq!(
-            drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&ample), None).await.unwrap(),
-            ClaimOutcome::Drained(DrainOutcome::Replicated)
+            drain_next(&ssd, &store, &NoopEnqueuer, Some(&ample), None).await.unwrap(),
+            ClaimOutcome::Drained(DrainOutcome::Enqueued)
         );
         assert!(ssd_part.exists(), "the admitted drain retains the SSD part");
     }
@@ -771,9 +749,7 @@ mod tests {
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
     async fn a_drain_records_its_latency_in_the_snapshot(pool: PgPool) {
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let snapshot = SnapshotCell::new();
         let part = part_at(5, 1);
@@ -781,8 +757,8 @@ mod tests {
 
         // A successful drain feeds its latency into the window, so p99 leaves zero.
         assert_eq!(
-            drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, Some(&snapshot)).await.unwrap(),
-            ClaimOutcome::Drained(DrainOutcome::Replicated)
+            drain_next(&ssd, &store, &NoopEnqueuer, None, Some(&snapshot)).await.unwrap(),
+            ClaimOutcome::Drained(DrainOutcome::Enqueued)
         );
         assert!(snapshot.p99() > Duration::ZERO, "the drain's latency was recorded in the snapshot");
     }
@@ -790,9 +766,7 @@ mod tests {
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
     async fn a_failed_drain_returns_the_claim_to_pending(pool: PgPool) {
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
 
         // Record a part as landed but never write its SSD files: the drain copy then
@@ -803,7 +777,7 @@ mod tests {
         let part = part_at(5, 1);
         store.record_landed_part(&part).await.unwrap();
 
-        let err = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, None).await.unwrap_err();
+        let err = drain_next(&ssd, &store, &NoopEnqueuer, None, None).await.unwrap_err();
         assert!(
             matches!(err, super::DrainCycleError::Drain(_)),
             "a missing SSD part is a drain failure, got {err:?}"
@@ -819,9 +793,7 @@ mod tests {
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
     async fn a_drained_part_increments_the_drained_counter(pool: PgPool) {
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let snapshot = SnapshotCell::new();
         let part = part_at(5, 1);
@@ -829,7 +801,7 @@ mod tests {
 
         // Counting lives per part in drain_next, so a single drained part is one
         // drained attempt and zero failed attempts (the units error_bps divides).
-        drain_next(&ceph, &ssd, &store, &NoopEnqueuer, None, Some(&snapshot)).await.unwrap();
+        drain_next(&ssd, &store, &NoopEnqueuer, None, Some(&snapshot)).await.unwrap();
         let counts = snapshot.load();
         assert_eq!(counts.drained, 1, "the drained part was counted");
         assert_eq!(counts.failed, 0, "a success records no failure");
@@ -849,9 +821,7 @@ mod tests {
         // incident showed one such part starves the whole node.
         let db = pool.clone();
         let ssd_dir = mounted_ssd_dir();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let snapshot = SnapshotCell::new();
         // Breaker threshold 1: a single Ceph failure would open it, so a subsequently
@@ -868,9 +838,7 @@ mod tests {
         let part = part_at(5, 1);
         store.record_landed_part(&part).await.unwrap();
 
-        let step = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot))
-            .await
-            .unwrap();
+        let step = drain_next(&ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot)).await.unwrap();
         assert_eq!(step, ClaimOutcome::Skipped, "a vanished source skips this part; the burst keeps claiming");
 
         let counts = snapshot.load();
@@ -916,9 +884,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let never_mounted = parent.path().join("local_object_cache");
         std::fs::create_dir_all(&never_mounted).unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(&never_mounted);
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let snapshot = SnapshotCell::new();
         let enforcer = Arc::new(Mutex::new(Enforcer::new(
@@ -933,9 +899,7 @@ mod tests {
         let part = part_at(11, 1);
         store.record_landed_part(&part).await.unwrap();
 
-        let step = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot))
-            .await
-            .unwrap();
+        let step = drain_next(&ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot)).await.unwrap();
         assert_eq!(
             step,
             ClaimOutcome::Idle,
@@ -1033,9 +997,7 @@ mod tests {
         // breaker, and the burst keeps claiming (Skipped).
         let db = pool.clone();
         let ssd_dir = mounted_ssd_dir();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let snapshot = SnapshotCell::new();
         let enforcer = enforcer_with(1_000_000);
@@ -1054,9 +1016,7 @@ mod tests {
             .await
             .unwrap();
 
-        let step = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot))
-            .await
-            .unwrap();
+        let step = drain_next(&ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot)).await.unwrap();
         assert_eq!(step, ClaimOutcome::Skipped, "a write-off is part-specific; the burst keeps claiming");
 
         assert_eq!(
@@ -1091,9 +1051,7 @@ mod tests {
         // skip (the write-off outcome itself is unchanged — the data is already gone).
         let db = pool.clone();
         let ssd_dir = mounted_ssd_dir();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let snapshot = SnapshotCell::new();
         let enforcer = enforcer_with(1_000_000);
@@ -1110,9 +1068,7 @@ mod tests {
             .await
             .unwrap();
 
-        let step = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot))
-            .await
-            .unwrap();
+        let step = drain_next(&ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot)).await.unwrap();
         assert_eq!(step, ClaimOutcome::Skipped, "classification changes the signal, never the outcome");
 
         assert_eq!(
@@ -1138,9 +1094,7 @@ mod tests {
         // table here: that absence IS the classification failure under test.
         let db = pool.clone();
         let ssd_dir = mounted_ssd_dir();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let snapshot = SnapshotCell::new();
         let enforcer = enforcer_with(1_000_000);
@@ -1154,9 +1108,7 @@ mod tests {
             .await
             .unwrap();
 
-        let step = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot))
-            .await
-            .unwrap();
+        let step = drain_next(&ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot)).await.unwrap();
         assert_eq!(
             step,
             ClaimOutcome::Skipped,
@@ -1185,9 +1137,7 @@ mod tests {
         // observations count.
         let db = pool.clone();
         let ssd_dir = mounted_ssd_dir();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let enforcer = enforcer_with(1_000_000);
 
@@ -1200,7 +1150,7 @@ mod tests {
             .await
             .unwrap();
 
-        let step = drain_next(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), None).await.unwrap();
+        let step = drain_next(&ssd, &store, &NoopEnqueuer, Some(&enforcer), None).await.unwrap();
         assert_eq!(step, ClaimOutcome::Skipped);
 
         assert_eq!(
@@ -1228,9 +1178,7 @@ mod tests {
         // backoff removing the oversized part from the claim head across wakes.
         let db = pool.clone();
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let snapshot = SnapshotCell::new();
         // Rate 1 B/s with a 64-byte burst: the ~10 KB debt booked below repays over
@@ -1265,7 +1213,7 @@ mod tests {
         seed_part(ssd_dir.path(), &store, &tiny, &[b""]).await;
 
         let token = CancellationToken::new();
-        let tally = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot), &token, 1)
+        let tally = drain_until_empty(&ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot), &token, 1)
             .await
             .unwrap();
 
@@ -1276,7 +1224,7 @@ mod tests {
         );
         assert_eq!(
             status_of(&store, &tiny).await,
-            Some(ReplicationState::Replicated),
+            Some(ReplicationState::Uploading),
             "the part behind the denied one drained in the same cycle",
         );
         assert_eq!(
@@ -1324,9 +1272,7 @@ mod tests {
         const CYCLE_BOUND: usize = 30;
         let db = pool.clone();
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
         let snapshot = SnapshotCell::new();
         // Rate 1 B/s, burst 64 B, with ~10 KB of pre-booked overdraft debt: repayment
@@ -1372,14 +1318,14 @@ mod tests {
             cycles += 1;
             // concurrency 1 keeps the oldest-first claim order observable, which is
             // the ordering the incident's starvation depended on.
-            let tally = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot), &token, 1)
+            let tally = drain_until_empty(&ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot), &token, 1)
                 .await
                 .unwrap();
             total_drained += tally.drained;
             total_skipped += tally.skipped;
             let mut all_replicated = true;
             for part in &ready {
-                if status_of(&store, part).await != Some(ReplicationState::Replicated) {
+                if status_of(&store, part).await != Some(ReplicationState::Uploading) {
                     all_replicated = false;
                     break;
                 }
@@ -1392,7 +1338,7 @@ mod tests {
         for part in &ready {
             assert_eq!(
                 status_of(&store, part).await,
-                Some(ReplicationState::Replicated),
+                Some(ReplicationState::Uploading),
                 "ready part {} must drain within {CYCLE_BOUND} cycles despite the wall (took {cycles} cycles; \
                  drained {total_drained}, skipped {total_skipped})",
                 part.part().get(),
@@ -1428,9 +1374,7 @@ mod tests {
         // SAME cycle instead of waiting for the next wake.
         let db = pool.clone();
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
 
         let missing = part_at(5, 1);
@@ -1440,7 +1384,7 @@ mod tests {
 
         let enforcer = enforcer_with(1_000_000);
         let token = CancellationToken::new();
-        let tally = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), None, &token, 1)
+        let tally = drain_until_empty(&ssd, &store, &NoopEnqueuer, Some(&enforcer), None, &token, 1)
             .await
             .unwrap();
 
@@ -1451,7 +1395,7 @@ mod tests {
         );
         assert_eq!(
             status_of(&store, &ready).await,
-            Some(ReplicationState::Replicated),
+            Some(ReplicationState::Uploading),
             "the ready part is not starved"
         );
         assert_eq!(defer_state(&db, &missing).await, (true, 1), "the missing-source part is backed off");
@@ -1464,9 +1408,7 @@ mod tests {
         // keeps the burst refilling — which IS the documented meaning of `skipped` — so
         // the tally must count it, or the cycle log undercounts what the burst skipped.
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
 
         let missing = part_at(5, 1);
@@ -1475,9 +1417,7 @@ mod tests {
         seed_part(ssd_dir.path(), &store, &ready, &[b"ready part"]).await;
 
         let token = CancellationToken::new();
-        let tally = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, None, &token, 1)
-            .await
-            .unwrap();
+        let tally = drain_until_empty(&ssd, &store, &NoopEnqueuer, None, None, &token, 1).await.unwrap();
 
         assert_eq!(
             (tally.drained, tally.skipped),
@@ -1494,9 +1434,7 @@ mod tests {
         // promptly next wake) and the burst stops, leaving the parts behind untouched.
         let db = pool.clone();
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
 
         let broken = part_at(5, 1);
@@ -1509,7 +1447,7 @@ mod tests {
 
         let enforcer = enforcer_with(1_000_000);
         let token = CancellationToken::new();
-        let tally = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, Some(&enforcer), None, &token, 1)
+        let tally = drain_until_empty(&ssd, &store, &NoopEnqueuer, Some(&enforcer), None, &token, 1)
             .await
             .unwrap();
 
@@ -1532,20 +1470,17 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
-    async fn a_not_ready_enqueue_commits_replicated_and_lands_on_the_sweep_worklist(pool: PgPool) {
-        // Tier-2 decoupled commit end-to-end through drain_next: a part whose Ceph copy + verify
-        // succeed but whose backend enqueue is not ready (an in-flight MPU whose address is NULL)
-        // now (1) COMMITS Replicated and frees the SSD copy — it does NOT defer + re-copy as
-        // before; (2) counts as `drained`, not `deferred`/`failed`; (3) is left unstamped
-        // (upload_enqueued_at NULL) on the enqueue-sweep worklist so the publish is re-driven once
-        // the address lands. The enforcer's breaker trips on a single Ceph failure, so a
-        // subsequently-admitted drain proves a successful commit never signalled it.
+    async fn a_not_ready_publish_defers_with_backoff_and_commits_nothing(pool: PgPool) {
+        // An in-flight MPU end-to-end through drain_next: the part is whole and hashed, but its
+        // address is not written so it cannot be published. It (1) is NOT committed — no
+        // `uploading` row pins the SSD copy, no residency claim; (2) counts as `deferred`, not
+        // `drained`/`failed`; (3) is backed off via `defer_part` (not released to the claim
+        // head, where it would be re-claimed every poll); (4) trips no breaker and leaks no
+        // permit. CompleteMultipartUpload clears the backoff; the next drain publishes.
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
-        create_object_versions_table(&pool).await;
-        let store = Store::from_pool(pool.clone());
+        let db = pool.clone();
+        let store = Store::from_pool(pool);
         let snapshot = SnapshotCell::new();
         let enforcer = Arc::new(Mutex::new(Enforcer::new(
             CircuitBreaker::new(BreakerConfig {
@@ -1558,144 +1493,83 @@ mod tests {
         let part = part_at(5, 1);
         seed_part(ssd_dir.path(), &store, &part, &[b"deferred part bytes"]).await;
 
-        let outcome = drain_next(&ceph, &ssd, &store, &DeferringEnqueuer, Some(&enforcer), Some(&snapshot))
+        // drain_next surfaces the deferral as the error it is; drain_until_empty is what folds
+        // it into a `Skipped` slot and keeps the burst going.
+        let err = drain_next(&ssd, &store, &DeferringEnqueuer, Some(&enforcer), Some(&snapshot))
             .await
-            .unwrap();
-        assert_eq!(
-            outcome,
-            ClaimOutcome::Drained(DrainOutcome::Replicated),
-            "a not-ready enqueue still commits Replicated"
+            .unwrap_err();
+        assert!(
+            matches!(err, DrainCycleError::Drain(hippius_drain_core::PartDrainError::NotReady)),
+            "a not-ready part is a deferral, got: {err:?}"
         );
 
         let counts = snapshot.load();
-        assert_eq!(counts.drained, 1, "the part was committed (Ceph-durable)");
-        assert_eq!(counts.deferred, 0, "a not-ready enqueue is no longer a deferral");
-        assert_eq!(counts.failed, 0, "and it is not a Ceph-write failure");
-        assert_eq!(counts.error_bps(), 0, "so it stays out of the Ceph failure rate");
+        assert_eq!((counts.drained, counts.deferred, counts.failed), (0, 1, 0), "a deferral, not an outcome");
+        assert_eq!(counts.error_bps(), 0);
 
-        assert_eq!(
-            status_of(&store, &part).await,
-            Some(ReplicationState::Replicated),
-            "the Ceph commit is decoupled from the address-gated enqueue",
-        );
-        assert!(
-            ssd_dir.path().join(part.relative_dir()).exists(),
-            "the SSD copy is retained as the read tier; the uploader reads from the shared pool",
-        );
-        // Not on the worklist YET: with no address the sweep could only load the same not-ready
-        // context again, and a never-ready row at the head of the oldest-first ring starves
-        // every part behind it (the 2026-08-27 prod block). It surfaces the moment the address
-        // lands — CompleteMultipartUpload — with no wake or defer bookkeeping.
-        seed_object_version(&pool, &part, None, Some(0), Some("")).await; // an in-flight MPU: no address yet
-        assert!(
-            store.list_replicated_unenqueued_parts(10).await.unwrap().is_empty(),
-            "a replicated part whose address is still NULL is not offered to the enqueue sweep",
-        );
-        sqlx::query("UPDATE object_versions SET address = $1")
-            .bind("addr")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let worklist = store.list_replicated_unenqueued_parts(10).await.unwrap();
-        assert!(
-            worklist.contains(&part),
-            "once the address is written the un-enqueued replicated part is on the enqueue-sweep worklist",
-        );
+        assert_eq!(status_of(&store, &part).await, Some(ReplicationState::Pending), "nothing was committed");
+        let (deferred, attempts) = defer_state(&db, &part).await;
+        assert!(deferred, "backed off, not released to the claim head");
+        assert_eq!(attempts, 1);
+        assert!(ssd_dir.path().join(part.relative_dir()).exists(), "the SSD copy is untouched");
 
-        // The breaker (threshold 1) never saw a failure, so a fresh drain is still
-        // admitted; the released permit means concurrency is not the blocker.
         assert_eq!(
             enforcer.lock().unwrap().try_drain(1, Instant::now()),
             DrainDecision::Allowed,
-            "a committed drain neither tripped the breaker nor leaked the permit",
+            "a deferral neither tripped the breaker nor leaked the permit",
         );
-    }
 
-    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
-    async fn a_burst_that_fails_midway_keeps_the_drained_count(pool: PgPool) {
-        let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
-        let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
-        let store = Store::from_pool(pool);
-        let snapshot = SnapshotCell::new();
-        let token = CancellationToken::new();
-
-        // One good part (drains), then one whose POOL destination is blocked so its copy
-        // fails with a GENUINE (non-ENOENT) Ceph-write error — a stand-in for a sick/full
-        // pool, which unlike a vanished SSD source (ENOENT, a benign deferral) MUST count
-        // as a failure. Both seeded on SSD so the bad one reaches the pool write; claimed
-        // in landed_at order, so the good one drains first.
-        seed_part(ssd_dir.path(), &store, &part_at(5, 1), &[b"good part bytes"]).await;
-        seed_part(ssd_dir.path(), &store, &part_at(5, 2), &[b"bad part bytes"]).await;
-        // A regular file where part 2's pool directory must go makes the copy's
-        // `create_dir_all` fail with AlreadyExists (deterministic and root-safe, unlike a
-        // chmod-based denial that root would bypass in CI).
-        let blocked = pool_dir.path().join(part_at(5, 2).relative_dir());
-        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
-        std::fs::write(&blocked, b"not a directory").unwrap();
-
-        // The burst drains the good part then fails on the bad one. The #10 fix:
-        // the part drained before the failure is NOT discarded. concurrency=1 keeps the
-        // strict landed_at order this test asserts on.
-        drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, Some(&snapshot), &token, 1)
+        // Complete writes the address (the fake enqueuer stands in for that): a re-drain hands
+        // the part over.
+        sqlx::query("UPDATE cephor_replication_status SET deferred_until = NULL")
+            .execute(&db)
             .await
-            .unwrap_err();
-        let counts = snapshot.load();
-        assert_eq!(counts.drained, 1, "the part drained before the failure is kept");
-        assert_eq!(counts.failed, 1, "the failed part is counted once");
-        // error_bps is dimensionally clean: 1 failed of 2 attempts = 5000 bps.
-        assert_eq!(counts.error_bps(), 5000, "failed attempts over total attempts");
+            .unwrap();
+        assert_eq!(
+            drain_next(&ssd, &store, &NoopEnqueuer, Some(&enforcer), Some(&snapshot)).await.unwrap(),
+            ClaimOutcome::Drained(DrainOutcome::Enqueued),
+        );
+        assert_eq!(status_of(&store, &part).await, Some(ReplicationState::Uploading));
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
-    async fn a_not_ready_enqueue_does_not_stall_the_burst_and_only_it_awaits_the_sweep(pool: PgPool) {
-        // Tier-2 decoupled commit: a not-ready enqueue no longer defers, so ALL three parts
-        // commit Replicated in one burst — part 1's backend enqueue is not ready (address NULL)
-        // but it still commits, and parts 2 and 3 enqueue inline. Only part 1 is left unstamped
-        // on the enqueue-sweep worklist; parts 2 and 3 are stamped and off it. concurrency=1
-        // forces serial claims so part 1 (the oldest) is reached first.
+    async fn a_not_ready_part_does_not_stall_the_burst_behind_it(pool: PgPool) {
+        // The 2026-07-26 head-of-line shape, now on the publish path: part 1 (the oldest) cannot
+        // be published (address NULL), parts 2 and 3 can. The burst must skip part 1 with
+        // backoff and hand over 2 and 3 in the same run. concurrency=1 forces serial claims so
+        // part 1 is reached first.
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
-        create_object_versions_table(&pool).await;
-        let store = Store::from_pool(pool.clone());
+        let db = pool.clone();
+        let store = Store::from_pool(pool);
         for number in 1..=3_u32 {
             seed_part(ssd_dir.path(), &store, &part_at(5, number), &[b"backlog part"]).await;
         }
-        // The worklist only offers parts whose version has an address; the fake enqueuer, not
-        // the DB, is what makes part 1's inline enqueue not-ready here.
-        seed_object_version(&pool, &part_at(5, 1), Some("addr"), Some(1), None).await;
 
         let token = CancellationToken::new();
-        let drained = drain_until_empty(&ceph, &ssd, &store, &DeferPartOneEnqueuer, None, None, &token, 1)
+        let tally = drain_until_empty(&ssd, &store, &DeferPartOneEnqueuer, None, None, &token, 1)
             .await
-            .unwrap()
-            .drained;
-        assert_eq!(drained, 3, "all three parts committed (a not-ready enqueue no longer defers)");
+            .unwrap();
+        assert_eq!((tally.drained, tally.skipped), (2, 1), "parts 2 and 3 handed over; part 1 skipped");
 
-        for number in 1..=3_u32 {
+        assert_eq!(status_of(&store, &part_at(5, 1)).await, Some(ReplicationState::Pending));
+        assert!(
+            defer_state(&db, &part_at(5, 1)).await.0,
+            "part 1 is backed off, not spinning at the claim head"
+        );
+        for number in 2..=3_u32 {
             assert_eq!(
                 status_of(&store, &part_at(5, number)).await,
-                Some(ReplicationState::Replicated),
-                "part {number} committed Replicated",
+                Some(ReplicationState::Uploading),
+                "part {number} was handed to the uploader",
             );
         }
-        let worklist = store.list_replicated_unenqueued_parts(10).await.unwrap();
-        assert_eq!(
-            worklist,
-            vec![part_at(5, 1)],
-            "only the not-ready part 1 awaits the enqueue sweep; parts 2 & 3 enqueued inline",
-        );
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
     async fn drain_until_empty_drains_the_whole_backlog(pool: PgPool) {
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
 
         // Three honest parts pending under one object version.
@@ -1704,14 +1578,14 @@ mod tests {
         }
 
         let token = CancellationToken::new();
-        let drained = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, None, &token, 4)
+        let drained = drain_until_empty(&ssd, &store, &NoopEnqueuer, None, None, &token, 4)
             .await
             .unwrap()
             .drained;
         assert_eq!(drained, 3, "every pending part was drained in one run");
         // The backlog is now empty.
         assert_eq!(
-            drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, None, &token, 4)
+            drain_until_empty(&ssd, &store, &NoopEnqueuer, None, None, &token, 4)
                 .await
                 .unwrap()
                 .drained,
@@ -1724,9 +1598,7 @@ mod tests {
         // F14: a backlog larger than the concurrency must still drain fully — the
         // in-flight set is refilled as each drain completes, not capped at one wave.
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
 
         for number in 1..=8_u32 {
@@ -1734,13 +1606,13 @@ mod tests {
         }
 
         let token = CancellationToken::new();
-        let drained = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, None, &token, 3)
+        let drained = drain_until_empty(&ssd, &store, &NoopEnqueuer, None, None, &token, 3)
             .await
             .unwrap()
             .drained;
         assert_eq!(drained, 8, "all 8 parts drained with concurrency 3 (refill works)");
         assert_eq!(
-            drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, None, &token, 3)
+            drain_until_empty(&ssd, &store, &NoopEnqueuer, None, None, &token, 3)
                 .await
                 .unwrap()
                 .drained,
@@ -1751,9 +1623,7 @@ mod tests {
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
     async fn a_cancelled_drain_stops_at_the_part_boundary(pool: PgPool) {
         let ssd_dir = tempfile::tempdir().unwrap();
-        let pool_dir = tempfile::tempdir().unwrap();
         let ssd = LocalSsd::new(ssd_dir.path());
-        let ceph = LocalFs::new(pool_dir.path());
         let store = Store::from_pool(pool);
 
         // A real backlog of three parts.
@@ -1766,7 +1636,7 @@ mod tests {
         // honors the supervisor's grace instead of being force-aborted mid-backlog.
         let token = CancellationToken::new();
         token.cancel();
-        let drained = drain_until_empty(&ceph, &ssd, &store, &NoopEnqueuer, None, None, &token, 4)
+        let drained = drain_until_empty(&ssd, &store, &NoopEnqueuer, None, None, &token, 4)
             .await
             .unwrap()
             .drained;

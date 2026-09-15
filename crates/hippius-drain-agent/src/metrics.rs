@@ -73,6 +73,54 @@ fn build_provider(service_name: &'static str) -> Option<SdkMeterProvider> {
     Some(provider)
 }
 
+/// Registers the upload-sweep instruments: the hand-off's backstop paths, and the one gauge
+/// that says a part's only copy is stuck on this node's SSD.
+fn register_upload_sweep_instruments(
+    meter: &opentelemetry::metrics::Meter,
+    snapshot: &Arc<SnapshotCell>,
+    instruments: &mut Vec<Box<dyn std::any::Any>>,
+) {
+    // Confirmed from coverage: the uploader finished but its own uploading->replicated flip
+    // was lost. Expect ~zero; a rate means uploader flips are being lost.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_uploads_confirmed_by_sweep_total")
+            .with_callback(move |observer| observer.observe(snap.load().uploads_confirmed, &[]))
+            .build(),
+    ));
+
+    // Re-published: a request that never completed within the re-drive window (lost between
+    // the drain and the uploader, or the uploader died mid-part). A sustained rate pages.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_uploads_redriven_total")
+            .with_callback(move |observer| observer.observe(snap.load().uploads_redriven, &[]))
+            .build(),
+    ));
+
+    // Retired: the object was deleted before its upload completed.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_counter("drain_uploads_abandoned_total")
+            .with_callback(move |observer| observer.observe(snap.load().uploads_abandoned, &[]))
+            .build(),
+    ));
+
+    // Durability alarm: `uploading` parts past their re-publish budget and still not on the
+    // backend. Each is a single-copy part (this SSD only) whose upload keeps failing — the
+    // DLQ/operator path owns it. A gauge: it falls when the operator re-drives them.
+    let snap = Arc::clone(snapshot);
+    instruments.push(Box::new(
+        meter
+            .u64_observable_gauge("drain_uploads_exhausted")
+            .with_callback(move |observer| observer.observe(snap.uploads_exhausted(), &[]))
+            .build(),
+    ));
+}
+
 /// Registers the SSD read-tier instruments: how much is resident, and how fast the evictor is
 /// giving it back.
 ///
@@ -366,6 +414,8 @@ pub fn init(service_name: &'static str, snapshot: &Arc<SnapshotCell>, enforcer: 
             .with_callback(move |observer| observer.observe(snap.corrupt_parts(), &[]))
             .build(),
     ));
+
+    register_upload_sweep_instruments(&meter, snapshot, &mut instruments);
 
     // Saturation: SSD disk fill fraction (0.0..=1.0). This is what crosses the api's
     // fs_cache_pressure cutoff and 503s every PUT on the node, so it is the operational

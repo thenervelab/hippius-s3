@@ -420,8 +420,10 @@ where
         };
 
         match status.state {
-            // Live: owned by the drain pipeline.
-            ReplicationState::Pending | ReplicationState::Draining => report.skipped_live += 1,
+            // Live: owned by the drain pipeline, or handed to the uploader — for an `uploading`
+            // part the SSD copy is the ONLY copy until the backend acks, so it is never touched
+            // here however aged; a stuck hand-off is the upload sweep's to re-drive.
+            ReplicationState::Pending | ReplicationState::Draining | ReplicationState::Uploading => report.skipped_live += 1,
             // Replicated: RETAINED on purpose. This is the node's read tier — a local GET
             // serves it at ~705 MB/s / ~6 ms per chunk instead of ~94 MB/s / ~40 ms from the
             // pool — so a lingering `replicated` part is the intended steady state, not a

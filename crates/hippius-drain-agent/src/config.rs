@@ -44,6 +44,20 @@ const DEFAULT_DRAIN_CONCURRENCY: u32 = 4;
 /// is re-copied from its intact SSD source this many times before being held `corrupt` and
 /// paged — enough to ride out a transient pool-copy corruption without looping on a durable one.
 const DEFAULT_REDRIVE_MAX_ATTEMPTS: u32 = 3;
+/// Upload-sweep period when `CEPHOR_UPLOAD_SWEEP_POLL_SECS` is unset. Every arm of the sweep
+/// is a backstop (the uploader's own flip is the happy path), and each is a partial-index
+/// scan of this node's `uploading` rows, so half a minute keeps a lost flip or a lost request
+/// from pinning an SSD copy for long without polling the primary for nothing.
+const DEFAULT_UPLOAD_SWEEP_POLL: Duration = Duration::from_secs(30);
+/// How long an `uploading` part may sit since its hand-off before the sweep re-publishes it,
+/// when `CEPHOR_UPLOAD_REDRIVE_SECS` is unset. Must exceed the slowest legitimate part upload
+/// (a 5 GB part at the uploader's chunk concurrency, plus its queue wait behind a burst) or the
+/// sweep duplicates in-flight work; an hour is comfortably past that and still bounds how long
+/// a lost request stays a single-copy part.
+const DEFAULT_UPLOAD_REDRIVE_AFTER: Duration = Duration::from_hours(1);
+/// Max re-publishes per `uploading` part when `CEPHOR_UPLOAD_REDRIVE_MAX_ATTEMPTS` is unset.
+/// Past this the part is left to the DLQ/operator path and counted in `drain_uploads_exhausted`.
+const DEFAULT_UPLOAD_REDRIVE_MAX_ATTEMPTS: u32 = 3;
 /// Claim lease TTL when `CEPHOR_CLAIM_LEASE_TTL_SECS` is unset: a `draining`
 /// claim older than this is treated as abandoned (the H1 crash-recovery TTL).
 /// Mirrors the store-side default; long enough not to reclaim a live slow drain,
@@ -208,6 +222,12 @@ pub struct Config {
     /// Max times an R4 `corrupt` part is re-driven before it is held and paged. Bounds the
     /// re-drive so a persistently-bad pool copy cannot loop forever.
     pub redrive_max_attempts: u32,
+    /// How often the upload sweep (the hand-off backstop) runs.
+    pub upload_sweep_poll: Duration,
+    /// How long an `uploading` part may sit since its hand-off before the sweep re-publishes it.
+    pub upload_redrive_after: Duration,
+    /// Max re-publishes per `uploading` part before it is left to the operator path.
+    pub upload_redrive_max_attempts: u32,
     /// How often bounded `corrupt` parts are re-driven. Separate from `reclaim_poll` because a
     /// corrupt part is a live object running on its SSD copy alone: this interval is a
     /// single-copy exposure window, not a debris-collection cadence.
@@ -309,6 +329,10 @@ impl Config {
             grace: self.grace,
             drain_concurrency: self.drain_concurrency,
             redrive_max_attempts: self.redrive_max_attempts,
+            upload_sweep_poll: self.upload_sweep_poll,
+            upload_redrive_after: self.upload_redrive_after,
+            upload_redrive_max_attempts: self.upload_redrive_max_attempts,
+            upload_backends: self.enqueue_backends(),
             redrive_poll: self.redrive_poll,
             failed_reclaim_poll: self.failed_reclaim_poll,
             landed_poll: self.landed_poll,
@@ -393,6 +417,9 @@ impl Config {
             orphan_reclaim_grace: duration_secs(&get, "CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", DEFAULT_ORPHAN_RECLAIM_GRACE)?,
             drain_concurrency: positive_u32_or(&get, "CEPHOR_DRAIN_CONCURRENCY", DEFAULT_DRAIN_CONCURRENCY)?,
             redrive_max_attempts: positive_u32_or(&get, "CEPHOR_REDRIVE_MAX_ATTEMPTS", DEFAULT_REDRIVE_MAX_ATTEMPTS)?,
+            upload_sweep_poll: duration_secs(&get, "CEPHOR_UPLOAD_SWEEP_POLL_SECS", DEFAULT_UPLOAD_SWEEP_POLL)?,
+            upload_redrive_after: duration_secs(&get, "CEPHOR_UPLOAD_REDRIVE_SECS", DEFAULT_UPLOAD_REDRIVE_AFTER)?,
+            upload_redrive_max_attempts: positive_u32_or(&get, "CEPHOR_UPLOAD_REDRIVE_MAX_ATTEMPTS", DEFAULT_UPLOAD_REDRIVE_MAX_ATTEMPTS)?,
             redrive_poll: duration_secs(&get, "CEPHOR_REDRIVE_POLL_SECS", DEFAULT_REDRIVE_POLL)?,
             evict_poll: duration_secs(&get, "CEPHOR_EVICT_POLL_SECS", DEFAULT_EVICT_POLL)?,
             evict_reserve_permille: permille_or(&get, "CEPHOR_EVICT_RESERVE_PERMILLE", DEFAULT_EVICT_RESERVE_PERMILLE)?,

@@ -31,6 +31,9 @@ def test_rust_golden_upload_chain_request_validates_in_python() -> None:
     assert [c.id for c in req.chunks] == [1]
     assert req.upload_id == "11111111-1111-4111-8111-111111111111"
     assert req.upload_backends == ["arion"]
+    # The node whose SSD holds the part: the queue the drain published to, and where a retry
+    # or DLQ re-queue must route back to.
+    assert req.node_id == "ingest-node-1"
     assert req.attempts == 0
     assert req.bypass_billing is False
     # Fields the Rust producer omits must take the model's defaults, not raise.
