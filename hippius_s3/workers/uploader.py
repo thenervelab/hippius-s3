@@ -234,6 +234,8 @@ class Uploader:
                 f"chunks={len(all_chunk_cids)} duration={total_duration:.2f}s"
             )
 
+            await self._record_object_arion_hash(payload.object_id, int(payload.object_version or 1))
+
             span.set_attribute("result.chunks_uploaded", len(all_chunk_cids))
             span.set_attribute("result.duration_s", total_duration)
 
@@ -245,6 +247,42 @@ class Uploader:
             )
 
             return all_chunk_cids
+
+    def _arion_hash_of(self, upload_result: Any) -> str | None:
+        """The hash Arion registered this chunk under, or None for a non-Arion backend.
+
+        Not ``upload_result.id``: that is HCFS's file_id (its path hash), which only HCFS knows.
+        HCFS returns the real one as ``arion_hash``; servers that predate that field return the same
+        value as ``upload_id`` (``cid`` here), which falls back to the S3 hash — the BLAKE3 of the same
+        ciphertext, so identical to what Arion content-addresses it by.
+        """
+        if self.backend_name != "arion":
+            return None
+        explicit = getattr(upload_result, "arion_hash", None)
+        if explicit is not None:
+            # An empty value is HCFS saying it has no Arion copy; upload_id would then be the S3 hash.
+            return str(explicit) or None
+        value = getattr(upload_result, "cid", None)
+        return str(value) if value else None
+
+    async def _record_object_arion_hash(self, object_id: str, object_version: int) -> None:
+        """Surface the chunk's Arion hash on the version once it is stored as a single chunk.
+
+        Best effort: the chunks are already on Arion, and failing here would requeue an upload that
+        succeeded just to redo a display column.
+        """
+        if self.backend_name != "arion":
+            return
+        try:
+            async with self._acquire_conn() as conn:
+                await conn.execute(
+                    get_query("update_object_version_arion_hash"),
+                    object_id,
+                    object_version,
+                    self.backend_name,
+                )
+        except Exception:
+            logger.warning(f"Failed to record arion_hash object_id={object_id} version={object_version}", exc_info=True)
 
     async def _drain_rows(self, payload: UploadChainRequest) -> dict[int, tuple[str, str | None]]:
         """(status, content_sha256) of the drain's row for each part of a drain-published request."""
@@ -485,7 +523,7 @@ class Uploader:
                 # the returned hashes. The chunk_backend rows are NOT written here: they land
                 # only after the whole part is up and its digest has been checked against the
                 # drain's, below — a row is the backend's claim to hold the acknowledged bytes.
-                async def upload_one_chunk(ci: int) -> tuple[int, str, str]:
+                async def upload_one_chunk(ci: int) -> tuple[int, str, str, str | None]:
                     async with self._put_semaphore:
                         piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
                         if not isinstance(piece, (bytes, bytearray)):
@@ -508,12 +546,13 @@ class Uploader:
                         )
 
                         file_hash = str(chunk_upload_result.id)
+                        arion_hash = self._arion_hash_of(chunk_upload_result)
                         logger.info(
                             f"Uploaded chunk: backend={self.backend_name} object_id={object_id} part={part_number} "
                             f"chunk={ci} file_id={file_hash} upload_id={chunk_upload_result.cid} "
-                            f"status={chunk_upload_result.status}"
+                            f"arion_hash={arion_hash} status={chunk_upload_result.status}"
                         )
-                        return ci, file_hash, chunk_hash(data)
+                        return ci, file_hash, chunk_hash(data), arion_hash
 
                 # WU-2: prefetch every chunk's part_chunks.id in one query before the gather.
                 async with self._acquire_conn() as conn:
@@ -532,8 +571,8 @@ class Uploader:
                     raise next((e for e in errors if is_billing_error(e)), errors[0])
 
                 ok_results = sorted((r for r in results if isinstance(r, tuple)), key=lambda t: t[0])
-                all_file_hashes: list[str] = [fh for _, fh, _ in ok_results]
-                observed = part_digest([ch for _, _, ch in ok_results])
+                all_file_hashes: list[str] = [fh for _, fh, _, _ in ok_results]
+                observed = part_digest([ch for _, _, ch, _ in ok_results])
 
                 # The fence: the bytes this upload sent must be the bytes the drain hashed at
                 # hand-off. A mismatch means the SSD part was rewritten under us (an UploadPart
@@ -550,13 +589,14 @@ class Uploader:
                     return ChunkUploadResult(cids=[], part_number=part_number, stale=True)
 
                 async with self._acquire_conn() as conn:
-                    for ci, file_hash, _ in ok_results:
+                    for ci, file_hash, _, arion_hash in ok_results:
                         await conn.fetchval(
                             get_query("insert_chunk_backend"),
                             part_id,
                             int(ci),
                             self.backend_name,
                             file_hash,
+                            arion_hash,
                         )
 
                 span.set_attribute("result.num_piece_cids", len(all_file_hashes))

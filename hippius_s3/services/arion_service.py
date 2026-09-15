@@ -77,7 +77,11 @@ class UploadResponse(BaseModel):
     upload_id: str
     timestamp: int
     size_bytes: int = 0
+    # HCFS's path hash: what /download and /delete address the file by. Not an Arion id.
     file_id: str
+    # The hash Arion registered the file under. None from HCFS servers that predate the field;
+    # "" when the server has no Arion backend.
+    arion_hash: str | None = None
 
     @property
     def cid(self) -> str:

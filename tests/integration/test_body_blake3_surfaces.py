@@ -56,8 +56,7 @@ async def seeded() -> AsyncGenerator[tuple[asyncpg.Connection, dict], None]:
     # 6 skipped" — a green run in which every DB assertion silently vanished, which is the same
     # false-green that let the crash-looping e2e workers go unnoticed for months. Fail loudly.
     if not await conn.fetchval(
-        "SELECT 1 FROM information_schema.columns "
-        "WHERE table_name = 'object_versions' AND column_name = 'body_blake3'"
+        "SELECT 1 FROM information_schema.columns WHERE table_name = 'object_versions' AND column_name = 'body_blake3'"
     ):
         await conn.close()
         pytest.fail("object_versions.body_blake3 is missing — run `python -m hippius_s3.scripts.migrate`")
@@ -168,13 +167,14 @@ async def test_head_and_download_queries_expose_the_digest(seeded: tuple[asyncpg
 async def test_the_two_head_hashes_are_different_things(seeded: tuple[asyncpg.Connection, dict]) -> None:
     """X-Hippius-Arion-File-Hash and X-Hippius-Body-Blake3 must never be conflated.
 
-    The first is chunk_backend.backend_identifier — Arion's id for the first ENCRYPTED chunk, i.e.
-    where the bytes live. The second is BLAKE3 of the PLAINTEXT, i.e. what the object contains.
+    The first is chunk_backend.arion_hash — the hash Arion registered the first ENCRYPTED chunk
+    under. The second is BLAKE3 of the PLAINTEXT, i.e. what the object contains.
     They are sourced from different tables and are not derivable from one another; a refactor that
     collapses them would silently start reporting storage location as content identity.
     """
     conn, ids = seeded
-    arion_identifier = "a" * 64
+    arion_hash = "a" * 64
+    hcfs_file_id = "f" * 64
     part_id, upload_id = uuid.uuid4(), uuid.uuid4()
     await conn.execute(
         "INSERT INTO multipart_uploads (upload_id, bucket_id, object_key, is_completed, initiated_at) "
@@ -195,12 +195,14 @@ async def test_the_two_head_hashes_are_different_things(seeded: tuple[asyncpg.Co
         part_id,
     )
     await conn.execute(
-        "INSERT INTO chunk_backend (chunk_id, backend, backend_identifier) VALUES ($1, 'arion', $2)",
+        "INSERT INTO chunk_backend (chunk_id, backend, backend_identifier, arion_hash) VALUES ($1, 'arion', $2, $3)",
         chunk_id,
-        arion_identifier,
+        hcfs_file_id,
+        arion_hash,
     )
 
     head = await conn.fetchrow(get_query("get_object_head_by_path"), ids["name"], "k/digest.bin")
-    assert head["arion_file_hash"] == arion_identifier, "storage-location header comes from chunk_backend"
+    assert head["arion_file_hash"] == arion_hash, "Arion header comes from chunk_backend.arion_hash"
+    assert head["arion_file_hash"] != hcfs_file_id, "HCFS's file_id is not an Arion id"
     assert head["body_blake3"] == DIGEST, "content header comes from object_versions"
     assert head["arion_file_hash"] != head["body_blake3"], "these are two different identifiers"

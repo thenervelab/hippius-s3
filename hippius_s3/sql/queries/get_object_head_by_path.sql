@@ -60,10 +60,12 @@ SELECT
     oi.object_version,
     oi.is_delete_marker,
     oi.version_last_modified,
-    arion.backend_identifier AS arion_file_hash
+    arion.arion_hash AS arion_file_hash
 FROM object_info oi
 LEFT JOIN LATERAL (
-    SELECT cb.backend_identifier
+    -- arion_hash, not backend_identifier: the latter is HCFS's file_id (its path hash), which
+    -- neither Arion nor the explorer knows.
+    SELECT cb.arion_hash
     FROM chunk_backend cb
     JOIN part_chunks pc ON pc.id = cb.chunk_id
     JOIN parts p ON pc.part_id = p.part_id
@@ -73,6 +75,6 @@ LEFT JOIN LATERAL (
       AND p.part_number = 1
       AND pc.chunk_index = 0
       AND NOT cb.deleted
-      AND cb.backend_identifier IS NOT NULL
+      AND cb.arion_hash IS NOT NULL
     LIMIT 1
 ) arion ON TRUE;
