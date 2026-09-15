@@ -336,10 +336,12 @@ class _InvalidationSpy:
         self.probes: list[tuple[int, int]] = []
         self.unlinked: list[tuple[int, int]] = []
 
-    async def __call__(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bool:
+    async def __call__(
+        self, object_id: str, object_version: int, part_number: int, chunk_index: int, durable_elsewhere: bool = False
+    ) -> bool:
         key = (int(part_number), int(chunk_index))
         self.probes.append(key)
-        removed = bool(await self._real(object_id, object_version, part_number, chunk_index))
+        removed = bool(await self._real(object_id, object_version, part_number, chunk_index, durable_elsewhere))
         if removed:
             self.unlinked.append(key)
         return removed
@@ -445,3 +447,85 @@ async def test_an_unrecoverable_chunk_ends_the_request_after_exactly_one_invalid
     assert cache.fetches.count((1, failing)) == 2, "the original fetch plus exactly one retry — never a loop"
     assert collector.record_aead_failure.call_count == 1
     collector.record_aead_failure.assert_called_once_with("local", "unrecovered")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefetch", [0, 4])
+async def test_a_poisoned_local_chunk_with_no_pool_copy_recovers_from_the_backend(
+    tmp_path: Path, prefetch: int
+) -> None:
+    """Post-cutover shape: nothing is ever on the pool, so pool presence can no longer license
+    the unlink. A live backend row for the chunk does — the backend holds the acknowledged
+    bytes and the streamer fetches them straight back. Without this the invalidate-and-retry
+    arm is dead for every part ingested after the cutover."""
+    from hippius_s3.reader.backend_fetch import BackendChunkFetcher
+
+    dual = _dual(tmp_path)
+    good = _good()
+    await _write_part(dual, [POISON_TAG, good[1]])
+    fetched: list[tuple[int, int]] = []
+
+    async def fetch_missing(item: ChunkPlanItem) -> bytes:
+        fetched.append((int(item.part_number), int(item.chunk_index)))
+        return good[int(item.chunk_index)]
+
+    del BackendChunkFetcher  # the fake above stands in for it; imported only to name the tier
+    collector = MagicMock()
+    cache = _StoreCache(dual)
+    with patch("hippius_s3.monitoring.get_metrics_collector", return_value=collector):
+        gen = streamer.stream_plan(
+            obj_cache=cache,
+            object_id=OBJ,
+            object_version=1,
+            plan=_plan(),
+            storage_version=5,
+            key_bytes=KEY,
+            suite_id=SUITE,
+            bucket_id=BUCKET,
+            upload_id="",
+            prefetch_chunks=prefetch,
+            chunk_timeout=5.0,
+            fetch_missing=fetch_missing,
+            has_backend_copy=lambda item: True,
+        )
+        out = b"".join([piece async for piece in gen])
+
+    assert out == b"".join(PLAINTEXT)
+    assert fetched == [(1, 0)], "only the poisoned chunk was re-fetched, from the backend"
+    assert not _chunk_file(dual, 0).exists(), "the poisoned local copy is gone"
+    collector.record_aead_failure.assert_called_once_with("local", "recovered")
+
+
+@pytest.mark.asyncio
+async def test_a_poisoned_only_copy_is_never_unlinked(tmp_path: Path) -> None:
+    """No pool copy and no backend row: the local copy is the only copy of the part (still in its
+    upload window), and a DEK fault fails it too — unlinking would destroy data over a fault that
+    may not be in the bytes at all."""
+    dual = _dual(tmp_path)
+    await _write_part(dual, [POISON_TAG, _good()[1]])
+
+    async def fetch_missing(item: ChunkPlanItem) -> bytes:
+        raise AssertionError("nothing should be fetched: the local copy was not dropped")
+
+    collector = MagicMock()
+    cache = _StoreCache(dual)
+    with patch("hippius_s3.monitoring.get_metrics_collector", return_value=collector), pytest.raises(InvalidTag):
+        gen = streamer.stream_plan(
+            obj_cache=cache,
+            object_id=OBJ,
+            object_version=1,
+            plan=_plan(),
+            storage_version=5,
+            key_bytes=KEY,
+            suite_id=SUITE,
+            bucket_id=BUCKET,
+            upload_id="",
+            prefetch_chunks=0,
+            chunk_timeout=5.0,
+            fetch_missing=fetch_missing,
+            has_backend_copy=lambda item: False,
+        )
+        await gen.__anext__()
+
+    assert _chunk_file(dual, 0).read_bytes() == POISON_TAG, "the only copy is untouched"
+    collector.record_aead_failure.assert_called_once_with("remote", "unrecovered")

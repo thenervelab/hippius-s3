@@ -289,6 +289,14 @@ pub enum ConfigError {
         /// The offending variable.
         var: &'static str,
     },
+    /// A variable whose value must be at least another variable's value.
+    #[error("environment variable `{var}` must be at least `{floor}`")]
+    BelowFloor {
+        /// The offending variable.
+        var: &'static str,
+        /// The variable it may not undercut.
+        floor: &'static str,
+    },
     /// A count variable exceeded its representable maximum (e.g. a drain
     /// concurrency past `u32::MAX`). A misconfiguration must fail fast.
     #[error("environment variable `{var}` value {value} exceeds the maximum {limit}")]
@@ -386,6 +394,16 @@ impl Config {
     /// [`from_env`](Self::from_env) so tests drive it with a fixture map instead
     /// of the process-global environment.
     fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let upload_sweep_poll = duration_secs(&get, "CEPHOR_UPLOAD_SWEEP_POLL_SECS", DEFAULT_UPLOAD_SWEEP_POLL)?;
+        let upload_redrive_after = duration_secs(&get, "CEPHOR_UPLOAD_REDRIVE_SECS", DEFAULT_UPLOAD_REDRIVE_AFTER)?;
+        // A window shorter than the poll would re-publish every `uploading` row on every pass
+        // and burn the whole re-drive budget within a few polls of the hand-off.
+        if upload_redrive_after < upload_sweep_poll {
+            return Err(ConfigError::BelowFloor {
+                var: "CEPHOR_UPLOAD_REDRIVE_SECS",
+                floor: "CEPHOR_UPLOAD_SWEEP_POLL_SECS",
+            });
+        }
         Ok(Self {
             database_url: required(&get, "CEPHOR_DATABASE_URL")?,
             ssd_root: required_path(&get, "CEPHOR_SSD_ROOT")?,
@@ -414,8 +432,8 @@ impl Config {
             orphan_reclaim_grace: duration_secs(&get, "CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", DEFAULT_ORPHAN_RECLAIM_GRACE)?,
             drain_concurrency: positive_u32_or(&get, "CEPHOR_DRAIN_CONCURRENCY", DEFAULT_DRAIN_CONCURRENCY)?,
             redrive_max_attempts: positive_u32_or(&get, "CEPHOR_REDRIVE_MAX_ATTEMPTS", DEFAULT_REDRIVE_MAX_ATTEMPTS)?,
-            upload_sweep_poll: duration_secs(&get, "CEPHOR_UPLOAD_SWEEP_POLL_SECS", DEFAULT_UPLOAD_SWEEP_POLL)?,
-            upload_redrive_after: duration_secs(&get, "CEPHOR_UPLOAD_REDRIVE_SECS", DEFAULT_UPLOAD_REDRIVE_AFTER)?,
+            upload_sweep_poll,
+            upload_redrive_after,
             upload_redrive_max_attempts: positive_u32_or(&get, "CEPHOR_UPLOAD_REDRIVE_MAX_ATTEMPTS", DEFAULT_UPLOAD_REDRIVE_MAX_ATTEMPTS)?,
             redrive_poll: duration_secs(&get, "CEPHOR_REDRIVE_POLL_SECS", DEFAULT_REDRIVE_POLL)?,
             evict_poll: duration_secs(&get, "CEPHOR_EVICT_POLL_SECS", DEFAULT_EVICT_POLL)?,

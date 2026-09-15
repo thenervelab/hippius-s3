@@ -5,6 +5,7 @@ retries and one concurrency budget per process. Nothing here writes to any cache
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import patch
 
 import pytest
 
@@ -102,3 +103,68 @@ async def test_the_concurrency_budget_is_shared_across_fetches() -> None:
     fetcher = _fetcher({"arion": slow}, concurrency=2)
     await asyncio.gather(*(fetcher.fetch([("arion", str(i))], "addr") for i in range(8)))
     assert peak == 2, f"the semaphore bounds backend concurrency (peak {peak})"
+
+
+@pytest.mark.asyncio
+async def test_a_saturated_budget_fails_fast_instead_of_queueing_until_the_first_chunk_bound() -> None:
+    # One slot, held by a fetch that never returns. The next fetch must not wait on the
+    # semaphore indefinitely (every queued read would then 503 together at the 25 s
+    # first-chunk bound): it gives up after the queue timeout with the retryable error.
+    release = asyncio.Event()
+
+    async def stuck(identifier: str, address: str) -> bytes:
+        await release.wait()
+        return b"late"
+
+    fetcher = BackendChunkFetcher(
+        {"arion": stuck}, concurrency=1, attempts=1, base_sleep=0.0, jitter=0.0, queue_timeout=0.05
+    )
+    holder = asyncio.create_task(fetcher.fetch([("arion", "id-1")], "addr"))
+    await asyncio.sleep(0)
+    with pytest.raises(ChunkUnavailableError, match="budget saturated"):
+        await fetcher.fetch([("arion", "id-2")], "addr")
+    release.set()
+    assert await holder == b"late", "the holder keeps its slot and completes"
+
+
+@pytest.mark.asyncio
+async def test_the_slot_is_released_when_the_fetch_is_cancelled() -> None:
+    # A client that disconnects cancels the fetch mid-flight; the slot it held must come back,
+    # or a pod's budget leaks one slot per abandoned cold read until nothing can be served.
+    started = asyncio.Event()
+
+    async def slow(identifier: str, address: str) -> bytes:
+        started.set()
+        await asyncio.sleep(60)
+        return b"never"
+
+    fetcher = BackendChunkFetcher(
+        {"arion": slow}, concurrency=1, attempts=1, base_sleep=0.0, jitter=0.0, queue_timeout=0.05
+    )
+    task = asyncio.create_task(fetcher.fetch([("arion", "id")], "addr"))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    async def quick(identifier: str, address: str) -> bytes:
+        return b"served"
+
+    fetcher._fetchers["arion"] = quick
+    assert await fetcher.fetch([("arion", "id")], "addr") == b"served"
+
+
+@pytest.mark.asyncio
+async def test_transient_retries_back_off_exponentially() -> None:
+    sleeps: list[float] = []
+
+    async def flaky(identifier: str, address: str) -> bytes:
+        raise ConnectionError("429")
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    fetcher = BackendChunkFetcher({"arion": flaky}, concurrency=1, attempts=3, base_sleep=1.0, jitter=0.0)
+    with patch("hippius_s3.reader.backend_fetch.asyncio.sleep", fake_sleep), pytest.raises(ChunkUnavailableError):
+        await fetcher.fetch([("arion", "id")], "addr")
+    assert sleeps == [1.0, 2.0], "base × 2^(attempt-1), and no sleep after the last attempt"

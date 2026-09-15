@@ -39,6 +39,13 @@ class FakeRedis:
             return None
         return items[index]
 
+    async def scan_iter(self, match: str, count: int = 100):
+        import fnmatch
+
+        for key in sorted(set(self.lists) | set(self.zsets)):
+            if fnmatch.fnmatch(key, match):
+                yield key
+
 
 def test_key_sets_cover_all_backends_and_kinds():
     lists, zsets = build_queue_key_sets(_config())
@@ -116,3 +123,28 @@ async def test_redis_failure_keeps_previous_values():
     # run() swallows the raise and keeps the last-good values; sample_once
     # surfaces it so the loop's except path owns the policy.
     assert sampler.depths["ovh_unpin_requests"] == 1
+
+
+@pytest.mark.asyncio
+async def test_node_scoped_upload_queues_are_discovered_and_gauged():
+    # The drain publishes to `{b}_upload_requests:<node>` and each node's uploader keeps its
+    # retries in `{b}_upload_retries:<node>`; the node set is a cluster fact, so the sampler
+    # discovers the keys per sample. A node queue nobody reads is exactly the silent backlog
+    # this gauge exists to show. The DLQ shares the prefix and stays a DLQ.
+    payload = json.dumps({"object_id": "x", "first_enqueued_at": 900.0})
+    redis = FakeRedis(
+        lists={
+            "arion_upload_requests:k8s-v3-node1": [payload, payload],
+            "arion_upload_requests:dlq": [payload],
+        },
+        zsets={"arion_upload_retries:k8s-v3-node1": ["a"]},
+    )
+    sampler = QueueDepthSampler(redis, _config(), register_metrics=False)
+
+    await sampler.sample_once(now=1000.0)
+
+    assert sampler.depths["arion_upload_requests:k8s-v3-node1"] == 2
+    assert sampler.depths["arion_upload_retries:k8s-v3-node1"] == 1
+    assert sampler.oldest_age["arion_upload_requests:k8s-v3-node1"] == pytest.approx(100.0)
+    assert sampler.depths["arion_upload_requests:dlq"] == 1
+    assert "arion_upload_requests:dlq" not in sampler.oldest_age

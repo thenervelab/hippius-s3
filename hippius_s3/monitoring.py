@@ -24,7 +24,7 @@ tracer = trace.get_tracer(__name__)
 
 # The storage tiers a chunk read can be served from, closed by construction so the `tier`
 # label cannot drift into unbounded cardinality.
-ChunkReadTier = Literal["local", "peer", "pool"]
+ChunkReadTier = Literal["local", "peer", "pool", "backend"]
 
 # Why a peer fetch did not happen, or its answer was not used. Closed by construction, like
 # ChunkReadTier. The reasons demand different responses and must stay distinguishable:
@@ -826,7 +826,7 @@ class MetricsCollector:
     def record_chunk_read_tier(self, tier: ChunkReadTier) -> None:
         """Count one chunk read against the tier that served it.
 
-        The `Literal` is what keeps this label bounded: three values fixed in code, so it
+        The `Literal` is what keeps this label bounded: four values fixed in code, so it
         cannot become a cardinality problem the way a caller-supplied string would.
         """
         self.chunk_reads_by_tier.add(1, attributes={"tier": tier})

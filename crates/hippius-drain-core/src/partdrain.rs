@@ -231,6 +231,16 @@ pub trait UploadEnqueuer: Send + Sync {
     /// Publish the part's backend upload request. Idempotent at the consumer, so a
     /// re-publish after a crash between publish and commit is safe.
     fn enqueue(&self, part: &PartKey) -> impl Future<Output = Result<EnqueueOutcome, Self::Error>> + Send;
+
+    /// Whether [`enqueue`](Self::enqueue) could publish the part right now — the cheap
+    /// probe `drain_part` runs BEFORE it reads and hashes the part, so a not-ready part (an
+    /// in-flight MPU) is deferred at the cost of one row lookup, not a full SSD read per
+    /// backoff. `enqueue` still answers `NotReady` for itself; this only skips the work in
+    /// front of it. Defaults to `true` for enqueuers with no such notion.
+    fn ready(&self, part: &PartKey) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        let _ = part;
+        async { Ok(true) }
+    }
 }
 
 /// A part-drain failure. Every variant leaves the SSD copy intact, so a failed
@@ -370,6 +380,15 @@ where
             declared: meta.num_chunks,
             present,
         });
+    }
+
+    // Not-ready is decided before the hash loop, not after it: an in-flight MPU part is
+    // re-claimed on every backoff until CompleteMultipartUpload, and a full SSD read per
+    // attempt would charge the drain budget (and the NVMe) for a part that cannot be
+    // published yet. `enqueue` below still answers NotReady on its own read of the row, so
+    // a version that goes away between the two probes is still deferred, never committed.
+    if !enqueuer.ready(part).await.map_err(PartDrainError::enqueue)? {
+        return Err(PartDrainError::NotReady);
     }
 
     // The digest of what is being handed over, folded from every chunk's hash in index order.

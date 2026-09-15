@@ -6,7 +6,7 @@ Business-logic layer. Crypto, KMS, backend clients, copy helpers, audit. The API
 
 | File | Purpose |
 |---|---|
-| [object_reader.py](object_reader.py) | `build_stream_context` — cache-vs-pipeline decision, download coalescing, envelope unwrap for GETs. |
+| [object_reader.py](object_reader.py) | `build_stream_context` — cache-vs-pipeline decision, backend location resolution, envelope unwrap for GETs. |
 | [crypto_service.py](crypto_service.py) | `CryptoService` — AEAD adapter registry (`hip-enc/aes256gcm`, `hip-enc/legacy`), per-chunk encrypt/decrypt. |
 | [key_service.py](key_service.py) | Per-object key derivation (legacy v≤4 SecretBox path). |
 | [envelope_service.py](envelope_service.py) | `generate_dek`, `wrap_dek(kek, dek, aad)`, `unwrap_dek(kek, wrapped, aad)` — AES-256-GCM envelope. |
@@ -51,10 +51,7 @@ Suite IDs:
 1. Validate storage version ([line 57](object_reader.py)) via `require_supported_storage_version`.
 2. Read parts list, build chunk plan (respects Range).
 3. **Batch check FS cache** ([line 67](object_reader.py)) via `obj_cache.chunks_exist_batch` — one pass.
-4. If any chunk missing → enter pipeline mode:
-   - For each missing part, attempt `SET NX EX {lock_ttl}` on `download_in_progress:{object_id}:v:{ov}:part:{pn}` ([line 87-94](object_reader.py)). Redis hiccups fail-open (still enqueue).
-   - If you acquired the lock, resolve per-chunk CIDs from `part_chunks` ([line 117-143](object_reader.py)), build a `DownloadChainRequest`, enqueue.
-   - If lock held by another streamer, skip enqueue — we'll wait on pub/sub.
+4. If any chunk is missing (or the plan is long enough that a mid-stream eviction is plausible) → resolve every chunk's backend location (`chunk_backend.backend_identifier`, one batched query per download backend) onto `StreamContext.locations`. Nothing is enqueued and no lock is taken: the streamer fetches a missing chunk from the backend into memory itself (`make_fetch_missing` → [../reader/backend_fetch.py](../reader/backend_fetch.py)). A chunk with no location yet (its part is inside the upload window on another node) is re-polled on the local tiers for `HIPPIUS_READ_MISSING_CHUNK_WAIT_SECONDS`, then the first-chunk peek returns a retryable 503.
 5. Unwrap DEK:
    - Call `get_bucket_kek_bytes(bucket_id, kek_id)` — asks the KMS client to unwrap the bucket KEK.
    - Call `unwrap_dek(kek_bytes, wrapped_dek, aad)` → plaintext DEK.

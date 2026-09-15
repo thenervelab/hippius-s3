@@ -857,33 +857,42 @@ async fn landed_once(queue: &LandedQueue, store: &Store, ssd: &LocalSsd, snapsho
     if parts.is_empty() && dropped == 0 {
         return;
     }
-    let mut recorded = 0u64;
-    let mut relanded: Vec<(&PartKey, Option<PartDigest>)> = Vec::new();
-    for part in &parts {
-        // Idempotent, and the same call the reconciler makes — so an announcement racing the
-        // backstop is a no-op rather than a conflict.
-        match store.record_landed_part(part).await {
-            Ok(outcome) => {
-                recorded += 1;
-                if outcome.state == ReplicationState::Replicated {
-                    relanded.push((part, outcome.digest));
-                }
-            }
-            Err(err) => tracing::warn!(error = %err, "recording an announced part failed; the reconciler will recover it"),
-        }
-    }
-    snapshot.record_landed(recorded, dropped);
     if dropped > 0 {
         // The api and this agent disagree about the message shape, so EVERY announcement is
         // being lost and discovery has silently fallen back to the reconciler's walk — the
         // thing this path exists to avoid. Loud, because nothing else would show it.
         tracing::error!(dropped, "landed announcements were unparseable; the api/agent wire contract has diverged");
     }
+    check_announced(store, ssd, &parts, dropped, snapshot).await;
+}
+
+/// Records each announced part and runs the divergence check on the ones that were already
+/// handed over. Split from [`landed_once`] so it can be driven without a Redis queue.
+async fn check_announced(store: &Store, ssd: &LocalSsd, parts: &[PartKey], dropped: u64, snapshot: &SnapshotCell) {
+    let mut recorded = 0u64;
+    let mut relanded: Vec<(&PartKey, ReplicationState, Option<PartDigest>)> = Vec::new();
+    for part in parts {
+        // Idempotent, and the same call the reconciler makes — so an announcement racing the
+        // backstop is a no-op rather than a conflict.
+        match store.record_landed_part(part).await {
+            Ok(outcome) => {
+                recorded += 1;
+                // Both handed-over states: an `uploading` part's bytes are what the uploader
+                // is reading right now, so a rewrite under it is the most urgent divergence
+                // there is — the acknowledged bytes have no other copy yet.
+                if matches!(outcome.state, ReplicationState::Uploading | ReplicationState::Replicated) {
+                    relanded.push((part, outcome.state, outcome.digest));
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "recording an announced part failed; the reconciler will recover it"),
+        }
+    }
+    snapshot.record_landed(recorded, dropped);
     if recorded > 0 {
         tracing::debug!(recorded, "recorded announced parts");
     }
-    for (part, stored) in relanded {
-        check_reland(store, ssd, part, stored.as_ref(), snapshot).await;
+    for (part, state, stored) in relanded {
+        check_reland(store, ssd, part, state, stored.as_ref(), snapshot).await;
     }
 }
 
@@ -901,7 +910,7 @@ async fn landed_once(queue: &LandedQueue, store: &Store, ssd: &LocalSsd, snapsho
 /// at check time means an eviction/reclaim unlinked it in between — and if the rewrite had
 /// diverged, the client's acknowledged bytes are destroyed while the pool serves the superseded
 /// ones. That is a possible-data-loss signature, logged at ERROR, not a disk warning.
-async fn check_reland(store: &Store, ssd: &LocalSsd, part: &PartKey, stored: Option<&PartDigest>, snapshot: &SnapshotCell) {
+async fn check_reland(store: &Store, ssd: &LocalSsd, part: &PartKey, state: ReplicationState, stored: Option<&PartDigest>, snapshot: &SnapshotCell) {
     let observed = match observed_part_digest(ssd, part).await {
         Ok(digest) => digest,
         Err(err) => {
@@ -923,7 +932,7 @@ async fn check_reland(store: &Store, ssd: &LocalSsd, part: &PartKey, stored: Opt
             return;
         }
     };
-    let verdict = verdict_for_reland(ReplicationState::Replicated, stored, &observed);
+    let verdict = verdict_for_reland(state, stored, &observed);
     if !verdict.redrives() {
         snapshot.record_reland(RelandOutcome::Unchanged);
         return;
@@ -1049,9 +1058,15 @@ async fn upload_sweep_once<E: UploadEnqueuer>(
             for part in &stale {
                 // Bump BEFORE publishing: a bump that outlives a lost publish costs one extra
                 // window; a publish that outlives a lost bump would re-publish every pass.
-                if let Err(err) = store.bump_upload_attempts(part).await {
-                    tracing::warn!(error = %err, "upload-sweep attempt bump failed; will retry next poll");
-                    continue;
+                // A bump that matched no row means the uploader flipped it between the
+                // listing and now — nothing left to re-publish.
+                match store.bump_upload_attempts(part).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "upload-sweep attempt bump failed; will retry next poll");
+                        continue;
+                    }
                 }
                 match enqueuer.enqueue(part).await {
                     Ok(EnqueueOutcome::Published) => report.redriven += 1,
@@ -1065,7 +1080,7 @@ async fn upload_sweep_once<E: UploadEnqueuer>(
         Err(err) => tracing::warn!(error = %err, "upload-sweep stale query failed; will retry next poll"),
     }
 
-    match store.count_uploading_exhausted(redrive_after, max_attempts).await {
+    match store.count_uploading_exhausted(max_attempts).await {
         Ok(n) => report.exhausted = n,
         Err(err) => tracing::warn!(error = %err, "upload-sweep exhausted count failed"),
     }
@@ -1611,11 +1626,13 @@ impl<E: UploadEnqueuer + 'static> AgentRuntime<E> {
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr, reason = "tests")]
 mod tests {
     use super::{
-        AgentRuntime, DiskUsage, EvictionPolicy, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, SharedDiskReport, check_shared_disk,
-        default_enforcer, eviction_target, node_observation, promote_floor_permille, published_promote_floor, pull_action, record_drain_signals,
+        AgentRuntime, DiskUsage, EvictionPolicy, HeartbeatConfig, PullAction, RateControl, RuntimeConfig, SharedDiskReport, UploadSweepReport,
+        check_announced, check_shared_disk, default_enforcer, eviction_target, node_observation, promote_floor_permille, published_promote_floor,
+        pull_action, record_drain_signals, upload_sweep_once,
     };
     use crate::localfs::LocalSsd;
     use crate::supervisor::ShutdownTrigger;
+    use crate::worker::drain_until_empty;
     use core::str::FromStr;
     use hippius_drain_core::DiskPressure;
 
@@ -2155,6 +2172,191 @@ mod tests {
         let meta = ssd_root.join(part.relative_dir()).join("meta.json");
         let handle = std::fs::OpenOptions::new().write(true).open(&meta).unwrap();
         handle.set_modified(std::time::SystemTime::now() - Duration::from_hours(2)).unwrap();
+    }
+
+    /// The slice of the api schema the upload sweep and the re-drive read (`objects`,
+    /// `object_versions`, `parts`, `part_chunks`, `chunk_backend`). The drain-core migrations
+    /// are cephor-only, so a test of the cross-table arms stands these up itself.
+    async fn create_sweep_schema(pool: &PgPool) {
+        for ddl in [
+            "CREATE TABLE objects (object_id uuid PRIMARY KEY, deleted_at timestamptz)",
+            "CREATE TABLE object_versions (object_id uuid NOT NULL, object_version bigint NOT NULL, address text, \
+             PRIMARY KEY (object_id, object_version))",
+            "CREATE TABLE parts (part_id uuid PRIMARY KEY DEFAULT gen_random_uuid(), object_id uuid NOT NULL, \
+             object_version bigint NOT NULL, part_number bigint NOT NULL, size_bytes bigint)",
+            "CREATE TABLE part_chunks (id bigserial PRIMARY KEY, part_id uuid NOT NULL, chunk_index int NOT NULL)",
+            "CREATE TABLE chunk_backend (chunk_id bigint NOT NULL, backend text NOT NULL, backend_identifier text, \
+             deleted boolean NOT NULL DEFAULT false, deleted_at timestamptz, PRIMARY KEY (chunk_id, backend))",
+        ] {
+            sqlx::query(ddl).execute(pool).await.unwrap();
+        }
+    }
+
+    /// Seeds a live object + version (with an address) and one `part_chunks` row for the part,
+    /// covered on `backends`. Returns the chunk id.
+    async fn seed_live_part(pool: &PgPool, part: &PartKey, backends: &[&str]) -> i64 {
+        sqlx::query("INSERT INTO objects (object_id) VALUES ($1::uuid) ON CONFLICT DO NOTHING")
+            .bind(part.object().as_str())
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO object_versions (object_id, object_version, address) VALUES ($1::uuid, $2, 'addr') ON CONFLICT DO NOTHING")
+            .bind(part.object().as_str())
+            .bind(i64::from(part.version().get()))
+            .execute(pool)
+            .await
+            .unwrap();
+        let part_id: String = sqlx::query_scalar(
+            "INSERT INTO parts (object_id, object_version, part_number, size_bytes) VALUES ($1::uuid, $2, $3, 20) RETURNING part_id::text",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let chunk: i64 = sqlx::query_scalar("INSERT INTO part_chunks (part_id, chunk_index) VALUES ($1::uuid, 0) RETURNING id")
+            .bind(&part_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        for backend in backends {
+            sqlx::query("INSERT INTO chunk_backend (chunk_id, backend, backend_identifier) VALUES ($1, $2, 'id')")
+                .bind(chunk)
+                .bind(backend)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        chunk
+    }
+
+    /// An enqueuer that records what it was asked to publish.
+    #[derive(Default)]
+    struct RecordingEnqueuer(std::sync::Mutex<Vec<PartKey>>);
+    impl UploadEnqueuer for RecordingEnqueuer {
+        type Error = std::io::Error;
+        async fn enqueue(&self, part: &PartKey) -> Result<EnqueueOutcome, std::io::Error> {
+            self.0.lock().unwrap().push(part.clone());
+            Ok(EnqueueOutcome::Published)
+        }
+    }
+
+    /// Drains every pending part on the SSD to `uploading` with the no-op enqueuer.
+    async fn hand_over_all(ssd: &LocalSsd, store: &Store) {
+        drain_until_empty(ssd, store, &NoopEnqueuer, None, None, &CancellationToken::new(), 1)
+            .await
+            .unwrap();
+    }
+
+    async fn status_of(store: &Store, part: &PartKey) -> Option<ReplicationState> {
+        <Store as PartReplicationStore>::status(store, part).await.unwrap()
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn the_upload_sweep_confirms_then_retires_then_redrives_and_counts(pool: PgPool) {
+        // The three arms in one pass, in order, against four `uploading` parts: covered → confirmed
+        // (and NOT re-published even though it is also stale); version gone → retired; stale with
+        // budget → re-published exactly once, budget bumped before the publish; past the cap →
+        // counted, not published. A second pass is a no-op except for the gauge.
+        create_sweep_schema(&pool).await;
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let snapshot = SnapshotCell::new();
+        let backends = vec!["arion".to_owned()];
+
+        let covered = part_at(5, 1);
+        // Same object, a version with no `object_versions` row (an aborted overwrite).
+        let version_gone = part_at(6, 2);
+        let stale = part_at(5, 3);
+        let exhausted = part_at(5, 4);
+        for part in [&covered, &version_gone, &stale, &exhausted] {
+            seed_part(ssd_dir.path(), &store, part).await;
+        }
+        hand_over_all(&ssd, &store).await;
+        for part in [&covered, &version_gone, &stale, &exhausted] {
+            assert_eq!(status_of(&store, part).await, Some(ReplicationState::Uploading));
+        }
+        seed_live_part(&pool, &covered, &["arion"]).await;
+        seed_live_part(&pool, &stale, &[]).await;
+        seed_live_part(&pool, &exhausted, &[]).await;
+        // Everything sat past the window; `exhausted` has already used its budget.
+        sqlx::query("UPDATE cephor_replication_status SET updated_at = now() - interval '2 hours'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE cephor_replication_status SET upload_attempts = 3 WHERE part_number = 4")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let enqueuer = RecordingEnqueuer::default();
+        let report = upload_sweep_once(&store, &enqueuer, &snapshot, &backends, Duration::from_hours(1), 3).await;
+
+        assert_eq!(
+            report,
+            UploadSweepReport {
+                confirmed: 1,
+                abandoned: 1,
+                redriven: 1,
+                exhausted: 1
+            }
+        );
+        assert_eq!(
+            *enqueuer.0.lock().unwrap(),
+            vec![stale.clone()],
+            "only the stale, in-budget part is re-published"
+        );
+        assert_eq!(status_of(&store, &covered).await, Some(ReplicationState::Replicated));
+        assert_eq!(status_of(&store, &version_gone).await, Some(ReplicationState::Replicated), "retired");
+        assert_eq!(status_of(&store, &stale).await, Some(ReplicationState::Uploading));
+        let attempts: i32 = sqlx::query_scalar("SELECT upload_attempts FROM cephor_replication_status WHERE part_number = 3")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 1, "the bump is recorded with the publish");
+        let loaded = snapshot.load();
+        assert_eq!((loaded.uploads_confirmed, loaded.uploads_redriven, loaded.uploads_abandoned), (1, 1, 1));
+        assert_eq!(snapshot.uploads_exhausted(), 1);
+
+        let again = upload_sweep_once(&store, &enqueuer, &snapshot, &backends, Duration::from_hours(1), 3).await;
+        assert_eq!(
+            again,
+            UploadSweepReport {
+                exhausted: 1,
+                ..UploadSweepReport::default()
+            },
+            "a second pass inside the window does nothing but read the gauge"
+        );
+        assert_eq!(enqueuer.0.lock().unwrap().len(), 1, "no duplicate publish");
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn a_rewritten_uploading_part_announced_again_is_redriven(pool: PgPool) {
+        // An UploadPart retry that lands different bytes while the part is `uploading` (the
+        // uploader may be mid-read of the old ones) is announced like any landing; the check
+        // must run for the `uploading` state too, or the acknowledged bytes are never uploaded.
+        create_sweep_schema(&pool).await;
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let snapshot = SnapshotCell::new();
+
+        let part = part_at(5, 1);
+        seed_part(ssd_dir.path(), &store, &part).await;
+        hand_over_all(&ssd, &store).await;
+        assert_eq!(status_of(&store, &part).await, Some(ReplicationState::Uploading));
+
+        // The same announcement with the same bytes is a no-op.
+        check_announced(&store, &ssd, std::slice::from_ref(&part), 0, &snapshot).await;
+        assert_eq!(status_of(&store, &part).await, Some(ReplicationState::Uploading));
+        assert_eq!(snapshot.load().reland_redriven, 0);
+
+        std::fs::write(ssd_dir.path().join(part.relative_dir()).join("chunk_0.bin"), b"rewritten by a retry").unwrap();
+        check_announced(&store, &ssd, std::slice::from_ref(&part), 0, &snapshot).await;
+        assert_eq!(status_of(&store, &part).await, Some(ReplicationState::Pending), "re-driven");
+        assert_eq!(snapshot.load().reland_redriven, 1);
     }
 
     /// Every part has left the drain: handed to the uploader (`Uploading`) or acked by the backend

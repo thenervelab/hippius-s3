@@ -15,6 +15,14 @@
 --   mid-part). Bounded: past the cap the sweep leaves the row for the DLQ/operator path and
 --   counts it, so a permanently failing part (a 402, a missing chunk) cannot be re-driven
 --   forever. Reset to 0 by the drain's own commit (a fresh hand-off starts a fresh budget).
+--
+-- This file is the transactional half. sqlx wraps a migration in one transaction unless told
+-- otherwise, so the ACCESS EXCLUSIVE lock the constraint swap takes is HELD until commit —
+-- which is why validating the widened CHECK (a scan of every row) is in 0021, outside a
+-- transaction, and not here: held across that scan it would block every drain and uploader
+-- statement on the fleet for its whole duration. The partial index below is the one scan that
+-- stays: it builds in seconds at this table's cardinality (the judgement 0013/0017/0018
+-- recorded for plain over CONCURRENTLY here) and rolls back cleanly if aborted.
 
 -- lock_timeout is the load-bearing line, exactly as in 0013/0018/0019: the constraint swap and
 -- ADD COLUMN each need ACCESS EXCLUSIVE, which queues behind any open reader and then blocks
@@ -24,13 +32,11 @@
 SET LOCAL lock_timeout = '5s';
 
 -- NOT VALID: adding a CHECK normally scans the whole table (~11M rows on prod) under ACCESS
--- EXCLUSIVE. NOT VALID takes the lock only for the catalog change; the VALIDATE below holds
--- just SHARE UPDATE EXCLUSIVE (no blocking of the drain's UPDATEs) while it scans. Every
--- existing row already satisfies the widened set, so validation cannot fail.
+-- EXCLUSIVE. NOT VALID takes the lock only for the catalog change; new and updated rows are
+-- checked from this point on, which is all the drain needs. 0021 validates the existing rows.
 ALTER TABLE cephor_replication_status DROP CONSTRAINT IF EXISTS cephor_replication_status_status_check;
 ALTER TABLE cephor_replication_status ADD CONSTRAINT cephor_replication_status_status_check
     CHECK (status IN ('pending', 'draining', 'uploading', 'replicated', 'failed', 'corrupt')) NOT VALID;
-ALTER TABLE cephor_replication_status VALIDATE CONSTRAINT cephor_replication_status_status_check;
 
 -- Metadata-only on PG 11+ (a non-volatile default is stored in the catalog, not written to
 -- every row).

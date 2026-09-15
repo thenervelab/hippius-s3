@@ -415,6 +415,11 @@ jobs:
           # SigV4 against it. Old header-trusting pods receiving public traffic (an auth
           # bypass) is prevented by the label either way.
           kubectl delete deployment/gateway -n hippius-s3-staging --ignore-not-found=true
+          # The download pipeline is gone (reads stream from the backend in-process); prune its
+          # Deployment the same way — `apply -k` never deletes a removed resource, and a
+          # lingering downloader would keep an RW pool mount and a Postgres pool open for
+          # a queue nothing publishes to. Idempotent after the first deploy.
+          kubectl delete deployment/arion-downloader -n hippius-s3-staging --ignore-not-found=true
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
           # The node-local uploader must be Ready BEFORE the drain image rolls: the drain
           # publishes to `arion_upload_requests:<node>`, which only this DaemonSet reads. Same

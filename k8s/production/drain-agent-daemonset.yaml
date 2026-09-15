@@ -106,9 +106,9 @@ spec:
                    AND EXISTS (SELECT 1 FROM information_schema.columns
                                WHERE table_schema = 'public'
                                  AND table_name = 'cephor_replication_status'
-                                 AND column_name IN ('content_sha256', 'relanded_at', 'reclaimed_at')
-                               HAVING count(DISTINCT column_name) = 3)")" = "t" ]; do
-                echo "waiting for the cephor schema (allocator migrations 0016-0019)"; sleep 3
+                                 AND column_name IN ('content_sha256', 'relanded_at', 'reclaimed_at', 'upload_attempts')
+                               HAVING count(DISTINCT column_name) = 4)")" = "t" ]; do
+                echo "waiting for the cephor schema (allocator migrations 0016-0020)"; sleep 3
               done
           env:
             - name: CEPHOR_DATABASE_URL

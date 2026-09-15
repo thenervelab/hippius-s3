@@ -74,8 +74,18 @@ spec:
             - -c
             - |
               until pg_isready -h postgres-rw -p 5432; do echo "waiting for postgres"; sleep 3; done
-              until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "SELECT to_regclass('public.cephor_replication_status') IS NOT NULL")" = "t" ]; do
-                echo "waiting for the cephor schema (allocator migration)"; sleep 3
+              # The column check (not just the table) is what keeps a drain pod from starting
+              # against a schema older than its binary: `apply -k` starts this DaemonSet and
+              # the allocator at the same instant, and the CHECK rejects 'uploading' until
+              # 0020 lands. Same shape as production's gate.
+              until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "
+                SELECT to_regclass('public.cephor_ssd_residency') IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_schema = 'public'
+                                 AND table_name = 'cephor_replication_status'
+                                 AND column_name IN ('content_sha256', 'relanded_at', 'reclaimed_at', 'upload_attempts')
+                               HAVING count(DISTINCT column_name) = 4)")" = "t" ]; do
+                echo "waiting for the cephor schema (allocator migrations 0016-0020)"; sleep 3
               done
           env:
             - name: CEPHOR_DATABASE_URL

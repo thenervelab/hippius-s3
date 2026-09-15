@@ -762,3 +762,92 @@ async def test_part_chunk_upload_failure_propagates(mock_config, mock_db_pool, m
                 object_version=1,
                 account_ss58="5FakeTestAccountAddress123456789012345678901234",
             )
+
+
+@pytest.mark.asyncio
+async def test_a_node_scoped_request_for_a_part_no_longer_uploading_is_dropped(mock_config, mock_db_pool):
+    # A drain-published request is only actionable while its part is in the hand-off state. A
+    # duplicate that arrives after the flip (the SSD copy may already be evicted) must be dropped
+    # here, not read the disk, miss, and dead-letter a healthy object as "missing".
+    uploader = Uploader(
+        mock_db_pool, FakeRedis(), FakeRedis(), mock_config, backend_name="arion", backend_client=MagicMock()
+    )
+    mock_conn = AsyncMock()
+    mock_conn.fetchval = AsyncMock(return_value=False)
+    mock_conn.fetch = AsyncMock(
+        return_value=[MockRow({"part_number": 1, "status": "replicated", "content_sha256": "d"})]
+    )
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+    payload = UploadChainRequest(
+        address="user1",
+        bucket_name="test-bucket",
+        object_key="test-key",
+        object_id="obj-123",
+        object_version=1,
+        chunks=[Chunk(id=1)],
+        node_id="ingest-node-1",
+    )
+
+    with patch.object(uploader, "_upload_chunks", new_callable=AsyncMock) as mock_upload_chunks:
+        assert await uploader.process_upload(payload) == []
+        mock_upload_chunks.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matches", [True, False], ids=["acknowledged_bytes", "rewritten_under_us"])
+async def test_chunk_backend_rows_are_written_only_for_the_bytes_the_drain_acknowledged(
+    mock_config, mock_db_pool, mock_fs_store, matches: bool
+):
+    # The fence: rows are the backend's claim to hold the acknowledged part. An upload that
+    # raced an UploadPart retry (or outlived a re-drive) hashes to something else and records
+    # nothing — otherwise the sweep would confirm the fresh hand-off from these rows and the
+    # evictor would free the only good copy.
+    from hippius_s3.workers.part_digest import chunk_hash
+    from hippius_s3.workers.part_digest import part_digest
+
+    uploader = Uploader(
+        mock_db_pool, FakeRedis(), FakeRedis(), mock_config, backend_name="arion", backend_client=MagicMock()
+    )
+    uploader.fs_store = mock_fs_store
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(return_value=MockRow({"part_id": "part-uuid"}))
+    mock_conn.fetch = AsyncMock(return_value=[MockRow({"chunk_index": 0, "id": 7})])
+    mock_conn.fetchval = AsyncMock(return_value=1)
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+    api = AsyncMock()
+    api.upload_file_and_get_cid = AsyncMock(
+        return_value=UploadResponse(
+            id="file-uuid-1",
+            original_name="c",
+            content_type="application/octet-stream",
+            size_bytes=1,
+            sha256_hex="x",
+            cid="Qm",
+            status="completed",
+            file_url="u",
+            created_at="t",
+            updated_at="t",
+        )
+    )
+    uploader.backend_client = api
+    acknowledged = part_digest([chunk_hash(b"encrypted_chunk_data_123")])
+    expected = acknowledged if matches else "0" * 64
+
+    with patch("hippius_s3.workers.uploader.get_query", return_value="MOCKED_QUERY"):
+        result = await uploader._upload_single_chunk(
+            object_id="obj-123",
+            object_key="k",
+            chunk=Chunk(id=1),
+            upload_id="upload-123",
+            object_version=1,
+            account_ss58="5Fake",
+            expected_digest=expected,
+        )
+
+    inserts = [c for c in mock_conn.fetchval.call_args_list if c.args and c.args[0] == "MOCKED_QUERY"]
+    if matches:
+        assert result.stale is False and result.digest == acknowledged and result.cids == ["file-uuid-1"]
+        assert len(inserts) == 1
+    else:
+        assert result.stale is True and result.cids == []
+        assert inserts == [], "a mismatch records nothing"

@@ -146,6 +146,10 @@ impl RedisEnqueuer {
 impl UploadEnqueuer for RedisEnqueuer {
     type Error = EnqueueError;
 
+    async fn ready(&self, part: &PartKey) -> Result<bool, EnqueueError> {
+        self.store.upload_address_ready(part).await.map_err(EnqueueError::Store)
+    }
+
     async fn enqueue(&self, part: &PartKey) -> Result<EnqueueOutcome, EnqueueError> {
         let Some(ctx) = self.store.load_upload_context(part).await.map_err(EnqueueError::Store)? else {
             // Not-ready is an EXPECTED, common outcome: an in-flight MPU part (address NULL

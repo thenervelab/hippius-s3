@@ -73,10 +73,9 @@ async def _decrypt_reloading_once(
     except CIPHERTEXT_UNUSABLE:
         if not await invalidate_fn(item):
             # Nothing local held these bytes (a peer, the pool or the backend served them, or this
-            # deployment has no lower tier) — re-fetching would return the same bytes, and the
-            # backend copy is authoritative, so a fault there is a real error. The store also
-            # answers False when a redrive has marked the pool copy suspect: the retry would read
-            # superseded bytes that still authenticate, so failing here is the only safe outcome.
+            # deployment has no lower tier), or the local copy is the ONLY copy (no backend row
+            # yet, no pool copy) — re-fetching would return the same bytes, and the backend copy
+            # is authoritative, so a fault there is a real error.
             _record_aead_failure("remote", "unrecovered")
             raise
         logger.warning(
@@ -164,6 +163,18 @@ async def _emit(
             item, task = pending.popleft()
             try:
                 c = await task
+            except ChunkUnavailableError as exc:
+                # Expected on a read inside a part's upload window (nothing can serve it yet)
+                # or a saturated backend budget: retryable, so a line rather than a traceback.
+                logger.warning(
+                    "STREAM chunk unavailable object_id=%s v=%s part=%s chunk=%s: %s",
+                    object_id,
+                    int(object_version),
+                    int(item.part_number),
+                    int(item.chunk_index),
+                    exc,
+                )
+                raise
             except Exception:
                 logger.exception(
                     "STREAM fetch failed object_id=%s v=%s part=%s chunk=%s",
@@ -206,6 +217,7 @@ async def stream_plan(
     prefetch_chunks: int = 0,
     chunk_timeout: float | None = None,
     fetch_missing: FetchMissingFn | None = None,
+    has_backend_copy: Callable[[ChunkPlanItem], bool] | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """Yield the plan's plaintext, chunk by chunk.
 
@@ -214,7 +226,9 @@ async def stream_plan(
     ciphertext is decrypted here and yielded, never written back. `fetch_missing=None` (a caller
     with no backend, e.g. a test over a bare store) turns a miss into `ChunkUnavailableError`.
     `chunk_timeout` bounds each chunk's fetch so a stalled backend ends the stream in minutes
-    rather than hanging the open response.
+    rather than hanging the open response. `has_backend_copy` says whether a chunk has a live
+    backend row: that is what lets a local copy that fails to authenticate be dropped and
+    re-fetched from the backend — without it only a pool copy licenses the drop.
     """
     prefetch = max(0, int(prefetch_chunks))
 
@@ -242,8 +256,11 @@ async def stream_plan(
     async def _invalidate(item: ChunkPlanItem) -> bool:
         if invalidate_local is None:
             return False
+        durable = bool(has_backend_copy(item)) if has_backend_copy is not None else False
         return bool(
-            await invalidate_local(object_id, int(object_version), int(item.part_number), int(item.chunk_index))
+            await invalidate_local(
+                object_id, int(object_version), int(item.part_number), int(item.chunk_index), durable
+            )
         )
 
     async def _fetch(item: ChunkPlanItem) -> bytes:

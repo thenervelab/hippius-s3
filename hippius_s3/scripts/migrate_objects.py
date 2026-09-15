@@ -365,6 +365,11 @@ async def migrate_one(
         address=address,
     )
     # Enqueue background publish for the migrated version
+    # The request goes to the GLOBAL queue (no node_id), whose uploader reads the shared pool:
+    # this script must run where HIPPIUS_OBJECT_CACHE_DIR is the pool. Run on an ingest node it
+    # would write the migrated parts to that node's SSD instead, where only the drain (which
+    # publishes to the node's own queue) can hand them over — and this enqueue would then be a
+    # request the pool-reading uploader dead-letters as missing.
     try:
         parts = await db.fetch(
             get_query("list_parts_for_version"),

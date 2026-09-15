@@ -61,22 +61,39 @@ class BackendChunkFetcher:
         attempts: int,
         base_sleep: float,
         jitter: float,
+        queue_timeout: float | None = None,
     ) -> None:
         self._fetchers = fetchers
         self._semaphore = asyncio.Semaphore(max(1, int(concurrency)))
         self._attempts = max(1, int(attempts))
         self._base_sleep = float(base_sleep)
         self._jitter = float(jitter)
+        self._queue_timeout = None if queue_timeout is None else float(queue_timeout)
 
     def can_serve(self, backend: str) -> bool:
         return backend in self._fetchers
+
+    async def _acquire_slot(self) -> None:
+        """Take a slot in the pod's budget, or give up: a saturated budget (a slow backend under
+        many cold readers) must surface as a fast retryable failure on the reads that cannot be
+        served, not as every queued read timing out in lockstep at the first-chunk bound."""
+        if self._queue_timeout is None:
+            await self._semaphore.acquire()
+            return
+        try:
+            await asyncio.wait_for(self._semaphore.acquire(), timeout=self._queue_timeout)
+        except TimeoutError as exc:
+            raise ChunkUnavailableError(
+                f"backend fetch budget saturated for {self._queue_timeout:.0f}s; the read cannot be served now"
+            ) from exc
 
     async def fetch(self, locations: Iterable[BackendLocation], address: str) -> bytes:
         """Return the chunk's ciphertext from the first location that serves it.
 
         Locations are tried in the order given (the object's download-backend order). A transient
-        failure is retried on the same location; a permanent one (a 404: the identifier is stale)
-        moves on to the next. Exhausting every location is `ChunkUnavailableError`.
+        failure is retried on the same location with exponential backoff (a 429/5xx is ridden
+        out, not burnt through); a permanent one (a 404: the identifier is stale) moves on to the
+        next. Exhausting every location is `ChunkUnavailableError`.
         """
         tried = 0
         for backend, identifier in locations:
@@ -85,9 +102,9 @@ class BackendChunkFetcher:
                 continue
             tried += 1
             for attempt in range(1, self._attempts + 1):
+                await self._acquire_slot()
                 try:
-                    async with self._semaphore:
-                        return await fetch_one(identifier, address)
+                    data = await fetch_one(identifier, address)
                 except Exception as exc:  # noqa: BLE001 - every backend error is classified below
                     kind = classify_download_error(exc)
                     if kind != "transient" or attempt == self._attempts:
@@ -101,8 +118,26 @@ class BackendChunkFetcher:
                             exc,
                         )
                         break
-                    await asyncio.sleep(self._base_sleep * attempt + random.uniform(0, self._jitter))
+                    await asyncio.sleep(self._base_sleep * (2 ** (attempt - 1)) + random.uniform(0, self._jitter))
+                    continue
+                finally:
+                    self._semaphore.release()
+                _record_backend_read()
+                return data
         raise ChunkUnavailableError(f"no backend served the chunk (locations tried: {tried})")
+
+
+def _record_backend_read() -> None:
+    """Count a chunk served by the backend tier, next to local/peer/pool. Never let observability
+    fail a read."""
+    try:
+        from hippius_s3.monitoring import get_metrics_collector
+
+        collector = get_metrics_collector()
+        if collector is not None:
+            collector.record_chunk_read_tier("backend")
+    except Exception:  # noqa: BLE001 - a metrics failure must not fail a read
+        pass
 
 
 _fetcher: BackendChunkFetcher | None = None
@@ -137,4 +172,5 @@ def _build_fetcher() -> BackendChunkFetcher:
         attempts=int(cfg.read_backend_fetch_attempts),
         base_sleep=float(cfg.read_backend_fetch_retry_base_seconds),
         jitter=float(cfg.read_backend_fetch_retry_jitter_seconds),
+        queue_timeout=float(cfg.read_backend_fetch_queue_timeout_seconds),
     )

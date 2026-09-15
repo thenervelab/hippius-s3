@@ -30,7 +30,7 @@ Chunk size is read per-part from the DB (`parts.chunk_size_bytes`), not from con
 
 ### `prefetch_chunks=0` (sequential; function-param fallback, not the runtime default)
 
-Trivial loop: for each item, `await obj_cache.wait_for_chunk(...)` → `decrypt_chunk_if_needed(...)` → `yield maybe_slice(pt, slice_start, slice_end_excl)`. Preserves strict ordering and back-pressure.
+Trivial loop: for each item, `await obj_cache.get_chunk(...)` (local → peer → pool), else `fetch_missing(item)` (the backend, into memory) → `decrypt_chunk_if_needed(...)` → `yield maybe_slice(pt, slice_start, slice_end_excl)`. Preserves strict ordering and back-pressure.
 
 ### `prefetch_chunks>0` (pipelined)
 
@@ -61,13 +61,15 @@ An authentication failure is **not** a plain raise any more. The decrypter defin
 decrypt either yields authenticated plaintext or raises, counted as
 `chunk_aead_failures_total{tier=local|remote, outcome=recovered|unrecovered}`.
 
-Two gates bound the retry. The invalidation only happens when the **pool holds the chunk** — a
-freshly ingested part lives on SSD alone until the drain replicates it, and a DEK fault fails those
-chunks too, so an ungated unlink would turn a key error into data loss. And the retry is
+Two gates bound the retry. The invalidation only happens when a **durable copy exists elsewhere**
+— a live `chunk_backend` row (the backend holds it; `has_backend_copy` from the resolved
+locations) or, for pool-era parts, a pool copy — because a freshly ingested part lives on SSD alone
+until the backend acks it, and a DEK fault fails those chunks too, so an ungated unlink would turn a
+key error into data loss. And the retry is
 straight-line, not a loop: a DEK-level fault fails every chunk, and with promotion on, a looping
 retry would re-warm the copy it just dropped and never run out of things to invalidate. When
 nothing local held the bytes (peer/pool served them, or no lower tier exists), the failure raises
-immediately — re-fetching would return the same bytes, and a pool fault is a genuine error. Full
+immediately — re-fetching would return the same bytes, and a backend/pool fault is a genuine error. Full
 rationale: [../cache/CLAUDE.md](../cache/CLAUDE.md) "Invalidating a chunk that fails AEAD".
 
 `maybe_slice(pt, slice_start, slice_end_excl)` ([decrypter.py:55](decrypter.py)) trims plaintext for Range requests.

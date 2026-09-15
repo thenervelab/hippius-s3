@@ -549,11 +549,19 @@ class Config:
     # arion_upload_concurrency; a transient backend error is retried this many times per location.
     read_backend_fetch_concurrency: int = env("HIPPIUS_READ_BACKEND_FETCH_CONCURRENCY:32", convert=int)
     read_backend_fetch_attempts: int = env("HIPPIUS_READ_BACKEND_FETCH_ATTEMPTS:3", convert=int)
+    # Exponential: base × 2^(attempt-1) + jitter. 1 s base so a throttling backend (429/5xx) is
+    # ridden out over ~3 s across the attempts rather than burnt through in under a second.
     read_backend_fetch_retry_base_seconds: float = env(
-        "HIPPIUS_READ_BACKEND_FETCH_RETRY_BASE_SECONDS:0.1", convert=float
+        "HIPPIUS_READ_BACKEND_FETCH_RETRY_BASE_SECONDS:1.0", convert=float
     )
     read_backend_fetch_retry_jitter_seconds: float = env(
-        "HIPPIUS_READ_BACKEND_FETCH_RETRY_JITTER_SECONDS:0.1", convert=float
+        "HIPPIUS_READ_BACKEND_FETCH_RETRY_JITTER_SECONDS:0.25", convert=float
+    )
+    # How long a fetch may wait for a slot in the pod's concurrency budget before it gives up
+    # (a retryable 503 on the first chunk). Below the 25 s first-chunk timeout by design, so a
+    # saturated budget fails fast and visibly instead of every queued read timing out in lockstep.
+    read_backend_fetch_queue_timeout_seconds: float = env(
+        "HIPPIUS_READ_BACKEND_FETCH_QUEUE_TIMEOUT_SECONDS:15", convert=float
     )
     # Streaming prefetch window (chunks fetched ahead of the one being decrypted/sent). On a
     # cold read it is also the per-request backend parallelism.

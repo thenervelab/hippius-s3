@@ -497,7 +497,9 @@ impl Store {
     }
 
     /// The true drain backlog for `node`: the total `parts.size_bytes` of every part this
-    /// node still owns as `pending`/`draining` in `cephor_replication_status`.
+    /// node still owns as `pending`/`draining`/`uploading` in `cephor_replication_status` —
+    /// `uploading` included because until the backend acks it the SSD copy is the only one,
+    /// pinned against eviction and so not headroom (nor cache: see `node_cache_bytes`).
     ///
     /// This is the WI-20c reconcile of `drain_ssd_backlog_bytes`, which the heartbeat used
     /// to source from raw SSD occupancy (`statvfs`). Occupancy OVERCOUNTS the backlog by
@@ -519,7 +521,7 @@ impl Store {
                ON p.object_id = crs.object_id::uuid \
               AND p.object_version = crs.version \
               AND p.part_number = crs.part_number \
-             WHERE crs.node_id = $1 AND crs.status IN ('pending', 'draining')",
+             WHERE crs.node_id = $1 AND crs.status IN ('pending', 'draining', 'uploading')",
         )
         .bind(node)
         .fetch_one(&self.pool)
@@ -720,21 +722,38 @@ impl Store {
     ///
     /// [`StoreError::Database`].
     pub async fn redrive_diverged_part(&self, part: &PartKey, observed: &PartDigest) -> Result<bool> {
-        let affected = sqlx::query(
-            "UPDATE cephor_replication_status \
-             SET status = 'pending', claimed_at = NULL, deferred_until = NULL, \
-                 upload_enqueued_at = NULL, upload_attempts = 0, updated_at = now() \
-             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND node_id = $4 \
-               AND status IN ('uploading', 'replicated') AND content_sha256 IS DISTINCT FROM $5",
+        // The part's live chunk_backend rows describe the SUPERSEDED bytes (part_chunks rows —
+        // and so chunk_backend rows — survive an UploadPart retry), so they are retired in the
+        // same statement. Otherwise the upload sweep's coverage arm would read them as proof
+        // the fresh hand-off reached the backend and confirm it `replicated` before the
+        // uploader has re-read a byte — and the evictor would then free the only good copy.
+        // The next successful upload of the part revives them (insert_chunk_backend's
+        // ON CONFLICT clears the soft-delete).
+        let (affected,): (i64,) = sqlx::query_as(
+            "WITH redriven AS ( \
+                 UPDATE cephor_replication_status \
+                 SET status = 'pending', claimed_at = NULL, deferred_until = NULL, \
+                     upload_enqueued_at = NULL, upload_attempts = 0, updated_at = now() \
+                 WHERE object_id = $1 AND version = $2 AND part_number = $3 AND node_id = $4 \
+                   AND status IN ('uploading', 'replicated') AND content_sha256 IS DISTINCT FROM $5 \
+                 RETURNING object_id, version, part_number \
+             ), retired AS ( \
+                 UPDATE chunk_backend cb SET deleted = true, deleted_at = now() \
+                 FROM part_chunks pc \
+                 JOIN parts p ON p.part_id = pc.part_id \
+                 JOIN redriven r ON p.object_id = r.object_id::uuid \
+                                AND p.object_version = r.version AND p.part_number = r.part_number \
+                 WHERE cb.chunk_id = pc.id AND NOT cb.deleted \
+             ) \
+             SELECT count(*)::bigint FROM redriven",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
         .bind(self.node_id.as_deref())
         .bind(observed.as_str())
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        .fetch_one(&self.pool)
+        .await?;
         Ok(affected > 0)
     }
 
@@ -1082,8 +1101,8 @@ impl Store {
     /// # Errors
     ///
     /// [`StoreError::Database`].
-    pub async fn bump_upload_attempts(&self, part: &PartKey) -> Result<()> {
-        sqlx::query(
+    pub async fn bump_upload_attempts(&self, part: &PartKey) -> Result<bool> {
+        let affected = sqlx::query(
             "UPDATE cephor_replication_status SET upload_attempts = upload_attempts + 1, updated_at = now() \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'uploading'",
         )
@@ -1091,29 +1110,30 @@ impl Store {
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected();
+        Ok(affected > 0)
     }
 
-    /// How many of THIS node's `uploading` parts have exhausted their re-publish budget and
-    /// still sit past `older_than` — the gauge behind the "uploads stuck" alert. Each is a part
-    /// whose only copy is this node's SSD and whose upload keeps not completing (a 402, a
-    /// missing `part_chunks` row, a DLQ'd request); the operator path (`dlq_requeue`) owns it.
+    /// How many of THIS node's `uploading` parts have exhausted their re-publish budget — the
+    /// gauge behind the "uploads stuck" alert. Each is a part whose only copy is this node's
+    /// SSD and whose upload keeps not completing (a 402, a missing `part_chunks` row, a DLQ'd
+    /// request); the operator path (`dlq_requeue`) owns it.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`].
-    pub async fn count_uploading_exhausted(&self, older_than: Duration, max_attempts: u32) -> Result<u64> {
+    pub async fn count_uploading_exhausted(&self, max_attempts: u32) -> Result<u64> {
         let Some(node) = self.node_id.as_deref() else {
             return Ok(0);
         };
+        // No age predicate: a part is exhausted the moment its last re-publish is recorded,
+        // not one window later — the gauge must not read 0 for an hour after the fact.
         let (count,): (i64,) = sqlx::query_as(
             "SELECT count(*)::bigint FROM cephor_replication_status \
-             WHERE node_id = $1 AND status = 'uploading' \
-               AND updated_at < now() - (interval '1 second' * $2) AND upload_attempts >= $3",
+             WHERE node_id = $1 AND status = 'uploading' AND upload_attempts >= $2",
         )
         .bind(node)
-        .bind(older_than.as_secs_f64())
         .bind(i64::from(max_attempts))
         .fetch_one(&self.pool)
         .await?;
@@ -1153,6 +1173,24 @@ impl Store {
         .await?
         .rows_affected();
         Ok(affected)
+    }
+
+    /// Whether the part's version is ready to publish — the same test
+    /// [`load_upload_context`](Self::load_upload_context) applies (a version row whose
+    /// `address` is set), as one indexed lookup. The probe `drain_part` runs before it reads
+    /// and hashes the part, so a not-ready part costs a row lookup per backoff, not an SSD read.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on query failure.
+    pub async fn upload_address_ready(&self, part: &PartKey) -> Result<bool> {
+        let ready: Option<bool> =
+            sqlx::query_scalar("SELECT address IS NOT NULL FROM object_versions WHERE object_id = $1::uuid AND object_version = $2")
+                .bind(part.object().as_str())
+                .bind(i64::from(part.version().get()))
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(ready.unwrap_or(false))
     }
 
     /// Loads the non-derivable fields the agent needs to build a part's backend
@@ -4341,7 +4379,7 @@ mod part_tests {
         assert_eq!(store.list_uploading_stale(Duration::ZERO, 3, 10).await.unwrap(), vec![part.clone()]);
 
         for attempt in 1..=3 {
-            store.bump_upload_attempts(&part).await.unwrap();
+            assert!(store.bump_upload_attempts(&part).await.unwrap(), "an uploading row takes the bump");
             assert!(
                 store.list_uploading_stale(Duration::from_hours(1), 3, 10).await.unwrap().is_empty(),
                 "a bump restarts the window (attempt {attempt})"
@@ -4352,22 +4390,17 @@ mod part_tests {
             "past the cap it is no longer offered"
         );
         assert_eq!(
-            store.count_uploading_exhausted(Duration::ZERO, 3).await.unwrap(),
+            store.count_uploading_exhausted(3).await.unwrap(),
             1,
-            "and is counted as stuck"
-        );
-        assert_eq!(
-            store.count_uploading_exhausted(Duration::from_hours(1), 3).await.unwrap(),
-            0,
-            "the count honours the window"
+            "and is counted as stuck the moment its last re-publish is recorded"
         );
 
         // A fresh hand-off (a re-drive that went pending → draining → uploading) resets the budget.
         store.confirm_replicated(std::slice::from_ref(&part)).await.unwrap();
-        assert_eq!(
-            store.count_uploading_exhausted(Duration::ZERO, 3).await.unwrap(),
-            0,
-            "a replicated part is not stuck"
+        assert_eq!(store.count_uploading_exhausted(3).await.unwrap(), 0, "a replicated part is not stuck");
+        assert!(
+            !store.bump_upload_attempts(&part).await.unwrap(),
+            "a row the uploader flipped between the listing and the bump is not re-published"
         );
     }
 
@@ -4423,8 +4456,18 @@ mod part_tests {
         // B-2 on the hand-off: an UploadPart retry that lands different bytes while the part is
         // `uploading` must return it to `pending` (the uploader may be reading the old bytes), and
         // a re-announcement of an `uploading` part stamps relanded_at like a `replicated` one.
+        // The part's chunk_backend rows — which survive the retry, because part_chunks rows do —
+        // must be retired with it, or the sweep's coverage arm reads the superseded upload as
+        // proof the fresh hand-off reached the backend.
+        create_app_schema(&pool).await;
         let store = Store::from_pool(pool.clone()).with_node_id("node-a");
         let part = seed_uploading(&store, UUID_A, 5, 1).await;
+        let chunks = seed_part_chunks(&pool, &part, 2).await;
+        for chunk in &chunks {
+            cover_chunk(&pool, *chunk, "arion", false).await;
+        }
+        let backends = vec!["arion".to_owned()];
+        assert_eq!(store.list_uploading_covered(&backends, 10).await.unwrap(), vec![part.clone()]);
 
         // The announcement of a rewrite names a part that already reads `uploading`.
         store.record_landed_part(&part).await.unwrap();
@@ -4457,6 +4500,53 @@ mod part_tests {
                 .unwrap();
         assert!(stamp_cleared, "a re-drive clears the publish stamp");
         assert_eq!(attempts, 0, "and the re-publish budget");
+        let live_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM chunk_backend WHERE NOT deleted")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(live_rows, 0, "the superseded upload's chunk_backend rows are retired with the re-drive");
+
+        // The fresh hand-off is NOT covered until the uploader writes new rows.
+        let claim = store.claim_part().await.unwrap().expect("re-claims the re-driven part");
+        store
+            .mark_uploading(&claim, &PartVerified::for_test(), &PartDigest::from_stored("other".to_owned()))
+            .await
+            .unwrap();
+        assert!(
+            store.list_uploading_covered(&backends, 10).await.unwrap().is_empty(),
+            "stale coverage cannot confirm the re-driven hand-off"
+        );
+        // What insert_chunk_backend's ON CONFLICT does for a re-upload: revive the rows.
+        sqlx::query("UPDATE chunk_backend SET deleted = false, deleted_at = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_uploading_covered(&backends, 10).await.unwrap(),
+            vec![part.clone()],
+            "a fresh upload revives the rows and covers it again"
+        );
+    }
+
+    #[sqlx::test]
+    async fn an_uploading_parts_bytes_are_backlog_not_cache_and_never_evictable(pool: PgPool) {
+        // Between the hand-off and the uploader's flip the SSD holds the ONLY copy: those bytes
+        // are neither evictable cache nor free headroom. They count as backlog (work the node
+        // must still move off), stay off the evictor's worklist, and are not cache bytes.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let part = seed_uploading(&store, UUID_A, 5, 1).await;
+        seed_part_chunks(&pool, &part, 1).await;
+        store.record_resident(&part, 4096).await.unwrap();
+
+        assert_eq!(store.node_backlog_bytes("node-a").await.unwrap(), 4096, "pinned bytes are backlog");
+        assert_eq!(store.node_cache_bytes("node-a").await.unwrap(), 0, "and not evictable cache");
+        assert!(store.evictable_parts(10).await.unwrap().is_empty(), "the evictor never sees it");
+
+        store.confirm_replicated(std::slice::from_ref(&part)).await.unwrap();
+        assert_eq!(store.node_backlog_bytes("node-a").await.unwrap(), 0);
+        assert_eq!(store.node_cache_bytes("node-a").await.unwrap(), 4096, "once on the backend it is cache");
+        assert_eq!(store.evictable_parts(10).await.unwrap().len(), 1);
     }
 
     #[sqlx::test]

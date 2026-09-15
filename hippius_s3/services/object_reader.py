@@ -71,6 +71,18 @@ class StreamContext:
     locations: ChunkLocations = field(default_factory=dict)
 
 
+# A warm plan longer than this resolves locations too: the body of a multi-GB read runs for
+# minutes, long enough for the evictor to drop a chunk the plan-time check saw, and the body
+# never touches the DB — so a long warm read carries its backend fallback from the start.
+# 64 chunks × 4 MiB = 256 MiB; below that a mid-stream eviction is unlikely enough that the
+# extra query on every warm GET is not worth it.
+_RESOLVE_LOCATIONS_MIN_CHUNKS = 64
+
+
+def _needs_locations(source: str, plan: list[ChunkPlanItem]) -> bool:
+    return source == "pipeline" or len(plan) > _RESOLVE_LOCATIONS_MIN_CHUNKS
+
+
 async def _resolve_chunk_locations(db: Any, object_id: str, object_version: int) -> ChunkLocations:
     """Every backend location of every chunk of the version, in download-backend order.
 
@@ -148,12 +160,13 @@ async def build_stream_context(
         parts = await read_parts_list(db, info["object_id"], ov)
     plan = await build_chunk_plan(db, info["object_id"], parts, rng, object_version=ov)
 
-    # Batch check all chunks in a single pass; only a plan with a miss pays for the location lookup.
+    # Batch check all chunks in a single pass; a plan with a miss pays for the location lookup,
+    # and so does a long warm one (see `_needs_locations`).
     checks = [(int(item.part_number), int(item.chunk_index)) for item in plan]
     exist_results = await obj_cache.chunks_exist_batch(info["object_id"], ov, checks)
     source = "cache" if all(exist_results) else "pipeline"
     locations: ChunkLocations = {}
-    if source == "pipeline":
+    if _needs_locations(source, plan):
         locations = await _resolve_chunk_locations(db, info["object_id"], ov)
 
     object_version = int(info.get("object_version") or info.get("current_object_version") or 1)
@@ -206,7 +219,7 @@ async def build_stream_context(
                 # current version's — the body fetches whatever this context says.
                 locations = (
                     await _resolve_chunk_locations(db, info["object_id"], object_version)
-                    if source == "pipeline"
+                    if _needs_locations(source, plan)
                     else {}
                 )
                 kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
@@ -259,6 +272,7 @@ def _stream(ctx: StreamContext, obj_cache: Any, info: dict, *, address: str) -> 
         prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
         chunk_timeout=float(cfg.stream_chunk_timeout_seconds),
         fetch_missing=make_fetch_missing(ctx, obj_cache, object_id=str(info["object_id"]), address=address),
+        has_backend_copy=lambda item: (int(item.part_number), int(item.chunk_index)) in ctx.locations,
     )
 
 
@@ -304,11 +318,18 @@ async def read_response(
 
     async def _body() -> AsyncGenerator[bytes, None]:
         nonlocal first_chunk
-        if first_chunk is not None:
-            yield first_chunk
-            first_chunk = None  # release the (up to ~4 MiB) first chunk for the rest of the stream
-        async for chunk in gen:
-            yield chunk
+        # `finally: aclose()` runs the streamer's own cleanup (cancel the prefetch tasks, which
+        # releases their backend-budget slots and closes their HTTP streams) the moment the
+        # response ends — a client that disconnects mid-stream must not leave up to
+        # prefetch+1 chunks' worth of fetches running until the generator is garbage-collected.
+        try:
+            if first_chunk is not None:
+                yield first_chunk
+                first_chunk = None  # release the (up to ~4 MiB) first chunk for the rest of the stream
+            async for chunk in gen:
+                yield chunk
+        finally:
+            await gen.aclose()
 
     headers = build_headers(
         info,

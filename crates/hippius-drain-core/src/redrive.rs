@@ -425,6 +425,23 @@ mod tests {
     }
 
     #[test]
+    fn the_digest_matches_the_python_uploaders_fold() {
+        // The uploader (hippius_s3/workers/part_digest.py) reproduces this fold to fence its
+        // chunk_backend writes on the row's content_sha256; tests/unit/test_part_digest.py
+        // pins the same golden, so a drift on either side fails one of the two.
+        let chunk_zero = "03047aba0943318f2da44328856c1a7100c9239c4839cfe7fe36cdb2a2a255a2";
+        let chunk_one = "f54ac4fc59ff7f7010e4d2433baf48beee4300b92a58b92e15b80b6472f440ff";
+        assert_eq!(
+            part_digest(&[chunk_zero, chunk_one]).as_str(),
+            "3e85e400a0b5249473ce9325322b8d66d91b32008603a7a52c1c9a44b6efe5d6"
+        );
+        assert_eq!(
+            part_digest::<&str>(&[]).as_str(),
+            "4897c99081ad24f71fb73a2489ecb5ac5e5c2f2f2d14f64783ed2233c58185c8"
+        );
+    }
+
+    #[test]
     fn a_digest_is_stable_and_separates_content_order_and_count() {
         // The four properties the comparison rests on. Stability is what makes an unchanged part
         // read as unchanged; the other three are what stop a real change reading as unchanged.

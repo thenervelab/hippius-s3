@@ -274,7 +274,12 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
             self._promoting.discard(in_flight)
 
     async def invalidate_local_chunk(
-        self, object_id: str, object_version: int, part_number: int, chunk_index: int
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        chunk_index: int,
+        durable_elsewhere: bool = False,
     ) -> bool:
         """Drop THIS node's copy of a chunk whose stored ciphertext would not authenticate.
 
@@ -290,13 +295,15 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         That is also why this method exists on the dual store alone: without a fallback dir the
         single store's root IS the shared pool, and the same call would delete the last copy.
 
-        The pool-presence gate is a data-loss guard, not an optimisation. A freshly ingested part
-        lives on SSD alone until the drain replicates it, and a DEK fault fails those chunks too —
+        The durable-copy gate is a data-loss guard, not an optimisation. A freshly ingested part
+        lives on SSD alone until the backend acks it, and a DEK fault fails those chunks too —
         so an ungated unlink would destroy data over a fault that has nothing to do with the bytes.
-        The gate is exact for a second reason: pool presence is meta-gated, and the drain persists
-        the pool's meta.json LAST, after every chunk is copied and byte-verified (partdrain.rs), so
-        anything this can unlink is already past the point where a drain in flight reads the source.
-        A REDRIVEN part is the one case where pool presence lies — see the status check below.
+        Two things count as a durable copy: `durable_elsewhere` (the caller resolved a live
+        chunk_backend row for this chunk — the backend holds it and the read path can fetch it
+        straight back), or a pool copy, for pool-era parts. Without either, the local copy is
+        the only copy and stays put. Pool presence is meta-gated, and the drain persisted the
+        pool's meta.json LAST, after every chunk was copied and byte-verified, so anything this
+        can unlink on that ground is past the point where a drain in flight read the source.
 
         Removes one chunk file, never the part: `meta.json` is the readiness gate, and a part with
         meta and a hole is exactly the downloader's normal partial-fill state — the hole reads as a
@@ -306,7 +313,9 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         re-write it immediately afterwards; that is self-limiting (the next failed read invalidates
         it again) and not worth serialising against the promotion path.
         """
-        if not await self.fallback.chunk_exists(object_id, object_version, part_number, chunk_index):
+        if not durable_elsewhere and not await self.fallback.chunk_exists(
+            object_id, object_version, part_number, chunk_index
+        ):
             return False
 
         chunk_path = self._chunk_file(Path(self.part_path(object_id, object_version, part_number)), chunk_index)

@@ -9,6 +9,7 @@ import redis.asyncio as async_redis
 from hippius_s3.dlq.base import BaseDLQManager
 from hippius_s3.queue import UploadChainRequest
 from hippius_s3.queue import get_queue_client
+from hippius_s3.queue import upload_queue_name
 
 
 class UploadDLQManager(BaseDLQManager[UploadChainRequest]):
@@ -16,13 +17,12 @@ class UploadDLQManager(BaseDLQManager[UploadChainRequest]):
 
     def __init__(self, redis_client: async_redis.Redis, backend_name: str = "upload"):
         self.backend_name = backend_name
-        self._queue_name = f"{backend_name}_upload_requests"
 
         async def enqueue_to_backend(payload: UploadChainRequest) -> None:
             """Enqueue upload request to specific backend queue."""
             client = get_queue_client()
             raw = payload.model_dump_json()
-            await client.lpush(self._queue_name, raw)  # ty: ignore[invalid-await]
+            await client.lpush(self._queue_name_for(payload), raw)  # ty: ignore[invalid-await]
 
         super().__init__(
             redis_client=redis_client,
@@ -31,12 +31,20 @@ class UploadDLQManager(BaseDLQManager[UploadChainRequest]):
             request_class=UploadChainRequest,
         )
 
+    def _queue_name_for(self, payload: UploadChainRequest) -> str:
+        """A re-queued request must go back to the node that holds its bytes.
+
+        A drain-published request (node_id set) is only readable by that node's uploader; on
+        the global queue the base uploader would find no chunks and DLQ it again as permanent.
+        """
+        return upload_queue_name(self.backend_name, payload.node_id)
+
     async def _bulk_enqueue(self, payloads: List[UploadChainRequest]) -> None:
         """Bulk enqueue upload requests via Redis pipeline."""
         client = get_queue_client()
         pipe = client.pipeline()
         for payload in payloads:
-            pipe.lpush(self._queue_name, payload.model_dump_json())
+            pipe.lpush(self._queue_name_for(payload), payload.model_dump_json())
         await pipe.execute()
 
     def _get_identifier(self, payload: UploadChainRequest) -> str:
