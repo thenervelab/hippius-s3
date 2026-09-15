@@ -80,17 +80,15 @@ class BackgroundMetricsCollector:
                 logger.error(f"Error collecting metrics: {e}")
                 await asyncio.sleep(5)  # Wait 5 seconds on error
 
-    # All per-backend queues to track (lists use LLEN, ZSETs use ZCARD)
-    LIST_QUEUES = [
-        "arion_upload_requests",
-        "ovh_upload_requests",
-        "arion_unpin_requests",
-        "ovh_unpin_requests",
-        "substrate_requests",
-    ]
-    ZSET_QUEUES = [
-        "arion_upload_retries",
-    ]
+    @staticmethod
+    def _fixed_queues() -> tuple[list[str], list[str]]:
+        # The global per-backend lists (LLEN) and retry ZSETs (ZCARD), derived from the pinned
+        # backend set so a queue name is never hardcoded twice.
+        config = get_config()
+        lists = [f"{b}_upload_requests" for b in config.upload_backends]
+        lists += [f"{b}_unpin_requests" for b in config.delete_backends]
+        lists.append("substrate_requests")
+        return lists, [f"{b}_upload_retries" for b in config.upload_backends]
 
     @staticmethod
     def _dlq_queues() -> list[str]:
@@ -125,12 +123,13 @@ class BackgroundMetricsCollector:
         try:
             rc = self.redis_queues_client or self.redis_client
 
+            fixed_lists, fixed_zsets = self._fixed_queues()
             node_lists, node_zsets = await self._node_scoped_queues(rc)
-            for queue_name in self.LIST_QUEUES + self._dlq_queues() + node_lists:
+            for queue_name in fixed_lists + self._dlq_queues() + node_lists:
                 length = int(await rc.llen(queue_name) or 0)  # ty: ignore
                 self.metrics_collector.set_queue_length(queue_name, length)
 
-            for queue_name in self.ZSET_QUEUES + node_zsets:
+            for queue_name in fixed_zsets + node_zsets:
                 length = int(await rc.zcard(queue_name) or 0)
                 self.metrics_collector.set_queue_length(queue_name, length)
 

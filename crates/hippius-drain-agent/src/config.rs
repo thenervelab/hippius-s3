@@ -44,13 +44,11 @@ const DEFAULT_DRAIN_CONCURRENCY: u32 = 4;
 /// is re-copied from its intact SSD source this many times before being held `corrupt` and
 /// paged — enough to ride out a transient pool-copy corruption without looping on a durable one.
 const DEFAULT_REDRIVE_MAX_ATTEMPTS: u32 = 3;
-/// The storage backend set, pinned in code rather than read from the environment. It is the
-/// replication contract: every backend listed must have workers consuming its upload queue,
-/// or no part ever reaches full coverage and its `uploading` row — the SSD copy pinned against
-/// eviction — stays forever. A second backend is a code change that ships together with the
-/// workers that serve it; the Python side pins the same set (`hippius_s3/config.py
-/// STORAGE_BACKENDS`), and the two must agree.
-const STORAGE_BACKENDS: &[&str] = &["arion"];
+/// The storage backend set — the mirror of `STORAGE_BACKENDS` in `hippius_s3/config.py`, which
+/// carries the rationale (pinned in code, never env-driven). The two are held equal through
+/// the wire golden: `enqueue.rs` serializes this set into it, the Python wire test asserts it
+/// against the Python constant.
+pub(crate) const STORAGE_BACKENDS: &[&str] = &["arion"];
 
 /// Upload-sweep period when `CEPHOR_UPLOAD_SWEEP_POLL_SECS` is unset. Every arm of the sweep
 /// is a backstop (the uploader's own flip is the happy path), and each is a partial-index
@@ -209,9 +207,7 @@ pub struct Config {
     /// [`STORAGE_BACKENDS`], never read from the environment (see that constant).
     pub upload_backends: Vec<String>,
     /// Additional backends the janitor gate requires coverage on before reclaiming a part.
-    /// EMPTY, pinned: a backup backend is a deliberate opt-in made in code, and the enqueuer
-    /// MUST push to the same union ([`enqueue_backends`](Config::enqueue_backends)) —
-    /// otherwise a required backend is never enqueued and the gate deadlocks (C10).
+    /// Empty, pinned — a code-only opt-in; see [`enqueue_backends`](Config::enqueue_backends).
     pub backup_backends: Vec<String>,
     /// How often the SSD-reclaim worker scans for `failed` (abandoned-upload) parts.
     pub reclaim_poll: Duration,
@@ -368,14 +364,13 @@ impl Config {
     /// the part could never reach full coverage and the janitor would never reclaim its
     /// SSD copy — a permanent leak/deadlock.
     ///
-    /// It is NOT fully per-version aware: the gate keys on each version's *persisted*
+    /// It is NOT per-version aware: the janitor gate keys on each version's *persisted*
     /// `object_versions.upload_backends` (and forces `['ipfs']` for a `migration` version),
-    /// while this uses the agent's *current* global `config.upload_backends`. The two match
-    /// only when every drained version's persisted set equals the current config and no
-    /// `migration` version transits the drain. A migration or config-drifted version can
-    /// therefore still be required-but-under-enqueued (the same leak, not data loss) — a
-    /// residual the G2 replication-gate sentinel is there to surface. The complete fix reads
-    /// the per-version set in the enqueuer (`load_upload_context` already reads that row).
+    /// while this uses the pinned set. With the set pinned in code the persisted column is a
+    /// record of what the version was written under, not an independent requirement; a
+    /// version persisted under a wider set than the code now pins is required-but-never-
+    /// enqueued (a leak the G2 replication-gate sentinel surfaces, not data loss) until that
+    /// column is backfilled to the pinned set.
     #[must_use]
     pub fn enqueue_backends(&self) -> Vec<String> {
         let mut backends = self.upload_backends.clone();
@@ -552,7 +547,7 @@ mod tests {
         Config, ConfigError, DEFAULT_ALLOCATION_POLL, DEFAULT_CLAIM_LEASE, DEFAULT_DECAY_HALF_LIFE, DEFAULT_DEFER_BACKOFF_CAP,
         DEFAULT_DRAIN_CONCURRENCY, DEFAULT_DRAIN_POLL, DEFAULT_EVICT_HEADROOM_PERMILLE, DEFAULT_EVICT_RESERVE_PERMILLE, DEFAULT_FLOOR_RATE_BPS,
         DEFAULT_HEARTBEAT_POLL, DEFAULT_HEARTBEAT_TTL, DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_ORPHAN_RECLAIM_GRACE, DEFAULT_RECLAIM_GRACE,
-        DEFAULT_RECLAIM_POLL,
+        DEFAULT_RECLAIM_POLL, STORAGE_BACKENDS,
     };
     use core::str::FromStr;
     use hippius_drain_core::{ByteRate, NodeId};
@@ -792,10 +787,11 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_redis_url_and_defaults_upload_backends_to_arion() {
+    fn reads_the_redis_url_and_pins_the_backend_set() {
         let config = Config::from_lookup(lookup(&required_only())).unwrap();
         assert_eq!(config.redis_queues_url, "redis://localhost:6382/0");
-        assert_eq!(config.upload_backends, vec!["arion".to_owned()]);
+        assert_eq!(config.upload_backends, STORAGE_BACKENDS);
+        assert!(config.backup_backends.is_empty(), "a backup backend is a code-only opt-in");
     }
 
     #[test]
@@ -852,15 +848,6 @@ mod tests {
     }
 
     #[test]
-    fn backup_backends_default_to_empty_not_arion() {
-        // Unlike upload_backends (which defaults to ["arion"]), backup must default EMPTY:
-        // a spurious default backup backend would make the janitor gate require coverage
-        // the enqueuer then has to satisfy for no reason.
-        let config = Config::from_lookup(lookup(&required_only())).unwrap();
-        assert!(config.backup_backends.is_empty(), "no backup backends unless opted in, in code");
-    }
-
-    #[test]
     fn enqueue_backends_is_the_deduped_ordered_union_of_upload_and_backup() {
         // C10: the enqueuer must push to every backend the janitor gate requires
         // (upload ∪ backup). Upload order is preserved; a backup already in upload is not
@@ -873,12 +860,6 @@ mod tests {
             vec!["arion".to_owned(), "ipfs".to_owned(), "s3backup".to_owned()],
             "upload order kept, overlap deduped, new backup appended",
         );
-    }
-
-    #[test]
-    fn enqueue_backends_with_no_backup_is_just_upload() {
-        let config = Config::from_lookup(lookup(&required_only())).unwrap();
-        assert_eq!(config.enqueue_backends(), vec!["arion".to_owned()]);
     }
 
     #[test]

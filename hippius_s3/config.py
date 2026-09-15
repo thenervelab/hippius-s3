@@ -36,6 +36,10 @@ def _parse_csv_urls(value: str | None) -> list[str]:
 STORAGE_BACKENDS: tuple[str, ...] = ("arion",)
 
 
+def _storage_backends() -> list[str]:
+    return list(STORAGE_BACKENDS)
+
+
 # The Hippius network's SS58 prefix — the format cacher/run_cacher.py derives account addresses
 # in, and so the only encoding an account_address is ever compared against.
 HIPPIUS_SS58_FORMAT = 42
@@ -488,9 +492,9 @@ class Config:
 
     # Per-operation backend lists (queue names derived as {backend}_{op}_requests). Pinned to
     # STORAGE_BACKENDS — see the note on that constant for why these are not env-driven.
-    upload_backends: list[str] = dataclasses.field(default_factory=lambda: list(STORAGE_BACKENDS))
-    download_backends: list[str] = dataclasses.field(default_factory=lambda: list(STORAGE_BACKENDS))
-    delete_backends: list[str] = dataclasses.field(default_factory=lambda: list(STORAGE_BACKENDS))
+    upload_backends: list[str] = dataclasses.field(default_factory=_storage_backends)
+    download_backends: list[str] = dataclasses.field(default_factory=_storage_backends)
+    delete_backends: list[str] = dataclasses.field(default_factory=_storage_backends)
     # Additional backends that must have replicated a chunk before the janitor is allowed to
     # evict it from the FS cache. Unioned with upload_backends when checking "fully
     # replicated". Empty: a backup backend is a deliberate opt-in, made in code.

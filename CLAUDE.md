@@ -296,7 +296,7 @@ Config is a typed dataclass: [hippius_s3/config.py](hippius_s3/config.py). Value
 
 ### Backend routing
 
-Not environment-driven. The storage backend set is pinned in code — `STORAGE_BACKENDS` in [hippius_s3/config.py](hippius_s3/config.py) (`upload_backends`, `download_backends`, `delete_backends`; `backup_backends` is empty) and the matching constant in [crates/hippius-drain-agent/src/config.rs](crates/hippius-drain-agent/src/config.rs). It is the replication contract: every backend listed must have workers consuming its queues, or no part ever reaches full coverage and the drain's `uploading` rows pin their SSD copies forever. Adding a backend is a code change that ships with the workers that serve it.
+Not environment-driven: the storage backend set is `STORAGE_BACKENDS` in [hippius_s3/config.py](hippius_s3/config.py), mirrored in [crates/hippius-drain-agent/src/config.rs](crates/hippius-drain-agent/src/config.rs) and pinned to the wire golden by both sides' tests. The comment on the Python constant says why it is a code change, not a setting.
 
 ### Feature flags
 

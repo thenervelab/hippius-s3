@@ -98,10 +98,6 @@ Create a `.env` file. Base defaults are in `.env.defaults`.
 | `HIPPIUS_AUTH_ENCRYPTION_KEY` | Encryption key for auth tokens (64 char hex) |
 | `FRONTEND_HMAC_SECRET` | HMAC secret for frontend endpoints |
 
-**Backend Routing**
-| Variable | Default | Description |
-|----------|---------|-------------|
-
 ### Optional
 
 **KMS / Encryption**
