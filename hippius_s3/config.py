@@ -367,16 +367,33 @@ class Config:
     # than the extra load a 1.4-hour sweep costs. Going faster wants the handful of outlier buckets
     # on their own cadence first, which is the real fix.
     #
-    # Recompute holds a GLOBAL advisory lock, so the compactor skips (pg_TRY_) while it runs. That
-    # is harmless -- the ledger is insert-only, prod inserts ~1-3 rows/s, and a 55s hold costs the
-    # ledger ~165 rows -- but it is another reason not to crank this.
+    # Recompute holds the rollup advisory lock for the bucket it is verifying, so the compactor skips
+    # (pg_TRY_) that ONE bucket while it runs and folds every other bucket normally. It used to be a
+    # global key, which is how a single oversized bucket stalled all compaction for its whole timeout.
     usage_reconcile_buckets_per_cycle: int = env("HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE:50", convert=int)
     usage_reconcile_interval_seconds: int = env("HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS:300", convert=int)
     # Server-side bound on ONE bucket recompute, applied as the pool's statement_timeout (prod's own
-    # is 0, so this is the only bound). It has to clear the largest bucket -- tens of seconds, see
-    # above -- by a wide margin, or the reconciler could never verify the one bucket that matters
-    # most, and a bucket that always times out becomes the permanent head of the recompute queue.
-    usage_reconcile_timeout_seconds: float = env("HIPPIUS_USAGE_RECONCILE_TIMEOUT_SECONDS:300.0", convert=float)
+    # is 0, so this is the only bound).
+    #
+    # DELIBERATELY SHORT, and deliberately far below usage_reconcile_interval_seconds. It was 300s,
+    # equal to the interval, which meant one un-aggregatable bucket could consume an entire cycle --
+    # and with two of them the reconciler was holding locks for longer than the interval,
+    # continuously. A bucket that cannot be summed in 20s cannot be summed at all in this design
+    # (prod's largest needs a 167 GB seq scan), so waiting longer buys nothing and costs the pass.
+    # Such buckets are routed to sliced verification instead, which needs no single large aggregate.
+    usage_reconcile_timeout_seconds: float = env("HIPPIUS_USAGE_RECONCILE_TIMEOUT_SECONDS:20.0", convert=float)
+    # Consecutive recompute failures before a bucket is verified in key-range slices instead. Two, not
+    # one, so a single transient failure (a lock wait, a replica hiccup) does not divert a bucket that
+    # is perfectly aggregatable onto the slow path.
+    usage_verify_slice_after_failures: int = env("HIPPIUS_USAGE_VERIFY_SLICE_AFTER_FAILURES:2", convert=int)
+    # Objects per slice. Sized so one slice is a short indexed nested loop rather than anything the
+    # planner would rather seq-scan: at 50k objects the measured plan cost is ~1,212 against
+    # 15,032,678 for the unsliced aggregate over prod's largest bucket.
+    usage_verify_slice_objects: int = env("HIPPIUS_USAGE_VERIFY_SLICE_OBJECTS:50000", convert=int)
+    # Slices per reconcile cycle. 4 x 50k = 200k objects/cycle, so prod's 136M-object bucket completes
+    # a sweep in ~680 cycles (~2.4 days at the 300s interval). Slow is fine: this is a drift alarm on
+    # a bucket that has no other verification at all, and the alternative is none.
+    usage_verify_slices_per_cycle: int = env("HIPPIUS_USAGE_VERIFY_SLICES_PER_CYCLE:4", convert=int)
 
     # ATS (Apache Traffic Server) reverse-proxy cache endpoints (CSV). When ATS_CACHE_ENDPOINT is unset,
     # all PURGE + public Cache-Control logic becomes a no-op — safe default for local dev.

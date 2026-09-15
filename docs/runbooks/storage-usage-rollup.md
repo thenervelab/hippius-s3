@@ -27,7 +27,7 @@ Rules live in [`k8s/otel/values/prometheus.yaml`](../../k8s/otel/values/promethe
 |---|---|---|
 | `StorageRollupWorkerSilent` | No cycles for 15m. **Usage is frozen estate-wide.** | `kubectl -n <ns> logs deploy/usage-rollup -c usage-rollup --tail=100`. It never raises out of its loop, so silence means the pod is down, crash-looping, or stuck on an init container. |
 | `StorageRollupDrift` | A write path moved bytes without emitting a delta | Grep `STORAGE_ROLLUP_DRIFT` for bucket ids. Then read [Diagnosing drift](#diagnosing-drift). |
-| `StorageRollupLedgerLagging` | Compacting but behind | Usually a long recompute holding the global advisory lock. Check for a `recompute_bucket_storage_usage` in `pg_stat_activity`. Self-clears. |
+| `StorageRollupLedgerLagging` | Compacting but behind | Usually a long recompute holding that bucket's advisory lock. Check for a `recompute_bucket_storage_usage` in `pg_stat_activity`. Self-clears. Since the lock became per-bucket this can only delay the ONE bucket being recomputed; estate-wide lag means something else. |
 | `StorageRollupNegativeCounter` | A decrement without its increment | Real trigger defect. The reconciler repairs the value, not the cause. |
 | `PlansCacheStale` / `PlansCacherSilent` | The quota gate's cache is frozen | Last-known-good keeps serving. Check the upstream plans endpoint and `StorageRollupNotBackfilled`. |
 | `PlanGateUnavailable` | The gate could not resolve a plan | **Customer-visible.** Plan accounts fall through to the credit path, which they cannot satisfy → 402. Check `redis-accounts`. |
@@ -99,9 +99,15 @@ SELECT * FROM recompute_bucket_storage_usage('<bucket-uuid>');
 ```
 
 It SETS the counter to truth and discards that bucket's pending ledger rows in the same snapshot, so
-it converges rather than double-counting. It holds the rollup's **global** advisory lock while it
-runs, which pauses the compactor — harmless (the ledger is insert-only) but it is why the reconciler
-is rate-limited.
+it converges rather than double-counting. It holds **that bucket's** advisory lock while it runs,
+which pauses compaction for that bucket only — harmless (the ledger is insert-only).
+
+⚠️ **This is the only repair path for an oversized bucket, and it will not finish on the largest
+ones.** prod's biggest holds 80.7% of the `objects` table, so this aggregate is a 167 GB seq scan.
+The reconciler no longer even attempts it — after `HIPPIUS_USAGE_VERIFY_SLICE_AFTER_FAILURES` (2)
+failures a bucket is verified in key-range slices instead, which DETECTS drift but never writes
+the counter. Repairing such a bucket means running this statement with a raised
+`statement_timeout`, deliberately, out of hours.
 
 ## The lock order you must not break
 
