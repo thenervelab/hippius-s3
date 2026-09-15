@@ -151,6 +151,16 @@ spec:
               value: "150"
             - name: CEPHOR_EVICT_HEADROOM_PERMILLE
               value: "50"
+            # STAGING ONLY. The ingest dir here sits on the node's shared root disk, so the
+            # free-space floor above measures other tenants: it either never arms (150+ GB
+            # free against a ~1 GB read tier) or, raised past that, evicts every part the
+            # moment it replicates. Bound the retained cache by bytes instead: with the
+            # reserve/headroom permilles applied to a 6 GB budget, eviction arms once the
+            # replicated parts on this node exceed ~5.1 GB and frees back to ~4.8 GB, so a
+            # 1 GiB upload past that point is what gets the coldest part evicted. Unset on
+            # production, where the NVMe is the agent's own disk and free space is the truth.
+            - name: CEPHOR_EVICT_CACHE_BUDGET_BYTES
+              value: "6000000000"
             # Max parts drained concurrently — the in-flight gate that lets the node
             # overlap fsync latency across parts (the AIMD allocator only tunes bytes/s).
             # Safe code default (4); set here for per-node tuning.

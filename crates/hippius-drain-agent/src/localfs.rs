@@ -6,7 +6,7 @@
 //! seams. There is no pool side any more: the drain hands parts to the node-local
 //! uploader, which reads this same tree.
 
-use core::future::Future;
+use crate::disk::DiskUsage;
 use hippius_drain_core::{
     ChunkIndex, DiscoveredPart, FailedGrace, FreeSpaceProbe, META_FILE_NAME, OrphanGrace, PartKey, PartMeta, PartRemover, PartScan, PartSource,
     chunk_file_name, parse_part_dir,
@@ -587,6 +587,21 @@ impl PartRemover for LocalSsd {
     }
 }
 
+impl LocalSsd {
+    /// One `statvfs` of the ingest disk. Blocks, so it goes to the blocking pool (axiom
+    /// `r4r_ch10_01`) exactly as the heartbeat does; a panicked probe task surfaces as an error.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if `statvfs` fails or the blocking task panics.
+    pub async fn usage(&self) -> io::Result<DiskUsage> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || crate::disk::disk_usage(&root))
+            .await
+            .map_err(io::Error::other)?
+    }
+}
+
 impl FreeSpaceProbe for LocalSsd {
     type Error = io::Error;
 
@@ -597,17 +612,8 @@ impl FreeSpaceProbe for LocalSsd {
     /// sums `cephor_ssd_residency.bytes`, which is denormalized at residency time and records
     /// zero for a part whose size was unknown. A pass trusting that sum alone could believe it
     /// had freed nothing while reclaiming real space, and page until its time budget.
-    ///
-    /// `statvfs` blocks, so it goes to the blocking pool (axiom `r4r_ch10_01`) exactly as the
-    /// heartbeat and the pass's initial probe do.
-    fn free_bytes(&self) -> impl Future<Output = io::Result<u64>> + Send {
-        let root = self.root.clone();
-        async move {
-            tokio::task::spawn_blocking(move || crate::disk::disk_usage(&root))
-                .await
-                .map_err(io::Error::other)?
-                .map(|usage| usage.free_bytes)
-        }
+    async fn free_bytes(&self) -> io::Result<u64> {
+        self.usage().await.map(|usage| usage.free_bytes)
     }
 }
 

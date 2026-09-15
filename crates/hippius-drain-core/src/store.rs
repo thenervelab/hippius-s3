@@ -377,6 +377,12 @@ impl Store {
         self
     }
 
+    /// The node this store scopes parts to; `None` for the allocator.
+    #[must_use]
+    pub fn node_id(&self) -> Option<&str> {
+        self.node_id.as_deref()
+    }
+
     /// Applies any pending migrations.
     ///
     /// # Errors

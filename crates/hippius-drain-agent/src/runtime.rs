@@ -16,7 +16,7 @@
 //! gracefully — a tick in flight finishes before the worker exits (axiom
 //! `rust_quality_129_async_graceful_shutdown`).
 
-use crate::disk::{DiskUsage, disk_usage};
+use crate::disk::{DiskUsage, budget_usage, disk_usage};
 use crate::landed::LandedQueue;
 use crate::localfs::LocalSsd;
 use crate::readiness::ReadinessTracker;
@@ -24,11 +24,12 @@ use crate::supervisor::{RunReport, Supervisor, WorkerName};
 use crate::worker::drain_until_empty;
 use hippius_drain_core::{
     BreakerConfig, ByteRate, Bytes, CircuitBreaker, Clock, ConcurrencyLimiter, CoordError, Coordinator, Enforcer, EnqueueOutcome, EvictionPass,
-    EvictionTarget, FailedGrace, NodeId, NodeObservation, OrphanGrace, PartDigest, PartKey, ReclaimError, ReclaimGraces, RelandOutcome,
-    ReplicationState, ScanWorker, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate, evict_to_target,
-    jittered, observed_part_digest, reclaim_failed, reclaim_ssd, reconcile_parts, reland_read_outcome, verdict_for_reland,
+    EvictionTarget, FailedGrace, FreeSpaceProbe, NodeId, NodeObservation, OrphanGrace, PartDigest, PartKey, ReclaimError, ReclaimGraces,
+    RelandOutcome, ReplicationState, ScanWorker, SnapshotCell, Store, StoredAllocation, SystemClock, TokenBucket, UploadEnqueuer, decay_rate,
+    evict_to_target, jittered, observed_part_digest, reclaim_failed, reclaim_ssd, reconcile_parts, reland_read_outcome, verdict_for_reland,
 };
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -382,6 +383,72 @@ pub struct EvictionPolicy {
     /// Wall-clock ceiling on one pass, so eviction cannot monopolise the disk the drain is also
     /// writing to. Whatever is left over resumes on the next poll.
     pub max_pass: Duration,
+    /// When set, the evictor measures occupancy against a virtual disk of this many bytes,
+    /// filled by the node's accounted resident cache, instead of the real ingest disk. The
+    /// reserve and headroom permilles then bound the retained read cache rather than the free
+    /// space on a filesystem — see [`CacheBudgetProbe`] for why that is the only signal that
+    /// means anything on a disk the agent does not own. `None` (the shipped default) probes
+    /// the disk with `statvfs`.
+    ///
+    /// A shim for nodes whose ingest dir is not their own disk (staging), not a second
+    /// production policy: the budget is a hand-picked constant, the api's promotion gate cannot
+    /// express it (see [`published_promote_floor`]), and every probe under it is a residency
+    /// `SUM` rather than a `statvfs`.
+    pub cache_budget_bytes: Option<u64>,
+}
+
+/// The evictor's occupancy signal when [`EvictionPolicy::cache_budget_bytes`] is set: the
+/// node's accounted resident cache (`Store::node_cache_bytes`) against a virtual disk of
+/// `budget` bytes, in place of `statvfs`.
+///
+/// Every free-space gate assumes the ingest disk holds what this agent stores and nothing
+/// else. On a shared disk (staging's ingest dir sits on the node's root filesystem) the free
+/// space is a co-tenant's number: a floor above it evicts every replicated part the moment it
+/// lands and reports `starved` forever, and a floor below it never arms at all, so the read
+/// tier is either empty or unbounded and no permille setting can make it otherwise. The budget
+/// substitutes the one quantity the agent does control — the bytes it retains — and leaves the
+/// reserve/headroom arithmetic untouched: eviction arms when the cache exceeds
+/// `budget × (1 − reserve)` and frees back to `budget × (1 − reserve − headroom)`.
+///
+/// Every probe — the pass's initial one and the re-probe after each eviction page — is one
+/// residency `SUM` for this node. Sized for a small tier: on a node retaining millions of parts
+/// that aggregate per page is not free, which is one more reason this stays a shim.
+struct CacheBudgetProbe<'a> {
+    store: &'a Store,
+    node: &'a str,
+    budget: u64,
+}
+
+impl CacheBudgetProbe<'_> {
+    async fn usage(&self) -> io::Result<DiskUsage> {
+        let resident = self.store.node_cache_bytes(self.node).await.map_err(io::Error::other)?;
+        Ok(budget_usage(self.budget, resident))
+    }
+}
+
+/// The occupancy signal one eviction pass runs against, chosen once per pass so the initial
+/// target and every re-probe come from the same source. Two probes that could be chosen
+/// independently is how a pass would arm on the budget and then page against `statvfs`.
+enum EvictProbe<'a> {
+    Disk(&'a LocalSsd),
+    Budget(CacheBudgetProbe<'a>),
+}
+
+impl EvictProbe<'_> {
+    async fn usage(&self) -> io::Result<DiskUsage> {
+        match self {
+            Self::Disk(ssd) => ssd.usage().await,
+            Self::Budget(probe) => probe.usage().await,
+        }
+    }
+}
+
+impl FreeSpaceProbe for EvictProbe<'_> {
+    type Error = io::Error;
+
+    async fn free_bytes(&self) -> io::Result<u64> {
+        self.usage().await.map(|usage| usage.free_bytes)
+    }
 }
 
 /// Resolves a policy against a probed disk into the concrete byte target for one pass.
@@ -446,6 +513,13 @@ fn resolved_reserve_permille(policy: EvictionPolicy, allocated_reserve_permille:
 /// reads an absent key as "signal unavailable" and falls back to its own static floor — which
 /// is the honest answer when there is no live control loop to track.
 fn published_promote_floor(policy: EvictionPolicy, allocated_reserve_permille: Option<u16>) -> Option<u16> {
+    // Under a byte budget the band is held in bytes of retained cache, which the api's gate —
+    // a permille of the REAL mount's free space — cannot express. Publishing the permille floor
+    // anyway would describe a band the evictor is not holding, the exact disagreement this
+    // publication exists to remove; letting the key lapse hands the api its static floor.
+    if policy.cache_budget_bytes.is_some() {
+        return None;
+    }
     let reserve = resolved_reserve_permille(policy, allocated_reserve_permille);
     let floor = promote_floor_permille(reserve, policy.headroom_permille);
     let target = reserve.saturating_add(policy.headroom_permille);
@@ -487,16 +561,16 @@ impl PromoteFloorPublisher {
 /// next poll rather than propagated (a failed pass must not kill the agent), but `starved`
 /// and `skipped_unreplicated` are surfaced loudly because neither is self-correcting.
 async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, policy: EvictionPolicy, floor: Option<&PromoteFloorPublisher>) {
-    let root = ssd.root().to_path_buf();
-    // statvfs blocks — same rule as the heartbeat probe (axiom r4r_ch10_01).
-    let usage = match tokio::task::spawn_blocking(move || disk_usage(&root)).await {
-        Ok(Ok(usage)) => usage,
-        Ok(Err(err)) => {
-            tracing::warn!(error = %err, "eviction disk probe failed");
-            return;
-        }
+    // The budget probe needs a node to sum residency for; a store without one (the allocator's)
+    // has no read tier to bound, and probing the real disk for it would be the wrong signal too.
+    let probe = match policy.cache_budget_bytes.zip(store.node_id()) {
+        Some((budget, node)) => EvictProbe::Budget(CacheBudgetProbe { store, node, budget }),
+        None => EvictProbe::Disk(ssd),
+    };
+    let usage = match probe.usage().await {
+        Ok(usage) => usage,
         Err(err) => {
-            tracing::warn!(error = %err, "eviction disk probe task panicked");
+            tracing::warn!(error = %err, "eviction occupancy probe failed");
             return;
         }
     };
@@ -517,7 +591,7 @@ async fn evict_once(ssd: &LocalSsd, store: &Store, snapshot: &SnapshotCell, poli
         page: policy.batch,
         max_duration: policy.max_pass,
     };
-    match evict_to_target(store, ssd, ssd, &SystemClock, target, pass).await {
+    match evict_to_target(store, ssd, &probe, &SystemClock, target, pass).await {
         Ok(report) => {
             snapshot.record_evicted(report.evicted, report.freed_bytes);
             snapshot.record_evict_blocked_unreplicated(report.skipped_unreplicated);
@@ -1763,6 +1837,7 @@ mod tests {
             headroom_permille: 50,
             batch: 128,
             max_pass: Duration::from_secs(10),
+            cache_budget_bytes: None,
         };
 
         let target = eviction_target(usage, policy, None);
@@ -1789,6 +1864,7 @@ mod tests {
             headroom_permille: 50,
             batch: 128,
             max_pass: Duration::from_secs(10),
+            cache_budget_bytes: None,
         };
 
         let target = eviction_target(usage, policy, Some(400));
@@ -1810,6 +1886,7 @@ mod tests {
             headroom_permille: 50,
             batch: 128,
             max_pass: Duration::from_secs(10),
+            cache_budget_bytes: None,
         };
 
         assert_eq!(eviction_target(usage, policy, None).reserve, 600 * GIB);
@@ -1830,6 +1907,7 @@ mod tests {
             headroom_permille: 50,
             batch: 128,
             max_pass: Duration::from_secs(10),
+            cache_budget_bytes: None,
         };
 
         assert_eq!(eviction_target(usage, policy, None).deficit(), 0, "a zero reserve never arms");
@@ -1852,6 +1930,7 @@ mod tests {
             headroom_permille: 50,
             batch: 128,
             max_pass: Duration::from_secs(10),
+            cache_budget_bytes: None,
         }
     }
 
@@ -1999,6 +2078,17 @@ mod tests {
         // hippius-drain-allocator's AllocConfig) — so it inverted for every reserve >= 175 and
         // said nothing. Exhaustive over the shipped range rather than sampled: 251 values is
         // cheaper than a proptest run and proves the property outright.
+        assert_eq!(
+            published_promote_floor(
+                EvictionPolicy {
+                    cache_budget_bytes: Some(6_000_000_000),
+                    ..shipped_policy()
+                },
+                None
+            ),
+            None,
+            "a byte budget holds a band the api's permille gate cannot express, so nothing is published"
+        );
         for reserve in 150_u16..=400 {
             let floor = published_promote_floor(
                 EvictionPolicy {
@@ -2430,6 +2520,7 @@ mod tests {
                     headroom_permille: 50,
                     batch: 512,
                     max_pass: Duration::from_secs(10),
+                    cache_budget_bytes: None,
                 },
                 redrive_max_attempts: 3,
                 upload_sweep_poll: Duration::from_mins(1),
@@ -2527,6 +2618,7 @@ mod tests {
                     headroom_permille: 50,
                     batch: 512,
                     max_pass: Duration::from_secs(10),
+                    cache_budget_bytes: None,
                 },
                 redrive_max_attempts: 3,
                 upload_sweep_poll: Duration::from_mins(1),
@@ -2658,6 +2750,7 @@ mod tests {
                     headroom_permille: 50,
                     batch: 512,
                     max_pass: Duration::from_secs(10),
+                    cache_budget_bytes: None,
                 },
                 redrive_max_attempts: 3,
                 upload_sweep_poll: Duration::from_mins(1),
@@ -2735,6 +2828,7 @@ mod tests {
                     headroom_permille: 50,
                     batch: 512,
                     max_pass: Duration::from_secs(10),
+                    cache_budget_bytes: None,
                 },
                 redrive_max_attempts: 3,
                 upload_sweep_poll: Duration::from_mins(1),
@@ -2795,6 +2889,7 @@ mod tests {
                     headroom_permille: 50,
                     batch: 512,
                     max_pass: Duration::from_secs(10),
+                    cache_budget_bytes: None,
                 },
                 redrive_max_attempts: 3,
                 upload_sweep_poll: Duration::from_mins(1),
@@ -2927,6 +3022,7 @@ mod tests {
                 headroom_permille: 0,
                 batch: 512,
                 max_pass: Duration::from_secs(10),
+                cache_budget_bytes: None,
             },
             None,
         )
@@ -2946,6 +3042,60 @@ mod tests {
             Some(ReplicationState::Replicated),
             "eviction drops the SSD copy only; the pool copy stays authoritative",
         );
+    }
+
+    #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
+    async fn evict_once_bounds_the_resident_cache_to_its_byte_budget_instead_of_the_disk(pool: PgPool) {
+        // Two 20-byte replicated parts against a 30-byte budget: the virtual disk is over-full,
+        // so the pass arms regardless of how empty the test machine's real disk is. Reserve 150‰
+        // of 30 bytes is 4, headroom 50‰ is 1, so the goal is 5 bytes free under the budget —
+        // met by evicting exactly the colder part (10 free), never both.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let snapshot = SnapshotCell::new();
+
+        let colder = part_at(5, 1);
+        let warmer = part_at(5, 2);
+        for part in [&colder, &warmer] {
+            seed_ssd_dir(ssd_dir.path(), part);
+            store.record_landed_part(part).await.unwrap();
+            seed_resident(&store, &pool, part, 20).await;
+        }
+        // Pin the order rather than trusting two `now()` stamps to differ: the worklist is
+        // coldest-first, and the assertion below is about WHICH part goes.
+        sqlx::query("UPDATE cephor_ssd_residency SET resident_at = now() - interval '1 minute' WHERE object_id = $1 AND part_number = $2")
+            .bind(colder.object().as_str())
+            .bind(i64::from(colder.part().get()))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let ssd = LocalSsd::new(ssd_dir.path());
+        let policy = EvictionPolicy {
+            reserve_permille: 150,
+            headroom_permille: 50,
+            batch: 512,
+            max_pass: Duration::from_secs(10),
+            cache_budget_bytes: Some(30),
+        };
+        super::evict_once(&ssd, &store, &snapshot, policy, None).await;
+
+        assert!(
+            !ssd_dir.path().join(colder.relative_dir()).exists(),
+            "the colder part was evicted to get under the budget"
+        );
+        assert!(
+            ssd_dir.path().join(warmer.relative_dir()).exists(),
+            "the goal was met after one part; the warmer one stays"
+        );
+        assert_eq!(snapshot.evicted(), 1);
+        assert_eq!(store.node_cache_bytes("node-a").await.unwrap(), 20);
+
+        // 20 resident of 30 leaves 10 free, above the 4-byte reserve: the band holds, nothing
+        // more is evicted. The hysteresis the disk mode has, on the budget.
+        super::evict_once(&ssd, &store, &snapshot, policy, None).await;
+        assert_eq!(snapshot.evicted(), 1, "a pass inside the band evicts nothing");
+        assert!(ssd_dir.path().join(warmer.relative_dir()).exists());
     }
 
     #[sqlx::test(migrations = "../hippius-drain-core/migrations")]
@@ -2975,6 +3125,7 @@ mod tests {
                 headroom_permille: 0,
                 batch: 512,
                 max_pass: Duration::from_secs(10),
+                cache_budget_bytes: None,
             },
             None,
         )
