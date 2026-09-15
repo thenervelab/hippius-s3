@@ -8,6 +8,7 @@
 use crate::runtime::{EvictionPolicy, HeartbeatConfig, RuntimeConfig};
 use core::str::FromStr;
 use hippius_drain_core::{ByteRate, NodeId};
+use std::num::NonZeroU64;
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -250,6 +251,12 @@ pub struct Config {
     pub landed_poll: Duration,
     /// Wall-clock ceiling on one eviction pass; the remainder resumes on the next poll.
     pub evict_max_pass: Duration,
+    /// `CEPHOR_EVICT_CACHE_BUDGET_BYTES`: when set and non-zero, the evictor bounds the node's
+    /// accounted resident cache to this many bytes — the reserve and headroom permilles apply
+    /// to the budget instead of to the ingest disk's free space. For nodes whose ingest dir
+    /// shares a disk the agent does not own, where free space measures a co-tenant. Unset or
+    /// zero (the shipped default) keeps the `statvfs` gate.
+    pub evict_cache_budget_bytes: Option<u64>,
     /// Path of the liveness file the runtime touches each heartbeat tick; a k8s
     /// `livenessProbe` checks its freshness to restart a wedged (not crashed) pod.
     pub liveness_file: PathBuf,
@@ -351,6 +358,7 @@ impl Config {
                 headroom_permille: self.evict_headroom_permille,
                 batch: self.evict_batch,
                 max_pass: self.evict_max_pass,
+                cache_budget_bytes: self.evict_cache_budget_bytes,
             },
         }
     }
@@ -443,6 +451,9 @@ impl Config {
             evict_headroom_permille: permille_or(&get, "CEPHOR_EVICT_HEADROOM_PERMILLE", DEFAULT_EVICT_HEADROOM_PERMILLE)?,
             evict_batch: positive_u32_or(&get, "CEPHOR_EVICT_BATCH", DEFAULT_EVICT_BATCH)?,
             evict_max_pass: duration_secs(&get, "CEPHOR_EVICT_MAX_PASS_SECS", DEFAULT_EVICT_MAX_PASS)?,
+            // Zero means "no budget", not a zero-byte cache: an explicit 0 must read as the
+            // disk gate, the same as unset, so the knob can be neutralised in a manifest.
+            evict_cache_budget_bytes: NonZeroU64::new(u64_or(&get, "CEPHOR_EVICT_CACHE_BUDGET_BYTES", 0)?).map(NonZeroU64::get),
             landed_poll: duration_secs(&get, "CEPHOR_LANDED_POLL_SECS", DEFAULT_LANDED_POLL)?,
             failed_reclaim_poll: duration_secs(&get, "CEPHOR_FAILED_RECLAIM_POLL_SECS", DEFAULT_FAILED_RECLAIM_POLL)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
@@ -859,6 +870,30 @@ mod tests {
             config.enqueue_backends(),
             vec!["arion".to_owned(), "ipfs".to_owned(), "s3backup".to_owned()],
             "upload order kept, overlap deduped, new backup appended",
+        );
+    }
+
+    #[test]
+    fn the_cache_budget_is_off_unless_set_to_a_positive_byte_count() {
+        let config = Config::from_lookup(lookup(&required_only())).unwrap();
+        assert_eq!(config.evict_cache_budget_bytes, None, "unset: the disk gate");
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_EVICT_CACHE_BUDGET_BYTES", "0"));
+        assert_eq!(
+            Config::from_lookup(lookup(&pairs)).unwrap().evict_cache_budget_bytes,
+            None,
+            "explicit zero: the disk gate"
+        );
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_EVICT_CACHE_BUDGET_BYTES", "6000000000"));
+        assert_eq!(
+            Config::from_lookup(lookup(&pairs))
+                .unwrap()
+                .runtime_config()
+                .evict_policy
+                .cache_budget_bytes,
+            Some(6_000_000_000),
+            "a positive budget reaches the evictor's policy",
         );
     }
 

@@ -75,6 +75,26 @@ pub fn disk_usage(path: &Path) -> io::Result<DiskUsage> {
     })
 }
 
+/// The [`DiskUsage`] of a virtual disk of `budget` bytes holding `resident` bytes — the
+/// evictor's view when it is bounding the node's accounted cache rather than a filesystem.
+///
+/// Same shape as [`disk_usage`] so the reserve/headroom arithmetic downstream cannot tell the
+/// two apart. A cache already past its budget reads as a full disk (zero free), not as a
+/// negative one.
+///
+/// # Errors
+///
+/// [`io::Error`] only if the used fraction fails validation, which `used_fraction` rules out.
+pub fn budget_usage(budget: u64, resident: u64) -> io::Result<DiskUsage> {
+    let free = budget.saturating_sub(resident);
+    let pressure = DiskPressure::from_fraction(used_fraction(budget, free)).map_err(io::Error::other)?;
+    Ok(DiskUsage {
+        pressure,
+        free_bytes: free,
+        total_bytes: budget,
+    })
+}
+
 /// Widens a platform-dependent-width `statvfs` count to `u64`.
 fn widen(value: impl Into<u64>) -> u64 {
     value.into()
