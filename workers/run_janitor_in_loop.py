@@ -1104,8 +1104,13 @@ async def is_replicated_on_all_backends(
         True if ALL chunks have all expected backends registered in chunk_backend,
         False otherwise (including if no chunks exist or chunk count doesn't match expected)
     """
-    # Read the upload_backends persisted at version-creation time.
-    # Falls back to config.upload_backends for rows created before the column existed.
+    # Read the upload_backends persisted at version-creation time. It is a RECORD of what the
+    # version was written under, not a requirement of its own: the pinned set
+    # (config.upload_backends, STORAGE_BACKENDS) is the contract, so a backend retired from it
+    # since the version was written is no longer required — otherwise every version written
+    # under the wider set would be pinned on the cache forever. Falls back to the pinned set
+    # for rows created before the column existed. Mirrors the CASE in
+    # find_underreplicated_live_chunks.sql and janitor_evictable_candidates.sql.
     row = await db.fetchrow(
         """SELECT version_type, upload_backends FROM object_versions
            WHERE object_id = $1 AND object_version = $2""",
@@ -1113,12 +1118,13 @@ async def is_replicated_on_all_backends(
         object_version,
     )
     version_type = row["version_type"] if row else None
+    pinned = list(config.upload_backends)
     if version_type == "migration":
         expected: list[str] = ["ipfs"]
     elif row and row["upload_backends"]:
-        expected = list(row["upload_backends"])
+        expected = [b for b in row["upload_backends"] if b in pinned] or pinned
     else:
-        expected = list(config.upload_backends)
+        expected = pinned
 
     # Union in any configured backup backends. The janitor must not delete a
     # part until every required backend — upload AND backup — has a live
