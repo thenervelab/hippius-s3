@@ -241,8 +241,16 @@ Two jobs in one loop:
 
 | Job | Interval | What it does |
 |---|---|---|
-| **Compact** | `HIPPIUS_USAGE_ROLLUP_LOOP_SLEEP` (5s) | Claims `HIPPIUS_USAGE_ROLLUP_BATCH_SIZE` (5000) ledger rows with `DELETE ... RETURNING` and adds them to the counter. |
-| **Reconcile** | `HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS` (300s) | Fully recomputes `HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE` (50) live buckets, oldest-recomputed first, and exports the correction as **drift**. ~5.6h for a full sweep over prod's ~3,350 live buckets, which is the only bound on how long a bucket can carry a wrong number. These are the heaviest aggregates in the schema and they run on the PRIMARY — a cold 200-bucket pass measured 35.9s / 9.8 GiB of buffer traffic, which is why the rate is 50 and not 200. Read the justification in [config.py](../hippius_s3/config.py) before changing either number. |
+| **Compact** | `HIPPIUS_USAGE_ROLLUP_LOOP_SLEEP` (5s) | Drains the ledger **one bucket at a time**, oldest work first, `HIPPIUS_USAGE_ROLLUP_BATCH_SIZE` (5000) rows per claim, with `DELETE ... RETURNING` under that bucket's advisory lock. Also accumulates `churn_bytes`. |
+| **Reconcile** | `HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS` (300s) | Recomputes `HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE` (50) live buckets, **least-recently-ATTEMPTED** first, and exports the correction as **drift**. ~5.6h for a full sweep over prod's ~3,350 live buckets, which is the only bound on how long a bucket can carry a wrong number. These are the heaviest aggregates in the schema and they run on the PRIMARY — a cold 200-bucket pass measured 35.9s / 9.8 GiB of buffer traffic, which is why the rate is 50 and not 200. Bounded per bucket by `HIPPIUS_USAGE_RECONCILE_TIMEOUT_SECONDS` (**20s**, far below the interval on purpose). Read the justification in [config.py](../hippius_s3/config.py) before changing any of them. |
+| **Verify (sliced)** | same pass as Reconcile | A bucket that fails `HIPPIUS_USAGE_VERIFY_SLICE_AFTER_FAILURES` (2) recomputes is instead summed in indexed `object_key` ranges — `HIPPIUS_USAGE_VERIFY_SLICES_PER_CYCLE` (4) × `HIPPIUS_USAGE_VERIFY_SLICE_OBJECTS` (50k) per cycle — carrying a cursor across cycles. **It MEASURES only and never writes the counter.** Drift is claimed only when the gap exceeds the `churn_bytes` that moved during the sweep, which makes it a one-sided test that cannot false-positive on live traffic. |
+
+**Least-recently-ATTEMPTED, not least-recently-recomputed.** `recompute_bucket_storage_usage()` only
+stamps on success, so ordering the queue on that stamp meant a bucket whose aggregate can never
+complete kept a NULL timestamp, sat at the head of the queue forever, and starved everything behind
+it — prod 2026-09-15: 168 failures in 24h on one bucket and 47 of 50 slots used per pass. The
+failure is recorded in its own transaction (the recompute's has already rolled back) so the bucket
+rotates out after one try.
 
 **Compaction is exactly-once by construction.** The rows leave the ledger in the same transaction
 that adds them to the counter, so a crash puts them back and a second compactor can only see rows
@@ -260,12 +268,21 @@ the outgoing version at the same time. **Alert on it.** Same for
 `storage_rollup_negative_buckets`, which is only reachable if a decrement was recorded without its
 increment.
 
-**A recompute and a compaction must not overlap**, or the recompute's `SET` can silently discard a
-delta the compactor has already consumed — permanently, and in a way that keeps the drift metric
-non-zero forever, destroying the one signal that says the ledger is wrong. A global advisory lock
-enforces it: the compactor uses `pg_try_advisory_xact_lock` and skips the cycle, the recompute waits.
-The recompute itself drains the bucket's pending ledger rows and aggregates the truth in ONE
-statement, therefore in ONE snapshot, so a write landing mid-recompute is counted exactly once.
+**A recompute and a compaction of the SAME bucket must not overlap**, or the recompute's `SET` can
+silently discard a delta the compactor has already consumed — permanently, and in a way that keeps
+the drift metric non-zero forever, destroying the one signal that says the ledger is wrong. A
+**per-bucket** advisory lock enforces it — `pg_advisory_xact_lock(rollup_key, bucket_key)` — where
+the compactor uses `pg_try_` and skips just that bucket while the recompute waits. The recompute
+itself drains the bucket's pending ledger rows and aggregates the truth in ONE statement, therefore
+in ONE snapshot, so a write landing mid-recompute is counted exactly once.
+
+⚠️ **The second lock argument used to be a hardcoded `0`, i.e. one key for the whole estate.** A
+recompute of any single bucket therefore stalled compaction for every other bucket for its entire
+timeout. On prod (2026-09-15) one 136M-object bucket — 80.7% of the `objects` table, so a 167 GB seq
+scan that can never finish in a cycle — failed 168 times in 24h and aged the ledger's oldest row to
+**412s** against a normal 2s. Keying the lock per bucket is what makes an un-aggregatable bucket a
+local problem instead of an estate-wide one. Pinned by
+`test_a_recompute_does_not_block_an_unrelated_buckets_compaction`.
 
 **Why a separate worker rather than a second loop in the plans-cacher.** The plans-cacher's pool is
 `DATABASE_READONLY_URL`, a read replica, because its work must not run on the primary. Compaction

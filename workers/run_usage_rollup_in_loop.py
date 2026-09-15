@@ -105,6 +105,9 @@ async def run_cycle(pool: asyncpg.Pool, reconcile: bool) -> bool:
                     conn,
                     config.usage_reconcile_buckets_per_cycle,
                     config.usage_reconcile_timeout_seconds,
+                    slice_after_failures=config.usage_verify_slice_after_failures,
+                    slice_page_objects=config.usage_verify_slice_objects,
+                    slice_max_per_cycle=config.usage_verify_slices_per_cycle,
                 )
                 changed = [r for r in results if r.drift_bytes]
                 for result in results:
