@@ -416,6 +416,21 @@ jobs:
           # bypass) is prevented by the label either way.
           kubectl delete deployment/gateway -n hippius-s3-staging --ignore-not-found=true
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
+          # The node-local uploader must be Ready BEFORE the drain image rolls: the drain
+          # publishes to `arion_upload_requests:<node>`, which only this DaemonSet reads. Same
+          # partial-roll policy as drain-agent below (>= 1 Ready; warn on partial, fail on zero).
+          if ! kubectl rollout status daemonset/arion-uploader-local -n hippius-s3-staging --timeout=10m; then
+            ready=$(kubectl get ds arion-uploader-local -n hippius-s3-staging -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+            desired=$(kubectl get ds arion-uploader-local -n hippius-s3-staging -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+            if [ "${ready:-0}" -ge 1 ]; then
+              echo "::warning::arion-uploader-local rolled ${ready}/${desired} (a labeled node is likely at pod capacity); proceeding"
+            else
+              echo "::error::arion-uploader-local has zero Ready pods (${ready}/${desired})"
+              kubectl get ds arion-uploader-local -n hippius-s3-staging -o wide || true
+              kubectl get pods -l app=arion-uploader-local -n hippius-s3-staging -o wide || true
+              exit 1
+            fi
+          fi
           # Drain stack, allocator-first: the allocator applies the cephor_* migrations
           # on startup, so confirm it is Ready (strict) before the per-node agent DaemonSet.
           kubectl rollout status deployment/drain-allocator -n hippius-s3-staging --timeout=5m

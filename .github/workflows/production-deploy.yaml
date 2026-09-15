@@ -404,6 +404,10 @@ jobs:
           # maintenance window.
           kubectl delete deployment/gateway -n "$ns" --ignore-not-found=true
           kubectl rollout status deployment/arion-uploader -n "$ns" --timeout=10m
+          # The node-local uploader must be Ready BEFORE the drain image rolls: the drain publishes
+          # to `arion_upload_requests:<node>`, which only this DaemonSet reads. Strict, like
+          # drain-agent below: an ingest node without it never uploads what it ingests.
+          kubectl rollout status daemonset/arion-uploader-local -n "$ns" --timeout=20m
           # Drain stack (allocator-first: it applies the cephor_* migrations on startup). Present
           # only once the drain block is uncommented in kustomization.yaml (at cutover).
           wait_deploy drain-allocator 5m
