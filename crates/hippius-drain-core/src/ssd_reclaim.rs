@@ -172,6 +172,13 @@ pub trait ReclaimLog: Send + Sync {
     /// place, with everything past the first page waiting on the hourly walk. The walk-driven
     /// path did not need this because it is disk-keyed; a status-keyed worklist does.
     fn mark_failed_reclaimed(&self, parts: &[PartKey]) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Releases this node's residency claims on deleted-object orphans the caller just
+    /// unlinked. An orphan has no replication row, so `mark_failed_reclaimed`'s row-keyed
+    /// release cannot reach its claim, and a claim that outlives its bytes is a lie two readers
+    /// act on: the reconciler reads "resident, no row" as a read-promoted copy (never drained),
+    /// and a re-minted version number landing on this node would inherit it.
+    fn release_orphan_residency(&self, parts: &[PartKey]) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// The `object_versions` backing seam: answers two questions about a batch of parts, both
@@ -392,6 +399,7 @@ where
         backing.servable_parts(&failed_aged).await.map_err(ReclaimError::backing)?
     };
 
+    let mut orphans_unlinked: Vec<PartKey> = Vec::new();
     for discovered in parts {
         report.scanned += 1;
         let part = &discovered.part;
@@ -403,6 +411,7 @@ where
         let Some(status) = states.get(part) else {
             if unbacked.contains(part) && discovered.age >= graces.orphan.get() {
                 remover.unlink_part(part).await.map_err(ReclaimError::Remove)?;
+                orphans_unlinked.push(part.clone());
                 report.reclaimed_orphan += 1;
             } else {
                 report.skipped_absent += 1;
@@ -446,6 +455,10 @@ where
             // stays as defense-in-depth for a row not yet promoted to `Corrupt`).
             ReplicationState::Corrupt => report.skipped_corrupt += 1,
         }
+    }
+
+    if !orphans_unlinked.is_empty() {
+        log.release_orphan_residency(&orphans_unlinked).await.map_err(ReclaimError::log)?;
     }
 
     debug_assert_eq!(
@@ -746,6 +759,8 @@ mod tests {
         states: HashMap<String, PartStatusAge>,
         calls: Mutex<u32>,
         fail: bool,
+        /// Orphans whose residency claim the reclaim released after unlinking them.
+        released: Mutex<Vec<String>>,
     }
 
     impl FakeLog {
@@ -758,11 +773,16 @@ mod tests {
                 states,
                 calls: Mutex::new(0),
                 fail: false,
+                released: Mutex::new(Vec::new()),
             }
         }
 
         fn calls(&self) -> u32 {
             *self.calls.lock().unwrap()
+        }
+
+        fn released(&self) -> Vec<String> {
+            self.released.lock().unwrap().clone()
         }
     }
 
@@ -770,6 +790,11 @@ mod tests {
         type Error = io::Error;
 
         async fn mark_failed_reclaimed(&self, _parts: &[PartKey]) -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        async fn release_orphan_residency(&self, parts: &[PartKey]) -> Result<(), io::Error> {
+            self.released.lock().unwrap().extend(parts.iter().map(key));
             Ok(())
         }
 
@@ -1212,6 +1237,11 @@ mod tests {
         assert_eq!(report.reclaimed_orphan, 1);
         assert_eq!(report.skipped_absent, 0);
         assert_eq!(remover.removed(), vec![key(&part)], "the deleted-object orphan was unlinked");
+        assert_eq!(
+            log.released(),
+            vec![key(&part)],
+            "its residency claim went with the bytes, so no stale claim can be read as a promoted copy",
+        );
     }
 
     #[tokio::test]
@@ -1415,6 +1445,10 @@ mod failed_reclaim_tests {
             let gone: Vec<PartKey> = parts.to_vec();
             self.marked.lock().unwrap().extend(gone.iter().map(|p| p.part().get()));
             self.candidates.lock().unwrap().retain(|p| !gone.contains(p));
+            Ok(())
+        }
+
+        async fn release_orphan_residency(&self, _parts: &[PartKey]) -> Result<(), io::Error> {
             Ok(())
         }
 
