@@ -86,8 +86,7 @@ async def test_all_cached_uses_batch_and_sets_source_cache(
 
 
 @pytest.mark.asyncio
-@patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock)
-@patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=["ipfs"])
+@patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=["arion"])
 @patch("hippius_s3.services.object_reader.build_chunk_plan")
 @patch("hippius_s3.services.object_reader.read_parts_list")
 @patch("hippius_s3.services.object_reader.require_supported_storage_version", return_value=5)
@@ -104,7 +103,6 @@ async def test_partial_cached_sets_source_pipeline(
     mock_read_parts,
     mock_plan,
     mock_resolve,
-    mock_enqueue,
 ):
     plan_items = _make_plan_items(3)
     mock_plan.return_value = plan_items
@@ -115,6 +113,9 @@ async def test_partial_cached_sets_source_pipeline(
     # First and third cached, second missing
     obj_cache = FakeObjCache([True, False, True])
     db = FakeDB()
+    db.fetch = AsyncMock(
+        return_value=[{"part_number": 1, "chunk_index": i, "backend_identifier": f"id-{i}"} for i in range(3)]
+    )
 
     from hippius_s3.services.object_reader import build_stream_context
 
@@ -122,13 +123,14 @@ async def test_partial_cached_sets_source_pipeline(
 
     assert ctx.source == "pipeline"
     obj_cache.chunks_exist_batch.assert_awaited_once()
-    # Download should have been enqueued for the missing chunk
-    mock_enqueue.assert_awaited_once()
+    # A miss resolves every chunk's backend location up front (one query per backend), so the body
+    # never needs the DB — a chunk cached at plan time can still be evicted before it is read.
+    mock_resolve.assert_awaited_once()
+    assert ctx.locations == {(1, i): (("arion", f"id-{i}"),) for i in range(3)}
 
 
 @pytest.mark.asyncio
-@patch("hippius_s3.services.object_reader.enqueue_download_request", new_callable=AsyncMock)
-@patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=["ipfs"])
+@patch("hippius_s3.services.object_reader.resolve_object_backends", new_callable=AsyncMock, return_value=["arion"])
 @patch("hippius_s3.services.object_reader.build_chunk_plan")
 @patch("hippius_s3.services.object_reader.read_parts_list")
 @patch("hippius_s3.services.object_reader.require_supported_storage_version", return_value=5)
@@ -145,7 +147,6 @@ async def test_none_cached_sets_source_pipeline(
     mock_read_parts,
     mock_plan,
     mock_resolve,
-    mock_enqueue,
 ):
     plan_items = _make_plan_items(4)
     mock_plan.return_value = plan_items
@@ -161,7 +162,8 @@ async def test_none_cached_sets_source_pipeline(
     ctx = await build_stream_context(db, None, obj_cache, _make_info(), rng=None, address="addr1")
 
     assert ctx.source == "pipeline"
-    mock_enqueue.assert_awaited_once()
+    mock_resolve.assert_awaited_once()
+    assert ctx.locations == {}, "no backend row yet: the body re-polls the local tiers, then 503s"
 
 
 @pytest.mark.asyncio

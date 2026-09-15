@@ -13,6 +13,7 @@ from typing import Iterable
 from hippius_s3.monitoring import AeadFailureOutcome
 from hippius_s3.monitoring import AeadFailureTier
 
+from .backend_fetch import ChunkUnavailableError
 from .decrypter import CIPHERTEXT_UNUSABLE
 from .decrypter import decrypt_chunk_if_needed
 from .decrypter import maybe_slice
@@ -28,6 +29,9 @@ DecryptFn = Callable[[bytes, ChunkPlanItem], Awaitable[bytes]]
 # Drops this node's cached copy of a chunk, returning whether one was removed. False means there
 # was nothing local to invalidate, so re-fetching would only return the same bytes.
 InvalidateFn = Callable[[ChunkPlanItem], Awaitable[bool]]
+# The lowest tier: fetch a chunk the local tiers do not hold (from the backend, into memory).
+# Raises `ChunkUnavailableError` when nothing can serve it.
+FetchMissingFn = Callable[[ChunkPlanItem], Awaitable[bytes]]
 
 
 def _record_aead_failure(tier: AeadFailureTier, outcome: AeadFailureOutcome) -> None:
@@ -60,7 +64,7 @@ async def _decrypt_reloading_once(
     The retry is straight-line and happens EXACTLY once — deliberately not a loop. A DEK-level
     fault (wrong wrapped key, wrong AAD) fails every chunk of every object, and an unbounded
     invalidate-and-retry would turn that single fault into a fleet-wide cache wipe that also
-    hammers the pool. Note what the bound implies per request: a retry that fails too ends the
+    hammers the backend. Note what the bound implies per request: a retry that fails too ends the
     stream, so a request invalidates once and stops, while a request that keeps recovering is by
     definition healing isolated corruption one chunk at a time.
     """
@@ -68,11 +72,11 @@ async def _decrypt_reloading_once(
         return await decrypt_fn(cbytes, item)
     except CIPHERTEXT_UNUSABLE:
         if not await invalidate_fn(item):
-            # Nothing local held these bytes (a peer or the pool served them, or this deployment
-            # has no lower tier) — re-fetching would return the same bytes, and the pool copy is
-            # authoritative, so a fault there is a real error. The store also answers False when
-            # a redrive has marked the pool copy suspect: the retry would read superseded bytes
-            # that still authenticate, so failing here is the only safe outcome.
+            # Nothing local held these bytes (a peer, the pool or the backend served them, or this
+            # deployment has no lower tier) — re-fetching would return the same bytes, and the
+            # backend copy is authoritative, so a fault there is a real error. The store also
+            # answers False when a redrive has marked the pool copy suspect: the retry would read
+            # superseded bytes that still authenticate, so failing here is the only safe outcome.
             _record_aead_failure("remote", "unrecovered")
             raise
         logger.warning(
@@ -136,7 +140,8 @@ async def _emit(
 
     it = iter(plan)
 
-    # A small lookahead window to overlap chunk fetch with decrypt + response IO.
+    # A small lookahead window to overlap chunk fetch with decrypt + response IO. With the backend
+    # as the lowest tier this is also the per-request backend parallelism on a cold read.
     pending: deque[tuple[ChunkPlanItem, asyncio.Task[bytes]]] = deque()
 
     def _schedule_one() -> bool:
@@ -200,7 +205,17 @@ async def stream_plan(
     # Fallback only; object_reader passes the wired default HTTP_STREAM_PREFETCH_CHUNKS (16 in prod).
     prefetch_chunks: int = 0,
     chunk_timeout: float | None = None,
+    fetch_missing: FetchMissingFn | None = None,
 ) -> AsyncGenerator[bytes, None]:
+    """Yield the plan's plaintext, chunk by chunk.
+
+    Each chunk is read from the local tiers (`obj_cache.get_chunk`: this node's SSD, then a peer's,
+    then the pool) and, on a miss, pulled from the backend into memory by `fetch_missing` — the
+    ciphertext is decrypted here and yielded, never written back. `fetch_missing=None` (a caller
+    with no backend, e.g. a test over a bare store) turns a miss into `ChunkUnavailableError`.
+    `chunk_timeout` bounds each chunk's fetch so a stalled backend ends the stream in minutes
+    rather than hanging the open response.
+    """
     prefetch = max(0, int(prefetch_chunks))
 
     async def _decrypt(c: bytes, item: ChunkPlanItem) -> bytes:
@@ -231,35 +246,21 @@ async def stream_plan(
             await invalidate_local(object_id, int(object_version), int(item.part_number), int(item.chunk_index))
         )
 
-    # RQ-1: one pub/sub subscription for the whole stream, demuxed per chunk, instead of a fresh
-    # subscribe/unsubscribe per cold chunk. Opt-in; the default per-chunk path is unchanged.
-    if _single_subscription_enabled() and hasattr(obj_cache, "stream_subscription"):
-        sub_timeout = float(chunk_timeout) if chunk_timeout is not None else _default_chunk_timeout()
-        async with obj_cache.stream_subscription(object_id, int(object_version)) as sub:
-
-            async def _wait_sub(item: ChunkPlanItem) -> bytes:
-                return await sub.wait_for_chunk(int(item.part_number), int(item.chunk_index), timeout=sub_timeout)
-
-            async for out in _emit(
-                plan=plan,
-                wait_fn=_wait_sub,
-                decrypt_fn=_decrypt,
-                invalidate_fn=_invalidate,
-                object_id=object_id,
-                object_version=int(object_version),
-                prefetch=prefetch,
-            ):
-                yield out
-        return
+    async def _fetch(item: ChunkPlanItem) -> bytes:
+        cached = await obj_cache.get_chunk(object_id, int(object_version), int(item.part_number), int(item.chunk_index))
+        if cached is not None:
+            return cached
+        if fetch_missing is None:
+            raise ChunkUnavailableError(
+                f"chunk not on any local tier and no backend fetch configured: "
+                f"{object_id} v{int(object_version)} part {int(item.part_number)} chunk {int(item.chunk_index)}"
+            )
+        return await fetch_missing(item)
 
     async def _wait(item: ChunkPlanItem) -> bytes:
-        return await obj_cache.wait_for_chunk(
-            object_id,
-            int(object_version),
-            int(item.part_number),
-            int(item.chunk_index),
-            timeout=chunk_timeout,
-        )
+        if chunk_timeout is None:
+            return await _fetch(item)
+        return await asyncio.wait_for(_fetch(item), timeout=float(chunk_timeout))
 
     async for out in _emit(
         plan=plan,
@@ -271,21 +272,3 @@ async def stream_plan(
         prefetch=prefetch,
     ):
         yield out
-
-
-def _single_subscription_enabled() -> bool:
-    try:
-        from hippius_s3.config import get_config
-
-        return bool(get_config().stream_single_subscription)
-    except Exception:
-        return False
-
-
-def _default_chunk_timeout() -> float:
-    try:
-        from hippius_s3.config import get_config
-
-        return float(get_config().cache_ttl_seconds)
-    except Exception:
-        return 3600.0
