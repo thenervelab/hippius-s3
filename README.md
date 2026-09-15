@@ -88,7 +88,6 @@ Create a `.env` file. Base defaults are in `.env.defaults`.
 | Variable | Description |
 |----------|-------------|
 | `HIPPIUS_SUBSTRATE_URL` | Blockchain RPC URL (default: `wss://rpc.hippius.network`) |
-| `HIPPIUS_VALIDATOR_REGION` | Validator region identifier (default: `decentralized`) |
 | `HIPPIUS_API_BASE_URL` | Hippius blockchain API (default: `https://api.hippius.com/api`) |
 
 **Authentication & Security**
@@ -322,7 +321,7 @@ docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 | OTel Collector | localhost:4317/4318 | OTLP receiver |
 | App Metrics | http://localhost:8080/metrics | Prometheus endpoint |
 
-Pre-built Grafana dashboards: Hippius S3 Overview (API performance, request rates, error rates) and S3 Workers (queue depths, processing rates, backend latency).
+Grafana dashboards live in `monitoring/grafana/dashboards/`.
 
 ## Benchmarks
 

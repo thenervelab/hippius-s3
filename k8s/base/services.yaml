@@ -3,9 +3,8 @@ kind: Service
 metadata:
   name: api
 spec:
-  # The api-local DaemonSet is the whole serving fleet since the drain-direct cutover (the
-  # pool-backed api Deployment is gone). A full swap by design: a pool-backed api pod writes
-  # to CephFS, which the drain never scans, so there is no safe hybrid to route to.
+  # The api-local DaemonSet is the whole serving fleet; there is no pool-backed api Deployment
+  # any more. tests/unit/test_k8s_service_selectors.py keeps this selector honest.
   selector:
     app: api-local
   # Site-pinning: prefer the api pod on the CALLER's node, falling back gracefully to any

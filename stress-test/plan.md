@@ -301,7 +301,7 @@ these; it does not replace them.
 ### 4.7 Prod-scale query gate (R2)
 - **Purpose:** prove the reaper + reconciler queries are index-driven at prod cardinality **before** enabling on prod —
   the nvme-postgres-instability incident class.
-- **Build (`db/prod_scale_gate.py`):** load a **prod-scale** clean dump (a filtered prod dump; the old `gen_clean_dump.py` helper is gone) into a staging DB;
+- **Build (`db/prod_scale_gate.py`):** load a **prod-scale** filtered prod dump into a staging DB;
   `EXPLAIN (ANALYZE, BUFFERS)` the reaper `SELECT`, `claim_part`, and the reconciler `statuses()`/`part_states()`;
   **HypoPG/Dexter** to confirm the right indexes. **Rewrite batch predicates as `col = ANY($1::uuid[])`** (btree, PG17
   ~3×) — never `scalar = ANY(array_column)` (forces a seq scan, needs GIN).

@@ -22,9 +22,7 @@
 # allow-list (node1..node5) is belt-and-suspenders WITH the label: a stray/mislabeled node
 # alone can't place ingest on a psql/cache node.
 #
-# Routing: the existing `api` Service (the gateway's GATEWAY_BACKEND_URL=http://api:8000
-# upstream) is patched to select `app: api-local` (kustomization.yaml), so the gateway routes
-# here through the normal front door.
+# Routing: the `api` and `gateway` Services (k8s/base/services.yaml) select `app: api-local`.
 #
 # IMPORTANT: with no ceph api pods, every upload stages locally and stays `pending` until the
 # drain replicates local->ceph. The drain stack (allocator + agent) MUST be up first.

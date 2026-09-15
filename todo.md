@@ -26,7 +26,7 @@ If you're new here, read [CLAUDE.md](CLAUDE.md) first for the architectural map.
                                     │         └─ fs_store.set_chunk         │
                                     │         └─ WriteThroughPartsWriter    │
                                     │                                       │
-                                    │  obj_cache: FS chunks + Redis pubsub  │
+                                    │  obj_cache: FS chunks + peer fetch    │
                                     └──┬─────────┬─────────────┬────────────┘
                                        │         │             │
           ┌────────────────────────────┘         │             └──────────────┐
@@ -34,8 +34,8 @@ If you're new here, read [CLAUDE.md](CLAUDE.md) first for the architectural map.
   ┌──────────────┐              ┌─────────────────────────┐       ┌─────────────────────┐
   │ PostgreSQL   │              │ FileSystemPartsStore    │       │ Redis queues        │
   │ + keystore   │              │ /var/lib/hippius/       │       │ arion_upload_requests│
-  │              │              │   object_cache/         │       │ arion_download_...  │
-  └──────────────┘              │ + ChunkNotifier pubsub  │       │ unpin_requests      │
+  │              │              │   object_cache/         │       │   (:<node> per node) │
+  └──────────────┘              │                         │       │ unpin_requests      │
                                 └────────┬────────────────┘       └─────────┬───────────┘
                                          │                                  │
                                          ▼                                  ▼
@@ -170,10 +170,6 @@ The publish-time trim only covers parts published after the fix. For inventoried
 ### Follow-up — hippius-otel alert on servable write-offs
 
 Add `increase(drain_parts_written_off_servable_total[1h]) > 0` to hippius-otel. A servable write-off is data loss for a part a client could still read — always operator-worthy, and the counter exists precisely so this alert can be cheap.
-
-### P1 — Meta.json rewrites on concurrent upload + download
-
-Obsolete since 2026-09: the downloader is gone, so nothing but the writer touches `meta.json` any more.
 
 ### P1 — `execute_v5_fast_path_copy` latent risk
 
@@ -542,11 +538,7 @@ This section covers only the **local FS bytes**. The worse half — superseded v
 
 **Action**: audit every SQL query that feeds `build_stream_context` for a `deleted_at IS NULL` predicate. Anchor: [hippius_s3/sql/queries/](hippius_s3/sql/queries/).
 
-### 5.3 Partial-fill meta consistency
-
-Obsolete since 2026-09: the downloader that wrote `meta.json` before its chunks is gone; the writer writes it last, so a visible `meta.json` means a complete part.
-
-### 5.4 Mixed-deploy window after a cache refactor
+### 5.3 Mixed-deploy window after a cache refactor
 
 During any future change to the cache layout (not planned right now, but e.g. if we add a content-hash index), a rolling deploy will have old pods reading old layout and new pods reading new. Janitor races especially bad. Checklist: always provide a read-fallback (see `DualFileSystemPartsStore` at [hippius_s3/cache/dual_fs_store.py](hippius_s3/cache/dual_fs_store.py)) and migrate with a flag-gated single rollout.
 
@@ -564,19 +556,7 @@ Checklist derived from the 2026-04-21 postmortem. Each item is a small-medium PR
 
 ---
 
-## 7. Dead code and cleanup candidates
-
-Low-risk deletions; each one should be a one-PR cleanup:
-
-1. ~~`hippius_s3/writer/cache_writer.py`~~ — deleted 2026-09-15.
-2. **Redis download-cache residue**. Grep for `REDIS_DOWNLOAD_CACHE_URL`, `redis_download_cache_url`, `DOWNLOAD_CACHE_TTL`, `redis-download-cache`. Should all be gone after the FS migration. Patch any stragglers in docker-compose files and k8s manifests.
-3. **`set_download_chunk`** shim in [hippius_s3/cache/object_parts.py](hippius_s3/cache/object_parts.py) — if still present (prior memory says it was removed), verify. Old download-cache API.
-4. **Any references to `manifest_cid` or `manifest_service`**. Replaced by `chunk_backend` tracking long ago.
-5. ~~`hippius_s3/workers/fs_cleanup.py`~~ — deleted 2026-09-15.
-
----
-
-## 8. Getting started as a new contributor
+## 7. Getting started as a new contributor
 
 1. Clone the repo. You need Python 3.10+, Docker (with compose v2), and `uv`.
 2. Create a venv: `python3 -m venv .venv && source .venv/bin/activate && uv pip install -e ".[dev]"`.

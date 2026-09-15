@@ -158,7 +158,7 @@ pytest tests/unit/cache -xvs
 
 ### 2.4 When tests hang
 
-Tests that rely on Redis pub/sub can hang if the `redis-queues` client is stale. First thing to try:
+A hung test is usually a stale `redis-queues` client. First thing to try:
 
 ```bash
 docker compose restart redis-queues
@@ -186,7 +186,7 @@ docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 ```
 
 Adds:
-- Grafana at http://localhost:3000 (admin/admin). Pre-built dashboards for Hippius S3 Overview and S3 Workers.
+- Grafana at http://localhost:3000 (admin/admin). Dashboards from `monitoring/grafana/dashboards/`.
 - Prometheus at http://localhost:9090
 - Loki at http://localhost:3100
 - Tempo (traces) at http://localhost:3200
@@ -456,7 +456,7 @@ Say you're adding a `reconciler` worker that compares DB state with Arion state 
 2. Check structured logs in Loki: `{service="api"} |= "<ray_id>"`.
 3. Open Tempo with the same ray id for the span timeline.
 4. Cold reads stream from the backend in-process (there is no download queue). A `ChunkUnavailableError` means the backend fetch could not get a slot in time — check `chunk_reads_by_tier_total{tier="backend"}` and the api-local logs.
-5If it's a timeout, check if it's upstream (Arion, KMS, chain API).
+5. If it's a timeout, check whether it is upstream (Arion, KMS, chain API).
 
 ### 6.7 Requeue a failed upload
 
@@ -519,7 +519,6 @@ If you're about to write `try/except Exception`, stop and rethink.
 
 - **Never buffer large payloads**. Use `AsyncIterator[bytes]` and stream. See `put_simple_stream_full` and `ForwardService`.
 - **Atomic writes to shared state**. FS writes always go through tmp + rename. DB writes use transactions (or atomic CTEs like `upsert_object_basic`). Redis mutations should be `SET NX EX` or pipelined.
-- **Pub/sub for readiness, not for transport**. The FS is the source of truth; pub/sub tells you "go check again".
 - **Ray-id propagation**. Any cross-service call must carry the ray_id. Every log line should have it.
 - **Use the query loader**: `get_query("name")` loads from `hippius_s3/sql/queries/name.sql`. Don't inline SQL in Python.
 
@@ -595,15 +594,11 @@ We don't nitpick style (ruff handles that). We don't block on taste.
 
 Almost always a broken-v5 row — the version got reserved but the envelope wasn't written. The write-side fix is in [object_writer.py:244-261](hippius_s3/writer/object_writer.py); if you're seeing fresh broken rows, check your code path writes `kek_id` and `wrapped_dek` before the object_versions row becomes serveable.
 
-### 9.4 "Streamer hangs forever on GET"
+### 9.4 "GET stalls"
 
-The download-coalescing lock has a typo somewhere. The lock key format MUST be exactly:
-
-```
-download_in_progress:{object_id}:v:{object_version}:part:{part_number}
-```
-
-— this lock and the downloader that released it are gone (cold reads stream from the backend in-process since 2026-09); the key format is kept here only so old dashboards and logs still make sense.
+There is no coalescing lock or downloader any more — cold reads fetch from the backend in the api
+process. A stall is either a slow backend fetch, which ends in `ChunkUnavailableError`, or an
+upstream stall; follow 6.6.
 
 ### 9.5 "My chunks don't decrypt"
 
@@ -648,7 +643,6 @@ Three possibilities:
 
 - `os.utime` on chunk read. Microseconds.
 - JSON marshalling for meta.json. The file is tiny.
-- Redis pub/sub. Fan-out is bounded by the number of concurrent streamers on the same chunk.
 
 ### 10.3 Things that are expensive
 
@@ -674,7 +668,6 @@ Don't optimize based on intuition. Measure, change, re-measure.
 - **AEAD** — Authenticated Encryption with Associated Data. AES-256-GCM is an AEAD suite.
 - **Arion** — Our backend storage service. Every object chunk lives on Arion. API client: [hippius_s3/services/arion_service.py](hippius_s3/services/arion_service.py).
 - **CID** — Content IDentifier. A content-addressed identifier from the backend. Stored in `chunk_backend.backend_identifier`.
-- **DCR** — DownloadChainRequest. A message on `arion_download_requests` describing parts + chunks to fetch.
 - **DEK** — Data Encryption Key. Per-object-version AES key. Wrapped by the bucket KEK.
 - **DLQ** — Dead-Letter Queue. Redis list for permanently-failed operations. See [hippius_s3/dlq/CLAUDE.md](hippius_s3/dlq/CLAUDE.md).
 - **FS cache** — the filesystem-backed chunk cache at `/var/lib/hippius/object_cache`. See [hippius_s3/cache/CLAUDE.md](hippius_s3/cache/CLAUDE.md).

@@ -18,13 +18,11 @@ remembered to add. That is what this test is for.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-import yaml
+from tests.unit.k8s_manifests import load_docs
+from tests.unit.k8s_manifests import pod_spec
 
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 BASE_MANIFESTS = [
     "k8s/base/workers-deployments.yaml",
@@ -35,14 +33,8 @@ DEAD_HOST = "postgres-rw"
 LIVE_HOST = "postgres-nvme-rw"
 
 
-def _docs(rel: str) -> list[dict[str, Any]]:
-    text = (REPO_ROOT / rel).read_text()
-    return [d for d in yaml.safe_load_all(text) if isinstance(d, dict)]
-
-
 def _init_commands(doc: dict[str, Any]) -> list[str]:
-    spec = (doc.get("spec") or {}).get("template", {}).get("spec") or {}
-    return [" ".join(c.get("command") or []) for c in spec.get("initContainers") or []]
+    return [" ".join(c.get("command") or []) for c in pod_spec(doc).get("initContainers") or []]
 
 
 def _workloads_gated_on(host: str, manifests: list[str]) -> set[str]:
@@ -54,7 +46,7 @@ def _workloads_gated_on(host: str, manifests: list[str]) -> set[str]:
     needle = f" {host} "
     found: set[str] = set()
     for rel in manifests:
-        for doc in _docs(rel):
+        for doc in load_docs(rel):
             name = (doc.get("metadata") or {}).get("name")
             if name and any(needle in cmd for cmd in _init_commands(doc)):
                 found.add(name)

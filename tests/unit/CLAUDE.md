@@ -6,7 +6,7 @@ Pure unit tests. No external services — mocks for DB, Redis, Arion, KMS. Fast;
 
 ```
 tests/unit/
-├── cache/                     # FS store + parts cache + notifier
+├── cache/                     # FS store + parts cache
 ├── gateway/                   # SigV4, auth, ACL scope
 ├── writer/                    # object_writer, write_through
 ├── services/                  # crypto, envelope, KEK, arion
@@ -38,7 +38,7 @@ pytest tests/unit/cache -xvs
 ## Running specific suites
 
 ```bash
-pytest tests/unit/cache -xvs              # FS store, RedisObjectPartsCache, ChunkNotifier
+pytest tests/unit/cache -xvs              # FS store, RedisObjectPartsCache
 pytest tests/unit/gateway -xvs            # SigV4, ACL scope, auth
 pytest tests/unit -k "uploader or unpinner" -xvs   # Uploader/unpinner
 pytest tests/unit/writer -xvs             # ObjectWriter + write-through

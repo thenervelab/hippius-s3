@@ -1,5 +1,4 @@
 import dataclasses
-import uuid
 
 import dotenv
 
@@ -164,7 +163,6 @@ class Config:
     # admin surface can destroy whole accounts, so it gets its own credential. Verified
     # by admin_hmac middleware (fail-closed when empty).
     admin_hmac_secret: str = env("HIPPIUS_ADMIN_HMAC_SECRET:", convert=str)
-    max_request_size_mb: int = env("MAX_REQUEST_SIZE_MB", convert=int)
 
     # Logging
     log_level: str = env("LOG_LEVEL")
@@ -181,8 +179,6 @@ class Config:
     enable_audit_logging: bool = env("ENABLE_AUDIT_LOGGING", convert=lambda x: x.lower() == "true")
     enable_api_docs: bool = env("ENABLE_API_DOCS", convert=lambda x: x.lower() == "true")
     enable_request_profiling: bool = env("ENABLE_REQUEST_PROFILING:false", convert=lambda x: x.lower() == "true")
-    enable_public_read: bool = env("HIPPIUS_ENABLE_PUBLIC_READ:true", convert=lambda x: x.lower() == "true")
-    public_bucket_cache_ttl_seconds: int = env("PUBLIC_BUCKET_CACHE_TTL_SECONDS:60", convert=int)
     enable_bypass_credit_check: bool = env("HIPPIUS_BYPASS_CREDIT_CHECK:false", convert=lambda x: x.lower() == "true")
     read_only_mode: bool = env("HIPPIUS_READ_ONLY_MODE:false", convert=lambda x: x.lower() == "true")
     # LS-1: do the ListObjectsV2 delimiter rollup in SQL (a loose-index skip-scan) instead of the
@@ -203,7 +199,6 @@ class Config:
     arion_bearer_token: str = env("ARION_BEARER_TOKEN")
     hippius_secret_decryption_material: str = env("HIPPIUS_AUTH_ENCRYPTION_KEY")
 
-    validator_region: str = env("HIPPIUS_VALIDATOR_REGION")
     hippius_api_base_url: str = env("HIPPIUS_API_BASE_URL:https://api.hippius.com/")
     arion_billing_bypass_key: str = env("ARION_BILLING_BYPASS_KEY:")
     # Internal Hippius-owned accounts that store our own data. Their writes skip the credit and
@@ -416,19 +411,10 @@ class Config:
     # a timeout lets the hot path fail fast with a retryable 503 instead of hanging under contention.
     db_pool_acquire_timeout: float = env("API_DB_POOL_ACQUIRE_TIMEOUT:5.0", convert=float)
 
-    # API signing key for pre-signed URLs
-    # Generated on first run if not provided
-    api_signing_key: str = env("API_SIGNING_KEY:" + str(uuid.uuid4()))
-
     # S3 multipart upload settings
     max_multipart_part_size: int = 512 * 1024 * 1024  # 512 MiB per part
     max_multipart_part_count: int = 10000  # AWS S3 standard
     max_object_size: int = 0  # Computed at runtime in get_config()
-
-    # worker specific settings
-    unpinner_sleep_loop: float = 5.0
-    cacher_loop_sleep: float = 60.0  # 1 minute
-    pin_checker_loop_sleep: float = 7200.0  # 2 hours
 
     # Uploader configuration (supersedes legacy pinner config)
     uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:7", convert=int)
@@ -449,8 +435,6 @@ class Config:
     # 40 pods x 12 = 480, leaving headroom for api/gateway/downloader/etc. Raise alongside
     # arion_upload_concurrency, watching total connections.
     uploader_db_pool_max: int = env("HIPPIUS_UPLOADER_DB_POOL_MAX:12", convert=int)
-    # Heavy validation gating (legacy PINNER_VALIDATE_COVERAGE supported for compat)
-    uploader_validate_coverage: bool = env("UPLOADER_VALIDATE_COVERAGE:false", convert=lambda x: x.lower() == "true")
     # Deadline (seconds) for polling meta.json on the shared FS cache before
     # giving up. The api pod writes meta last after fsync. On prod the api and
     # consumer workers are co-located on the cache node so reads see meta
@@ -497,7 +481,6 @@ class Config:
     # Per-operation backend lists (queue names derived as {backend}_{op}_requests). Pinned to
     # STORAGE_BACKENDS — see the note on that constant for why these are not env-driven.
     upload_backends: list[str] = dataclasses.field(default_factory=_storage_backends)
-    download_backends: list[str] = dataclasses.field(default_factory=_storage_backends)
     delete_backends: list[str] = dataclasses.field(default_factory=_storage_backends)
     # Additional backends that must have replicated a chunk before the janitor is allowed to
     # evict it from the FS cache. Unioned with upload_backends when checking "fully
@@ -635,15 +618,7 @@ class Config:
     ovh_kms_retry_base_ms: int = env("HIPPIUS_OVH_KMS_RETRY_BASE_MS:500", convert=int)
     ovh_kms_retry_max_ms: int = env("HIPPIUS_OVH_KMS_RETRY_MAX_MS:5000", convert=int)
 
-    # endpoint chunk download settings
-    redis_read_chunk_timeout: int = 60
-
-    # initial stream timeout (seconds) before sending first byte
-    http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
-
     # DLQ configuration
-    dlq_dir: str = env("HIPPIUS_DLQ_DIR:/tmp/hippius_dlq")
-    dlq_archive_dir: str = env("HIPPIUS_DLQ_ARCHIVE_DIR:/tmp/hippius_dlq_archive")
     # Soft cap on entries per DLQ list (best-effort: a non-atomic LLEN+LPUSH may overshoot by up to
     # the number of concurrent pushers). The DLQ lives on redis-queues (2GB, noeviction) alongside the
     # drain's cephor:* lease/fence keys, work queues and notify:* pub/sub — a permanent-error storm on

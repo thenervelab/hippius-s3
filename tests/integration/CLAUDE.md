@@ -36,7 +36,6 @@ Env: [.env.test-local](../../.env.test-local) (localhost connections).
 
 - Presigned URL tests (boto3 generates, client POSTs).
 - ACL scope integration (mocks ACL service grants, not the scope evaluator — which is dormant; see [../../hippius_s3/gateway/services/CLAUDE.md](../../hippius_s3/gateway/services/CLAUDE.md)).
-- Migration smoke tests — v4→v5 with fixtures.
 - Worker queue round trips (enqueue → worker picks up → DB row updated).
 
 ## Running

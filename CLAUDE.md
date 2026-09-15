@@ -48,7 +48,7 @@ The pipeline is deliberately split so the user-facing path (gateway + API) is fa
 │   └── main.py              # API factory + lifespan
 ├── workers/                 # Worker ENTRY points (run_*_in_loop.py) — invoked by k8s
 ├── cacher/                  # Substrate account data cacher service
-├── scripts/                 # Top-level ops scripts (dumps, smoke tests, MPU retry)
+├── scripts/                 # Top-level ops scripts (migration gate, smoke helpers, MPU retry)
 ├── tests/                   # unit/, integration/, e2e/, smoke/
 ├── docs/                    # Architecture and spec docs (s4.md, s3-compatibility.md)
 ├── k8s/                     # Kustomize manifests: base/, staging/, production/, otel/
@@ -253,7 +253,7 @@ Canonicalization uses `request.scope["raw_path"]` (bytes) rather than `request.u
 
 ### Scripts
 - [hippius_s3/scripts/CLAUDE.md](hippius_s3/scripts/CLAUDE.md) — operational and migration scripts.
-- [scripts/CLAUDE.md](scripts/CLAUDE.md) — top-level ops scripts (smoke tests, dump generators).
+- [scripts/CLAUDE.md](scripts/CLAUDE.md) — top-level ops scripts (migration gate, smoke helpers, SQL one-offs).
 
 ### Tests
 - [tests/unit/CLAUDE.md](tests/unit/CLAUDE.md), [tests/integration/CLAUDE.md](tests/integration/CLAUDE.md), [tests/e2e/CLAUDE.md](tests/e2e/CLAUDE.md).
@@ -338,7 +338,7 @@ pytest tests/e2e/test_GetObject_Range.py -xvs
 # Code quality
 ruff check . --fix
 ruff format .
-ty check hippius_s3 gateway
+ty check hippius_s3 workers
 pre-commit run --all-files
 
 # Run stack
@@ -392,7 +392,7 @@ Both share the same `build-base` and `build-images` jobs (duplicated, since GitH
 
 OTel instrumentation across FastAPI, asyncpg, httpx, redis. Standard span attributes: `hippius.ray_id`, `hippius.account.main`. Metrics exported via Prometheus on `/metrics`; dashboards in [monitoring/grafana/](monitoring/grafana/) (applied to the cluster by [k8s/otel/install.sh](k8s/otel/install.sh)).
 
-Key dashboards: Hippius S3 Overview (request rates, latencies, error rates, queue depths), S3 Workers (backend latency, retry rates), FS cache (age buckets, pressure mode, hot parts).
+Dashboards live in [monitoring/grafana/dashboards/](monitoring/grafana/dashboards/) and are applied to the cluster by [k8s/otel/install.sh](k8s/otel/install.sh).
 
 ### 10.3 Querying Loki on prod
 

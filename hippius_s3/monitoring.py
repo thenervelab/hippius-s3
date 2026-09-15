@@ -128,7 +128,6 @@ class MetricsCollector:
         self._queue_lengths: dict[str, int] = {}
         self._used_mem = 0
         self._max_mem = 0
-        self._backup_last_success_timestamp = 0.0
         self._db_pool_size = 0
         self._db_pool_free = 0
         self._db_pool_used = 0
@@ -378,42 +377,6 @@ class MetricsCollector:
             unit="1",
         )
 
-        self.backup_cycles_total = self.meter.create_counter(
-            name="backup_cycles_total",
-            description="Total backup cycles completed",
-            unit="1",
-        )
-
-        self.backup_database_duration = self.meter.create_histogram(
-            name="backup_database_duration_seconds",
-            description="Duration to backup each database",
-            unit="s",
-        )
-
-        self.backup_database_size = self.meter.create_histogram(
-            name="backup_database_size_bytes",
-            description="Backup file size per database",
-            unit="bytes",
-        )
-
-        self.backup_upload_duration = self.meter.create_histogram(
-            name="backup_upload_duration_seconds",
-            description="S3 upload duration per database backup",
-            unit="s",
-        )
-
-        self.backup_databases_count = self.meter.create_counter(
-            name="backup_databases_count",
-            description="Count of databases backed up per cycle",
-            unit="1",
-        )
-
-        self.backup_cleanup_deleted_count = self.meter.create_counter(
-            name="backup_cleanup_deleted_count",
-            description="Old backups deleted during retention cleanup",
-            unit="1",
-        )
-
         self.meter.create_observable_gauge(
             name="redis_memory_used_bytes", callbacks=[self._obs_redis_used_mem], description="Redis used memory bytes"
         )
@@ -424,12 +387,6 @@ class MetricsCollector:
 
         self.meter.create_observable_gauge(
             name="hippius_queue_length", callbacks=[self._obs_queue_lengths], description="Length of Redis queues"
-        )
-
-        self.meter.create_observable_gauge(
-            name="backup_last_success_timestamp",
-            callbacks=[self._obs_backup_last_success],
-            description="Unix timestamp of last successful backup cycle",
         )
 
         self.meter.create_observable_gauge(
@@ -448,12 +405,6 @@ class MetricsCollector:
             description="Database connection pool used connections",
         )
 
-        self.gateway_overhead_duration = self.meter.create_histogram(
-            name="gateway_overhead_seconds",
-            description="Gateway middleware processing time excluding body streaming",
-            unit="s",
-        )
-
         self.auth_cache_hits = self.meter.create_counter(
             name="auth_cache_hits_total",
             description="Total auth cache hits",
@@ -463,18 +414,6 @@ class MetricsCollector:
         self.auth_cache_misses = self.meter.create_counter(
             name="auth_cache_misses_total",
             description="Total auth cache misses",
-            unit="1",
-        )
-
-        self.seed_auth_cache_hits = self.meter.create_counter(
-            name="seed_auth_cache_hits_total",
-            description="Total seed phrase auth cache hits",
-            unit="1",
-        )
-
-        self.seed_auth_cache_misses = self.meter.create_counter(
-            name="seed_auth_cache_misses_total",
-            description="Total seed phrase auth cache misses",
             unit="1",
         )
 
@@ -650,9 +589,6 @@ class MetricsCollector:
 
     def set_queue_length(self, queue_name: str, length: int) -> None:
         self._queue_lengths[queue_name] = length
-
-    def _obs_backup_last_success(self, _: object) -> list[metrics.Observation]:
-        return [metrics.Observation(self._backup_last_success_timestamp, {})]
 
     def _obs_db_pool_size(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._db_pool_size, {})]
@@ -895,71 +831,11 @@ class MetricsCollector:
             if duration is not None:
                 self.unpinner_duration.record(duration, attributes=attributes)
 
-    def record_gateway_overhead(
-        self,
-        duration: float,
-        method: str,
-        status_code: int,
-        handler: Optional[str] = None,
-    ) -> None:
-        attributes: dict[str, str] = {
-            "method": method,
-            "status_code": str(status_code),
-        }
-        if handler:
-            attributes["handler"] = handler
-
-        self.gateway_overhead_duration.record(duration, attributes=attributes)
-
     def record_auth_cache(self, hit: bool) -> None:
         if hit:
             self.auth_cache_hits.add(1)
         else:
             self.auth_cache_misses.add(1)
-
-    def record_seed_auth_cache(self, hit: bool) -> None:
-        if hit:
-            self.seed_auth_cache_hits.add(1)
-        else:
-            self.seed_auth_cache_misses.add(1)
-
-    def record_backup_operation(
-        self,
-        database_name: str,
-        success: bool,
-        backup_duration: Optional[float] = None,
-        backup_size_bytes: Optional[int] = None,
-        upload_duration: Optional[float] = None,
-    ) -> None:
-        attributes = {
-            "database": database_name,
-            "success": str(success).lower(),
-        }
-
-        if backup_duration is not None:
-            self.backup_database_duration.record(backup_duration, attributes=attributes)
-
-        if backup_size_bytes is not None:
-            self.backup_database_size.record(backup_size_bytes, attributes=attributes)
-
-        if upload_duration is not None:
-            self.backup_upload_duration.record(upload_duration, attributes=attributes)
-
-        if success:
-            self.backup_databases_count.add(1, attributes=attributes)
-
-    def record_backup_cycle(self, success: bool, num_databases: int = 0) -> None:
-        attributes = {"success": str(success).lower()}
-        self.backup_cycles_total.add(1, attributes=attributes)
-
-        if success:
-            import time
-
-            self._backup_last_success_timestamp = time.time()
-
-    def record_backup_cleanup(self, database_name: str, deleted_count: int) -> None:
-        attributes = {"database": database_name}
-        self.backup_cleanup_deleted_count.add(deleted_count, attributes=attributes)
 
     def record_mpu_reaper_cycle(
         self,
@@ -1108,22 +984,7 @@ class NullMetricsCollector:
     def record_unpinner_operation(self, *args: object, **kwargs: object) -> None:
         pass
 
-    def record_gateway_overhead(self, *args: object, **kwargs: object) -> None:
-        pass
-
     def record_auth_cache(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_seed_auth_cache(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_backup_operation(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_backup_cycle(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_backup_cleanup(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_mpu_reaper_cycle(self, *args: object, **kwargs: object) -> None:

@@ -8,6 +8,7 @@ Operational and migration scripts. Most are invoked manually by an operator duri
 
 | Script | Purpose | Notes |
 |---|---|---|
+| [backfill_arion_hash.py](backfill_arion_hash.py) | Backfill `chunk_backend.backend_identifier` with the Arion `path_hash`. | K8s manifest: [k8s/backfill-arion-hash-job.yaml](../../k8s/backfill-arion-hash-job.yaml). |
 | [migrate.py](migrate.py) | Apply SQL migrations from [../sql/migrations/](../sql/migrations/). | Run on API pod startup via container entrypoint. Idempotent. |
 | [cleanup_migration_versions.py](cleanup_migration_versions.py) | Purge stale rows from the v4→v5 migration. | |
 | [delete_legacy_object_versions.py](delete_legacy_object_versions.py) | **DANGEROUS**. Remove pre-v5 rows from `object_versions`. | Pre-v5 rows are unreadable (`MIN_SUPPORTED_STORAGE_VERSION = 5`); this is how they are retired. |
@@ -84,8 +85,3 @@ python -m hippius_s3.scripts.<script_name> --help
 ```
 
 Most take argparse-style flags; some accept env vars (documented inline in the `if __name__ == "__main__"` block).
-
-## Progress files
-
-Long-running migrations use `/tmp/migration_progress.txt` (or similar) as a resumable checkpoint. If a job gets OOM-killed mid-run, restart — it resumes from the last committed batch.
-

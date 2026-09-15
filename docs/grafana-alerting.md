@@ -113,10 +113,7 @@ it fired immediately and never stopped.
    limit), below the 0.6 trigger. It cannot fire as written.
 3. **The FS-cache 503 is inferred, not measured** (`fs_cache_pressure.py:64`
    rejects PUTs but emits no counter), so both FS-cache rules alert on the cause.
-4. **`backup_last_success_timestamp` is hardcoded 0** on every pod — there is no
-   backup-staleness alerting, and `time() - max(...)` ≈ 56 years is an inviting trap.
 5. **FIXED — failed unpins are now observable.** `metrics_collector_task.py:96-102`
    (`_dlq_queues`) now gauges every backend upload DLQ (`{backend}_upload_requests:dlq`
    derived from `config.upload_backends`) **plus** `unpin_requests:dlq`, so a full ovh or
    unpin DLQ is no longer invisible. (Previously only `arion_upload_requests:dlq` was polled.)
-6. ~~`downloader_duration_seconds` bucket mismatch~~ — the downloader and its histogram were removed in 2026-09.
