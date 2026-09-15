@@ -139,16 +139,6 @@ def _parse_enable_billing_plans() -> bool:
     return _parse_bool(os.environ.get("HIPPIUS_ENABLE_BILLING_PLANS"))
 
 
-def _parse_account_whitelist() -> list[str]:
-    """Parse comma-separated account whitelist from environment variable."""
-    import os
-
-    whitelist_str = os.environ.get("HIPPIUS_ORPHAN_WORKER_ACCOUNT_WHITELIST", "")
-    if whitelist_str:
-        return [a.strip() for a in whitelist_str.split(",") if a.strip()]
-    return []
-
-
 @dataclasses.dataclass
 class Config:
     """Application configuration settings."""
@@ -439,9 +429,6 @@ class Config:
     unpinner_sleep_loop: float = 5.0
     cacher_loop_sleep: float = 60.0  # 1 minute
     pin_checker_loop_sleep: float = 7200.0  # 2 hours
-    orphan_checker_loop_sleep: int = env("ORPHAN_CHECKER_LOOP_SLEEP:7200", convert=int)  # 2 hours
-    orphan_checker_batch_size: int = env("ORPHAN_CHECKER_BATCH_SIZE:500", convert=int)  # Files per API call
-    orphan_checker_account_whitelist: list[str] = dataclasses.field(default_factory=_parse_account_whitelist)
 
     # Uploader configuration (supersedes legacy pinner config)
     uploader_max_attempts: int = env("HIPPIUS_UPLOADER_MAX_ATTEMPTS:7", convert=int)

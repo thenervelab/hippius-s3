@@ -60,5 +60,5 @@ Delete pin on backend → mark `chunk_backend.deleted = true, deleted_at = now()
 
 ## Tracing
 
-All worker operations emit OTel spans with `hippius.ray_id`, `hippius.account.main`, and backend-specific attributes. See [downloader.py:114-123](downloader.py) for the standard span shape.
+All worker operations emit OTel spans with `hippius.ray_id`, `hippius.account.main`, and backend-specific attributes. See [uploader.py](uploader.py) for the standard span shape.
 

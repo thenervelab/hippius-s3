@@ -28,7 +28,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 BASE_MANIFESTS = [
     "k8s/base/workers-deployments.yaml",
-    "k8s/base/api-deployment.yaml",
 ]
 PROD_PATCH = "k8s/production/postgres-nvme-initwait-patch.yaml"
 

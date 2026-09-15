@@ -2,8 +2,9 @@
 
 > Research snapshot, 2026-06-17. Map of every deployed pod/service/worker and how
 > they string together. Cross-checked against `k8s/` manifests and worker entry
-> points. Two items here are **drift from the main CLAUDE.md** (flagged below):
-> the **ATS edge tier** and the **orphan-checker** worker.
+> points. One item here is **drift from the main CLAUDE.md** (flagged below):
+> the **ATS edge tier**. The download pipeline, the orphan checker and the v4→v5
+> migrator were removed in 2026-09; rows for them are gone from the tables below.
 
 The system is split into **edge → gateway → API → workers**, backed by
 **Postgres + 4 Redis instances + an FS chunk cache**. Two FastAPI services
@@ -45,13 +46,10 @@ Image: `ghcr.io/thenervelab/hippius-s3/workers:latest`.
 | Worker | Entry point | Queue / trigger | Prod replicas | Role |
 |---|---|---|---|---|
 | **arion-uploader** | `workers/run_arion_uploader_in_loop.py` | `arion_upload_requests` | **40** | Reads chunks from FS → uploads to Arion → records `chunk_backend` → publishes to Hippius chain. Recreate strategy. |
-| **arion-downloader** | `workers/run_arion_downloader_in_loop.py` | `arion_download_requests` | 10 | Cache-miss path: fetches chunks from Arion → FS cache → pub/sub notifies waiting streamers. Also runs in the cache tier. |
 | **arion-unpinner** | `workers/run_arion_unpinner_in_loop.py` | `arion_unpin_requests` | 3 | Soft-deletes `chunk_backend` rows + DELETEs from Arion. |
 | **janitor** | `workers/run_janitor_in_loop.py` | ~5-min loop | 1 | FS cache GC. Replication-gated (never evicts un-replicated chunks), hot-retention + disk-pressure modes. |
-| **orphan-checker** | `workers/run_orphan_checker_in_loop.py` | ~2-hr loop | 1 | Scans chain for on-chain files missing from DB → enqueues unpin. **Not in the CLAUDE.md worker list.** |
 | **account-cacher** | `workers/run_account_cacher_in_loop.py` | ~5-min loop | 1 | Caches Substrate account credit/role state into redis-accounts (10-min TTL). |
 | **cachet-health-checker** | `workers/cachet_health_check.py` | poll | 1 | Reports gateway health to external Cachet status page. |
-| **migrator** | `workers/run_migrator_once.py` | K8s Job | one-shot | Data migrations (e.g. v4→v5 storage version). |
 
 ### Rust drain fleet (SSD→Ceph ingest, s3-2.1)
 
@@ -137,10 +135,8 @@ Queue names are `{backend}_*` so an additional backend (beyond `arion`) gets par
 | gateway | R | R/W (metrics) | — | — | — | — |
 | api | R/W | R/W (cache+pubsub) | R (DLQ) | R/W | — | — |
 | arion-uploader | R/W | — | R (pop) | R | W (upload) | W (tx) |
-| arion-downloader | R | W (pub/sub) | R (pop) | W | R (download) | — |
 | arion-unpinner | R/W | — | R (pop) | — | W (delete) | — |
 | janitor | R | R | R (DLQ scan) | R/D | — | — |
-| orphan-checker | R/W | — | W (enqueue) | — | — | R |
 | account-cacher | — | — | — | — | — | R |
 
 ---
@@ -148,4 +144,3 @@ Queue names are `{backend}_*` so an additional backend (beyond `arion`) gets par
 ## Drift from CLAUDE.md (worth reconciling)
 
 1. **ATS edge tier** — entire Apache Traffic Server caching layer (gateway integration, PURGE, cache-control, auth-probe) is undocumented in the main CLAUDE.md. Part of the S3 2.0 cache redesign.
-2. **orphan-checker worker** — present as an entry point and referenced in the subsystem index, but missing from the section-5/section-7 worker descriptions.

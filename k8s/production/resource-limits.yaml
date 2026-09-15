@@ -1,27 +1,6 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: api
-spec:
-  # Cutover full-swap: base ceph `api` scaled to 0 — the drain-direct `api-local` fleet
-  # (replicas=5) serves all traffic via the `api` Service selector patch in kustomization.yaml.
-  # Rollback = scale back to 5 + repoint the Service to app: api.
-  replicas: 0
-  template:
-    spec:
-      containers:
-        - name: api
-          resources:
-            requests:
-              cpu: 1000m
-              memory: 2Gi
-            limits:
-              cpu: 4000m
-              memory: 3Gi
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
   name: arion-uploader
 spec:
   replicas: 10

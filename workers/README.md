@@ -10,8 +10,6 @@ Background workers that process async operations via Redis queues. Each worker r
 | Arion Unpinner | `run_arion_unpinner_in_loop.py` | `arion_unpin_requests` | Single instance | Delete chunks from Arion |
 | Janitor | `run_janitor_in_loop.py` | N/A (polling) | Single instance | FS cache cleanup at `/var/lib/hippius/object_cache` |
 | Account Cacher | `run_account_cacher_in_loop.py` | N/A (scheduled) | Single instance | Warm account credit cache in Redis |
-| Orphan Checker | `run_orphan_checker_in_loop.py` | N/A (scheduled) | Single instance | Detect blockchain orphan files, enqueue cleanup |
-| Migrator | `run_migrator_once.py` | N/A (one-shot) | One-shot | Run DB migrations on startup, then exit |
 | MPU Reaper | `run_mpu_reaper_in_loop.py` | N/A (polling) | Single instance | Reaps abandoned in-flight multipart uploads |
 
 ### Scaling Notes

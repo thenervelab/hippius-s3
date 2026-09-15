@@ -130,9 +130,7 @@ See `.env.defaults` for the full list of configurable values.
 
 | File | Purpose |
 |------|---------|
-| `docker-compose.yml` | Base config: API, gateway, PostgreSQL, 5 Redis instances, Arion workers |
-| `docker-compose.prod.yml` | Production overrides: performance tuning, backup, health monitoring |
-| `docker-compose.staging.yml` | Staging configuration |
+| `docker-compose.yml` | Base config: API, PostgreSQL, Redis instances, Arion workers |
 | `docker-compose.e2e.yml` | E2E testing: mock services (mock-arion, mock-kms, mock-hippius-api, toxiproxy) |
 | `docker-compose.monitoring.yml` | LGTM observability stack |
 
@@ -144,15 +142,7 @@ docker compose up -d
 docker compose logs -f api
 ```
 
-**Production**
-```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-```
-
-**Staging**
-```bash
-docker compose -f docker-compose.yml -f docker-compose.staging.yml up -d
-```
+Staging and production run on Kubernetes (see `k8s/`), not on compose.
 
 **With Monitoring**
 ```bash
@@ -265,8 +255,8 @@ hippius_s3/            Main API application
     s3/                Bucket, object, multipart, tagging endpoints
     middlewares/        IP whitelist, profiler, input validation, metrics
   services/            Business logic (crypto, KMS, Arion client, copy, audit)
-  workers/             Worker core logic (uploader, downloader, unpinner)
-  writer/              Write pipeline (chunker, write-through, DB)
+  workers/             Worker core logic (uploader, unpinner, purger)
+  writer/              Write pipeline (object writer, write-through, DB)
   reader/              Read pipeline (planner, fetcher, decrypter, streamer)
   repositories/        Database access layer
   cache/               Multi-layer cache (Redis + filesystem)

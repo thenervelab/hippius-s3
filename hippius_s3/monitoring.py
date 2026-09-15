@@ -538,21 +538,6 @@ class MetricsCollector:
             unit="1",
         )
 
-        self.orphan_checker_cycles_total = self.meter.create_counter(
-            name="orphan_checker_cycles_total", description="Total orphan-checker cycles run", unit="1"
-        )
-        self.orphan_checker_files_scanned_total = self.meter.create_counter(
-            name="orphan_checker_files_scanned_total",
-            description="On-chain files scanned by the orphan checker",
-            unit="1",
-        )
-        self.orphan_checker_orphans_found_total = self.meter.create_counter(
-            name="orphan_checker_orphans_found_total", description="Orphaned files found + enqueued for unpin", unit="1"
-        )
-        self.orphan_checker_duration_seconds = self.meter.create_histogram(
-            name="orphan_checker_duration_seconds", description="Orphan-checker cycle duration", unit="s"
-        )
-
         self.account_cacher_cycles_total = self.meter.create_counter(
             name="account_cacher_cycles_total", description="Total account-cacher cycles run", unit="1"
         )
@@ -1002,20 +987,6 @@ class MetricsCollector:
     def record_purger_backpressure_wait(self) -> None:
         self.purger_backpressure_waits_total.add(1)
 
-    def record_orphan_checker_cycle(
-        self,
-        success: bool,
-        files_scanned: int,
-        orphans_found: int,
-        duration: float,
-    ) -> None:
-        self.orphan_checker_cycles_total.add(1, attributes={"success": str(success).lower()})
-        self.orphan_checker_duration_seconds.record(duration)
-        if files_scanned > 0:
-            self.orphan_checker_files_scanned_total.add(files_scanned)
-        if orphans_found > 0:
-            self.orphan_checker_orphans_found_total.add(orphans_found)
-
     def record_account_cacher_cycle(
         self,
         success: bool,
@@ -1162,9 +1133,6 @@ class NullMetricsCollector:
         pass
 
     def record_purger_backpressure_wait(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_orphan_checker_cycle(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_plan_gate(self, *args: object, **kwargs: object) -> None:

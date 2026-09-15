@@ -577,11 +577,11 @@ Checklist derived from the 2026-04-21 postmortem. Each item is a small-medium PR
 
 Low-risk deletions; each one should be a one-PR cleanup:
 
-1. **[hippius_s3/writer/cache_writer.py](hippius_s3/writer/cache_writer.py)** — `CacheWriter` class. Not referenced anywhere in the main code graph except the module itself. `WriteThroughPartsWriter` superseded it. Confirm with `rg '\bcache_writer\b|\bCacheWriter\b'` (only self-reference expected) and delete.
+1. ~~`hippius_s3/writer/cache_writer.py`~~ — deleted 2026-09-15.
 2. **Redis download-cache residue**. Grep for `REDIS_DOWNLOAD_CACHE_URL`, `redis_download_cache_url`, `DOWNLOAD_CACHE_TTL`, `redis-download-cache`. Should all be gone after the FS migration. Patch any stragglers in docker-compose files and k8s manifests.
 3. **`set_download_chunk`** shim in [hippius_s3/cache/object_parts.py](hippius_s3/cache/object_parts.py) — if still present (prior memory says it was removed), verify. Old download-cache API.
 4. **Any references to `manifest_cid` or `manifest_service`**. Replaced by `chunk_backend` tracking long ago.
-5. **[hippius_s3/workers/fs_cleanup.py](hippius_s3/workers/fs_cleanup.py)** — zero importers (`rg fs_cleanup` hits only the module itself; no entry point in `workers/` runs it). Confirm and delete.
+5. ~~`hippius_s3/workers/fs_cleanup.py`~~ — deleted 2026-09-15.
 
 ---
 

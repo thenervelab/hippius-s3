@@ -9,10 +9,8 @@ Entry point is [`ObjectWriter`](object_writer.py); the heavy lifting is in [`put
 | File | Purpose |
 |---|---|
 | [object_writer.py](object_writer.py) | Orchestrator. Simple PUT, MPU part upload, MPU completion, append. |
-| [chunker.py](chunker.py) | `stream_encrypt_to_chunks` — buffers plaintext, yields ciphertext one chunk at a time. |
 | [write_through_writer.py](write_through_writer.py) | `WriteThroughPartsWriter` — FS writes (fatal), then the landed-part announcement (best-effort). |
 | [landed.py](landed.py) | `LandedPartPublisher` — tells this node's drain agent a part is complete, so discovery is a queue pop instead of a whole-disk walk. |
-| [cache_writer.py](cache_writer.py) | **Dead code** — `CacheWriter` not referenced anywhere. Delete candidate in [todo.md](../../todo.md). |
 | [db.py](db.py) | `upsert_object_basic`, `ensure_upload_row` — atomic DB reserves. |
 | [types.py](types.py) | Dataclasses: `PutResult`, `PartResult`, `CompleteResult`, `AppendPreconditionFailed`, etc. |
 

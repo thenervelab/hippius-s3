@@ -238,7 +238,7 @@ Canonicalization uses `request.scope["raw_path"]` (bytes) rather than `request.u
 ### Workers
 - [hippius_s3/workers/CLAUDE.md](hippius_s3/workers/CLAUDE.md) — core logic (uploader, unpinner).
 - [workers/CLAUDE.md](workers/CLAUDE.md) — entry-point loops and janitor.
-- Entry scripts: [workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py), [workers/run_arion_unpinner_in_loop.py](workers/run_arion_unpinner_in_loop.py), [workers/run_janitor_in_loop.py](workers/run_janitor_in_loop.py), [workers/run_orphan_checker_in_loop.py](workers/run_orphan_checker_in_loop.py), [workers/run_account_cacher_in_loop.py](workers/run_account_cacher_in_loop.py), [workers/run_migrator_once.py](workers/run_migrator_once.py), [workers/cachet_health_check.py](workers/cachet_health_check.py).
+- Entry scripts: [workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py), [workers/run_arion_unpinner_in_loop.py](workers/run_arion_unpinner_in_loop.py), [workers/run_janitor_in_loop.py](workers/run_janitor_in_loop.py), [workers/run_account_cacher_in_loop.py](workers/run_account_cacher_in_loop.py), [workers/cachet_health_check.py](workers/cachet_health_check.py).
 
 ### Business services
 - [hippius_s3/services/CLAUDE.md](hippius_s3/services/CLAUDE.md) — all service modules.
@@ -390,7 +390,7 @@ Both share the same `build-base` and `build-images` jobs (duplicated, since GitH
 
 ### 10.2 Monitoring
 
-OTel instrumentation across FastAPI, asyncpg, httpx, redis. Standard span attributes: `hippius.ray_id`, `hippius.account.main`. Metrics exported via Prometheus on `/metrics`; dashboards in [monitoring/grafana/](monitoring/grafana/) and [k8s/base/grafana-dashboards.yaml](k8s/base/grafana-dashboards.yaml).
+OTel instrumentation across FastAPI, asyncpg, httpx, redis. Standard span attributes: `hippius.ray_id`, `hippius.account.main`. Metrics exported via Prometheus on `/metrics`; dashboards in [monitoring/grafana/](monitoring/grafana/) (applied to the cluster by [k8s/otel/install.sh](k8s/otel/install.sh)).
 
 Key dashboards: Hippius S3 Overview (request rates, latencies, error rates, queue depths), S3 Workers (backend latency, retry rates), FS cache (age buckets, pressure mode, hot parts).
 
@@ -438,12 +438,11 @@ Response shape: `{"status":"success","data":{"resultType":"streams","result":[{"
 
 - **DLQ requeue**: [hippius_s3/scripts/dlq_requeue.py](hippius_s3/scripts/dlq_requeue.py).
 - **Failed pin resubmit**: [hippius_s3/scripts/resubmit_failed_pins.py](hippius_s3/scripts/resubmit_failed_pins.py).
-- **Arion identifier migration** (new): [hippius_s3/scripts/migrate_arion_identifiers.py](hippius_s3/scripts/migrate_arion_identifiers.py) + [k8s/migrate-arion-identifiers-job.yaml](k8s/migrate-arion-identifiers-job.yaml). Fixes legacy chunk_backend rows that stored `arion_hash` instead of `path_hash`.
+- **Arion hash backfill**: [hippius_s3/scripts/backfill_arion_hash.py](hippius_s3/scripts/backfill_arion_hash.py) + [k8s/backfill-arion-hash-job.yaml](k8s/backfill-arion-hash-job.yaml).
 - **Storage-usage rollup** (the billed byte counter): [docs/runbooks/storage-usage-rollup.md](docs/runbooks/storage-usage-rollup.md)
   — alerts and what to do, why `DISABLE TRIGGER` is not a switch, diagnosing drift, the backfill.
 - **Reserved-name / ownerless bucket audit**: [hippius_s3/scripts/report_reserved_name_buckets.py](hippius_s3/scripts/report_reserved_name_buckets.py). Read-only. Run after any change to the gateway's auth-exempt paths.
-- **Clean prod DB dump for testing**: [scripts/gen_clean_dump.py](scripts/gen_clean_dump.py).
-- **MPU retry**: [scripts/retryable-mpu.py](scripts/retryable-mpu.py) with usage notes in [retryable-mpu.md](retryable-mpu.md) (if present).
+- **MPU retry**: [scripts/retryable-mpu.py](scripts/retryable-mpu.py) with usage notes in [scripts/retryable-mpu.md](scripts/retryable-mpu.md).
 - **Dangerous scripts** (flagged for a reason):
   - [hippius_s3/scripts/nuke_user.py](hippius_s3/scripts/nuke_user.py) — deletes a user and all their data.
   - [hippius_s3/scripts/purge_buckets.py](hippius_s3/scripts/purge_buckets.py), [purge_source_versions.py](hippius_s3/scripts/purge_source_versions.py).

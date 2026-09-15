@@ -405,6 +405,10 @@ jobs:
           # lingering downloader would keep an RW pool mount and a Postgres pool open for
           # a queue nothing publishes to. Idempotent after the first deploy.
           kubectl delete deployment/arion-downloader -n "$ns" --ignore-not-found=true
+          # The base (pool-backed) api Deployment is gone from the manifests: the api-local
+          # DaemonSet is the whole serving fleet. It sat at 0 replicas since the cutover, so
+          # pruning it changes nothing that serves; idempotent after the first deploy.
+          kubectl delete deployment/api -n "$ns" --ignore-not-found=true
           kubectl rollout status deployment/arion-uploader -n "$ns" --timeout=10m
           # The node-local uploader must be Ready BEFORE the drain image rolls: the drain publishes
           # to `arion_upload_requests:<node>`, which only this DaemonSet reads. Strict, like
@@ -443,7 +447,6 @@ jobs:
 
       - name: Restart external deployments
         run: |
-          kubectl rollout restart deployment/hydrator -n hippius-s3-prod --ignore-not-found || true
           kubectl rollout restart deployment/backup -n hippius-s3-prod --ignore-not-found || true
           # otel-collector mounts otel-collector-config by static name, with no reloader
           # sidecar and no kustomize hash suffix, so `kubectl apply -k` updates the

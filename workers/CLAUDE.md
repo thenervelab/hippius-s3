@@ -9,11 +9,9 @@ Worker entry points — the `run_*.py` scripts that actually run as pod processe
 | [run_arion_uploader_in_loop.py](run_arion_uploader_in_loop.py) | Drains `arion_upload_requests`, uploads chunks to Arion, publishes to chain. | Horizontally scalable (`replicas: 10` in production) |
 | [run_arion_unpinner_in_loop.py](run_arion_unpinner_in_loop.py) | Drains `unpin_requests`, soft-deletes `chunk_backend` rows, calls Arion delete. | Horizontally scalable; per-pod request concurrency (`HIPPIUS_UNPINNER_MAX_INFLIGHT`) + shared Arion-DELETE semaphore (`HIPPIUS_UNPINNER_PARALLELISM`) |
 | [run_janitor_in_loop.py](run_janitor_in_loop.py) | FS cache GC with replication gate, hot retention, and pressure modes. | Single instance |
-| [run_orphan_checker_in_loop.py](run_orphan_checker_in_loop.py) | Periodically scans the Hippius chain for orphaned files and enqueues cleanup. | Single instance |
 | [run_account_cacher_in_loop.py](run_account_cacher_in_loop.py) | Warms account credit cache from Substrate. | Single instance |
 | [run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py) | Scrapes the S3 billing-plan catalog + account→plan map from api.hippius.com into `redis-accounts`. | Single instance (**must stay `replicas: 1`**) |
 | [run_usage_rollup_in_loop.py](run_usage_rollup_in_loop.py) | Folds the storage delta ledger into `bucket_storage_usage`; reconciles it and exports drift. | Single instance (**must stay `replicas: 1`**) |
-| [run_migrator_once.py](run_migrator_once.py) | One-shot data migration (e.g., v4→v5). Invoked as a K8s Job. | Job |
 | [cachet_health_check.py](cachet_health_check.py) | Pushes status to the external Cachet status page. | CronJob |
 
 Each `run_*_in_loop.py` is a thin wrapper that imports the shared logic and provides backend-specific parameters (`backend_name`, `queue_name`, `fetch_fn`, etc.). See [../hippius_s3/workers/CLAUDE.md](../hippius_s3/workers/CLAUDE.md) for the core loop internals.
@@ -60,14 +58,6 @@ The FS-walk phases are **parallel, sharded, and budgeted** so a cycle always com
 - `fs_cache_age_bucket_parts{age_bucket=...}`
 - `fs_janitor_deleted_total` / `fs_janitor_tmp_deleted_total`
 
-## Orphan checker
-
-[run_orphan_checker_in_loop.py](run_orphan_checker_in_loop.py). Scans Substrate for files that exist on-chain but have no corresponding entry in our DB — these are orphans from past incidents or test accounts. Enqueues unpin.
-
-Config:
-- `ORPHAN_CHECKER_LOOP_SLEEP=7200` (2h) — how often to run.
-- `ORPHAN_CHECKER_BATCH_SIZE=500` — files per API call.
-- `HIPPIUS_ORPHAN_WORKER_ACCOUNT_WHITELIST` — optional whitelist; if set, only those accounts are scanned. Safety valve for staging.
 
 ## Account cacher
 
@@ -307,9 +297,6 @@ per transaction, each recompute SETS rather than adds, and `backfilled_at` is on
 complete pass — so a run that dies part way through degrades to the pre-existing behaviour (the
 plans-cacher keeps its previous roll) rather than to a wrong bill.
 
-## Migrator
-
-[run_migrator_once.py](run_migrator_once.py). Subprocess wrapper around [../hippius_s3/scripts/migrate_objects.py](../hippius_s3/scripts/migrate_objects.py). Runs as a K8s Job; exits on completion.
 
 ## Cachet health check
 

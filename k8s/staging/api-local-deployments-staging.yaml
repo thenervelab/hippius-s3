@@ -225,8 +225,9 @@ spec:
             periodSeconds: 60
             timeoutSeconds: 10
             failureThreshold: 5
-          # See the note in k8s/base/api-deployment.yaml: keeps this pod serving while
-          # endpoint removal propagates, so SIGTERM lands only after traffic has moved off.
+          # Keeps this pod serving while endpoint removal propagates to every kube-proxy, so
+          # SIGTERM lands only after traffic has moved off. The sleep is deducted from
+          # terminationGracePeriodSeconds, so it plus uvicorn's 25s drain must fit inside it.
           lifecycle:
             preStop:
               exec:

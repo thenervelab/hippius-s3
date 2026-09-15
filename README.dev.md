@@ -217,15 +217,9 @@ COMPOSE_PROJECT_NAME=hippius-e2e docker compose -f docker-compose.yml -f docker-
 
 ### 3.4 Production / staging
 
-```bash
-# Production overrides (real rate limits, bigger Redis memory caps, etc.)
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-
-# Staging
-docker compose -f docker-compose.yml -f docker-compose.staging.yml up -d
-```
-
-You rarely run these locally; they're there for parity investigation.
+Staging and production run on Kubernetes from `k8s/staging` and `k8s/production`; there are no
+compose overrides for them. Render an overlay with `kubectl kustomize k8s/staging` to see what a
+deploy applies.
 
 ### 3.5 Base image rebuild
 

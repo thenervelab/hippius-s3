@@ -6,23 +6,7 @@ services:
     environment:
       <<: *monitoring-enabled
 
-  gateway:
-    environment:
-      <<: *monitoring-enabled
-
-  ipfs-uploader:
-    environment:
-      <<: *monitoring-enabled
-
   arion-uploader:
-    environment:
-      <<: *monitoring-enabled
-
-  ipfs-downloader:
-    environment:
-      <<: *monitoring-enabled
-
-  ipfs-unpinner:
     environment:
       <<: *monitoring-enabled
 

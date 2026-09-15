@@ -8,20 +8,6 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: api
-spec:
-  template:
-    spec:
-      initContainers:
-        - name: wait-for-postgres
-          command:
-            - sh
-            - -c
-            - until pg_isready -h postgres-nvme-rw -p 5432 -U postgres; do echo waiting for postgres; sleep 5; done
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
   name: arion-uploader
 spec:
   template:
