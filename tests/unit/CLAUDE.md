@@ -8,7 +8,7 @@ Pure unit tests. No external services — mocks for DB, Redis, Arion, KMS. Fast;
 tests/unit/
 ├── cache/                     # FS store + parts cache + notifier
 ├── gateway/                   # SigV4, auth, ACL scope
-├── writer/                    # object_writer, chunker, write_through
+├── writer/                    # object_writer, write_through
 ├── services/                  # crypto, envelope, KEK, arion
 ├── test_janitor_hot_retention.py     # Absolute no-deletion under non-replication
 └── conftest.py

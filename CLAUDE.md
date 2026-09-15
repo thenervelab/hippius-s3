@@ -35,7 +35,7 @@ The pipeline is deliberately split so the user-facing path (gateway + API) is fa
 │   ├── api/                 # Internal FastAPI on :8000
 │   │   ├── middlewares/     # request_context, fs_cache_pressure, metrics, tracing
 │   │   └── s3/              # buckets/, objects/, multipart.py, extensions/append.py
-│   ├── writer/              # Upload pipeline: object_writer, chunker, write_through_writer
+│   ├── writer/              # Upload pipeline: object_writer, write_through_writer
 │   ├── reader/              # Read pipeline: planner, streamer, decrypter
 │   ├── cache/               # FileSystemPartsStore, RedisObjectPartsCache, DualFileSystemPartsStore, peers
 │   ├── services/            # crypto, KMS, Arion client, Hippius API, copy, audit, ACL helper
@@ -226,7 +226,7 @@ Canonicalization uses `request.scope["raw_path"]` (bytes) rather than `request.u
 - Entry: [hippius_s3/main.py](hippius_s3/main.py) — `factory()` at line 248, `lifespan` at 87.
 
 ### Upload pipeline
-- [hippius_s3/writer/CLAUDE.md](hippius_s3/writer/CLAUDE.md) — `ObjectWriter`, `WriteThroughPartsWriter`, chunker, DB.
+- [hippius_s3/writer/CLAUDE.md](hippius_s3/writer/CLAUDE.md) — `ObjectWriter`, `WriteThroughPartsWriter`, DB.
 
 ### Download / streaming pipeline
 - [hippius_s3/reader/CLAUDE.md](hippius_s3/reader/CLAUDE.md) — planner, streamer, decrypter.

@@ -49,8 +49,6 @@ Key environment variables for workers:
 | `HIPPIUS_UNPINNER_MAX_ATTEMPTS` | `5` | Max retry attempts for unpins |
 | `HIPPIUS_UNPINNER_BACKOFF_BASE_MS` | `1000` | Base backoff delay (ms) |
 | `HIPPIUS_UNPINNER_BACKOFF_MAX_MS` | `60000` | Max backoff delay (ms) |
-| `ORPHAN_CHECKER_LOOP_SLEEP` | `7200` | Orphan checker interval (seconds) |
-| `ORPHAN_CHECKER_BATCH_SIZE` | `100` | Orphan checker batch size |
 
 ## Docker
 

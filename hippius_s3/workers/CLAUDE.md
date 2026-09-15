@@ -46,7 +46,7 @@ both layers multiplies the budgets (7 × 4 ≈ 24 requests) at a backend that is
 
 Per-pod request concurrency and the shared Arion-POST ceiling are covered under **Concurrency model** below.
 
-Error classification lives in [errors.py](errors.py) — three path-specific classifiers sharing one rule engine (`classify_upload_error`, `classify_download_error`, `classify_unpin_error`). The key divergence is 404: permanent on upload/download, transient on unpin (pin commit pending upstream). Upload-only: `402` → `billing`. Layers: custom exception class → boto `Error.Code` → HTTP status → exception class/errno → keyword fallback → chained `__cause__`. Unmatched errors return `"unknown"` and go to the DLQ. (`error_classifier.py` is a back-compat re-export shim.)
+Error classification lives in [errors.py](errors.py) — three path-specific classifiers sharing one rule engine (`classify_upload_error`, `classify_download_error`, `classify_unpin_error`). The key divergence is 404: permanent on upload/download, transient on unpin (pin commit pending upstream). Upload-only: `402` → `billing`. Layers: custom exception class → boto `Error.Code` → HTTP status → exception class/errno → keyword fallback → chained `__cause__`. Unmatched errors return `"unknown"` and go to the DLQ.
 
 Transient failures go back to the queue with backoff; permanent failures go to the upload DLQ ([../dlq/upload_dlq.py](../dlq/upload_dlq.py)) for manual intervention.
 
