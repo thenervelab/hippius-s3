@@ -1,7 +1,7 @@
 # The hippius-drain agent: the per-node drain daemon.
-# One pod per ingest node, draining that node's local-SSD ingest dir to
-# the shared CephFS pool, path-preservingly per the api part layout
-# (<object_id>/v<version>/part_<n>/). Parts are discovered from the api's landed-part
+# One pod per ingest node, verifying each part that lands on that node's local-SSD
+# ingest dir (the api part layout <object_id>/v<version>/part_<n>/) and handing it to
+# the node-local uploader (arion_upload_requests:<node>). Parts are discovered from the api's landed-part
 # announcements (cephor:landed:<node> on the queue Redis); the reconciler's SSD scan is the
 # BACKSTOP for an announcement that was never delivered, not the primary trigger.
 #
@@ -14,10 +14,8 @@
 # == Volumes ==
 #  * SSD source: the SAME hostPath the api pods write to,
 #    /var/lib/hippius/local_ingest_staging (the `_staging` suffix keeps it disjoint
-#    from prod on a shared node). RW so the agent can unlink a part after a verified,
-#    committed pool copy.
-#  * CephFS pool: object-cache-pvc — ReadWriteMany ceph-filesystem, mounted RW (the api
-#    pods mount it read-only; the agent is the writer into ceph).
+#    from prod on a shared node). RW so the agent can unlink a part once the backend
+#    acks it (the evictor) and reclaim debris.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -107,8 +105,6 @@ spec:
             # mounted at the same paths the api uses, so the relative part dirs line up.
             - name: CEPHOR_SSD_ROOT
               value: /var/lib/hippius/local_object_cache
-            - name: CEPHOR_POOL_ROOT
-              value: /var/lib/hippius/object_cache
             # The drain is the sole upload producer (s3-2.1 drain-direct): once a part is
             # replicated to ceph it pushes an UploadChainRequest to {backend}_upload_requests
             # for each configured backend. Reuse the api's queue-Redis + upload-backend list.
@@ -221,8 +217,6 @@ spec:
           volumeMounts:
             - name: local-ingest
               mountPath: /var/lib/hippius/local_object_cache
-            - name: object-cache
-              mountPath: /var/lib/hippius/object_cache
           resources:
             requests:
               cpu: 100m
@@ -264,6 +258,3 @@ spec:
           hostPath:
             path: /var/lib/hippius/local_ingest_staging
             type: DirectoryOrCreate
-        - name: object-cache
-          persistentVolumeClaim:
-            claimName: object-cache-pvc

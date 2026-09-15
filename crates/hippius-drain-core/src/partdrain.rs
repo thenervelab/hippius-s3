@@ -36,7 +36,7 @@ use crate::enforce::BreakerSignal;
 use crate::redrive::{PartDigest, part_digest};
 use crate::state::ReplicationState;
 use core::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// Which step an I/O error struck, for diagnostics. Every step touches the node-local SSD;
@@ -178,29 +178,6 @@ pub trait PartSource: Send + Sync {
 
     /// The lowercase-hex content hash of one source chunk.
     fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> impl Future<Output = std::io::Result<String>> + Send;
-}
-
-/// The shared `CephFS` pool the drain USED to copy parts into.
-///
-/// No longer consulted by [`drain_part`]: the uploader reads the node's SSD directly. Kept
-/// only until the pool is unmounted (PR 2), for the agent's `LocalFs` impl and its tests.
-// TODO: delete with the pool (PR 2).
-pub trait PartPool: Send + Sync {
-    /// Durably copy `source` into the pool at the part's `chunk_<index>.bin`,
-    /// returning the lowercase-hex SHA-256 of the bytes streamed during the copy.
-    fn persist_chunk(&self, source: &Path, part: &PartKey, index: ChunkIndex) -> impl Future<Output = std::io::Result<String>> + Send;
-
-    /// Durably copy `source` into the pool at the part's `meta.json`.
-    fn persist_meta(&self, source: &Path, part: &PartKey) -> impl Future<Output = std::io::Result<()>> + Send;
-
-    /// Fsync the part's directory once, after every chunk + meta has been renamed into place.
-    fn finalize_part(&self, part: &PartKey) -> impl Future<Output = std::io::Result<()>> + Send;
-
-    /// The lowercase-hex content hash of one pooled chunk.
-    fn chunk_hash(&self, part: &PartKey, index: ChunkIndex) -> impl Future<Output = std::io::Result<String>> + Send;
-
-    /// Remove a part's pool dir. Idempotent.
-    fn remove_part(&self, part: &PartKey) -> impl Future<Output = std::io::Result<()>> + Send;
 }
 
 /// The central replication-status store the drain commits its result to.

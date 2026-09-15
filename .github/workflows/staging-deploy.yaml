@@ -415,7 +415,6 @@ jobs:
           # SigV4 against it. Old header-trusting pods receiving public traffic (an auth
           # bypass) is prevented by the label either way.
           kubectl delete deployment/gateway -n hippius-s3-staging --ignore-not-found=true
-          kubectl rollout status deployment/arion-downloader -n hippius-s3-staging --timeout=10m
           kubectl rollout status deployment/arion-uploader -n hippius-s3-staging --timeout=10m
           # Drain stack, allocator-first: the allocator applies the cephor_* migrations
           # on startup, so confirm it is Ready (strict) before the per-node agent DaemonSet.

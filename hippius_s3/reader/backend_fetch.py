@@ -8,9 +8,9 @@ with the pool, and promoting Arion-served chunks onto the NVMe would put cache-f
 amplification on every cold read, competing with ingest for the same disk. (Peer-served chunks
 still promote, in `DualFileSystemPartsStore`; that decision is unchanged.)
 
-This replaces the downloader round-trip: the api used to enqueue a `DownloadChainRequest`, a
-worker fetched the chunk into the pool, and the streamer waited on a pub/sub notification to
-re-read it. Three hops and two copies for one 4 MiB read.
+This replaced the downloader round-trip: the api used to enqueue a download request, a worker
+fetched the chunk into the pool, and the streamer waited on a pub/sub notification to re-read it.
+Three hops and two copies for one 4 MiB read.
 
 One `ArionClient` per process — `fetch` runs once per chunk, ~1280 times for a 5 GiB object, and
 a client per call is a TCP+TLS handshake per chunk. A per-process semaphore bounds the backend
@@ -135,6 +135,6 @@ def _build_fetcher() -> BackendChunkFetcher:
         {"arion": arion_fetch},
         concurrency=int(cfg.read_backend_fetch_concurrency),
         attempts=int(cfg.read_backend_fetch_attempts),
-        base_sleep=float(cfg.downloader_retry_base_seconds),
-        jitter=float(cfg.downloader_retry_jitter_seconds),
+        base_sleep=float(cfg.read_backend_fetch_retry_base_seconds),
+        jitter=float(cfg.read_backend_fetch_retry_jitter_seconds),
     )

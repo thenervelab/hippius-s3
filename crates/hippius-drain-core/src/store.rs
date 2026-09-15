@@ -12,8 +12,6 @@
 //! `query!` once CI Postgres infra exists.
 
 use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
-use crate::gc::GcClaim;
-use crate::ids::FileId;
 use crate::partdrain::{ClaimedPart, PartReplicationStore, PartVerified};
 use crate::reconcile::PartLandingLog;
 use crate::reconcile::PartStatus;
@@ -627,63 +625,6 @@ impl Store {
             .fetch_one(&self.pool)
             .await?;
         Ok(u64::try_from(count).unwrap_or(0))
-    }
-
-    /// Claims a file for GC. Returns `Some(GcClaim)` if this caller won the claim,
-    /// `None` if another agent already holds a live, incomplete claim — so the
-    /// reclaim runs once. The returned [`GcClaim`] is the capability
-    /// [`crate::gc_object`] requires; this is its only production constructor, so
-    /// winning the durable marker is the sole path to authorizing a reclaim.
-    ///
-    /// A claim whose holder crashed before [`complete_gc`](Store::complete_gc) is
-    /// re-winnable once `claimed_at` ages past the claim lease — without this, a
-    /// single crashed claimant would wedge a file's GC forever (the marker row
-    /// conflicts but never completes). A *completed* claim is never re-won; a
-    /// *fresh* (within-lease) claim is left to its current holder. Mirrors
-    /// [`claim_chunk`](Store::claim_chunk)'s lease-based re-claim.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`].
-    pub async fn claim_gc(&self, file: &FileId) -> Result<Option<GcClaim>> {
-        let row = sqlx::query_as::<_, (String,)>(
-            "INSERT INTO cephor_gc_state (file_id, claimed_at) VALUES ($1, now()) \
-             ON CONFLICT (file_id) DO UPDATE SET claimed_at = now() \
-                WHERE cephor_gc_state.completed_at IS NULL \
-                  AND cephor_gc_state.claimed_at < now() - $2 * interval '1 second' \
-             RETURNING file_id",
-        )
-        .bind(file.as_str())
-        .bind(self.claim_lease.as_secs_f64())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|_| GcClaim::new(file.clone())))
-    }
-
-    /// Marks a claimed file's GC complete.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`].
-    pub async fn complete_gc(&self, file: &FileId) -> Result<()> {
-        sqlx::query("UPDATE cephor_gc_state SET completed_at = now() WHERE file_id = $1")
-            .bind(file.as_str())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Whether a file's GC has completed.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`].
-    pub async fn is_gc_complete(&self, file: &FileId) -> Result<bool> {
-        let row = sqlx::query_as::<_, (bool,)>("SELECT completed_at IS NOT NULL FROM cephor_gc_state WHERE file_id = $1")
-            .bind(file.as_str())
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.is_some_and(|(done,)| done))
     }
 
     /// Records that a part has landed on SSD and awaits drain. Idempotent: a repeat for the
@@ -2004,7 +1945,6 @@ impl BackingLog for Store {
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::Store;
-    use crate::ids::FileId;
     use core::str::FromStr;
     use sqlx::postgres::PgPool;
 
@@ -2065,64 +2005,6 @@ mod tests {
         assert!(
             node_a.claim_part().await.unwrap().is_some(),
             "after re-recording, node-a owns and claims it"
-        );
-    }
-
-    #[sqlx::test]
-    async fn gc_claim_is_exclusive_then_completes(pool: PgPool) {
-        let store = Store::from_pool(pool);
-        let file = FileId::from_str("file-1").unwrap();
-        assert!(store.claim_gc(&file).await.unwrap().is_some(), "first claim wins");
-        assert!(store.claim_gc(&file).await.unwrap().is_none(), "second claim loses");
-        assert!(!store.is_gc_complete(&file).await.unwrap());
-        store.complete_gc(&file).await.unwrap();
-        assert!(store.is_gc_complete(&file).await.unwrap());
-    }
-
-    #[sqlx::test]
-    async fn a_stale_incomplete_gc_claim_is_reclaimable(pool: PgPool) {
-        // The GC analogue of the chunk-claim crash-recovery fix (#13): an agent won
-        // a GC claim (marker row inserted) then crashed before `complete_gc`. The
-        // claim is now older than the lease, so a fresh claim must reclaim the
-        // wedged file — without this, the conflicting, never-completed row would
-        // block that file's reclaim forever.
-        let store = Store::from_pool(pool.clone());
-        let file = FileId::from_str("file-1").unwrap();
-        assert!(store.claim_gc(&file).await.unwrap().is_some(), "first claim wins");
-        assert!(store.claim_gc(&file).await.unwrap().is_none(), "a fresh claim is still held");
-
-        // Age the claim past the lease (backdating is the only deterministic way to
-        // fast-forward the lease clock — there is no public API to age a claim).
-        sqlx::query("UPDATE cephor_gc_state SET claimed_at = now() - interval '1 hour' WHERE file_id = $1")
-            .bind(file.as_str())
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        assert!(
-            store.claim_gc(&file).await.unwrap().is_some(),
-            "a stale, incomplete GC claim is re-winnable",
-        );
-    }
-
-    #[sqlx::test]
-    async fn a_completed_gc_claim_is_never_reclaimed(pool: PgPool) {
-        // Once a file's GC has completed its debris is gone, so even an aged claim
-        // row must not hand out a new claim (which would re-run a pointless reclaim).
-        let store = Store::from_pool(pool.clone());
-        let file = FileId::from_str("file-1").unwrap();
-        store.claim_gc(&file).await.unwrap().expect("first claim wins");
-        store.complete_gc(&file).await.unwrap();
-
-        sqlx::query("UPDATE cephor_gc_state SET claimed_at = now() - interval '1 hour' WHERE file_id = $1")
-            .bind(file.as_str())
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        assert!(
-            store.claim_gc(&file).await.unwrap().is_none(),
-            "a completed GC is terminal and never re-claimed, even when aged",
         );
     }
 }

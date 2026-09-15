@@ -39,7 +39,7 @@ The pipeline is deliberately split so the user-facing path (gateway + API) is fa
 │   ├── reader/              # Read pipeline: planner, streamer, decrypter
 │   ├── cache/               # FileSystemPartsStore, RedisObjectPartsCache, ChunkNotifier
 │   ├── services/            # crypto, KMS, Arion client, Hippius API, copy, audit, ACL helper
-│   ├── workers/             # Core worker loops (uploader, downloader, unpinner)
+│   ├── workers/             # Core worker loops (uploader, unpinner)
 │   ├── dlq/                 # Dead-letter queue implementations (upload, unpin)
 │   ├── repositories/        # Database access layer
 │   ├── sql/                 # Migrations (migrations/) and parameterized queries (queries/)
@@ -97,7 +97,7 @@ A **subsystem index** with links to per-directory `CLAUDE.md` files is in sectio
    - For each chunk: `obj_cache.get_chunk` walks this node's NVMe → a peer's NVMe → the pool; on a miss, `fetch_missing` ([hippius_s3/reader/backend_fetch.py](hippius_s3/reader/backend_fetch.py)) pulls the ciphertext **from Arion into memory** by its recorded location (one `ArionClient` per process, `HIPPIUS_READ_BACKEND_FETCH_CONCURRENCY` in flight per pod, `HIPPIUS_READ_BACKEND_FETCH_ATTEMPTS` bounded retries per location). Arion-served bytes are **never written to any cache** — no pool fill, no NVMe promotion (peer-served chunks still promote).
    - A chunk with no location yet (its part is inside the upload window on another node) can only come from a peer: the local tiers are re-polled for `HIPPIUS_READ_MISSING_CHUNK_WAIT_SECONDS`, then the request fails with a retryable 503 (`ChunkUnavailableError` → `DownloadNotReadyError` at the first-chunk peek; a mid-stream one ends the stream). Each chunk is bounded by `HIPPIUS_STREAM_CHUNK_TIMEOUT_SECONDS`.
    - Decrypt ([reader/decrypter.py](hippius_s3/reader/decrypter.py)) in-process, optionally slice for Range, yield.
-4. `UploadPartCopy` and streaming `CopyObject` read their source through the same `stream_object` path. The **downloader worker** and `DownloadChainRequest` still exist but nothing enqueues to them; they go with the pool (PR 2).
+4. `UploadPartCopy` and streaming `CopyObject` read their source through the same `stream_object` path. There is no download worker any more.
 
 ### 3.3 Range request specifics
 
@@ -147,7 +147,7 @@ Chunk ciphertext     (AES-256-GCM per chunk; AAD binds bucket_id:object_id:versi
 ```
 
 - **Atomic writes**: each worker writes to a unique `.tmp.<uuid4>` file and `os.replace`s onto the final path ([hippius_s3/cache/fs_store.py:92](hippius_s3/cache/fs_store.py), [fs_store.py:123-131](hippius_s3/cache/fs_store.py)). Concurrent writers of the same chunk are safe — content is deterministic per (object_id, version, part, chunk_index), so last rename wins is harmless.
-- **Meta is the readiness signal**: `get_chunk` returns `None` if `meta.json` is missing ([fs_store.py:168](hippius_s3/cache/fs_store.py)) — even if the chunk file exists. Uploaders write meta **last** (after all chunks); downloaders write meta **first** (so per-chunk visibility works as chunks land).
+- **Meta is the readiness signal**: `get_chunk` returns `None` if `meta.json` is missing ([fs_store.py:168](hippius_s3/cache/fs_store.py)) — even if the chunk file exists. Writers (ingest, promotion) write meta **last**, after every chunk.
 - **Hot retention via read-recency tracking**: reads no longer `os.utime` the files — the per-read atime touch was removed (dead on read-only mounts, an MDS metadata write elsewhere). Instead a successful read records recency via `tracker.note_read(...)` into `fs_cache_inventory.last_access_at` ([fs_store.py:180-195](hippius_s3/cache/fs_store.py)). Janitor uses `last_access_at` to keep hot parts on NVMe for `HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS` (default 4h). `os.utime` still applies on the set/touch write paths, so stat atime now reflects write recency only.
 - **UUID coercion**: asyncpg may hand back `UUID` objects OR strings. `_safe_object_id` handles both ([fs_store.py:48-62](hippius_s3/cache/fs_store.py)) and rejects anything else to prevent path traversal.
 
@@ -236,9 +236,9 @@ Canonicalization uses `request.scope["raw_path"]` (bytes) rather than `request.u
 - [hippius_s3/cache/CLAUDE.md](hippius_s3/cache/CLAUDE.md) — `FileSystemPartsStore`, `RedisObjectPartsCache`, `ChunkNotifier`, `DualFileSystemPartsStore`.
 
 ### Workers
-- [hippius_s3/workers/CLAUDE.md](hippius_s3/workers/CLAUDE.md) — core logic (uploader, downloader, unpinner).
+- [hippius_s3/workers/CLAUDE.md](hippius_s3/workers/CLAUDE.md) — core logic (uploader, unpinner).
 - [workers/CLAUDE.md](workers/CLAUDE.md) — entry-point loops and janitor.
-- Entry scripts: [workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py), [workers/run_arion_downloader_in_loop.py](workers/run_arion_downloader_in_loop.py), [workers/run_arion_unpinner_in_loop.py](workers/run_arion_unpinner_in_loop.py), [workers/run_janitor_in_loop.py](workers/run_janitor_in_loop.py), [workers/run_orphan_checker_in_loop.py](workers/run_orphan_checker_in_loop.py), [workers/run_account_cacher_in_loop.py](workers/run_account_cacher_in_loop.py), [workers/run_migrator_once.py](workers/run_migrator_once.py), [workers/cachet_health_check.py](workers/cachet_health_check.py).
+- Entry scripts: [workers/run_arion_uploader_in_loop.py](workers/run_arion_uploader_in_loop.py), [workers/run_arion_unpinner_in_loop.py](workers/run_arion_unpinner_in_loop.py), [workers/run_janitor_in_loop.py](workers/run_janitor_in_loop.py), [workers/run_orphan_checker_in_loop.py](workers/run_orphan_checker_in_loop.py), [workers/run_account_cacher_in_loop.py](workers/run_account_cacher_in_loop.py), [workers/run_migrator_once.py](workers/run_migrator_once.py), [workers/cachet_health_check.py](workers/cachet_health_check.py).
 
 ### Business services
 - [hippius_s3/services/CLAUDE.md](hippius_s3/services/CLAUDE.md) — all service modules.
@@ -290,10 +290,9 @@ Config is a typed dataclass: [hippius_s3/config.py](hippius_s3/config.py). Value
 | `HIPPIUS_CHUNK_SIZE_BYTES` | `4194304` (4 MiB) | Must be consistent across upload/download code paths. |
 | `HIPPIUS_CACHE_TTL` | `3600` | Pub/sub wait timeout. |
 | `HIPPIUS_FS_CACHE_HOT_RETENTION_SECONDS` | `14400` (4h) | Janitor keeps recently-read parts. |
-| `DOWNLOAD_COALESCE_LOCK_TTL` | `600` | Lock expiry guards downloader crashes. |
-| `DOWNLOADER_SEMAPHORE` | `20` | Concurrent chunk fetches per DCR. |
-| `DOWNLOADER_MAX_INFLIGHT` | `10` | Concurrent `DownloadChainRequest`s per pod. |
-| `DOWNLOADER_CHUNK_RETRIES` | `3` | Per-chunk retry attempts. |
+| `HIPPIUS_READ_BACKEND_FETCH_CONCURRENCY` | `32` | Backend chunk fetches in flight per api pod (cold reads). |
+| `HIPPIUS_READ_BACKEND_FETCH_ATTEMPTS` | `3` | Retries per backend location on a transient error. |
+| `HIPPIUS_READ_MISSING_CHUNK_WAIT_SECONDS` | `10` | Re-poll of the local tiers for a chunk no backend holds yet, before a 503. |
 
 ### Backend routing
 
@@ -416,7 +415,7 @@ The pod's container has no `wget`/`curl`, so always port-forward and curl from y
 
 **Namespaces of interest:** `hippius-s3-prod`, `hippius-s3-staging`, `hippius-arion`, `hippius-arion-staging`, `hippius-indexer`.
 
-**`app` values in `hippius-s3-prod`:** `gateway`, `api`, `arion-uploader`, `arion-downloader`, `arion-unpinner`, `janitor`, `account-cacher`, `cachet-health-checker`, 1`redis-queues`, `redis-accounts`, `otel-collector`.
+**`app` values in `hippius-s3-prod`:** `gateway`, `api`, `arion-uploader`, `arion-uploader-local`, `arion-unpinner`, `janitor`, `account-cacher`, `cachet-health-checker`, 1`redis-queues`, `redis-accounts`, `otel-collector`.
 
 **Run a query (LogQL):**
 ```bash

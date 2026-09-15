@@ -138,7 +138,6 @@ async fn main() -> Result<ExitCode, StartupError> {
     let metrics = hippius_drain_agent::metrics::init("hippius-drain-agent", &runtime.snapshot(), Some(&enforcer));
 
     tracing::info!(
-        pool_root = %config.pool_root.display(),
         ssd_root = %config.ssd_root.display(),
         upload_backends = ?config.upload_backends,
         backup_backends = ?config.backup_backends,

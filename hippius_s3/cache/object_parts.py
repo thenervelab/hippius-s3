@@ -1,9 +1,9 @@
-"""Parts cache facade — FS-backed chunks with Redis pub/sub notifications.
+"""Parts cache facade — FS-backed chunks.
 
 Previously backed by Redis (hence the class name `RedisObjectPartsCache`).
 After the FS-cache migration, chunk and meta I/O is delegated to
-`FileSystemPartsStore` and the only Redis use is the pub/sub channel
-for chunk-ready notifications (isolated in `ChunkNotifier`).
+`FileSystemPartsStore`; the read path's lowest tier is the backend itself
+(`hippius_s3.reader.backend_fetch`), so there is no chunk-ready pub/sub any more.
 
 The class name is kept for now to minimize call-site churn; a follow-up PR
 may rename to `PartsCache`.
@@ -16,8 +16,6 @@ from typing import Optional
 from typing import Protocol
 
 from .fs_store import FileSystemPartsStore
-from .notifier import ChunkNotifier
-from .notifier import build_chunk_key
 
 
 # Lazy monitoring import: avoid pulling opentelemetry at import-time
@@ -57,15 +55,11 @@ DEFAULT_OBJ_PART_TTL_SECONDS = 1800
 
 
 class RedisObjectPartsCache:
-    """FS-backed parts cache with Redis pub/sub notifications.
+    """FS-backed parts cache.
 
-    Composes `FileSystemPartsStore` for all chunk/meta I/O and `ChunkNotifier`
-    for the wait/notify pub/sub pattern that coordinates streamers with
-    download workers.
-
-    The `redis_client` param is retained for backward compatibility (some
-    callers reach `.redis` for in-progress flag cleanup); it's only used
-    for those legacy operations and may be removed once those are cleaned up.
+    Composes `FileSystemPartsStore` for all chunk/meta I/O. The `redis_client` /
+    `queues_client` params are retained for call-site compatibility; neither is used for
+    chunk or meta storage.
     """
 
     def __init__(
@@ -74,22 +68,17 @@ class RedisObjectPartsCache:
         queues_client: Any = None,
         fs_store: Optional[FileSystemPartsStore] = None,
     ) -> None:
-        # `redis_client` is retained because a few callers access `.redis` for
-        # the download-coalescing lock (SET/DELETE on `download_in_progress:…`
-        # keys). It is not used for chunk or meta storage.
         self.redis = redis_client
-        # `queues_client` is the pub/sub transport. Fall back to redis_client
-        # only for tests that pass a single mock.
-        self._notifier = ChunkNotifier(queues_client or redis_client)
+        del queues_client
         self._fs = fs_store
 
-    # ---- key builders (used by some callers for pub/sub / diagnostics) ----
+    # ---- key builders (diagnostics) ----
 
     def build_key(self, object_id: str, object_version: int, part_number: int) -> str:
         return f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}"
 
     def build_chunk_key(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> str:
-        return build_chunk_key(object_id, object_version, part_number, chunk_index)
+        return f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}:chunk:{int(chunk_index)}"
 
     def build_meta_key(self, object_id: str, object_version: int, part_number: int) -> str:
         return f"obj:{object_id}:v:{int(object_version)}:part:{int(part_number)}:meta"
@@ -258,38 +247,3 @@ class RedisObjectPartsCache:
         """
         del ttl
         await self.fs.touch_part(object_id, int(object_version), int(part_number))
-
-    # ---- pub/sub API ----
-
-    async def wait_for_chunk(
-        self,
-        object_id: str,
-        object_version: int,
-        part_number: int,
-        chunk_index: int,
-        *,
-        timeout: float | None = None,  # noqa: ASYNC109
-    ) -> bytes:
-        # A3: callers (the streamer) can pass a per-chunk bound; default to the full cache TTL so
-        # existing callers are unchanged.
-        if timeout is None:
-            timeout = _get_config_value("cache_ttl_seconds", DEFAULT_OBJ_PART_TTL_SECONDS)
-        return await self._notifier.wait_for_chunk(
-            object_id,
-            int(object_version),
-            int(part_number),
-            int(chunk_index),
-            fetch_fn=self.fs.get_chunk,
-            timeout=float(timeout),
-        )
-
-    async def notify_chunk(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> None:
-        await self._notifier.notify(object_id, int(object_version), int(part_number), int(chunk_index))
-
-    def stream_subscription(self, object_id: str, object_version: int) -> Any:
-        """One pub/sub subscription for the whole stream (RQ-1), wired to this cache's FS fetch.
-
-        Returns an async context manager; inside it call
-        `sub.wait_for_chunk(part_number, chunk_index, timeout=...)`.
-        """
-        return self._notifier.stream_subscription(object_id, int(object_version), fetch_fn=self.fs.get_chunk)

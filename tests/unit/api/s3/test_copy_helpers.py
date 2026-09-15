@@ -295,9 +295,9 @@ class _SentinelStop(Exception):
 async def test_streaming_copy_streams_via_app_obj_cache():
     """The source read must go through the lifespan-built cache.
 
-    Building a fresh RedisObjectPartsCache here would leave its ChunkNotifier on the
-    general redis client, which in prod is a RedisCluster with no `.pubsub()` — every
-    copy that had to wait for a chunk 500'd. See handle_streaming_copy.
+    The lifespan-built cache carries the dual-tier store (peer fetch, promotion, residency);
+    a fresh RedisObjectPartsCache here would read a bare single-tier store. See
+    handle_streaming_copy.
     """
     captured = {}
 

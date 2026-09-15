@@ -10,6 +10,3 @@ services:
                "--maxmemory",
                "5000mb", ]
 
-  arion-downloader:
-    deploy:
-      replicas: 1

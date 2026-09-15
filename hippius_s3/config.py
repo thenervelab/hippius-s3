@@ -413,7 +413,6 @@ class Config:
 
     # worker specific settings
     unpinner_sleep_loop: float = 5.0
-    downloader_sleep_loop: float = 0.01
     cacher_loop_sleep: float = 60.0  # 1 minute
     pin_checker_loop_sleep: float = 7200.0  # 2 hours
     orphan_checker_loop_sleep: int = env("ORPHAN_CHECKER_LOOP_SLEEP:7200", convert=int)  # 2 hours
@@ -544,51 +543,26 @@ class Config:
     object_lock_max_retention_days: int = env("HIPPIUS_OBJECT_LOCK_MAX_RETENTION_DAYS:3650", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
     object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
-    # Downloader behavior (default: no whole-part backfill)
-    downloader_allow_part_backfill: bool = env(
-        "DOWNLOADER_ALLOW_PART_BACKFILL:false", convert=lambda x: x.lower() == "true"
-    )
-
-    # Downloader retry tuning (used by per-backend downloader workers)
-    downloader_chunk_retries: int = env("DOWNLOADER_CHUNK_RETRIES:3", convert=int)
-    downloader_retry_base_seconds: float = env("DOWNLOADER_RETRY_BASE_SECONDS:0.1", convert=float)
-    downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
-    # Request-level retry: when a whole DownloadChainRequest fails (Arion exhaustion or a process
-    # error), requeue it via a per-backend retry ZSET + 2s mover instead of dropping it (A12).
-    # Mirrors the uploader's request-level retry (uploader_max_attempts / _backoff_*_ms).
-    downloader_max_attempts: int = env("HIPPIUS_DOWNLOADER_MAX_ATTEMPTS:5", convert=int)
-    downloader_backoff_base_ms: int = env("HIPPIUS_DOWNLOADER_BACKOFF_BASE_MS:500", convert=int)
-    downloader_backoff_max_ms: int = env("HIPPIUS_DOWNLOADER_BACKOFF_MAX_MS:60000", convert=int)
-    downloader_semaphore: int = env("DOWNLOADER_SEMAPHORE:20", convert=int)
-    # Max concurrent DownloadChainRequests a single downloader pod processes.
-    # The main loop dequeues and spawns tasks up to this cap; the semaphore
-    # above still bounds total concurrent chunk fetches across all tasks.
-    # Range-heavy read patterns produce many 1-part DCRs, so parallelising
-    # DCRs is what delivers real backend throughput.
-    downloader_max_inflight: int = env("DOWNLOADER_MAX_INFLIGHT:10", convert=int)
-    # When multiple streamers hit a cache miss on the same part concurrently,
-    # only one enqueues a DownloadChainRequest; the others wait via pub/sub.
-    # The Redis lock that enforces this is cleared by the downloader on
-    # completion (compare-and-delete on the enqueuer's token, A5), and this TTL
-    # caps the worst-case hang if the downloader crashes mid-request. Raised to
-    # 600s (A5) so a legitimately slow multi-chunk part download does not expire
-    # the lock mid-flight and let a second streamer enqueue a duplicate DCR.
-    download_coalesce_lock_ttl_seconds: int = env("DOWNLOAD_COALESCE_LOCK_TTL:600", convert=int)
     # The read path's own backend fetch (hippius_s3/reader/backend_fetch.py): on a cache miss the
     # api pulls the chunk from the backend into memory and decrypts it in-process — no downloader,
     # no pool write. One concurrency budget per pod across every in-flight GET, like the uploader's
     # arion_upload_concurrency; a transient backend error is retried this many times per location.
     read_backend_fetch_concurrency: int = env("HIPPIUS_READ_BACKEND_FETCH_CONCURRENCY:32", convert=int)
     read_backend_fetch_attempts: int = env("HIPPIUS_READ_BACKEND_FETCH_ATTEMPTS:3", convert=int)
+    read_backend_fetch_retry_base_seconds: float = env(
+        "HIPPIUS_READ_BACKEND_FETCH_RETRY_BASE_SECONDS:0.1", convert=float
+    )
+    read_backend_fetch_retry_jitter_seconds: float = env(
+        "HIPPIUS_READ_BACKEND_FETCH_RETRY_JITTER_SECONDS:0.1", convert=float
+    )
+    # Streaming prefetch window (chunks fetched ahead of the one being decrypted/sent). On a
+    # cold read it is also the per-request backend parallelism.
+    http_stream_prefetch_chunks: int = env("HTTP_STREAM_PREFETCH_CHUNKS:16", convert=int)
     # A chunk on no backend yet (its part is inside the upload window on another node) can only
     # come from a peer. When the peer tier misses too, re-poll the local tiers this long before
     # giving up with a retryable 503, so a briefly-shed peer fetch (a saturated peer) recovers
     # without the client retrying.
     read_missing_chunk_wait_seconds: float = env("HIPPIUS_READ_MISSING_CHUNK_WAIT_SECONDS:10", convert=float)
-    # DB-1: config-driven downloader Postgres pool (was hardcoded min=2/max=20). Audit
-    # Σ(replicas × pool_max) across roles against Postgres max_connections before raising.
-    downloader_db_pool_min: int = env("HIPPIUS_DOWNLOADER_DB_POOL_MIN:2", convert=int)
-    downloader_db_pool_max: int = env("HIPPIUS_DOWNLOADER_DB_POOL_MAX:20", convert=int)
     # CF-3: depth of the encrypt producer/consumer queue per streaming write. Peak buffered memory
     # per PUT ≈ chunk_size × this. Exposed so it can move with chunk size (CF-1).
     write_queue_maxsize: int = env("HIPPIUS_WRITE_QUEUE_MAXSIZE:16", convert=int)
@@ -641,16 +615,6 @@ class Config:
 
     # initial stream timeout (seconds) before sending first byte
     http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
-
-    # RQ-1: use ONE pub/sub subscription per stream (demuxed to per-chunk events) instead of a fresh
-    # subscribe/unsubscribe per cold chunk. Correctness-sensitive (the demux + FS re-check race
-    # guard); opt-in with a per-chunk fallback so it can be rolled back without a redeploy.
-    stream_single_subscription: bool = env(
-        "HIPPIUS_STREAM_SINGLE_SUBSCRIPTION:false", convert=lambda x: x.lower() == "true"
-    )
-    # Download streaming prefetch window (number of chunks to fetch concurrently).
-    # Helps cache-hit throughput by reducing per-chunk Redis roundtrip stalls.
-    http_stream_prefetch_chunks: int = env("HTTP_STREAM_PREFETCH_CHUNKS:16", convert=int)
 
     # DLQ configuration
     dlq_dir: str = env("HIPPIUS_DLQ_DIR:/tmp/hippius_dlq")
