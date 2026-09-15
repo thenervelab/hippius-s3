@@ -267,7 +267,7 @@ async def test_critical_pressure_evicts_replicated_cold_parts(fs_root, fs_store,
 
 @pytest.mark.asyncio
 async def test_backup_backends_unioned_into_replication_check(fs_root, fs_store, redis_mock, db_mock, monkeypatch):
-    """When HIPPIUS_BACKUP_BACKENDS is set, those backends must be required
+    """When backup backends are configured, those backends must be required
     for the replication check too. This guards against deleting FS chunks
     before a configured backup backend has accepted them.
     """

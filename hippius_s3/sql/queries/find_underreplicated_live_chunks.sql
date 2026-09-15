@@ -35,7 +35,7 @@
 -- chunk_backend (chunk_id) live index rather than aggregating every backend per chunk.
 --
 -- Parameters:
---   $1 backup_backends          TEXT[]  — configured HIPPIUS_BACKUP_BACKENDS
+--   $1 backup_backends          TEXT[]  — config.backup_backends
 --   $2 default_upload_backends  TEXT[]  — config.upload_backends (fallback for legacy rows)
 --   $3 limit                    INT     — max violating chunks to return
 --   $4 replication_sla_seconds  INT     — grace window; only parts landed longer ago than
@@ -44,11 +44,16 @@ WITH live_versions AS (
     SELECT
         ov.object_id,
         ov.object_version,
+        -- The persisted per-version list is a RECORD of what the version was written under,
+        -- intersected with the pinned set ($2): a backend retired from the set since is no
+        -- longer required (or every version written under the wider set would be flagged
+        -- forever). An empty intersection falls back to the pinned set.
         ARRAY(
             SELECT DISTINCT unnest(
                 (CASE
                     WHEN ov.version_type = 'migration' THEN ARRAY['ipfs']::text[]
-                    WHEN ov.upload_backends IS NOT NULL AND cardinality(ov.upload_backends) > 0 THEN ov.upload_backends
+                    WHEN ov.upload_backends IS NOT NULL AND ov.upload_backends && $2::text[]
+                        THEN ARRAY(SELECT unnest(ov.upload_backends) INTERSECT SELECT unnest($2::text[]))
                     ELSE $2::text[]
                 END) || $1::text[]
             )

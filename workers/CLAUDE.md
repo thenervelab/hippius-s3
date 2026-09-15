@@ -24,7 +24,7 @@ Each `run_*_in_loop.py` is a thin wrapper that imports the shared logic and prov
 
 ### Core invariant
 
-**Replication is an absolute gate.** A chunk that has NOT been replicated to every required backend (`HIPPIUS_UPLOAD_BACKENDS` ∪ `HIPPIUS_BACKUP_BACKENDS`) is **never** deleted — under any conditions, including a full disk. The critical-pressure path still honors this: if nothing is replicated and disk is at 95%+, the janitor logs ERROR and deletes nothing. Operator paging, not data loss.
+**Replication is an absolute gate.** A chunk that has NOT been replicated to every required backend (`config.upload_backends` ∪ `config.backup_backends`, pinned in code as `STORAGE_BACKENDS`) is **never** deleted — under any conditions, including a full disk. The critical-pressure path still honors this: if nothing is replicated and disk is at 95%+, the janitor logs ERROR and deletes nothing. Operator paging, not data loss.
 
 ### Pressure modes
 

@@ -230,7 +230,7 @@ mod tests {
             object_version: 5,
             chunks: vec![Chunk { id: 1 }],
             upload_id: Some("11111111-1111-4111-8111-111111111111".to_owned()),
-            upload_backends: vec!["arion".to_owned()],
+            upload_backends: crate::config::STORAGE_BACKENDS.iter().map(|b| (*b).to_owned()).collect(),
             node_id: Some("ingest-node-1".to_owned()),
             request_id: None,
             attempts: 0,

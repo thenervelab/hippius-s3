@@ -27,10 +27,17 @@ def _parse_csv_urls(value: str | None) -> list[str]:
     return deduped
 
 
-def _parse_backends(value: str | None, default: str = "arion") -> list[str]:
-    """Parse comma-separated list of backend names."""
-    value = value or default
-    return [b.strip() for b in value.split(",") if b.strip()]
+# The storage backend set is pinned in code, not read from the environment. It is the
+# replication contract: every backend listed must have workers consuming its upload and unpin
+# queues, or no part ever reaches full coverage and the drain's `uploading` rows — SSD copies
+# pinned against eviction — accumulate forever. A second backend is a code change that ships
+# together with the workers that serve it (and the matching constant in the Rust drain config,
+# crates/hippius-drain-agent/src/config.rs).
+STORAGE_BACKENDS: tuple[str, ...] = ("arion",)
+
+
+def _storage_backends() -> list[str]:
+    return list(STORAGE_BACKENDS)
 
 
 # The Hippius network's SS58 prefix — the format cacher/run_cacher.py derives account addresses
@@ -483,14 +490,15 @@ class Config:
     # MERGE-BLOCKER: HCFS must confirm empty folder_hash works before this is used in prod.
     unpinner_folder_hash: str = env("HIPPIUS_ARION_FOLDER_HASH:", convert=str)
 
-    # Per-operation backend lists (queue names derived as {backend}_{op}_requests)
-    upload_backends: list[str] = env("HIPPIUS_UPLOAD_BACKENDS:arion", convert=_parse_backends)
-    download_backends: list[str] = env("HIPPIUS_DOWNLOAD_BACKENDS:arion", convert=_parse_backends)
-    delete_backends: list[str] = env("HIPPIUS_DELETE_BACKENDS:arion", convert=_parse_backends)
-    # Optional additional backends that must have replicated a chunk before
-    # the janitor is allowed to evict it from the FS cache. Unioned with
-    # upload_backends when checking "fully replicated".
-    backup_backends: list[str] = env("HIPPIUS_BACKUP_BACKENDS:", convert=lambda v: _parse_backends(v, default=""))
+    # Per-operation backend lists (queue names derived as {backend}_{op}_requests). Pinned to
+    # STORAGE_BACKENDS — see the note on that constant for why these are not env-driven.
+    upload_backends: list[str] = dataclasses.field(default_factory=_storage_backends)
+    download_backends: list[str] = dataclasses.field(default_factory=_storage_backends)
+    delete_backends: list[str] = dataclasses.field(default_factory=_storage_backends)
+    # Additional backends that must have replicated a chunk before the janitor is allowed to
+    # evict it from the FS cache. Unioned with upload_backends when checking "fully
+    # replicated". Empty: a backup backend is a deliberate opt-in, made in code.
+    backup_backends: list[str] = dataclasses.field(default_factory=list)
 
     # Cache TTL (shared across components — still used for pub/sub wait timeout)
     cache_ttl_seconds: int = env("HIPPIUS_CACHE_TTL:3600", convert=int)

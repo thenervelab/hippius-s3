@@ -61,7 +61,7 @@
 --   $1 object_ids               TEXT[]   — slice tuples' object_id (parallel array; unnest WITH ORDINALITY)
 --   $2 object_versions          BIGINT[] — slice tuples' object_version (parallel array)
 --   $3 part_numbers             BIGINT[] — slice tuples' part_number (parallel array)
---   $4 backup_backends          TEXT[]   — configured HIPPIUS_BACKUP_BACKENDS
+--   $4 backup_backends          TEXT[]   — config.backup_backends
 --   $5 default_upload_backends  TEXT[]   — config.upload_backends (fallback for NULL rows)
 --   $6 max_age_seconds          INT      — age gate; a part qualifies only if uploaded_at is older
 --   $7 ignore_age               BOOL     — pressure override; TRUE bypasses the age gate
@@ -73,11 +73,16 @@ required_sets AS (
     SELECT
         ov.object_id,
         ov.object_version,
+        -- The persisted per-version list is a RECORD of what the version was written under,
+        -- intersected with the pinned set ($5): a backend retired from the set since is no
+        -- longer required (or every version written under the wider set would be pinned on
+        -- the cache forever). An empty intersection falls back to the pinned set.
         ARRAY(
             SELECT DISTINCT unnest(
                 (CASE
                     WHEN ov.version_type = 'migration' THEN ARRAY['ipfs']::text[]
-                    WHEN ov.upload_backends IS NOT NULL AND cardinality(ov.upload_backends) > 0 THEN ov.upload_backends
+                    WHEN ov.upload_backends IS NOT NULL AND ov.upload_backends && $5::text[]
+                        THEN ARRAY(SELECT unnest(ov.upload_backends) INTERSECT SELECT unnest($5::text[]))
                     ELSE $5::text[]
                 END) || $4::text[]
             )

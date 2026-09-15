@@ -11,9 +11,6 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
       # Drain-direct topology: the api writes parts to the node-local SSD cache, which the
       # node-local uploader reads straight from; nothing is copied to the shared pool
       # (object_cache) any more. Reads still fall back to the pool for pool-era parts.
@@ -61,9 +58,6 @@ services:
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_ARION_BASE_URL=http://toxiproxy:19090
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
@@ -85,9 +79,6 @@ services:
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_ARION_BASE_URL=http://toxiproxy:19090
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
     volumes:
       - .:/app
       - kms_certs:/kms_certs:ro
@@ -193,9 +184,6 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
     volumes:
       - .:/app
 
@@ -205,9 +193,6 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
     volumes:
       - .:/app
 
@@ -217,9 +202,6 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
     volumes:
       - .:/app
 
@@ -313,7 +295,6 @@ services:
       - CEPHOR_NODE_ID=e2e-node
       - CEPHOR_SSD_ROOT=/var/lib/hippius/local_object_cache
       - REDIS_QUEUES_URL=redis://redis-queues:6379
-      - HIPPIUS_UPLOAD_BACKENDS=arion
       # Tight polls + short deferral backoff so a freshly-landed (and a just-completed
       # MPU's) part drains within the e2e wait windows.
       - CEPHOR_RECONCILE_POLL_SECS=2

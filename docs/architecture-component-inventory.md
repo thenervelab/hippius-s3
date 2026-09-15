@@ -126,7 +126,7 @@ client → gateway(auth/ACL) → api(soft-delete) → enqueue arion_unpin_reques
 - `arion_unpin_requests`
 - `{backend}_upload_dlq`, `{backend}_unpin_dlq` — dead-letter queues (scanned by janitor to avoid evicting in-flight data)
 
-Queue names are `{backend}_*` so additional backends (beyond `arion`) get parallel queues via `HIPPIUS_UPLOAD_BACKENDS` / `HIPPIUS_DOWNLOAD_BACKENDS` / `HIPPIUS_DELETE_BACKENDS`.
+Queue names are `{backend}_*` so an additional backend (beyond `arion`) gets parallel queues; the backend set is pinned in code (`STORAGE_BACKENDS` in `hippius_s3/config.py`), and adding one ships with the workers that consume its queues.
 
 ---
 

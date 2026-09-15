@@ -61,16 +61,10 @@ lists the ingest tier as `resources:` — `api-local-deployments-production.yaml
 Service at `app: api-local` (base `api` scaled to 0). Prod ingest nodes `node1..node5` are
 prepared (dedicated NVMe `/s3-data`, labeled `s3-prod-local-ingest=true`).
 
-The drain-agent env is sourced (not hardcoded): it sets `CEPHOR_SSD_ROOT`/`CEPHOR_POOL_ROOT`,
-`REDIS_QUEUES_URL` (`required()` — a missing var crash-loops the agent fail-fast), and
-`HIPPIUS_UPLOAD_BACKENDS`.
-
-Both staging and prod pull `HIPPIUS_UPLOAD_BACKENDS` from a `secretKeyRef`
-(`{name: hippius-s3-secrets, key: HIPPIUS_UPLOAD_BACKENDS}`) —
-`k8s/staging/drain-agent-daemonset.yaml:125-129` and
-`k8s/production/drain-agent-daemonset.yaml:137-141` — so the drain stamps the same
-`UploadChainRequest.upload_backends` value as the api/uploader fleet reads from that secret.
-It is **not** hardcoded to `arion` on either environment.
+The drain-agent env sets `CEPHOR_SSD_ROOT` and `REDIS_QUEUES_URL` (`required()` — a missing
+var crash-loops the agent fail-fast). The backend set is not env-driven: it is pinned in code on
+both sides (`STORAGE_BACKENDS` in `hippius_s3/config.py` and in the drain's `config.rs`), so the
+drain stamps the same `UploadChainRequest.upload_backends` the api/uploader fleet uses.
 
 ## bypass_billing (P4)
 

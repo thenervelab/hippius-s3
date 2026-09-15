@@ -155,7 +155,7 @@ Chunk ciphertext     (AES-256-GCM per chunk; AAD binds bucket_id:object_id:versi
 
 [workers/run_janitor_in_loop.py](workers/run_janitor_in_loop.py) — critical safety invariants documented at the top of the file ([janitor.py:1-22](workers/run_janitor_in_loop.py)):
 
-- **Replication is an absolute gate.** A chunk that has NOT been replicated to every required backend (`HIPPIUS_UPLOAD_BACKENDS` ∪ `HIPPIUS_BACKUP_BACKENDS`) is **never** deleted — under any condition, including disk-full.
+- **Replication is an absolute gate.** A chunk that has NOT been replicated to every required backend (`config.upload_backends` ∪ `config.backup_backends`, both pinned in code — see `STORAGE_BACKENDS` in [hippius_s3/config.py](hippius_s3/config.py)) is **never** deleted — under any condition, including disk-full.
 - **Hot retention.** Parts whose atime is within `fs_cache_hot_retention_seconds` are kept, regardless of age.
 - **DLQ protection.** `get_all_dlq_object_ids` ([janitor.py:220](workers/run_janitor_in_loop.py)) scans all upload + unpin DLQs to avoid deleting data for still-in-flight operations.
 - **Disk-pressure modes** ([janitor.py:125-146](workers/run_janitor_in_loop.py)):
@@ -296,12 +296,7 @@ Config is a typed dataclass: [hippius_s3/config.py](hippius_s3/config.py). Value
 
 ### Backend routing
 
-| Variable | Default | Notes |
-|---|---|---|
-| `HIPPIUS_UPLOAD_BACKENDS` | `arion` | Which backends the uploader writes to. |
-| `HIPPIUS_DOWNLOAD_BACKENDS` | `arion` | Download fallback order. |
-| `HIPPIUS_DELETE_BACKENDS` | `arion` | Unpin fan-out. |
-| `HIPPIUS_BACKUP_BACKENDS` | `` | Extra backends that must replicate a chunk before the janitor may evict it — unioned with upload backends for the replication gate ([config.py:163](hippius_s3/config.py)). |
+Not environment-driven: the storage backend set is `STORAGE_BACKENDS` in [hippius_s3/config.py](hippius_s3/config.py), mirrored in [crates/hippius-drain-agent/src/config.rs](crates/hippius-drain-agent/src/config.rs) and pinned to the wire golden by both sides' tests. The comment on the Python constant says why it is a code change, not a setting.
 
 ### Feature flags
 

@@ -138,24 +138,14 @@ spec:
             # mounted at the same paths the api uses, so the relative part dirs line up.
             - name: CEPHOR_SSD_ROOT
               value: /var/lib/hippius/local_object_cache
-            # The drain is the sole upload producer (s3-2.1 drain-direct): once a part is
-            # replicated to ceph it pushes an UploadChainRequest to {backend}_upload_requests
-            # for each configured backend. Reuse the api's queue-Redis + upload-backend list.
+            # The drain is the sole upload producer: once a part is verified whole on the
+            # node's SSD it pushes an UploadChainRequest to {backend}_upload_requests:<node>
+            # for each pinned backend (STORAGE_BACKENDS). Reuse the api's queue-Redis.
             - name: REDIS_QUEUES_URL
               valueFrom:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: REDIS_QUEUES_URL
-            # Sourced from the shared secret (like every Python worker), NOT a literal:
-            # the drain is the sole upload producer, so if a backup backend is added to the
-            # secret the drain must fan out to it too — a hardcoded "arion" would silently
-            # under-replicate (never enqueue the new backend, so the janitor replication gate
-            # never clears -> unbounded cache growth).
-            - name: HIPPIUS_UPLOAD_BACKENDS
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_UPLOAD_BACKENDS
             # SSD-ingest reclaim worker: clean up broken/abandoned uploads (failed parts
             # the drain skips forever), replicated crash-orphans (a crash between the
             # mark_replicated commit and the drain's own unlink), and orphan write-temps,

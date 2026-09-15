@@ -53,7 +53,6 @@ services:
       - CEPHOR_SSD_ROOT=/var/lib/hippius/local_object_cache
       - CEPHOR_POOL_ROOT=/var/lib/hippius/object_cache
       - REDIS_QUEUES_URL=redis://toxiproxy:16379
-      - HIPPIUS_UPLOAD_BACKENDS=arion
       - CEPHOR_RECONCILE_POLL_SECS=2
       - CEPHOR_DRAIN_POLL_SECS=1
       - CEPHOR_DEFER_BACKOFF_SECS=2

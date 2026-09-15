@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from hippius_s3.config import STORAGE_BACKENDS
 from hippius_s3.queue import UploadChainRequest
 
 
@@ -30,7 +31,9 @@ def test_rust_golden_upload_chain_request_validates_in_python() -> None:
     assert req.object_version == 5
     assert [c.id for c in req.chunks] == [1]
     assert req.upload_id == "11111111-1111-4111-8111-111111111111"
-    assert req.upload_backends == ["arion"]
+    # The golden is what ties the two sides' pinned backend sets together: the Rust producer
+    # builds it from its STORAGE_BACKENDS, this asserts it against the Python one.
+    assert req.upload_backends == list(STORAGE_BACKENDS)
     # The node whose SSD holds the part: the queue the drain published to, and where a retry
     # or DLQ re-queue must route back to.
     assert req.node_id == "ingest-node-1"
