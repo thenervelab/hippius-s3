@@ -226,10 +226,17 @@ async def test_migration_version_requires_ipfs(conn):
     assert (str(covered[0]), covered[1], covered[2]) not in result, "a migration chunk with ipfs is safe"
 
 
-async def test_per_version_upload_backends_drive_the_requirement(conn):
-    # required comes from the version's own upload_backends, not the config default.
-    oid, ver, chunk = await _chunk(conn, live_backends=["arion"], upload_backends=["arion", "ovh"])
-    assert await _violations(conn, backup=[]) == {(oid, ver, chunk)}, "missing ovh (a per-version backend) is flagged"
+async def test_the_persisted_list_is_intersected_with_the_pinned_set(conn):
+    # The version's own upload_backends is a record of what it was written under, not a
+    # requirement: a backend retired from the pinned set since is dropped from the requirement,
+    # so arion coverage alone is full coverage. Otherwise every version written under the wider
+    # set would page forever after the retirement.
+    oid, ver, chunk = await _chunk(conn, live_backends=["arion"], upload_backends=["arion", "retired"])
+    assert await _violations(conn, backup=[], default_upload=["arion"]) == set(), "a retired backend is not required"
+    # A persisted list with nothing pinned left in it falls back to the pinned set — never to
+    # an empty requirement.
+    oid2, ver2, chunk2 = await _chunk(conn, live_backends=[], upload_backends=["retired"])
+    assert await _violations(conn, backup=[], default_upload=["arion"]) == {(oid2, ver2, chunk2)}
 
 
 async def test_legacy_null_upload_backends_fall_back_to_config_default(conn):
