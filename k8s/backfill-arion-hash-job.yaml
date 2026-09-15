@@ -1,6 +1,14 @@
 # One-off backfill of chunk_backend.arion_hash / object_versions.arion_hash from HCFS file_records.
-# See hippius_s3/scripts/backfill_arion_hash.py. Needs migration 20260911120000 applied and an API
+# See hippius_s3/scripts/backfill_arion_hash.py. Needs migration 20260915120000 applied and an API
 # image that contains the script (i.e. deploy the arion_hash release first).
+#
+# NOT part of the deploy: this file is deliberately absent from every kustomization. It reads a
+# second database and walks ~413M chunk_backend rows, so it runs by hand, after the release, and
+# can be stopped and resumed at any point.
+#
+# PIN THE IMAGE. `api:latest` is pushed by BOTH the staging and the production workflows, so it is
+# whichever environment built last. Replace it with the SHA production is actually running:
+#   kubectl -n hippius-s3-prod get deploy api -o jsonpath='{.spec.template.spec.containers[0].image}'
 #
 # IMPORTANT: namespace below is hardcoded to production. Edit for staging.
 #

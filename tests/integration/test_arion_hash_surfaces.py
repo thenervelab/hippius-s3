@@ -205,3 +205,35 @@ async def test_a_retry_without_a_hash_keeps_the_stored_one(seeded: tuple[asyncpg
         part_id,
     )
     assert stored == ARION_HASH
+
+
+async def test_a_part_landing_after_a_single_chunk_rollup_clears_it(seeded: tuple[asyncpg.Connection, dict]) -> None:
+    """Parts replicate in any order. A small last part of a multipart upload can reach the uploader
+    before the others have even been PUT, so its rollup sees one part row and stamps its chunk hash on
+    the version. The next part's rollup must take that back, or a multi-chunk object lists a hash that
+    belongs to one of its pieces."""
+    conn, ids = seeded
+    part2 = await _add_part(conn, ids, 2, 1)
+    await _store_chunk(conn, part2, 0, FILE_ID, ARION_HASH)
+    await _rollup(conn, ids)
+    assert await _version_arion_hash(conn, ids) == ARION_HASH, "only one part row exists yet, so it looks single-chunk"
+
+    part1 = await _add_part(conn, ids, 1, 2)
+    await _store_chunk(conn, part1, 0, "f0" * 32, "a0" * 32)
+    await _store_chunk(conn, part1, 1, "f1" * 32, "a1" * 32)
+    await _rollup(conn, ids)
+    assert await _version_arion_hash(conn, ids) is None
+
+
+async def test_an_append_onto_a_single_chunk_object_clears_its_hash(seeded: tuple[asyncpg.Connection, dict]) -> None:
+    """S4 append adds a part to the SAME object_version; the object is no longer a single chunk."""
+    conn, ids = seeded
+    part1 = await _add_part(conn, ids, 1, 1)
+    await _store_chunk(conn, part1, 0, FILE_ID, ARION_HASH)
+    await _rollup(conn, ids)
+    assert await _version_arion_hash(conn, ids) == ARION_HASH
+
+    appended = await _add_part(conn, ids, 2, 1)
+    await _store_chunk(conn, appended, 0, "f2" * 32, "a2" * 32)
+    await _rollup(conn, ids)
+    assert await _version_arion_hash(conn, ids) is None

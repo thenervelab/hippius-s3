@@ -12,6 +12,9 @@ Rows the backfill cannot fill are counted, never guessed at:
   * missing_in_hcfs  — no (bucket owner, path_hash) row. Chunks written into someone else's bucket
                        under an ACL grant were uploaded under the writer's account, not the owner's.
   * empty_in_hcfs    — HCFS has the row but no Arion copy (arion_hash = '').
+A non-empty HCFS arion_hash is the right VALUE (the content hash) but not proof Arion holds the
+blob: HCFS's `both` backend stamps it when it dispatches the background Arion push, before the push
+is known to have succeeded. The same is true of the value the live uploader stores from /upload.
 
 Reads HCFS read-only. Idempotent: only touches rows whose arion_hash IS NULL, so it can be stopped
 and re-run at any point.
