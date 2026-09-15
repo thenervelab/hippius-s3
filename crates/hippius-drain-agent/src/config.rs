@@ -44,6 +44,14 @@ const DEFAULT_DRAIN_CONCURRENCY: u32 = 4;
 /// is re-copied from its intact SSD source this many times before being held `corrupt` and
 /// paged — enough to ride out a transient pool-copy corruption without looping on a durable one.
 const DEFAULT_REDRIVE_MAX_ATTEMPTS: u32 = 3;
+/// The storage backend set, pinned in code rather than read from the environment. It is the
+/// replication contract: every backend listed must have workers consuming its upload queue,
+/// or no part ever reaches full coverage and its `uploading` row — the SSD copy pinned against
+/// eviction — stays forever. A second backend is a code change that ships together with the
+/// workers that serve it; the Python side pins the same set (`hippius_s3/config.py
+/// STORAGE_BACKENDS`), and the two must agree.
+const STORAGE_BACKENDS: &[&str] = &["arion"];
+
 /// Upload-sweep period when `CEPHOR_UPLOAD_SWEEP_POLL_SECS` is unset. Every arm of the sweep
 /// is a backstop (the uploader's own flip is the happy path), and each is a partial-index
 /// scan of this node's `uploading` rows, so half a minute keeps a lost flip or a lost request
@@ -197,14 +205,13 @@ pub struct Config {
     /// Redis URL for the upload queues — the drain pushes each replicated part's
     /// `UploadChainRequest` here (drain-direct; the drain is the sole upload producer).
     pub redis_queues_url: String,
-    /// Backends to enqueue each part's upload to (`{backend}_upload_requests`), from
-    /// `HIPPIUS_UPLOAD_BACKENDS` (comma-list). Defaults to `["arion"]`.
+    /// Backends to enqueue each part's upload to (`{backend}_upload_requests`): pinned to
+    /// [`STORAGE_BACKENDS`], never read from the environment (see that constant).
     pub upload_backends: Vec<String>,
-    /// `HIPPIUS_BACKUP_BACKENDS` (comma-list). Defaults to EMPTY — a backup backend is a
-    /// deliberate opt-in. The janitor gate requires coverage on `upload_backends ∪
-    /// backup_backends` before reclaiming a part, so the enqueuer MUST push to the same
-    /// union ([`enqueue_backends`](Config::enqueue_backends)) — otherwise a configured
-    /// backup backend is required-but-never-enqueued and the gate deadlocks (C10).
+    /// Additional backends the janitor gate requires coverage on before reclaiming a part.
+    /// EMPTY, pinned: a backup backend is a deliberate opt-in made in code, and the enqueuer
+    /// MUST push to the same union ([`enqueue_backends`](Config::enqueue_backends)) —
+    /// otherwise a required backend is never enqueued and the gate deadlocks (C10).
     pub backup_backends: Vec<String>,
     /// How often the SSD-reclaim worker scans for `failed` (abandoned-upload) parts.
     pub reclaim_poll: Duration,
@@ -357,7 +364,7 @@ impl Config {
     ///
     /// This closes the C10 backup half: without the union, a configured backup backend
     /// would be required by the janitor gate (`is_replicated_on_all_backends` unions the
-    /// per-version `upload_backends` with `HIPPIUS_BACKUP_BACKENDS`) but never enqueued, so
+    /// per-version `upload_backends` with the backup set) but never enqueued, so
     /// the part could never reach full coverage and the janitor would never reclaim its
     /// SSD copy — a permanent leak/deadlock.
     ///
@@ -425,8 +432,8 @@ impl Config {
             defer_backoff_cap: duration_secs(&get, "CEPHOR_DEFER_BACKOFF_CAP_SECS", DEFAULT_DEFER_BACKOFF_CAP)?,
             heartbeat_ttl: duration_secs(&get, "CEPHOR_HEARTBEAT_TTL_SECS", DEFAULT_HEARTBEAT_TTL)?,
             redis_queues_url: required(&get, "REDIS_QUEUES_URL")?,
-            upload_backends: parse_backends(&get, "HIPPIUS_UPLOAD_BACKENDS"),
-            backup_backends: parse_optional_backends(&get, "HIPPIUS_BACKUP_BACKENDS"),
+            upload_backends: STORAGE_BACKENDS.iter().map(|backend| (*backend).to_owned()).collect(),
+            backup_backends: Vec::new(),
             reclaim_poll: duration_secs(&get, "CEPHOR_RECLAIM_POLL_SECS", DEFAULT_RECLAIM_POLL)?,
             reclaim_grace: duration_secs(&get, "CEPHOR_RECLAIM_GRACE_SECS", DEFAULT_RECLAIM_GRACE)?,
             orphan_reclaim_grace: duration_secs(&get, "CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", DEFAULT_ORPHAN_RECLAIM_GRACE)?,
@@ -447,26 +454,6 @@ impl Config {
             readiness_file: path_or(&get, "CEPHOR_READINESS_FILE", DEFAULT_READINESS_FILE),
         })
     }
-}
-
-/// Parses a comma-separated backend list (`HIPPIUS_UPLOAD_BACKENDS`), trimming and
-/// dropping empties. Defaults to `["arion"]` when unset or empty (mirrors the Python
-/// `config.upload_backends` default).
-fn parse_backends(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Vec<String> {
-    let parsed = parse_optional_backends(get, var);
-    if parsed.is_empty() { vec!["arion".to_owned()] } else { parsed }
-}
-
-/// Parses a comma-separated backend list with an EMPTY default (no fallback backend) —
-/// for `HIPPIUS_BACKUP_BACKENDS`, where "unset" must mean "no backup", never `["arion"]`.
-fn parse_optional_backends(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Vec<String> {
-    get(var)
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect()
 }
 
 /// Resolves a required identifier variable into a validated [`NodeId`].
@@ -865,28 +852,12 @@ mod tests {
     }
 
     #[test]
-    fn upload_backends_parses_a_trimmed_comma_list() {
-        let mut pairs = required_only();
-        pairs.push(("HIPPIUS_UPLOAD_BACKENDS", " arion , ovh "));
-        let config = Config::from_lookup(lookup(&pairs)).unwrap();
-        assert_eq!(config.upload_backends, vec!["arion".to_owned(), "ovh".to_owned()]);
-    }
-
-    #[test]
     fn backup_backends_default_to_empty_not_arion() {
         // Unlike upload_backends (which defaults to ["arion"]), backup must default EMPTY:
         // a spurious default backup backend would make the janitor gate require coverage
         // the enqueuer then has to satisfy for no reason.
         let config = Config::from_lookup(lookup(&required_only())).unwrap();
-        assert!(config.backup_backends.is_empty(), "no HIPPIUS_BACKUP_BACKENDS -> no backup backends");
-    }
-
-    #[test]
-    fn backup_backends_parse_a_trimmed_comma_list() {
-        let mut pairs = required_only();
-        pairs.push(("HIPPIUS_BACKUP_BACKENDS", " ipfs , s3backup "));
-        let config = Config::from_lookup(lookup(&pairs)).unwrap();
-        assert_eq!(config.backup_backends, vec!["ipfs".to_owned(), "s3backup".to_owned()]);
+        assert!(config.backup_backends.is_empty(), "no backup backends unless opted in, in code");
     }
 
     #[test]
@@ -894,10 +865,9 @@ mod tests {
         // C10: the enqueuer must push to every backend the janitor gate requires
         // (upload ∪ backup). Upload order is preserved; a backup already in upload is not
         // duplicated; a genuinely new backup backend is appended.
-        let mut pairs = required_only();
-        pairs.push(("HIPPIUS_UPLOAD_BACKENDS", "arion,ipfs"));
-        pairs.push(("HIPPIUS_BACKUP_BACKENDS", "ipfs,s3backup")); // ipfs overlaps, s3backup is new
-        let config = Config::from_lookup(lookup(&pairs)).unwrap();
+        let mut config = Config::from_lookup(lookup(&required_only())).unwrap();
+        config.upload_backends = vec!["arion".to_owned(), "ipfs".to_owned()];
+        config.backup_backends = vec!["ipfs".to_owned(), "s3backup".to_owned()]; // ipfs overlaps, s3backup is new
         assert_eq!(
             config.enqueue_backends(),
             vec!["arion".to_owned(), "ipfs".to_owned(), "s3backup".to_owned()],
@@ -907,9 +877,7 @@ mod tests {
 
     #[test]
     fn enqueue_backends_with_no_backup_is_just_upload() {
-        let mut pairs = required_only();
-        pairs.push(("HIPPIUS_UPLOAD_BACKENDS", "arion"));
-        let config = Config::from_lookup(lookup(&pairs)).unwrap();
+        let config = Config::from_lookup(lookup(&required_only())).unwrap();
         assert_eq!(config.enqueue_backends(), vec!["arion".to_owned()]);
     }
 

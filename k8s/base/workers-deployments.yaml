@@ -155,21 +155,6 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: FRONTEND_HMAC_SECRET
-            - name: HIPPIUS_UPLOAD_BACKENDS
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_UPLOAD_BACKENDS
-            - name: HIPPIUS_DOWNLOAD_BACKENDS
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_DOWNLOAD_BACKENDS
-            - name: HIPPIUS_DELETE_BACKENDS
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_DELETE_BACKENDS
             - name: HIPPIUS_UPLOADER_MAX_INFLIGHT
               valueFrom:
                 secretKeyRef:
@@ -549,11 +534,6 @@ spec:
             # the replication-gate fallback (empty-upload_backends versions) and to
             # enumerate every upload backend's DLQ for deletion protection. Defaulting
             # to ["arion"] silently skipped the ovh DLQ and under-required the gate.
-            - name: HIPPIUS_UPLOAD_BACKENDS
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_UPLOAD_BACKENDS
           volumeMounts:
             - name: object-cache
               mountPath: /var/lib/hippius/object_cache
@@ -1133,11 +1113,6 @@ spec:
             # (config.py:211) and never enqueues ovh_unpin_requests, so every purge leaks
             # the OVH copies and leaves objects un-hard-deletable. Every delete-doing worker
             # carries this; the purger was missing it.
-            - name: HIPPIUS_DELETE_BACKENDS
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_DELETE_BACKENDS
             - name: HIPPIUS_SERVICE_KEY
               valueFrom:
                 secretKeyRef:

@@ -35,7 +35,7 @@
 -- chunk_backend (chunk_id) live index rather than aggregating every backend per chunk.
 --
 -- Parameters:
---   $1 backup_backends          TEXT[]  — configured HIPPIUS_BACKUP_BACKENDS
+--   $1 backup_backends          TEXT[]  — config.backup_backends
 --   $2 default_upload_backends  TEXT[]  — config.upload_backends (fallback for legacy rows)
 --   $3 limit                    INT     — max violating chunks to return
 --   $4 replication_sla_seconds  INT     — grace window; only parts landed longer ago than

@@ -7,7 +7,7 @@ without enqueuing unpins). The janitor hard-delete query (now fast + index-drive
 therefore deletes nothing, because nothing is "ready". This script re-drives the unpins:
 
   - Live backends with an unpin worker: re-enqueue an unpin via `enqueue_unpin_request`,
-    which routes to the configured `delete_backends` (HIPPIUS_DELETE_BACKENDS). The
+    which routes to the configured `delete_backends` (config.STORAGE_BACKENDS). The
     unpin workers delete the chunks from their backend AND mark `chunk_backend.deleted=true`,
     so the object becomes ready for hard-delete.
   - Deprecated backends with no worker (default: `ipfs`) — those chunks are gone, so we

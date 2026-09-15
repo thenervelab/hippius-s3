@@ -61,7 +61,7 @@
 --   $1 object_ids               TEXT[]   — slice tuples' object_id (parallel array; unnest WITH ORDINALITY)
 --   $2 object_versions          BIGINT[] — slice tuples' object_version (parallel array)
 --   $3 part_numbers             BIGINT[] — slice tuples' part_number (parallel array)
---   $4 backup_backends          TEXT[]   — configured HIPPIUS_BACKUP_BACKENDS
+--   $4 backup_backends          TEXT[]   — config.backup_backends
 --   $5 default_upload_backends  TEXT[]   — config.upload_backends (fallback for NULL rows)
 --   $6 max_age_seconds          INT      — age gate; a part qualifies only if uploaded_at is older
 --   $7 ignore_age               BOOL     — pressure override; TRUE bypasses the age gate

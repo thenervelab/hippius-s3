@@ -101,9 +101,6 @@ Create a `.env` file. Base defaults are in `.env.defaults`.
 **Backend Routing**
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HIPPIUS_UPLOAD_BACKENDS` | `arion` | Backends for uploads |
-| `HIPPIUS_DOWNLOAD_BACKENDS` | `arion` | Backends for downloads (tried in order) |
-| `HIPPIUS_DELETE_BACKENDS` | `arion` | Backends for deletions |
 
 ### Optional
 
@@ -259,9 +256,6 @@ Secrets required for CI/CD deployment (configured in `.github/workflows/producti
 | | `HIPPIUS_OVH_KMS_OKMS_ID` | OVH KMS identifier |
 | **Queues** | `HIPPIUS_UPLOAD_QUEUE_NAMES` | Upload queue names |
 | | `HIPPIUS_DOWNLOAD_QUEUE_NAMES` | Download queue names |
-| **Backend Routing** | `HIPPIUS_UPLOAD_BACKENDS` | Upload backend config |
-| | `HIPPIUS_DOWNLOAD_BACKENDS` | Download backend config |
-| | `HIPPIUS_DELETE_BACKENDS` | Delete backend config |
 | **Monitoring** | `SENTRY_DSN` | Sentry error tracking |
 | | `CACHET_API_KEY` | Status page API key |
 | | `CACHET_COMPONENT_ID` | Status page component ID |

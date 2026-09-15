@@ -151,11 +151,6 @@ spec:
             # secret the drain must fan out to it too — a hardcoded "arion" would silently
             # under-replicate (never enqueue the new backend, so the janitor replication gate
             # never clears -> unbounded cache growth).
-            - name: HIPPIUS_UPLOAD_BACKENDS
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_UPLOAD_BACKENDS
             # SSD-ingest reclaim worker: clean up broken/abandoned uploads (failed parts
             # the drain skips forever), replicated crash-orphans (a crash between the
             # mark_replicated commit and the drain's own unlink), and orphan write-temps,
