@@ -12,8 +12,6 @@
 //! `query!` once CI Postgres infra exists.
 
 use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
-use crate::gc::GcClaim;
-use crate::ids::FileId;
 use crate::partdrain::{ClaimedPart, PartReplicationStore, PartVerified};
 use crate::reconcile::PartLandingLog;
 use crate::reconcile::PartStatus;
@@ -79,6 +77,7 @@ fn state_from_db(raw: &str) -> Result<ReplicationState> {
     match raw {
         "pending" => Ok(ReplicationState::Pending),
         "draining" => Ok(ReplicationState::Draining),
+        "uploading" => Ok(ReplicationState::Uploading),
         "replicated" => Ok(ReplicationState::Replicated),
         "failed" => Ok(ReplicationState::Failed),
         "corrupt" => Ok(ReplicationState::Corrupt),
@@ -91,6 +90,41 @@ fn state_from_db(raw: &str) -> Result<ReplicationState> {
 /// one giant `IN (...)` list; the worker still reads every part, just over a few
 /// queries instead of one unbounded one.
 const RECLAIM_STATUS_BATCH: usize = 500;
+
+/// Rows deleted per `gc_terminal_status_rows` call. The GC runs hourly and the arms it reaps
+/// can accumulate hundreds of thousands of rows between runs (the un-enqueued rows of
+/// hard-deleted objects did, on prod); a bound turns one long write transaction on the
+/// primary into a short one per hour, draining a backlog over a few cycles.
+const GC_BATCH_ROWS: i64 = 50_000;
+
+/// The PK tuple of many parts as three parallel columns, the shape every batched
+/// `(object_id, version, part_number) IN (SELECT * FROM UNNEST(...))` query binds.
+fn key_columns(parts: &[PartKey]) -> (Vec<&str>, Vec<i64>, Vec<i64>) {
+    let mut object_ids: Vec<&str> = Vec::with_capacity(parts.len());
+    let mut versions: Vec<i64> = Vec::with_capacity(parts.len());
+    let mut part_numbers: Vec<i64> = Vec::with_capacity(parts.len());
+    for part in parts {
+        object_ids.push(part.object().as_str());
+        versions.push(i64::from(part.version().get()));
+        part_numbers.push(i64::from(part.part().get()));
+    }
+    (object_ids, versions, part_numbers)
+}
+
+/// The PK-tuple rows a batched lookup returns, as a set of parts — the read-side counterpart
+/// of [`key_columns`].
+fn part_set(rows: Vec<(String, i64, i64)>) -> Result<HashSet<PartKey>> {
+    rows.into_iter()
+        .map(|(object_id, version, part_number)| {
+            PartRow {
+                object_id,
+                version,
+                part_number,
+            }
+            .into_part()
+        })
+        .collect()
+}
 
 /// Converts an `EXTRACT(EPOCH FROM (now() - updated_at))` age in seconds into a
 /// [`Duration`], clamping a negative (clock skew) or non-finite value to zero. A
@@ -353,8 +387,8 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes terminal replication rows older than `retention`, returning how many were
-    /// removed. Terminal rows are inert — nothing returns one to a live state
+    /// Deletes up to [`GC_BATCH_ROWS`] terminal replication rows older than `retention`,
+    /// returning how many were removed. Terminal rows are inert — nothing returns one to a live state
     /// (`release_part`/`defer_part` are guarded on `status='draining'`) — so aged ones are
     /// pure debris that bloat the hot `claim_part` / reconcile scans. NEVER touches
     /// `pending`/`draining` (live) rows. Idempotent and safe to run concurrently: a row
@@ -365,19 +399,19 @@ impl Store {
     /// enqueue (`upload_enqueued_at IS NULL` — an in-flight MPU part committed to Ceph but not
     /// yet published) is the enqueue sweep's worklist, so deleting it would DROP the backend
     /// upload; it is spared until the sweep stamps it (or the reaper flips it `failed` as an
-    /// abandoned orphan, which this then GCs).
+    /// abandoned orphan, which this then GCs) — UNLESS its `object_versions` row is gone. A
+    /// hard-deleted object has nothing left to publish, and the row would otherwise be immortal:
+    /// the sweep skips it (no address to load), the reaper never sees it (no version to abandon),
+    /// and nothing else touches `replicated`. Prod accumulated ~150k of these per node.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the delete fails.
     pub async fn gc_terminal_status_rows(&self, retention: Duration) -> Result<u64> {
-        // The residency guard is a DURABILITY gate, not an optimisation. Both readers of
-        // `cephor_ssd_residency` in this crate — `evictable_parts` and `node_cache_bytes` — INNER
-        // JOIN this table and require `status = 'replicated'`, so deleting the row of a part that
-        // is still on disk makes that part simultaneously **unevictable and unaccounted**: the
-        // evictor's worklist can never emit it, so it occupies ingest NVMe forever, and the
-        // heartbeat stops counting its bytes, which also feeds the shared-filesystem check into
-        // reading the node as though a foreign writer owned the disk.
+        // The residency guard is a DURABILITY gate, not an optimisation. A `failed`/`corrupt`
+        // part's SSD copy may be a live object's last good source, and the row is the only
+        // record of that; deleting it while the bytes are resident would let the evictor (which
+        // owns any resident part with no row — see `evictable_parts`) unlink the last copy.
         //
         // This was unreachable before read-tier retention, and that is why the retention window
         // above was never sized against it: the drain unlinked a replicated part's SSD copy within
@@ -398,17 +432,27 @@ impl Store {
         // lookup; migration 0016 added it for exactly this key shape and 0017 deliberately kept
         // it. No new index, no migration.
         let affected = sqlx::query(
-            "DELETE FROM cephor_replication_status s \
-             WHERE (s.status = 'failed' OR (s.status = 'replicated' AND s.upload_enqueued_at IS NOT NULL)) \
-               AND s.updated_at < now() - (interval '1 second' * $1) \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM cephor_ssd_residency r \
-                   WHERE r.object_id = s.object_id \
-                     AND r.version = s.version \
-                     AND r.part_number = s.part_number \
-               )",
+            "DELETE FROM cephor_replication_status \
+             WHERE ctid IN ( \
+                 SELECT s.ctid FROM cephor_replication_status s \
+                 WHERE ( s.status = 'failed' \
+                         OR (s.status = 'replicated' \
+                             AND (s.upload_enqueued_at IS NOT NULL \
+                                  OR NOT EXISTS ( \
+                                      SELECT 1 FROM object_versions ov \
+                                      WHERE ov.object_id = s.object_id::uuid AND ov.object_version = s.version \
+                                  ))) ) \
+                   AND s.updated_at < now() - (interval '1 second' * $1) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM cephor_ssd_residency r \
+                       WHERE r.object_id = s.object_id \
+                         AND r.version = s.version \
+                         AND r.part_number = s.part_number \
+                   ) \
+                 LIMIT $2 )",
         )
         .bind(retention.as_secs_f64())
+        .bind(GC_BATCH_ROWS)
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -437,12 +481,14 @@ impl Store {
         // counted by `node_backlog_bytes` as the undrained work it is. Counting it here too
         // would double-count it AND overstate the node's ingest headroom, which understates its
         // drain urgency to the allocator: the one direction this signal must never err in.
+        // A resident part with no row at all is a read-promoted copy (see `evictable_parts`),
+        // which IS evictable and counts.
         let (bytes,): (i64,) = sqlx::query_as(
             "SELECT COALESCE(SUM(r.bytes), 0)::bigint \
              FROM cephor_ssd_residency r \
-             JOIN cephor_replication_status s \
+             LEFT JOIN cephor_replication_status s \
                ON s.object_id = r.object_id AND s.version = r.version AND s.part_number = r.part_number \
-             WHERE r.node_id = $1 AND s.status = 'replicated'",
+             WHERE r.node_id = $1 AND (s.status IS NULL OR s.status = 'replicated')",
         )
         .bind(node)
         .fetch_one(&self.pool)
@@ -451,7 +497,9 @@ impl Store {
     }
 
     /// The true drain backlog for `node`: the total `parts.size_bytes` of every part this
-    /// node still owns as `pending`/`draining` in `cephor_replication_status`.
+    /// node still owns as `pending`/`draining`/`uploading` in `cephor_replication_status` —
+    /// `uploading` included because until the backend acks it the SSD copy is the only one,
+    /// pinned against eviction and so not headroom (nor cache: see `node_cache_bytes`).
     ///
     /// This is the WI-20c reconcile of `drain_ssd_backlog_bytes`, which the heartbeat used
     /// to source from raw SSD occupancy (`statvfs`). Occupancy OVERCOUNTS the backlog by
@@ -473,7 +521,7 @@ impl Store {
                ON p.object_id = crs.object_id::uuid \
               AND p.object_version = crs.version \
               AND p.part_number = crs.part_number \
-             WHERE crs.node_id = $1 AND crs.status IN ('pending', 'draining')",
+             WHERE crs.node_id = $1 AND crs.status IN ('pending', 'draining', 'uploading')",
         )
         .bind(node)
         .fetch_one(&self.pool)
@@ -581,63 +629,6 @@ impl Store {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
-    /// Claims a file for GC. Returns `Some(GcClaim)` if this caller won the claim,
-    /// `None` if another agent already holds a live, incomplete claim — so the
-    /// reclaim runs once. The returned [`GcClaim`] is the capability
-    /// [`crate::gc_object`] requires; this is its only production constructor, so
-    /// winning the durable marker is the sole path to authorizing a reclaim.
-    ///
-    /// A claim whose holder crashed before [`complete_gc`](Store::complete_gc) is
-    /// re-winnable once `claimed_at` ages past the claim lease — without this, a
-    /// single crashed claimant would wedge a file's GC forever (the marker row
-    /// conflicts but never completes). A *completed* claim is never re-won; a
-    /// *fresh* (within-lease) claim is left to its current holder. Mirrors
-    /// [`claim_chunk`](Store::claim_chunk)'s lease-based re-claim.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`].
-    pub async fn claim_gc(&self, file: &FileId) -> Result<Option<GcClaim>> {
-        let row = sqlx::query_as::<_, (String,)>(
-            "INSERT INTO cephor_gc_state (file_id, claimed_at) VALUES ($1, now()) \
-             ON CONFLICT (file_id) DO UPDATE SET claimed_at = now() \
-                WHERE cephor_gc_state.completed_at IS NULL \
-                  AND cephor_gc_state.claimed_at < now() - $2 * interval '1 second' \
-             RETURNING file_id",
-        )
-        .bind(file.as_str())
-        .bind(self.claim_lease.as_secs_f64())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|_| GcClaim::new(file.clone())))
-    }
-
-    /// Marks a claimed file's GC complete.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`].
-    pub async fn complete_gc(&self, file: &FileId) -> Result<()> {
-        sqlx::query("UPDATE cephor_gc_state SET completed_at = now() WHERE file_id = $1")
-            .bind(file.as_str())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Whether a file's GC has completed.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`].
-    pub async fn is_gc_complete(&self, file: &FileId) -> Result<bool> {
-        let row = sqlx::query_as::<_, (bool,)>("SELECT completed_at IS NOT NULL FROM cephor_gc_state WHERE file_id = $1")
-            .bind(file.as_str())
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.is_some_and(|(done,)| done))
-    }
-
     /// Records that a part has landed on SSD and awaits drain. Idempotent: a repeat for the
     /// same `(object_id, version, part_number)` never changes `status`, so the reconciler's
     /// backstop scan and the announcement fast path can both call it freely.
@@ -677,7 +668,7 @@ impl Store {
              VALUES ($1, $2, $3, 'pending', $4) \
              ON CONFLICT (object_id, version, part_number) \
              DO UPDATE SET node_id = COALESCE(cephor_replication_status.node_id, EXCLUDED.node_id), \
-                           relanded_at = CASE WHEN cephor_replication_status.status = 'replicated' \
+                           relanded_at = CASE WHEN cephor_replication_status.status IN ('uploading', 'replicated') \
                                               THEN now() ELSE cephor_replication_status.relanded_at END \
              RETURNING status, content_sha256",
         )
@@ -731,21 +722,38 @@ impl Store {
     ///
     /// [`StoreError::Database`].
     pub async fn redrive_diverged_part(&self, part: &PartKey, observed: &PartDigest) -> Result<bool> {
-        let affected = sqlx::query(
-            "UPDATE cephor_replication_status \
-             SET status = 'pending', claimed_at = NULL, deferred_until = NULL, \
-                 upload_enqueued_at = NULL, updated_at = now() \
-             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND node_id = $4 \
-               AND status = 'replicated' AND content_sha256 IS DISTINCT FROM $5",
+        // The part's live chunk_backend rows describe the SUPERSEDED bytes (part_chunks rows —
+        // and so chunk_backend rows — survive an UploadPart retry), so they are retired in the
+        // same statement. Otherwise the upload sweep's coverage arm would read them as proof
+        // the fresh hand-off reached the backend and confirm it `replicated` before the
+        // uploader has re-read a byte — and the evictor would then free the only good copy.
+        // The next successful upload of the part revives them (insert_chunk_backend's
+        // ON CONFLICT clears the soft-delete).
+        let (affected,): (i64,) = sqlx::query_as(
+            "WITH redriven AS ( \
+                 UPDATE cephor_replication_status \
+                 SET status = 'pending', claimed_at = NULL, deferred_until = NULL, \
+                     upload_enqueued_at = NULL, upload_attempts = 0, updated_at = now() \
+                 WHERE object_id = $1 AND version = $2 AND part_number = $3 AND node_id = $4 \
+                   AND status IN ('uploading', 'replicated') AND content_sha256 IS DISTINCT FROM $5 \
+                 RETURNING object_id, version, part_number \
+             ), retired AS ( \
+                 UPDATE chunk_backend cb SET deleted = true, deleted_at = now() \
+                 FROM part_chunks pc \
+                 JOIN parts p ON p.part_id = pc.part_id \
+                 JOIN redriven r ON p.object_id = r.object_id::uuid \
+                                AND p.object_version = r.version AND p.part_number = r.part_number \
+                 WHERE cb.chunk_id = pc.id AND NOT cb.deleted \
+             ) \
+             SELECT count(*)::bigint FROM redriven",
         )
         .bind(part.object().as_str())
         .bind(i64::from(part.version().get()))
         .bind(i64::from(part.part().get()))
         .bind(self.node_id.as_deref())
         .bind(observed.as_str())
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        .fetch_one(&self.pool)
+        .await?;
         Ok(affected > 0)
     }
 
@@ -764,7 +772,7 @@ impl Store {
     /// [`StoreError::Database`]; [`StoreError::Invalid`] if a stored part is malformed.
     pub async fn claim_part(&self) -> Result<Option<ClaimedPart>> {
         // Stamp a fresh fencing token (nextval) on the claim and return it: the commit
-        // (mark_replicated) is guarded by it, so a claim re-won here after lease expiry
+        // (mark_uploading) is guarded by it, so a claim re-won here after lease expiry
         // gets a NEW token and the prior claimant's stale commit fences out (F4).
         let row = sqlx::query_as::<_, ClaimedPartRow>(
             "UPDATE cephor_replication_status \
@@ -942,28 +950,247 @@ impl Store {
     }
 
     /// The enqueue sweep's worklist: up to `limit` of THIS node's `replicated` parts whose
-    /// backend upload has not yet been published (`upload_enqueued_at IS NULL`), oldest-
-    /// committed first. These are parts drained to the pool before their object's address was
-    /// finalized (an in-flight MPU) — the sweep re-attempts `enqueue` for each and, on success,
-    /// stamps [`mark_upload_enqueued`](PartReplicationStore::mark_upload_enqueued). Node-scoped
-    /// like `claim_part` (a part's upload identity is loaded via `load_upload_context`, but the
+    /// backend upload has not yet been published (`upload_enqueued_at IS NULL`) AND can be
+    /// published now, oldest-committed first. These are parts drained to the pool before their
+    /// object's address was finalized (an in-flight MPU) — the sweep re-attempts `enqueue` for
+    /// each and, on success, stamps
+    /// [`mark_upload_enqueued`](PartReplicationStore::mark_upload_enqueued). Node-scoped like
+    /// `claim_part` (a part's upload identity is loaded via `load_upload_context`, but the
     /// worklist is this node's own committed parts). Uses the `cephor_replication_unenqueued_idx`
-    /// partial index, so the scan is proportional to the small outstanding set.
+    /// partial index, so the scan is proportional to the outstanding set.
+    ///
+    /// Only rows whose version has an `address` qualify. `load_upload_context` returns
+    /// not-ready for a NULL address and the sweep leaves such a row untouched, so without this
+    /// predicate a row that can NEVER be published — a pre-cutover version (no `address` was
+    /// ever written) re-recorded by the reconciler from a read-promoted SSD copy, or an
+    /// abandoned MPU — sits at the head of the oldest-first ring forever. Once more than
+    /// `limit` of them accumulated (prod, 2026-08-27, every node) the sweep re-loaded the same
+    /// not-ready batch every poll and published nothing: every MPU part drained before
+    /// `CompleteMultipartUpload` stayed pool-only. An in-flight MPU's parts simply do not match
+    /// until Complete writes the address, then surface on the next poll — no wake needed.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`]; [`StoreError::Invalid`] if a stored part is malformed.
     pub async fn list_replicated_unenqueued_parts(&self, limit: u32) -> Result<Vec<PartKey>> {
         let rows = sqlx::query_as::<_, PartRow>(
-            "SELECT object_id, version, part_number FROM cephor_replication_status \
-             WHERE node_id = $1 AND status = 'replicated' AND upload_enqueued_at IS NULL \
-             ORDER BY updated_at LIMIT $2",
+            "SELECT s.object_id, s.version, s.part_number FROM cephor_replication_status s \
+             WHERE s.node_id = $1 AND s.status = 'replicated' AND s.upload_enqueued_at IS NULL \
+               AND EXISTS ( \
+                   SELECT 1 FROM object_versions ov \
+                   WHERE ov.object_id = s.object_id::uuid AND ov.object_version = s.version \
+                     AND ov.address IS NOT NULL \
+               ) \
+             ORDER BY s.updated_at LIMIT $2",
         )
         .bind(self.node_id.as_deref())
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(PartRow::into_part).collect()
+    }
+
+    /// The upload sweep's confirmation worklist: up to `limit` of THIS node's `uploading` parts
+    /// whose every chunk has a live `chunk_backend` row on every backend in `backends`,
+    /// oldest-committed first. These are parts the uploader finished but whose own
+    /// `uploading → replicated` flip was lost (a crash between the last chunk's row and the
+    /// flip, a Redis-side retry that re-uploaded an already-covered part…); the sweep flips
+    /// them from coverage, which is the DB-authoritative record of what the backend holds.
+    ///
+    /// A part with NO `part_chunks` rows is never offered: "every chunk is covered" is vacuously
+    /// true for it, yet it is either a zero-byte part (the uploader's own flip handles it) or
+    /// a part whose placeholder rows have not been inserted yet (MPU `UploadPart` announces
+    /// before the `parts`/`part_chunks` inserts commit) — flipping the latter would evict the
+    /// only copy of a part the backend never received.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`]; [`StoreError::Invalid`] if a stored part is malformed.
+    pub async fn list_uploading_covered(&self, backends: &[String], limit: u32) -> Result<Vec<PartKey>> {
+        let Some(node) = self.node_id.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query_as::<_, PartRow>(
+            "SELECT s.object_id, s.version, s.part_number FROM cephor_replication_status s \
+             WHERE s.node_id = $1 AND s.status = 'uploading' \
+               AND EXISTS ( \
+                   SELECT 1 FROM parts p JOIN part_chunks pc ON pc.part_id = p.part_id \
+                   WHERE p.object_id = s.object_id::uuid AND p.object_version = s.version AND p.part_number = s.part_number \
+               ) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM parts p \
+                   JOIN part_chunks pc ON pc.part_id = p.part_id \
+                   CROSS JOIN UNNEST($2::text[]) AS req(backend) \
+                   WHERE p.object_id = s.object_id::uuid AND p.object_version = s.version AND p.part_number = s.part_number \
+                     AND NOT EXISTS ( \
+                         SELECT 1 FROM chunk_backend cb \
+                         WHERE cb.chunk_id = pc.id AND cb.backend = req.backend AND NOT cb.deleted \
+                     ) \
+               ) \
+             ORDER BY s.updated_at LIMIT $3",
+        )
+        .bind(node)
+        .bind(backends)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(PartRow::into_part).collect()
+    }
+
+    /// Flips `uploading` parts to `replicated`, returning how many rows changed. The uploader's
+    /// and the upload sweep's shared commit: only an `uploading` row qualifies, so a re-flip
+    /// (the two racing) is a harmless no-op and a row a re-drive returned to `pending` is left
+    /// alone.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    pub async fn confirm_replicated(&self, parts: &[PartKey]) -> Result<u64> {
+        if parts.is_empty() {
+            return Ok(0);
+        }
+        let (object_ids, versions, part_numbers) = key_columns(parts);
+        let affected = sqlx::query(
+            "UPDATE cephor_replication_status SET status = 'replicated', updated_at = now() \
+             WHERE status = 'uploading' \
+               AND (object_id, version, part_number) IN (SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::bigint[]))",
+        )
+        .bind(&object_ids)
+        .bind(&versions)
+        .bind(&part_numbers)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected)
+    }
+
+    /// The upload sweep's re-drive worklist: up to `limit` of THIS node's `uploading` parts
+    /// that have sat past `older_than` since their last hand-off (`updated_at`) with fewer
+    /// than `max_attempts` re-publishes, oldest first. A published request that never reached
+    /// the uploader (the queue lost it, the uploader died mid-part) is otherwise invisible: the
+    /// row is not claimable, not evictable, and nothing else re-drives it.
+    ///
+    /// Run AFTER [`list_uploading_covered`](Store::list_uploading_covered) in the same pass, so a
+    /// part the backend already holds is confirmed rather than re-published.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`]; [`StoreError::Invalid`] if a stored part is malformed.
+    pub async fn list_uploading_stale(&self, older_than: Duration, max_attempts: u32, limit: u32) -> Result<Vec<PartKey>> {
+        let Some(node) = self.node_id.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query_as::<_, PartRow>(
+            "SELECT object_id, version, part_number FROM cephor_replication_status \
+             WHERE node_id = $1 AND status = 'uploading' \
+               AND updated_at < now() - (interval '1 second' * $2) AND upload_attempts < $3 \
+             ORDER BY updated_at LIMIT $4",
+        )
+        .bind(node)
+        .bind(older_than.as_secs_f64())
+        .bind(i64::from(max_attempts))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(PartRow::into_part).collect()
+    }
+
+    /// Records one re-publish of an `uploading` part: bumps `upload_attempts` and `updated_at`
+    /// (so the row leaves the stale worklist for another `older_than` window).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    pub async fn bump_upload_attempts(&self, part: &PartKey) -> Result<bool> {
+        let affected = sqlx::query(
+            "UPDATE cephor_replication_status SET upload_attempts = upload_attempts + 1, updated_at = now() \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'uploading'",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected > 0)
+    }
+
+    /// How many of THIS node's `uploading` parts have exhausted their re-publish budget — the
+    /// gauge behind the "uploads stuck" alert. Each is a part whose only copy is this node's
+    /// SSD and whose upload keeps not completing (a 402, a missing `part_chunks` row, a DLQ'd
+    /// request); the operator path (`dlq_requeue`) owns it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    pub async fn count_uploading_exhausted(&self, max_attempts: u32) -> Result<u64> {
+        let Some(node) = self.node_id.as_deref() else {
+            return Ok(0);
+        };
+        // No age predicate: a part is exhausted the moment its last re-publish is recorded,
+        // not one window later — the gauge must not read 0 for an hour after the fact.
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT count(*)::bigint FROM cephor_replication_status \
+             WHERE node_id = $1 AND status = 'uploading' AND upload_attempts >= $2",
+        )
+        .bind(node)
+        .bind(i64::from(max_attempts))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// Retires up to `limit` of THIS node's `uploading` parts whose object is gone or
+    /// soft-deleted — the exact predicate the uploader skips on (`is_object_deleted`), so such
+    /// a request completes with no `chunk_backend` rows and the row would otherwise be
+    /// re-published until its budget ran out and then counted as stuck forever. Flipped to
+    /// `replicated`: there is nothing left to upload, the SSD copy is disposable cache the
+    /// evictor may unlink, and the terminal GC reaps the row after retention. Returns how many.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    pub async fn abandon_uploading_deleted(&self, limit: u32) -> Result<u64> {
+        let Some(node) = self.node_id.as_deref() else {
+            return Ok(0);
+        };
+        let affected = sqlx::query(
+            "UPDATE cephor_replication_status SET status = 'replicated', updated_at = now() \
+             WHERE ctid IN ( \
+                 SELECT s.ctid FROM cephor_replication_status s \
+                 WHERE s.node_id = $1 AND s.status = 'uploading' \
+                   AND ( NOT EXISTS ( \
+                             SELECT 1 FROM object_versions ov \
+                             WHERE ov.object_id = s.object_id::uuid AND ov.object_version = s.version ) \
+                         OR EXISTS ( \
+                             SELECT 1 FROM objects o \
+                             WHERE o.object_id = s.object_id::uuid AND o.deleted_at IS NOT NULL ) ) \
+                 LIMIT $2 )",
+        )
+        .bind(node)
+        .bind(i64::from(limit))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected)
+    }
+
+    /// Whether the part's version is ready to publish — the same test
+    /// [`load_upload_context`](Self::load_upload_context) applies (a version row whose
+    /// `address` is set), as one indexed lookup. The probe `drain_part` runs before it reads
+    /// and hashes the part, so a not-ready part costs a row lookup per backoff, not an SSD read.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on query failure.
+    pub async fn upload_address_ready(&self, part: &PartKey) -> Result<bool> {
+        let ready: Option<bool> =
+            sqlx::query_scalar("SELECT address IS NOT NULL FROM object_versions WHERE object_id = $1::uuid AND object_version = $2")
+                .bind(part.object().as_str())
+                .bind(i64::from(part.version().get()))
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(ready.unwrap_or(false))
     }
 
     /// Loads the non-derivable fields the agent needs to build a part's backend
@@ -1069,26 +1296,28 @@ impl PartReplicationStore for Store {
         self.record_resident(part, bytes).await
     }
 
-    async fn mark_replicated(&self, claim: &ClaimedPart, _proof: &PartVerified, digest: &PartDigest) -> Result<()> {
+    async fn mark_uploading(&self, claim: &ClaimedPart, _proof: &PartVerified, digest: &PartDigest) -> Result<()> {
         // Guard on `draining` AND the claim's fencing token: only the agent that still
         // holds THIS claim may commit. Zero rows means the claim was lost — either the
         // row left `draining`, or it was re-claimed (a new claim_seq) after the lease,
-        // e.g. this agent stalled past the lease and another re-won the part. Either
-        // way the caller must NOT unlink the SSD copy — surface PartClaimLost, not a
-        // false Ok. The claim_seq is what distinguishes "I still hold it" from "someone
-        // re-won it and it's draining again under them" (F4).
+        // e.g. this agent stalled past the lease and another re-won the part. Surface
+        // PartClaimLost, not a false Ok. The claim_seq is what distinguishes "I still hold
+        // it" from "someone re-won it and it's draining again under them" (F4).
         let part = claim.part();
-        // Reset corrupt_attempts on a genuine commit: the counter bounds re-drives for ONE
-        // corruption episode, so a part that recovered (corrupt→pending→replicated) must not
-        // carry a spent budget if the same row is ever corrupted again. Harmless on the common
-        // path (it is already 0).
+        // Reset corrupt_attempts and upload_attempts on a genuine commit: each counter bounds
+        // re-drives for ONE episode, so a part that recovered must not carry a spent budget
+        // if it is ever re-driven again. Harmless on the common path (both already 0).
         // content_sha256 is written HERE, not by a follow-up statement: a part that reads
-        // `replicated` with a missing digest is unverifiable, and the re-landing check treats
+        // `uploading` with a missing digest is unverifiable, and the re-landing check treats
         // unverifiable as diverged — so a two-statement commit would leave a crash window whose
-        // recovery is a needless full re-copy of the part (B-2).
+        // recovery is a needless re-upload of the part (B-2).
+        // upload_enqueued_at is stamped by the same commit: the publish precedes it (the drain
+        // is at-least-once), and the stamp is what keeps this row off the legacy enqueue
+        // sweep's worklist and lets the terminal GC reap it once it is `replicated`.
         let affected = sqlx::query(
             "UPDATE cephor_replication_status \
-             SET status = 'replicated', corrupt_attempts = 0, content_sha256 = $5, updated_at = now() \
+             SET status = 'uploading', corrupt_attempts = 0, upload_attempts = 0, content_sha256 = $5, \
+                 upload_enqueued_at = now(), updated_at = now() \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'draining' AND claim_seq = $4",
         )
         .bind(part.object().as_str())
@@ -1106,13 +1335,22 @@ impl PartReplicationStore for Store {
         }
         Ok(())
     }
+}
 
-    async fn mark_upload_enqueued(&self, part: &PartKey) -> Result<()> {
-        // Stamp the backend-enqueue completion. Guarded on `status = 'replicated'` (never a
-        // claim, since the enqueue sweep holds none): only a Ceph-durable part can have its
-        // upload published. Idempotent — a re-stamp (inline enqueue racing the sweep, or a
-        // re-drive) just re-writes now(). Zero rows (the part left `replicated`, e.g. a reaper
-        // flipped it `failed`) is a harmless no-op: there is nothing to publish for it anymore.
+/// The remaining part-status transitions: written by the legacy enqueue sweep (pool-era rows),
+/// the reaper-style terminal marks, and the servability probe they share.
+impl Store {
+    /// Stamps a legacy `replicated` (pool-era) row's backend enqueue as published (sets
+    /// `upload_enqueued_at`). Called by the agent's enqueue sweep after a successful publish.
+    /// Keyed on `status = 'replicated'` and idempotent, so a re-stamp is a harmless no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    pub async fn mark_upload_enqueued(&self, part: &PartKey) -> Result<()> {
+        // Guarded on `status = 'replicated'` (never a claim, since the enqueue sweep holds
+        // none). Zero rows (the part left `replicated`, e.g. a reaper flipped it `failed`) is a
+        // harmless no-op: there is nothing to publish for it anymore.
         sqlx::query(
             "UPDATE cephor_replication_status SET upload_enqueued_at = now() \
              WHERE object_id = $1 AND version = $2 AND part_number = $3 AND status = 'replicated'",
@@ -1125,12 +1363,18 @@ impl PartReplicationStore for Store {
         Ok(())
     }
 
-    async fn mark_failed(&self, claim: &ClaimedPart, _reason: &str) -> Result<()> {
-        // Guarded on `draining` AND this claim's fencing token, mirroring mark_replicated:
+    /// Terminally fails a claimed part. Guarded on `draining` and the claim's fencing token;
+    /// idempotent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    pub async fn mark_failed(&self, claim: &ClaimedPart, _reason: &str) -> Result<()> {
+        // Guarded on `draining` AND this claim's fencing token, mirroring mark_uploading:
         // only the agent that still holds THIS claim may terminally fail the part. A fenced
         // stale claimant (its claim re-won after the lease) matches zero rows and MUST NOT
         // flip the live re-claimed part to `failed`. Zero rows is a harmless no-op here
-        // (unlike mark_replicated) because mark_failed authorizes no SSD unlink — so it is
+        // (unlike mark_uploading) because mark_failed authorizes no SSD unlink — so it is
         // NOT surfaced as PartClaimLost, which also keeps it idempotent (a second call
         // finds status='failed', not 'draining'). Clear claimed_at, like release_part, so a
         // failed part holds no lingering live-claim timestamp (F18).
@@ -1148,7 +1392,14 @@ impl PartReplicationStore for Store {
         Ok(())
     }
 
-    async fn mark_corrupt(&self, claim: &ClaimedPart, _reason: &str) -> Result<()> {
+    /// Marks a claimed part `corrupt` (R4). Same claim fence + idempotency as [`mark_failed`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    ///
+    /// [`mark_failed`]: Store::mark_failed
+    pub async fn mark_corrupt(&self, claim: &ClaimedPart, _reason: &str) -> Result<()> {
         // Same claim-fence + idempotency shape as mark_failed (a fenced stale claimant matches
         // zero rows and must NOT touch the live re-claimed part; a second call finds 'corrupt',
         // not 'draining'). Clears claimed_at like mark_failed. The corrupt_attempts counter is
@@ -1167,7 +1418,14 @@ impl PartReplicationStore for Store {
         Ok(())
     }
 
-    async fn is_version_servable(&self, part: &PartKey) -> Result<bool> {
+    /// Whether the part's `object_versions` row is still SERVABLE: address set OR a real size
+    /// OR an md5 — the same predicate as the reclaim gate's `servable_parts` and the janitor's
+    /// unservable check.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`].
+    pub async fn is_version_servable(&self, part: &PartKey) -> Result<bool> {
         // The inverse of janitor_part_terminally_abandoned.sql's unservable predicate for the
         // servable disjuncts (address set / size>0 / md5 set), shared with the reclaim gate's
         // servable_parts: a version SERVES a GET if its address is set, OR it has a real size,
@@ -1231,14 +1489,7 @@ impl PartLandingLog for Store {
         // no row simply does not come back, so the caller treats it as absent.
         let mut out = HashMap::with_capacity(parts.len());
         for batch in parts.chunks(RECLAIM_STATUS_BATCH) {
-            let mut object_ids: Vec<&str> = Vec::with_capacity(batch.len());
-            let mut versions: Vec<i64> = Vec::with_capacity(batch.len());
-            let mut part_numbers: Vec<i64> = Vec::with_capacity(batch.len());
-            for part in batch {
-                object_ids.push(part.object().as_str());
-                versions.push(i64::from(part.version().get()));
-                part_numbers.push(i64::from(part.part().get()));
-            }
+            let (object_ids, versions, part_numbers) = key_columns(batch);
             let rows = sqlx::query_as::<_, (String, i64, i64, String, bool)>(
                 "SELECT object_id, version, part_number, status, (status = 'pending' AND node_id IS NULL) \
                  FROM cephor_replication_status \
@@ -1275,6 +1526,34 @@ impl PartLandingLog for Store {
         // announcement path, which is the only one that observes a rewrite (see LandedOutcome).
         Store::record_landed_part(self, part).await.map(|_| ())
     }
+
+    async fn resident_here(&self, parts: &[PartKey]) -> Result<HashSet<PartKey>> {
+        // Node-scoped: a residency row names WHOSE disk holds the copy, and only this node's
+        // copy can be the promoted one the reconciler just scanned. A store with no node id (the
+        // allocator) reconciles nothing, so it answers "none". Served by
+        // `cephor_ssd_residency_part_idx` on the PK tuple, chunked like `statuses`.
+        let Some(node) = self.node_id.as_deref() else {
+            return Ok(HashSet::new());
+        };
+        let mut out = HashSet::with_capacity(parts.len());
+        for batch in parts.chunks(RECLAIM_STATUS_BATCH) {
+            let (object_ids, versions, part_numbers) = key_columns(batch);
+            let rows = sqlx::query_as::<_, (String, i64, i64)>(
+                "SELECT r.object_id, r.version, r.part_number FROM cephor_ssd_residency r \
+                 WHERE r.node_id = $1 \
+                   AND (r.object_id, r.version, r.part_number) IN \
+                       (SELECT * FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]))",
+            )
+            .bind(node)
+            .bind(&object_ids)
+            .bind(&versions)
+            .bind(&part_numbers)
+            .fetch_all(&self.pool)
+            .await?;
+            out.extend(part_set(rows)?);
+        }
+        Ok(out)
+    }
 }
 
 /// The reclaim worker's batched view of the store: read the replication state + age
@@ -1297,11 +1576,15 @@ impl ResidentLog for Store {
         // Selecting on residency alone would offer it to the evictor. The orchestrator refuses
         // it regardless, but a worklist that never emits it is the real guard.
         //
-        // INNER JOIN: a residency row with no replication row means the object was hard-deleted,
-        // which is the reclaimer's disposition (deleted-object orphan), not the evictor's. Note
-        // the reclaimer unlinks the part and leaves the row — it never touches this table — so
-        // this join is not merely a filter, it is the whole reason that row is inert. See
-        // `drop_residency` for why leaving it is safe and for the assumption that makes it so.
+        // LEFT JOIN: a residency row with NO replication row is a read-promoted copy, and the
+        // evictor owns it. The api's promoter claims residency and copies a part only when the
+        // pool already holds it; an ingested part gets its residency inside `drain_part`, after
+        // its row exists (and while that row is `draining`, which the status guard excludes). So
+        // "resident, no row" is only ever a copy whose source is the pool — or a claim that
+        // outlived its bytes, which the unlink then finds absent and the release cleans up. This
+        // is what lets the reconciler leave promoted copies alone instead of recording them: a
+        // resident part no query owns is invisible to eviction and to `node_cache_bytes`, and
+        // sits on the NVMe forever.
         //
         // THIS ORDER BY IS THE EVICTION POLICY; the orchestrator walks it and never re-sorts.
         //
@@ -1328,13 +1611,15 @@ impl ResidentLog for Store {
         // Unchanged verdict means the pool copy matches, at which point eviction is safe again
         // the moment the grace lapses. Filtered per joined row, like the status guard, so it
         // costs nothing on the recency index scan.
-        let rows = sqlx::query_as::<_, (String, i64, i64, String, i64)>(
+        let rows = sqlx::query_as::<_, (String, i64, i64, Option<String>, i64)>(
             "SELECT r.object_id, r.version, r.part_number, s.status, r.bytes \
              FROM cephor_ssd_residency r \
-             JOIN cephor_replication_status s \
+             LEFT JOIN cephor_replication_status s \
                ON s.object_id = r.object_id AND s.version = r.version AND s.part_number = r.part_number \
-             WHERE r.node_id = $1 AND s.status = 'replicated' \
-               AND (s.relanded_at IS NULL OR s.relanded_at < now() - ($3 * interval '1 second')) \
+             WHERE r.node_id = $1 \
+               AND (s.status IS NULL \
+                    OR (s.status = 'replicated' \
+                        AND (s.relanded_at IS NULL OR s.relanded_at < now() - ($3 * interval '1 second')))) \
              ORDER BY COALESCE(r.last_read_at, r.resident_at) \
              LIMIT $2",
         )
@@ -1355,7 +1640,7 @@ impl ResidentLog for Store {
             out.push(ResidentPart {
                 part,
                 bytes: u64::try_from(bytes).unwrap_or(0),
-                state: state_from_db(&status)?,
+                state: status.as_deref().map(state_from_db).transpose()?,
             });
         }
         Ok(out)
@@ -1477,20 +1762,12 @@ impl Store {
     /// residency rows itself, part-keyed across ALL nodes, because a terminal `failed` part's
     /// rows can never be read again and any survivor would block `gc_terminal_status_rows`'
     /// residency guard forever. The delete HERE stays node-scoped because the evictor's premise
-    /// is the opposite: the part is live read tier (`replicated`), and a peer's promoted copy of
-    /// it is exactly what must survive this node's eviction. The remaining loose end is the
-    /// deleted-object orphan the walk reclaims — no replication row, so its leftover residency
-    /// row blocks no GC and drifts no signal (both `evictable_parts` and `node_cache_bytes`
-    /// INNER JOIN the replication row). A dead row bounded by the hard-delete rate, not a leak
-    /// of disk or of accounting.
-    ///
-    /// **Nothing enforces that.** There is no foreign key and no cascade between the two tables;
-    /// what keeps the orphan-path row harmless is the `status = 'replicated'` predicate, written
-    /// out twice. Dropping it from either query — or adding a third consumer that reads this
-    /// table by `node_id` alone — turns those dead rows into live over-accounting, compounded by
-    /// the api's `ResidencyRecorder`, which ACCUMULATES `bytes` and so would add to a stale row
-    /// rather than replace it. Such a change must also add a `drop_residency` call on the orphan
-    /// path this doc calls needless.
+    /// is the opposite: the part is live read tier, and a peer's promoted copy of it is exactly
+    /// what must survive this node's eviction. The deleted-object orphan the reclaim walk
+    /// unlinks releases its claim through the same delete
+    /// ([`release_orphan_residency`](crate::ssd_reclaim::ReclaimLog::release_orphan_residency)):
+    /// a resident part with no replication row is what the evictor and the reconciler read as a
+    /// read-promoted copy, so a claim must never outlive its bytes.
     ///
     /// [`mark_failed_reclaimed`]: crate::ssd_reclaim::ReclaimLog::mark_failed_reclaimed
     ///
@@ -1504,14 +1781,7 @@ impl Store {
         if parts.is_empty() {
             return Ok(());
         }
-        let mut object_ids: Vec<&str> = Vec::with_capacity(parts.len());
-        let mut versions: Vec<i64> = Vec::with_capacity(parts.len());
-        let mut part_numbers: Vec<i64> = Vec::with_capacity(parts.len());
-        for part in parts {
-            object_ids.push(part.object().as_str());
-            versions.push(i64::from(part.version().get()));
-            part_numbers.push(i64::from(part.part().get()));
-        }
+        let (object_ids, versions, part_numbers) = key_columns(parts);
         sqlx::query(
             "DELETE FROM cephor_ssd_residency \
              WHERE node_id = $1 \
@@ -1535,6 +1805,10 @@ impl ReclaimLog for Store {
         self.reclaimable_failed_parts_impl(grace, limit).await
     }
 
+    async fn release_orphan_residency(&self, parts: &[PartKey]) -> Result<()> {
+        self.drop_residency(parts).await
+    }
+
     async fn mark_failed_reclaimed(&self, parts: &[PartKey]) -> Result<()> {
         let Some(node) = self.node_id.as_deref() else {
             return Ok(());
@@ -1542,14 +1816,7 @@ impl ReclaimLog for Store {
         if parts.is_empty() {
             return Ok(());
         }
-        let mut object_ids: Vec<&str> = Vec::with_capacity(parts.len());
-        let mut versions: Vec<i64> = Vec::with_capacity(parts.len());
-        let mut part_numbers: Vec<i64> = Vec::with_capacity(parts.len());
-        for part in parts {
-            object_ids.push(part.object().as_str());
-            versions.push(i64::from(part.version().get()));
-            part_numbers.push(i64::from(part.part().get()));
-        }
+        let (object_ids, versions, part_numbers) = key_columns(parts);
         // Batched: a per-part UPDATE would put a round-trip in the reclaim inner loop. Node
         // scoped like every other write here — a peer's row names a file this agent never
         // touched, so marking it would claim work it did not do.
@@ -1598,14 +1865,7 @@ impl ReclaimLog for Store {
         let mut out = HashMap::with_capacity(parts.len());
         // Chunk the IN-list so a pathological backlog never builds one giant query.
         for batch in parts.chunks(RECLAIM_STATUS_BATCH) {
-            let mut object_ids: Vec<&str> = Vec::with_capacity(batch.len());
-            let mut versions: Vec<i64> = Vec::with_capacity(batch.len());
-            let mut part_numbers: Vec<i64> = Vec::with_capacity(batch.len());
-            for part in batch {
-                object_ids.push(part.object().as_str());
-                versions.push(i64::from(part.version().get()));
-                part_numbers.push(i64::from(part.part().get()));
-            }
+            let (object_ids, versions, part_numbers) = key_columns(batch);
             // Match the batch by its PK tuple via UNNEST'd parallel arrays — one query,
             // a PK lookup per element (no new index needed). A part with no row simply
             // does not come back, so the caller treats it as absent.
@@ -1653,14 +1913,7 @@ impl BackingLog for Store {
         let mut out = HashSet::with_capacity(parts.len());
         // Chunk the request so a pathological backlog never builds one giant array.
         for batch in parts.chunks(RECLAIM_STATUS_BATCH) {
-            let mut object_ids: Vec<&str> = Vec::with_capacity(batch.len());
-            let mut versions: Vec<i64> = Vec::with_capacity(batch.len());
-            let mut part_numbers: Vec<i64> = Vec::with_capacity(batch.len());
-            for part in batch {
-                object_ids.push(part.object().as_str());
-                versions.push(i64::from(part.version().get()));
-                part_numbers.push(i64::from(part.part().get()));
-            }
+            let (object_ids, versions, part_numbers) = key_columns(batch);
             // Echo back exactly the input parts whose (object_id, version) has NO
             // object_versions row. NOT EXISTS against the ov PK stays index-only; the
             // object_id is echoed from the input UNNEST (never read from object_versions),
@@ -1681,16 +1934,7 @@ impl BackingLog for Store {
             .bind(&part_numbers)
             .fetch_all(&self.pool)
             .await?;
-            for (object_id, version, part_number) in rows {
-                out.insert(
-                    PartRow {
-                        object_id,
-                        version,
-                        part_number,
-                    }
-                    .into_part()?,
-                );
-            }
+            out.extend(part_set(rows)?);
         }
         Ok(out)
     }
@@ -1699,14 +1943,7 @@ impl BackingLog for Store {
         let mut out = HashSet::with_capacity(parts.len());
         // Chunk the request so a pathological backlog never builds one giant array.
         for batch in parts.chunks(RECLAIM_STATUS_BATCH) {
-            let mut object_ids: Vec<&str> = Vec::with_capacity(batch.len());
-            let mut versions: Vec<i64> = Vec::with_capacity(batch.len());
-            let mut part_numbers: Vec<i64> = Vec::with_capacity(batch.len());
-            for part in batch {
-                object_ids.push(part.object().as_str());
-                versions.push(i64::from(part.version().get()));
-                part_numbers.push(i64::from(part.part().get()));
-            }
+            let (object_ids, versions, part_numbers) = key_columns(batch);
             // Echo back exactly the input parts whose (object_id, version) row EXISTS and is
             // SERVABLE — the inverse of janitor_part_terminally_abandoned.sql's unservable
             // predicate for the servable disjuncts. MUST stay in lockstep with that file (and
@@ -1735,16 +1972,7 @@ impl BackingLog for Store {
             .bind(&part_numbers)
             .fetch_all(&self.pool)
             .await?;
-            for (object_id, version, part_number) in rows {
-                out.insert(
-                    PartRow {
-                        object_id,
-                        version,
-                        part_number,
-                    }
-                    .into_part()?,
-                );
-            }
+            out.extend(part_set(rows)?);
         }
         Ok(out)
     }
@@ -1755,7 +1983,6 @@ impl BackingLog for Store {
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::Store;
-    use crate::ids::FileId;
     use core::str::FromStr;
     use sqlx::postgres::PgPool;
 
@@ -1818,64 +2045,6 @@ mod tests {
             "after re-recording, node-a owns and claims it"
         );
     }
-
-    #[sqlx::test]
-    async fn gc_claim_is_exclusive_then_completes(pool: PgPool) {
-        let store = Store::from_pool(pool);
-        let file = FileId::from_str("file-1").unwrap();
-        assert!(store.claim_gc(&file).await.unwrap().is_some(), "first claim wins");
-        assert!(store.claim_gc(&file).await.unwrap().is_none(), "second claim loses");
-        assert!(!store.is_gc_complete(&file).await.unwrap());
-        store.complete_gc(&file).await.unwrap();
-        assert!(store.is_gc_complete(&file).await.unwrap());
-    }
-
-    #[sqlx::test]
-    async fn a_stale_incomplete_gc_claim_is_reclaimable(pool: PgPool) {
-        // The GC analogue of the chunk-claim crash-recovery fix (#13): an agent won
-        // a GC claim (marker row inserted) then crashed before `complete_gc`. The
-        // claim is now older than the lease, so a fresh claim must reclaim the
-        // wedged file — without this, the conflicting, never-completed row would
-        // block that file's reclaim forever.
-        let store = Store::from_pool(pool.clone());
-        let file = FileId::from_str("file-1").unwrap();
-        assert!(store.claim_gc(&file).await.unwrap().is_some(), "first claim wins");
-        assert!(store.claim_gc(&file).await.unwrap().is_none(), "a fresh claim is still held");
-
-        // Age the claim past the lease (backdating is the only deterministic way to
-        // fast-forward the lease clock — there is no public API to age a claim).
-        sqlx::query("UPDATE cephor_gc_state SET claimed_at = now() - interval '1 hour' WHERE file_id = $1")
-            .bind(file.as_str())
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        assert!(
-            store.claim_gc(&file).await.unwrap().is_some(),
-            "a stale, incomplete GC claim is re-winnable",
-        );
-    }
-
-    #[sqlx::test]
-    async fn a_completed_gc_claim_is_never_reclaimed(pool: PgPool) {
-        // Once a file's GC has completed its debris is gone, so even an aged claim
-        // row must not hand out a new claim (which would re-run a pointless reclaim).
-        let store = Store::from_pool(pool.clone());
-        let file = FileId::from_str("file-1").unwrap();
-        store.claim_gc(&file).await.unwrap().expect("first claim wins");
-        store.complete_gc(&file).await.unwrap();
-
-        sqlx::query("UPDATE cephor_gc_state SET claimed_at = now() - interval '1 hour' WHERE file_id = $1")
-            .bind(file.as_str())
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        assert!(
-            store.claim_gc(&file).await.unwrap().is_none(),
-            "a completed GC is terminal and never re-claimed, even when aged",
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1913,14 +2082,26 @@ mod part_tests {
         // upload was ALREADY enqueued (upload_enqueued_at set). Keep: a FRESH terminal row, any
         // pending/draining (live) row, AND — the Tier-2 guard — an aged `replicated` row still
         // awaiting its enqueue (upload_enqueued_at NULL), the enqueue sweep's worklist: pruning
-        // it would drop the backend upload.
+        // it would drop the backend upload. An aged un-enqueued `replicated` row whose
+        // object_versions row is GONE is reaped though: a hard-deleted object has nothing left
+        // to publish, and no other path ever retires that row.
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, UUID_A, 5, Some("addr")).await;
         let store = Store::from_pool(pool.clone());
         let fresh = part(UUID_A, 5, 1); // replicated + enqueued, young -> kept (age gate)
         let old_replicated_enqueued = part(UUID_A, 5, 2); // aged + enqueued -> pruned
         let old_replicated_unenqueued = part(UUID_A, 5, 5); // aged, NOT enqueued -> spared (worklist)
         let old_failed = part(UUID_A, 5, 3); // aged failed -> pruned
         let pending = part(UUID_A, 5, 4); // live -> kept
-        for p in [&fresh, &old_replicated_enqueued, &old_replicated_unenqueued, &old_failed, &pending] {
+        let old_unenqueued_version_gone = part(UUID_A, 6, 1); // aged, NOT enqueued, no version row -> pruned
+        for p in [
+            &fresh,
+            &old_replicated_enqueued,
+            &old_replicated_unenqueued,
+            &old_failed,
+            &pending,
+            &old_unenqueued_version_gone,
+        ] {
             store.record_landed_part(p).await.unwrap();
         }
         // Fresh: replicated + enqueued but updated_at ~now, so it is younger than the retention —
@@ -1940,10 +2121,19 @@ mod part_tests {
         store.mark_upload_enqueued(&old_replicated_enqueued).await.unwrap();
         force_terminal(&pool, &old_replicated_unenqueued, "replicated").await; // backdated 2h, left unstamped
         force_terminal(&pool, &old_failed, "failed").await; // backdated 2h
+        force_terminal(&pool, &old_unenqueued_version_gone, "replicated").await; // backdated 2h, left unstamped
 
         let pruned = store.gc_terminal_status_rows(Duration::from_hours(1)).await.unwrap();
 
-        assert_eq!(pruned, 2, "only the aged failed + aged enqueued-replicated rows are pruned");
+        assert_eq!(
+            pruned, 3,
+            "the aged failed, aged enqueued-replicated and aged version-gone rows are pruned"
+        );
+        assert_eq!(
+            store.status(&old_unenqueued_version_gone).await.unwrap(),
+            None,
+            "an aged un-enqueued row whose version row is gone is debris and was pruned"
+        );
         assert_eq!(
             store.status(&fresh).await.unwrap(),
             Some(ReplicationState::Replicated),
@@ -1980,6 +2170,7 @@ mod part_tests {
         // CEPHOR_REPLICATED_RECLAIM_GRACE_SECS (1h in prod), so no `replicated` row could outlive
         // its part. Retention holds parts on a free-space policy, which on an uncontended node is
         // indefinite — well past the 7-day default this GC runs at.
+        create_app_schema(&pool).await;
         let store = Store::from_pool(pool.clone()).with_node_id("node-a");
         let resident = part(UUID_A, 6, 1); // aged + enqueued, but STILL ON DISK -> must survive
         let evicted = part(UUID_A, 6, 2); // aged + enqueued, no residency row -> pruned as before
@@ -2013,6 +2204,7 @@ mod part_tests {
         // which for a read-through promotion is NOT the ingesting node in the replication row —
         // so a node-scoped guard would prune the row out from under the very node holding the
         // copy, which is the leak this fix exists to prevent.
+        create_app_schema(&pool).await;
         let ingesting = Store::from_pool(pool.clone()).with_node_id("node-a");
         let promoting = Store::from_pool(pool.clone()).with_node_id("node-b");
         let promoted = part(UUID_A, 7, 1);
@@ -2037,6 +2229,7 @@ mod part_tests {
     /// forever, regrowing the unbounded failed-row backlog migration 0018 cleaned up.
     #[sqlx::test]
     async fn a_reclaimed_failed_part_releases_its_residency_and_then_gcs(pool: PgPool) {
+        create_app_schema(&pool).await;
         let ingesting = Store::from_pool(pool.clone()).with_node_id("node-a");
         let promoting = Store::from_pool(pool.clone()).with_node_id("node-b");
         let p = part(UUID_A, 8, 1);
@@ -2046,10 +2239,7 @@ mod part_tests {
         ingesting.record_landed_part(&p).await.unwrap();
         let claim = ingesting.claim_part().await.unwrap().expect("the landed part is claimable");
         ingesting.record_resident(&p, 4096).await.unwrap();
-        ingesting
-            .mark_replicated(&claim, &PartVerified::for_test(), &test_digest())
-            .await
-            .unwrap();
+        commit_replicated(&ingesting, &claim).await;
         promoting.record_resident(&p, 4096).await.unwrap();
 
         // R4 flags the pool copy corrupt; the redrive returns the part to `pending` leaving
@@ -2117,6 +2307,7 @@ mod part_tests {
             }
         }
 
+        create_app_schema(&pool).await;
         let store = Store::from_pool(pool.clone()).with_node_id("node-a");
         let retained = part(UUID_A, 9, 1);
 
@@ -2125,7 +2316,7 @@ mod part_tests {
         store.record_landed_part(&retained).await.unwrap();
         let claim = store.claim_part().await.unwrap().expect("the landed part is claimable");
         store.record_resident(&retained, 4096).await.unwrap();
-        store.mark_replicated(&claim, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        commit_replicated(&store, &claim).await;
         force_terminal(&pool, &retained, "replicated").await; // backdated 2h: aged past retention
         store.mark_upload_enqueued(&retained).await.unwrap(); // leaves updated_at aged
 
@@ -2174,6 +2365,7 @@ mod part_tests {
         // unlink is a filesystem decision, and a corrupt part need carry no residency row at all
         // (nothing writes one outside drain commit and read-through promotion). So the status
         // list must exclude `corrupt` on its own, which is what this pins.
+        create_app_schema(&pool).await;
         let store = Store::from_pool(pool.clone());
         let held = part(UUID_A, 9, 1);
         let control = part(UUID_A, 9, 2);
@@ -2403,7 +2595,6 @@ mod part_tests {
     async fn is_version_servable_is_the_drain_time_corrupt_discriminator(pool: PgPool) {
         // The R4 mark-path discriminator: same predicate as servable_parts, one part at a time.
         // A servable version (any disjunct) -> Corrupt; an unservable/missing one -> Failed.
-        use crate::partdrain::PartReplicationStore;
         create_app_schema(&pool).await;
         let store = Store::from_pool(pool.clone());
         seed_ov(&pool, UUID_A, 1, Some("5Faddr"), None, None).await; // address set -> servable
@@ -2494,14 +2685,14 @@ mod part_tests {
         store.record_landed_part(&p).await.unwrap();
         let claimed = store.claim_part().await.unwrap().unwrap();
 
-        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        commit_replicated(&store, &claimed).await;
 
         store.record_resident(&p, 4096).await.unwrap();
         assert_eq!(store.node_cache_bytes("node-a").await.unwrap(), 4096, "the retained part is cache");
         let worklist = store.evictable_parts(10).await.unwrap();
         assert_eq!(worklist.len(), 1);
         assert_eq!(worklist[0].part, p);
-        assert_eq!(worklist[0].state, ReplicationState::Replicated);
+        assert_eq!(worklist[0].state, Some(ReplicationState::Replicated));
     }
 
     #[sqlx::test]
@@ -2535,7 +2726,7 @@ mod part_tests {
         assert_eq!(first.digest, None, "nothing has been committed for it yet");
 
         let claimed = store.claim_part().await.unwrap().unwrap();
-        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        commit_replicated(&store, &claimed).await;
 
         let second = store.record_landed_part(&p).await.unwrap();
         assert_eq!(second.state, ReplicationState::Replicated, "the upsert never touches status");
@@ -2552,7 +2743,7 @@ mod part_tests {
         let p = part(UUID_A, 5, 1);
         store.record_landed_part(&p).await.unwrap();
         let claimed = store.claim_part().await.unwrap().unwrap();
-        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        commit_replicated(&store, &claimed).await;
 
         assert!(!store.redrive_diverged_part(&p, &test_digest()).await.unwrap());
         assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Replicated));
@@ -2568,7 +2759,7 @@ mod part_tests {
         let p = part(UUID_A, 5, 1);
         store.record_landed_part(&p).await.unwrap();
         let claimed = store.claim_part().await.unwrap().unwrap();
-        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        commit_replicated(&store, &claimed).await;
         store.mark_upload_enqueued(&p).await.unwrap();
 
         let rewritten = crate::redrive::part_digest(&["different-chunk-0-hash"]);
@@ -2619,7 +2810,7 @@ mod part_tests {
         seed_part_size(&pool, UUID_A, 5, 1, Some(4096)).await;
         store.record_landed_part(&p).await.unwrap();
         let claimed = store.claim_part().await.unwrap().unwrap();
-        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        commit_replicated(&store, &claimed).await;
         store.record_resident(&p, 4096).await.unwrap();
         assert_eq!(
             store.evictable_parts(10).await.unwrap().len(),
@@ -2764,7 +2955,7 @@ mod part_tests {
         seed_part_size(&pool, UUID_A, 5, 1, Some(4096)).await;
         store.record_landed_part(&p).await.unwrap();
         let claimed = store.claim_part().await.unwrap().unwrap();
-        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        commit_replicated(&store, &claimed).await;
         store.record_resident(&p, 4096).await.unwrap();
         assert_eq!(store.evictable_parts(10).await.unwrap().len(), 1, "committed and resident is evictable");
 
@@ -3260,17 +3451,39 @@ mod part_tests {
     }
 
     #[sqlx::test]
-    async fn mark_replicated_commits_a_claimed_part(pool: PgPool) {
-        let store = Store::from_pool(pool);
+    async fn mark_uploading_hands_over_a_claimed_part_and_confirm_replicated_completes_it(pool: PgPool) {
+        let store = Store::from_pool(pool.clone());
         let p = part(UUID_A, 5, 1);
         store.record_landed_part(&p).await.unwrap();
         let claimed = store.claim_part().await.unwrap().unwrap();
-        store.mark_replicated(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        store.mark_uploading(&claimed, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Uploading));
+        let (stamped, digest, attempts): (bool, Option<String>, i32) = sqlx::query_as(
+            "SELECT upload_enqueued_at IS NOT NULL, content_sha256, upload_attempts FROM cephor_replication_status WHERE object_id = $1",
+        )
+        .bind(p.object().as_str())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(stamped, "the hand-off stamps upload_enqueued_at: the publish preceded the commit");
+        assert_eq!(
+            digest.as_deref(),
+            Some(test_digest().as_str()),
+            "the digest is written by the same statement"
+        );
+        assert_eq!(attempts, 0);
+
+        assert_eq!(store.confirm_replicated(std::slice::from_ref(&p)).await.unwrap(), 1);
         assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Replicated));
+        assert_eq!(
+            store.confirm_replicated(std::slice::from_ref(&p)).await.unwrap(),
+            0,
+            "a re-flip is a no-op"
+        );
     }
 
     #[sqlx::test]
-    async fn mark_replicated_without_a_draining_claim_is_part_claim_lost(pool: PgPool) {
+    async fn mark_uploading_without_a_draining_claim_is_part_claim_lost(pool: PgPool) {
         let store = Store::from_pool(pool);
         let p = part(UUID_A, 5, 1);
         store.record_landed_part(&p).await.unwrap(); // status = pending, never claimed
@@ -3279,7 +3492,7 @@ mod part_tests {
         // value is irrelevant here — the status guard already rejects it).
         let unclaimed = ClaimedPart::new(p.clone(), 0);
         let err = store
-            .mark_replicated(&unclaimed, &PartVerified::for_test(), &test_digest())
+            .mark_uploading(&unclaimed, &PartVerified::for_test(), &test_digest())
             .await
             .unwrap_err();
         let expected = p.relative_dir().to_string_lossy().into_owned();
@@ -3349,10 +3562,7 @@ mod part_tests {
         let second = store.claim_part().await.unwrap().expect("the stale claim is re-won past the lease");
         assert_ne!(first.claim_seq(), second.claim_seq(), "the re-claim gets a fresh fencing token");
 
-        let err = store
-            .mark_replicated(&first, &PartVerified::for_test(), &test_digest())
-            .await
-            .unwrap_err();
+        let err = store.mark_uploading(&first, &PartVerified::for_test(), &test_digest()).await.unwrap_err();
         let expected = p.relative_dir().to_string_lossy().into_owned();
         assert!(
             matches!(err, StoreError::PartClaimLost { ref part } if part.as_ref() == expected),
@@ -3363,13 +3573,13 @@ mod part_tests {
             Some(ReplicationState::Draining),
             "the fenced commit leaves the live claim's draining row untouched",
         );
-        store.mark_replicated(&second, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        commit_replicated(&store, &second).await;
         assert_eq!(store.status(&p).await.unwrap(), Some(ReplicationState::Replicated));
     }
 
     #[sqlx::test]
     async fn mark_failed_by_a_fenced_stale_claimant_does_not_fail_the_live_part(pool: PgPool) {
-        // WI-3: the mark_failed counterpart of the mark_replicated fence. A stale claimant
+        // WI-3: the mark_failed counterpart of the mark_uploading fence. A stale claimant
         // whose claim was re-won after the lease must NOT flip the live re-claimed part to
         // `failed` — its guarded UPDATE matches zero rows (a harmless no-op, not an error,
         // since mark_failed authorizes no SSD unlink).
@@ -3517,13 +3727,17 @@ mod part_tests {
     async fn create_app_schema(pool: &PgPool) {
         for ddl in [
             "CREATE TABLE buckets (bucket_id uuid PRIMARY KEY, bucket_name text NOT NULL)",
-            "CREATE TABLE objects (object_id uuid PRIMARY KEY, bucket_id uuid NOT NULL, object_key text NOT NULL)",
+            "CREATE TABLE objects (object_id uuid PRIMARY KEY, bucket_id uuid NOT NULL, object_key text NOT NULL, \
+             deleted_at timestamptz)",
             "CREATE TABLE object_versions (object_id uuid NOT NULL, object_version bigint NOT NULL, address text, \
              size_bytes bigint, md5_hash text, \
              PRIMARY KEY (object_id, object_version))",
             "CREATE TABLE multipart_uploads (upload_id uuid PRIMARY KEY, object_id uuid, initiated_at timestamptz NOT NULL)",
-            "CREATE TABLE parts (object_id uuid NOT NULL, object_version bigint NOT NULL, part_number bigint NOT NULL, \
-             size_bytes bigint, upload_id uuid)",
+            "CREATE TABLE parts (part_id uuid PRIMARY KEY DEFAULT gen_random_uuid(), object_id uuid NOT NULL, \
+             object_version bigint NOT NULL, part_number bigint NOT NULL, size_bytes bigint, upload_id uuid)",
+            "CREATE TABLE part_chunks (id bigserial PRIMARY KEY, part_id uuid NOT NULL, chunk_index int NOT NULL)",
+            "CREATE TABLE chunk_backend (chunk_id bigint NOT NULL, backend text NOT NULL, backend_identifier text, \
+             deleted boolean NOT NULL DEFAULT false, deleted_at timestamptz, PRIMARY KEY (chunk_id, backend))",
         ] {
             sqlx::query(ddl).execute(pool).await.unwrap();
         }
@@ -3930,6 +4144,67 @@ mod part_tests {
     }
 
     #[sqlx::test]
+    async fn reconcile_leaves_a_read_promoted_copy_to_the_evictor_and_recovers_a_lost_trigger(pool: PgPool) {
+        // The store half of the promoted-copy rule (see `crate::reconcile`): a residency row on
+        // THIS node with no replication row is a read-promoted copy — left alone by the
+        // reconciler, owned by the evictor, never on the sweep worklist. Residency on another
+        // node is not evidence about this disk.
+        use crate::reconcile::{DiscoveredPart, PartScan, reconcile_parts};
+        use crate::ssd_evict::ResidentLog;
+        use core::future::Future;
+
+        struct Parts(Vec<DiscoveredPart>);
+        impl PartScan for Parts {
+            fn scan_parts(&self) -> impl Future<Output = std::io::Result<Vec<DiscoveredPart>>> + Send {
+                let parts = self.0.clone();
+                async move { Ok(parts) }
+            }
+        }
+
+        create_app_schema(&pool).await;
+        let node_a = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let node_b = Store::from_pool(pool.clone()).with_node_id("node-b");
+        let promoted_here = part(UUID_A, 5, 1);
+        let promoted_elsewhere = part(UUID_A, 5, 2);
+        node_b.record_resident(&promoted_here, 100).await.unwrap();
+        node_a.record_resident(&promoted_elsewhere, 100).await.unwrap();
+
+        let scanner = Parts(vec![
+            DiscoveredPart {
+                part: promoted_here.clone(),
+                age: std::time::Duration::ZERO,
+            },
+            DiscoveredPart {
+                part: promoted_elsewhere.clone(),
+                age: std::time::Duration::ZERO,
+            },
+        ]);
+        let report = reconcile_parts(&scanner, &node_b).await.unwrap();
+
+        assert_eq!(report.promoted_copies, 1, "the copy resident on THIS node is a promotion");
+        assert_eq!(report.recovered, 1, "residency on another node says nothing about this disk: recovered");
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&node_b, &promoted_here).await.unwrap(),
+            None,
+            "a promoted copy gets no replication row — it never entered the drain",
+        );
+        assert!(
+            node_b.list_replicated_unenqueued_parts(10).await.unwrap().is_empty(),
+            "a promoted copy has nothing to publish, so it never reaches the enqueue-sweep worklist",
+        );
+        let evictable: Vec<_> = node_b.evictable_parts(10).await.unwrap().into_iter().map(|r| (r.part, r.state)).collect();
+        assert_eq!(
+            evictable,
+            vec![(promoted_here.clone(), None)],
+            "the evictor owns the row-less promoted copy"
+        );
+        assert_eq!(node_b.node_cache_bytes("node-b").await.unwrap(), 100, "and counts it as cache");
+        let claimed = node_b.claim_part().await.unwrap().expect("the recovered part is claimable");
+        assert_eq!(claimed.part(), &promoted_elsewhere);
+        assert!(node_b.claim_part().await.unwrap().is_none(), "the promoted copy never entered the drain");
+    }
+
+    #[sqlx::test]
     async fn plain_defer_part_never_touches_missing_source_attempts(pool: PgPool) {
         // The amendment's core invariant: overdraft/not-ready deferrals go through
         // defer_part and must NOT count toward the missing-source write-off — only
@@ -3947,29 +4222,357 @@ mod part_tests {
         );
     }
 
-    /// Drives one part `pending → draining → replicated` (the drain's commit path) and returns it.
+    /// Seeds a POOL-ERA row: `replicated` with `upload_enqueued_at` NULL — a part the old
+    /// decoupled-commit drain copied to the pool before its address was written, whose backend
+    /// publish is still owed to the legacy enqueue sweep. The current drain never produces this
+    /// shape (its commit stamps the publish), so the tests for the legacy sweep and its GC arm
+    /// model it by clearing the stamp after a normal commit.
     async fn seed_replicated(store: &Store, uuid: &str, version: u32, part_number: u32) -> crate::apipart::PartKey {
         use crate::apipart::{ObjectId, PartKey, PartNumber, Version};
-        use crate::partdrain::PartVerified;
         use core::str::FromStr;
         let part = PartKey::new(ObjectId::from_str(uuid).unwrap(), Version::new(version), PartNumber::new(part_number));
         store.record_landed_part(&part).await.unwrap();
         let claim = store.claim_part().await.unwrap().expect("claims the seeded pending part");
         assert_eq!(claim.part(), &part);
-        store.mark_replicated(&claim, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        commit_replicated(store, &claim).await;
+        sqlx::query(
+            "UPDATE cephor_replication_status SET upload_enqueued_at = NULL \
+             WHERE object_id = $1 AND version = $2 AND part_number = $3",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .execute(&store.pool)
+        .await
+        .unwrap();
         part
+    }
+
+    /// The full commit path for a claimed part: the drain's `mark_uploading` hand-off followed
+    /// by the uploader's/sweep's `confirm_replicated` flip.
+    async fn commit_replicated(store: &Store, claim: &ClaimedPart) {
+        store.mark_uploading(claim, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        assert_eq!(store.confirm_replicated(std::slice::from_ref(claim.part())).await.unwrap(), 1);
+    }
+
+    /// Drives one part `pending → draining → uploading` (the drain's hand-off) and returns it.
+    async fn seed_uploading(store: &Store, uuid: &str, version: u32, part_number: u32) -> PartKey {
+        let part = PartKey::new(ObjectId::from_str(uuid).unwrap(), Version::new(version), PartNumber::new(part_number));
+        store.record_landed_part(&part).await.unwrap();
+        let claim = store.claim_part().await.unwrap().expect("claims the seeded pending part");
+        assert_eq!(claim.part(), &part);
+        store.mark_uploading(&claim, &PartVerified::for_test(), &test_digest()).await.unwrap();
+        part
+    }
+
+    /// Seeds the app-side `parts` row + `n` `part_chunks` rows for a part, returning the chunk ids.
+    async fn seed_part_chunks(pool: &PgPool, part: &PartKey, n: i32) -> Vec<i64> {
+        let part_id: String = sqlx::query_scalar(
+            "INSERT INTO parts (object_id, object_version, part_number, size_bytes) VALUES ($1::uuid, $2, $3, 4096) RETURNING part_id::text",
+        )
+        .bind(part.object().as_str())
+        .bind(i64::from(part.version().get()))
+        .bind(i64::from(part.part().get()))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut ids = Vec::new();
+        for index in 0..n {
+            let id: i64 = sqlx::query_scalar("INSERT INTO part_chunks (part_id, chunk_index) VALUES ($1::uuid, $2) RETURNING id")
+                .bind(&part_id)
+                .bind(index)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Records a live backend row for a chunk — what the uploader writes per uploaded chunk.
+    async fn cover_chunk(pool: &PgPool, chunk_id: i64, backend: &str, deleted: bool) {
+        sqlx::query("INSERT INTO chunk_backend (chunk_id, backend, backend_identifier, deleted) VALUES ($1, $2, 'id', $3)")
+            .bind(chunk_id)
+            .bind(backend)
+            .bind(deleted)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn the_upload_sweep_confirms_only_this_nodes_fully_covered_uploading_parts(pool: PgPool) {
+        // The sweep's confirmation arm, from chunk_backend coverage: a part is offered only when
+        // EVERY chunk has a live row on EVERY required backend, it has part_chunks rows at all
+        // (the vacuous-truth trap: a part whose placeholder inserts have not committed yet has
+        // no chunks and would otherwise read as fully covered), and it belongs to this node.
+        const OBJECT: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, OBJECT, 5, Some("addr")).await;
+        let node_a = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let node_b = Store::from_pool(pool.clone()).with_node_id("node-b");
+        let backends = vec!["arion".to_owned()];
+
+        let covered = seed_uploading(&node_a, OBJECT, 5, 1).await;
+        for id in seed_part_chunks(&pool, &covered, 2).await {
+            cover_chunk(&pool, id, "arion", false).await;
+        }
+        let partial = seed_uploading(&node_a, OBJECT, 5, 2).await;
+        let ids = seed_part_chunks(&pool, &partial, 2).await;
+        cover_chunk(&pool, ids[0], "arion", false).await;
+        let soft_deleted_row = seed_uploading(&node_a, OBJECT, 5, 3).await;
+        for id in seed_part_chunks(&pool, &soft_deleted_row, 1).await {
+            cover_chunk(&pool, id, "arion", true).await; // an unpinned row is not coverage
+        }
+        let no_chunks = seed_uploading(&node_a, OBJECT, 5, 4).await;
+        seed_part_chunks(&pool, &no_chunks, 0).await;
+        let other_node = seed_uploading(&node_b, OBJECT, 5, 5).await;
+        for id in seed_part_chunks(&pool, &other_node, 1).await {
+            cover_chunk(&pool, id, "arion", false).await;
+        }
+
+        assert_eq!(
+            node_a.list_uploading_covered(&backends, 10).await.unwrap(),
+            vec![covered.clone()],
+            "only the fully-covered part of THIS node is offered"
+        );
+        assert_eq!(node_a.confirm_replicated(std::slice::from_ref(&covered)).await.unwrap(), 1);
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&node_a, &covered).await.unwrap(),
+            Some(ReplicationState::Replicated)
+        );
+        for still in [&partial, &soft_deleted_row, &no_chunks, &other_node] {
+            assert_eq!(
+                <Store as PartReplicationStore>::status(&node_a, still).await.unwrap(),
+                Some(ReplicationState::Uploading)
+            );
+        }
+        assert!(
+            node_a.list_uploading_covered(&backends, 10).await.unwrap().is_empty(),
+            "confirmed parts leave the worklist"
+        );
+
+        // A second required backend must be covered too: the same union the janitor gate uses.
+        let two = vec!["arion".to_owned(), "ovh".to_owned()];
+        assert!(
+            node_b.list_uploading_covered(&two, 10).await.unwrap().is_empty(),
+            "arion-only coverage is not enough for arion+ovh"
+        );
+        assert_eq!(node_b.list_uploading_covered(&backends, 10).await.unwrap(), vec![other_node]);
+    }
+
+    #[sqlx::test]
+    async fn the_upload_sweep_redrives_stale_uploading_parts_up_to_the_cap_then_counts_them(pool: PgPool) {
+        // The re-drive arm: a part that sat `uploading` past the window is offered until it has
+        // been re-published `max_attempts` times; each bump moves it out of the window; past the
+        // cap it is counted as exhausted rather than offered. A fresh hand-off is never stale.
+        const OBJECT: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, OBJECT, 5, Some("addr")).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let part = seed_uploading(&store, OBJECT, 5, 1).await;
+
+        assert!(
+            store.list_uploading_stale(Duration::from_hours(1), 3, 10).await.unwrap().is_empty(),
+            "just handed over"
+        );
+        assert_eq!(store.list_uploading_stale(Duration::ZERO, 3, 10).await.unwrap(), vec![part.clone()]);
+
+        for attempt in 1..=3 {
+            assert!(store.bump_upload_attempts(&part).await.unwrap(), "an uploading row takes the bump");
+            assert!(
+                store.list_uploading_stale(Duration::from_hours(1), 3, 10).await.unwrap().is_empty(),
+                "a bump restarts the window (attempt {attempt})"
+            );
+        }
+        assert!(
+            store.list_uploading_stale(Duration::ZERO, 3, 10).await.unwrap().is_empty(),
+            "past the cap it is no longer offered"
+        );
+        assert_eq!(
+            store.count_uploading_exhausted(3).await.unwrap(),
+            1,
+            "and is counted as stuck the moment its last re-publish is recorded"
+        );
+
+        // A fresh hand-off (a re-drive that went pending → draining → uploading) resets the budget.
+        store.confirm_replicated(std::slice::from_ref(&part)).await.unwrap();
+        assert_eq!(store.count_uploading_exhausted(3).await.unwrap(), 0, "a replicated part is not stuck");
+        assert!(
+            !store.bump_upload_attempts(&part).await.unwrap(),
+            "a row the uploader flipped between the listing and the bump is not re-published"
+        );
+    }
+
+    #[sqlx::test]
+    async fn the_upload_sweep_retires_uploading_parts_of_deleted_objects(pool: PgPool) {
+        // The retire arm, on the uploader's own skip predicate (is_object_deleted): a version
+        // row gone, or an object soft-deleted, has nothing left to upload. Such a part is flipped
+        // `replicated` (evictable, GC-able) rather than re-published until its budget runs out.
+        const LIVE: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+        const SOFT: &str = "11111111-2222-4333-8444-555555555555";
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, LIVE, 5, Some("addr")).await;
+        seed_object_version(&pool, SOFT, 5, Some("addr")).await;
+        sqlx::query("UPDATE objects SET deleted_at = now() WHERE object_id = $1::uuid")
+            .bind(SOFT)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let other = Store::from_pool(pool.clone()).with_node_id("node-b");
+
+        let live = seed_uploading(&store, LIVE, 5, 1).await;
+        let version_gone = seed_uploading(&store, LIVE, 6, 1).await;
+        let soft_deleted = seed_uploading(&store, SOFT, 5, 1).await;
+        let other_nodes = seed_uploading(&other, LIVE, 7, 1).await;
+
+        assert_eq!(
+            store.abandon_uploading_deleted(10).await.unwrap(),
+            2,
+            "the gone version and the soft-deleted object"
+        );
+        for retired in [&version_gone, &soft_deleted] {
+            assert_eq!(
+                <Store as PartReplicationStore>::status(&store, retired).await.unwrap(),
+                Some(ReplicationState::Replicated)
+            );
+        }
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &live).await.unwrap(),
+            Some(ReplicationState::Uploading),
+            "a live upload is untouched"
+        );
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &other_nodes).await.unwrap(),
+            Some(ReplicationState::Uploading),
+            "another node's row is that node's to retire"
+        );
+        assert_eq!(store.abandon_uploading_deleted(10).await.unwrap(), 0, "idempotent");
+    }
+
+    #[sqlx::test]
+    async fn a_rewritten_uploading_part_is_redriven_and_a_relanded_one_is_grace_gated(pool: PgPool) {
+        // B-2 on the hand-off: an UploadPart retry that lands different bytes while the part is
+        // `uploading` must return it to `pending` (the uploader may be reading the old bytes), and
+        // a re-announcement of an `uploading` part stamps relanded_at like a `replicated` one.
+        // The part's chunk_backend rows — which survive the retry, because part_chunks rows do —
+        // must be retired with it, or the sweep's coverage arm reads the superseded upload as
+        // proof the fresh hand-off reached the backend.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let part = seed_uploading(&store, UUID_A, 5, 1).await;
+        let chunks = seed_part_chunks(&pool, &part, 2).await;
+        for chunk in &chunks {
+            cover_chunk(&pool, *chunk, "arion", false).await;
+        }
+        let backends = vec!["arion".to_owned()];
+        assert_eq!(store.list_uploading_covered(&backends, 10).await.unwrap(), vec![part.clone()]);
+
+        // The announcement of a rewrite names a part that already reads `uploading`.
+        store.record_landed_part(&part).await.unwrap();
+        let relanded: bool = sqlx::query_scalar("SELECT relanded_at IS NOT NULL FROM cephor_replication_status WHERE object_id = $1")
+            .bind(part.object().as_str())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(relanded, "an announcement naming an uploading part is a possible rewrite");
+
+        assert!(
+            !store.redrive_diverged_part(&part, &test_digest()).await.unwrap(),
+            "same digest: no re-drive"
+        );
+        assert!(
+            store
+                .redrive_diverged_part(&part, &PartDigest::from_stored("other".to_owned()))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &part).await.unwrap(),
+            Some(ReplicationState::Pending)
+        );
+        let (stamp_cleared, attempts): (bool, i32) =
+            sqlx::query_as("SELECT upload_enqueued_at IS NULL, upload_attempts FROM cephor_replication_status WHERE object_id = $1")
+                .bind(part.object().as_str())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(stamp_cleared, "a re-drive clears the publish stamp");
+        assert_eq!(attempts, 0, "and the re-publish budget");
+        let live_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM chunk_backend WHERE NOT deleted")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(live_rows, 0, "the superseded upload's chunk_backend rows are retired with the re-drive");
+
+        // The fresh hand-off is NOT covered until the uploader writes new rows.
+        let claim = store.claim_part().await.unwrap().expect("re-claims the re-driven part");
+        store
+            .mark_uploading(&claim, &PartVerified::for_test(), &PartDigest::from_stored("other".to_owned()))
+            .await
+            .unwrap();
+        assert!(
+            store.list_uploading_covered(&backends, 10).await.unwrap().is_empty(),
+            "stale coverage cannot confirm the re-driven hand-off"
+        );
+        // What insert_chunk_backend's ON CONFLICT does for a re-upload: revive the rows.
+        sqlx::query("UPDATE chunk_backend SET deleted = false, deleted_at = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_uploading_covered(&backends, 10).await.unwrap(),
+            vec![part.clone()],
+            "a fresh upload revives the rows and covers it again"
+        );
+    }
+
+    #[sqlx::test]
+    async fn an_uploading_parts_bytes_are_backlog_not_cache_and_never_evictable(pool: PgPool) {
+        // Between the hand-off and the uploader's flip the SSD holds the ONLY copy: those bytes
+        // are neither evictable cache nor free headroom. They count as backlog (work the node
+        // must still move off), stay off the evictor's worklist, and are not cache bytes.
+        create_app_schema(&pool).await;
+        let store = Store::from_pool(pool.clone()).with_node_id("node-a");
+        let part = seed_uploading(&store, UUID_A, 5, 1).await;
+        seed_part_chunks(&pool, &part, 1).await;
+        store.record_resident(&part, 4096).await.unwrap();
+
+        assert_eq!(store.node_backlog_bytes("node-a").await.unwrap(), 4096, "pinned bytes are backlog");
+        assert_eq!(store.node_cache_bytes("node-a").await.unwrap(), 0, "and not evictable cache");
+        assert!(store.evictable_parts(10).await.unwrap().is_empty(), "the evictor never sees it");
+
+        store.confirm_replicated(std::slice::from_ref(&part)).await.unwrap();
+        assert_eq!(store.node_backlog_bytes("node-a").await.unwrap(), 0);
+        assert_eq!(store.node_cache_bytes("node-a").await.unwrap(), 4096, "once on the backend it is cache");
+        assert_eq!(store.evictable_parts(10).await.unwrap().len(), 1);
     }
 
     #[sqlx::test]
     async fn the_enqueue_sweep_worklist_tracks_the_backend_publish(pool: PgPool) {
         // Tier-2: a part committed `replicated` before its address landed is on the sweep
-        // worklist until mark_upload_enqueued stamps it (what the enqueue sweep does after a
-        // successful publish). The worklist is node-scoped and ordered by commit time.
+        // worklist — once that address exists — until mark_upload_enqueued stamps it (what the
+        // enqueue sweep does after a successful publish). The worklist is node-scoped and
+        // ordered by commit time. A row whose version has NO address (an in-flight or abandoned
+        // MPU, or a pre-cutover version), or no version row at all, is never offered: the sweep
+        // could only re-load a not-ready context for it, and a never-ready row at the head of
+        // the oldest-first ring starved every real part behind it on prod (2026-08-27).
+        const OBJECT: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, OBJECT, 5, Some("addr")).await;
+        seed_object_version(&pool, OBJECT, 6, None).await;
         let store = Store::from_pool(pool);
-        let part = seed_replicated(&store, "466916c0-d61b-4518-b81b-9576b574270a", 5, 1).await;
+        let part = seed_replicated(&store, OBJECT, 5, 1).await;
+        let _address_null = seed_replicated(&store, OBJECT, 6, 1).await;
+        let _version_gone = seed_replicated(&store, OBJECT, 7, 1).await;
 
         let before = store.list_replicated_unenqueued_parts(10).await.unwrap();
-        assert_eq!(before, vec![part.clone()], "a replicated, un-enqueued part is on the worklist");
+        assert_eq!(
+            before,
+            vec![part.clone()],
+            "only the replicated, un-enqueued part whose version has an address is on the worklist"
+        );
 
         store.mark_upload_enqueued(&part).await.unwrap();
         assert!(
@@ -3981,19 +4584,57 @@ mod part_tests {
     }
 
     #[sqlx::test]
+    async fn the_enqueue_sweep_worklist_is_not_starved_by_more_never_ready_rows_than_its_limit(pool: PgPool) {
+        // The prod failure shape (2026-08-27): MORE never-ready rows than the sweep's batch
+        // limit, all older than the first publishable row. With a limit-then-filter worklist the
+        // batch was 100% not-ready on every poll and the publishable row behind it was never
+        // offered. The worklist must skip past an arbitrarily long not-ready head.
+        const OBJECT: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+        const LIMIT: u32 = 8;
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, OBJECT, 1, None).await; // pre-cutover / in-flight: never ready
+        seed_object_version(&pool, OBJECT, 2, Some("addr")).await;
+        let store = Store::from_pool(pool);
+        // 2x the limit of not-ready rows, committed BEFORE the publishable one so they sort
+        // ahead of it in the oldest-first ring.
+        for number in 1..=(LIMIT * 2) {
+            seed_replicated(&store, OBJECT, 1, number).await;
+        }
+        let publishable = seed_replicated(&store, OBJECT, 2, 1).await;
+
+        let worklist = store.list_replicated_unenqueued_parts(LIMIT).await.unwrap();
+        assert_eq!(
+            worklist,
+            vec![publishable],
+            "the publishable row is offered even though more than `limit` never-ready rows precede it"
+        );
+    }
+
+    #[sqlx::test]
     async fn gc_spares_a_replicated_row_awaiting_enqueue_but_reaps_a_stamped_one(pool: PgPool) {
         // The GC guard: gc_terminal_status_rows must NOT delete a `replicated` row whose backend
         // upload is still outstanding (upload_enqueued_at IS NULL) — that would drop the enqueue
         // sweep's worklist item and lose the backend upload. A stamped `replicated` row is
-        // genuinely terminal and IS reaped.
+        // genuinely terminal and IS reaped — and so is an un-enqueued row whose object_versions
+        // row is gone, which has nothing left to publish and nothing else to retire it.
+        const OBJECT: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, OBJECT, 5, Some("addr")).await;
         let store = Store::from_pool(pool);
-        let unenqueued = seed_replicated(&store, "466916c0-d61b-4518-b81b-9576b574270a", 5, 1).await;
-        let enqueued = seed_replicated(&store, "466916c0-d61b-4518-b81b-9576b574270a", 5, 2).await;
+        let unenqueued = seed_replicated(&store, OBJECT, 5, 1).await;
+        let enqueued = seed_replicated(&store, OBJECT, 5, 2).await;
+        let version_gone = seed_replicated(&store, OBJECT, 6, 1).await;
         store.mark_upload_enqueued(&enqueued).await.unwrap();
 
-        // Retention ZERO makes every row "aged"; only the stamped one is eligible.
+        // Retention ZERO makes every row "aged"; the stamped one and the version-gone one are
+        // eligible.
         let removed = store.gc_terminal_status_rows(Duration::ZERO).await.unwrap();
-        assert_eq!(removed, 1, "only the stamped (fully terminal) replicated row is reaped");
+        assert_eq!(removed, 2, "the stamped replicated row and the version-gone row are reaped");
+        assert_eq!(
+            <Store as PartReplicationStore>::status(&store, &version_gone).await.unwrap(),
+            None,
+            "an un-enqueued row for a hard-deleted object is debris, not a worklist item",
+        );
         assert_eq!(
             <Store as PartReplicationStore>::status(&store, &unenqueued).await.unwrap(),
             Some(crate::state::ReplicationState::Replicated),

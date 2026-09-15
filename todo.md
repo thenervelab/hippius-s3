@@ -191,54 +191,92 @@ Fast-path copy: rewraps the DEK under the destination's AAD, copies `chunk_backe
 
 **Proposed**: add a prominent comment block at [copy_service_v5.py:24](hippius_s3/services/copy_service_v5.py) documenting the invariant ("fast path requires either (a) non-MPU single-part object OR (b) explicit FS backfill of all chunks into the destination object_id path"). Consider a feature flag before re-enabling for MPU.
 
-### P2 — Billing plans: usage is recomputed from scratch every cycle, forever
+### DONE — Billing plans: usage is no longer recomputed from scratch every cycle
 
-**Superseded a P1 that mis-diagnosed this.** The earlier entry blamed bucket fan-out and quoted
-~33s. Both were wrong: most of the account's buckets are soft-deleted and the query filters
-`deleted_at IS NULL`, and of the live ones a single bucket holding a filesystem-style workload of
-millions of small objects is ~99% of the work. The true single-statement cost is over a minute —
-~33s was where the replica's cancellation fired, not where the query finished.
+**Superseded two designs that both mis-framed this.** The first blamed 203-bucket fan-out and quoted
+~33s. The second fixed the cancellation by chunking, and left ~165s of replica work per cycle,
+forever. Both were shaped around "there are only a few tens of plan accounts", which was true and
+irrelevant: **account cardinality was never the problem; objects-per-account is.** Most of that
+account's buckets are soft-deleted and the query filters `deleted_at IS NULL`; of the live ones, a
+single bucket holding a filesystem-style workload of millions of small objects is ~99% of the work.
 
-The immediate blocker is fixed: `usage_service.py` now walks each bucket in keyset pages, so no
-single statement approaches the 30s ceilings. Measured cold on the prod replica at the 200k default,
-one page is 2.91s and the whole account is **~115s** across ~40 statements.
-
-**What remains** is that ~115s of database work per cycle, per cycle, forever — recomputing a number
-that changed by a few objects. It is O(objects) and that bucket only grows, so this gets worse on its
-own. Every other object store treats this as an incrementally maintained number rather than a repeated
-scan ([Ceph RGW](https://docs.ceph.com/en/latest/radosgw/admin/) caches per-instance stats behind
-`rgw bucket quota ttl`; [Swift](https://docs.openstack.org/swift/latest/api/container_quotas.html)
-updates account/container DBs asynchronously; AWS ships Storage Lens daily and offers no quota at all).
-
-**Proposed: an insert-only delta ledger folded into a per-bucket rollup.**
+**Shipped: an insert-only delta ledger folded into a per-bucket rollup.**
+[20260910120000_storage_usage_rollup.sql](hippius_s3/sql/migrations/20260910120000_storage_usage_rollup.sql),
+[workers/run_usage_rollup_in_loop.py](workers/run_usage_rollup_in_loop.py).
 
 ```
-object_versions / objects   --AFTER-ROW TRIGGERS, INSERT only-->  storage_delta_ledger
-                                                                          |
-                              compactor: DELETE ... RETURNING *, fold     v
+objects / object_versions   --5 row triggers, INSERT only-->  storage_delta_ledger
+                                                                      |
+                            compactor: DELETE ... RETURNING, fold     v
                                                               bucket_storage_usage
-                                                                          |
-                                          account total = indexed SUM  <--+  (sub-ms)
+                                                                      |
+                                  account total = indexed SUM  <------+  (sub-ms)
 ```
 
-The refinement over the trigger design deleted earlier in this project: keep the triggers, but make
-what they write an **INSERT, not an UPDATE**. That preserves the property that made triggers
-attractive — `ON DELETE CASCADE` means `nuke_user.py`, `purge_buckets.py` and the janitor's
-hard-delete are accounted for automatically, and no new endpoint can forget to call a helper — while
-removing the hot-row contention and MVCC bloat that made them risky. The full-scan cost then runs
-**once per bucket as a backfill and never again**, which is the only property that actually ends
-this problem. Sharded counters are the wrong tool here: the guidance is consistent that they suit
-approximate display counters and push correctness onto the read path, which is not acceptable for
-billing.
+The refinement over the trigger design that was deleted earlier in this project: what the triggers
+write is an **INSERT, not an `UPDATE ... SET bytes = bytes + delta`**. That keeps the property which
+made triggers attractive — `ON DELETE CASCADE` means `nuke_user.py`, `purge_buckets.py` and the
+janitor's hard-delete are accounted for automatically, and no new endpoint can forget to call a
+helper — while removing the hot-row contention and MVCC bloat that made them risky. The full scan
+now runs **once per bucket as a backfill and never again**.
 
-Worth stealing alongside it: RGW's **soft threshold**, where the cached number is trusted while an
-account is comfortably under quota and refreshed only near the limit. With a rollup making reads
-sub-millisecond we could afford it on every request, which would also close the "refresh interval is
-the enforcement lag" gap below.
+Sharded counters were rejected: the guidance is consistent that they suit approximate display
+counters and push correctness onto the read path, which is not acceptable for billing.
 
-Note the premise the current design was justified on — "only a few tens of plan accounts" — was never
-the relevant number. **Account cardinality was never the problem; objects-per-account is.** One
-account with one 7.8M-object bucket breaks a recount design no matter how few accounts exist.
+### 🚨 ROLLOUT: the triggers are the one part of billing plans with NO kill switch
+
+Everything else in this feature can be turned off in minutes — `HIPPIUS_ENABLE_BILLING_PLANS`, an
+empty `hippius_s3_plan_accounts` hash, or scaling the plans-cacher to zero. **The triggers can not.**
+They are schema, they fire on every object write by every account the moment the migration lands, and
+the billing flag does not gate them. So "ship it with billing disabled" protects the quota decision
+and gives no protection at all against the genuinely new risk.
+
+Three consequences worth holding in mind:
+
+- **Blast radius is every account, not plan customers.** Everything before this only touched accounts
+  in the plan hash. This touches all writes.
+- **The failure mode is a failed upload, not a wrong number.** A trigger that raises aborts the
+  caller's transaction, so a bug here is a data-plane outage on the hottest path, not a billing
+  discrepancy.
+- **Rollback is slower than a flag, and the brake can itself hurt.**
+  `ALTER TABLE ... DISABLE TRIGGER` is metadata-only but takes ACCESS EXCLUSIVE, so it queues behind
+  running queries while blocking every reader and writer. On a cluster where a janitor read-storm has
+  already caused failovers, that lever needs `lock_timeout` and a deliberate moment.
+
+**Ship it in this order:**
+
+1. Deploy with billing disabled. Triggers start collecting; reads refuse until backfilled.
+2. **LOAD-TEST THE WRITE PATH ON STAGING WITH TRIGGERS LIVE** — concurrent PUTs, overwrites, deletes
+   and MPUs, watching write error rate and p99 against a pre-deploy baseline. This is the step that
+   catches a raising trigger or a latency regression, and it is before any of it matters in prod. A
+   single `aws s3 cp` proves nothing about a trigger under contention; staging has no organic traffic,
+   so the load has to be generated.
+3. Run the backfill manually (`--dry-run`, then `--apply`).
+4. Confirm pay-as-you-go is unaffected — as a measurement, not a smoke test.
+5. Only then enable enforcement.
+
+**Before step 1, two things should exist:** a named incident runbook for `DISABLE TRIGGER` (the
+statements, the `lock_timeout`, and the requirement to `recompute_bucket_storage_usage()` afterwards
+— `hippius_s3/sql/CLAUDE.md` currently covers this only for bulk migrations, not for an incident),
+and an alert on `storage_delta_ledger` depth, because if the compactor dies the ledger grows silently
+and a failing ledger insert is a failing user write.
+
+**Still worth stealing:** RGW's **soft threshold**, where the cached number is trusted while an
+account is comfortably under quota and refreshed only near the limit. With the rollup making reads
+sub-millisecond we could now afford a live read on every request, which would also close the
+"refresh interval is the enforcement lag" gap below. Nothing on the request path reads it yet.
+
+**Two follow-ups this left open:**
+
+1. **`get_admin_account_stats.sql` and `console_list_buckets.sql` still compute the number.** They
+   are the operator's and the customer's views of the same figure, and they are the same O(objects)
+   aggregate the plans-cacher just stopped running — `admin.py` already degrades to a null count on
+   timeout for the largest account. Both could read `bucket_storage_usage` instead. Not done here
+   because a third consumer means a third chance to drift, and the parity tests currently pin one.
+2. **A soft-deleted bucket's counter is maintained but never verified.** The triggers do not care
+   about bucket liveness, so its counter stays correct; the reconciler skips it, because its total
+   is read by nobody. There is no path that revives a soft-deleted bucket today. If one is ever
+   added it must recompute the bucket on the way through.
 
 ### P1 — Billing plans: `active` is ignored because upstream returns it false on every row
 
@@ -248,8 +286,8 @@ admits a row on `billing == "plan"` plus a plan name, and does NOT consult `acti
 It did originally, on the reading that a lapsed subscription is distinguished only by that flag. The
 live payload said otherwise: `active: false` on **every row** it serves, zero exceptions across the
 two days the endpoint has been up — including the sole real subscriber, whose row carried a real
-subscription id and a `next_charge` date in the FUTURE. A cancelled subscription has no future
-charge date, so the field is not carrying that meaning; it
+subscription id and a `next_charge` date in the FUTURE. A
+cancelled subscription has no future charge date, so the field is not carrying that meaning; it
 looks simply unpopulated. Requiring it admitted nobody, making the gate permanently inert and
 unobservable even in shadow mode.
 
@@ -298,7 +336,7 @@ middleware chain or resolving the bucket owner twice. Size it first with a cross
 ### P1 — Billing plans: nothing accumulates bytes admitted between refreshes
 
 Every request compares against the same cached `used_bytes` until the next plans-cacher cycle, so
-within a 10-minute window the quota bounds nothing: an account at 9.9/10 TiB can issue an unbounded
+within one refresh window the quota bounds nothing: an account at 9.9/10 TiB can issue an unbounded
 number of 100 GiB PUTs, each of which individually "fits". With concurrent clients that is
 effectively unlimited, not "one cycle's worth".
 
@@ -310,11 +348,28 @@ time.
 
 ### P2 — Billing plans: enforcement lags by one refresh interval, in both directions
 
-Usage is counted by the plans-cacher every `HIPPIUS_PLANS_LOOP_SLEEP` (10 min), and nothing on the
+Usage is counted by the plans-cacher every `HIPPIUS_PLANS_LOOP_SLEEP` (**2 min** since #515; this
+figure IS the bound on overshoot, so keep it accurate), and nothing on the
 request path recomputes. So an account can overshoot its quota by one cycle's worth of uploads, and
 — the sharper edge — a customer who deletes data to get back under stays refused until the next
 cycle. The 402 message says as much, but the real levers are the interval itself, or re-checking on
-the denial path (deliberately not done: it would put an unbounded query in front of a live upload).
+the denial path.
+
+**That second lever is now viable and this entry's old reasoning is stale.** It used to say
+"deliberately not done: it would put an unbounded query in front of a live upload" — true when usage
+meant an O(objects) aggregate, false since the rollup: the read is one indexed SUM, measured at
+~1ms of database time (11.3ms wall for the largest account's 2,024 buckets). A live read on the
+DENIAL path only — allow stays a pure cache hit — closes the sharper half of this: a customer who
+just deleted data stops being refused for a full cycle. Bound it with the asyncpg timeout already
+threaded through, and keep it well inside **1 second**, because botocore waits exactly
+`wait_for_read(sock, 1)` for a `100-continue` and curl's `CURLOPT_EXPECT_100_TIMEOUT_MS` is also
+1000ms — blow that budget and the client gives up waiting and sends the body anyway.
+
+Prior art, for whoever picks this up: OpenStack Nova replaced its reserve/commit/rollback quota
+ledger with exactly "count at the point of the operation, then recheck" and documented why the
+ledger had to go — it "required being very thorough to keep track of everything … producing
+hard-to-find bugs" and drifted out of sync when services died mid-operation. Do not build a
+reservation table here; our drain-direct pipeline has the same mid-operation death case.
 
 ### P2 — Billing plans: an overwrite is charged as if it were additive
 
@@ -365,6 +420,20 @@ No strong opinion here — needs a benchmark before we touch anything.
 **Proposed**: either store into a `bucket_lifecycles` table (and have the janitor/orphan worker respect it for expiry), or reject with 501 NotImplemented until we're ready. Silent acknowledgement is worse than either.
 
 Same file, line 177-179: CORS configuration is similarly acknowledged and ignored. Intentional per the commit history, but worth flagging: if we ever do want to surface bucket-level CORS, this is where it lives today.
+
+### P2 — Create-only (`If-None-Match: *`) is refused, not implemented, on CopyObject
+
+**File**: [hippius_s3/api/s3/objects/copy_object_endpoint.py](hippius_s3/api/s3/objects/copy_object_endpoint.py). A copy is a write to the destination key, so the header carries the same create-only intent PutObject honours — but none of the three copy paths (same-bucket alias, v5 fast path, streaming) lands the destination through the conditional reserve/finalize the PUT writer uses. Rather than ignore the header (which is how a write-once client silently gets an overwritten object) the endpoint answers 501 NotImplemented for every value, `*` included.
+
+**Proposed**: route the destination write of all three copy paths through a shared conditional reserve so `If-None-Match: *` can be honoured, then drop the 501. Until then the refusal is the honest answer; a client that wants write-once semantics on a copy has to PUT instead.
+
+### P2 — An aborted MPU still resurrects a soft-deleted key
+
+**File**: [hippius_s3/sql/queries/upsert_object_multipart.sql](hippius_s3/sql/queries/upsert_object_multipart.sql). InitiateMultipartUpload's upsert sets `deleted_at = NULL` on the `objects` row, so starting an MPU on a soft-deleted key immediately makes the key's *pre-delete* content readable again — and if the upload is then abandoned or aborted, it stays that way. Pre-existing, and independent of conditional writes.
+
+Conditional completion no longer depends on that state: `multipart_uploads.key_existed_at_initiate` records what the key looked like *before* the upsert cleared the evidence, so a create-only MPU over a soft-deleted key completes (correct — a soft-deleted key does not exist) instead of being refused and leaving the old content exposed.
+
+**Proposed**: defer the un-delete from initiate to completion, so an in-flight MPU never makes a deleted key visible. Blocked on one thing: while the row stays soft-deleted it is a candidate for the hard-delete ring ([find_objects_ready_for_hard_delete.sql](hippius_s3/sql/queries/find_objects_ready_for_hard_delete.sql), 1h grace + all `chunk_backend` rows deleted), so a multi-hour MPU could have its object row hard-deleted mid-upload. Deferring needs an "open upload" exclusion in that ring, which is a query with a documented read-storm history — measure before touching it.
 
 ### P2 — Pre-check race on PUT overwrite object_id selection
 

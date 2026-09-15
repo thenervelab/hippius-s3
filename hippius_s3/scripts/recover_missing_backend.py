@@ -10,6 +10,12 @@ Optionally, ``--require-backend`` restricts results to objects that already have
 chunks on another backend (e.g. only recover Arion for objects that have IPFS).
 Without it, all objects missing the target backend are included.
 
+Pool-era parts only. A part the drain has handed to a node-local uploader (its
+``cephor_replication_status`` row is ``uploading``) lives on that node's SSD, which the
+global-queue uploader cannot read, and the drain's upload sweep already re-drives it —
+so such parts are dropped from the payload here (logged) rather than sent to a queue
+whose consumer would dead-letter them as missing.
+
 Usage (on an API pod):
     # Arion recovery (objects that have IPFS but not Arion)
     python -m hippius_s3.scripts.recover_missing_backend --backend arion --require-backend ipfs --dry-run
@@ -176,6 +182,22 @@ async def main() -> None:
         object_id = str(row["object_id"])
         part_numbers = list(row["part_numbers"])
         upload_id_raw = row["upload_id"]
+
+        drain_owned = await db.fetch(
+            "SELECT part_number FROM cephor_replication_status "
+            "WHERE object_id = $1 AND version = $2 AND status = 'uploading'",
+            object_id,
+            int(row["object_version"]),
+        )
+        if drain_owned:
+            owned = {int(r["part_number"]) for r in drain_owned}
+            logger.info(
+                f"  Skipping parts the drain's upload sweep owns (uploading, on a node's SSD): "
+                f"object_id={object_id} version={row['object_version']} parts={sorted(owned)}"
+            )
+            part_numbers = [pn for pn in part_numbers if int(pn) not in owned]
+            if not part_numbers:
+                continue
 
         payload = UploadChainRequest(
             address=str(row["address"]),

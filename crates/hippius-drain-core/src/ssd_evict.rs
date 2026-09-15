@@ -10,17 +10,23 @@
 //!
 //! # What it may delete, and the invariant that bounds it
 //!
-//! Only a part that is `replicated` AND marked resident. A `replicated` part has a durable,
-//! byte-verified, committed pool copy — that commit is precisely the drain's own record that
-//! the `CephFS` copy exists — so unlinking the SSD copy costs latency, never data: a read falls
-//! through to the pool tier (`DualFileSystemPartsStore`'s fallback), exactly as it did before
-//! retention. Every other state is off limits, and for a sharper reason than tidiness:
+//! Only a resident part that is `replicated`, or that has no replication row at all. A
+//! `replicated` part has a durable, byte-verified, committed pool copy — that commit is
+//! precisely the drain's own record that the `CephFS` copy exists — so unlinking the SSD copy
+//! costs latency, never data: a read falls through to the pool tier
+//! (`DualFileSystemPartsStore`'s fallback), exactly as it did before retention. A resident part
+//! with NO replication row is a read-promoted copy: the api's promoter claims residency and
+//! copies a part only when the pool already holds it, while an ingested part gets its residency
+//! inside `drain_part`, after its row exists — so "resident, no row" can only be a copy whose
+//! source is the pool. Cache ownership therefore keys on residency, and the reconciler leaves
+//! such copies alone rather than feeding them into the drain. Every other state is off limits,
+//! and for a sharper reason than tidiness:
 //!
 //! - `pending`/`draining` — the SSD copy is the ONLY durable copy. Deleting it is data loss.
 //! - `failed`/`corrupt` — the SSD copy may be a live object's last good source (see
 //!   [`crate::ssd_reclaim`]'s corrupt-live guard).
 //!
-//! The SQL worklist already filters to resident+`replicated`, but this module re-checks the
+//! The SQL worklist already filters to that set, but this module re-checks the
 //! state it is handed and refuses anything else, counting it in
 //! [`skipped_unreplicated`](EvictionReport::skipped_unreplicated). That counter must stay at
 //! zero forever; a non-zero value means the worklist query and this invariant have diverged,
@@ -81,8 +87,9 @@ pub struct ResidentPart {
     /// NULL-sized contributes zero, so it is still evicted but frees no *accounted* bytes —
     /// the pass simply continues to the next part rather than stopping short.
     pub bytes: u64,
-    /// The part's replication state, re-checked here against the eviction invariant.
-    pub state: ReplicationState,
+    /// The part's replication state, re-checked here against the eviction invariant. `None`
+    /// is a resident part with no replication row — a read-promoted copy (see the module doc).
+    pub state: Option<ReplicationState>,
 }
 
 /// The free-space floor this pass must restore.
@@ -365,7 +372,7 @@ where
             // pure comparison. Ordering it after the goal test made the counter sample only the
             // prefix of a page the pass happened to need, so a worklist that had drifted could
             // go unreported precisely when eviction was cheap.
-            if candidate.state != ReplicationState::Replicated {
+            if !matches!(candidate.state, None | Some(ReplicationState::Replicated)) {
                 report.skipped_unreplicated += 1;
                 continue;
             }
@@ -492,7 +499,7 @@ mod tests {
         ResidentPart {
             part: part_at(version, 1),
             bytes,
-            state: ReplicationState::Replicated,
+            state: Some(ReplicationState::Replicated),
         }
     }
 
@@ -779,9 +786,9 @@ mod tests {
         // and counted so the divergence is alertable.
         let mut parts = vec![resident(1, GIB), resident(2, GIB)];
         let mut pending = resident(3, 60 * GIB);
-        pending.state = ReplicationState::Pending;
+        pending.state = Some(ReplicationState::Pending);
         let mut corrupt = resident(4, 60 * GIB);
-        corrupt.state = ReplicationState::Corrupt;
+        corrupt.state = Some(ReplicationState::Corrupt);
         parts.push(pending);
         parts.push(corrupt);
         parts.extend((5..=8).map(|v| resident(v, GIB)));
@@ -805,6 +812,32 @@ mod tests {
         let removed = remover.removed();
         assert!(!removed.contains(&key(&part_at(3, 1))), "the pending part was unlinked");
         assert!(!removed.contains(&key(&part_at(4, 1))), "the corrupt part was unlinked");
+    }
+
+    #[tokio::test]
+    async fn a_resident_part_with_no_replication_row_is_evicted_like_a_replicated_one() {
+        // A read-promoted copy: residency, no replication row (see the module doc). Its source
+        // is the pool, so it is cache the evictor owns — not a divergence to count.
+        let mut promoted = resident(1, 10 * GIB);
+        promoted.state = None;
+        let log = FakeLog::of(&[promoted, resident(2, GIB)]);
+        let remover = FakeRemover::default();
+        let probe = FakeProbe::new(300 * GIB, GIB);
+        let counting = CountingProbe {
+            probe: &probe,
+            remover: &remover,
+        };
+        let clock = TestClock::new();
+        let target = EvictionTarget {
+            free: 300 * GIB,
+            reserve: 305 * GIB,
+            headroom: GIB,
+        };
+
+        let report = evict_to_target(&log, &remover, &counting, &clock, target, pass(2)).await.unwrap();
+
+        assert_eq!(report.skipped_unreplicated, 0, "a row-less resident part is not a worklist divergence");
+        assert!(remover.removed().contains(&key(&part_at(1, 1))), "the promoted copy was unlinked");
     }
 
     #[tokio::test]
@@ -1076,7 +1109,7 @@ mod tests {
         let parts: Vec<ResidentPart> = (1..=4)
             .map(|v| {
                 let mut p = resident(v, GIB);
-                p.state = ReplicationState::Pending;
+                p.state = Some(ReplicationState::Pending);
                 p
             })
             .collect();
@@ -1160,9 +1193,9 @@ mod tests {
         // costs nothing. One part covers the whole deficit; the violations behind it must still
         // be counted, and still must not be unlinked.
         let mut pending = resident(9, 0);
-        pending.state = ReplicationState::Pending;
+        pending.state = Some(ReplicationState::Pending);
         let mut corrupt = resident(10, 0);
-        corrupt.state = ReplicationState::Corrupt;
+        corrupt.state = Some(ReplicationState::Corrupt);
         let log = FakeLog::of(&[resident(1, 100 * GIB), pending, corrupt]);
         let remover = FakeRemover::default();
         let probe = FakeProbe::new(300 * GIB, GIB);

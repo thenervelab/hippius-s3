@@ -37,6 +37,7 @@ from hippius_s3.cache import peers
 from hippius_s3.cache import read_recency
 from hippius_s3.cache import residency
 from hippius_s3.monitoring import MetricsCollector
+from hippius_s3.reader import backend_fetch
 from hippius_s3.reader import streamer
 from hippius_s3.writer import landed
 
@@ -141,6 +142,13 @@ WRAPPERS: list[tuple[str, Callable[..., None], tuple[Any, ...], str, dict[str, s
         ("local", "recovered"),
         "chunk_aead_failures_total",
         {"tier": "local", "outcome": "recovered"},
+    ),
+    (
+        "hippius_s3/reader/backend_fetch.py::_record_backend_read",
+        backend_fetch._record_backend_read,
+        (),
+        "chunk_reads_by_tier_total",
+        {"tier": "backend"},
     ),
 ]
 

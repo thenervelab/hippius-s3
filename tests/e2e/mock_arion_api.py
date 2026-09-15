@@ -8,7 +8,7 @@ from fastapi import Form
 from fastapi import HTTPException
 from fastapi import Request
 from fastapi import UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 from mock_faults import install_fault_controller
 from pydantic import BaseModel
 
@@ -111,13 +111,15 @@ async def download(account_ss58: str, identifier: str):
     entry = _store.get(identifier)
     if entry is None:
         raise HTTPException(status_code=404, detail="not found")
-    import io
-
     data = entry["bytes"]
     # F8: hand back a truncated body so the agent's chunk verify sees a short/corrupt read.
     if directive.truncate_bytes:
         data = data[: directive.truncate_bytes]
-    return StreamingResponse(io.BytesIO(data), media_type="application/octet-stream")
+    # Not StreamingResponse(io.BytesIO(data)): Starlette iterates a sync file object line by line
+    # in a threadpool, and ciphertext has a '\n' every ~256 bytes — 16k threadpool hops and 16k
+    # chunked frames per 4 MiB chunk, ~4 s each, which pushes concurrent cold reads past the
+    # api's 25 s first-chunk timeout.
+    return Response(content=data, media_type="application/octet-stream")
 
 
 class CanUploadRequest(BaseModel):

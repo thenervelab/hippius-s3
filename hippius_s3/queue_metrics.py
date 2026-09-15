@@ -50,7 +50,6 @@ def build_queue_key_sets(config: Config) -> tuple[list[str], list[str]]:
     """
     kinds = (
         ("upload", config.upload_backends),
-        ("download", config.download_backends),
         ("unpin", config.delete_backends),
     )
     lists: list[str] = []
@@ -92,6 +91,7 @@ class QueueDepthSampler:
     ) -> None:
         self._redis = redis_client
         self.list_keys, self.zset_keys = build_queue_key_sets(config)
+        self._upload_backends = list(config.upload_backends)
         self.depths: dict[str, int] = {}
         self.oldest_age: dict[str, float] = {}
         if register_metrics:
@@ -113,6 +113,26 @@ class QueueDepthSampler:
     def _obs_age(self, _: object) -> list[otel_metrics.Observation]:
         return [otel_metrics.Observation(v, {"queue": k}) for k, v in self.oldest_age.items()]
 
+    async def _node_queue_keys(self) -> tuple[list[str], list[str]]:
+        """The node-scoped upload lists/ZSETs that exist right now (`{b}_upload_requests:<node>`,
+        `{b}_upload_retries:<node>`). Discovered per sample rather than configured: the set of
+        ingest nodes is a cluster fact, and a queue for a node whose uploader pod is not reading
+        it is exactly the silent backlog these gauges exist to show."""
+        lists: list[str] = []
+        zsets: list[str] = []
+        for backend in self._upload_backends:
+            async for raw in self._redis.scan_iter(match=f"{backend}_upload_requests:*", count=200):
+                key = raw.decode() if isinstance(raw, bytes) else str(raw)
+                if not key.endswith(":dlq"):
+                    lists.append(key)
+            zsets.extend(
+                [
+                    raw.decode() if isinstance(raw, bytes) else str(raw)
+                    async for raw in self._redis.scan_iter(match=f"{backend}_upload_retries:*", count=200)
+                ]
+            )
+        return sorted(lists), sorted(zsets)
+
     async def sample_once(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
         # Build fresh dicts and atomically rebind at the end. The OTel exporter runs the
@@ -120,16 +140,18 @@ class QueueDepthSampler:
         # (on the event loop) can raise "dictionary changed size during iteration" in a
         # callback. A reference rebind is atomic under the GIL, so a callback always reads a
         # complete prior-or-next snapshot.
+        node_lists, node_zsets = await self._node_queue_keys()
+        list_keys = self.list_keys + node_lists
         new_depths: dict[str, int] = {}
-        for key in self.list_keys:
+        for key in list_keys:
             new_depths[key] = int(await self._redis.llen(key))
-        for key in self.zset_keys:
+        for key in self.zset_keys + node_zsets:
             new_depths[key] = int(await self._redis.zcard(key))
         # Oldest-age only for plain request lists: BRPOP consumes from the
         # right, so index -1 is the next payload out and the oldest waiting.
         # Keys with unknowable age are simply omitted (fresh dict starts empty).
         new_oldest_age: dict[str, float] = {}
-        for key in self.list_keys:
+        for key in list_keys:
             if key.endswith(":dlq"):
                 continue
             if new_depths.get(key, 0) > 0:

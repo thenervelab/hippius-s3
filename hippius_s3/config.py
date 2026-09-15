@@ -277,35 +277,99 @@ class Config:
     # by one cycle's worth of uploads, and a customer who deletes data to get back under stays
     # refused until the next cycle sees it (nothing on the request path recomputes). Shortening it
     # is the only lever; the cost is one storage count per plan account per cycle.
-    plans_loop_sleep: int = env("HIPPIUS_PLANS_LOOP_SLEEP:600", convert=int)
-    # How many per-account storage counts the plans-cacher runs at once. Sized for a few tens of
-    # plan accounts: enough that one very large account does not set the pace for the cycle, small
-    # enough that these aggregates never become the heaviest thing on the primary.
+    #
+    # 120s rather than the original 600s. Ten minutes was priced against a usage read that scanned
+    # the object table per account; since the rollup landed that read is an indexed SUM over
+    # bucket_storage_usage returning in sub-milliseconds, so the DB side of a cycle is now
+    # negligible and there is no reason to make a customer who freed space wait ten minutes to be
+    # let back in. The remaining cost is the upstream plans scrape, which this multiplies by 5 --
+    # one paginated GET per cycle against an endpoint we do not own. That is the number to watch if
+    # this is shortened further, not the database.
+    plans_loop_sleep: int = env("HIPPIUS_PLANS_LOOP_SLEEP:120", convert=int)
+    # How many per-account usage reads the plans-cacher runs at once. Both halves of this knob's
+    # original rationale are gone: the read is no longer an aggregate that one huge account could
+    # pace the cycle with (it is an indexed SUM over bucket_storage_usage, ~1ms of database time,
+    # measured 11.3ms wall for the largest account's 2,024 buckets) and it no longer runs on the
+    # primary (database_readonly_url). It survives only as the pool's size, and with plan accounts
+    # in the low single digits the concurrency is academic. If plan adoption grows, prefer one
+    # grouped query over N round trips to raising this.
     plans_usage_concurrency: int = env("HIPPIUS_PLANS_USAGE_CONCURRENCY:4", convert=int)
-    # Server-side bound on ONE STATEMENT of a storage count -- one keyset page, not the whole
-    # account. Unbounded, a single bad plan would stall the cycle holding a pool connection, and
-    # every plan account's usage would silently freeze at its last good value while the gate kept
-    # enforcing it. Note the replica enforces its own 30s ceiling via max_standby_streaming_delay,
-    # so raising this past 30s buys nothing on its own.
+    # Server-side bound on the per-account usage read. That read is now an indexed SUM over
+    # bucket_storage_usage and returns in sub-milliseconds, so this is a stuck-connection guard
+    # rather than a tuning knob: unbounded, one wedged query would stall the cycle holding a pool
+    # connection, and every plan account's usage would silently freeze at its last good value while
+    # the gate kept enforcing it.
     plans_usage_timeout_seconds: float = env("HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS:30.0", convert=float)
-    # Objects per keyset page when counting a bucket. Bounds ONE statement against the two 30s
-    # ceilings above; no value changes the total, only how close a statement gets to being cancelled.
-    #
-    # Tune it by measurement and judge it by the WORST page, never the mean. Per-row cost is neither
-    # linear in page size nor uniform across a bucket -- it roughly doubles between key regions from
-    # heap locality, and falls off a cliff past a few hundred thousand rows. Each of those cost a
-    # wrong default once: 500k looked fine extrapolated and took 20s, and 200k looked like a 10x
-    # margin on one sample that a second sample put at 5.7x.
-    #
-    # Numbers, and the offsets they were sampled at, live in workers/CLAUDE.md -- one copy, because
-    # two would drift.
-    plans_usage_page_size: int = env("HIPPIUS_PLANS_USAGE_PAGE_SIZE:200000", convert=int)
     # Per-attempt bound on the scrape. Retry COUNTS cannot bound latency when the per-attempt cost
     # is unbounded, and this worker holds no request.
     plans_api_timeout_seconds: float = env("HIPPIUS_PLANS_API_TIMEOUT_SECONDS:30.0", convert=float)
     # Age past which the cached maps are reported stale. Serving stale is still strictly better than
     # failing closed, so this drives a metric and an alert, never a behaviour change.
-    plans_stale_after_seconds: int = env("HIPPIUS_PLANS_STALE_AFTER_SECONDS:3600", convert=int)
+    #
+    # Tracks plans_loop_sleep at 5 missed cycles: at a 600s poll, 3600s was 6 cycles, and leaving it
+    # there while the poll dropped to 120s would mean 30 consecutive failed refreshes before anyone
+    # heard about it. The ratio is what matters, not the absolute number.
+    plans_stale_after_seconds: int = env("HIPPIUS_PLANS_STALE_AFTER_SECONDS:600", convert=int)
+
+    # Storage-usage rollup (workers/run_usage_rollup_in_loop.py). See
+    # 20260910120000_storage_usage_rollup.sql for the mechanism.
+    #
+    # How often the compactor wakes. This interval is the rollup's own staleness, on top of the
+    # plans-cacher's 10 minutes, so it wants to be small: the work is one indexed DELETE per batch
+    # and idling on an empty ledger costs one count.
+    usage_rollup_loop_sleep: int = env("HIPPIUS_USAGE_ROLLUP_LOOP_SLEEP:5", convert=int)
+    # Ledger rows claimed per fold. The claim is one transaction, so this bounds how long the
+    # rollup rows are locked and how much WAL one fold writes; the loop just runs more batches.
+    usage_rollup_batch_size: int = env("HIPPIUS_USAGE_ROLLUP_BATCH_SIZE:5000", convert=int)
+    # Live buckets fully recomputed per reconcile pass, and how often a pass runs. Together these
+    # set how long a full sweep of the estate takes, which is the ONLY bound on how long a bucket
+    # can carry a wrong number.
+    #
+    # 25/hour was far too slow, and the reasoning behind it ("the reconciler is an alarm, not the
+    # mechanism") does not survive the drift being an OVER-count: a hot-key customer could be
+    # over-billed for weeks before anything noticed. An alarm nobody hears is not an alarm.
+    #
+    # SWEEP ARITHMETIC. list_buckets_for_usage_reconcile.sql filters `deleted_at IS NULL`, and
+    # production has ~3,350 LIVE buckets out of ~48,200 -- so price this against the live count, not
+    # the total. At 50 per 300s that is 600/hour and a full sweep in about 5.6 hours.
+    #
+    # WHY 50 AND NOT 200. An earlier version of this comment claimed "~0.2-0.5s of primary work per
+    # 300s cycle -- a ~0.1% duty cycle", extrapolated from per-bucket costs measured on a laptop
+    # (0.8ms empty, 8.1ms at 1000 objects). THAT WAS WRONG BY ONE TO TWO ORDERS OF MAGNITUDE.
+    # Measured on the production replica instead:
+    #
+    #   * a random 200-live-bucket pass, COLD: 35.9s wall, 9.77 GiB of buffer traffic
+    #     (2.88 GiB physical). Warm, the same sample's slowest bucket drops to 0.7s -- so the number
+    #     that matters is the cold one, and a reconciler sweeping least-recently-recomputed buckets
+    #     is cold by construction.
+    #   * the aggregate costs ~6 buffers per object, and the estate averages ~50k objects per live
+    #     bucket (167M objects / 3,350 buckets).
+    #   * the largest bucket (7.8M live objects) was CANCELLED by the replica at 38.7s having
+    #     already read 270 GiB logical / 44 GiB physical without finishing. Extrapolated: ~55s warm,
+    #     ~60 GiB physical.
+    #
+    # So a 200-bucket pass is a 4-23% duty cycle, not 0.1%, and it runs on the PRIMARY -- this
+    # worker writes, and recompute must share one snapshot with the ledger rows it discards, so it
+    # cannot use the replica the way the read path does. A recurring ~60 GiB physical read on this
+    # primary is the same order as the janitor read-storm that stalled it and triggered a failover
+    # (see database_readonly_url below). At 200/300s the largest bucket would be re-scanned every
+    # ~84 minutes, forever; at 50 it is every ~5.6 hours.
+    #
+    # The reconciler is a drift ALARM, not the mechanism that keeps the number right -- the
+    # compactor does that continuously. A 5.6-hour sweep is ample for an alarm and is worth far more
+    # than the extra load a 1.4-hour sweep costs. Going faster wants the handful of outlier buckets
+    # on their own cadence first, which is the real fix.
+    #
+    # Recompute holds a GLOBAL advisory lock, so the compactor skips (pg_TRY_) while it runs. That
+    # is harmless -- the ledger is insert-only, prod inserts ~1-3 rows/s, and a 55s hold costs the
+    # ledger ~165 rows -- but it is another reason not to crank this.
+    usage_reconcile_buckets_per_cycle: int = env("HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE:50", convert=int)
+    usage_reconcile_interval_seconds: int = env("HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS:300", convert=int)
+    # Server-side bound on ONE bucket recompute, applied as the pool's statement_timeout (prod's own
+    # is 0, so this is the only bound). It has to clear the largest bucket -- tens of seconds, see
+    # above -- by a wide margin, or the reconciler could never verify the one bucket that matters
+    # most, and a bucket that always times out becomes the permanent head of the recompute queue.
+    usage_reconcile_timeout_seconds: float = env("HIPPIUS_USAGE_RECONCILE_TIMEOUT_SECONDS:300.0", convert=float)
 
     # ATS (Apache Traffic Server) reverse-proxy cache endpoints (CSV). When ATS_CACHE_ENDPOINT is unset,
     # all PURGE + public Cache-Control logic becomes a no-op — safe default for local dev.
@@ -349,7 +413,6 @@ class Config:
 
     # worker specific settings
     unpinner_sleep_loop: float = 5.0
-    downloader_sleep_loop: float = 0.01
     cacher_loop_sleep: float = 60.0  # 1 minute
     pin_checker_loop_sleep: float = 7200.0  # 2 hours
     orphan_checker_loop_sleep: int = env("ORPHAN_CHECKER_LOOP_SLEEP:7200", convert=int)  # 2 hours
@@ -387,6 +450,11 @@ class Config:
     # poll. After the window = genuine fault → raise (classifier routes
     # to DLQ as permanent).
     fs_meta_wait_seconds: float = env("HIPPIUS_FS_META_WAIT_SECONDS:30", convert=float)
+    # The node-local uploader can dequeue a drain-published request before the drain has
+    # committed the row `uploading` (publish precedes commit): how long it polls a `draining`
+    # row for the commit, and how far back on the retry ZSET a still-uncommitted part goes.
+    uploader_hand_off_wait_seconds: float = env("HIPPIUS_UPLOADER_HAND_OFF_WAIT_SECONDS:10", convert=float)
+    uploader_hand_off_retry_delay_seconds: float = env("HIPPIUS_UPLOADER_HAND_OFF_RETRY_DELAY_SECONDS:5", convert=float)
 
     # Unpinner configuration
     # How many unpin requests one unpinner pod processes concurrently (outer bounded-dispatch,
@@ -480,40 +548,34 @@ class Config:
     object_lock_max_retention_days: int = env("HIPPIUS_OBJECT_LOCK_MAX_RETENTION_DAYS:3650", convert=int)
     # Unified object part chunk size (bytes) for cache and range math
     object_chunk_size_bytes: int = env("HIPPIUS_CHUNK_SIZE_BYTES:4194304", convert=int)
-    # Downloader behavior (default: no whole-part backfill)
-    downloader_allow_part_backfill: bool = env(
-        "DOWNLOADER_ALLOW_PART_BACKFILL:false", convert=lambda x: x.lower() == "true"
+    # The read path's own backend fetch (hippius_s3/reader/backend_fetch.py): on a cache miss the
+    # api pulls the chunk from the backend into memory and decrypts it in-process — no downloader,
+    # no pool write. One concurrency budget per pod across every in-flight GET, like the uploader's
+    # arion_upload_concurrency; a transient backend error is retried this many times per location.
+    read_backend_fetch_concurrency: int = env("HIPPIUS_READ_BACKEND_FETCH_CONCURRENCY:32", convert=int)
+    read_backend_fetch_attempts: int = env("HIPPIUS_READ_BACKEND_FETCH_ATTEMPTS:3", convert=int)
+    # Exponential: base × 2^(attempt-1) + jitter. 1 s base so a throttling backend (429/5xx) is
+    # ridden out over ~3 s across the attempts rather than burnt through in under a second.
+    read_backend_fetch_retry_base_seconds: float = env(
+        "HIPPIUS_READ_BACKEND_FETCH_RETRY_BASE_SECONDS:1.0", convert=float
     )
-
-    # Downloader retry tuning (used by per-backend downloader workers)
-    downloader_chunk_retries: int = env("DOWNLOADER_CHUNK_RETRIES:3", convert=int)
-    downloader_retry_base_seconds: float = env("DOWNLOADER_RETRY_BASE_SECONDS:0.1", convert=float)
-    downloader_retry_jitter_seconds: float = env("DOWNLOADER_RETRY_JITTER_SECONDS:0.1", convert=float)
-    # Request-level retry: when a whole DownloadChainRequest fails (Arion exhaustion or a process
-    # error), requeue it via a per-backend retry ZSET + 2s mover instead of dropping it (A12).
-    # Mirrors the uploader's request-level retry (uploader_max_attempts / _backoff_*_ms).
-    downloader_max_attempts: int = env("HIPPIUS_DOWNLOADER_MAX_ATTEMPTS:5", convert=int)
-    downloader_backoff_base_ms: int = env("HIPPIUS_DOWNLOADER_BACKOFF_BASE_MS:500", convert=int)
-    downloader_backoff_max_ms: int = env("HIPPIUS_DOWNLOADER_BACKOFF_MAX_MS:60000", convert=int)
-    downloader_semaphore: int = env("DOWNLOADER_SEMAPHORE:20", convert=int)
-    # Max concurrent DownloadChainRequests a single downloader pod processes.
-    # The main loop dequeues and spawns tasks up to this cap; the semaphore
-    # above still bounds total concurrent chunk fetches across all tasks.
-    # Range-heavy read patterns produce many 1-part DCRs, so parallelising
-    # DCRs is what delivers real backend throughput.
-    downloader_max_inflight: int = env("DOWNLOADER_MAX_INFLIGHT:10", convert=int)
-    # When multiple streamers hit a cache miss on the same part concurrently,
-    # only one enqueues a DownloadChainRequest; the others wait via pub/sub.
-    # The Redis lock that enforces this is cleared by the downloader on
-    # completion (compare-and-delete on the enqueuer's token, A5), and this TTL
-    # caps the worst-case hang if the downloader crashes mid-request. Raised to
-    # 600s (A5) so a legitimately slow multi-chunk part download does not expire
-    # the lock mid-flight and let a second streamer enqueue a duplicate DCR.
-    download_coalesce_lock_ttl_seconds: int = env("DOWNLOAD_COALESCE_LOCK_TTL:600", convert=int)
-    # DB-1: config-driven downloader Postgres pool (was hardcoded min=2/max=20). Audit
-    # Σ(replicas × pool_max) across roles against Postgres max_connections before raising.
-    downloader_db_pool_min: int = env("HIPPIUS_DOWNLOADER_DB_POOL_MIN:2", convert=int)
-    downloader_db_pool_max: int = env("HIPPIUS_DOWNLOADER_DB_POOL_MAX:20", convert=int)
+    read_backend_fetch_retry_jitter_seconds: float = env(
+        "HIPPIUS_READ_BACKEND_FETCH_RETRY_JITTER_SECONDS:0.25", convert=float
+    )
+    # How long a fetch may wait for a slot in the pod's concurrency budget before it gives up
+    # (a retryable 503 on the first chunk). Below the 25 s first-chunk timeout by design, so a
+    # saturated budget fails fast and visibly instead of every queued read timing out in lockstep.
+    read_backend_fetch_queue_timeout_seconds: float = env(
+        "HIPPIUS_READ_BACKEND_FETCH_QUEUE_TIMEOUT_SECONDS:15", convert=float
+    )
+    # Streaming prefetch window (chunks fetched ahead of the one being decrypted/sent). On a
+    # cold read it is also the per-request backend parallelism.
+    http_stream_prefetch_chunks: int = env("HTTP_STREAM_PREFETCH_CHUNKS:16", convert=int)
+    # A chunk on no backend yet (its part is inside the upload window on another node) can only
+    # come from a peer. When the peer tier misses too, re-poll the local tiers this long before
+    # giving up with a retryable 503, so a briefly-shed peer fetch (a saturated peer) recovers
+    # without the client retrying.
+    read_missing_chunk_wait_seconds: float = env("HIPPIUS_READ_MISSING_CHUNK_WAIT_SECONDS:10", convert=float)
     # CF-3: depth of the encrypt producer/consumer queue per streaming write. Peak buffered memory
     # per PUT ≈ chunk_size × this. Exposed so it can move with chunk size (CF-1).
     write_queue_maxsize: int = env("HIPPIUS_WRITE_QUEUE_MAXSIZE:16", convert=int)
@@ -566,16 +628,6 @@ class Config:
 
     # initial stream timeout (seconds) before sending first byte
     http_stream_initial_timeout_seconds: float = env("HTTP_STREAM_INITIAL_TIMEOUT_SECONDS:5", convert=float)
-
-    # RQ-1: use ONE pub/sub subscription per stream (demuxed to per-chunk events) instead of a fresh
-    # subscribe/unsubscribe per cold chunk. Correctness-sensitive (the demux + FS re-check race
-    # guard); opt-in with a per-chunk fallback so it can be rolled back without a redeploy.
-    stream_single_subscription: bool = env(
-        "HIPPIUS_STREAM_SINGLE_SUBSCRIPTION:false", convert=lambda x: x.lower() == "true"
-    )
-    # Download streaming prefetch window (number of chunks to fetch concurrently).
-    # Helps cache-hit throughput by reducing per-chunk Redis roundtrip stalls.
-    http_stream_prefetch_chunks: int = env("HTTP_STREAM_PREFETCH_CHUNKS:16", convert=int)
 
     # DLQ configuration
     dlq_dir: str = env("HIPPIUS_DLQ_DIR:/tmp/hippius_dlq")

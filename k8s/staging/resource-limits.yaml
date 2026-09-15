@@ -89,23 +89,6 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: arion-downloader
-spec:
-  template:
-    spec:
-      containers:
-        - name: arion-downloader
-          resources:
-            requests:
-              cpu: 250m
-              memory: 512Mi
-            limits:
-              cpu: 1000m
-              memory: 2Gi
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
   name: arion-unpinner
 spec:
   template:
@@ -119,3 +102,20 @@ spec:
             limits:
               cpu: 1000m
               memory: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: usage-rollup
+spec:
+  template:
+    spec:
+      containers:
+        - name: usage-rollup
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 512Mi

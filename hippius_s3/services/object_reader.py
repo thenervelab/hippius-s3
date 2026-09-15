@@ -7,18 +7,19 @@ from __future__ import annotations
 # until the endpoint returned; a cold read then pinned a pool slot for the whole
 # stream_first_chunk_timeout_seconds, and ~60 such reads on one pod starved every PUT on it into
 # a pool-acquire 503 — observed 2026-09-08.) So `db` is only ours until build_stream_context
-# finishes. Anything reached from inside the response body (stream_plan's wait/decrypt path)
+# finishes. Anything reached from inside the response body (stream_plan's fetch/decrypt path)
 # must do ZERO DB work: by then the connection is back in the pool and probably owned by another
 # request, and asyncpg Connections are not safe for concurrent use. Violating this raises
 # `InterfaceError: another operation is in progress` — which surfaces as a 500 before the first
 # byte, or a 200 with a full Content-Length and a truncated body after it, and can also break the
 # unrelated request that now legitimately holds that connection. If the body genuinely needs
 # something from the DB, resolve it in build_stream_context and close over the VALUE, never `db`.
+# This is why every missing chunk's backend location is resolved HERE, up front, and carried on
+# the StreamContext: the body fetches by those values and never asks the DB where a chunk is.
 import asyncio
-import contextlib
 import logging
-import time
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 from typing import AsyncGenerator
 
@@ -27,14 +28,13 @@ from fastapi.responses import StreamingResponse
 
 from hippius_s3.api.s3.common import build_headers
 from hippius_s3.backend_routing import resolve_object_backends
-from hippius_s3.cache.notifier import ChunkNotReadyError
 from hippius_s3.config import get_config
-from hippius_s3.queue import DownloadChainRequest
-from hippius_s3.queue import PartChunkSpec
-from hippius_s3.queue import PartToDownload
-from hippius_s3.queue import enqueue_download_request
+from hippius_s3.reader.backend_fetch import BackendLocation
+from hippius_s3.reader.backend_fetch import ChunkUnavailableError
+from hippius_s3.reader.backend_fetch import get_backend_fetcher
 from hippius_s3.reader.db_meta import read_parts_list
 from hippius_s3.reader.planner import build_chunk_plan
+from hippius_s3.reader.streamer import FetchMissingFn
 from hippius_s3.reader.streamer import stream_plan
 from hippius_s3.reader.types import ChunkPlanItem
 from hippius_s3.reader.types import RangeRequest
@@ -52,6 +52,12 @@ class DownloadNotReadyError(Exception):
     pass
 
 
+# Where each chunk of the plan can be fetched from when no local tier holds it, keyed by
+# (part_number, chunk_index), in the object's download-backend order. Empty for a chunk no backend
+# holds yet (its part is still in its upload window).
+ChunkLocations = dict[tuple[int, int], tuple[BackendLocation, ...]]
+
+
 @dataclass
 class StreamContext:
     plan: list[ChunkPlanItem]
@@ -62,197 +68,76 @@ class StreamContext:
     suite_id: str | None
     bucket_id: str
     upload_id: str
+    locations: ChunkLocations = field(default_factory=dict)
 
 
-# RQ-4: compare-and-delete Lua — delete the coalesce lock only while it still holds our token, so we
-# never steal a lock a later streamer/downloader re-acquired. Fixed script (no user input in the body);
-# mirrors the downloader's release. The key format must match _enqueue_missing_downloads exactly.
-_COALESCE_LOCK_RELEASE_LUA = (
-    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
-)
+# A warm plan longer than this resolves locations too: the body of a multi-GB read runs for
+# minutes, long enough for the evictor to drop a chunk the plan-time check saw, and the body
+# never touches the DB — so a long warm read carries its backend fallback from the start.
+# 64 chunks × 4 MiB = 256 MiB; below that a mid-stream eviction is unlikely enough that the
+# extra query on every warm GET is not worth it.
+_RESOLVE_LOCATIONS_MIN_CHUNKS = 64
 
 
-async def _release_coalesce_locks(
-    redis: Any,
-    *,
-    object_id: str,
-    object_version: int,
-    part_numbers: set[int],
-    ray_token: str,
-) -> None:
-    """Best-effort CAD-release of this streamer's per-part coalesce locks (RQ-4).
+def _needs_locations(source: str, plan: list[ChunkPlanItem]) -> bool:
+    return source == "pipeline" or len(plan) > _RESOLVE_LOCATIONS_MIN_CHUNKS
 
-    Called when the first-chunk wait times out so the next GET re-enqueues immediately instead of
-    waiting out the lock TTL. CAD-on-token means locks we don't own (lost the coalesce race) no-op.
+
+async def _resolve_chunk_locations(db: Any, object_id: str, object_version: int) -> ChunkLocations:
+    """Every backend location of every chunk of the version, in download-backend order.
+
+    One query per backend the object is served from (RD-1's batched lookup), resolved while this
+    request still owns `db`. The whole version is resolved rather than just the plan's misses: a
+    chunk the local tiers held at plan time can be evicted before the body reaches it, and the
+    body may not ask the DB.
     """
-    for pn in part_numbers:
-        lock_key = f"download_in_progress:{object_id}:v:{int(object_version)}:part:{int(pn)}"
-        with contextlib.suppress(Exception):
-            await redis.eval(_COALESCE_LOCK_RELEASE_LUA, 1, lock_key, ray_token)
-
-
-# RQ-3: backends whose downloader fetches by content id (CID) rather than a deterministic
-# backend_identifier. Only for these does the per-part CID resolution matter; Arion (the production
-# backend) is deterministically addressed and its downloader ignores spec.cid entirely.
-_CID_ADDRESSED_BACKENDS: frozenset[str] = frozenset({"ipfs"})
-
-
-async def _enqueue_download_for_parts(
-    db: Any,
-    redis: Any,
-    info: dict,
-    *,
-    object_version: int,
-    storage_version: int,
-    indices_by_part: dict[int, set[int]],
-    address: str,
-    cfg: Any,
-) -> None:
-    """Coalesce-lock the given parts and enqueue ONE DownloadChainRequest for the un-coalesced ones.
-
-    Shared core of two call sites, BOTH of which run before streaming starts while this request
-    still legitimately owns `db`: the primary cold-read miss and the envelope-race version fallback.
-    Nothing may call this from inside the response body — see the module note on `db` lifetime.
-    Idempotent: the per-part SET NX lock guarantees only one enqueue per (object_id, version, part)
-    until the lock TTL, so calling it again for a part already being fetched is a no-op.
-    """
-    if not indices_by_part:
-        return
-    object_id = info["object_id"]
-
-    # Coalesce concurrent misses on the same part: only one streamer
-    # actually enqueues a download request per (object_id, version, part).
-    # Others will just wait on the pub/sub notification emitted by the
-    # downloader. The lock TTL covers crashed-streamer / crashed-downloader
-    # cases — on TTL expiry, the next miss re-enqueues.
-    lock_ttl = int(getattr(cfg, "download_coalesce_lock_ttl_seconds", 120))
-    ray_token = str(info.get("ray_id") or "anonymous")
-    # RD-6: acquire every part's coalesce lock in one pipelined round trip instead of one SET NX per
-    # part. Fail-open on a Redis hiccup (treat all as acquired) so the download still happens — a
-    # duplicate enqueue is deduped by the downloader via chunk_exists.
-    parts = list(indices_by_part.keys())
-    lock_keys = [f"download_in_progress:{object_id}:v:{object_version}:part:{pn}" for pn in parts]
-    try:
-        pipe = redis.pipeline(transaction=False)
-        for lk in lock_keys:
-            pipe.set(lk, ray_token, nx=True, ex=lock_ttl)
-        set_results = await pipe.execute()
-    except Exception:
-        set_results = [True] * len(parts)
-
-    acquired_parts: set[int] = set()
-    for pn, acquired in zip(parts, set_results, strict=True):
-        if acquired:
-            acquired_parts.add(pn)
-        else:
-            logger.debug(
-                "download coalesced: another streamer is fetching object_id=%s v=%s part=%s (lock held)",
-                object_id,
-                object_version,
-                pn,
-            )
-
-    # If every missing part is already being fetched by someone else,
-    # we don't enqueue anything — we just fall through to stream_plan,
-    # which will wait on pub/sub for each chunk.
-    # RQ-3: the downloader resolves each chunk's location from chunk_backend itself and never reads
-    # spec.cid — CIDs only matter to a content-addressed backend. Resolve the object's backends once
-    # and skip the per-part CID query entirely unless a CID-addressed backend actually serves it.
-    db_backends = await resolve_object_backends(db, object_id, object_version)
-    needs_cid = bool(set(db_backends) & _CID_ADDRESSED_BACKENDS)
-
-    dl_parts: list[PartToDownload] = []
-    for pn, idxs in indices_by_part.items():
-        if pn not in acquired_parts:
-            continue
-        include = {int(i) for i in idxs}
-        by_index: dict[int, tuple[str | None, int | None]] = {}
-        if needs_cid:
-            try:
-                rows = await db.fetch(
-                    get_query("get_part_chunks_by_object_and_number"),
-                    object_id,
-                    object_version,
-                    int(pn),
-                )
-                for r in rows or []:
-                    ci = int(r[0])
-                    if ci not in include:
-                        continue
-                    cid_raw = r[1]
-                    cid_val = str(cid_raw).strip() if cid_raw is not None else None
-                    if cid_val and cid_val.lower() in {"", "none", "pending"}:
-                        cid_val = None
-                    clen = int(r[2]) if (len(r) > 2 and r[2] is not None) else None
-                    by_index[ci] = (cid_val, clen)
-            except Exception:
-                # If chunk metadata isn't present (common for CID-less objects), keep cid=None
-                by_index = {}
-
-        specs: list[PartChunkSpec] = []
-        for ci in sorted(include):
-            cid_val, clen = by_index.get(int(ci), (None, None))
-            specs.append(PartChunkSpec(index=int(ci), cid=cid_val, cipher_size_bytes=clen))
-
-        dl_parts.append(PartToDownload(part_number=int(pn), chunks=specs))
-    if dl_parts:
-        req = DownloadChainRequest(
-            request_id=f"{object_id}::shared",
-            object_id=object_id,
-            object_version=object_version,
-            object_storage_version=int(storage_version),
-            object_key=info.get("object_key", ""),
-            bucket_name=info.get("bucket_name", ""),
-            address=address,
-            subaccount=address,
-            substrate_url=cfg.substrate_url,
-            size=int(info.get("size_bytes") or 0),
-            multipart=bool(info.get("multipart")),
-            chunks=dl_parts,
-            ray_id=info.get("ray_id"),
-            download_backends=db_backends if db_backends else None,
-            # A6: a genuine backstop so the downloader's stale-discard isn't dead for read-path
-            # DCRs. cache_ttl is the longest any streamer waits, so a DCR older than that has no
-            # live waiter and is safe to drop unprocessed.
-            expire_at=time.time() + float(cfg.cache_ttl_seconds),
+    backends = await resolve_object_backends(db, object_id, object_version)
+    locations: dict[tuple[int, int], list[BackendLocation]] = {}
+    for backend in backends:
+        rows = await db.fetch(
+            get_query("get_chunk_backend_identifiers_by_part"), backend, object_id, int(object_version)
         )
-        await enqueue_download_request(req)
+        for row in rows or []:
+            identifier = row["backend_identifier"]
+            if not identifier:
+                continue
+            locations.setdefault((int(row["part_number"]), int(row["chunk_index"])), []).append(
+                (backend, str(identifier))
+            )
+    return {key: tuple(found) for key, found in locations.items()}
 
 
-async def _enqueue_missing_downloads(
-    db: Any,
-    redis: Any,
-    info: dict,
-    *,
-    object_version: int,
-    storage_version: int,
-    plan: list[ChunkPlanItem],
-    exist_results: list[bool],
-    address: str,
-    cfg: Any,
-) -> None:
-    """Enqueue a DownloadChainRequest for the chunks in `plan` that are missing from the FS cache.
+def make_fetch_missing(ctx: StreamContext, obj_cache: Any, *, object_id: str, address: str) -> FetchMissingFn:
+    """The streamer's lowest tier for one request: fetch a chunk from its backend into memory.
 
-    Coalesces concurrent misses per (object_id, version, part) via a Redis NX lock so only one
-    streamer enqueues; the rest wait on the downloader's pub/sub notification. Shared by the primary
-    read path AND the envelope-race version fallback — the fallback used to return a `pipeline`
-    source without enqueuing anything, so a cold read of the fallback version hung on pub/sub until
-    the wait timed out.
+    Closes over the locations resolved in `build_stream_context` — never over `db`. A chunk with
+    no location is on no backend yet (its part is inside the upload window, on some node's SSD);
+    only a peer can serve it, so the local tiers are re-polled for a bounded time before the
+    request gives up with a retryable error.
     """
-    indices_by_part: dict[int, set[int]] = {}
-    for item, cached in zip(plan, exist_results, strict=True):
-        if not cached:
-            indices_by_part.setdefault(int(item.part_number), set()).add(int(item.chunk_index))
-    await _enqueue_download_for_parts(
-        db,
-        redis,
-        info,
-        object_version=object_version,
-        storage_version=storage_version,
-        indices_by_part=indices_by_part,
-        address=address,
-        cfg=cfg,
-    )
+    cfg = get_config()
+    fetcher = get_backend_fetcher()
+    object_version = int(ctx.object_version)
+    wait_s = float(getattr(cfg, "read_missing_chunk_wait_seconds", 10.0))
+
+    async def _fetch_missing(item: ChunkPlanItem) -> bytes:
+        key = (int(item.part_number), int(item.chunk_index))
+        locations = ctx.locations.get(key, ())
+        if locations:
+            return await fetcher.fetch(locations, address)
+        deadline = asyncio.get_running_loop().time() + wait_s
+        while True:
+            await asyncio.sleep(1.0)
+            cached = await obj_cache.get_chunk(object_id, object_version, key[0], key[1])
+            if cached is not None:
+                return cached
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ChunkUnavailableError(
+                    f"chunk on no backend yet and no local tier served it within {wait_s:.0f}s: "
+                    f"{object_id} v{object_version} part {key[0]} chunk {key[1]}"
+                )
+
+    return _fetch_missing
 
 
 async def build_stream_context(
@@ -265,7 +150,6 @@ async def build_stream_context(
     address: str,
     parts: list[dict] | None = None,
 ) -> StreamContext:
-    cfg = get_config()
     storage_version = require_supported_storage_version(int(info["storage_version"]))
     # v4-only policy: always decrypt at read time.
 
@@ -276,31 +160,14 @@ async def build_stream_context(
         parts = await read_parts_list(db, info["object_id"], ov)
     plan = await build_chunk_plan(db, info["object_id"], parts, rng, object_version=ov)
 
-    # Batch check all chunks in a single Redis pipeline round trip
-    source = "cache"
+    # Batch check all chunks in a single pass; a plan with a miss pays for the location lookup,
+    # and so does a long warm one (see `_needs_locations`).
     checks = [(int(item.part_number), int(item.chunk_index)) for item in plan]
     exist_results = await obj_cache.chunks_exist_batch(info["object_id"], ov, checks)
-
-    # Build missing set from batch results
-    indices_by_part: dict[int, set[int]] = {}
-    for item, cached in zip(plan, exist_results, strict=True):
-        if not cached:
-            source = "pipeline"
-            idx_set = indices_by_part.setdefault(int(item.part_number), set())
-            idx_set.add(int(item.chunk_index))
-
-    if source == "pipeline":
-        await _enqueue_missing_downloads(
-            db,
-            redis,
-            info,
-            object_version=ov,
-            storage_version=storage_version,
-            plan=plan,
-            exist_results=exist_results,
-            address=address,
-            cfg=cfg,
-        )
+    source = "cache" if all(exist_results) else "pipeline"
+    locations: ChunkLocations = {}
+    if _needs_locations(source, plan):
+        locations = await _resolve_chunk_locations(db, info["object_id"], ov)
 
     object_version = int(info.get("object_version") or info.get("current_object_version") or 1)
     bucket_id = str(info.get("bucket_id") or "")
@@ -348,20 +215,13 @@ async def build_stream_context(
                 checks = [(int(item.part_number), int(item.chunk_index)) for item in plan]
                 exist_results = await obj_cache.chunks_exist_batch(info["object_id"], object_version, checks)
                 source = "cache" if all(exist_results) else "pipeline"
-                if source == "pipeline":
-                    # Cold read of the fallback version: enqueue the missing chunks so the streamer's
-                    # pub/sub wait is actually fulfilled instead of hanging until it times out.
-                    await _enqueue_missing_downloads(
-                        db,
-                        redis,
-                        info,
-                        object_version=object_version,
-                        storage_version=storage_version,
-                        plan=plan,
-                        exist_results=exist_results,
-                        address=address,
-                        cfg=cfg,
-                    )
+                # Cold read of the fallback version: resolve ITS chunks' locations, not the
+                # current version's — the body fetches whatever this context says.
+                locations = (
+                    await _resolve_chunk_locations(db, info["object_id"], object_version)
+                    if _needs_locations(source, plan)
+                    else {}
+                )
                 kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
                 aad = f"hippius-dek:{bucket_id}:{info['object_id']}:{object_version}".encode("utf-8")
                 key_bytes = unwrap_dek(kek=kek_bytes, wrapped_dek=bytes(wrapped_dek), aad=aad)
@@ -374,6 +234,7 @@ async def build_stream_context(
                     suite_id=suite_id,
                     bucket_id=bucket_id,
                     upload_id=str(info.get("upload_id") or ""),
+                    locations=locations,
                 )
         raise RuntimeError("v5_missing_envelope_metadata")
     kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
@@ -390,6 +251,28 @@ async def build_stream_context(
         suite_id=suite_id,
         bucket_id=bucket_id,
         upload_id=upload_id,
+        locations=locations,
+    )
+
+
+def _stream(ctx: StreamContext, obj_cache: Any, info: dict, *, address: str) -> AsyncGenerator[bytes, None]:
+    cfg = get_config()
+    return stream_plan(
+        obj_cache=obj_cache,
+        object_id=info["object_id"],
+        object_version=ctx.object_version,
+        plan=ctx.plan,
+        storage_version=ctx.storage_version,
+        key_bytes=ctx.key_bytes,
+        suite_id=ctx.suite_id,
+        bucket_id=ctx.bucket_id,
+        upload_id=ctx.upload_id,
+        address=address,
+        bucket_name=str(info.get("bucket_name", "")),
+        prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
+        chunk_timeout=float(cfg.stream_chunk_timeout_seconds),
+        fetch_missing=make_fetch_missing(ctx, obj_cache, object_id=str(info["object_id"]), address=address),
+        has_backend_copy=lambda item: (int(item.part_number), int(item.chunk_index)) in ctx.locations,
     )
 
 
@@ -411,63 +294,42 @@ async def read_response(
     the endpoint releases its pooled connection before calling this. See the module note.
     """
     cfg = get_config()
-    gen = stream_plan(
-        obj_cache=obj_cache,
-        object_id=info["object_id"],
-        object_version=ctx.object_version,
-        plan=ctx.plan,
-        storage_version=ctx.storage_version,
-        key_bytes=ctx.key_bytes,
-        suite_id=ctx.suite_id,
-        bucket_id=ctx.bucket_id,
-        upload_id=ctx.upload_id,
-        address=address,
-        bucket_name=str(info.get("bucket_name", "")),
-        prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
-        chunk_timeout=float(cfg.stream_chunk_timeout_seconds),
-    )
-    # A2: bound the wait for the FIRST chunk. `stream_plan` otherwise waits up to cache_ttl_seconds
-    # (~1h) per chunk, so an un-drained object whose part is on no backend yet would hang the whole
-    # GET for an hour. Peek the first chunk here, before the StreamingResponse is returned, so a
-    # first-chunk timeout surfaces as a retryable 503 (DownloadNotReadyError, caught by the endpoint)
-    # *before* the 200/206 headers are committed. Warm reads return the chunk immediately. A3 bounds
-    # each LATER chunk to stream_chunk_timeout_seconds (via chunk_timeout above), so a mid-stream
-    # permanent failure breaks the stream in minutes instead of hanging the open response ~1h.
+    gen = _stream(ctx, obj_cache, info, address=address)
+    # A2: bound the wait for the FIRST chunk, so a cold read whose chunk cannot be served (a part
+    # still inside its upload window on another node, a backend outage) surfaces as a retryable
+    # 503 (DownloadNotReadyError, caught by the endpoint) *before* the 200/206 headers are
+    # committed. Warm reads return the chunk immediately. A3 bounds each LATER chunk to
+    # stream_chunk_timeout_seconds (via chunk_timeout in `_stream`), so a mid-stream permanent
+    # failure breaks the stream in minutes instead of hanging the open response.
     first_timeout = float(cfg.stream_first_chunk_timeout_seconds)
     first_chunk: bytes | None = None
     try:
         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=first_timeout)
     except StopAsyncIteration:
         first_chunk = None  # empty (zero-byte) object — nothing to stream
-    except (TimeoutError, asyncio.TimeoutError, ChunkNotReadyError) as exc:
-        # ChunkNotReadyError: the downloader gave up fast on a backend miss and notified anyway, so
-        # the peek woke to an empty cache. Same retryable outcome as a timeout — a 503, not a 500.
+    except (TimeoutError, asyncio.TimeoutError, ChunkUnavailableError) as exc:
+        # ChunkUnavailableError: no tier could serve the chunk (nothing on a backend yet, or the
+        # backend fetch failed after its retries). Same retryable outcome as a timeout — a 503, not
+        # a 500.
         await gen.aclose()
-        # RQ-4: release the coalesce locks this streamer set (CAD on our ray token) so the client's
-        # retry re-enqueues immediately rather than waiting out the lock TTL (default 600s).
-        await _release_coalesce_locks(
-            redis,
-            object_id=str(info["object_id"]),
-            object_version=int(ctx.object_version),
-            # Best-effort on the error path: a malformed plan item must never turn the 503 into a 500.
-            part_numbers={
-                int(getattr(item, "part_number", 0))
-                for item in ctx.plan
-                if getattr(item, "part_number", None) is not None
-            },
-            ray_token=str(info.get("ray_id") or "anonymous"),
-        )
         raise DownloadNotReadyError(
             "Parts not ready: first chunk did not arrive within the initial stream timeout"
         ) from exc
 
     async def _body() -> AsyncGenerator[bytes, None]:
         nonlocal first_chunk
-        if first_chunk is not None:
-            yield first_chunk
-            first_chunk = None  # release the (up to ~4 MiB) first chunk for the rest of the stream
-        async for chunk in gen:
-            yield chunk
+        # `finally: aclose()` runs the streamer's own cleanup (cancel the prefetch tasks, which
+        # releases their backend-budget slots and closes their HTTP streams) the moment the
+        # response ends — a client that disconnects mid-stream must not leave up to
+        # prefetch+1 chunks' worth of fetches running until the generator is garbage-collected.
+        try:
+            if first_chunk is not None:
+                yield first_chunk
+                first_chunk = None  # release the (up to ~4 MiB) first chunk for the rest of the stream
+            async for chunk in gen:
+                yield chunk
+        finally:
+            await gen.aclose()
 
     headers = build_headers(
         info,
@@ -498,13 +360,13 @@ async def stream_object(
     """Return an async iterator of plaintext bytes for the requested object.
 
     This wraps build_stream_context and stream_plan so callers don't need to know
-    about parts catalogs, chunk plans, or downloader details.
+    about parts catalogs, chunk plans, or backend locations.
 
-    A2/A3: `bound_first_chunk=True` (used by streaming CopyObject, which reads a *source* object)
-    eagerly peeks the first chunk under `stream_first_chunk_timeout_seconds` and raises
-    `DownloadNotReadyError` if it doesn't arrive — so a copy whose source is still draining fails
-    fast with a retryable 503 *before* the caller writes a partial destination, instead of hanging
-    up to cache_ttl. Every chunk is bounded by `stream_chunk_timeout_seconds` regardless.
+    A2/A3: `bound_first_chunk=True` (used by streaming CopyObject and UploadPartCopy, which read a
+    *source* object) eagerly peeks the first chunk under `stream_first_chunk_timeout_seconds` and
+    raises `DownloadNotReadyError` if it doesn't arrive — so a copy whose source is not servable
+    yet fails fast with a retryable 503 *before* the caller writes a partial destination. Every
+    chunk is bounded by `stream_chunk_timeout_seconds` regardless.
     """
     cfg = get_config()
     ctx = await build_stream_context(
@@ -515,21 +377,7 @@ async def stream_object(
         rng=rng,
         address=address,
     )
-    gen = stream_plan(
-        obj_cache=obj_cache,
-        object_id=info["object_id"],
-        object_version=ctx.object_version,
-        plan=ctx.plan,
-        storage_version=ctx.storage_version,
-        key_bytes=ctx.key_bytes,
-        suite_id=ctx.suite_id,
-        bucket_id=ctx.bucket_id,
-        upload_id=ctx.upload_id,
-        address=address,
-        bucket_name=str(info.get("bucket_name", "")),
-        prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
-        chunk_timeout=float(cfg.stream_chunk_timeout_seconds),
-    )
+    gen = _stream(ctx, obj_cache, info, address=address)
     if not bound_first_chunk:
         return gen
 
@@ -539,7 +387,7 @@ async def stream_object(
         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=float(cfg.stream_first_chunk_timeout_seconds))
     except StopAsyncIteration:
         first_chunk = None  # empty (zero-byte) source
-    except (TimeoutError, asyncio.TimeoutError, ChunkNotReadyError) as exc:
+    except (TimeoutError, asyncio.TimeoutError, ChunkUnavailableError) as exc:
         # See read_response: a terminal miss is retryable, so map it to 503 rather than a 500.
         await gen.aclose()
         raise DownloadNotReadyError(

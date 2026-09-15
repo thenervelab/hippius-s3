@@ -23,7 +23,7 @@ groups:
               to: 0
             datasourceUid: PBFA97CFB590B2093
             model:
-              expr: 'max(hippius_queue_length{queue_name=~".*_upload_requests|.*_upload_retries|substrate_requests"})'
+              expr: 'max(hippius_queue_length{queue_name=~".*_upload_requests(:.*)?|.*_upload_retries(:.*)?|substrate_requests", queue_name!~".*:dlq"})'
               refId: A
           - refId: B
             relativeTimeRange:
@@ -582,7 +582,7 @@ groups:
               to: 0
             datasourceUid: PBFA97CFB590B2093
             model:
-              expr: 'min(kube_daemonset_status_number_ready{namespace="hippius-s3-prod",daemonset=~"api-local|drain-agent"})'
+              expr: 'min(kube_daemonset_status_number_ready{namespace="hippius-s3-prod",daemonset=~"api-local|drain-agent|arion-uploader-local"})'
               refId: A
           - refId: B
             relativeTimeRange:

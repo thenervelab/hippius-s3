@@ -24,7 +24,11 @@ from starlette.requests import ClientDisconnect
 from hippius_s3 import dependencies
 from hippius_s3 import utils
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.common import InvalidContentMD5
+from hippius_s3.api.s3.common import UnsupportedConditionalWrite
 from hippius_s3.api.s3.common import format_s3_timestamp
+from hippius_s3.api.s3.common import parse_content_md5
+from hippius_s3.api.s3.common import parse_write_if_none_match
 from hippius_s3.api.s3.copy_helpers import parse_copy_source
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.errors import s3_error_response
@@ -45,6 +49,8 @@ from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
+from hippius_s3.writer.types import BadDigest
+from hippius_s3.writer.types import PreconditionFailed
 from hippius_s3.xml_helpers import add_subelement
 from hippius_s3.xml_helpers import create_element
 from hippius_s3.xml_helpers import parse_untrusted_xml
@@ -504,6 +510,9 @@ async def initiate_multipart_upload(
             json.dumps(metadata),
             datetime.fromtimestamp(file_mtime, timezone.utc) if file_mtime is not None else None,
             uuid.UUID(object_id),
+            # Captured by the reserve above, BEFORE its upsert cleared any soft delete on the key.
+            # CompleteMultipartUpload's If-None-Match: * cannot re-derive it later.
+            bool(upsert_result["existed_live"]),
         )
 
         root = create_element("InitiateMultipartUploadResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
@@ -600,6 +609,17 @@ async def upload_part(
             status_code=400,
         )
 
+    # Content-MD5 digests the request body, so it applies to a regular UploadPart only; an
+    # UploadPartCopy carries no body. Parsed before the body is read; matched by the writer.
+    # Kept after the upload lookup so an unknown uploadId is NoSuchUpload, as on S3, rather than
+    # InvalidDigest — both are answered before any byte of the body is read.
+    expected_md5: bytes | None = None
+    if not request.headers.get("x-amz-copy-source"):
+        try:
+            expected_md5 = parse_content_md5(request.headers.get("content-md5"))
+        except InvalidContentMD5:
+            return await utils.respond_before_body(request, errors.invalid_digest_response())
+
     # Get object_id and current_object_version from multipart upload
     object_id = ongoing_multipart_upload["object_id"]
     current_object_version = int(ongoing_multipart_upload.get("current_object_version") or 1)
@@ -677,22 +697,12 @@ async def upload_part(
                 status_code=405,
             )
 
-        # Read source via reader pipeline to obtain plaintext when needed
-        # Read plaintext via reader pipeline (parts → plan → stream decrypt)
-        try:
-            from hippius_s3.queue import DownloadChainRequest  # local import
-            from hippius_s3.queue import PartChunkSpec  # local import
-            from hippius_s3.queue import PartToDownload  # local import
-            from hippius_s3.queue import enqueue_download_request  # local import
-            from hippius_s3.reader.db_meta import read_parts_list  # local import to avoid cycles
-            from hippius_s3.reader.planner import build_chunk_plan  # local import
-            from hippius_s3.reader.streamer import stream_plan  # local import
-        except Exception:
-            return s3_error_response("InternalError", "Reader pipeline unavailable", status_code=500)
+        # Read the source's plaintext through the reader pipeline (parts → plan → local tiers, then
+        # the backend into memory, decrypted here) — the same path a GET takes.
+        from hippius_s3.services.object_reader import stream_object  # local import to avoid cycles
 
         object_id_str = str(source_obj["object_id"])
         src_ver = int(source_obj.get("object_version") or 1)
-        parts = await read_parts_list(pool, object_id_str, src_ver)
         rng = None
         source_size = int(source_obj.get("size_bytes") or 0)
         if range_start is not None and range_end is not None:
@@ -703,72 +713,11 @@ async def upload_part(
             from hippius_s3.reader.types import RangeRequest  # local import
 
             rng = RangeRequest(start=int(range_start), end=int(range_end))
-        plan = await build_chunk_plan(pool, object_id_str, parts, rng, object_version=src_ver)
 
-        # Enqueue downloader for any missing chunk indices in cache. CP-2: one batched existence
-        # check (off-loop, meta-gated) instead of a serial per-chunk stat, matching the GET path.
-        # Lifespan-built cache: it holds the standalone queues client that `stream_plan` below
-        # needs for chunk-ready pub/sub. See the note in copy_helpers.handle_streaming_copy.
-        obj_cache = request.app.state.obj_cache
-        checks = [(int(it.part_number), int(it.chunk_index)) for it in plan]
-        exist_flags = await obj_cache.chunks_exist_batch(object_id_str, src_ver, checks)
-        indices_by_part: dict[int, list[int]] = {}
-        for it, present in zip(plan, exist_flags, strict=True):
-            if not present:
-                indices_by_part.setdefault(int(it.part_number), []).append(int(it.chunk_index))
-        if indices_by_part:
-            dl_parts: list[PartToDownload] = []
-            for pn, idxs in indices_by_part.items():
-                try:
-                    rows = await pool.fetch(
-                        get_query("get_part_chunks_by_object_and_number"),
-                        object_id_str,
-                        src_ver,
-                        int(pn),
-                    )
-                    all_entries = [(int(r[0]), str(r[1]), int(r[2]) if r[2] is not None else None) for r in rows or []]
-                    chunk_specs: list[PartChunkSpec] = []
-                    include = {int(i) for i in idxs}
-                    for ci, cid, clen in all_entries:
-                        if int(ci) in include:
-                            chunk_specs.append(
-                                PartChunkSpec(
-                                    index=int(ci),
-                                    cid=str(cid),
-                                    cipher_size_bytes=int(clen) if clen is not None else None,
-                                )
-                            )
-                    if not chunk_specs:
-                        continue
-                    dl_parts.append(PartToDownload(part_number=int(pn), chunks=chunk_specs))
-                except Exception:
-                    continue
-            req = DownloadChainRequest(
-                request_id=f"{object_id_str}::upload_part_copy",
-                object_id=object_id_str,
-                object_version=src_ver,
-                object_storage_version=int(source_obj.get("storage_version") or 0),
-                object_key=source_object_key,
-                bucket_name=source_bucket_name,
-                address=request.state.main_account_id,
-                subaccount=request.state.main_account_id,
-                substrate_url=config.substrate_url,
-                size=int(source_obj.get("size_bytes") or 0),
-                multipart=bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
-                chunks=dl_parts,
-            )
-            await enqueue_download_request(req)
-
-        # Stream plaintext bytes
         raw_storage_version = source_obj.get("storage_version")
         if raw_storage_version is None:
             return s3_error_response("InternalError", "Missing storage version", status_code=500)
         storage_version = require_supported_storage_version(int(raw_storage_version))
-        bucket_id = str(source_obj.get("bucket_id") or "")
-        suite_id = str(
-            source_obj.get("enc_suite_id") or ("hip-enc/aes256gcm" if storage_version >= 5 else "hip-enc/legacy")
-        )
-        key_bytes: bytes | None = None
         expected_size = (
             int(range_end - range_start + 1)
             if range_start is not None and range_end is not None
@@ -780,36 +729,30 @@ async def upload_part(
                 "UploadPartCopy source is too large to buffer in memory",
                 status_code=413,
             )
-        if storage_version >= 5:
-            from hippius_s3.services.envelope_service import unwrap_dek
-            from hippius_s3.services.kek_service import get_bucket_kek_bytes
-
-            kek_id = source_obj.get("kek_id")
-            wrapped_dek = source_obj.get("wrapped_dek")
-            if not bucket_id or not kek_id or not wrapped_dek:
-                return s3_error_response("InternalError", "Missing v5 envelope metadata", status_code=500)
-            kek_bytes = await get_bucket_kek_bytes(bucket_id=bucket_id, kek_id=kek_id)
-            aad = f"hippius-dek:{bucket_id}:{object_id_str}:{src_ver}".encode("utf-8")
-            key_bytes = unwrap_dek(kek=kek_bytes, wrapped_dek=bytes(wrapped_dek), aad=aad)
-        else:
-            from hippius_s3.services.key_service import get_or_create_encryption_key_bytes
-
-            key_bytes = await get_or_create_encryption_key_bytes(
-                main_account_id=request.state.main_account_id,
-                bucket_name=source_bucket_name,
-            )
-        chunks_iter = stream_plan(
-            obj_cache=obj_cache,
-            object_id=object_id_str,
-            object_version=src_ver,
-            plan=plan,
-            storage_version=storage_version,
-            key_bytes=key_bytes,
-            suite_id=suite_id,
-            bucket_id=bucket_id,
-            upload_id="",
+        if not source_obj.get("bucket_id") or not source_obj.get("kek_id") or not source_obj.get("wrapped_dek"):
+            return s3_error_response("InternalError", "Missing v5 envelope metadata", status_code=500)
+        # bound_first_chunk: a source that cannot be served yet fails fast with a retryable 503
+        # before any destination bytes are staged.
+        chunks_iter = await stream_object(
+            pool,
+            request.app.state.redis_client,
+            request.app.state.obj_cache,
+            {
+                "object_id": object_id_str,
+                "object_version": src_ver,
+                "storage_version": storage_version,
+                "bucket_id": str(source_obj.get("bucket_id") or ""),
+                "bucket_name": source_bucket_name,
+                "object_key": source_object_key,
+                "size_bytes": source_size,
+                "multipart": bool((json.loads(source_obj.get("metadata") or "{}") or {}).get("multipart", False)),
+                "enc_suite_id": source_obj.get("enc_suite_id"),
+                "kek_id": source_obj.get("kek_id"),
+                "wrapped_dek": source_obj.get("wrapped_dek"),
+            },
+            rng=rng,
             address=request.state.main_account_id,
-            bucket_name=source_bucket_name,
+            bound_first_chunk=True,
         )
         body_iter: AsyncIterator[bytes] = chunks_iter
     else:
@@ -842,7 +785,13 @@ async def upload_part(
                 account_address=request.state.main_account_id,
                 part_number=int(part_number),
                 body_iter=body_iter,
+                expected_md5=expected_md5,
             )
+        except BadDigest as exc:
+            # The writer discarded this attempt before publishing it; any earlier upload of this
+            # part number is untouched.
+            logger.info(f"UploadPart {part_number} for upload {upload_id} rejected: {exc}")
+            return errors.bad_digest_response()
         except ClientDisconnect:
             logger.warning(f"Client disconnected during part {part_number} upload for upload {upload_id}")
 
@@ -1190,6 +1139,11 @@ async def complete_multipart_upload(
     db: dependencies.DBConnection,
 ) -> Response:
     """Internal implementation of multipart upload completion logic."""
+    # Conditional create (If-None-Match: *) — S3 evaluates it at completion, not at initiate.
+    try:
+        if_none_match = parse_write_if_none_match(request.headers.get("if-none-match"))
+    except UnsupportedConditionalWrite:
+        return await utils.respond_before_body(request, errors.conditional_write_not_implemented_response())
     try:
         # Validate the multipart upload exists
         multipart_upload = await db.fetchrow(get_query("get_multipart_upload"), upload_id)
@@ -1342,20 +1296,27 @@ async def complete_multipart_upload(
             redis_client=request.app.state.redis_client,
             fs_store=request.app.state.fs_store,
         )
-        complete_res = await writer.mpu_complete(
-            bucket_name=bucket_name,
-            object_id=str(object_id),
-            object_key=object_key,
-            upload_id=str(upload_id),
-            object_version=int(object_version),
-            address=request.state.main_account_id,
-            # B1: the client's <Part> selection — the final object (bytes + ETag + size) reflects
-            # only these; a strict subset is recorded so the reader excludes the unlisted parts.
-            selected_parts=[pn for pn, _ in part_info],
-            # MPU-3: reuse the parts rows already fetched (and ETag-validated) above so mpu_complete
-            # doesn't re-read the parts table for the combined ETag and total size.
-            db_parts=db_parts,
-        )
+        try:
+            complete_res = await writer.mpu_complete(
+                bucket_name=bucket_name,
+                object_id=str(object_id),
+                object_key=object_key,
+                upload_id=str(upload_id),
+                object_version=int(object_version),
+                address=request.state.main_account_id,
+                # B1: the client's <Part> selection — the final object (bytes + ETag + size) reflects
+                # only these; a strict subset is recorded so the reader excludes the unlisted parts.
+                selected_parts=[pn for pn, _ in part_info],
+                # MPU-3: reuse the parts rows already fetched (and ETag-validated) above so mpu_complete
+                # doesn't re-read the parts table for the combined ETag and total size.
+                db_parts=db_parts,
+                if_none_match=if_none_match,
+                key_existed_at_initiate=bool(multipart_upload["key_existed_at_initiate"]),
+            )
+        except PreconditionFailed:
+            # Nothing was committed: the upload stays open and can be aborted, as on S3.
+            logger.info(f"CompleteMultipartUpload {bucket_name}/{object_key}: If-None-Match: * and the key exists")
+            return errors.precondition_failed_response()
 
         # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It
         # persists the main-account address (the upload identity); the Rust drain reads

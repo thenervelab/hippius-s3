@@ -10,7 +10,7 @@ is one Redis HGET and a comparison -- no database work on the request path at al
 
 WHAT THAT COSTS, stated plainly because it is a deliberate choice and not an oversight:
 
-  * Usage is as fresh as the last refresh (HIPPIUS_PLANS_LOOP_SLEEP, 10 minutes), not as fresh as
+  * Usage is as fresh as the last refresh (HIPPIUS_PLANS_LOOP_SLEEP, 2 minutes), not as fresh as
     the last write. An account can exceed its allowance by up to one cycle's worth of uploads.
   * A denial is NOT re-checked against a live count. A customer who deletes data to get back under
     their quota stays refused until the next refresh picks the deletion up. That is the sharp edge

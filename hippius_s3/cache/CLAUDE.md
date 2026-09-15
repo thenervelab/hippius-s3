@@ -1,14 +1,13 @@
 # hippius_s3/cache/
 
-Chunk cache. Backed by a shared filesystem volume; Redis is used only for pub/sub readiness notifications — **not** for chunk storage (that changed 2026-04-21 with the FS-cache migration).
+Chunk cache. Backed by filesystem volumes (node-local NVMe, peers, the pool) with the backend itself as the lowest read tier; Redis holds no chunk data and, since the direct-to-Arion read path, no chunk-ready pub/sub either.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | [fs_store.py](fs_store.py) | `FileSystemPartsStore` — the actual on-disk cache. Atomic writes, meta-gated reads, read-recency tracking (`note_read` → `fs_cache_inventory.last_access_at`). |
-| [object_parts.py](object_parts.py) | `RedisObjectPartsCache` — facade composing `FileSystemPartsStore` + `ChunkNotifier`. Name retained for compat; chunk I/O is FS-backed. |
-| [notifier.py](notifier.py) | `ChunkNotifier` — Redis pub/sub wrapper for chunk-ready notifications. |
+| [object_parts.py](object_parts.py) | `RedisObjectPartsCache` — facade over `FileSystemPartsStore`. Name retained for compat; chunk I/O is FS-backed. |
 | [dual_fs_store.py](dual_fs_store.py) | `DualFileSystemPartsStore` — the tiered read path: node-local NVMe → peer node → CephFS pool. Optionally promotes a pool/peer-served chunk onto local flash. |
 | [peers.py](peers.py) | `PeerRegistry` (self-registration of pod IPs in Redis, TTL'd) + `PeerChunkFetcher` (resolve which node holds a part, fetch one chunk from it). |
 | [read_recency.py](read_recency.py) | `ReadRecencyRecorder` — stamps `cephor_ssd_residency.last_read_at` on a local hit (sampled), so the drain evictor orders on USE rather than arrival. |
@@ -63,10 +62,12 @@ plaintext fails to authenticate, then re-fetches and decrypts **exactly once**, 
 `chunk_aead_failures_total{tier,outcome}`.
 
 Three things about it are load-bearing. It removes one chunk file, never the part or `meta.json` —
-a part with meta and a hole is the downloader's normal partial-fill state, so the hole falls
-through a tier while its siblings still serve. It is gated on the pool holding the chunk, because
-a freshly ingested part is on SSD alone until the drain replicates it and a DEK fault fails those
-chunks too; without the gate a key error would become data loss. And it lives on
+a part with meta and a hole is a normal partial-promotion state, so the hole falls
+through a tier while its siblings still serve. It is gated on a durable copy existing elsewhere —
+a live `chunk_backend` row (`durable_elsewhere`, passed by the streamer from the resolved
+locations) or, for pool-era parts, a pool copy — because a freshly ingested part is on SSD alone
+until the backend acks it and a DEK fault fails those chunks too; without the gate a key error
+would become data loss. And it lives on
 `DualFileSystemPartsStore` alone — with no fallback dir the single store's root IS the pool, so
 the same call there would delete the authoritative copy.
 
@@ -101,8 +102,8 @@ and would delete it mid-upload. A SIGKILL'd attempt's leftovers are swept by the
 orphan sweep at its 24h grace; readers and the drain's completeness gate never count staged names.
 
 - Every file is written atomically: unique tmp name → `os.replace` ([fs_store.py:92, 123-131](fs_store.py)). Two workers writing the same chunk path each use their own tmp — last rename wins, content is deterministic, no corruption.
-- **`meta.json` is the readiness gate**: `get_chunk` returns None unless `meta.json` exists AND the specific chunk file exists ([fs_store.py:168-173](fs_store.py)). `chunks_exist_batch` same — and it must stay a two-part test, because the two writers below mean different things by `meta.json`: meta alone would report a downloader's in-flight chunks as present and break partial-range fills.
-- Uploaders write meta **last** (after all chunks). Downloaders write meta **first** (eager from DB parts row) so partial-range fills become readable as chunks land.
+- **`meta.json` is the readiness gate**: `get_chunk` returns None unless `meta.json` exists AND the specific chunk file exists ([fs_store.py:168-173](fs_store.py)). `chunks_exist_batch` same — and it must stay a two-part test: a promoted part is filled chunk by chunk, so meta alone would report in-flight chunks as present.
+- Ingest writes meta **last** (after all chunks). Promotion writes meta eagerly so partially-promoted parts are readable chunk by chunk.
 - **The read path parses the part directory listing.** `chunks_exist_batch` answers per part with one `os.scandir` rather than a stat per chunk: on the pool tier every stat is an MDS round trip (~6ms), so the per-chunk form made read TTFB O(total_chunks) and cost 10-20s before the first byte of a 5 GB object. Two consequences before you change anything on disk: the staged/tmp naming above is now a **read-path correctness dependency** (any name parsing as `chunk_<i>.bin` counts as published, which is why the parser round-trips the index back through the filename), and scans run on a dedicated `fs-scan` pool sized by `HIPPIUS_FS_STORE_SCAN_CONCURRENCY` — off asyncio's default executor so a fan-out cannot starve the `get_chunk`/`set_chunk` IO living there, with a per-request cap so one large object cannot queue ahead of everyone else.
 
 ## Atomicity on CephFS / NVMe
@@ -126,41 +127,19 @@ Reads no longer `os.utime` the chunk/meta files — the per-read atime touch was
 
 ## `RedisObjectPartsCache`
 
-[object_parts.py:59](object_parts.py). Misnomer — the class name is legacy. Actual composition:
-
-- `self._fs`: `FileSystemPartsStore` (created lazily from config if not injected). All chunk/meta I/O goes here.
-- `self._notifier`: `ChunkNotifier` backed by `queues_client` (= `redis_queues_client`, port 6382).
-- `self.redis`: still retained for a narrow purpose — the download-coalescing lock `download_in_progress:...` uses `SET NX EX` / `DELETE` on this client ([object_parts.py:78](object_parts.py) comment). Not used for data.
-
-Key methods:
-
-- `get_chunk` / `set_chunk` / `chunks_exist_batch` → delegate to `self._fs`.
-- `get_meta` / `set_meta` → delegate to `self._fs`.
-- `get(...)` / `set(...)` — whole-part legacy API, assembled from chunks ([object_parts.py:190-245](object_parts.py)).
-- `expire(...)` → `fs.touch_part` (was Redis TTL extension before the migration).
-- `notify_chunk(oid, v, pn, ci)` → `self._notifier.notify(...)` publishes to `notify:{chunk_key}`.
-- `wait_for_chunk(oid, v, pn, ci)` → `self._notifier.wait_for_chunk(..., fetch_fn=self.fs.get_chunk, timeout=cache_ttl_seconds)`.
-
-## `ChunkNotifier`
-
-[notifier.py:35](notifier.py). Pub/sub pattern:
-
-- **Key format**: `f"obj:{object_id}:v:{version}:part:{part_number}:chunk:{chunk_index}"` ([notifier.py:26-32](notifier.py)).
-- **Channel**: `f"notify:{chunk_key}"`.
-- `notify(...)` publishes `"1"` on the channel.
-- **`stream_subscription(object_id, object_version, fetch_fn=...)`** (RQ-1) — an async context manager that opens ONE pattern subscription (`notify:obj:{oid}:v:{v}:part:*:chunk:*`) for a whole stream and demuxes notifications to per-chunk `asyncio.Event`s. Replaces the per-chunk subscribe/unsubscribe churn of `wait_for_chunk` on cold multi-chunk reads. Gated by `HIPPIUS_STREAM_SINGLE_SUBSCRIPTION` (default off); `stream_plan` falls back to per-chunk `wait_for_chunk` when off. Keeps the post-subscribe FS re-check race guard and adds a periodic FS re-check (`_STREAM_RECHECK_INTERVAL_SECONDS`) so a missed wakeup degrades to a bounded poll instead of hanging.
-- `wait_for_chunk(...)` flow ([notifier.py:61](notifier.py)):
-  1. Fast-path call `fetch_fn` (typically `fs_store.get_chunk`); return if present.
-  2. Subscribe to the channel.
-  3. Re-check `fetch_fn` once (handles the race where the worker notified between step 1 and step 2).
-  4. Block on `pubsub.listen()` until a message arrives or `timeout` expires.
-  5. Fetch again. On transient miss (janitor delete or CephFS replication lag), sleep 100ms and retry once ([notifier.py:117-124](notifier.py)).
-  6. If still missing, raise `RuntimeError`.
+[object_parts.py](object_parts.py). Misnomer — the class name is legacy. It is a thin facade over
+`FileSystemPartsStore` (`self.fs`, created lazily from config if not injected); all chunk/meta I/O
+goes there. `get_chunk` / `set_chunk` / `chunks_exist_batch` / `get_meta` / `set_meta` delegate;
+`expire(...)` → `fs.touch_part`. The chunk-ready pub/sub (`ChunkNotifier`, `wait_for_chunk`,
+`notify_chunk`) and the download-coalescing lock went with the downloader: a chunk on no local tier
+is fetched from the backend into memory by the read path itself
+([../reader/backend_fetch.py](../reader/backend_fetch.py)), so nothing waits on a notification.
 
 ## Dead / removed
 
 - **`RedisDownloadChunksCache`** — the separate 32GB Redis download cache. Removed 2026-04-21 along with the `redis-download-cache` StatefulSet, `REDIS_DOWNLOAD_CACHE_URL`, and the `DOWNLOAD_CACHE_TTL` env var. If you see any reference to these, it's stale.
 - **`set_download_chunk`** shim — removed.
+- **`ChunkNotifier`** (`notifier.py`), **`ReplicationSuspectProbe`** (`replication_probe.py`) and the downloader worker — removed with the direct-to-Arion read path; reads pull a missing chunk from the backend in-process.
 - **Manifest-CID machinery** (`manifest_service`) — replaced by `chunk_backend` long ago.
 
 ## Disk pressure
