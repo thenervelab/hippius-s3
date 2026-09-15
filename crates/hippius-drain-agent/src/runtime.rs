@@ -3036,6 +3036,14 @@ mod tests {
             store.record_landed_part(part).await.unwrap();
             seed_resident(&store, &pool, part, 20).await;
         }
+        // Pin the order rather than trusting two `now()` stamps to differ: the worklist is
+        // coldest-first, and the assertion below is about WHICH part goes.
+        sqlx::query("UPDATE cephor_ssd_residency SET resident_at = now() - interval '1 minute' WHERE object_id = $1 AND part_number = $2")
+            .bind(colder.object().as_str())
+            .bind(i64::from(colder.part().get()))
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let ssd = LocalSsd::new(ssd_dir.path());
         let policy = EvictionPolicy {
