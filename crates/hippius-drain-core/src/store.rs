@@ -4115,6 +4115,33 @@ mod part_tests {
     }
 
     #[sqlx::test]
+    async fn the_enqueue_sweep_worklist_is_not_starved_by_more_never_ready_rows_than_its_limit(pool: PgPool) {
+        // The prod failure shape (2026-08-27): MORE never-ready rows than the sweep's batch
+        // limit, all older than the first publishable row. With a limit-then-filter worklist the
+        // batch was 100% not-ready on every poll and the publishable row behind it was never
+        // offered. The worklist must skip past an arbitrarily long not-ready head.
+        const OBJECT: &str = "466916c0-d61b-4518-b81b-9576b574270a";
+        const LIMIT: u32 = 8;
+        create_app_schema(&pool).await;
+        seed_object_version(&pool, OBJECT, 1, None).await; // pre-cutover / in-flight: never ready
+        seed_object_version(&pool, OBJECT, 2, Some("addr")).await;
+        let store = Store::from_pool(pool);
+        // 2x the limit of not-ready rows, committed BEFORE the publishable one so they sort
+        // ahead of it in the oldest-first ring.
+        for number in 1..=(LIMIT * 2) {
+            seed_replicated(&store, OBJECT, 1, number).await;
+        }
+        let publishable = seed_replicated(&store, OBJECT, 2, 1).await;
+
+        let worklist = store.list_replicated_unenqueued_parts(LIMIT).await.unwrap();
+        assert_eq!(
+            worklist,
+            vec![publishable],
+            "the publishable row is offered even though more than `limit` never-ready rows precede it"
+        );
+    }
+
+    #[sqlx::test]
     async fn gc_spares_a_replicated_row_awaiting_enqueue_but_reaps_a_stamped_one(pool: PgPool) {
         // The GC guard: gc_terminal_status_rows must NOT delete a `replicated` row whose backend
         // upload is still outstanding (upload_enqueued_at IS NULL) — that would drop the enqueue
