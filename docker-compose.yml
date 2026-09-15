@@ -227,8 +227,14 @@ services:
       - WORKER_SCRIPT=workers/run_arion_uploader_in_loop.py
       - ENABLE_WATCHFILES=true
       - HIPPIUS_ARION_BASE_URL=${HIPPIUS_ARION_BASE_URL:-https://arion.hippius.com/}
+      # Node-local uploader: consume this node's queue (the drain-agent below publishes to
+      # arion_upload_requests:<CEPHOR_NODE_ID>) and read the parts off the same local ingest
+      # dir the api writes and the drain verifies. One node in compose, so one name.
+      - NODE_NAME=e2e-node
+      - HIPPIUS_OBJECT_CACHE_DIR=/var/lib/hippius/local_object_cache
     volumes:
       - .:/app
+      - /var/lib/hippius/local_object_cache:/var/lib/hippius/local_object_cache
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
       - /var/lib/hippius/kms:/kms_certs:ro
     healthcheck:

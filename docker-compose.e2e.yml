@@ -68,6 +68,7 @@ services:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
       - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
+      - /var/lib/hippius/local_object_cache:/var/lib/hippius/local_object_cache
       - kms_certs:/kms_certs:ro
     depends_on:
       mock-kms:
