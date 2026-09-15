@@ -1,9 +1,14 @@
 """E2E: the janitor's SQL-driven eviction phase evicts a replicated part, and a GET refetches it.
 
 Round-trip proof that the new engine is SAFE: a part that is fully replicated to every required
-backend is evicted from the FS cache by evict_from_inventory, and a subsequent GET rehydrates it
-through the download pipeline. If eviction ever deleted an under-replicated part, the follow-up GET
-would fail — that is the safety invariant this test guards.
+backend is evicted from the FS cache by evict_from_inventory, and a subsequent GET refetches it
+from the backend. If eviction ever deleted an under-replicated part, the follow-up GET would fail —
+that is the safety invariant this test guards.
+
+The janitor owns the shared pool (object_cache), which is now pool-era only: the drain uploads a
+part straight from the node's SSD and never copies it there. So each test materializes the pool
+copy itself — the part's chunk files copied from the SSD tier right after the PUT, before the
+drain can reclaim them — to stand in for the parts that reached the pool before the cutover.
 
 No existing e2e test drives the janitor, and its container runs the loop on a 600s cadence, so
 this seeds fs_cache_inventory deterministically and execs ONE eviction pass in the janitor
@@ -54,6 +59,18 @@ def _seed_inventory(object_id: str, object_version: int, *, dsn: str = DEFAULT_D
 
 def _part_dir(object_id: str, object_version: int, part_number: int) -> str:
     return f"/var/lib/hippius/object_cache/{object_id}/v{object_version}/part_{part_number}"
+
+
+def _materialize_pool_copy(object_id: str, object_version: int) -> None:
+    """Copy the version's parts from the api's SSD tier into the shared pool, as a pool-era part.
+
+    The api container mounts both tiers. Run straight after the PUT: the SSD copy is complete once
+    PUT returns (meta.json is written last) and the drain's reclaim walk has not had a chance at it.
+    """
+    src = f"/var/lib/hippius/local_object_cache/{object_id}/v{object_version}"
+    dst = f"/var/lib/hippius/object_cache/{object_id}/v{object_version}"
+    rc, out, err = compose_exec("api", ["sh", "-c", f"mkdir -p {dst} && cp -a {src}/. {dst}/"])
+    assert rc == 0, f"pool copy failed rc={rc}\nstdout={out}\nstderr={err}"
 
 
 def _run_one_eviction_pass(pressure: int = 2) -> str:
@@ -154,12 +171,13 @@ def test_sql_eviction_evicts_replicated_part_and_get_refetches(
     key = "sql-evict.bin"
     content = b"janitor sql eviction round-trip payload"
     boto3_client.put_object(Bucket=bucket, Key=key, Body=content)
+    object_id, object_version = get_object_id_and_version(bucket, key)
+    _materialize_pool_copy(object_id, object_version)
 
     # Wait for the replication gate's precondition: every chunk backed on arion. Only then is the
     # part a legitimate eviction candidate (an under-replicated part must never be evicted).
     assert wait_for_all_backends_ready(bucket, key, min_count=1, timeout_seconds=30.0)
 
-    object_id, object_version = get_object_id_and_version(bucket, key)
     parts = _seed_inventory(object_id, object_version)
     assert parts, "object should have at least one part"
 
@@ -176,8 +194,8 @@ def test_sql_eviction_evicts_replicated_part_and_get_refetches(
     gone_rc, _, _ = compose_exec("janitor", ["test", "-e", _part_dir(object_id, object_version, parts[0])])
     assert gone_rc != 0, "part dir must be removed after SQL eviction"
 
-    # And the object still reads: the GET rehydrates through the download pipeline, proving the
-    # eviction was safe (the bytes were fully replicated and are re-fetchable from the backend).
+    # And the object still reads: the GET refetches from the backend, proving the eviction was
+    # safe (the bytes were fully replicated and are re-fetchable from the backend).
     resp = boto3_client.get_object(Bucket=bucket, Key=key)
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
     assert resp["Body"].read() == content
@@ -193,8 +211,9 @@ def _prepare_aged_candidate(boto3_client: Any, bucket: str, key: str, content: b
     legitimate candidate whose eviction now turns solely on last_access_at.
     """
     boto3_client.put_object(Bucket=bucket, Key=key, Body=content)
-    assert wait_for_all_backends_ready(bucket, key, min_count=1, timeout_seconds=30.0)
     object_id, object_version = get_object_id_and_version(bucket, key)
+    _materialize_pool_copy(object_id, object_version)
+    assert wait_for_all_backends_ready(bucket, key, min_count=1, timeout_seconds=30.0)
     parts = _seed_inventory(object_id, object_version)
     assert parts, "object should have at least one part"
     part_number = parts[0]
