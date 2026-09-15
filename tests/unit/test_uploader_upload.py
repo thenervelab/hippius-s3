@@ -851,3 +851,79 @@ async def test_chunk_backend_rows_are_written_only_for_the_bytes_the_drain_ackno
     else:
         assert result.stale is True and result.cids == []
         assert inserts == [], "a mismatch records nothing"
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_outruns_the_drains_commit_waits_for_it(mock_config, mock_db_pool):
+    # The drain publishes BEFORE it commits `uploading`; a delivery dequeued in that window
+    # sees `draining`. It must not be dropped as stale — it waits for the commit and then
+    # carries the committed digest into the upload.
+    mock_config.uploader_hand_off_wait_seconds = 2.0
+    uploader = Uploader(
+        mock_db_pool, FakeRedis(), FakeRedis(), mock_config, backend_name="arion", backend_client=MagicMock()
+    )
+    mock_conn = AsyncMock()
+    mock_conn.fetchval = AsyncMock(return_value=False)
+    mock_conn.fetch = AsyncMock(
+        side_effect=[
+            [MockRow({"part_number": 1, "status": "draining", "content_sha256": None})],
+            [MockRow({"part_number": 1, "status": "uploading", "content_sha256": "d1"})],
+        ]
+    )
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+    payload = UploadChainRequest(
+        address="user1",
+        bucket_name="test-bucket",
+        object_key="test-key",
+        object_id="obj-123",
+        object_version=1,
+        chunks=[Chunk(id=1)],
+        node_id="ingest-node-1",
+    )
+
+    with patch.object(uploader, "_upload_chunks", new_callable=AsyncMock, return_value=["cid"]) as mock_upload_chunks:
+        assert await uploader.process_upload(payload) == ["cid"]
+
+    assert mock_upload_chunks.call_args.kwargs["expected_digests"] == {1: "d1"}
+    assert [c.id for c in mock_upload_chunks.call_args.kwargs["chunks"]] == [1]
+
+
+@pytest.mark.asyncio
+async def test_a_part_still_uncommitted_at_the_deadline_goes_back_on_the_nodes_retry_zset(mock_config, mock_db_pool):
+    # If the commit has not landed by the deadline the part is neither read unfenced nor
+    # dropped (a drop would leave it to the sweep's re-drive window an hour away): it is
+    # re-scheduled on this node's retry ZSET and comes back once the row is `uploading`.
+    from hippius_s3 import queue as q
+
+    redis = FakeRedis()
+    q.initialize_queue_client(redis)
+    mock_config.uploader_hand_off_wait_seconds = 0.0
+    mock_config.uploader_hand_off_retry_delay_seconds = 0.0
+    uploader = Uploader(mock_db_pool, redis, redis, mock_config, backend_name="arion", backend_client=MagicMock())
+    mock_conn = AsyncMock()
+    mock_conn.fetchval = AsyncMock(return_value=False)
+    mock_conn.fetch = AsyncMock(
+        return_value=[
+            MockRow({"part_number": 1, "status": "draining", "content_sha256": None}),
+            MockRow({"part_number": 2, "status": "uploading", "content_sha256": "d2"}),
+        ]
+    )
+    mock_db_pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=mock_conn)))
+    payload = UploadChainRequest(
+        address="user1",
+        bucket_name="test-bucket",
+        object_key="test-key",
+        object_id="obj-123",
+        object_version=1,
+        chunks=[Chunk(id=1), Chunk(id=2)],
+        node_id="ingest-node-1",
+    )
+
+    with patch.object(uploader, "_upload_chunks", new_callable=AsyncMock, return_value=["cid2"]) as mock_upload_chunks:
+        assert await uploader.process_upload(payload) == ["cid2"]
+
+    assert [c.id for c in mock_upload_chunks.call_args.kwargs["chunks"]] == [2], "the committed part uploads now"
+    assert await redis.zcard("arion_upload_retries:ingest-node-1") == 1, "the uncommitted part comes back later"
+    (member,) = await redis.zrange("arion_upload_retries:ingest-node-1", 0, -1)
+    retried = UploadChainRequest.model_validate_json(member)
+    assert [c.id for c in retried.chunks] == [1] and retried.node_id == "ingest-node-1"

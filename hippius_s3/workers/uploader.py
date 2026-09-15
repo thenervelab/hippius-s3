@@ -19,6 +19,7 @@ from hippius_s3.dlq.upload_dlq import UploadDLQManager
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.utils import get_query
 from hippius_s3.workers.errors import is_billing_error
 from hippius_s3.workers.part_digest import chunk_hash
@@ -159,10 +160,24 @@ class Uploader:
                 # it (a duplicate after a re-publish; the SSD copy may be gone by now), a re-drive
                 # returned it to pending (a fresh request is coming), or it was retired. Dropping
                 # it is what keeps a duplicate from ending in the DLQ as a "missing" part.
-                expected_digests = await self._handed_over_parts(payload)
+                expected_digests, in_flight = await self._await_hand_off(payload)
+                if in_flight:
+                    # The drain publishes BEFORE it commits `uploading` (at-least-once), and this
+                    # delivery outran the commit. The row is `draining` and has no digest to fence
+                    # on yet, so the parts come back through the retry ZSET rather than being read
+                    # unfenced or dropped (a drop would leave them to the sweep's re-drive window).
+                    await enqueue_retry_request(
+                        payload.model_copy(update={"chunks": in_flight}),
+                        backend_name=self.backend_name,
+                        delay_seconds=self._hand_off_retry_delay_seconds(),
+                        last_error="hand-off still committing",
+                    )
                 chunks = [c for c in payload.chunks if int(c.id) in expected_digests]
-                if len(chunks) != len(payload.chunks):
-                    skipped = sorted(int(c.id) for c in payload.chunks if int(c.id) not in expected_digests)
+                deferred = {int(c.id) for c in in_flight}
+                skipped = sorted(
+                    int(c.id) for c in payload.chunks if int(c.id) not in expected_digests and int(c.id) not in deferred
+                )
+                if skipped:
                     logger.info(
                         f"Dropping stale parts of a node-scoped request (no longer uploading): "
                         f"object_id={payload.object_id} version={payload.object_version} parts={skipped}"
@@ -231,9 +246,8 @@ class Uploader:
 
             return all_chunk_cids
 
-    async def _handed_over_parts(self, payload: UploadChainRequest) -> dict[int, str]:
-        """The parts of a drain-published request still in the hand-off, with the digest the
-        drain recorded for each — the fence every chunk_backend write and the flip go through."""
+    async def _drain_rows(self, payload: UploadChainRequest) -> dict[int, tuple[str, str | None]]:
+        """(status, content_sha256) of the drain's row for each part of a drain-published request."""
         async with self._acquire_conn() as conn:
             rows = await conn.fetch(
                 get_query("get_replication_status_for_parts"),
@@ -241,11 +255,40 @@ class Uploader:
                 int(payload.object_version),
                 [int(c.id) for c in payload.chunks],
             )
-        return {
-            int(r["part_number"]): str(r["content_sha256"])
-            for r in rows
-            if r["status"] == "uploading" and r["content_sha256"] is not None
+        return {int(r["part_number"]): (str(r["status"]), r["content_sha256"]) for r in rows}
+
+    def _hand_off_wait_seconds(self) -> float:
+        value = getattr(self.config, "uploader_hand_off_wait_seconds", None)
+        return float(value) if isinstance(value, (int, float)) else 10.0
+
+    def _hand_off_retry_delay_seconds(self) -> float:
+        value = getattr(self.config, "uploader_hand_off_retry_delay_seconds", None)
+        return float(value) if isinstance(value, (int, float)) else 5.0
+
+    async def _await_hand_off(self, payload: UploadChainRequest) -> tuple[dict[int, str], List[Chunk]]:
+        """Split a drain-published request into the parts in the hand-off (with the digest the
+        drain recorded for each — the fence every chunk_backend write and the flip go through)
+        and the parts whose hand-off is still being committed (`draining`).
+
+        The drain commits `uploading` milliseconds after it publishes, so a `draining` row is
+        polled for a short while first; only what is still `draining` at the deadline is reported
+        as in flight, for the caller to re-schedule.
+        """
+        deadline = asyncio.get_running_loop().time() + self._hand_off_wait_seconds()
+        while True:
+            rows = await self._drain_rows(payload)
+            if not any(status == "draining" for status, _ in rows.values()):
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.25)
+        handed_over = {
+            part_number: str(digest)
+            for part_number, (status, digest) in rows.items()
+            if status == "uploading" and digest is not None
         }
+        in_flight = [c for c in payload.chunks if rows.get(int(c.id), ("", None))[0] == "draining"]
+        return handed_over, in_flight
 
     async def _upload_chunks(
         self,

@@ -450,6 +450,11 @@ class Config:
     # poll. After the window = genuine fault → raise (classifier routes
     # to DLQ as permanent).
     fs_meta_wait_seconds: float = env("HIPPIUS_FS_META_WAIT_SECONDS:30", convert=float)
+    # The node-local uploader can dequeue a drain-published request before the drain has
+    # committed the row `uploading` (publish precedes commit): how long it polls a `draining`
+    # row for the commit, and how far back on the retry ZSET a still-uncommitted part goes.
+    uploader_hand_off_wait_seconds: float = env("HIPPIUS_UPLOADER_HAND_OFF_WAIT_SECONDS:10", convert=float)
+    uploader_hand_off_retry_delay_seconds: float = env("HIPPIUS_UPLOADER_HAND_OFF_RETRY_DELAY_SECONDS:5", convert=float)
 
     # Unpinner configuration
     # How many unpin requests one unpinner pod processes concurrently (outer bounded-dispatch,
