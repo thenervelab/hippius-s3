@@ -57,7 +57,7 @@ async def test_persist_never_touches_the_legacy_cid_columns() -> None:
     """ipfs_cid/cid_id are read back as REAL CIDs by the purge+unpin scripts.
 
     `nuke_user.py`, `purge_buckets.py`, `purge_source_versions.py`,
-    `cleanup_migration_versions.py` and `export_legacy_unpin_worklist.py` all select
+    and `cleanup_migration_versions.py` all select
     `COALESCE(c.cid, ov.ipfs_cid)` guarded only against NULL/''/'pending' — a 64-hex BLAKE3
     digest passes every one of those, so parking the digest there would feed plaintext hashes
     into the unpin worklist as though they were pins.

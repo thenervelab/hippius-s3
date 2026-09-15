@@ -18,7 +18,6 @@ from hippius_s3.monitoring import NullMetricsCollector
 def _exercise(collector: MetricsCollector | NullMetricsCollector) -> None:
     collector.record_mpu_reaper_cycle(success=True, reaped=3, duration=0.5, oldest_reaped_age=1200.0)
     collector.record_mpu_reaper_cycle(success=False, reaped=0, duration=0.1)
-    collector.record_orphan_checker_cycle(success=True, files_scanned=100, orphans_found=2, duration=1.0)
     collector.record_account_cacher_cycle(success=True, accounts_cached=42, duration=0.3)
     collector.record_cachet_check(status="operational", update_success=True)
     collector.record_dlq_push(queue="arion_upload_requests:dlq", error_type="transient")

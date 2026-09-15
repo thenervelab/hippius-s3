@@ -109,26 +109,6 @@ class FileStatusResponse(BaseModel):
     updated_at: str
 
 
-class FileItem(BaseModel):
-    file_id: str
-    cid: str
-    original_name: str
-    size_bytes: int
-    status: str
-    pinned_node_ids: list[str]
-    active_replica_count: int
-    miners: Any
-    updated_at: str
-    created_at: str
-
-
-class ListFilesResponse(BaseModel):
-    count: int
-    next: str | None
-    previous: str | None
-    results: list[FileItem]
-
-
 class DeleteResult(BaseModel):
     status: str
     file_id: str
@@ -159,14 +139,6 @@ class BatchDeleteResult(BaseModel):
 
 class BatchDeleteResponse(BaseModel):
     Success: BatchDeleteResult
-
-
-class DownloadMetadata(BaseModel):
-    file_id: str
-    user_id: str
-    size_bytes: str
-    revision_seq: str
-    revision_id: str
 
 
 class HippiusAPIError(Exception):

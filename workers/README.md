@@ -10,13 +10,11 @@ Background workers that process async operations via Redis queues. Each worker r
 | Arion Unpinner | `run_arion_unpinner_in_loop.py` | `arion_unpin_requests` | Single instance | Delete chunks from Arion |
 | Janitor | `run_janitor_in_loop.py` | N/A (polling) | Single instance | FS cache cleanup at `/var/lib/hippius/object_cache` |
 | Account Cacher | `run_account_cacher_in_loop.py` | N/A (scheduled) | Single instance | Warm account credit cache in Redis |
-| Orphan Checker | `run_orphan_checker_in_loop.py` | N/A (scheduled) | Single instance | Detect blockchain orphan files, enqueue cleanup |
-| Migrator | `run_migrator_once.py` | N/A (one-shot) | One-shot | Run DB migrations on startup, then exit |
 | MPU Reaper | `run_mpu_reaper_in_loop.py` | N/A (polling) | Single instance | Reaps abandoned in-flight multipart uploads |
 
 ### Scaling Notes
 
-The uploader and unpinner must run as single instances to avoid exceeding Hippius blockchain rate limits (they create substrate transactions). The downloader only reads from Arion and Redis, so it can be safely replicated for higher throughput.
+The uploader and unpinner must run as single instances to avoid exceeding Hippius blockchain rate limits (they create substrate transactions).
 
 ## Data Flow
 
@@ -51,8 +49,6 @@ Key environment variables for workers:
 | `HIPPIUS_UNPINNER_MAX_ATTEMPTS` | `5` | Max retry attempts for unpins |
 | `HIPPIUS_UNPINNER_BACKOFF_BASE_MS` | `1000` | Base backoff delay (ms) |
 | `HIPPIUS_UNPINNER_BACKOFF_MAX_MS` | `60000` | Max backoff delay (ms) |
-| `ORPHAN_CHECKER_LOOP_SLEEP` | `7200` | Orphan checker interval (seconds) |
-| `ORPHAN_CHECKER_BATCH_SIZE` | `100` | Orphan checker batch size |
 
 ## Docker
 

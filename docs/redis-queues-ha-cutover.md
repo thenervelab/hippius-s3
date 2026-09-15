@@ -131,7 +131,7 @@ Do BOTH:
 NEW=$(printf 'redis://redis-queues-ha-master:6379/0' | base64)
 kubectl -n $NS patch secret hippius-s3-secrets --type merge -p "{\"data\":{\"REDIS_QUEUES_URL\":\"$NEW\"}}"
 kubectl -n $NS rollout restart ds/drain-agent ds/api-local deploy/drain-allocator deploy/mpu-reaper \
-  deploy/arion-uploader deploy/arion-downloader deploy/arion-unpinner   # any consumer of the queues client
+  deploy/arion-uploader deploy/arion-unpinner   # any consumer of the queues client
 ```
 Consumers reconnect to the HA master. The drain is retry-safe, so a per-pod reconnect blip is absorbed.
 

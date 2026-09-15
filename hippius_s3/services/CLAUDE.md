@@ -8,7 +8,6 @@ Business-logic layer. Crypto, KMS, backend clients, copy helpers, audit. The API
 |---|---|
 | [object_reader.py](object_reader.py) | `build_stream_context` — cache-vs-pipeline decision, backend location resolution, envelope unwrap for GETs. |
 | [crypto_service.py](crypto_service.py) | `CryptoService` — AEAD adapter registry (`hip-enc/aes256gcm`, `hip-enc/legacy`), per-chunk encrypt/decrypt. |
-| [key_service.py](key_service.py) | Per-object key derivation (legacy v≤4 SecretBox path). |
 | [envelope_service.py](envelope_service.py) | `generate_dek`, `wrap_dek(kek, dek, aad)`, `unwrap_dek(kek, wrapped, aad)` — AES-256-GCM envelope. |
 | [kek_service.py](kek_service.py) | Per-bucket KEK management: `get_or_create_active_bucket_kek`, `get_bucket_kek_bytes`, `init_kms_client`, `close_kek_pool`. |
 | [ovh_kms_client.py](ovh_kms_client.py) | mTLS client to OVH KMS. Retries with exponential backoff; wraps/unwraps KEKs. |

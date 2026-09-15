@@ -30,7 +30,7 @@ Redis-cached wrapper around Arion `/objectstore/tokens/auth/`. The cache key is 
 
 Per-request permission evaluator. Called from `acl_middleware`. Reads ACL rows from the main DB + ACL cache (`redis-acl`). Evaluates grant matching against the request's `(account, bucket, key, permission)` tuple.
 
-Bucket-level ACLs and object-level ACLs both supported. Public buckets are modeled as explicit ACL grants (`AllUsers` grantee) rather than a boolean flag — migration script at [hippius_s3/scripts/migrate_public_buckets_to_acl.py](../../scripts/migrate_public_buckets_to_acl.py) converted legacy `is_public` bools.
+Bucket-level ACLs and object-level ACLs both supported. Public buckets are modeled as explicit ACL grants (`AllUsers` grantee) rather than a boolean flag — the `20251121000000_migrate_public_buckets_to_acl` SQL migration converted legacy `is_public` bools.
 
 ## [account_service.py](account_service.py) — `fetch_account`
 
