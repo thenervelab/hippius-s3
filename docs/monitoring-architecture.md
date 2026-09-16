@@ -27,7 +27,7 @@ The monitoring stack consists of:
 graph TB
     subgraph "Application Layer"
         API[FastAPI App<br/>:8000]
-        Workers[Workers<br/>uploader, downloader,<br/>unpinner, etc.]
+        Workers[Workers<br/>uploader, unpinner,<br/>janitor, etc.]
     end
 
     subgraph "Infrastructure"

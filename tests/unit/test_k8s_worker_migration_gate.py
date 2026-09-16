@@ -17,13 +17,12 @@ block was copy-pasted.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-import yaml
+from tests.unit.k8s_manifests import load_docs
+from tests.unit.k8s_manifests import pod_spec
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = "k8s/base/workers-deployments.yaml"
 
 GATE = "wait-for-migrations"
@@ -43,16 +42,11 @@ UNGATED_BY_DESIGN = {"plans-cacher", "account-cacher", "cachet-health-checker"}
 
 
 def _worker_docs() -> list[dict[str, Any]]:
-    text = (REPO_ROOT / MANIFEST).read_text()
-    return [d for d in yaml.safe_load_all(text) if isinstance(d, dict) and (d.get("metadata") or {}).get("name")]
-
-
-def _pod_spec(doc: dict[str, Any]) -> dict[str, Any]:
-    return (doc.get("spec") or {}).get("template", {}).get("spec") or {}
+    return [d for d in load_docs(MANIFEST) if (d.get("metadata") or {}).get("name")]
 
 
 def _declares_database_url(doc: dict[str, Any]) -> bool:
-    for container in _pod_spec(doc).get("containers") or []:
+    for container in pod_spec(doc).get("containers") or []:
         for env in container.get("env") or []:
             if env.get("name") == "DATABASE_URL":
                 return True
@@ -60,7 +54,7 @@ def _declares_database_url(doc: dict[str, Any]) -> bool:
 
 
 def _gates_on_migrations(doc: dict[str, Any]) -> bool:
-    return any(c.get("name") == GATE for c in _pod_spec(doc).get("initContainers") or [])
+    return any(c.get("name") == GATE for c in pod_spec(doc).get("initContainers") or [])
 
 
 def test_every_db_reading_worker_gates_on_migrations_or_is_a_named_exception() -> None:
