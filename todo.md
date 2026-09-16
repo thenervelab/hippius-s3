@@ -448,10 +448,6 @@ Deliberately not done as part of #401: it changes the path every middleware sees
 Both middleware modules were deleted in the gateway/api merge PR: they were never registered (the old `gateway/main.py` held only a commented-out banhammer registration) and their config lived on the deleted `GatewayConfig`. If the features are revived, recover the modules from git history and register them in `hippius_s3/main.py`; the unban endpoint in `hippius_s3/api/user.py` still clears `hippius_banhammer:*` Redis keys.
 
 
-### P2 — Seed phrase auth failure messages
-
-**File**: [hippius_s3/gateway/middlewares/sigv4.py](hippius_s3/gateway/middlewares/sigv4.py). Base64 decode failures on the seed phrase return a bare 403 InvalidAccessKeyId with no diagnostic. Users who've fat-fingered their access key see no hint. Minor UX win to return `"Malformed seed encoding"` in non-prod.
-
 ---
 
 ## 4. Download / range / bandwidth optimizations

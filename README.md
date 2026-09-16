@@ -9,7 +9,7 @@ Client (AWS CLI / MinIO / boto3)
     | HTTPS + AWS SigV4
     v
 Hippius S3 API (auth + ACL + audit middleware, then the S3 handlers)
-    | node SSD + Redis queues
+    | node SSD -> drain agent -> Redis queues
     v
 Arion Workers (upload / unpin)
     |

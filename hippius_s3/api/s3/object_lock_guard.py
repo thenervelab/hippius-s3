@@ -6,9 +6,9 @@ S3 Object Lock has three tiers in this repo (see specs/s3-object-lock.md):
 - Tier 1 (shipped): bucket-level `?object-lock` and `x-amz-bucket-object-lock-enabled`
   are real endpoints — handled by `bucket_object_lock_endpoint`. These NO LONGER trip
   this guard.
-- Tier 2 (still open): per-object retention / legal hold and the per-object
-  `x-amz-object-lock-*` headers on PutObject / CreateMultipartUpload. Those continue to
-  return 501 here.
+- Tier 2 (mostly shipped): per-object retention / legal hold and the per-object
+  `x-amz-object-lock-*` headers on PutObject / CreateMultipartUpload are implemented, so
+  they no longer trip this guard. What remains genuinely unbuilt still returns 501 here.
 
 This helper centralises the Tier 2 detection so each entry point can make a single
 one-line call.

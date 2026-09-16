@@ -15,7 +15,7 @@
 --     table for the length of the scan — a production outage, not a slow deploy.
 -- The verification scan and the index build are the two genuinely expensive steps; they are split
 -- into the following two migrations so each can take a lock mode that does not block traffic.
--- docs/runbooks/object-lock-migration.md drives all three online, ahead of the deploy.
+-- Run all three online, ahead of the deploy.
 ALTER TABLE object_versions
     ADD COLUMN IF NOT EXISTS object_lock_mode TEXT,
     ADD COLUMN IF NOT EXISTS object_lock_retain_until TIMESTAMPTZ,

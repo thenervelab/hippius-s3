@@ -64,9 +64,9 @@ label (`apply` does not prune): `kubectl label node <name> s3-staging-local-inge
 
 ## How routing works (the "proper" front door)
 
-The `api` and `gateway` Services both select `app: api-local` (k8s/base/services.yaml), so public
-traffic reaches the local
-pods — normal front door, no separate target. Prod is unaffected (its overlay omits these patches).
+The `api` Service selects `app: api-local`, and the `gateway` alias selects that plus
+`hippius.io/edge: "true"` (k8s/base/services.yaml), so public traffic reaches the local pods —
+normal front door, no separate target. Prod is unaffected (its overlay omits these patches).
 
 ## Uploads: the drain copies local→ceph (now live)
 
