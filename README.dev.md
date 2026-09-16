@@ -97,12 +97,11 @@ Services that come up:
 
 | Service | Port | Purpose |
 |---|---|---|
-| `gateway` | 8080 | Public-facing. Hit this for S3 traffic. |
-| `api` | 8000 | Internal. Gateway forwards here. |
+| `api` | 8080 → 8000 | The merged app (auth + ACL + S3 handlers). Hit this for S3 traffic. |
 | `postgres` | 5432 | Main DB + keystore. |
 | `redis` | 6379 | General cache. |
 | `redis-accounts` | 6380 | Account cache. |
-| `redis-queues` | 6382 | Work queues + pub/sub. |
+| `redis-queues` | 6382 | Work queues. |
 | `redis-rate-limiting` | 6383 | Rate limit counters. |
 | `redis-acl` | 6384 | ACL cache. |
 | Arion worker pods | — | Uploader, unpinner, purger, janitor. |

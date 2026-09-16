@@ -13,8 +13,12 @@
 --
 -- Recovery: a build that fails midway leaves an INVALID index, which `IF NOT EXISTS` then SKIPS
 -- on the next run — leaving an index that is never used for reads but is still maintained on
--- every write. Check with the query in docs/runbooks/object-lock-migration.md and drop the
--- leftover (`DROP INDEX CONCURRENTLY idx_object_versions_locked;`) before re-running.
+-- every write. Check it, and drop the leftover before re-running:
+--     SELECT indisvalid, indisready FROM pg_index
+--     WHERE indexrelid = 'idx_object_versions_locked'::regclass;   -- both must be true
+--     DROP INDEX CONCURRENTLY idx_object_versions_locked;
+-- A long-running transaction elsewhere is the usual cause — check pg_stat_activity for old
+-- xact_start values before retrying.
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_object_versions_locked ON object_versions (object_id, object_version) WHERE object_lock_retain_until IS NOT NULL OR object_lock_legal_hold;
 
 -- migrate:down

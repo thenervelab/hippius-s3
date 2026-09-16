@@ -19,7 +19,7 @@ stateDiagram-v2
     end note
 ```
 
-Note: the `objects.status` column was dropped by the versioning migration, so nothing drives this
+Note: `objects.status` was dropped by `20251017000000_add_object_versions.sql`, so nothing drives this
 column from the objects side; `cephor_replication_status` below is the live machine.
 
 ## `cephor_replication_status` — the real completion/failure state machine
