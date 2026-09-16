@@ -68,7 +68,7 @@ A **subsystem index** with links to per-directory `CLAUDE.md` files is in sectio
 
 1. **Client → Gateway** (`https://s3.hippius.com/<bucket>/<key>`). SigV4-signed.
 2. **Merged middleware chain** (registered in [hippius_s3/main.py](hippius_s3/main.py), runs outer→inner): CORS → ray_id → cache_control → ats_purge → cache_invalidation → (read-only guard) → fs_cache_pressure → input validation → auth router → trailing slash → account → ACL → request_context → frontend HMAC → tracing → metrics → audit log → auth_probe. On the way back out: the same stack in reverse.
-3. **Auth orchestrator** ([hippius_s3/gateway/services/auth_orchestrator.py:39](hippius_s3/gateway/services/auth_orchestrator.py)) picks one of five methods (presigned URL, bearer, access key SigV4, seed-phrase SigV4, anonymous), verifies the signature, and attaches `request.state.account_id` / `request.state.account` / etc.
+3. **Auth orchestrator** ([hippius_s3/gateway/services/auth_orchestrator.py:39](hippius_s3/gateway/services/auth_orchestrator.py)) picks one of four methods (presigned URL, bearer, access key SigV4, anonymous), verifies the signature, and attaches `request.state.account_id` / `request.state.account` / etc.
 4. **ACL middleware** ([hippius_s3/gateway/middlewares/acl.py:70](hippius_s3/gateway/middlewares/acl.py)) checks bucket ownership + permission. Master tokens bypass.
 5. **Request context** ([hippius_s3/api/middlewares/request_context.py](hippius_s3/api/middlewares/request_context.py)) maps the auth middlewares' state into what handlers consume: `state.main_account_id` (storage attribution: bucket owner, caller fallback) and the caller's own `state.account` (never rebound). No forwarding hop exists: since the 2026-08 merge the same app continues straight into the S3 handlers. `fs_cache_pressure` ([hippius_s3/api/middlewares/fs_cache_pressure.py](hippius_s3/api/middlewares/fs_cache_pressure.py)) runs before auth and short-circuits PUTs with 503 + Retry-After **before reading the body** if the cache disk is ≥90% full.
 6. **PutObject endpoint** ([hippius_s3/api/s3/objects/put_object_endpoint.py:29](hippius_s3/api/s3/objects/put_object_endpoint.py)). Resolves bucket, decides if this is an S4 append (`x-amz-meta-append: true` → [extensions/append.py](hippius_s3/api/s3/extensions/append.py)), builds metadata.
@@ -195,19 +195,18 @@ Separate keystore DB for encryption keys (`HIPPIUS_KEYSTORE_DATABASE_URL`, falls
 
 ---
 
-## 6. Authentication (five methods)
+## 6. Authentication (four methods)
 
 Orchestrated by [hippius_s3/gateway/services/auth_orchestrator.py:39 `authenticate_request`](hippius_s3/gateway/services/auth_orchestrator.py). Priority order:
 
 1. **Presigned URL** — query params `X-Amz-Algorithm=AWS4-HMAC-SHA256`, `X-Amz-Credential`, `X-Amz-Signature`. Credential starts with `hip_`. Verified by [hippius_s3/gateway/middlewares/access_key_auth.py:139](hippius_s3/gateway/middlewares/access_key_auth.py).
 2. **Bearer token** — `Authorization: Bearer hip_...`. Verified against the Hippius API via [hippius_s3/gateway/services/auth_cache.py](hippius_s3/gateway/services/auth_cache.py) (Redis-cached).
 3. **Access key header** — SigV4 Authorization with credential starting `hip_`. Same verifier as presigned URL ([access_key_auth.py:35](hippius_s3/gateway/middlewares/access_key_auth.py)).
-4. **Seed phrase SigV4** — base64-encoded 12-word seed as access key ID, raw seed as secret. Verified by [hippius_s3/gateway/middlewares/sigv4.py `SigV4Verifier`](hippius_s3/gateway/middlewares/sigv4.py).
-5. **Anonymous** — GET/HEAD on public buckets with no Authorization header.
+4. **Anonymous** — GET/HEAD on public buckets with no Authorization header.
 
 Canonicalization uses `request.scope["raw_path"]` (bytes) rather than `request.url.path` to preserve exact percent-encoding. `hmac.compare_digest` is used for signature comparison (constant-time).
 
-**Token types**: Arion returns `master` or `sub` for access keys. Master tokens bypass ACL entirely ([hippius_s3/gateway/middlewares/acl.py:126-130](hippius_s3/gateway/middlewares/acl.py)) — authorization is enforced upstream by Arion. Sub-token scope evaluation is partially implemented ([hippius_s3/gateway/services/sub_token_scope.py](hippius_s3/gateway/services/sub_token_scope.py)) but **not wired** and currently imports a nonexistent `TokenAcl` — see [todo.md](todo.md).
+**Token types**: Arion returns `master` or `sub` for access keys. Master tokens bypass ACL entirely ([hippius_s3/gateway/middlewares/acl.py:126-130](hippius_s3/gateway/middlewares/acl.py)) — authorization is enforced upstream by Arion. Sub-token scope evaluation ([hippius_s3/gateway/services/sub_token_scope.py](hippius_s3/gateway/services/sub_token_scope.py)) is wired: [acl.py](hippius_s3/gateway/middlewares/acl.py) calls it on the live ACL path.
 
 ---
 
@@ -437,7 +436,6 @@ Response shape: `{"status":"success","data":{"resultType":"streams","result":[{"
 ## 11. Operational runbooks (quick pointers)
 
 - **DLQ requeue**: [hippius_s3/scripts/dlq_requeue.py](hippius_s3/scripts/dlq_requeue.py).
-- **Failed pin resubmit**: [hippius_s3/scripts/resubmit_failed_pins.py](hippius_s3/scripts/resubmit_failed_pins.py).
 - **Arion hash backfill**: [hippius_s3/scripts/backfill_arion_hash.py](hippius_s3/scripts/backfill_arion_hash.py) + [k8s/backfill-arion-hash-job.yaml](k8s/backfill-arion-hash-job.yaml).
 - **Storage-usage rollup** (the billed byte counter): [docs/runbooks/storage-usage-rollup.md](docs/runbooks/storage-usage-rollup.md)
   — alerts and what to do, why `DISABLE TRIGGER` is not a switch, diagnosing drift, the backfill.

@@ -31,9 +31,9 @@ Flow ([acl.py:70-171](acl.py)):
 
 ### [account.py](account.py) — `account_middleware`
 
-For seed-phrase auth: fetches subaccount role/credits from Arion via [gateway/services/account_service.py](../services/account_service.py). Results cached in `redis-accounts`. Populates `request.state.account` (upload/delete/credits flags, main account SS58).
+Fetches account role/credits from Arion via [gateway/services/account_service.py](../services/account_service.py). Results cached in `redis-accounts`. Populates `request.state.account` (upload/delete/credits flags, main account SS58).
 
-**Gotcha**: If Arion is down, this returns 503. There's no graceful degradation — non-seed-phrase auth methods (bearer, access key) don't hit this middleware's hot path, but seed-phrase auth blocks on Arion.
+**Gotcha**: If Arion is down, this returns 503. There's no graceful degradation — bearer and access-key auth do not hit this middleware's hot path, but an account lookup blocks on Arion.
 
 **Service accounts**: an access-key caller whose `account_address` is in `HIPPIUS_SERVICE_ACCOUNT_IDS`
 (comma-separated SS58, a GitHub secret in prod) skips both mutating-path gates — the
@@ -170,7 +170,6 @@ Not a middleware — a class used by `auth_orchestrator` and `access_key_auth`. 
 - **Canonical path**: built from `request.scope["raw_path"]` (bytes) rather than `request.url.path` ([sigv4.py:66-86](sigv4.py)) to preserve exact client percent-encoding.
 - **Host header fallback chain**: `x-forwarded-host` → `x-original-host` → `host` ([sigv4.py:118-124](sigv4.py)).
 - **Presigned URL payload hash** defaults to `UNSIGNED-PAYLOAD` ([sigv4.py:149-162](sigv4.py)); for streaming, falls back to SHA256 of empty body.
-- **Seed phrase extraction**: Authorization credential is base64-decoded to the 12-word seed ([sigv4.py:200-220](sigv4.py)). Malformed base64 → bare 403. Minor UX paper cut.
 
 ### [access_key_auth.py](access_key_auth.py) — helpers
 

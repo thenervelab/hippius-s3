@@ -19,8 +19,8 @@ stateDiagram-v2
     end note
 ```
 
-Note: `resubmit_failed_pins.py` operates on `objects.status`, **not** `object_versions.status`,
-so it does not drive this column (see the failed-pin recovery gotcha).
+Note: `objects.status` was dropped by `20251017000000_add_object_versions.sql`, so nothing drives this
+column from the objects side; `cephor_replication_status` below is the live machine.
 
 ## `cephor_replication_status` — the real completion/failure state machine
 
