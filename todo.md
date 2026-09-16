@@ -10,15 +10,8 @@ If you're new here, read [CLAUDE.md](CLAUDE.md) first for the architectural map.
 
 ```
                                     ┌───────────────────────────────────────┐
-  S3 client ──HTTPS+SigV4─────────▶ │  Gateway  (:8080)                    │
-  (aws-cli, boto3, mc, s3cmd)       │  auth · ACL · rate-limit* · audit    │
-                                    │  forward_service.py (streaming httpx)│
-                                    └────────┬──────────────────────────────┘
-                                             │ HTTP + X-Hippius-* trust headers
-                                             ▼
-                                    ┌───────────────────────────────────────┐
-                                    │  API  (:8000)                         │
-                                    │  parse_internal_headers · fs_cache_   │
+  S3 client ──HTTPS+SigV4─────────▶ │  api-local  (:8000)                   │
+  (aws-cli, boto3, mc, s3cmd)       │  auth · ACL · audit · fs_cache_       │
                                     │  pressure · input_validation          │
                                     │                                       │
                                     │  writer/ (PUT)        reader/ (GET)   │
@@ -383,25 +376,6 @@ FALSE, which for `HIPPIUS_READ_ONLY_MODE` or `HIPPIUS_BYPASS_CREDIT_CHECK` is th
 misconfiguration `_parse_bool` was written to prevent. Not a safe blanket sweep — `_parse_bool`
 raises on an unrecognised value, so any pod carrying a stray value today would start crash-looping —
 so do it deliberately, flag by flag.
-
-### P2 — Gateway → API streaming hop
-
-**What**: Every request streams through `gateway → forward_service → httpx → api`. Client body is read once via `request.stream()`, forwarded via `httpx.AsyncClient.stream()`, and the API response is re-streamed to the client via `StreamingResponse`. No buffering. ([hippius_s3/gateway/services/forward_service.py:113-170](hippius_s3/gateway/services/forward_service.py)).
-
-**Cost**: per-byte NIC traversal doubles (client→gw + gw→api), and tail latency doubles for any request where the API is slow. On large GETs this is meaningful. Keep-alive pool is shared (100 connections, 20 keepalive).
-
-**Why we can't just 307-redirect**:
-- Gateway is the only component that can verify SigV4 against the DB/Arion-backed access keys and evaluate ACL. Clients don't have auth tokens for the internal API.
-- The internal API listens inside the cluster; exposing it publicly would duplicate the auth surface.
-
-**Ideas worth exploring** (pick one, measure):
-
-1. **Merge gateway + API in the same pod.** Run one ASGI app with a "role" config: gateway role mounts the auth/ACL/forward chain and routes to local endpoints; api role exposes just `/s3`. Keeps the layering as middleware ordering rather than network hops. Tradeoff: harder to scale the two independently, but today they scale together anyway.
-2. **HTTP/2 + HPACK** between gateway and API. Cuts per-request header overhead; no behavior change required. Verify it doesn't break streaming upload chunked framing.
-3. **Dedicated cache-hit fast-path** for GETs that resolve entirely from FS cache: a lightweight sub-app mounted on the gateway that skips the httpx trip when `fs_cache_pressure` and chunks_exist_batch both say "all green". Obviously needs the gateway pod to have the FS cache volume mounted — requires redesign.
-4. **Measure first.** Add a gauge of gateway→API latency (we already emit `X-Hippius-Gateway-Time-Ms` on the forward). If the extra hop isn't actually dominating any SLO, leave it alone.
-
-No strong opinion here — needs a benchmark before we touch anything.
 
 ### P2 — `CreateBucket` lifecycle XML is parsed then discarded
 

@@ -8,13 +8,10 @@ An S3-compatible gateway for Hippius decentralized storage. Data is stored on th
 Client (AWS CLI / MinIO / boto3)
     | HTTPS + AWS SigV4
     v
-Gateway (Auth + ACL + Rate Limiting + Audit)
-    | HTTP + X-Hippius-* headers
+Hippius S3 API (auth + ACL + audit middleware, then the S3 handlers)
+    | node SSD + Redis queues
     v
-Hippius S3 API
-    | Redis queues
-    v
-Arion Workers (upload / download / unpin)
+Arion Workers (upload / unpin)
     |
     v
 Arion Storage Backend + Hippius Blockchain
@@ -24,9 +21,9 @@ Arion Storage Backend + Hippius Blockchain
 
 - **S3 Operations**: Buckets, objects, multipart uploads, metadata, tagging, ACLs, lifecycle policies
 - **S4 Extensions**: Atomic O(delta) appends with compare-and-swap semantics ([docs/s4.md](docs/s4.md))
-- **Authentication**: 5 methods (presigned URL, bearer token, access key, seed phrase SigV4, anonymous)
+- **Authentication**: 4 methods (presigned URL, bearer token, access key SigV4, anonymous)
 - **Security**: Input validation, credit verification, ACLs
-- **Encryption**: NaCl per-object keys with envelope encryption (OVH KMS in production)
+- **Encryption**: AES-256-GCM per chunk under a per-version key, envelope-wrapped (OVH KMS in production)
 - **Blockchain**: Automatic Arion storage and blockchain publishing with transaction tracking
 - **Monitoring**: OpenTelemetry with LGTM stack (Loki, Grafana, Tempo, Mimir/Prometheus)
 - **S3 Compatibility**: AWS CLI, MinIO Client, boto3, s3cmd ([docs/s3-compatibility.md](docs/s3-compatibility.md))
@@ -205,13 +202,12 @@ See [examples/py/](examples/py/) and [examples/js/](examples/js/) for more compl
 
 ## Authentication
 
-Five methods, evaluated in priority order:
+Four methods, evaluated in priority order:
 
 1. **Presigned URL** - Query params (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Signature`)
 2. **Bearer Token** - `Authorization: Bearer <token>` (`hip_*` prefixed tokens)
 3. **Access Key** - `hip_*` credentials in AWS SigV4 Authorization header
-4. **Seed Phrase SigV4** - Base64-encoded 12-word seed as access key, plain seed as secret key
-5. **Anonymous** - GET/HEAD on public buckets (no Authorization header)
+4. **Anonymous** - GET/HEAD on public buckets (no Authorization header)
 
 Get access keys at: https://console.hippius.com/dashboard/settings
 
@@ -261,10 +257,8 @@ hippius_s3/            Main API application
   cache/               Multi-layer cache (Redis + filesystem)
   dlq/                 Dead letter queues (upload, unpin)
   sql/                 Migrations and parameterized queries
+  gateway/             Auth, SigV4, ACL and audit middleware (merged into this app)
   scripts/             Operational scripts (migrate, requeue, nuke, purge)
-gateway/               Public-facing FastAPI gateway (port 8080)
-  middlewares/         Auth, SigV4, ACL, audit, CORS
-  services/            Auth orchestrator, ACL, account, forwarding
 workers/               Worker entry points (run_*_in_loop.py)
 cacher/                Substrate account data cacher
 tests/                 Unit, integration, E2E, ACL test suites

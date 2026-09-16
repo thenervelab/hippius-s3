@@ -65,9 +65,9 @@ Notes:
 | GetObject                                       | ✔         | Supports Range; If-None-Match (304); S3-like headers        | GET /{bucket}/{key}                           | test_GetObject.py, test_GetObject_Range.py, test_GetObject_Errors.py |
 | GetObjectAcl                                    | ✔         | ACL XML response via gateway                                | GET /{bucket}/{key}?acl                       | test_acl_access_keys_minio.py                                        |
 | GetObjectAttributes                             |           |                                                             |                                               |                                                                      |
-| GetObjectLegalHold                              | 501       | NotImplemented (Tier 0); see specs/s3-object-lock.md         | GET /{bucket}/{key}?legal-hold                | test_ObjectLegalHold.py                                              |
+| GetObjectLegalHold                              | ✔       | Tier 2: persisted and enforced; see specs/s3-object-lock.md         | GET /{bucket}/{key}?legal-hold                | test_ObjectLegalHold.py                                              |
 | GetObjectLockConfiguration                      | ✔         | Tier 1: returns persisted config; 404 ObjectLockConfigurationNotFoundError when unset | GET /{bucket}?object-lock      | test_BucketObjectLock.py                                             |
-| GetObjectRetention                              | 501       | NotImplemented (Tier 0); see specs/s3-object-lock.md         | GET /{bucket}/{key}?retention                 | test_ObjectRetention.py                                              |
+| GetObjectRetention                              | ✔       | Tier 2: persisted and enforced; see specs/s3-object-lock.md         | GET /{bucket}/{key}?retention                 | test_ObjectRetention.py                                              |
 | GetObjectTagging                                | ✔         | XML response                                                | GET /{bucket}/{key}?tagging                   | test_ObjectTagging.py                                                |
 | GetObjectTorrent                                |           |                                                             |                                               |                                                                      |
 | GetPublicAccessBlock                            |           |                                                             |                                               |                                                                      |
@@ -106,9 +106,9 @@ Notes:
 | PutBucketWebsite                                |           |                                                             |                                               |                                                                      |
 | PutObject                                       | ✔         | MD5 as ETag; x-amz-meta-\*                                  | PUT /{bucket}/{key}                           | test_PutObject.py, test_PutObject_Metadata.py                        |
 | PutObjectAcl                                    | ✔         | Supports canned ACLs, grant headers, or ACL XML             | PUT /{bucket}/{key}?acl                       | test_acl_access_keys_minio.py                                        |
-| PutObjectLegalHold                              | 501       | NotImplemented (Tier 0); see specs/s3-object-lock.md         | PUT /{bucket}/{key}?legal-hold                | test_ObjectLegalHold.py                                              |
+| PutObjectLegalHold                              | ✔       | Tier 2: persisted and enforced; see specs/s3-object-lock.md         | PUT /{bucket}/{key}?legal-hold                | test_ObjectLegalHold.py                                              |
 | PutObjectLockConfiguration                      | ✔         | Tier 1: persisted, not enforced (no WORM yet); see specs/s3-object-lock.md | PUT /{bucket}?object-lock        | test_BucketObjectLock.py                                             |
-| PutObjectRetention                              | 501       | NotImplemented (Tier 0); see specs/s3-object-lock.md         | PUT /{bucket}/{key}?retention                 | test_ObjectRetention.py                                              |
+| PutObjectRetention                              | ✔       | Tier 2: persisted and enforced; see specs/s3-object-lock.md         | PUT /{bucket}/{key}?retention                 | test_ObjectRetention.py                                              |
 | PutObjectTagging                                | ✔         | XML request                                                 | PUT /{bucket}/{key}?tagging                   | test_ObjectTagging.py                                                |
 | PutPublicAccessBlock                            |           |                                                             |                                               |                                                                      |
 | RenameObject                                    |           |                                                             |                                               |                                                                      |
@@ -124,7 +124,6 @@ Notes:
 
 - **Authentication**
 
-  - HMAC SigV4 via custom credentials (seed phrase based)
   - HMAC SigV4 via Hippius access keys (`hip_*`) in `Authorization` header credentials
   - SigV4 presigned URLs for `hip_*` access keys (`X-Amz-*` query authentication)
   - `Authorization: Bearer hip_*` access key support (Hippius extension)
@@ -254,6 +253,3 @@ Notes:
   the S3 path. `CopyObject` (which takes the source from the `x-amz-copy-source` header) and
   batch `DeleteObjects` (which takes keys from the request body) do not go through path parsing
   and still reach such an object if one exists.
-
-  `hippius_s3/scripts/report_delimiter_keys.py` reports any live keys containing either
-  character.

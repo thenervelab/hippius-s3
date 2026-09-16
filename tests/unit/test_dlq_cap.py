@@ -1,7 +1,7 @@
 """A10: the DLQ LPUSH is capped so a permanent-error storm can't fill the 2GB noeviction
 redis-queues instance and fail ALL writes pipeline-wide. At the cap push() is a no-op
 (drop-newest) — Postgres is the durable source of truth, so a lost failure record is
-re-derivable (scripts/resubmit_failed_pins.py). The alert fires long before the cap.
+re-derivable from the replication state. The alert fires long before the cap.
 """
 
 import sys
