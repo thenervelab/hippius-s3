@@ -4,10 +4,8 @@ WIRED TODAY: the unpin resolution query and the janitor's hard-delete ring, both
 ops scripts that issue raw DELETEs. That set is what makes the durability promise real, because it
 holds with no API code running at all.
 
-NOT WIRED YET: the delete endpoints (`DELETE ?versionId` must answer 403; a versionId-less DELETE
-must answer 200 and write a delete marker) and `DeleteObjects`. `deletion_refusal_reason` exists
-for them and is tested, but nothing calls it yet — see `specs/s3-object-lock-tier2-handoff.md` §5
-rows 1-3. Do not read this module as evidence that the API refuses a locked delete; it does not.
+ALSO WIRED: the single-object delete endpoint calls `deletion_refusal_reason`. The batch
+`DeleteObjects` path does not yet — see `specs/s3-object-lock-tier2-handoff.md` §5.
 
 Two rules are easy to get wrong and are worth stating up front, because both are load-bearing:
 

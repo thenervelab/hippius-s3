@@ -22,8 +22,7 @@
 -- predicate matches the DELETE's `is_completed = FALSE` exactly, so the planner can
 -- use it and turn the per-delete scan into a rows=1 seek.
 --
--- Built CONCURRENTLY out-of-band on prod via a k8s apply job (mirror
--- k8s/cleanup-indexes-staging-apply.yaml / migrate-recent-uploads-index-apply.yaml);
+-- Built CONCURRENTLY out-of-band on prod via a one-off k8s apply job;
 -- that job inserts the schema_migrations row before this file runs via dbmate, so
 -- dbmate sees it applied and skips it (no SHARE lock stalling PUT/DELETE on the 38 GB
 -- table during deploy). On a fresh DB (dbmate's path) the plain CREATE INDEX below is

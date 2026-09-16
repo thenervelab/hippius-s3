@@ -1,7 +1,9 @@
 # Spec: S3 Object Lock
 
-Status: Tier 0 and Tier 1 implemented. Tier 2 is designed and has contract tests
-(`xfail`), but no implementation yet. Drives compatibility with
+Status: Tier 0 and Tier 1 implemented. Tier 2 is partly implemented — per-object retention and
+legal hold are persisted, and locked versions are refused by the delete endpoints, the unpin
+resolution query and the janitor's hard-delete ring. The open items are tracked in
+`s3-object-lock-tier2-handoff.md`. Drives compatibility with
 `aws s3api put-object-lock-configuration` and the surrounding Object Lock APIs from the
 AWS S3 surface.
 
@@ -171,7 +173,7 @@ Tier 1 simplifications vs AWS (documented, acceptable for the backup-probe use c
 
 ### Tier 2 — real WORM enforcement (future epic)
 
-Honest WORM semantics require S3 versioning, which hippius-s3 currently does not have.
+Honest WORM semantics require S3 versioning, which shipped separately.
 Implementation scope:
 
 1. **Bucket versioning** — `PutBucketVersioning`, `GetBucketVersioning`,

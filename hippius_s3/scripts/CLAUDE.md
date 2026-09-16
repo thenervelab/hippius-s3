@@ -19,7 +19,6 @@ Operational and migration scripts. Most are invoked manually by an operator duri
 | Script | Purpose |
 |---|---|
 | [dlq_requeue.py](dlq_requeue.py) | CLI to requeue DLQ entries — per-identifier or bulk. Supports `--force` (requeue permanent-classified failures) and `--bypass-billing`. |
-| [resubmit_failed_pins.py](resubmit_failed_pins.py) | Retry failed simple uploads by re-enqueuing pin requests. Access-key auth only (seed-phrase support removed). |
 | [recover_missing_backend.py](recover_missing_backend.py) | Restore accidentally-deleted `chunk_backend` rows from Arion by matching identifiers. |
 
 ### Audits (read-only)

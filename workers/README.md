@@ -10,6 +10,9 @@ Background workers that process async operations via Redis queues. Each worker r
 | Arion Unpinner | `run_arion_unpinner_in_loop.py` | `arion_unpin_requests` | Single instance | Delete chunks from Arion |
 | Janitor | `run_janitor_in_loop.py` | N/A (polling) | Single instance | FS cache cleanup at `/var/lib/hippius/object_cache` |
 | Account Cacher | `run_account_cacher_in_loop.py` | N/A (scheduled) | Single instance | Warm account credit cache in Redis |
+| Plans Cacher | `run_plans_cacher_in_loop.py` | N/A (scheduled) | Single instance (**must stay 1**) | Warm the billing-plan catalog + account→plan map |
+| Usage Rollup | `run_usage_rollup_in_loop.py` | N/A (polling) | Single instance (**must stay 1**) | Fold the storage delta ledger into `bucket_storage_usage` |
+| Purger | `run_purger_in_loop.py` | N/A (polling) | Single instance | Purge deleted accounts' objects |
 | MPU Reaper | `run_mpu_reaper_in_loop.py` | N/A (polling) | Single instance | Reaps abandoned in-flight multipart uploads |
 
 ### Scaling Notes

@@ -55,7 +55,7 @@ Requirements:
 
 ## Test Flow
 
-1. **Auth**: Seed phrase base64-encoded as access key, plain seed as secret (SigV4)
+1. **Auth**: `hip_*` access key and secret (SigV4)
 2. **Bucket creation**: `PUT /{bucket}`
 3. **Object upload**: `PUT /{bucket}/{key}` -> chunks written to FS cache + Redis queue -> Arion uploader processes
 4. **Object read**: `GET /{bucket}/{key}` -> served from FS cache (write-through)

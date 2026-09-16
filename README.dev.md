@@ -97,12 +97,11 @@ Services that come up:
 
 | Service | Port | Purpose |
 |---|---|---|
-| `gateway` | 8080 | Public-facing. Hit this for S3 traffic. |
-| `api` | 8000 | Internal. Gateway forwards here. |
+| `api` | 8080 → 8000 | The merged app (auth + ACL + S3 handlers). Hit this for S3 traffic. |
 | `postgres` | 5432 | Main DB + keystore. |
 | `redis` | 6379 | General cache. |
 | `redis-accounts` | 6380 | Account cache. |
-| `redis-queues` | 6382 | Work queues + pub/sub. |
+| `redis-queues` | 6382 | Work queues. |
 | `redis-rate-limiting` | 6383 | Rate limit counters. |
 | `redis-acl` | 6384 | ACL cache. |
 | Arion worker pods | — | Uploader, unpinner, purger, janitor. |
@@ -581,7 +580,6 @@ We don't nitpick style (ruff handles that). We don't block on taste.
 ### 9.1 "My changes don't show up"
 
 - Did you save the file?
-- Are you hitting the gateway (`:8080`) or the api (`:8000`)? The gateway forwards, so sometimes your change to an endpoint works on `:8000` direct but your client is talking to `:8080`.
 - Is uvicorn's reloader stuck? `docker compose restart api`.
 
 ### 9.2 "The test passes locally but fails in CI"
@@ -682,7 +680,6 @@ Don't optimize based on intuition. Measure, change, re-measure.
 - **S4** — Hippius's S3 extension with atomic append. Spec at [docs/s4.md](docs/s4.md).
 - **SigV4** — AWS Signature Version 4. The signing scheme we accept for S3 requests.
 - **Storage version** — version of the crypto + layout scheme for an object_version. v5 is current; v≤4 is decrypt-only.
-- **Subaccount / seed phrase** — alternative to access keys. Derives SS58 address from a 12-word mnemonic.
 
 ---
 
