@@ -581,7 +581,6 @@ We don't nitpick style (ruff handles that). We don't block on taste.
 ### 9.1 "My changes don't show up"
 
 - Did you save the file?
-- Are you hitting the gateway (`:8080`) or the api (`:8000`)? The gateway forwards, so sometimes your change to an endpoint works on `:8000` direct but your client is talking to `:8080`.
 - Is uvicorn's reloader stuck? `docker compose restart api`.
 
 ### 9.2 "The test passes locally but fails in CI"
@@ -682,7 +681,6 @@ Don't optimize based on intuition. Measure, change, re-measure.
 - **S4** — Hippius's S3 extension with atomic append. Spec at [docs/s4.md](docs/s4.md).
 - **SigV4** — AWS Signature Version 4. The signing scheme we accept for S3 requests.
 - **Storage version** — version of the crypto + layout scheme for an object_version. v5 is current; v≤4 is decrypt-only.
-- **Subaccount / seed phrase** — alternative to access keys. Derives SS58 address from a 12-word mnemonic.
 
 ---
 
