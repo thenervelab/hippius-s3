@@ -846,6 +846,11 @@ class Config:
     # Per-scrape timeout for the pool-fullness probe; short relative to the cycle so a hung mgr
     # falls back to statvfs rather than stalling the loop.
     janitor_ceph_probe_timeout_seconds: float = env("HIPPIUS_JANITOR_CEPH_PROBE_TIMEOUT_SECONDS:5", convert=float)
+    # Pool FS GC (walks, SQL evict, Ceph mgr pressure). Default on: prod and e2e still
+    # own a shared cache mount. Staging unmounts that PVC; set false so this process
+    # keeps hard-delete / version-reap / sentinel / A21 without walking an empty overlay
+    # or publishing container-root disk as fs_cache:pressure.
+    janitor_fs_gc_enabled: bool = env("HIPPIUS_JANITOR_FS_GC_ENABLED:true", convert=_parse_bool)
     # Max soft-deleted objects hard-deleted per janitor cycle. The find query is
     # an index-probe over this many candidates; keep it bounded so a large
     # backlog drains gradually instead of in one DELETE-cascade burst.

@@ -111,8 +111,8 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: DATABASE_URL
-            # Source (node-local SSD ingest) and destination (shared ceph pool) —
-            # mounted at the same paths the api uses, so the relative part dirs line up.
+            # Node-local SSD ingest — same hostPath the api writes. Drain verifies
+            # the part here and enqueues the node-local uploader; no shared cache.
             - name: CEPHOR_SSD_ROOT
               value: /var/lib/hippius/local_object_cache
             # The drain is the sole upload producer: once a part is verified whole on the
