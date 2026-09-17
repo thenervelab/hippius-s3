@@ -427,3 +427,66 @@ async def pg_tx(pg_conn: asyncpg.Connection) -> AsyncGenerator[asyncpg.Connectio
         yield pg_conn
     finally:
         await tr.rollback()
+
+
+# --------------------------------------------------------------------------------------------
+# The storage-usage version lock ships in a SEPARATE release step from the code that makes it safe.
+# See docs/runbooks/prod-release-storage-rollup.md.
+#
+# The trigger takes FOR NO KEY UPDATE on a version row while holding the objects row, which imposes
+# "lock objects before object_versions". Production's fleet must be carrying the objects-first code
+# BEFORE that lock goes live, or concurrent same-key PUTs deadlock -- measured at 24% of requests at
+# concurrency 32. So step A ships the code with UNLOCKED triggers and step B installs the lock into a
+# fleet that is ready for it.
+#
+# Between those steps the counter legitimately over-counts under concurrency. That is harmless:
+# storage_usage_rollup_state.backfilled_at is still NULL, so usage_service refuses to serve a number
+# at all, and the backfill -- which runs after step B -- SETS every counter to the truth.
+#
+# Tests asserting the LOCKED behaviour are skipped when the schema does not have it yet, rather than
+# deleted or weakened. Step B's schema runs every one of them.
+# --------------------------------------------------------------------------------------------
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "requires_version_lock: asserts behaviour that exists only once the storage-usage version "
+        "lock is installed (release step B)",
+    )
+
+
+@pytest.fixture(scope="session")
+def version_lock_installed() -> bool:
+    """Whether this schema has the storage-usage version lock. Probed ONCE per session.
+
+    Session-scoped because it is a property of the schema, not of a test; a fresh connection per test
+    would be ~20 pointless round trips.
+    """
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        return True  # no database reachable; the tests themselves skip for that reason
+
+    async def _probe() -> bool:
+        conn = await asyncpg.connect(dsn)
+        try:
+            return bool(
+                await conn.fetchval("SELECT count(*) FROM pg_proc WHERE proname = 'storage_usage_version_bytes_locked'")
+            )
+        finally:
+            await conn.close()
+
+    return asyncio.run(_probe())
+
+
+@pytest.fixture(autouse=True)
+def _skip_without_version_lock(request: pytest.FixtureRequest) -> None:
+    """Skip a lock-dependent test when the schema predates the lock, saying which step it is in."""
+    if request.node.get_closest_marker("requires_version_lock") is None:
+        return
+
+    if not request.getfixturevalue("version_lock_installed"):
+        pytest.skip(
+            "the storage-usage version lock is not installed in this schema (release step A). "
+            "Step B installs it and these assertions then run."
+        )

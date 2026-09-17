@@ -1545,6 +1545,9 @@ mod tests {
         for number in 1..=3_u32 {
             seed_part(ssd_dir.path(), &store, &part_at(5, number), &[b"backlog part"]).await;
         }
+        // The worklist only offers parts whose version has an address; the fake enqueuer, not
+        // the DB, is what makes part 1's inline enqueue not-ready here.
+        seed_object_version(&pool, &part_at(5, 1), Some("addr"), Some(1), None).await;
 
         let token = CancellationToken::new();
         let tally = drain_until_empty(&ssd, &store, &DeferPartOneEnqueuer, None, None, &token, 1)
