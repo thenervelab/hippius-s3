@@ -12,6 +12,10 @@ Runs periodically and:
 - Cleans orphan `.tmp.*` files (from worker crashes during atomic write).
 - Hard-deletes soft-deleted objects whose backends have confirmed unpin.
 
+FS walks / SQL evict / pool-pressure publish are gated by
+`HIPPIUS_JANITOR_FS_GC_ENABLED` (default true). Staging unmounts the shared
+cache PVC and sets this false so the process stays the DB-GC worker.
+
 Disk-pressure modes (all still replication-gated):
 - Normal   (<85%):  honor hot retention; evict only replicated + aged + cold.
 - Elevated (85-95%): halve hot retention; evict replicated + cold regardless of age.
@@ -2323,9 +2327,12 @@ async def run_janitor_loop():
         if db_pool is not None:
             await db_pool.close()
 
+    fs_gc = bool(config.janitor_fs_gc_enabled)
+    fs_store = None
     try:
         db_pool = await asyncpg.create_pool(config.database_url, min_size=2, max_size=concurrency + 4)
-        fs_store = create_fs_store(config)
+        if fs_gc:
+            fs_store = create_fs_store(config)
         redis_client = Redis.from_url(config.redis_queues_url)
 
         # Initialize janitor-owned OTel metrics
@@ -2353,52 +2360,60 @@ async def run_janitor_loop():
         # absence (TTL lapse), so a broken publisher must NOT crashloop the janitor — the one
         # process that actually frees cache space. This narrow except degrades ONLY the pressure
         # publisher; the DB pool / fs_store / queues Redis above stay fatal.
+        #
+        # Skip entirely when FS GC is off: this pod has no cache mount, and publishing
+        # container-root statvfs as fs_cache:pressure would 503 ingest on a lie.
         def _record_pressure_publish() -> None:
             global _fs_pressure_last_publish_at
             _fs_pressure_last_publish_at = time.time()
 
-        try:
-            cache_redis_client = create_redis_client(config.redis_url)
-            pressure_publisher = PressurePublisher(
-                cache_redis_client,
-                Path(config.object_cache_dir),
-                mgr_metrics_url=config.janitor_ceph_mgr_metrics_url,
-                pools=config.janitor_ceph_pools.split(","),
-                probe_timeout_seconds=config.janitor_ceph_probe_timeout_seconds,
-                on_publish=_record_pressure_publish,
-            )
-            pressure_publish_task = asyncio.create_task(pressure_publisher.run())
-        except Exception as exc:
-            # fs_cache_pressure_signal_age_seconds stays at -1 and the absence alert fires.
-            logger.warning(
-                "pressure publisher setup failed (%s); janitor continues WITHOUT publishing "
-                "fs_cache:pressure — api pods fall back to node-local statvfs",
-                exc,
-            )
+        if fs_gc:
+            try:
+                cache_redis_client = create_redis_client(config.redis_url)
+                pressure_publisher = PressurePublisher(
+                    cache_redis_client,
+                    Path(config.object_cache_dir),
+                    mgr_metrics_url=config.janitor_ceph_mgr_metrics_url,
+                    pools=config.janitor_ceph_pools.split(","),
+                    probe_timeout_seconds=config.janitor_ceph_probe_timeout_seconds,
+                    on_publish=_record_pressure_publish,
+                )
+                pressure_publish_task = asyncio.create_task(pressure_publisher.run())
+            except Exception as exc:
+                # fs_cache_pressure_signal_age_seconds stays at -1 and the absence alert fires.
+                logger.warning(
+                    "pressure publisher setup failed (%s); janitor continues WITHOUT publishing "
+                    "fs_cache:pressure — api pods fall back to node-local statvfs",
+                    exc,
+                )
     except BaseException:
         await _shutdown()
         raise
 
     logger.info("Starting janitor service...")
-    logger.info(f"FS store root: {config.object_cache_dir}")
+    if fs_gc:
+        logger.info(f"FS store root: {config.object_cache_dir}")
+    else:
+        logger.info("FS cache GC disabled; DB durability phases only")
     logger.info(f"MPU stale threshold: {config.mpu_stale_seconds}s")
     logger.info(
         f"Aged-pending-orphan gauge grace: {config.aged_orphan_gauge_grace_seconds}s "
         f"(soak-visibility window, decoupled from the {config.mpu_sweep_grace_seconds}s reaper sweep grace)"
     )
-    logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")
-    logger.info(f"FS hot retention: {getattr(config, 'fs_cache_hot_retention_seconds', 10800)}s")
     logger.info(f"Cleanup concurrency: {concurrency}")
-    if config.janitor_ceph_mgr_metrics_url and config.janitor_ceph_pools:
-        logger.info(
-            f"Pool-fullness gate ACTIVE: pools={config.janitor_ceph_pools} via {config.janitor_ceph_mgr_metrics_url} "
-            f"(pressure = max(statvfs, fullest pool %USED))"
-        )
-    else:
-        logger.warning(
-            "Pool-fullness gate INACTIVE (HIPPIUS_JANITOR_CEPH_MGR_METRICS_URL / _POOLS unset); "
-            "pressure keyed on statvfs, which sees the PVC quota not the backing pool — the 2026-07-24 blind spot"
-        )
+    if fs_gc:
+        logger.info(f"FS GC max age: {config.fs_cache_gc_max_age_seconds}s")
+        logger.info(f"FS hot retention: {getattr(config, 'fs_cache_hot_retention_seconds', 10800)}s")
+        if config.janitor_ceph_mgr_metrics_url and config.janitor_ceph_pools:
+            logger.info(
+                f"Pool-fullness gate ACTIVE: pools={config.janitor_ceph_pools} via {config.janitor_ceph_mgr_metrics_url} "
+                f"(pressure = max(statvfs, fullest pool %USED))"
+            )
+        else:
+            logger.warning(
+                "Pool-fullness gate INACTIVE (HIPPIUS_JANITOR_CEPH_MGR_METRICS_URL / _POOLS unset); "
+                "pressure keyed on statvfs, which sees the PVC quota not the backing pool — the 2026-07-24 blind spot"
+            )
 
     # Sleep intervals: shorter under disk pressure to catch up
     sleep_normal = 600  # 10m
@@ -2412,8 +2427,13 @@ async def run_janitor_loop():
             _cycle_started = time.time()
             logger.info("Janitor cycle starting...")
             # Refresh disk/pressure gauges up front, and read pressure ONCE for the whole cycle.
-            await _update_disk_metrics(fs_store.root)
-            pressure = _pressure_mode(fs_store.root)
+            # No cache mount when FS GC is off: do not statvfs the container root.
+            if fs_gc:
+                assert fs_store is not None
+                await _update_disk_metrics(fs_store.root)
+                pressure = _pressure_mode(fs_store.root)
+            else:
+                pressure = 0
 
             # --- DB-only DURABILITY phases run FIRST ------------------------------------------
             # These used to run LAST, behind two full-tree FS walks. cleanup_stale_parts could
@@ -2444,7 +2464,7 @@ async def run_janitor_loop():
             # ELEVATED pressure rotates a smaller shard count (see _shards_for_pressure); CRITICAL
             # walks the whole tree with the wall-clock budget lifted entirely — freeing space must
             # never be capped by a clock.
-            shards = _shards_for_pressure(pressure)
+            shards = _shards_for_pressure(pressure) if fs_gc else 1
             walk_shard = _walk_shard % shards
             publish_sweep = walk_shard == shards - 1  # census publishes when the sweep wraps
             walk_conc = max(1, config.janitor_walk_concurrency)
@@ -2458,41 +2478,43 @@ async def run_janitor_loop():
             versions_reaped = 0
             sql_evicted = 0
 
-            # Phase (SQL EVICT): keyset-cursored discovery over fs_cache_inventory evicts only the
-            # fully-replicated, aged, cold candidates the index already knows about — O(evictable),
-            # not the walk's O(resident) CephFS crawl. Runs BEFORE the walk: in Wave 4 both engines
-            # coexist and are mutually idempotent (delete_part/clear_cached no-op on missing). The
-            # kill switch (HIPPIUS_JANITOR_SQL_MAX_DELETES_PER_CYCLE=0) makes it a no-op for rollback.
-            try:
-                _janitor_phase = 5  # sql_evict
-                sql_evicted = await evict_from_inventory(db_pool, fs_store, redis_client, pressure=pressure)
-            except Exception as e:
-                logger.error(f"SQL eviction error: {e}", exc_info=True)
+            if fs_gc:
+                assert fs_store is not None
+                # Phase (SQL EVICT): keyset-cursored discovery over fs_cache_inventory evicts only the
+                # fully-replicated, aged, cold candidates the index already knows about — O(evictable),
+                # not the walk's O(resident) CephFS crawl. Runs BEFORE the walk: in Wave 4 both engines
+                # coexist and are mutually idempotent (delete_part/clear_cached no-op on missing). The
+                # kill switch (HIPPIUS_JANITOR_SQL_MAX_DELETES_PER_CYCLE=0) makes it a no-op for rollback.
+                try:
+                    _janitor_phase = 5  # sql_evict
+                    sql_evicted = await evict_from_inventory(db_pool, fs_store, redis_client, pressure=pressure)
+                except Exception as e:
+                    logger.error(f"SQL eviction error: {e}", exc_info=True)
 
-            # Phase A (UNIFIED): ONE FS walk applies stale-reap + age-GC + census + orphan-tmp per
-            # part dir. This replaces the three separate full-tree walks that each independently
-            # crawled the shard (3× the CephFS MDS metadata load, ~3× the cycle time); the deletion
-            # RULES are unchanged (shared helpers), only the WALK is merged. The single walk gets
-            # ONE budget, unbounded at Critical — that is the ~3× cycle-time win.
-            try:
-                _janitor_phase = 1  # parts_unified
-                unified = await cleanup_parts_unified(
-                    db_pool,
-                    fs_store,
-                    redis_client,
-                    pressure=pressure,
-                    shard=walk_shard,
-                    shards=shards,
-                    walk_concurrency=walk_conc,
-                    deadline=_walk_deadline(loop, pressure, budget),
-                    publish_sweep=publish_sweep,
-                )
-                stale_count = unified["stale_mtime"]
-                abandoned_count = unified["abandoned"]
-                gc_count = unified["gc"]
-                tmp_count = unified["tmp"]
-            except Exception as e:
-                logger.error(f"Unified parts cleanup error: {e}", exc_info=True)
+                # Phase A (UNIFIED): ONE FS walk applies stale-reap + age-GC + census + orphan-tmp per
+                # part dir. This replaces the three separate full-tree walks that each independently
+                # crawled the shard (3× the CephFS MDS metadata load, ~3× the cycle time); the deletion
+                # RULES are unchanged (shared helpers), only the WALK is merged. The single walk gets
+                # ONE budget, unbounded at Critical — that is the ~3× cycle-time win.
+                try:
+                    _janitor_phase = 1  # parts_unified
+                    unified = await cleanup_parts_unified(
+                        db_pool,
+                        fs_store,
+                        redis_client,
+                        pressure=pressure,
+                        shard=walk_shard,
+                        shards=shards,
+                        walk_concurrency=walk_conc,
+                        deadline=_walk_deadline(loop, pressure, budget),
+                        publish_sweep=publish_sweep,
+                    )
+                    stale_count = unified["stale_mtime"]
+                    abandoned_count = unified["abandoned"]
+                    gc_count = unified["gc"]
+                    tmp_count = unified["tmp"]
+                except Exception as e:
+                    logger.error(f"Unified parts cleanup error: {e}", exc_info=True)
 
             # Phase D: hard-delete soft-deleted objects where all unpins are confirmed (DB-bound,
             # batch-capped — cannot starve the cycle).

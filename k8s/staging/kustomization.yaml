@@ -38,9 +38,12 @@ patches:
   - path: environment-patch.yaml
   - path: resource-limits.yaml
   - path: services-patch.yaml
-  # Slice 2 trial: global pool-era uploader off. Node-local arion-uploader-local
-  # remains. Recover of pool leftovers is done; new writes never hit the pool.
+  # Slice 2: unmount the shared cache. Global pool-era uploader off (node-local
+  # remains). Janitor is DB-GC only. The three CephFS claims (object-cache,
+  # persist, dlq) are deleted with this overlay.
   - path: arion-uploader-scale.yaml
+  - path: janitor-db-only.yaml
+  - path: drop-ceph-pvcs.yaml
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api

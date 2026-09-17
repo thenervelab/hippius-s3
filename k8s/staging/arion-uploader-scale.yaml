@@ -1,6 +1,19 @@
+# Global pool-era uploader is off on staging (node-local uploader DaemonSet remains).
+# Drop the cache claim too so the PVC can be deleted.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: arion-uploader
 spec:
   replicas: 0
+  template:
+    spec:
+      containers:
+        - name: arion-uploader
+          volumeMounts:
+            - $patch: delete
+              mountPath: /var/lib/hippius/object_cache
+      volumes:
+        - $patch: delete
+          name: object-cache
+
