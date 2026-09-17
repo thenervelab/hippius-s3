@@ -38,6 +38,9 @@ patches:
   - path: environment-patch.yaml
   - path: resource-limits.yaml
   - path: services-patch.yaml
+  # Slice 2 trial: global pool-era uploader off. Node-local arion-uploader-local
+  # remains. Recover of pool leftovers is done; new writes never hit the pool.
+  - path: arion-uploader-scale.yaml
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api
