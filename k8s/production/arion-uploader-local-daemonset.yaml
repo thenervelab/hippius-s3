@@ -7,9 +7,8 @@
 # Until then the SSD copy is the only copy, so this pod MUST run on the node that holds it:
 # a DaemonSet over the same node label as api-local / drain-agent, never a Deployment.
 #
-# Coexists with the base `arion-uploader` Deployment, which keeps draining the GLOBAL queue
-# for pool-era parts (bytes in the CephFS pool) until the pool is decommissioned. Same image,
-# same script: NODE_NAME set is what makes this one node-scoped.
+# The global `arion-uploader` Deployment is replicas 0 (node-local is the live consumer).
+# Same image, same script: NODE_NAME set is what makes this one node-scoped.
 #
 # == Volumes ==
 #  * SSD source: the SAME hostPath the api and drain-agent use — the dedicated /s3-data NVMe
