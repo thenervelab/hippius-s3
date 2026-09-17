@@ -77,7 +77,11 @@ class UploadResponse(BaseModel):
     upload_id: str
     timestamp: int
     size_bytes: int = 0
+    # HCFS's path hash: what /download and /delete address the file by. Not an Arion id.
     file_id: str
+    # The hash Arion registered the file under. None from HCFS servers that predate the field;
+    # "" when the server has no Arion backend.
+    arion_hash: str | None = None
 
     @property
     def cid(self) -> str:
@@ -103,26 +107,6 @@ class FileStatusResponse(BaseModel):
     file_url: str
     created_at: str
     updated_at: str
-
-
-class FileItem(BaseModel):
-    file_id: str
-    cid: str
-    original_name: str
-    size_bytes: int
-    status: str
-    pinned_node_ids: list[str]
-    active_replica_count: int
-    miners: Any
-    updated_at: str
-    created_at: str
-
-
-class ListFilesResponse(BaseModel):
-    count: int
-    next: str | None
-    previous: str | None
-    results: list[FileItem]
 
 
 class DeleteResult(BaseModel):
@@ -155,14 +139,6 @@ class BatchDeleteResult(BaseModel):
 
 class BatchDeleteResponse(BaseModel):
     Success: BatchDeleteResult
-
-
-class DownloadMetadata(BaseModel):
-    file_id: str
-    user_id: str
-    size_bytes: str
-    revision_seq: str
-    revision_id: str
 
 
 class HippiusAPIError(Exception):

@@ -24,7 +24,7 @@ tracer = trace.get_tracer(__name__)
 
 # The storage tiers a chunk read can be served from, closed by construction so the `tier`
 # label cannot drift into unbounded cardinality.
-ChunkReadTier = Literal["local", "peer", "pool"]
+ChunkReadTier = Literal["local", "peer", "pool", "backend"]
 
 # Why a peer fetch did not happen, or its answer was not used. Closed by construction, like
 # ChunkReadTier. The reasons demand different responses and must stay distinguishable:
@@ -128,7 +128,6 @@ class MetricsCollector:
         self._queue_lengths: dict[str, int] = {}
         self._used_mem = 0
         self._max_mem = 0
-        self._backup_last_success_timestamp = 0.0
         self._db_pool_size = 0
         self._db_pool_free = 0
         self._db_pool_used = 0
@@ -360,24 +359,6 @@ class MetricsCollector:
             unit="1",
         )
 
-        self.downloader_requests_total = self.meter.create_counter(
-            name="downloader_requests_total",
-            description="Total downloader requests processed",
-            unit="1",
-        )
-
-        self.downloader_duration = self.meter.create_histogram(
-            name="downloader_duration_seconds",
-            description="Duration of downloader processing",
-            unit="s",
-        )
-
-        self.downloader_chunks_fetched = self.meter.create_counter(
-            name="downloader_chunks_fetched_total",
-            description="Total chunks fetched from backends",
-            unit="1",
-        )
-
         self.unpinner_duration = self.meter.create_histogram(
             name="unpinner_duration_seconds",
             description="Duration of unpinner processing",
@@ -396,42 +377,6 @@ class MetricsCollector:
             unit="1",
         )
 
-        self.backup_cycles_total = self.meter.create_counter(
-            name="backup_cycles_total",
-            description="Total backup cycles completed",
-            unit="1",
-        )
-
-        self.backup_database_duration = self.meter.create_histogram(
-            name="backup_database_duration_seconds",
-            description="Duration to backup each database",
-            unit="s",
-        )
-
-        self.backup_database_size = self.meter.create_histogram(
-            name="backup_database_size_bytes",
-            description="Backup file size per database",
-            unit="bytes",
-        )
-
-        self.backup_upload_duration = self.meter.create_histogram(
-            name="backup_upload_duration_seconds",
-            description="S3 upload duration per database backup",
-            unit="s",
-        )
-
-        self.backup_databases_count = self.meter.create_counter(
-            name="backup_databases_count",
-            description="Count of databases backed up per cycle",
-            unit="1",
-        )
-
-        self.backup_cleanup_deleted_count = self.meter.create_counter(
-            name="backup_cleanup_deleted_count",
-            description="Old backups deleted during retention cleanup",
-            unit="1",
-        )
-
         self.meter.create_observable_gauge(
             name="redis_memory_used_bytes", callbacks=[self._obs_redis_used_mem], description="Redis used memory bytes"
         )
@@ -442,12 +387,6 @@ class MetricsCollector:
 
         self.meter.create_observable_gauge(
             name="hippius_queue_length", callbacks=[self._obs_queue_lengths], description="Length of Redis queues"
-        )
-
-        self.meter.create_observable_gauge(
-            name="backup_last_success_timestamp",
-            callbacks=[self._obs_backup_last_success],
-            description="Unix timestamp of last successful backup cycle",
         )
 
         self.meter.create_observable_gauge(
@@ -466,12 +405,6 @@ class MetricsCollector:
             description="Database connection pool used connections",
         )
 
-        self.gateway_overhead_duration = self.meter.create_histogram(
-            name="gateway_overhead_seconds",
-            description="Gateway middleware processing time excluding body streaming",
-            unit="s",
-        )
-
         self.auth_cache_hits = self.meter.create_counter(
             name="auth_cache_hits_total",
             description="Total auth cache hits",
@@ -481,18 +414,6 @@ class MetricsCollector:
         self.auth_cache_misses = self.meter.create_counter(
             name="auth_cache_misses_total",
             description="Total auth cache misses",
-            unit="1",
-        )
-
-        self.seed_auth_cache_hits = self.meter.create_counter(
-            name="seed_auth_cache_hits_total",
-            description="Total seed phrase auth cache hits",
-            unit="1",
-        )
-
-        self.seed_auth_cache_misses = self.meter.create_counter(
-            name="seed_auth_cache_misses_total",
-            description="Total seed phrase auth cache misses",
             unit="1",
         )
 
@@ -554,21 +475,6 @@ class MetricsCollector:
             name="purger_backpressure_waits_total",
             description="Times a purge job parked because an unpin queue was over its high-water mark",
             unit="1",
-        )
-
-        self.orphan_checker_cycles_total = self.meter.create_counter(
-            name="orphan_checker_cycles_total", description="Total orphan-checker cycles run", unit="1"
-        )
-        self.orphan_checker_files_scanned_total = self.meter.create_counter(
-            name="orphan_checker_files_scanned_total",
-            description="On-chain files scanned by the orphan checker",
-            unit="1",
-        )
-        self.orphan_checker_orphans_found_total = self.meter.create_counter(
-            name="orphan_checker_orphans_found_total", description="Orphaned files found + enqueued for unpin", unit="1"
-        )
-        self.orphan_checker_duration_seconds = self.meter.create_histogram(
-            name="orphan_checker_duration_seconds", description="Orphan-checker cycle duration", unit="s"
         )
 
         self.account_cacher_cycles_total = self.meter.create_counter(
@@ -683,9 +589,6 @@ class MetricsCollector:
 
     def set_queue_length(self, queue_name: str, length: int) -> None:
         self._queue_lengths[queue_name] = length
-
-    def _obs_backup_last_success(self, _: object) -> list[metrics.Observation]:
-        return [metrics.Observation(self._backup_last_success_timestamp, {})]
 
     def _obs_db_pool_size(self, _: object) -> list[metrics.Observation]:
         return [metrics.Observation(self._db_pool_size, {})]
@@ -844,7 +747,7 @@ class MetricsCollector:
     def record_chunk_read_tier(self, tier: ChunkReadTier) -> None:
         """Count one chunk read against the tier that served it.
 
-        The `Literal` is what keeps this label bounded: three values fixed in code, so it
+        The `Literal` is what keeps this label bounded: four values fixed in code, so it
         cannot become a cardinality problem the way a caller-supplied string would.
         """
         self.chunk_reads_by_tier.add(1, attributes={"tier": tier})
@@ -928,91 +831,11 @@ class MetricsCollector:
             if duration is not None:
                 self.unpinner_duration.record(duration, attributes=attributes)
 
-    def record_downloader_operation(
-        self,
-        backend: str,
-        success: bool,
-        duration: Optional[float] = None,
-        num_chunks: int = 0,
-    ) -> None:
-        attributes = {
-            "backend": backend,
-            "success": str(success).lower(),
-        }
-
-        self.downloader_requests_total.add(1, attributes=attributes)
-
-        if num_chunks > 0:
-            self.downloader_chunks_fetched.add(num_chunks, attributes=attributes)
-
-        if duration is not None:
-            self.downloader_duration.record(duration, attributes=attributes)
-
-    def record_gateway_overhead(
-        self,
-        duration: float,
-        method: str,
-        status_code: int,
-        handler: Optional[str] = None,
-    ) -> None:
-        attributes: dict[str, str] = {
-            "method": method,
-            "status_code": str(status_code),
-        }
-        if handler:
-            attributes["handler"] = handler
-
-        self.gateway_overhead_duration.record(duration, attributes=attributes)
-
     def record_auth_cache(self, hit: bool) -> None:
         if hit:
             self.auth_cache_hits.add(1)
         else:
             self.auth_cache_misses.add(1)
-
-    def record_seed_auth_cache(self, hit: bool) -> None:
-        if hit:
-            self.seed_auth_cache_hits.add(1)
-        else:
-            self.seed_auth_cache_misses.add(1)
-
-    def record_backup_operation(
-        self,
-        database_name: str,
-        success: bool,
-        backup_duration: Optional[float] = None,
-        backup_size_bytes: Optional[int] = None,
-        upload_duration: Optional[float] = None,
-    ) -> None:
-        attributes = {
-            "database": database_name,
-            "success": str(success).lower(),
-        }
-
-        if backup_duration is not None:
-            self.backup_database_duration.record(backup_duration, attributes=attributes)
-
-        if backup_size_bytes is not None:
-            self.backup_database_size.record(backup_size_bytes, attributes=attributes)
-
-        if upload_duration is not None:
-            self.backup_upload_duration.record(upload_duration, attributes=attributes)
-
-        if success:
-            self.backup_databases_count.add(1, attributes=attributes)
-
-    def record_backup_cycle(self, success: bool, num_databases: int = 0) -> None:
-        attributes = {"success": str(success).lower()}
-        self.backup_cycles_total.add(1, attributes=attributes)
-
-        if success:
-            import time
-
-            self._backup_last_success_timestamp = time.time()
-
-    def record_backup_cleanup(self, database_name: str, deleted_count: int) -> None:
-        attributes = {"database": database_name}
-        self.backup_cleanup_deleted_count.add(deleted_count, attributes=attributes)
 
     def record_mpu_reaper_cycle(
         self,
@@ -1039,20 +862,6 @@ class MetricsCollector:
 
     def record_purger_backpressure_wait(self) -> None:
         self.purger_backpressure_waits_total.add(1)
-
-    def record_orphan_checker_cycle(
-        self,
-        success: bool,
-        files_scanned: int,
-        orphans_found: int,
-        duration: float,
-    ) -> None:
-        self.orphan_checker_cycles_total.add(1, attributes={"success": str(success).lower()})
-        self.orphan_checker_duration_seconds.record(duration)
-        if files_scanned > 0:
-            self.orphan_checker_files_scanned_total.add(files_scanned)
-        if orphans_found > 0:
-            self.orphan_checker_orphans_found_total.add(orphans_found)
 
     def record_account_cacher_cycle(
         self,
@@ -1175,25 +984,7 @@ class NullMetricsCollector:
     def record_unpinner_operation(self, *args: object, **kwargs: object) -> None:
         pass
 
-    def record_downloader_operation(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_gateway_overhead(self, *args: object, **kwargs: object) -> None:
-        pass
-
     def record_auth_cache(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_seed_auth_cache(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_backup_operation(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_backup_cycle(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_backup_cleanup(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_mpu_reaper_cycle(self, *args: object, **kwargs: object) -> None:
@@ -1203,9 +994,6 @@ class NullMetricsCollector:
         pass
 
     def record_purger_backpressure_wait(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    def record_orphan_checker_cycle(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_plan_gate(self, *args: object, **kwargs: object) -> None:

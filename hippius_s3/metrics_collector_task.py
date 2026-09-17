@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+from typing import Any
 from typing import Optional
 from typing import Union
 
@@ -79,19 +80,15 @@ class BackgroundMetricsCollector:
                 logger.error(f"Error collecting metrics: {e}")
                 await asyncio.sleep(5)  # Wait 5 seconds on error
 
-    # All per-backend queues to track (lists use LLEN, ZSETs use ZCARD)
-    LIST_QUEUES = [
-        "arion_upload_requests",
-        "ovh_upload_requests",
-        "arion_download_requests",
-        "ovh_download_requests",
-        "arion_unpin_requests",
-        "ovh_unpin_requests",
-        "substrate_requests",
-    ]
-    ZSET_QUEUES = [
-        "arion_upload_retries",
-    ]
+    @staticmethod
+    def _fixed_queues() -> tuple[list[str], list[str]]:
+        # The global per-backend lists (LLEN) and retry ZSETs (ZCARD), derived from the pinned
+        # backend set so a queue name is never hardcoded twice.
+        config = get_config()
+        lists = [f"{b}_upload_requests" for b in config.upload_backends]
+        lists += [f"{b}_unpin_requests" for b in config.delete_backends]
+        lists.append("substrate_requests")
+        return lists, [f"{b}_upload_retries" for b in config.upload_backends]
 
     @staticmethod
     def _dlq_queues() -> list[str]:
@@ -101,15 +98,38 @@ class BackgroundMetricsCollector:
         config = get_config()
         return [f"{b}_upload_requests:dlq" for b in config.upload_backends] + ["unpin_requests:dlq"]
 
+    @staticmethod
+    async def _node_scoped_queues(rc: Any) -> tuple[list[str], list[str]]:
+        # The drain publishes to `{b}_upload_requests:<node>` and the node's uploader moves its
+        # retries through `{b}_upload_retries:<node>`; discovered per sample because the node set
+        # is a cluster fact. A node queue nobody reads is the backlog this gauge exists to show.
+        config = get_config()
+        lists: list[str] = []
+        zsets: list[str] = []
+        for backend in config.upload_backends:
+            async for raw in rc.scan_iter(match=f"{backend}_upload_requests:*", count=200):
+                key = raw.decode() if isinstance(raw, bytes) else str(raw)
+                if not key.endswith(":dlq"):
+                    lists.append(key)
+            zsets.extend(
+                [
+                    raw.decode() if isinstance(raw, bytes) else str(raw)
+                    async for raw in rc.scan_iter(match=f"{backend}_upload_retries:*", count=200)
+                ]
+            )
+        return sorted(lists), sorted(zsets)
+
     async def _collect_redis_metrics(self) -> None:
         try:
             rc = self.redis_queues_client or self.redis_client
 
-            for queue_name in self.LIST_QUEUES + self._dlq_queues():
+            fixed_lists, fixed_zsets = self._fixed_queues()
+            node_lists, node_zsets = await self._node_scoped_queues(rc)
+            for queue_name in fixed_lists + self._dlq_queues() + node_lists:
                 length = int(await rc.llen(queue_name) or 0)  # ty: ignore
                 self.metrics_collector.set_queue_length(queue_name, length)
 
-            for queue_name in self.ZSET_QUEUES:
+            for queue_name in fixed_zsets + node_zsets:
                 length = int(await rc.zcard(queue_name) or 0)
                 self.metrics_collector.set_queue_length(queue_name, length)
 

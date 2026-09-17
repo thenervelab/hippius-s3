@@ -17,7 +17,7 @@ self-enqueues at PUT; uploads complete e2e via the drain.
 | `drain-agent-daemonset.yaml` | The per-node `hippius-drain` agent — drains each node's local SSD → CephFS pool. Selects the ingest label + a hostname allow-list. |
 | `drain-allocator-deployment.yaml` | The singleton (leader-elected) drain budget allocator. |
 
-Untouched / still on ceph: `gateway`, `arion-uploader/downloader/unpinner`, `janitor`, the
+Untouched / still on ceph: `gateway`, `arion-uploader/unpinner`, `janitor`, the
 auxiliary worker stack, the shared configmap, `object-cache-pvc`.
 
 ## Storage: hostPath, self-provisioning (no manual node prep)
@@ -64,10 +64,9 @@ label (`apply` does not prune): `kubectl label node <name> s3-staging-local-inge
 
 ## How routing works (the "proper" front door)
 
-The gateway forwards to `http://api:8000` (the `api` Service) and blocks on an init `wait-for-api`
-(`nc -z api 8000`) until that Service has a ready endpoint. This trial scales base ceph `api` to 0
-and switches the `api` Service selector to `app: api-local`, so the gateway's backend is the 3 local
-pods — normal front door, no separate target. Prod is unaffected (its overlay omits these patches).
+The `api` Service selects `app: api-local`, and the `gateway` alias selects that plus
+`hippius.io/edge: "true"` (k8s/base/services.yaml), so public traffic reaches the local pods —
+normal front door, no separate target. Prod is unaffected (its overlay omits these patches).
 
 ## Uploads: the drain copies local→ceph (now live)
 

@@ -27,7 +27,7 @@ The monitoring stack consists of:
 graph TB
     subgraph "Application Layer"
         API[FastAPI App<br/>:8000]
-        Workers[Workers<br/>uploader, downloader,<br/>unpinner, etc.]
+        Workers[Workers<br/>uploader, unpinner,<br/>janitor, etc.]
     end
 
     subgraph "Infrastructure"
@@ -131,7 +131,7 @@ Redis/Postgres → Exporter → Prometheus (scrape)
 
 > **Where object data lives:** actual object chunks are stored on the **filesystem chunk cache**
 > at `/var/lib/hippius/object_cache`, not in Redis. Redis `:6379` is a short-lived **general
-> cache** only; `redis-queues :6382` carries work queues + chunk-ready pub/sub. The `fs_cache_*`
+> cache** only; `redis-queues :6382` carries the work queues. The `fs_cache_*`
 > / `fs_store_*` gauges above are the ones to watch for object-storage capacity/pressure.
 
 ### Traces Flow (Push Model)

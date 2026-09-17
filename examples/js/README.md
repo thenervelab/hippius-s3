@@ -9,7 +9,7 @@
 
 Two authentication methods:
 
-**Seed phrase (SigV4)**: Base64-encode your 12-word seed phrase as the access key, use the plain seed phrase as the secret key.
+**Access key (SigV4)**: use your `hip_*` access key and its secret, as with any S3 client.
 
 **Access key**: Use `hip_*` access keys from https://console.hippius.com/dashboard/settings.
 

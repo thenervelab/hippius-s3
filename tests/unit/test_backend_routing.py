@@ -12,10 +12,8 @@ from fakeredis.aioredis import FakeRedis
 from hippius_s3.backend_routing import compute_effective_backends
 from hippius_s3.backend_routing import resolve_object_backends
 from hippius_s3.queue import Chunk
-from hippius_s3.queue import DownloadChainRequest
 from hippius_s3.queue import UnpinChainRequest
 from hippius_s3.queue import UploadChainRequest
-from hippius_s3.queue import enqueue_download_request
 from hippius_s3.queue import enqueue_unpin_request
 from hippius_s3.queue import enqueue_upload_to_backends
 from hippius_s3.queue import initialize_queue_client
@@ -122,7 +120,6 @@ def _mock_config(upload=None, download=None, delete=None):
     """Return a mock config with configurable backend lists."""
     cfg = AsyncMock()
     cfg.upload_backends = upload or ["arion"]
-    cfg.download_backends = download or ["arion"]
     cfg.delete_backends = delete or ["arion"]
     return cfg
 
@@ -181,79 +178,6 @@ class TestUploadIntegration:
             await enqueue_upload_to_backends(payload)
         arion_len = await redis.llen("arion_upload_requests")
         assert arion_len == 1
-
-
-class TestDownloadIntegration:
-    @pytest.mark.asyncio
-    async def test_db_resolved_backends_used(self) -> None:
-        redis = FakeRedis()
-        initialize_queue_client(redis)
-        payload = DownloadChainRequest(
-            object_id="obj-1",
-            object_version=1,
-            object_key="k",
-            bucket_name="b",
-            address="user1",
-            subaccount="user1",
-            substrate_url="http://test",
-            size=100,
-            multipart=False,
-            chunks=[],
-            download_backends=["arion"],
-        )
-        with patch("hippius_s3.queue.get_config", return_value=_mock_config()):
-            await enqueue_download_request(payload)
-        arion_len = await redis.llen("arion_download_requests")
-        assert arion_len == 1
-
-    @pytest.mark.asyncio
-    async def test_no_backends_falls_to_config(self) -> None:
-        redis = FakeRedis()
-        initialize_queue_client(redis)
-        payload = DownloadChainRequest(
-            object_id="obj-1",
-            object_version=1,
-            object_key="k",
-            bucket_name="b",
-            address="user1",
-            subaccount="user1",
-            substrate_url="http://test",
-            size=100,
-            multipart=False,
-            chunks=[],
-            download_backends=None,
-        )
-        with patch("hippius_s3.queue.get_config", return_value=_mock_config()):
-            await enqueue_download_request(payload)
-        arion_len = await redis.llen("arion_download_requests")
-        assert arion_len == 1
-
-    @pytest.mark.asyncio
-    async def test_misconfig_does_not_enqueue(self, caplog: pytest.LogCaptureFixture) -> None:
-        redis = FakeRedis()
-        initialize_queue_client(redis)
-        payload = DownloadChainRequest(
-            object_id="obj-1",
-            object_version=1,
-            object_key="k",
-            bucket_name="b",
-            address="user1",
-            subaccount="user1",
-            substrate_url="http://test",
-            size=100,
-            multipart=False,
-            chunks=[],
-            download_backends=["s3"],
-        )
-        with patch("hippius_s3.queue.get_config", return_value=_mock_config()):
-            with caplog.at_level(logging.ERROR):
-                await enqueue_download_request(payload)
-        # Nothing enqueued
-        arion_len = await redis.llen("arion_download_requests")
-        s3_len = await redis.llen("s3_download_requests")
-        assert arion_len == 0
-        assert s3_len == 0
-        assert "All requested download backends disallowed" in caplog.text
 
 
 class TestUnpinIntegration:

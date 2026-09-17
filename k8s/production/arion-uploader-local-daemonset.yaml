@@ -1,0 +1,248 @@
+# The node-local arion uploader: one pod per ingest node, consuming ONLY that node's upload
+# queue (`arion_upload_requests:<node>`) and reading the parts straight off the node's NVMe.
+#
+# The drain-agent on the same node hands a part over the moment it is whole on SSD (its row
+# goes `uploading`); this pod uploads the chunks to Arion, writes their chunk_backend rows,
+# and flips the row `replicated` — at which point the drain's evictor may free the SSD copy.
+# Until then the SSD copy is the only copy, so this pod MUST run on the node that holds it:
+# a DaemonSet over the same node label as api-local / drain-agent, never a Deployment.
+#
+# Coexists with the base `arion-uploader` Deployment, which keeps draining the GLOBAL queue
+# for pool-era parts (bytes in the CephFS pool) until the pool is decommissioned. Same image,
+# same script: NODE_NAME set is what makes this one node-scoped.
+#
+# == Volumes ==
+#  * SSD source: the SAME hostPath the api and drain-agent use — the dedicated /s3-data NVMe
+#    on each ingest node. Read-only: this pod only reads chunks; residency, eviction and
+#    unlinking are the drain-agent's.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: arion-uploader-local
+  labels:
+    app: arion-uploader-local
+    worker-type: uploader
+    backend: arion
+spec:
+  selector:
+    matchLabels:
+      app: arion-uploader-local
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: arion-uploader-local
+        worker-type: uploader
+        backend: arion
+    spec:
+      # Same priority + node selection as drain-agent: an ingest node that runs api-local and
+      # drain-agent must also run this, or the parts it ingests are never uploaded.
+      priorityClassName: s3-ingest-priority
+      nodeSelector:
+        s3-prod-local-ingest: "true"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      # Keep in sync with drain-agent-daemonset.yaml +
+                      # api-local-deployments-production.yaml.
+                      - k8s-v3-node1
+                      - k8s-v3-node2
+                      - k8s-v3-node3
+                      - k8s-v3-node4
+                      - k8s-v3-node5
+      # run_worker() bounds cleanup at HIPPIUS_WORKER_DRAIN_TIMEOUT_SECONDS (20s); 40 leaves
+      # headroom. An in-flight part interrupted here is re-published by the drain's upload
+      # sweep once it sits `uploading` past the re-drive window.
+      terminationGracePeriodSeconds: 40
+      initContainers:
+        - name: wait-for-services
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - until nc -z postgres-nvme-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+        # Same gate as the base workers: never start against a schema older than the code.
+        - name: wait-for-migrations
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          command:
+            - python
+            - scripts/wait_for_migrations.py
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+      containers:
+        - name: arion-uploader-local
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+          env:
+            # The whole difference from the base Deployment: with NODE_NAME set the loop
+            # BRPOPs `arion_upload_requests:<node>` (and moves that node's retry ZSET), the
+            # queue the drain-agent on this same node publishes to.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Read chunks from the node's NVMe, at the path api-local and drain-agent use, so
+            # the relative part dirs line up. No fallback dir: a part on this queue is on this
+            # disk by construction; falling through to the pool would only hide a routing bug.
+            - name: HIPPIUS_OBJECT_CACHE_DIR
+              value: /var/lib/hippius/local_object_cache
+            - name: HIPPIUS_SERVICE_ACCOUNT_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_ACCOUNT_IDS
+                  optional: true
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: OTEL_SERVICE_NAME
+              value: "hippius-s3-uploader-local"
+            - name: WORKER_SCRIPT
+              value: "workers/run_arion_uploader_in_loop.py"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_URL
+            - name: REDIS_QUEUES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_QUEUES_URL
+            - name: HIPPIUS_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
+            - name: ARION_BILLING_BYPASS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BILLING_BYPASS_KEY
+            - name: ARION_RATE_LIMITING_PROXY_BYPASS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_RATE_LIMITING_PROXY_BYPASS_KEY
+            - name: HIPPIUS_AUTH_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_AUTH_ENCRYPTION_KEY
+            # Substituted by the deploy workflow, like the base workers-deployments.yaml.
+            - name: HIPPIUS_ARION_BASE_URL
+              value: "HIPPIUS_ARION_BASE_URL_PLACEHOLDER"
+            - name: HIPPIUS_ARION_VERIFY_SSL
+              value: "HIPPIUS_ARION_VERIFY_SSL_PLACEHOLDER"
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DISCORD_WEBHOOK_URL
+            - name: HIPPIUS_OVH_KMS_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_ENDPOINT
+            - name: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+            - name: HIPPIUS_OVH_KMS_OKMS_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_OKMS_ID
+            - name: FRONTEND_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: FRONTEND_HMAC_SECRET
+            - name: HIPPIUS_UPLOADER_MAX_INFLIGHT
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_UPLOADER_MAX_INFLIGHT
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+              readOnly: true
+            - name: kms-certs
+              mountPath: /kms_certs
+              readOnly: true
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - import os, redis; redis.Redis.from_url(os.environ["REDIS_QUEUES_URL"]).ping()
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+      volumes:
+        - name: local-ingest
+          hostPath:
+            # The dedicated NVMe mounted at /s3-data on each ingest node. type: Directory, as
+            # for api-local and drain-agent: if the NVMe is not mounted the pod must not start.
+            path: /s3-data
+            type: Directory
+        - name: kms-certs
+          secret:
+            secretName: ovh-kms-certs
+            defaultMode: 0400

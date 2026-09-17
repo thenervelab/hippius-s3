@@ -154,11 +154,6 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: HIPPIUS_OVH_KMS_OKMS_ID
-            - name: HIPPIUS_UPLOAD_BACKENDS
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_UPLOAD_BACKENDS
           livenessProbe:
             exec:
               command:

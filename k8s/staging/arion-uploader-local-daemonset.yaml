@@ -1,0 +1,206 @@
+# The node-local arion uploader for staging: one pod per ingest node, consuming ONLY that
+# node's upload queue (`arion_upload_requests:<node>`) and reading the parts straight off the
+# node's local ingest dir. See k8s/production/arion-uploader-local-daemonset.yaml for the
+# full rationale; the staging differences are the node label, the node list, and the
+# hostPath (the `_staging` suffix keeps it disjoint from prod on the shared node2/node3).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: arion-uploader-local
+  labels:
+    app: arion-uploader-local
+    worker-type: uploader
+    backend: arion
+spec:
+  selector:
+    matchLabels:
+      app: arion-uploader-local
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: arion-uploader-local
+        worker-type: uploader
+        backend: arion
+    spec:
+      nodeSelector:
+        s3-staging-local-ingest: "true"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      # Keep in sync with drain-agent-daemonset.yaml + api-local-deployments-staging.yaml.
+                      - k8s-v3-node2
+                      - k8s-v3-node3
+      terminationGracePeriodSeconds: 40
+      initContainers:
+        - name: wait-for-services
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - until nc -z postgres-rw 5432 && nc -z redis 6379 && nc -z redis-queues 6379; do echo waiting for services; sleep 5; done
+        - name: wait-for-migrations
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          command:
+            - python
+            - scripts/wait_for_migrations.py
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+      containers:
+        - name: arion-uploader-local
+          image: ghcr.io/thenervelab/hippius-s3/workers:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: hippius-s3-defaults
+            - configMapRef:
+                name: hippius-s3-environment
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HIPPIUS_OBJECT_CACHE_DIR
+              value: /var/lib/hippius/local_object_cache
+            - name: HIPPIUS_SERVICE_ACCOUNT_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_ACCOUNT_IDS
+                  optional: true
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
+            - name: OTEL_SERVICE_NAME
+              value: "hippius-s3-uploader-local"
+            - name: WORKER_SCRIPT
+              value: "workers/run_arion_uploader_in_loop.py"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_URL
+            - name: REDIS_QUEUES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: REDIS_QUEUES_URL
+            - name: HIPPIUS_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_SERVICE_KEY
+            - name: ARION_SERVICE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_SERVICE_KEY
+            - name: ARION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BEARER_TOKEN
+            - name: ARION_BILLING_BYPASS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_BILLING_BYPASS_KEY
+            - name: ARION_RATE_LIMITING_PROXY_BYPASS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: ARION_RATE_LIMITING_PROXY_BYPASS_KEY
+            - name: HIPPIUS_AUTH_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_AUTH_ENCRYPTION_KEY
+            - name: HIPPIUS_ARION_BASE_URL
+              value: "HIPPIUS_ARION_BASE_URL_PLACEHOLDER"
+            - name: HIPPIUS_ARION_VERIFY_SSL
+              value: "HIPPIUS_ARION_VERIFY_SSL_PLACEHOLDER"
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: DISCORD_WEBHOOK_URL
+            - name: HIPPIUS_OVH_KMS_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_ENDPOINT
+            - name: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_DEFAULT_KEY_ID
+            - name: HIPPIUS_OVH_KMS_OKMS_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_OVH_KMS_OKMS_ID
+            - name: FRONTEND_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: FRONTEND_HMAC_SECRET
+            - name: HIPPIUS_UPLOADER_MAX_INFLIGHT
+              valueFrom:
+                secretKeyRef:
+                  name: hippius-s3-secrets
+                  key: HIPPIUS_UPLOADER_MAX_INFLIGHT
+          volumeMounts:
+            - name: local-ingest
+              mountPath: /var/lib/hippius/local_object_cache
+              readOnly: true
+            - name: kms-certs
+              mountPath: /kms_certs
+              readOnly: true
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -d /proc/1 && grep -q python /proc/1/cmdline"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+      volumes:
+        - name: local-ingest
+          hostPath:
+            path: /var/lib/hippius/local_ingest_staging
+            type: DirectoryOrCreate
+        - name: kms-certs
+          secret:
+            secretName: ovh-kms-certs
+            defaultMode: 0400

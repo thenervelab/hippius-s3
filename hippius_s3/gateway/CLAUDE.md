@@ -56,8 +56,7 @@ Orchestrator: [gateway/services/auth_orchestrator.py:39 `authenticate_request`](
 1. **Presigned URL** — query params `X-Amz-Algorithm=AWS4-HMAC-SHA256` + `X-Amz-Credential` + `X-Amz-Signature`.
 2. **Bearer** — `Authorization: Bearer hip_...`.
 3. **Access key SigV4** — `Authorization: AWS4-HMAC-SHA256 Credential=hip_...` in header.
-4. **Seed phrase SigV4** — Authorization header present but credential doesn't start `hip_`.
-5. **Anonymous** — GET/HEAD on public buckets, no Authorization.
+4. **Anonymous** — GET/HEAD on public buckets, no Authorization.
 
 Detail: [gateway/services/CLAUDE.md](services/CLAUDE.md).
 

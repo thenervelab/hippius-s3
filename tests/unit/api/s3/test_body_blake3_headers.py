@@ -87,7 +87,8 @@ def test_anything_that_is_not_a_lowercase_hex_digest_emits_nothing(value: Any) -
 def test_the_digest_is_not_sourced_from_the_arion_identifier() -> None:
     """Pins the conflation that slipped past the SQL-layer guard.
 
-    X-Hippius-Arion-File-Hash is chunk_backend.backend_identifier — where the ENCRYPTED bytes live.
+    X-Hippius-Arion-File-Hash is chunk_backend.arion_hash — the hash Arion registered the ENCRYPTED
+    first chunk under.
     This header is BLAKE3 of the PLAINTEXT. Both are 64 hex chars, so a refactor swapping one for
     the other is invisible to any test that only checks the shape of the value.
     """

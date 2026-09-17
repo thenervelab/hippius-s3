@@ -57,7 +57,7 @@ CREATE TABLE object_versions(
     object_id uuid, object_version bigint, size_bytes bigint, md5_hash text,
     content_type text DEFAULT 'application/octet-stream', multipart bool DEFAULT false, status text DEFAULT 'published',
     is_delete_marker bool NOT NULL DEFAULT false, deleted_at timestamptz,
-    body_blake3 text
+    body_blake3 text, arion_hash text
 );
 CREATE TABLE object_names(
     bucket_id uuid NOT NULL, object_key text NOT NULL, object_id uuid NOT NULL,

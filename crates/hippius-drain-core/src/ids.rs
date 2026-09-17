@@ -64,16 +64,11 @@ identifier_newtype!(
     /// Identity of an ingest node (the Postgres primary key for node state).
     NodeId, "NodeId"
 );
-identifier_newtype!(
-    /// Identity of an uploaded file (the `CephFS` destination folder name); the GC
-    /// reclaim unit.
-    FileId, "FileId"
-);
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::{FileId, NodeId};
+    use super::NodeId;
     use crate::error::Error;
     use core::str::FromStr;
     use proptest::prelude::*;
@@ -87,13 +82,6 @@ mod tests {
     #[test]
     fn trims_surrounding_whitespace() {
         assert_eq!(NodeId::from_str("  node-a  ").unwrap().as_str(), "node-a");
-    }
-
-    #[test]
-    fn each_identifier_kind_validates() {
-        assert!(FileId::try_from(String::new()).is_err());
-        assert!(matches!(FileId::from_str("   "), Err(Error::EmptyIdentifier { kind: "FileId" })));
-        assert_eq!(FileId::from_str("file-1").unwrap().as_str(), "file-1");
     }
 
     #[cfg(feature = "serde")]

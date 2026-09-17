@@ -3,7 +3,7 @@
 All schema, migrations, and parameterized queries. Two subdirectories:
 
 - [migrations/](migrations/) — versioned SQL migrations run by [../scripts/migrate.py](../scripts/migrate.py). Additive only; no destructive down-migrations.
-- [queries/](queries/) — parameterized queries loaded via `hippius_s3.utils.get_query(name)`. One `.sql` file per query. 50+ queries today.
+- [queries/](queries/) — parameterized queries loaded via `hippius_s3.utils.get_query(name)`. One `.sql` file per query.
 
 Root SQL files:
 
@@ -83,9 +83,9 @@ All reads/writes go through `.sql` files loaded by [hippius_s3/utils/__init__.py
 - `get_object_for_download_with_permissions.sql` — the big query that GET/HEAD use. Filters out empty/reserved versions.
 - `get_object_for_download_with_permissions_by_version.sql` — explicit-version variant for the envelope-race fallback.
 - `upsert_object_basic.sql` — atomic reserve-a-new-version.
-- `create_migration_version.sql`, `swap_current_version_cas.sql` — used by the v4→v5 migrator.
+- `create_migration_version.sql`, `swap_current_version_cas.sql` — reserve a new version and swap the current pointer under CAS.
 - `update_object_version_metadata.sql`, `update_object_version_envelope.sql` — set size/md5/envelope on completion.
-- `get_chunk_backend_identifier.sql` — the downloader's per-chunk lookup.
+- `get_chunk_backend_identifier.sql` — per-chunk backend lookup (HEAD); `get_chunk_backend_identifiers_by_part.sql` — the read path's batched location resolution; `confirm_replication_status_uploaded.sql` / `get_replication_status_for_parts.sql` — the node-local uploader's half of the drain hand-off (digest-fenced).
 - `count_chunk_backends.sql` — uses DB-driven `chunk_size_bytes` rather than hardcoded 4 MiB (recent fix; see commit `0a66a25` and the Apr 21 memory notes).
 
 ## Known issue: broken v5 rows

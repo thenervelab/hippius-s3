@@ -21,6 +21,7 @@ SELECT
     -- digest, the same value ListObjects surfaces in Owner.ID.
     COALESCE(c.cid, ov.ipfs_cid) AS ipfs_cid,
     ov.body_blake3,
+    ov.arion_hash,
     recent.created_at AS uploaded_at
 FROM buckets b
 CROSS JOIN LATERAL (

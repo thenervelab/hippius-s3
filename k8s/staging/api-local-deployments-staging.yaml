@@ -25,9 +25,7 @@
 # (node2/node3) is belt-and-suspenders WITH the label: a stray/mislabeled node alone
 # can't place ingest on a psql/cache node — the hostname must ALSO be on the list.
 #
-# Routing: the existing `api` Service (the gateway's GATEWAY_BACKEND_URL=
-# http://api:8000 upstream) is patched to select `app: api-local`
-# (kustomization.yaml), so the gateway routes here through the normal front door.
+# Routing: the `api` and `gateway` Services (k8s/base/services.yaml) select `app: api-local`.
 #
 # IMPORTANT: with no ceph api pods, every upload stages locally and stays
 # `pending` until the replicator copies local->ceph. Install + test the replicator
@@ -225,8 +223,9 @@ spec:
             periodSeconds: 60
             timeoutSeconds: 10
             failureThreshold: 5
-          # See the note in k8s/base/api-deployment.yaml: keeps this pod serving while
-          # endpoint removal propagates, so SIGTERM lands only after traffic has moved off.
+          # Keeps this pod serving while endpoint removal propagates to every kube-proxy, so
+          # SIGTERM lands only after traffic has moved off. The sleep is deducted from
+          # terminationGracePeriodSeconds, so it plus uvicorn's 25s drain must fit inside it.
           lifecycle:
             preStop:
               exec:

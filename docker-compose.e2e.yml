@@ -11,12 +11,9 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
-      # Drain-direct topology: the api writes parts to the node-local SSD cache; the
-      # drain copies them to the shared pool (object_cache) that the uploader reads,
-      # then unlinks the SSD copy. Reads fall back to the pool for drained parts.
+      # Drain-direct topology: the api writes parts to the node-local SSD cache, which the
+      # node-local uploader reads straight from; nothing is copied to the shared pool
+      # (object_cache) any more. Reads still fall back to the pool for pool-era parts.
       - HIPPIUS_OBJECT_CACHE_DIR=/var/lib/hippius/local_object_cache
       - HIPPIUS_OBJECT_CACHE_FALLBACK_DIR=/var/lib/hippius/object_cache
       # MUST equal drain-agent's CEPHOR_NODE_ID: both sides build the queue name as
@@ -61,30 +58,17 @@ services:
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_ARION_BASE_URL=http://toxiproxy:19090
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
     volumes:
       - .:/app
       - ./.e2e/dlq:/tmp/hippius_dlq
       - ./.e2e/dlq_archive:/tmp/hippius_dlq_archive
+      - /var/lib/hippius/local_object_cache:/var/lib/hippius/local_object_cache
       - kms_certs:/kms_certs:ro
     depends_on:
       mock-kms:
         condition: service_healthy
       mock-arion:
         condition: service_healthy
-
-  arion-downloader:
-    env_file:
-      - .env.defaults
-      - .env.test-docker
-    environment:
-      - HIPPIUS_KEY=${HIPPIUS_KEY}
-      - HIPPIUS_ARION_BASE_URL=http://toxiproxy:19090
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
 
   # Unpin is a real backend call, so it points at the same toxiproxy hop the uploader and
   # downloader use — otherwise it would resolve the production Arion host from .env.defaults.
@@ -95,9 +79,6 @@ services:
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
       - HIPPIUS_ARION_BASE_URL=http://toxiproxy:19090
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
     volumes:
       - .:/app
       - kms_certs:/kms_certs:ro
@@ -203,9 +184,6 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
     volumes:
       - .:/app
 
@@ -215,9 +193,6 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
     volumes:
       - .:/app
 
@@ -227,9 +202,6 @@ services:
       - .env.test-docker
     environment:
       - HIPPIUS_KEY=${HIPPIUS_KEY}
-      - HIPPIUS_UPLOAD_BACKENDS=arion
-      - HIPPIUS_DOWNLOAD_BACKENDS=arion
-      - HIPPIUS_DELETE_BACKENDS=arion
     volumes:
       - .:/app
 
@@ -322,9 +294,7 @@ services:
       - CEPHOR_DATABASE_URL=postgresql://postgres:postgres@db:5432/hippius?sslmode=disable
       - CEPHOR_NODE_ID=e2e-node
       - CEPHOR_SSD_ROOT=/var/lib/hippius/local_object_cache
-      - CEPHOR_POOL_ROOT=/var/lib/hippius/object_cache
       - REDIS_QUEUES_URL=redis://redis-queues:6379
-      - HIPPIUS_UPLOAD_BACKENDS=arion
       # Tight polls + short deferral backoff so a freshly-landed (and a just-completed
       # MPU's) part drains within the e2e wait windows.
       - CEPHOR_RECONCILE_POLL_SECS=2
@@ -338,7 +308,6 @@ services:
       - RUST_LOG=hippius_drain_agent=debug,info
     volumes:
       - /var/lib/hippius/local_object_cache:/var/lib/hippius/local_object_cache
-      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
     depends_on:
       db:
         condition: service_healthy

@@ -46,12 +46,25 @@ async fn main() -> Result<(), StartupError> {
     let config = AllocatorConfig::from_env()?;
     let store = Store::connect(&config.database_url).await?;
 
+    // The probe requires mtime < 30s. 0021 VALIDATE can run for minutes on prod;
+    // a one-shot create would go stale and the kubelet would SIGKILL mid-migrate.
+    let liveness = config.liveness_file.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            ticks.tick().await;
+            let _ = std::fs::write(&liveness, b"ok");
+        }
+    });
+
     // The singleton allocator owns schema provisioning: it deploys before the agents
     // (allocator-first), so applying the migrations here means the agents come up
     // against a ready cephor_* schema and need no DDL rights of their own. Idempotent
     // — sqlx records applied migrations under an advisory lock, so a restart or a
     // brief multi-replica overlap during rollout re-runs nothing.
-    store.migrate().await?;
+    let migrated = store.migrate().await;
+    heartbeat.abort();
+    migrated?;
 
     // Terminal-row GC: a best-effort background sweep pruning aged replicated/failed rows
     // so cephor_replication_status does not grow unbounded and bloat the hot claim/reconcile

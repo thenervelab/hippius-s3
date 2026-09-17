@@ -143,11 +143,10 @@ def test_crash_exits_by_default() -> None:
 
 
 def test_only_previously_self_restarting_entrypoints_opt_in() -> None:
-    """Guards the behaviour-preservation claim: before this module, exactly these three
+    """Guards the behaviour-preservation claim: before this module, exactly these
     entrypoints wrapped themselves in `while True / except Exception / sleep(5)`."""
     expected = {
         "run_mpu_reaper_in_loop.py",
-        "run_orphan_checker_in_loop.py",
         "run_arion_unpinner_in_loop.py",
     }
     opted_in = {

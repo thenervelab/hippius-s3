@@ -16,7 +16,6 @@ from typing import Dict
 from typing import Tuple
 from typing import TypeVar
 
-import asyncpg
 from fastapi import Request
 from starlette.responses import Response
 
@@ -302,28 +301,3 @@ def get_query(name: str) -> str:
     logger.debug(f"Loading query from disk: {file_name}")
     with path.open("r") as fp:
         return fp.read().strip()
-
-
-async def upsert_cid_and_get_id(db: asyncpg.Pool, cid: str) -> str:
-    """Insert or get existing CID and return the cid_id (UUID)."""
-    result = await db.fetchrow(get_query("upsert_cid"), cid)
-    return str(result["id"])
-
-
-async def get_object_download_info(db: asyncpg.Pool, object_id: str) -> dict:
-    """Get complete download information for an object (simple or multipart)."""
-    result = await db.fetchrow(get_query("get_object_download_info_by_id"), object_id)
-
-    if not result:
-        raise ValueError(f"Object not found: {object_id}")
-
-    storage_version = int(result.get("storage_version") or 0)
-    download_chunks = result["download_chunks"]
-
-    return {
-        "object_id": result["object_id"],
-        "multipart": result["multipart"],
-        "storage_version": storage_version,
-        "needs_decryption": result["needs_decryption"],
-        "download_chunks": download_chunks,
-    }

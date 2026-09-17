@@ -21,6 +21,7 @@ import datetime
 import json
 import os
 import uuid
+from typing import Any
 from typing import AsyncGenerator
 
 import asyncpg
@@ -865,7 +866,7 @@ async def test_decrements_survive_the_upsert_arms(pg_tx: asyncpg.Connection) -> 
 
     This is the shape that a `GREATEST(0, ...)` on the INSERT arm of the fold would destroy:
     EXCLUDED.bytes_used would carry the clamped value into the DO UPDATE arm and floor every
-    decrement at zero. There is no clamp in compact_storage_delta_ledger.sql, and this is the test
+    decrement at zero. There is no clamp in compact_storage_delta_ledger_bucket.sql, and this is the test
     that says so.
     """
     acct = await _seed_account(pg_tx)
@@ -1034,7 +1035,7 @@ async def test_compaction_interleaved_with_live_writes_converges(committed_pool:
     async def compactor() -> None:
         for _ in range(40):
             async with committed_pool.acquire() as conn:
-                await storage_rollup_service.compact_once(conn, batch_size=3)
+                await storage_rollup_service.compact_bucket_once(conn, bucket_id, batch_size=3)
             await asyncio.sleep(0)
 
     await asyncio.gather(writer(), compactor())
@@ -1069,7 +1070,7 @@ async def test_recompute_interleaved_with_live_writes_converges(committed_pool: 
     async def compactor() -> None:
         for _ in range(20):
             async with committed_pool.acquire() as conn:
-                await storage_rollup_service.compact_once(conn, batch_size=5)
+                await storage_rollup_service.compact_bucket_once(conn, bucket_id, batch_size=5)
             await asyncio.sleep(0)
 
     await asyncio.gather(writer(), recomputer(), compactor())
@@ -1161,13 +1162,16 @@ async def test_compactor_yields_to_a_running_recompute(committed_pool: Committed
     async with committed_pool.acquire() as holder:
         tx = holder.transaction()
         await tx.start()
-        await holder.fetchval("SELECT pg_advisory_xact_lock(storage_usage_rollup_lock_key(), 0)")
+        await holder.fetchval(
+            "SELECT pg_advisory_xact_lock(storage_usage_rollup_lock_key(), storage_usage_bucket_lock_key($1))",
+            bucket_id,
+        )
 
         async with committed_pool.acquire() as writer:
             await _put(writer, bucket_id, "a", 1000)
 
         async with committed_pool.acquire() as compactor:
-            skipped = await storage_rollup_service.compact_once(compactor, batch_size=100)
+            skipped = await storage_rollup_service.compact_bucket_once(compactor, bucket_id, batch_size=100)
             assert skipped.rows_claimed == 0
             assert await _ledger_rows(compactor, bucket_id) != []
 
@@ -1176,6 +1180,51 @@ async def test_compactor_yields_to_a_running_recompute(committed_pool: Committed
     async with committed_pool.acquire() as conn:
         await _compact(conn)
         assert await _raw_rollup(conn, acct) == await _oracle(conn, acct) == 1000
+
+
+async def test_a_recompute_does_not_block_an_unrelated_buckets_compaction(
+    committed_pool: CommittedPool,
+) -> None:
+    """The 2026-09-15 starvation, at the lock level.
+
+    The lock's second argument used to be a hardcoded 0, so ONE key covered the whole estate and a
+    recompute of any bucket blocked compaction of every other. On prod that meant one 136M-object
+    bucket, holding the lock for its full 300s timeout over and over, aged the ledger's oldest row to
+    412s against a normal 2s -- while the buckets it was starving had nothing to do with it.
+
+    This is the test that would have caught it: hold bucket A's lock, then fold bucket B.
+    """
+    acct = await committed_pool.new_account()
+    held = await committed_pool.new_bucket(acct)
+    other = await committed_pool.new_bucket(acct)
+
+    async with committed_pool.acquire() as writer:
+        await _put(writer, held, "a", 1000)
+        await _put(writer, other, "b", 2500)
+
+    async with committed_pool.acquire() as holder:
+        tx = holder.transaction()
+        await tx.start()
+        await holder.fetchval(
+            "SELECT pg_advisory_xact_lock(storage_usage_rollup_lock_key(), storage_usage_bucket_lock_key($1))",
+            held,
+        )
+
+        async with committed_pool.acquire() as compactor:
+            blocked = await storage_rollup_service.compact_bucket_once(compactor, held, batch_size=100)
+            assert blocked.rows_claimed == 0, "the locked bucket should still be skipped"
+
+            progressed = await storage_rollup_service.compact_bucket_once(compactor, other, batch_size=100)
+            assert progressed.rows_claimed > 0, (
+                "an unrelated bucket's compaction was blocked by a recompute elsewhere -- the lock is "
+                "still effectively global"
+            )
+
+        await tx.rollback()
+
+    async with committed_pool.acquire() as conn:
+        await _compact(conn)
+        assert await _raw_rollup(conn, acct) == await _oracle(conn, acct) == 3500
 
 
 async def test_recompute_drain_and_aggregate_share_one_snapshot(committed_pool: CommittedPool) -> None:
@@ -2122,6 +2171,306 @@ async def test_the_mpu_upsert_still_creates_the_objects_row_and_its_version_in_o
     assert await _ledger_rows(pg_tx, bucket_id) == [7000], (
         "the MPU upsert emitted no delta for a new object, which means the objects row and its first "
         "version are no longer created in the same statement"
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# Verifying a bucket that cannot be aggregated at all.
+#
+# prod 2026-09-15: the largest bucket holds 136,221,023 of ~168,697,344 objects -- 80.7% of the
+# table -- so its recompute is a 167 GB seq scan hash-joined to 92 GB, cost 15,032,678, and cannot
+# finish inside a reconcile cycle. It therefore never stamped recomputed_at, never left the head of
+# the work queue, was retried 168 times in 24h, and held the (then global) advisory lock for its
+# whole timeout each time, aging the ledger's oldest row to 412s against a normal 2s.
+# --------------------------------------------------------------------------------------------
+
+
+async def _usage_row(conn: asyncpg.Connection, bucket_id: uuid.UUID) -> Any:
+    return await conn.fetchrow(
+        "SELECT bytes_used, churn_bytes, recompute_failures, attempted_at, recomputed_at"
+        " FROM bucket_storage_usage WHERE bucket_id = $1",
+        bucket_id,
+    )
+
+
+async def _slice(conn: asyncpg.Connection, bucket_id: uuid.UUID, cursor: str, limit: int) -> Any:
+    return await conn.fetchrow(get_query("sum_bucket_object_key_slice"), bucket_id, cursor, limit)
+
+
+async def test_a_successful_recompute_stamps_the_attempt_and_clears_failures(pg_tx: asyncpg.Connection) -> None:
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+    await _put(pg_tx, bucket_id, "a", 1000)
+    await _compact(pg_tx)
+
+    # Pretend two earlier attempts failed.
+    await pg_tx.fetchval(get_query("mark_bucket_reconcile_failed"), bucket_id)
+    await pg_tx.fetchval(get_query("mark_bucket_reconcile_failed"), bucket_id)
+    assert (await _usage_row(pg_tx, bucket_id))["recompute_failures"] == 2
+
+    await storage_rollup_service.recompute_bucket(pg_tx, bucket_id, 60.0)
+
+    row = await _usage_row(pg_tx, bucket_id)
+    assert row["attempted_at"] is not None
+    assert row["recomputed_at"] is not None
+    assert row["recompute_failures"] == 0, (
+        "a success must clear the failure count, or a bucket that recovers stays on the slow path forever"
+    )
+
+
+async def test_a_recorded_failure_rotates_the_bucket_out_of_the_queue_head(pg_tx: asyncpg.Connection) -> None:
+    """THE STARVATION FIX, against the real queue query.
+
+    Two buckets, both never verified. The queue hands back the first; recording its failed attempt
+    must put the OTHER one at the head, or the failing bucket is retried forever and its neighbour
+    is never checked.
+    """
+    acct = await _seed_account(pg_tx)
+    first = await _seed_bucket(pg_tx, acct)
+    second = await _seed_bucket(pg_tx, acct)
+    await _put(pg_tx, first, "a", 10)
+    await _put(pg_tx, second, "b", 20)
+    await _compact(pg_tx)
+
+    head = await pg_tx.fetch(get_query("list_buckets_for_usage_reconcile"), 2)
+    ids = [r["bucket_id"] for r in head]
+    assert set(ids) == {first, second}
+
+    await pg_tx.fetchval(get_query("mark_bucket_reconcile_failed"), ids[0])
+
+    after = await pg_tx.fetch(get_query("list_buckets_for_usage_reconcile"), 2)
+    assert after[0]["bucket_id"] == ids[1], "the failed bucket is still the queue head -- starvation is back"
+    assert after[1]["bucket_id"] == ids[0]
+    assert after[1]["recompute_failures"] == 1, "the queue must expose the failure count for routing"
+
+
+async def test_marking_a_failure_never_invents_a_counter_row(pg_tx: asyncpg.Connection) -> None:
+    """UPDATE-only by design.
+
+    An INSERT arm would have to pick a bytes_used, and 0 is a lie: it converts "this bucket has never
+    been seeded", which get_account_storage_bytes_rollup.sql reports as missing_buckets, into "this
+    bucket stores nothing" -- a wrong billing answer bought for a bookkeeping timestamp.
+    """
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+    assert await _usage_row(pg_tx, bucket_id) is None, "precondition: no counter row yet"
+
+    result = await pg_tx.fetchval(get_query("mark_bucket_reconcile_failed"), bucket_id)
+
+    assert result is None, "the UPDATE matched nothing, which is correct"
+    assert await _usage_row(pg_tx, bucket_id) is None, "a counter row was invented with a fabricated size"
+
+
+async def test_churn_accumulates_absolute_movement_not_the_net(pg_tx: asyncpg.Connection) -> None:
+    """The tolerance bound for sliced verification.
+
+    +N then -N nets to zero while genuinely moving the number twice. A signed bound would admit
+    exactly the drift the sweep exists to catch, so churn must be SUM(ABS(delta)).
+    """
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+
+    await _put(pg_tx, bucket_id, "a", 700)
+    await _compact(pg_tx)
+    after_put = await _usage_row(pg_tx, bucket_id)
+    assert after_put["churn_bytes"] == 700
+
+    await pg_tx.execute("DELETE FROM objects WHERE bucket_id = $1 AND object_key = 'a'", bucket_id)
+    await _compact(pg_tx)
+
+    row = await _usage_row(pg_tx, bucket_id)
+    assert row["bytes_used"] == 0, "the net is back to zero"
+    assert row["churn_bytes"] == 1400, "churn must count both directions, not cancel them"
+
+
+async def test_the_slice_query_totals_exactly_the_oracle(pg_tx: asyncpg.Connection) -> None:
+    """The premise of the whole mechanism: summing pages equals summing once."""
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+    sizes = {f"key-{i:03d}": 100 + i for i in range(17)}
+    for key, size in sizes.items():
+        await _put(pg_tx, bucket_id, key, size)
+
+    total = 0
+    cursor = ""
+    pages = 0
+    while True:
+        page = await _slice(pg_tx, bucket_id, cursor, 5)
+        if not page["objects_scanned"]:
+            break
+        total += int(page["bytes"])
+        cursor = page["next_cursor"]
+        pages += 1
+
+    assert pages == 4, "17 objects at 5 per page"
+    assert total == sum(sizes.values()) == await _oracle(pg_tx, acct)
+
+
+async def test_the_slice_cursor_advances_past_objects_that_contribute_nothing(pg_tx: asyncpg.Connection) -> None:
+    """A page of only delete markers / deleted versions sums to 0 but MUST move the cursor.
+
+    With the version predicate as an inner join those rows vanish from the page, so next_cursor comes
+    back NULL and the sweep re-reads the same range forever. The LEFT JOIN + FILTER is what stops it.
+    """
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+    object_id = await _put(pg_tx, bucket_id, "aaa", 500)
+    await _put(pg_tx, bucket_id, "zzz", 900)
+
+    # Make the first object's current version non-contributing, leaving the objects row live.
+    await pg_tx.execute(
+        "UPDATE object_versions SET is_delete_marker = true WHERE object_id = $1",
+        object_id,
+    )
+
+    page = await _slice(pg_tx, bucket_id, "", 1)
+    assert page["objects_scanned"] == 1
+    assert int(page["bytes"]) == 0, "a delete marker contributes no bytes"
+    assert page["next_cursor"] == "aaa", "the cursor must still advance or the sweep stalls here forever"
+
+    nxt = await _slice(pg_tx, bucket_id, page["next_cursor"], 1)
+    assert int(nxt["bytes"]) == 900
+
+
+async def test_the_slice_predicate_is_servable_by_an_index(pg_tx: asyncpg.Connection) -> None:
+    """The entire reason slicing is viable, so it is worth pinning rather than assuming.
+
+    Measured on prod: the unsliced aggregate over the largest bucket plans at cost 15,032,678 with a
+    parallel seq scan of both tables; bounded to a key range it plans at 1,212 with an index scan
+    either side. If a schema change ever costs us an index on (bucket_id, object_key), sliced
+    verification silently becomes as unusable as the thing it replaced.
+
+    This asserts the index is USABLE for the predicate, not which plan the planner picks. On a
+    fixture table of a handful of rows a seq scan is genuinely cheaper and Postgres is right to
+    choose it -- an earlier version of this test asserted the prod plan shape against three rows and
+    failed for that reason, proving nothing about the query. Disabling seqscan asks the question that
+    actually matters: CAN this predicate be served from an index, or has the index gone away?
+    """
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+    for i in range(5):
+        await _put(pg_tx, bucket_id, f"k{i}", 1)
+
+    await pg_tx.execute("SET LOCAL enable_seqscan = off")
+    plan = "\n".join(
+        r[0] for r in await pg_tx.fetch("EXPLAIN " + get_query("sum_bucket_object_key_slice"), bucket_id, "", 50)
+    )
+
+    assert "Index Scan" in plan or "Index Only Scan" in plan, (
+        f"the slice predicate cannot be served from any index, so it degrades to a full scan on a "
+        f"large bucket -- which is the failure sliced verification exists to avoid:\n{plan}"
+    )
+    assert "object_key" in plan, f"the index chosen does not bound object_key, so the keyset is not indexed:\n{plan}"
+
+
+async def test_a_sliced_sweep_verifies_a_quiet_bucket_with_no_drift(pg_tx: asyncpg.Connection) -> None:
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+    for i in range(9):
+        await _put(pg_tx, bucket_id, f"k{i}", 1000 + i)
+    await _compact(pg_tx)
+
+    sweep = await storage_rollup_service.verify_bucket_sliced(pg_tx, bucket_id, page_objects=2, max_slices=50)
+
+    assert sweep.complete
+    assert sweep.swept_bytes == await _oracle(pg_tx, acct)
+    assert sweep.gap_bytes == 0
+    assert not sweep.exceeds_tolerance
+    assert (
+        await pg_tx.fetchval("SELECT count(*) FROM bucket_storage_verify_state WHERE bucket_id = $1", bucket_id) == 0
+    ), "sweep state must be cleared when the sweep completes"
+
+
+async def test_a_completed_sweep_counts_as_a_verification(pg_tx: asyncpg.Connection) -> None:
+    """Otherwise an oversized bucket keeps its failure count and never leaves the queue head, which
+    is the same starvation by another route."""
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+    await _put(pg_tx, bucket_id, "a", 10)
+    await _compact(pg_tx)
+    await pg_tx.fetchval(get_query("mark_bucket_reconcile_failed"), bucket_id)
+    await pg_tx.fetchval(get_query("mark_bucket_reconcile_failed"), bucket_id)
+
+    await storage_rollup_service.verify_bucket_sliced(pg_tx, bucket_id, page_objects=50, max_slices=5)
+
+    row = await _usage_row(pg_tx, bucket_id)
+    assert row["recompute_failures"] == 0
+    assert row["recomputed_at"] is not None
+
+
+async def test_a_sweep_resumes_across_cycles_rather_than_restarting(pg_tx: asyncpg.Connection) -> None:
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+    for i in range(10):
+        await _put(pg_tx, bucket_id, f"k{i}", 100)
+    await _compact(pg_tx)
+
+    first = await storage_rollup_service.verify_bucket_sliced(pg_tx, bucket_id, page_objects=2, max_slices=2)
+    assert not first.complete
+    assert first.objects_scanned == 4
+
+    second = await storage_rollup_service.verify_bucket_sliced(pg_tx, bucket_id, page_objects=2, max_slices=99)
+    assert second.complete
+    assert second.objects_scanned == 10, "the sweep restarted instead of resuming from its cursor"
+    assert second.swept_bytes == await _oracle(pg_tx, acct) == 1000
+
+
+async def test_a_sweep_catches_drift_the_counter_cannot_explain(pg_tx: asyncpg.Connection) -> None:
+    """Inject exactly the failure the sweep exists to detect: a counter that disagrees with the base
+    tables by far more than any concurrent write could account for."""
+    acct = await _seed_account(pg_tx)
+    bucket_id = await _seed_bucket(pg_tx, acct)
+    await _put(pg_tx, bucket_id, "a", 5_000)
+    await _compact(pg_tx)
+
+    # A write path that moved bytes without emitting a delta looks exactly like this.
+    await pg_tx.execute(
+        "UPDATE bucket_storage_usage SET bytes_used = bytes_used - 100_000_000_000 WHERE bucket_id = $1",
+        bucket_id,
+    )
+
+    sweep = await storage_rollup_service.verify_bucket_sliced(pg_tx, bucket_id, page_objects=10, max_slices=5)
+
+    assert sweep.complete
+    assert sweep.gap_bytes == 100_000_000_000
+    assert sweep.exceeds_tolerance, "100 GB of drift was written off as concurrent churn"
+
+
+async def test_writes_during_a_sweep_do_not_manufacture_drift(committed_pool: CommittedPool) -> None:
+    """The false-positive case, which is what makes the tolerance necessary.
+
+    A sweep reads across cycles while writes land, so its total is a smear and the counter is a point
+    reading. Without the churn bound every busy bucket would report drift on every sweep -- and an
+    alarm that fires constantly is the same as no alarm, which this feature has already learned once
+    with the pre-backfill seeding logs.
+    """
+    acct = await committed_pool.new_account()
+    bucket_id = await committed_pool.new_bucket(acct)
+
+    async with committed_pool.acquire() as conn:
+        for i in range(6):
+            await _put(conn, bucket_id, f"k{i:02d}", 1_000)
+        await _compact(conn)
+
+    # Sweep the first page, then write BEHIND the cursor, then finish. The key has to sort before
+    # what the sweep has already read -- a late write ahead of the cursor is simply picked up by a
+    # later page and produces no smear at all, which is how the first version of this test passed
+    # while proving nothing.
+    async with committed_pool.acquire() as conn:
+        partial = await storage_rollup_service.verify_bucket_sliced(conn, bucket_id, page_objects=2, max_slices=1)
+        assert not partial.complete
+
+    async with committed_pool.acquire() as conn:
+        await _put(conn, bucket_id, "aaa-behind-cursor", 4_000)
+        await _compact(conn)
+
+    async with committed_pool.acquire() as conn:
+        sweep = await storage_rollup_service.verify_bucket_sliced(conn, bucket_id, page_objects=2, max_slices=99)
+
+    assert sweep.complete
+    assert sweep.gap_bytes != 0, "precondition: the late write should make the totals differ"
+    assert not sweep.exceeds_tolerance, (
+        f"a concurrent write was reported as drift: gap={sweep.gap_bytes} tolerance={sweep.tolerance_bytes}"
     )
 
 

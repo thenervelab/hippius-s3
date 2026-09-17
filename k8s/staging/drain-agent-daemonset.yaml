@@ -1,7 +1,7 @@
 # The hippius-drain agent: the per-node drain daemon.
-# One pod per ingest node, draining that node's local-SSD ingest dir to
-# the shared CephFS pool, path-preservingly per the api part layout
-# (<object_id>/v<version>/part_<n>/). Parts are discovered from the api's landed-part
+# One pod per ingest node, verifying each part that lands on that node's local-SSD
+# ingest dir (the api part layout <object_id>/v<version>/part_<n>/) and handing it to
+# the node-local uploader (arion_upload_requests:<node>). Parts are discovered from the api's landed-part
 # announcements (cephor:landed:<node> on the queue Redis); the reconciler's SSD scan is the
 # BACKSTOP for an announcement that was never delivered, not the primary trigger.
 #
@@ -14,10 +14,8 @@
 # == Volumes ==
 #  * SSD source: the SAME hostPath the api pods write to,
 #    /var/lib/hippius/local_ingest_staging (the `_staging` suffix keeps it disjoint
-#    from prod on a shared node). RW so the agent can unlink a part after a verified,
-#    committed pool copy.
-#  * CephFS pool: object-cache-pvc — ReadWriteMany ceph-filesystem, mounted RW (the api
-#    pods mount it read-only; the agent is the writer into ceph).
+#    from prod on a shared node). RW so the agent can unlink a part once the backend
+#    acks it (the evictor) and reclaim debris.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -76,8 +74,18 @@ spec:
             - -c
             - |
               until pg_isready -h postgres-rw -p 5432; do echo "waiting for postgres"; sleep 3; done
-              until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "SELECT to_regclass('public.cephor_replication_status') IS NOT NULL")" = "t" ]; do
-                echo "waiting for the cephor schema (allocator migration)"; sleep 3
+              # The column check (not just the table) is what keeps a drain pod from starting
+              # against a schema older than its binary: `apply -k` starts this DaemonSet and
+              # the allocator at the same instant, and the CHECK rejects 'uploading' until
+              # 0020 lands. Same shape as production's gate.
+              until [ "$(psql "$CEPHOR_DATABASE_URL" -tAc "
+                SELECT to_regclass('public.cephor_ssd_residency') IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_schema = 'public'
+                                 AND table_name = 'cephor_replication_status'
+                                 AND column_name IN ('content_sha256', 'relanded_at', 'reclaimed_at', 'upload_attempts')
+                               HAVING count(DISTINCT column_name) = 4)")" = "t" ]; do
+                echo "waiting for the cephor schema (allocator migrations 0016-0020)"; sleep 3
               done
           env:
             - name: CEPHOR_DATABASE_URL
@@ -107,26 +115,14 @@ spec:
             # mounted at the same paths the api uses, so the relative part dirs line up.
             - name: CEPHOR_SSD_ROOT
               value: /var/lib/hippius/local_object_cache
-            - name: CEPHOR_POOL_ROOT
-              value: /var/lib/hippius/object_cache
-            # The drain is the sole upload producer (s3-2.1 drain-direct): once a part is
-            # replicated to ceph it pushes an UploadChainRequest to {backend}_upload_requests
-            # for each configured backend. Reuse the api's queue-Redis + upload-backend list.
+            # The drain is the sole upload producer: once a part is verified whole on the
+            # node's SSD it pushes an UploadChainRequest to {backend}_upload_requests:<node>
+            # for each pinned backend (STORAGE_BACKENDS). Reuse the api's queue-Redis.
             - name: REDIS_QUEUES_URL
               valueFrom:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: REDIS_QUEUES_URL
-            # Sourced from the shared secret (like every Python worker), NOT a literal:
-            # the drain is the sole upload producer, so if a backup backend is added to the
-            # secret the drain must fan out to it too — a hardcoded "arion" would silently
-            # under-replicate (never enqueue the new backend, so the janitor replication gate
-            # never clears -> unbounded cache growth).
-            - name: HIPPIUS_UPLOAD_BACKENDS
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_UPLOAD_BACKENDS
             # SSD-ingest reclaim worker: clean up broken/abandoned uploads (failed parts
             # the drain skips forever), replicated crash-orphans (a crash between the
             # mark_replicated commit and the drain's own unlink), and orphan write-temps,
@@ -155,6 +151,16 @@ spec:
               value: "150"
             - name: CEPHOR_EVICT_HEADROOM_PERMILLE
               value: "50"
+            # STAGING ONLY. The ingest dir here sits on the node's shared root disk, so the
+            # free-space floor above measures other tenants: it either never arms (150+ GB
+            # free against a ~1 GB read tier) or, raised past that, evicts every part the
+            # moment it replicates. Bound the retained cache by bytes instead: with the
+            # reserve/headroom permilles applied to a 6 GB budget, eviction arms once the
+            # replicated parts on this node exceed ~5.1 GB and frees back to ~4.8 GB, so a
+            # 1 GiB upload past that point is what gets the coldest part evicted. Unset on
+            # production, where the NVMe is the agent's own disk and free space is the truth.
+            - name: CEPHOR_EVICT_CACHE_BUDGET_BYTES
+              value: "6000000000"
             # Max parts drained concurrently — the in-flight gate that lets the node
             # overlap fsync latency across parts (the AIMD allocator only tunes bytes/s).
             # Safe code default (4); set here for per-node tuning.
@@ -221,8 +227,6 @@ spec:
           volumeMounts:
             - name: local-ingest
               mountPath: /var/lib/hippius/local_object_cache
-            - name: object-cache
-              mountPath: /var/lib/hippius/object_cache
           resources:
             requests:
               cpu: 100m
@@ -264,6 +268,3 @@ spec:
           hostPath:
             path: /var/lib/hippius/local_ingest_staging
             type: DirectoryOrCreate
-        - name: object-cache
-          persistentVolumeClaim:
-            claimName: object-cache-pvc

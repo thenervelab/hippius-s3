@@ -26,6 +26,9 @@ resources:
   # and the per-ingest-node drain agent DaemonSet. Both use the `drain` image.
   - drain-allocator-deployment.yaml
   - drain-agent-daemonset.yaml
+  # The node-local uploader: consumes arion_upload_requests:<node> and reads the node's local
+  # ingest dir. Must be Ready before the drain image that publishes to node queues rolls.
+  - arion-uploader-local-daemonset.yaml
   # Auto-aborts abandoned multipart uploads so the drain stops re-deferring their
   # never-finalized parts (uses the `workers` image; DB + redis-queues only).
   - mpu-reaper-deployment.yaml
@@ -35,29 +38,6 @@ patches:
   - path: environment-patch.yaml
   - path: resource-limits.yaml
   - path: services-patch.yaml
-  # s3-2.0 trial: the api fleet is entirely the local-ingest pods (base api scaled
-  # to 0 in resource-limits.yaml). Point the existing `api` Service — the gateway's
-  # GATEWAY_BACKEND_URL=http://api:8000 upstream — straight at them, so routing goes
-  # through the normal front door with no separate target.
-  - target:
-      kind: Service
-      name: api
-    patch: |-
-      - op: replace
-        path: /spec/selector
-        value:
-          app: api-local
-  # Same swap for the gateway alias Service (see k8s/base/services.yaml): the merged
-  # api-local fleet is what answers on gateway:8080 now.
-  - target:
-      kind: Service
-      name: gateway
-    patch: |-
-      - op: replace
-        path: /spec/selector
-        value:
-          app: api-local
-          hippius.io/edge: "true"
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api

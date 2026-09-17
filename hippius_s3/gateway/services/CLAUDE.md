@@ -9,10 +9,10 @@ Single entry point that picks the right auth method based on request shape. Prio
 1. `_authenticate_presigned_url` ([line 100](auth_orchestrator.py)) — for `X-Amz-Algorithm=AWS4-HMAC-SHA256` query auth.
 2. `_authenticate_bearer` ([line 169](auth_orchestrator.py)) — for `Authorization: Bearer hip_...`.
 3. `_authenticate_access_key_header` ([line 236](auth_orchestrator.py)) — for `Authorization: AWS4-HMAC-SHA256 Credential=hip_...`.
-4. `_authenticate_seed_phrase` ([line 292](auth_orchestrator.py)) — Authorization header present but credential doesn't start `hip_`.
+4. Anything else — an Authorization header whose credential does not start `hip_`.
 5. Anonymous ([line 67](auth_orchestrator.py)) — GET/HEAD without Authorization.
 
-Returns an `AuthResult(is_valid, auth_method, access_key, account_address, token_type, seed_phrase, ...)`. The middleware adapter attaches these to `request.state`.
+Returns an `AuthResult(is_valid, auth_method, access_key, account_address, token_type, account_id, ...)`. The middleware adapter attaches these to `request.state`.
 
 **Line 75**: mutations without any Authorization header get a 403 short-circuit before attempting auth — only GET/HEAD get the anonymous fallthrough.
 
@@ -30,11 +30,11 @@ Redis-cached wrapper around Arion `/objectstore/tokens/auth/`. The cache key is 
 
 Per-request permission evaluator. Called from `acl_middleware`. Reads ACL rows from the main DB + ACL cache (`redis-acl`). Evaluates grant matching against the request's `(account, bucket, key, permission)` tuple.
 
-Bucket-level ACLs and object-level ACLs both supported. Public buckets are modeled as explicit ACL grants (`AllUsers` grantee) rather than a boolean flag — migration script at [hippius_s3/scripts/migrate_public_buckets_to_acl.py](../../scripts/migrate_public_buckets_to_acl.py) converted legacy `is_public` bools.
+Bucket-level ACLs and object-level ACLs both supported. Public buckets are modeled as explicit ACL grants (`AllUsers` grantee) rather than a boolean flag — the `20251121000000_migrate_public_buckets_to_acl` SQL migration converted legacy `is_public` bools.
 
 ## [account_service.py](account_service.py) — `fetch_account`
 
-For seed-phrase auth: given a seed, derive the SS58 subaccount ID via substrateinterface (called in an executor thread to avoid blocking — [account_service.py:29](account_service.py)), then fetch cached account data from `redis-accounts`. If missing, call the Substrate node.
+Fetch cached account data from `redis-accounts`. If missing, call the Substrate node.
 
 Populates `request.state.account` with main_account, has_credits, upload/delete flags. Since the merge these flow to the S3 handlers directly via [request_context](../../api/middlewares/request_context.py) (the `X-Hippius-*` header contract is dead — see the grep test in [tests/unit/test_request_context.py](../../../tests/unit/test_request_context.py)).
 

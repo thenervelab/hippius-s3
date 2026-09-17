@@ -53,6 +53,7 @@ SELECT v.object_key,
        v.size_bytes,
        v.md5_hash,
        v.body_blake3,
+       v.arion_hash,
        v.last_modified,
        v.current_object_version
 FROM (
@@ -63,6 +64,7 @@ FROM (
                ov.size_bytes,
                ov.md5_hash,
                ov.body_blake3,
+               ov.arion_hash,
                COALESCE(ov.last_modified, ov.created_at) AS last_modified,
                o.current_object_version
         FROM objects o
@@ -103,6 +105,7 @@ FROM (
                ov.size_bytes,
                ov.md5_hash,
                ov.body_blake3,
+               ov.arion_hash,
                COALESCE(ov.last_modified, ov.created_at) AS last_modified,
                o.current_object_version
         FROM object_names n

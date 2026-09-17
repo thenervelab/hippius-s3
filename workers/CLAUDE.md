@@ -7,14 +7,11 @@ Worker entry points — the `run_*.py` scripts that actually run as pod processe
 | Entry point | Purpose | Scaling |
 |---|---|---|
 | [run_arion_uploader_in_loop.py](run_arion_uploader_in_loop.py) | Drains `arion_upload_requests`, uploads chunks to Arion, publishes to chain. | Horizontally scalable (`replicas: 10` in production) |
-| [run_arion_downloader_in_loop.py](run_arion_downloader_in_loop.py) | Drains `arion_download_requests`, fetches chunks from Arion, fills FS cache, notifies streamers. | Horizontally scalable |
 | [run_arion_unpinner_in_loop.py](run_arion_unpinner_in_loop.py) | Drains `unpin_requests`, soft-deletes `chunk_backend` rows, calls Arion delete. | Horizontally scalable; per-pod request concurrency (`HIPPIUS_UNPINNER_MAX_INFLIGHT`) + shared Arion-DELETE semaphore (`HIPPIUS_UNPINNER_PARALLELISM`) |
 | [run_janitor_in_loop.py](run_janitor_in_loop.py) | FS cache GC with replication gate, hot retention, and pressure modes. | Single instance |
-| [run_orphan_checker_in_loop.py](run_orphan_checker_in_loop.py) | Periodically scans the Hippius chain for orphaned files and enqueues cleanup. | Single instance |
 | [run_account_cacher_in_loop.py](run_account_cacher_in_loop.py) | Warms account credit cache from Substrate. | Single instance |
 | [run_plans_cacher_in_loop.py](run_plans_cacher_in_loop.py) | Scrapes the S3 billing-plan catalog + account→plan map from api.hippius.com into `redis-accounts`. | Single instance (**must stay `replicas: 1`**) |
 | [run_usage_rollup_in_loop.py](run_usage_rollup_in_loop.py) | Folds the storage delta ledger into `bucket_storage_usage`; reconciles it and exports drift. | Single instance (**must stay `replicas: 1`**) |
-| [run_migrator_once.py](run_migrator_once.py) | One-shot data migration (e.g., v4→v5). Invoked as a K8s Job. | Job |
 | [cachet_health_check.py](cachet_health_check.py) | Pushes status to the external Cachet status page. | CronJob |
 
 Each `run_*_in_loop.py` is a thin wrapper that imports the shared logic and provides backend-specific parameters (`backend_name`, `queue_name`, `fetch_fn`, etc.). See [../hippius_s3/workers/CLAUDE.md](../hippius_s3/workers/CLAUDE.md) for the core loop internals.
@@ -25,7 +22,7 @@ Each `run_*_in_loop.py` is a thin wrapper that imports the shared logic and prov
 
 ### Core invariant
 
-**Replication is an absolute gate.** A chunk that has NOT been replicated to every required backend (`HIPPIUS_UPLOAD_BACKENDS` ∪ `HIPPIUS_BACKUP_BACKENDS`) is **never** deleted — under any conditions, including a full disk. The critical-pressure path still honors this: if nothing is replicated and disk is at 95%+, the janitor logs ERROR and deletes nothing. Operator paging, not data loss.
+**Replication is an absolute gate.** A chunk that has NOT been replicated to every required backend (`config.upload_backends` ∪ `config.backup_backends`, pinned in code as `STORAGE_BACKENDS`) is **never** deleted — under any conditions, including a full disk. The critical-pressure path still honors this: if nothing is replicated and disk is at 95%+, the janitor logs ERROR and deletes nothing. Operator paging, not data loss.
 
 ### Pressure modes
 
@@ -60,15 +57,6 @@ The FS-walk phases are **parallel, sharded, and budgeted** so a cycle always com
 - `fs_cache_pressure_mode` (0/1/2)
 - `fs_cache_age_bucket_parts{age_bucket=...}`
 - `fs_janitor_deleted_total` / `fs_janitor_tmp_deleted_total`
-
-## Orphan checker
-
-[run_orphan_checker_in_loop.py](run_orphan_checker_in_loop.py). Scans Substrate for files that exist on-chain but have no corresponding entry in our DB — these are orphans from past incidents or test accounts. Enqueues unpin.
-
-Config:
-- `ORPHAN_CHECKER_LOOP_SLEEP=7200` (2h) — how often to run.
-- `ORPHAN_CHECKER_BATCH_SIZE=500` — files per API call.
-- `HIPPIUS_ORPHAN_WORKER_ACCOUNT_WHITELIST` — optional whitelist; if set, only those accounts are scanned. Safety valve for staging.
 
 ## Account cacher
 
@@ -242,8 +230,16 @@ Two jobs in one loop:
 
 | Job | Interval | What it does |
 |---|---|---|
-| **Compact** | `HIPPIUS_USAGE_ROLLUP_LOOP_SLEEP` (5s) | Claims `HIPPIUS_USAGE_ROLLUP_BATCH_SIZE` (5000) ledger rows with `DELETE ... RETURNING` and adds them to the counter. |
-| **Reconcile** | `HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS` (300s) | Fully recomputes `HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE` (50) live buckets, oldest-recomputed first, and exports the correction as **drift**. ~5.6h for a full sweep over prod's ~3,350 live buckets, which is the only bound on how long a bucket can carry a wrong number. These are the heaviest aggregates in the schema and they run on the PRIMARY — a cold 200-bucket pass measured 35.9s / 9.8 GiB of buffer traffic, which is why the rate is 50 and not 200. Read the justification in [config.py](../hippius_s3/config.py) before changing either number. |
+| **Compact** | `HIPPIUS_USAGE_ROLLUP_LOOP_SLEEP` (5s) | Drains the ledger **one bucket at a time**, oldest work first, `HIPPIUS_USAGE_ROLLUP_BATCH_SIZE` (5000) rows per claim, with `DELETE ... RETURNING` under that bucket's advisory lock. Also accumulates `churn_bytes`. |
+| **Reconcile** | `HIPPIUS_USAGE_RECONCILE_INTERVAL_SECONDS` (300s) | Recomputes `HIPPIUS_USAGE_RECONCILE_BUCKETS_PER_CYCLE` (50) live buckets, **least-recently-ATTEMPTED** first, and exports the correction as **drift**. ~5.6h for a full sweep over prod's ~3,350 live buckets, which is the only bound on how long a bucket can carry a wrong number. These are the heaviest aggregates in the schema and they run on the PRIMARY — a cold 200-bucket pass measured 35.9s / 9.8 GiB of buffer traffic, which is why the rate is 50 and not 200. Bounded per bucket by `HIPPIUS_USAGE_RECONCILE_TIMEOUT_SECONDS` (**20s**, far below the interval on purpose). Read the justification in [config.py](../hippius_s3/config.py) before changing any of them. |
+| **Verify (sliced)** | same pass as Reconcile | A bucket that fails `HIPPIUS_USAGE_VERIFY_SLICE_AFTER_FAILURES` (2) recomputes is instead summed in indexed `object_key` ranges — `HIPPIUS_USAGE_VERIFY_SLICES_PER_CYCLE` (4) × `HIPPIUS_USAGE_VERIFY_SLICE_OBJECTS` (50k) per cycle — carrying a cursor across cycles. **It MEASURES only and never writes the counter.** Drift is claimed only when the gap exceeds the `churn_bytes` that moved during the sweep, which makes it a one-sided test that cannot false-positive on live traffic. |
+
+**Least-recently-ATTEMPTED, not least-recently-recomputed.** `recompute_bucket_storage_usage()` only
+stamps on success, so ordering the queue on that stamp meant a bucket whose aggregate can never
+complete kept a NULL timestamp, sat at the head of the queue forever, and starved everything behind
+it — prod 2026-09-15: 168 failures in 24h on one bucket and 47 of 50 slots used per pass. The
+failure is recorded in its own transaction (the recompute's has already rolled back) so the bucket
+rotates out after one try.
 
 **Compaction is exactly-once by construction.** The rows leave the ledger in the same transaction
 that adds them to the counter, so a crash puts them back and a second compactor can only see rows
@@ -261,12 +257,21 @@ the outgoing version at the same time. **Alert on it.** Same for
 `storage_rollup_negative_buckets`, which is only reachable if a decrement was recorded without its
 increment.
 
-**A recompute and a compaction must not overlap**, or the recompute's `SET` can silently discard a
-delta the compactor has already consumed — permanently, and in a way that keeps the drift metric
-non-zero forever, destroying the one signal that says the ledger is wrong. A global advisory lock
-enforces it: the compactor uses `pg_try_advisory_xact_lock` and skips the cycle, the recompute waits.
-The recompute itself drains the bucket's pending ledger rows and aggregates the truth in ONE
-statement, therefore in ONE snapshot, so a write landing mid-recompute is counted exactly once.
+**A recompute and a compaction of the SAME bucket must not overlap**, or the recompute's `SET` can
+silently discard a delta the compactor has already consumed — permanently, and in a way that keeps
+the drift metric non-zero forever, destroying the one signal that says the ledger is wrong. A
+**per-bucket** advisory lock enforces it — `pg_advisory_xact_lock(rollup_key, bucket_key)` — where
+the compactor uses `pg_try_` and skips just that bucket while the recompute waits. The recompute
+itself drains the bucket's pending ledger rows and aggregates the truth in ONE statement, therefore
+in ONE snapshot, so a write landing mid-recompute is counted exactly once.
+
+⚠️ **The second lock argument used to be a hardcoded `0`, i.e. one key for the whole estate.** A
+recompute of any single bucket therefore stalled compaction for every other bucket for its entire
+timeout. On prod (2026-09-15) one 136M-object bucket — 80.7% of the `objects` table, so a 167 GB seq
+scan that can never finish in a cycle — failed 168 times in 24h and aged the ledger's oldest row to
+**412s** against a normal 2s. Keying the lock per bucket is what makes an un-aggregatable bucket a
+local problem instead of an estate-wide one. Pinned by
+`test_a_recompute_does_not_block_an_unrelated_buckets_compaction`.
 
 **Why a separate worker rather than a second loop in the plans-cacher.** The plans-cacher's pool is
 `DATABASE_READONLY_URL`, a read replica, because its work must not run on the primary. Compaction
@@ -291,18 +296,14 @@ per transaction, each recompute SETS rather than adds, and `backfilled_at` is on
 complete pass — so a run that dies part way through degrades to the pre-existing behaviour (the
 plans-cacher keeps its previous roll) rather than to a wrong bill.
 
-## Migrator
-
-[run_migrator_once.py](run_migrator_once.py). Subprocess wrapper around [../hippius_s3/scripts/migrate_objects.py](../hippius_s3/scripts/migrate_objects.py). Runs as a K8s Job; exits on completion.
-
 ## Cachet health check
 
 [cachet_health_check.py](cachet_health_check.py). Pushes service status to the public Cachet status page via `CACHET_API_KEY` and `CACHET_COMPONENT_ID`. Cron-scheduled.
 
 ## Worker-specific gotchas
 
-- **Pool size**: uploader/downloader/unpinner use their own asyncpg pools inside the worker loop (min 2; per-worker max differs — downloader `HIPPIUS_DOWNLOADER_DB_POOL_MAX=20` ([config.py:293](../hippius_s3/config.py)), uploader `HIPPIUS_UPLOADER_DB_POOL_MAX=12` ([config.py:163](../hippius_s3/config.py)), unpinner `HIPPIUS_UNPINNER_DB_POOL_MAX=16` ([config.py:188](../hippius_s3/config.py)) — mind the aggregate against Postgres `max_connections`). Do NOT share the API's pool.
-- **Fatal reconnection**: if an inflight task raises a Redis or asyncpg connection error, the main loop flags the client for rebuild on the next iteration ([downloader.py:423-435](../hippius_s3/workers/downloader.py)). This prevents continued failures against a dead connection.
-- **Graceful shutdown**: on SIGTERM / KeyboardInterrupt, workers cancel inflight tasks and gather-with-exceptions before closing DB + Redis. See [downloader.py:496-508](../hippius_s3/workers/downloader.py).
+- **Pool size**: uploader/unpinner use their own asyncpg pools inside the worker loop (min 2; per-worker max differs — uploader `HIPPIUS_UPLOADER_DB_POOL_MAX=12` ([config.py:163](../hippius_s3/config.py)), unpinner `HIPPIUS_UNPINNER_DB_POOL_MAX=16` ([config.py:188](../hippius_s3/config.py)) — mind the aggregate against Postgres `max_connections`). Do NOT share the API's pool.
+- **Fatal reconnection**: if an inflight task raises a Redis or asyncpg connection error, the main loop flags the client for rebuild on the next iteration (see the uploader loop). This prevents continued failures against a dead connection.
+- **Graceful shutdown**: on SIGTERM / KeyboardInterrupt, workers cancel inflight tasks and gather-with-exceptions before closing DB + Redis. See `run_worker()` in [run_arion_uploader_in_loop.py](run_arion_uploader_in_loop.py).
 - **Retry mover runs on every pod**: `_retry_mover` ([run_arion_uploader_in_loop.py:133](run_arion_uploader_in_loop.py)) polls `{backend}_upload_retries` every 2s on each of the 10 uploader replicas. `move_due_upload_retries` claims due members with a server-side Lua `ZREM`-then-`LPUSH`, so exactly one pod re-enqueues each member; changing it back to a read-then-move re-introduces N-fold retry amplification. The unpin and download movers still have that race.
 - **Uploader retry budget**: `HIPPIUS_UPLOADER_MAX_ATTEMPTS=7`, `HIPPIUS_UPLOADER_BACKOFF_BASE_MS=500`, `HIPPIUS_UPLOADER_BACKOFF_MAX_MS=60000` — shipped in both [.env.defaults](../.env.defaults) and [k8s/base/configmap-defaults.yaml](../k8s/base/configmap-defaults.yaml), matching the [config.py](../hippius_s3/config.py) defaults. That is ~63s of tolerance (0.5, 1, 2, 4, 8, 16, 32s) before the request goes to the upload DLQ, which is manual-recovery only. This queue is the **only** retry layer for transport errors — `retry_on_error` in [arion_service.py](../hippius_s3/services/arion_service.py) deliberately does not catch them, because retrying in both layers multiplies into ~24 requests at an already-failing backend.

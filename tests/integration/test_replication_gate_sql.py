@@ -6,11 +6,13 @@ version, else the row's persisted upload_backends, else config default) unioned 
 config.backup_backends, then checks every chunk has a live chunk_backend row for all of
 them (via count_chunk_backends.sql).
 
-These tests pin the C10 residual the review surfaced: the drain enqueuer is version-blind
-(it pushes to the agent's global config.enqueue_backends), so a MIGRATION version — whose
-gate requirement is ['ipfs'] regardless of config — or a version whose persisted
-upload_backends drifted from current config is required-but-under-enqueued and therefore
-NOT reclaimable (a permanent SSD leak, surfaced by the G2 sentinel; not data loss).
+The persisted per-version list is a RECORD of what the version was written under, not a
+requirement of its own: it is intersected with the pinned set (config.upload_backends), so a
+backend retired from the set since the version was written is no longer required — otherwise
+every version written under the wider set would be pinned on the cache forever. The one
+per-version requirement that survives is the MIGRATION shape (['ipfs'] regardless of config),
+which the version-blind drain enqueuer cannot satisfy: such a version stays NOT reclaimable
+(a permanent SSD leak surfaced by the G2 sentinel; not data loss).
 """
 
 from __future__ import annotations
@@ -146,11 +148,19 @@ async def test_migration_version_with_ipfs_is_reclaimable(conn):
     assert await _replicated(conn, oid) is True, "migration version with its required ipfs copy is reclaimable"
 
 
-async def test_drifted_per_version_upload_backends_are_not_reclaimable(conn):
-    # Version persisted upload_backends=['arion','ovh'] (a superset of current config
-    # ['arion']); the version-blind enqueuer only pushed arion → gate requires ovh → leak.
-    oid = await _one_chunk_part(conn, live_backends=["arion"], upload_backends=["arion", "ovh"])
-    assert await _replicated(conn, oid) is False, "a version needing ovh is not reclaimable when only arion landed"
+async def test_a_backend_retired_from_the_pinned_set_is_no_longer_required(conn):
+    # Version persisted upload_backends=['arion','retired'] under a wider set than the code now
+    # pins (['arion']); the retired backend drops out of the requirement, so arion coverage
+    # alone makes the part reclaimable — the persisted list is a record, not a contract.
+    oid = await _one_chunk_part(conn, live_backends=["arion"], upload_backends=["arion", "retired"])
+    assert await _replicated(conn, oid) is True, "a retired backend in the persisted list must not pin the part"
+
+
+async def test_a_persisted_list_disjoint_from_the_pinned_set_falls_back_to_it(conn):
+    # Nothing in the persisted list is pinned any more: the requirement is the pinned set,
+    # never an empty set (which would make every part trivially reclaimable).
+    oid = await _one_chunk_part(conn, live_backends=[], upload_backends=["retired"])
+    assert await _replicated(conn, oid) is False, "an empty intersection must fall back to the pinned set"
 
 
 async def test_matching_per_version_backends_are_reclaimable(conn):
@@ -164,15 +174,17 @@ _SLA_SECONDS = 900
 
 
 async def _seed_servable_underreplicated(conn: asyncpg.Connection, *, landed_secs_ago: int) -> str:
-    """A LIVE object + SERVEABLE version (address set) whose single chunk landed on arion
-    only (ovh missing → under-covered), with its part's uploaded_at aged `landed_secs_ago`.
-    Returns object_id. This is exactly the shape the sentinel must judge: a real coverage
-    gap that is either still replicating (recent) or genuinely stuck (old)."""
+    """A LIVE object + SERVEABLE version (address set) whose single chunk has no live
+    chunk_backend row on the pinned backend (arion missing → under-covered), with its part's
+    uploaded_at aged `landed_secs_ago`. The version's persisted list also names a retired
+    backend, which must not count either way. Returns object_id. This is exactly the shape
+    the sentinel must judge: a real coverage gap that is either still replicating (recent)
+    or genuinely stuck (old)."""
     oid = _oid()
     await conn.execute("INSERT INTO objects (object_id, deleted_at) VALUES ($1::uuid, NULL)", oid)
     await conn.execute(
         "INSERT INTO object_versions (object_id, object_version, version_type, upload_backends, address) "
-        "VALUES ($1::uuid, 1, NULL, ARRAY['arion','ovh'], 'addr')",
+        "VALUES ($1::uuid, 1, NULL, ARRAY['arion','retired'], 'addr')",
         oid,
     )
     part_id = _oid()
@@ -184,8 +196,20 @@ async def _seed_servable_underreplicated(conn: asyncpg.Connection, *, landed_sec
         landed_secs_ago,
     )
     chunk_id = await conn.fetchval("INSERT INTO part_chunks (part_id) VALUES ($1::uuid) RETURNING id", part_id)
-    await conn.execute("INSERT INTO chunk_backend (chunk_id, backend, deleted) VALUES ($1, 'arion', false)", chunk_id)
+    await conn.execute("INSERT INTO chunk_backend (chunk_id, backend, deleted) VALUES ($1, 'retired', false)", chunk_id)
     return oid
+
+
+async def test_a_retired_backend_in_the_persisted_list_does_not_flag_a_covered_chunk(conn):
+    # Persisted ['arion','retired'], arion covered, retired not: no gap on any pinned backend,
+    # so the sentinel must stay quiet — otherwise every version written under the wider set
+    # pages forever after the retirement.
+    oid = await _seed_servable_underreplicated(conn, landed_secs_ago=_SLA_SECONDS + 600)
+    chunk_id = await conn.fetchval(
+        "SELECT pc.id FROM part_chunks pc JOIN parts p ON p.part_id = pc.part_id WHERE p.object_id = $1::uuid", oid
+    )
+    await conn.execute("INSERT INTO chunk_backend (chunk_id, backend, deleted) VALUES ($1, 'arion', false)", chunk_id)
+    assert await _sentinel_flags(conn, oid) is False, "coverage on every pinned backend is full coverage"
 
 
 async def _sentinel_flags(conn: asyncpg.Connection, oid: str) -> bool:
@@ -210,7 +234,7 @@ async def test_recent_underreplicated_part_is_not_flagged(conn):
 
 
 async def test_stale_underreplicated_part_is_flagged(conn):
-    # Landed well past the SLA and still missing ovh: replication is genuinely stuck, a real
+    # Landed well past the SLA and still missing arion: replication is genuinely stuck, a real
     # data-loss risk the moment the SSD copy is evicted. This is what the sentinel must page on.
     oid = await _seed_servable_underreplicated(conn, landed_secs_ago=_SLA_SECONDS + 600)
     assert await _sentinel_flags(conn, oid) is True, "a chunk stuck under-covered past the SLA must be flagged"

@@ -227,8 +227,14 @@ services:
       - WORKER_SCRIPT=workers/run_arion_uploader_in_loop.py
       - ENABLE_WATCHFILES=true
       - HIPPIUS_ARION_BASE_URL=${HIPPIUS_ARION_BASE_URL:-https://arion.hippius.com/}
+      # Node-local uploader: consume this node's queue (the drain-agent below publishes to
+      # arion_upload_requests:<CEPHOR_NODE_ID>) and read the parts off the same local ingest
+      # dir the api writes and the drain verifies. One node in compose, so one name.
+      - NODE_NAME=e2e-node
+      - HIPPIUS_OBJECT_CACHE_DIR=/var/lib/hippius/local_object_cache
     volumes:
       - .:/app
+      - /var/lib/hippius/local_object_cache:/var/lib/hippius/local_object_cache
       - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
       - /var/lib/hippius/kms:/kms_certs:ro
     healthcheck:
@@ -352,59 +358,6 @@ services:
       - PYTHONUNBUFFERED=1
       - WORKER_SCRIPT=workers/run_purger_in_loop.py
       - ENABLE_WATCHFILES=true
-    networks:
-      - hippius_net
-
-  arion-downloader:
-    build:
-      context: .
-      dockerfile: workers/Dockerfile
-      args:
-        BASE_IMAGE: ${BASE_IMAGE:-ghcr.io/thenervelab/hippius-s3/base:latest}
-    env_file:
-      - .env.defaults
-      - .env
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      redis-queues:
-        condition: service_healthy
-    deploy:
-      replicas: 1
-    restart: unless-stopped
-    environment:
-      - PYTHONUNBUFFERED=1
-      - WORKER_SCRIPT=workers/run_arion_downloader_in_loop.py
-      - ENABLE_WATCHFILES=true
-      - HIPPIUS_ARION_BASE_URL=${HIPPIUS_ARION_BASE_URL:-https://arion.hippius.com/}
-    volumes:
-      - /var/lib/hippius/object_cache:/var/lib/hippius/object_cache
-      - /var/lib/hippius/kms:/kms_certs:ro
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "python -c 'from hippius_s3.config import get_config; get_config()'",
-        ]
-      # start_interval probes every 2s while the container is starting, so `up --wait` learns
-      # about a dead-on-arrival worker as fast as the old 5s check did. Once healthy it backs off
-      # to 30s: this spawns a python interpreter and imports the config each time, and at 5s
-      # across four workers that was ~24% of a core burning continuously for no added signal.
-      #
-      # timeout is 45s, not the 10s this shipped with, because the probe's cost is wildly
-      # arch-dependent. It imports the whole config module chain: ~0.3s on a native x86 runner,
-      # but 8-10s idle and 38-60s under startup contention when the amd64 image runs under qemu
-      # on an arm64 Mac. At 10s that flapped straight to `unhealthy` and `up --wait` failed, so
-      # the local e2e stack was unusable on Apple Silicon while CI stayed green. Detection of a
-      # genuinely wedged worker is correspondingly slower; that is the right trade against
-      # breaking every arm64 developer.
-      interval: 30s
-      start_interval: 2s
-      timeout: 45s
-      retries: 3
-      start_period: 30s
     networks:
       - hippius_net
 

@@ -181,13 +181,20 @@ async def handle_list_objects(
         add_subelement(content, "ETag", f'"{obj["md5_hash"] or ""}"')
         add_subelement(content, "Size", str(obj["size_bytes"]))
         add_subelement(content, "StorageClass", "STANDARD")
-        owner = add_subelement(content, "Owner")
-        # Console reads Owner.ID as the Arion file hash. Surface the plaintext BLAKE3 once PUT/MPU
-        # has stored it; until then keep the account id, which the console treats as pending.
+        # The hash Arion registered the object under, which is what the explorer and indexer look it
+        # up by. Absent until the uploader has stored it, and for multi-chunk versions, which have no
+        # single Arion hash. NOT body_blake3: that digests the plaintext, Arion only sees ciphertext.
         # Bracket access, not .get(): if a listing query ever loses the column, that must be a
-        # KeyError, not a silently empty <ID/> on every object.
-        file_hash = obj["body_blake3"] or ""
-        add_subelement(owner, "ID", file_hash or bucket_owner)
+        # KeyError, not a silently missing hash on every object.
+        arion_hash = obj["arion_hash"] or ""
+        # <ArionHash> is the explicit field (a Hippius extension stock S3 clients ignore). Owner.ID
+        # carries it too because the console reaches this listing through the api.hippius.com
+        # objectstore proxy, which forwards Owner; without a hash it stays the account id, which the
+        # console treats as pending.
+        if arion_hash:
+            add_subelement(content, "ArionHash", arion_hash)
+        owner = add_subelement(content, "Owner")
+        add_subelement(owner, "ID", arion_hash or bucket_owner)
         add_subelement(owner, "DisplayName", bucket_owner)
 
     for common_prefix in common_prefixes:

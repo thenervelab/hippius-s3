@@ -1,7 +1,7 @@
 """Postgres-level view of the drain, for the staging e2e suite.
 
 Coarse on purpose: it reports ``cephor_replication_status`` row counts by status
-(``pending`` / ``draining`` / ``replicated`` / ``failed``), which is enough to assert
+(``pending`` / ``draining`` / ``uploading`` / ``replicated`` / ``failed``), which is enough to assert
 "the drain is committing replicated rows" without depending on the object->chunk_key
 mapping — that mapping is the still-unresolved api<->drain contract (the drain keys on
 its own content-addressed chunk_key, not the api's part identity). Tighten this to a
@@ -13,7 +13,7 @@ import asyncio
 import asyncpg  # type: ignore[import-untyped]
 
 
-_STATUSES = ("pending", "draining", "replicated", "failed")
+_STATUSES = ("pending", "draining", "uploading", "replicated", "failed")
 
 
 async def _counts(database_url: str) -> dict[str, int]:

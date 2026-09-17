@@ -420,8 +420,10 @@ where
         };
 
         match status.state {
-            // Live: owned by the drain pipeline.
-            ReplicationState::Pending | ReplicationState::Draining => report.skipped_live += 1,
+            // Live: owned by the drain pipeline, or handed to the uploader — for an `uploading`
+            // part the SSD copy is the ONLY copy until the backend acks, so it is never touched
+            // here however aged; a stuck hand-off is the upload sweep's to re-drive.
+            ReplicationState::Pending | ReplicationState::Draining | ReplicationState::Uploading => report.skipped_live += 1,
             // Replicated: RETAINED on purpose. This is the node's read tier — a local GET
             // serves it at ~705 MB/s / ~6 ms per chunk instead of ~94 MB/s / ~40 ms from the
             // pool — so a lingering `replicated` part is the intended steady state, not a
@@ -907,19 +909,23 @@ mod tests {
         let pending = part_at(UUID_A, 1, 1);
         let draining = part_at(UUID_A, 1, 2);
         let replicated = part_at(UUID_A, 1, 3);
+        // Handed to the uploader 30 days ago and never acked: the SSD copy is still the only
+        // one, and no age makes it reclaimable.
+        let uploading = part_at(UUID_A, 1, 4);
         let absent = part_at(UUID_B, 7, 1);
-        let scan = FakeScan::of(&[pending.clone(), draining.clone(), replicated.clone(), absent.clone()]);
+        let scan = FakeScan::of(&[pending.clone(), draining.clone(), replicated.clone(), uploading.clone(), absent.clone()]);
         let remover = FakeRemover::default();
         let log = FakeLog::with(&[
             (&pending, ReplicationState::Pending, HOUR),
             (&draining, ReplicationState::Draining, HOUR),
             (&replicated, ReplicationState::Replicated, HOUR),
+            (&uploading, ReplicationState::Uploading, Duration::from_hours(24 * 30)),
             // `absent` has no row in the log at all.
         ]);
 
         let report = reclaim_ssd(&scan, &remover, &log, &FakeBacking::all_backed(), GRACES).await.unwrap();
         assert_eq!(report.reclaimed, 0, "nothing but a failed part is ever reclaimed");
-        assert_eq!(report.skipped_live, 2);
+        assert_eq!(report.skipped_live, 3);
         assert_eq!(report.skipped_replicated, 1);
         assert_eq!(report.skipped_absent, 1);
         assert!(remover.removed().is_empty(), "no part was unlinked");

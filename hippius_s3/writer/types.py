@@ -1,24 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
-from typing import AsyncIterator
-
-
-StreamLike = AsyncIterator[bytes]
-
-
-@dataclass
-class PutContext:
-    db: Any
-    redis: Any
-    ipfs_service: Any
-    account_address: str
-    bucket_id: str
-    bucket_name: str
-    object_id: str
-    object_key: str
-    object_version: int
 
 
 @dataclass

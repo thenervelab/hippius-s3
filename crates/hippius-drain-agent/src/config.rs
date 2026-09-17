@@ -44,6 +44,26 @@ const DEFAULT_DRAIN_CONCURRENCY: u32 = 4;
 /// is re-copied from its intact SSD source this many times before being held `corrupt` and
 /// paged — enough to ride out a transient pool-copy corruption without looping on a durable one.
 const DEFAULT_REDRIVE_MAX_ATTEMPTS: u32 = 3;
+/// The storage backend set — the mirror of `STORAGE_BACKENDS` in `hippius_s3/config.py`, which
+/// carries the rationale (pinned in code, never env-driven). The two are held equal through
+/// the wire golden: `enqueue.rs` serializes this set into it, the Python wire test asserts it
+/// against the Python constant.
+pub(crate) const STORAGE_BACKENDS: &[&str] = &["arion"];
+
+/// Upload-sweep period when `CEPHOR_UPLOAD_SWEEP_POLL_SECS` is unset. Every arm of the sweep
+/// is a backstop (the uploader's own flip is the happy path), and each is a partial-index
+/// scan of this node's `uploading` rows, so half a minute keeps a lost flip or a lost request
+/// from pinning an SSD copy for long without polling the primary for nothing.
+const DEFAULT_UPLOAD_SWEEP_POLL: Duration = Duration::from_secs(30);
+/// How long an `uploading` part may sit since its hand-off before the sweep re-publishes it,
+/// when `CEPHOR_UPLOAD_REDRIVE_SECS` is unset. Must exceed the slowest legitimate part upload
+/// (a 5 GB part at the uploader's chunk concurrency, plus its queue wait behind a burst) or the
+/// sweep duplicates in-flight work; an hour is comfortably past that and still bounds how long
+/// a lost request stays a single-copy part.
+const DEFAULT_UPLOAD_REDRIVE_AFTER: Duration = Duration::from_hours(1);
+/// Max re-publishes per `uploading` part when `CEPHOR_UPLOAD_REDRIVE_MAX_ATTEMPTS` is unset.
+/// Past this the part is left to the DLQ/operator path and counted in `drain_uploads_exhausted`.
+const DEFAULT_UPLOAD_REDRIVE_MAX_ATTEMPTS: u32 = 3;
 /// Claim lease TTL when `CEPHOR_CLAIM_LEASE_TTL_SECS` is unset: a `draining`
 /// claim older than this is treated as abandoned (the H1 crash-recovery TTL).
 /// Mirrors the store-side default; long enough not to reclaim a live slow drain,
@@ -144,8 +164,6 @@ const DEFAULT_READINESS_FILE: &str = "/tmp/hippius-drain-agent.ready";
 pub struct Config {
     /// Postgres connection URL for the central state store.
     pub database_url: String,
-    /// Root of the shared `CephFS` pool mount — the drain destination.
-    pub pool_root: PathBuf,
     /// Root of the local SSD ingest cache — the drain source.
     pub ssd_root: PathBuf,
     /// Drain-worker poll floor.
@@ -185,14 +203,11 @@ pub struct Config {
     /// Redis URL for the upload queues — the drain pushes each replicated part's
     /// `UploadChainRequest` here (drain-direct; the drain is the sole upload producer).
     pub redis_queues_url: String,
-    /// Backends to enqueue each part's upload to (`{backend}_upload_requests`), from
-    /// `HIPPIUS_UPLOAD_BACKENDS` (comma-list). Defaults to `["arion"]`.
+    /// Backends to enqueue each part's upload to (`{backend}_upload_requests`): pinned to
+    /// [`STORAGE_BACKENDS`], never read from the environment (see that constant).
     pub upload_backends: Vec<String>,
-    /// `HIPPIUS_BACKUP_BACKENDS` (comma-list). Defaults to EMPTY — a backup backend is a
-    /// deliberate opt-in. The janitor gate requires coverage on `upload_backends ∪
-    /// backup_backends` before reclaiming a part, so the enqueuer MUST push to the same
-    /// union ([`enqueue_backends`](Config::enqueue_backends)) — otherwise a configured
-    /// backup backend is required-but-never-enqueued and the gate deadlocks (C10).
+    /// Additional backends the janitor gate requires coverage on before reclaiming a part.
+    /// Empty, pinned — a code-only opt-in; see [`enqueue_backends`](Config::enqueue_backends).
     pub backup_backends: Vec<String>,
     /// How often the SSD-reclaim worker scans for `failed` (abandoned-upload) parts.
     pub reclaim_poll: Duration,
@@ -208,6 +223,12 @@ pub struct Config {
     /// Max times an R4 `corrupt` part is re-driven before it is held and paged. Bounds the
     /// re-drive so a persistently-bad pool copy cannot loop forever.
     pub redrive_max_attempts: u32,
+    /// How often the upload sweep (the hand-off backstop) runs.
+    pub upload_sweep_poll: Duration,
+    /// How long an `uploading` part may sit since its hand-off before the sweep re-publishes it.
+    pub upload_redrive_after: Duration,
+    /// Max re-publishes per `uploading` part before it is left to the operator path.
+    pub upload_redrive_max_attempts: u32,
     /// How often bounded `corrupt` parts are re-driven. Separate from `reclaim_poll` because a
     /// corrupt part is a live object running on its SSD copy alone: this interval is a
     /// single-copy exposure window, not a debris-collection cadence.
@@ -229,6 +250,12 @@ pub struct Config {
     pub landed_poll: Duration,
     /// Wall-clock ceiling on one eviction pass; the remainder resumes on the next poll.
     pub evict_max_pass: Duration,
+    /// `CEPHOR_EVICT_CACHE_BUDGET_BYTES`: when set and non-zero, the evictor bounds the node's
+    /// accounted resident cache to this many bytes — the reserve and headroom permilles apply
+    /// to the budget instead of to the ingest disk's free space. For nodes whose ingest dir
+    /// shares a disk the agent does not own, where free space measures a co-tenant. Unset or
+    /// zero (the shipped default) keeps the `statvfs` gate.
+    pub evict_cache_budget_bytes: Option<u64>,
     /// Path of the liveness file the runtime touches each heartbeat tick; a k8s
     /// `livenessProbe` checks its freshness to restart a wedged (not crashed) pod.
     pub liveness_file: PathBuf,
@@ -271,6 +298,14 @@ pub enum ConfigError {
         /// The offending variable.
         var: &'static str,
     },
+    /// A variable whose value must be at least another variable's value.
+    #[error("environment variable `{var}` must be at least `{floor}`")]
+    BelowFloor {
+        /// The offending variable.
+        var: &'static str,
+        /// The variable it may not undercut.
+        floor: &'static str,
+    },
     /// A count variable exceeded its representable maximum (e.g. a drain
     /// concurrency past `u32::MAX`). A misconfiguration must fail fast.
     #[error("environment variable `{var}` value {value} exceeds the maximum {limit}")]
@@ -309,6 +344,10 @@ impl Config {
             grace: self.grace,
             drain_concurrency: self.drain_concurrency,
             redrive_max_attempts: self.redrive_max_attempts,
+            upload_sweep_poll: self.upload_sweep_poll,
+            upload_redrive_after: self.upload_redrive_after,
+            upload_redrive_max_attempts: self.upload_redrive_max_attempts,
+            upload_backends: self.enqueue_backends(),
             redrive_poll: self.redrive_poll,
             failed_reclaim_poll: self.failed_reclaim_poll,
             landed_poll: self.landed_poll,
@@ -318,6 +357,7 @@ impl Config {
                 headroom_permille: self.evict_headroom_permille,
                 batch: self.evict_batch,
                 max_pass: self.evict_max_pass,
+                cache_budget_bytes: self.evict_cache_budget_bytes,
             },
         }
     }
@@ -327,18 +367,17 @@ impl Config {
     ///
     /// This closes the C10 backup half: without the union, a configured backup backend
     /// would be required by the janitor gate (`is_replicated_on_all_backends` unions the
-    /// per-version `upload_backends` with `HIPPIUS_BACKUP_BACKENDS`) but never enqueued, so
+    /// per-version `upload_backends` with the backup set) but never enqueued, so
     /// the part could never reach full coverage and the janitor would never reclaim its
     /// SSD copy — a permanent leak/deadlock.
     ///
-    /// It is NOT fully per-version aware: the gate keys on each version's *persisted*
+    /// It is NOT per-version aware: the janitor gate keys on each version's *persisted*
     /// `object_versions.upload_backends` (and forces `['ipfs']` for a `migration` version),
-    /// while this uses the agent's *current* global `config.upload_backends`. The two match
-    /// only when every drained version's persisted set equals the current config and no
-    /// `migration` version transits the drain. A migration or config-drifted version can
-    /// therefore still be required-but-under-enqueued (the same leak, not data loss) — a
-    /// residual the G2 replication-gate sentinel is there to surface. The complete fix reads
-    /// the per-version set in the enqueuer (`load_upload_context` already reads that row).
+    /// while this uses the pinned set. With the set pinned in code the persisted column is a
+    /// record of what the version was written under, not an independent requirement; a
+    /// version persisted under a wider set than the code now pins is required-but-never-
+    /// enqueued (a leak the G2 replication-gate sentinel surfaces, not data loss) until that
+    /// column is backfilled to the pinned set.
     #[must_use]
     pub fn enqueue_backends(&self) -> Vec<String> {
         let mut backends = self.upload_backends.clone();
@@ -364,9 +403,18 @@ impl Config {
     /// [`from_env`](Self::from_env) so tests drive it with a fixture map instead
     /// of the process-global environment.
     fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let upload_sweep_poll = duration_secs(&get, "CEPHOR_UPLOAD_SWEEP_POLL_SECS", DEFAULT_UPLOAD_SWEEP_POLL)?;
+        let upload_redrive_after = duration_secs(&get, "CEPHOR_UPLOAD_REDRIVE_SECS", DEFAULT_UPLOAD_REDRIVE_AFTER)?;
+        // A window shorter than the poll would re-publish every `uploading` row on every pass
+        // and burn the whole re-drive budget within a few polls of the hand-off.
+        if upload_redrive_after < upload_sweep_poll {
+            return Err(ConfigError::BelowFloor {
+                var: "CEPHOR_UPLOAD_REDRIVE_SECS",
+                floor: "CEPHOR_UPLOAD_SWEEP_POLL_SECS",
+            });
+        }
         Ok(Self {
             database_url: required(&get, "CEPHOR_DATABASE_URL")?,
-            pool_root: required_path(&get, "CEPHOR_POOL_ROOT")?,
             ssd_root: required_path(&get, "CEPHOR_SSD_ROOT")?,
             drain_poll: duration_secs(&get, "CEPHOR_DRAIN_POLL_SECS", DEFAULT_DRAIN_POLL)?,
             reconcile_poll: duration_secs(&get, "CEPHOR_RECONCILE_POLL_SECS", DEFAULT_RECONCILE_POLL)?,
@@ -386,45 +434,34 @@ impl Config {
             defer_backoff_cap: duration_secs(&get, "CEPHOR_DEFER_BACKOFF_CAP_SECS", DEFAULT_DEFER_BACKOFF_CAP)?,
             heartbeat_ttl: duration_secs(&get, "CEPHOR_HEARTBEAT_TTL_SECS", DEFAULT_HEARTBEAT_TTL)?,
             redis_queues_url: required(&get, "REDIS_QUEUES_URL")?,
-            upload_backends: parse_backends(&get, "HIPPIUS_UPLOAD_BACKENDS"),
-            backup_backends: parse_optional_backends(&get, "HIPPIUS_BACKUP_BACKENDS"),
+            upload_backends: STORAGE_BACKENDS.iter().map(|backend| (*backend).to_owned()).collect(),
+            backup_backends: Vec::new(),
             reclaim_poll: duration_secs(&get, "CEPHOR_RECLAIM_POLL_SECS", DEFAULT_RECLAIM_POLL)?,
             reclaim_grace: duration_secs(&get, "CEPHOR_RECLAIM_GRACE_SECS", DEFAULT_RECLAIM_GRACE)?,
             orphan_reclaim_grace: duration_secs(&get, "CEPHOR_ORPHAN_RECLAIM_GRACE_SECS", DEFAULT_ORPHAN_RECLAIM_GRACE)?,
             drain_concurrency: positive_u32_or(&get, "CEPHOR_DRAIN_CONCURRENCY", DEFAULT_DRAIN_CONCURRENCY)?,
             redrive_max_attempts: positive_u32_or(&get, "CEPHOR_REDRIVE_MAX_ATTEMPTS", DEFAULT_REDRIVE_MAX_ATTEMPTS)?,
+            upload_sweep_poll,
+            upload_redrive_after,
+            upload_redrive_max_attempts: positive_u32_or(&get, "CEPHOR_UPLOAD_REDRIVE_MAX_ATTEMPTS", DEFAULT_UPLOAD_REDRIVE_MAX_ATTEMPTS)?,
             redrive_poll: duration_secs(&get, "CEPHOR_REDRIVE_POLL_SECS", DEFAULT_REDRIVE_POLL)?,
             evict_poll: duration_secs(&get, "CEPHOR_EVICT_POLL_SECS", DEFAULT_EVICT_POLL)?,
             evict_reserve_permille: permille_or(&get, "CEPHOR_EVICT_RESERVE_PERMILLE", DEFAULT_EVICT_RESERVE_PERMILLE)?,
             evict_headroom_permille: permille_or(&get, "CEPHOR_EVICT_HEADROOM_PERMILLE", DEFAULT_EVICT_HEADROOM_PERMILLE)?,
             evict_batch: positive_u32_or(&get, "CEPHOR_EVICT_BATCH", DEFAULT_EVICT_BATCH)?,
             evict_max_pass: duration_secs(&get, "CEPHOR_EVICT_MAX_PASS_SECS", DEFAULT_EVICT_MAX_PASS)?,
+            // Zero means "no budget", not a zero-byte cache: an explicit 0 must read as the
+            // disk gate, the same as unset, so the knob can be neutralised in a manifest.
+            evict_cache_budget_bytes: {
+                let bytes = u64_or(&get, "CEPHOR_EVICT_CACHE_BUDGET_BYTES", 0)?;
+                (bytes > 0).then_some(bytes)
+            },
             landed_poll: duration_secs(&get, "CEPHOR_LANDED_POLL_SECS", DEFAULT_LANDED_POLL)?,
             failed_reclaim_poll: duration_secs(&get, "CEPHOR_FAILED_RECLAIM_POLL_SECS", DEFAULT_FAILED_RECLAIM_POLL)?,
             liveness_file: path_or(&get, "CEPHOR_LIVENESS_FILE", DEFAULT_LIVENESS_FILE),
             readiness_file: path_or(&get, "CEPHOR_READINESS_FILE", DEFAULT_READINESS_FILE),
         })
     }
-}
-
-/// Parses a comma-separated backend list (`HIPPIUS_UPLOAD_BACKENDS`), trimming and
-/// dropping empties. Defaults to `["arion"]` when unset or empty (mirrors the Python
-/// `config.upload_backends` default).
-fn parse_backends(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Vec<String> {
-    let parsed = parse_optional_backends(get, var);
-    if parsed.is_empty() { vec!["arion".to_owned()] } else { parsed }
-}
-
-/// Parses a comma-separated backend list with an EMPTY default (no fallback backend) —
-/// for `HIPPIUS_BACKUP_BACKENDS`, where "unset" must mean "no backup", never `["arion"]`.
-fn parse_optional_backends(get: &impl Fn(&str) -> Option<String>, var: &'static str) -> Vec<String> {
-    get(var)
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect()
 }
 
 /// Resolves a required identifier variable into a validated [`NodeId`].
@@ -523,7 +560,7 @@ mod tests {
         Config, ConfigError, DEFAULT_ALLOCATION_POLL, DEFAULT_CLAIM_LEASE, DEFAULT_DECAY_HALF_LIFE, DEFAULT_DEFER_BACKOFF_CAP,
         DEFAULT_DRAIN_CONCURRENCY, DEFAULT_DRAIN_POLL, DEFAULT_EVICT_HEADROOM_PERMILLE, DEFAULT_EVICT_RESERVE_PERMILLE, DEFAULT_FLOOR_RATE_BPS,
         DEFAULT_HEARTBEAT_POLL, DEFAULT_HEARTBEAT_TTL, DEFAULT_MAX_DRAIN_RATE_BPS, DEFAULT_ORPHAN_RECLAIM_GRACE, DEFAULT_RECLAIM_GRACE,
-        DEFAULT_RECLAIM_POLL,
+        DEFAULT_RECLAIM_POLL, STORAGE_BACKENDS,
     };
     use core::str::FromStr;
     use hippius_drain_core::{ByteRate, NodeId};
@@ -539,7 +576,6 @@ mod tests {
     fn required_only() -> Vec<(&'static str, &'static str)> {
         vec![
             ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
-            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
             ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
             ("CEPHOR_NODE_ID", "node-7"),
             ("REDIS_QUEUES_URL", "redis://localhost:6382/0"),
@@ -550,7 +586,6 @@ mod tests {
     fn reads_required_vars_and_defaults_the_rest() {
         let config = Config::from_lookup(lookup(&required_only())).unwrap();
         assert_eq!(config.database_url, "postgres://localhost/cephor");
-        assert_eq!(config.pool_root, PathBuf::from("/mnt/pool"));
         assert_eq!(config.ssd_root, PathBuf::from("/mnt/ssd"));
         assert_eq!(config.drain_poll, DEFAULT_DRAIN_POLL);
     }
@@ -585,11 +620,7 @@ mod tests {
 
     #[test]
     fn a_missing_node_id_reports_it() {
-        let pairs = vec![
-            ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
-            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
-            ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
-        ];
+        let pairs = vec![("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"), ("CEPHOR_SSD_ROOT", "/mnt/ssd")];
         let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
         assert!(matches!(err, ConfigError::Missing("CEPHOR_NODE_ID")));
     }
@@ -599,7 +630,6 @@ mod tests {
         // Non-empty (passes the required check) but not a valid identifier.
         let pairs = vec![
             ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
-            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
             ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
             ("CEPHOR_NODE_ID", "   "),
         ];
@@ -723,24 +753,9 @@ mod tests {
     }
 
     #[test]
-    fn a_whitespace_pool_root_is_rejected() {
-        // Non-empty (passes the bare is_empty check) but blank: a whitespace path
-        // would silently resolve to a junk directory, so it is treated as missing.
-        let pairs = vec![
-            ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
-            ("CEPHOR_POOL_ROOT", "  \t "),
-            ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
-            ("CEPHOR_NODE_ID", "node-7"),
-        ];
-        let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
-        assert!(matches!(err, ConfigError::Missing("CEPHOR_POOL_ROOT")));
-    }
-
-    #[test]
     fn a_whitespace_ssd_root_is_rejected() {
         let pairs = vec![
             ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
-            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
             ("CEPHOR_SSD_ROOT", "   "),
             ("CEPHOR_NODE_ID", "node-7"),
         ];
@@ -750,18 +765,14 @@ mod tests {
 
     #[test]
     fn a_missing_required_var_reports_which_one() {
-        let pairs = vec![("CEPHOR_POOL_ROOT", "/mnt/pool"), ("CEPHOR_SSD_ROOT", "/mnt/ssd")];
+        let pairs = vec![("CEPHOR_SSD_ROOT", "/mnt/ssd")];
         let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
         assert!(matches!(err, ConfigError::Missing("CEPHOR_DATABASE_URL")));
     }
 
     #[test]
     fn an_empty_required_var_is_treated_as_missing() {
-        let pairs = vec![
-            ("CEPHOR_DATABASE_URL", ""),
-            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
-            ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
-        ];
+        let pairs = vec![("CEPHOR_DATABASE_URL", ""), ("CEPHOR_SSD_ROOT", "/mnt/ssd")];
         let err = Config::from_lookup(lookup(&pairs)).unwrap_err();
         assert!(matches!(err, ConfigError::Missing("CEPHOR_DATABASE_URL")));
     }
@@ -789,17 +800,17 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_redis_url_and_defaults_upload_backends_to_arion() {
+    fn reads_the_redis_url_and_pins_the_backend_set() {
         let config = Config::from_lookup(lookup(&required_only())).unwrap();
         assert_eq!(config.redis_queues_url, "redis://localhost:6382/0");
-        assert_eq!(config.upload_backends, vec!["arion".to_owned()]);
+        assert_eq!(config.upload_backends, STORAGE_BACKENDS);
+        assert!(config.backup_backends.is_empty(), "a backup backend is a code-only opt-in");
     }
 
     #[test]
     fn a_missing_redis_url_is_reported() {
         let pairs = vec![
             ("CEPHOR_DATABASE_URL", "postgres://localhost/cephor"),
-            ("CEPHOR_POOL_ROOT", "/mnt/pool"),
             ("CEPHOR_SSD_ROOT", "/mnt/ssd"),
             ("CEPHOR_NODE_ID", "node-7"),
         ];
@@ -850,39 +861,13 @@ mod tests {
     }
 
     #[test]
-    fn upload_backends_parses_a_trimmed_comma_list() {
-        let mut pairs = required_only();
-        pairs.push(("HIPPIUS_UPLOAD_BACKENDS", " arion , ovh "));
-        let config = Config::from_lookup(lookup(&pairs)).unwrap();
-        assert_eq!(config.upload_backends, vec!["arion".to_owned(), "ovh".to_owned()]);
-    }
-
-    #[test]
-    fn backup_backends_default_to_empty_not_arion() {
-        // Unlike upload_backends (which defaults to ["arion"]), backup must default EMPTY:
-        // a spurious default backup backend would make the janitor gate require coverage
-        // the enqueuer then has to satisfy for no reason.
-        let config = Config::from_lookup(lookup(&required_only())).unwrap();
-        assert!(config.backup_backends.is_empty(), "no HIPPIUS_BACKUP_BACKENDS -> no backup backends");
-    }
-
-    #[test]
-    fn backup_backends_parse_a_trimmed_comma_list() {
-        let mut pairs = required_only();
-        pairs.push(("HIPPIUS_BACKUP_BACKENDS", " ipfs , s3backup "));
-        let config = Config::from_lookup(lookup(&pairs)).unwrap();
-        assert_eq!(config.backup_backends, vec!["ipfs".to_owned(), "s3backup".to_owned()]);
-    }
-
-    #[test]
     fn enqueue_backends_is_the_deduped_ordered_union_of_upload_and_backup() {
         // C10: the enqueuer must push to every backend the janitor gate requires
         // (upload ∪ backup). Upload order is preserved; a backup already in upload is not
         // duplicated; a genuinely new backup backend is appended.
-        let mut pairs = required_only();
-        pairs.push(("HIPPIUS_UPLOAD_BACKENDS", "arion,ipfs"));
-        pairs.push(("HIPPIUS_BACKUP_BACKENDS", "ipfs,s3backup")); // ipfs overlaps, s3backup is new
-        let config = Config::from_lookup(lookup(&pairs)).unwrap();
+        let mut config = Config::from_lookup(lookup(&required_only())).unwrap();
+        config.upload_backends = vec!["arion".to_owned(), "ipfs".to_owned()];
+        config.backup_backends = vec!["ipfs".to_owned(), "s3backup".to_owned()]; // ipfs overlaps, s3backup is new
         assert_eq!(
             config.enqueue_backends(),
             vec!["arion".to_owned(), "ipfs".to_owned(), "s3backup".to_owned()],
@@ -891,11 +876,27 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_backends_with_no_backup_is_just_upload() {
+    fn the_cache_budget_is_off_unless_set_to_a_positive_byte_count() {
+        let config = Config::from_lookup(lookup(&required_only())).unwrap();
+        assert_eq!(config.evict_cache_budget_bytes, None, "unset: the disk gate");
         let mut pairs = required_only();
-        pairs.push(("HIPPIUS_UPLOAD_BACKENDS", "arion"));
-        let config = Config::from_lookup(lookup(&pairs)).unwrap();
-        assert_eq!(config.enqueue_backends(), vec!["arion".to_owned()]);
+        pairs.push(("CEPHOR_EVICT_CACHE_BUDGET_BYTES", "0"));
+        assert_eq!(
+            Config::from_lookup(lookup(&pairs)).unwrap().evict_cache_budget_bytes,
+            None,
+            "explicit zero: the disk gate"
+        );
+        let mut pairs = required_only();
+        pairs.push(("CEPHOR_EVICT_CACHE_BUDGET_BYTES", "6000000000"));
+        assert_eq!(
+            Config::from_lookup(lookup(&pairs))
+                .unwrap()
+                .runtime_config()
+                .evict_policy
+                .cache_budget_bytes,
+            Some(6_000_000_000),
+            "a positive budget reaches the evictor's policy",
+        );
     }
 
     #[test]

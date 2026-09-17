@@ -34,6 +34,7 @@ def _make_row(
     md5_hash: str = "deadbeef",
     ipfs_cid: str | None = "Qm...",
     body_blake3: str | None = None,
+    arion_hash: str | None = None,
 ) -> dict[str, Any]:
     return {
         "object_id": UUID(object_id),
@@ -45,6 +46,7 @@ def _make_row(
         "md5_hash": md5_hash,
         "ipfs_cid": ipfs_cid,
         "body_blake3": body_blake3,
+        "arion_hash": arion_hash,
         "uploaded_at": uploaded_at,
     }
 
@@ -90,6 +92,7 @@ async def test_cache_hit_skips_db(app: FastAPI, mocks: tuple[MagicMock, MagicMoc
                 "md5_hash": "abc",
                 "ipfs_cid": None,
                 "body_blake3": None,
+                "arion_hash": None,
                 "uploaded_at": "2026-04-27T12:00:00+00:00",
             }
         ],

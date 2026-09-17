@@ -117,16 +117,15 @@ def _is_peer_address(url: str) -> bool:
 # (the resolve joins on status='replicated', but only at resolve time). Deliberately NOT
 # re-checked at fetch time and not shortened: what a peer serves is its SSD copy, which during
 # a redrive is the SOURCE the drain re-copies from — current bytes, not stale ones. The
-# stale-bytes hazard a redrive opens is the POOL tier, and the AEAD-retry path re-checks the
-# status freshly there (`ReplicationSuspectProbe`); paying a per-part Postgres round trip here
-# would guard against nothing.
+# stale-bytes hazard a redrive opens is the POOL tier, not the peer's; paying a per-part
+# Postgres round trip here would guard against nothing.
 _OWNER_MEMO_TTL_SECONDS = 30.0
 _OWNER_MEMO_ENTRIES = 50_000
 
 # A miss ("no peer holds this") used to share the 30s owner TTL. Harbor's S3 driver GETs the
 # 20-byte `startedat` object on blob commit, often on a different api-local than the PUT, ~600ms
 # later — before the drain agent has claimed `cephor_replication_status`. The first miss was
-# then reused for the whole of `wait_for_chunk`, so the GET sat 5-9s waiting for the pool copy
+# then reused for the whole read of the part, so the GET sat 5-9s waiting for the pool copy
 # while the bytes sat on the ingest node's NVMe. A short negative TTL lets a late claim or the
 # fresh-part Redis hint be seen on the next poll without re-querying postgres per chunk of a
 # pool-only part (the positive TTL still covers that).
@@ -411,7 +410,7 @@ class PeerChunkFetcher:
         # query that yields both is paid once per part rather than once per chunk. A `None`
         # result is cached too — "no peer has this" is just as per-part — but only for
         # `_NEGATIVE_OWNER_MEMO_TTL_SECONDS`, so a just-written part whose drain claim (or
-        # fresh-part Redis hint) lands during `wait_for_chunk` is seen on the next poll.
+        # fresh-part Redis hint) lands during the read's local re-poll is seen on the next poll.
         #
         # The sizes are kept ONLY when a peer actually resolved. They are the expensive half of
         # the entry (one int per chunk, so ~1280 for a 5 GiB part), and a pool-only part — the
@@ -481,10 +480,15 @@ class PeerChunkFetcher:
                         -- (store.rs, R4): a corrupt part's SSD copy is "the last good
                         -- source" — the POOL copy is what failed verification, and without
                         -- this branch readers resolve no peer and read exactly that copy.
+                        -- 'uploading' is the hand-off window: the drain has published the
+                        -- part to the node-local uploader and the SSD copy is the ONLY copy
+                        -- (the evictor keys on 'replicated'), so for as long as the upload
+                        -- takes — past the 60s fresh-part hint on a large part or a backlog
+                        -- — the ingest node is the sole place a wrong-node read can be served.
                         SELECT s.node_id, 1 AS tier_pref, s.claimed_at AS ord
                         FROM cephor_replication_status s
                         WHERE s.object_id = $1 AND s.version = $2 AND s.part_number = $3
-                          AND s.status IN ('pending', 'draining', 'corrupt')
+                          AND s.status IN ('pending', 'draining', 'uploading', 'corrupt')
                           AND s.node_id IS NOT NULL
                           AND s.node_id <> $4
                     ) candidates

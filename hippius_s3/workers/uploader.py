@@ -19,8 +19,11 @@ from hippius_s3.dlq.upload_dlq import UploadDLQManager
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.queue import Chunk
 from hippius_s3.queue import UploadChainRequest
+from hippius_s3.queue import enqueue_retry_request
 from hippius_s3.utils import get_query
 from hippius_s3.workers.errors import is_billing_error
+from hippius_s3.workers.part_digest import chunk_hash
+from hippius_s3.workers.part_digest import part_digest
 
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,12 @@ class BackendClient(ABC):
 class ChunkUploadResult(BaseModel):
     cids: List[str]
     part_number: int
+    # The drain-style digest of the bytes actually uploaded (part_digest.py), or None for an
+    # empty part. What the confirm flip is fenced on.
+    digest: str | None = None
+    # The uploaded bytes did not match the digest the drain recorded at hand-off: nothing was
+    # written for this part (no chunk_backend rows, no flip) — the request was stale.
+    stale: bool = False
 
 
 class Uploader:
@@ -143,6 +152,40 @@ class Uploader:
                 span.set_attribute("skipped", True)
                 return []
 
+            chunks = payload.chunks
+            expected_digests: dict[int, str] = {}
+            if payload.node_id is not None:
+                # A drain-published request is only actionable while its part is in the hand-off
+                # state. Anything else means this delivery is stale: the uploader already flipped
+                # it (a duplicate after a re-publish; the SSD copy may be gone by now), a re-drive
+                # returned it to pending (a fresh request is coming), or it was retired. Dropping
+                # it is what keeps a duplicate from ending in the DLQ as a "missing" part.
+                expected_digests, in_flight = await self._await_hand_off(payload)
+                if in_flight:
+                    # The drain publishes BEFORE it commits `uploading` (at-least-once), and this
+                    # delivery outran the commit. The row is `draining` and has no digest to fence
+                    # on yet, so the parts come back through the retry ZSET rather than being read
+                    # unfenced or dropped (a drop would leave them to the sweep's re-drive window).
+                    await enqueue_retry_request(
+                        payload.model_copy(update={"chunks": in_flight}),
+                        backend_name=self.backend_name,
+                        delay_seconds=self._hand_off_retry_delay_seconds(),
+                        last_error="hand-off still committing",
+                    )
+                chunks = [c for c in payload.chunks if int(c.id) in expected_digests]
+                deferred = {int(c.id) for c in in_flight}
+                skipped = sorted(
+                    int(c.id) for c in payload.chunks if int(c.id) not in expected_digests and int(c.id) not in deferred
+                )
+                if skipped:
+                    logger.info(
+                        f"Dropping stale parts of a node-scoped request (no longer uploading): "
+                        f"object_id={payload.object_id} version={payload.object_version} parts={skipped}"
+                    )
+                if not chunks:
+                    span.set_attribute("skipped", True)
+                    return []
+
             start_time = time.time()
             logger.info(
                 f"Processing upload backend={self.backend_name} object_id={payload.object_id} chunks={len(payload.chunks)}"
@@ -177,11 +220,12 @@ class Uploader:
             all_chunk_cids = await self._upload_chunks(
                 object_id=payload.object_id,
                 object_key=payload.object_key,
-                chunks=payload.chunks,
+                chunks=chunks,
                 upload_id=payload.upload_id,
                 object_version=int(payload.object_version or 1),
                 account_ss58=payload.address,
                 extra_headers=extra_headers,
+                expected_digests=expected_digests,
             )
 
             total_duration = time.time() - start_time
@@ -189,6 +233,8 @@ class Uploader:
                 f"Upload complete backend={self.backend_name} object_id={payload.object_id} "
                 f"chunks={len(all_chunk_cids)} duration={total_duration:.2f}s"
             )
+
+            await self._record_object_arion_hash(payload.object_id, int(payload.object_version or 1))
 
             span.set_attribute("result.chunks_uploaded", len(all_chunk_cids))
             span.set_attribute("result.duration_s", total_duration)
@@ -202,6 +248,86 @@ class Uploader:
 
             return all_chunk_cids
 
+    def _arion_hash_of(self, upload_result: Any) -> str | None:
+        """The hash Arion registered this chunk under, or None for a non-Arion backend.
+
+        Not ``upload_result.id``: that is HCFS's file_id (its path hash), which only HCFS knows.
+        HCFS returns the real one as ``arion_hash``; servers that predate that field return the same
+        value as ``upload_id`` (``cid`` here), which falls back to the S3 hash — the BLAKE3 of the same
+        ciphertext, so identical to what Arion content-addresses it by.
+        """
+        if self.backend_name != "arion":
+            return None
+        explicit = getattr(upload_result, "arion_hash", None)
+        if explicit is not None:
+            # An empty value is HCFS saying it has no Arion copy; upload_id would then be the S3 hash.
+            return str(explicit) or None
+        value = getattr(upload_result, "cid", None)
+        return str(value) if value else None
+
+    async def _record_object_arion_hash(self, object_id: str, object_version: int) -> None:
+        """Surface the chunk's Arion hash on the version once it is stored as a single chunk.
+
+        Best effort: the chunks are already on Arion, and failing here would requeue an upload that
+        succeeded just to redo a display column.
+        """
+        if self.backend_name != "arion":
+            return
+        try:
+            async with self._acquire_conn() as conn:
+                await conn.execute(
+                    get_query("update_object_version_arion_hash"),
+                    object_id,
+                    object_version,
+                    self.backend_name,
+                )
+        except Exception:
+            logger.warning(f"Failed to record arion_hash object_id={object_id} version={object_version}", exc_info=True)
+
+    async def _drain_rows(self, payload: UploadChainRequest) -> dict[int, tuple[str, str | None]]:
+        """(status, content_sha256) of the drain's row for each part of a drain-published request."""
+        async with self._acquire_conn() as conn:
+            rows = await conn.fetch(
+                get_query("get_replication_status_for_parts"),
+                str(payload.object_id),
+                int(payload.object_version),
+                [int(c.id) for c in payload.chunks],
+            )
+        return {int(r["part_number"]): (str(r["status"]), r["content_sha256"]) for r in rows}
+
+    def _hand_off_wait_seconds(self) -> float:
+        value = getattr(self.config, "uploader_hand_off_wait_seconds", None)
+        return float(value) if isinstance(value, (int, float)) else 10.0
+
+    def _hand_off_retry_delay_seconds(self) -> float:
+        value = getattr(self.config, "uploader_hand_off_retry_delay_seconds", None)
+        return float(value) if isinstance(value, (int, float)) else 5.0
+
+    async def _await_hand_off(self, payload: UploadChainRequest) -> tuple[dict[int, str], List[Chunk]]:
+        """Split a drain-published request into the parts in the hand-off (with the digest the
+        drain recorded for each — the fence every chunk_backend write and the flip go through)
+        and the parts whose hand-off is still being committed (`draining`).
+
+        The drain commits `uploading` milliseconds after it publishes, so a `draining` row is
+        polled for a short while first; only what is still `draining` at the deadline is reported
+        as in flight, for the caller to re-schedule.
+        """
+        deadline = asyncio.get_running_loop().time() + self._hand_off_wait_seconds()
+        while True:
+            rows = await self._drain_rows(payload)
+            if not any(status == "draining" for status, _ in rows.values()):
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.25)
+        handed_over = {
+            part_number: str(digest)
+            for part_number, (status, digest) in rows.items()
+            if status == "uploading" and digest is not None
+        }
+        in_flight = [c for c in payload.chunks if rows.get(int(c.id), ("", None))[0] == "draining"]
+        return handed_over, in_flight
+
     async def _upload_chunks(
         self,
         object_id: str,
@@ -211,6 +337,7 @@ class Uploader:
         object_version: int,
         account_ss58: str,
         extra_headers: dict[str, str] | None = None,
+        expected_digests: dict[int, str] | None = None,
     ) -> List[str]:
         concurrency = self.config.uploader_multipart_max_concurrency
         with tracer.start_as_current_span(
@@ -241,6 +368,7 @@ class Uploader:
                             object_version=int(object_version),
                             account_ss58=account_ss58,
                             extra_headers=extra_headers,
+                            expected_digest=(expected_digests or {}).get(int(chunk.id)),
                         )
                     except Exception as e:
                         if is_billing_error(e):
@@ -264,15 +392,55 @@ class Uploader:
             else:
                 all_results = [first_result]
 
-            for result in all_results:
+            landed = [r for r in all_results if not r.stale]
+            for result in landed:
                 await self.obj_cache.expire(
                     object_id, int(object_version), result.part_number, ttl=self.config.cache_ttl_seconds
                 )
 
+            await self._confirm_uploaded(object_id, int(object_version), landed)
+
             all_cids = []
-            for result in all_results:
+            for result in landed:
                 all_cids.extend(result.cids)
             return all_cids
+
+    def _required_backends(self) -> set[str]:
+        """Every backend a part must reach before its row may read `replicated` — the union the
+        drain's upload sweep and the janitor's replication gate both require."""
+        upload = getattr(self.config, "upload_backends", None)
+        backup = getattr(self.config, "backup_backends", None)
+        required = set(upload) if isinstance(upload, (list, tuple, set)) else {self.backend_name}
+        if isinstance(backup, (list, tuple, set)):
+            required |= set(backup)
+        return required
+
+    async def _confirm_uploaded(self, object_id: str, object_version: int, results: List[ChunkUploadResult]) -> None:
+        """Flip the drain's `uploading` rows to `replicated` for the parts just uploaded.
+
+        Only after every chunk's chunk_backend row is written (the caller awaits the whole
+        fan-out first): `replicated` is what lets the drain's evictor unlink the SSD copy, so
+        flipping early would let it discard the only copy of a part the backend does not hold
+        yet. Guarded in the SQL on `uploading` AND on the digest of the bytes this upload sent,
+        so the legacy pool-reading uploader (rows already `replicated`), a re-driven row (back to
+        `pending`) and a request that outlived a re-drive (`uploading` again, for different
+        bytes) are all untouched.
+
+        Only when this backend is the whole required set: with a backup backend configured the
+        part is not replicated until BOTH have it, and only the drain's sweep sees both — it
+        confirms from chunk_backend coverage within its poll.
+        """
+        if self._required_backends() != {self.backend_name}:
+            return
+        async with self._acquire_conn() as conn:
+            for result in results:
+                await conn.execute(
+                    get_query("confirm_replication_status_uploaded"),
+                    str(object_id),
+                    int(object_version),
+                    int(result.part_number),
+                    result.digest,
+                )
 
     async def _upload_single_chunk(
         self,
@@ -283,6 +451,7 @@ class Uploader:
         object_version: int,
         account_ss58: str,
         extra_headers: dict[str, str] | None = None,
+        expected_digest: str | None = None,
     ) -> ChunkUploadResult:
         part_number = int(chunk.id)
         with tracer.start_as_current_span(
@@ -345,14 +514,16 @@ class Uploader:
 
             if num_chunks_meta == 0:
                 logger.debug(f"Empty file upload: object_id={object_id} part={part_number}")
-                return ChunkUploadResult(cids=[], part_number=part_number)
+                return ChunkUploadResult(cids=[], part_number=part_number, digest=part_digest([]))
 
             if num_chunks_meta > 0 and part_id:
                 # Upload a part's cipher chunks concurrently. Each chunk's backend POST is
                 # bounded by the shared per-pod `_put_semaphore` (all in-flight requests on
                 # this pod share one Arion concurrency budget). Chunk order is preserved in
-                # the returned hashes.
-                async def upload_one_chunk(ci: int) -> tuple[int, str]:
+                # the returned hashes. The chunk_backend rows are NOT written here: they land
+                # only after the whole part is up and its digest has been checked against the
+                # drain's, below — a row is the backend's claim to hold the acknowledged bytes.
+                async def upload_one_chunk(ci: int) -> tuple[int, str, str, str | None]:
                     async with self._put_semaphore:
                         piece = await self.fs_store.get_chunk(object_id, int(object_version), part_number, ci)
                         if not isinstance(piece, (bytes, bytearray)):
@@ -365,8 +536,9 @@ class Uploader:
                         if not chunk_id:
                             raise RuntimeError("part_chunk_row_missing")
 
+                        data = bytes(piece)
                         chunk_upload_result = await self.backend_client.upload_file_and_get_cid(
-                            file_data=bytes(piece),
+                            file_data=data,
                             file_name=str(chunk_id),
                             content_type="application/octet-stream",
                             account_ss58=account_ss58,
@@ -374,21 +546,13 @@ class Uploader:
                         )
 
                         file_hash = str(chunk_upload_result.id)
+                        arion_hash = self._arion_hash_of(chunk_upload_result)
                         logger.info(
                             f"Uploaded chunk: backend={self.backend_name} object_id={object_id} part={part_number} "
                             f"chunk={ci} file_id={file_hash} upload_id={chunk_upload_result.cid} "
-                            f"status={chunk_upload_result.status}"
+                            f"arion_hash={arion_hash} status={chunk_upload_result.status}"
                         )
-
-                        async with self._acquire_conn() as conn:
-                            await conn.fetchval(
-                                get_query("insert_chunk_backend"),
-                                part_id,
-                                int(ci),
-                                self.backend_name,
-                                file_hash,
-                            )
-                        return ci, file_hash
+                        return ci, file_hash, chunk_hash(data), arion_hash
 
                 # WU-2: prefetch every chunk's part_chunks.id in one query before the gather.
                 async with self._acquire_conn() as conn:
@@ -407,7 +571,33 @@ class Uploader:
                     raise next((e for e in errors if is_billing_error(e)), errors[0])
 
                 ok_results = sorted((r for r in results if isinstance(r, tuple)), key=lambda t: t[0])
-                all_file_hashes: list[str] = [fh for _, fh in ok_results]
+                all_file_hashes: list[str] = [fh for _, fh, _, _ in ok_results]
+                observed = part_digest([ch for _, _, ch, _ in ok_results])
+
+                # The fence: the bytes this upload sent must be the bytes the drain hashed at
+                # hand-off. A mismatch means the SSD part was rewritten under us (an UploadPart
+                # retry — the drain re-drives it and a fresh request follows) or this request
+                # outlived a re-drive; either way the backend now holds bytes that are NOT the
+                # acknowledged part, and recording them would let the evictor free the only
+                # good copy on the strength of a wrong one.
+                if expected_digest is not None and observed != expected_digest:
+                    logger.warning(
+                        f"Uploaded bytes do not match the drain's hand-off digest; not recording them: "
+                        f"object_id={object_id} version={int(object_version)} part={part_number}"
+                    )
+                    span.set_attribute("result.stale", True)
+                    return ChunkUploadResult(cids=[], part_number=part_number, stale=True)
+
+                async with self._acquire_conn() as conn:
+                    for ci, file_hash, _, arion_hash in ok_results:
+                        await conn.fetchval(
+                            get_query("insert_chunk_backend"),
+                            part_id,
+                            int(ci),
+                            self.backend_name,
+                            file_hash,
+                            arion_hash,
+                        )
 
                 span.set_attribute("result.num_piece_cids", len(all_file_hashes))
                 span.set_attribute("result.cids", ",".join(all_file_hashes))
@@ -415,6 +605,7 @@ class Uploader:
                 return ChunkUploadResult(
                     cids=all_file_hashes,
                     part_number=part_number,
+                    digest=observed,
                 )
 
             raise RuntimeError("part_meta_not_ready")

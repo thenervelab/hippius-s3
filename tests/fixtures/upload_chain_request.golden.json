@@ -13,6 +13,7 @@
   "upload_backends": [
     "arion"
   ],
+  "node_id": "ingest-node-1",
   "request_id": null,
   "attempts": 0,
   "first_enqueued_at": 0.0,

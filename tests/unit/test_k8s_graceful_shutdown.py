@@ -13,18 +13,17 @@ routine production deploy.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 
+from tests.unit.k8s_manifests import load_docs
+from tests.unit.k8s_manifests import pod_spec
+from tests.unit.k8s_manifests import workload
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # (manifest, workload name) for every workload that serves client HTTP traffic.
 SERVING_WORKLOADS = [
-    ("k8s/base/api-deployment.yaml", "api"),
     ("k8s/production/api-local-deployments-production.yaml", "api-local"),
     ("k8s/staging/api-local-deployments-staging.yaml", "api-local"),
 ]
@@ -33,18 +32,8 @@ SERVING_WORKLOADS = [
 UVICORN_DRAIN_SECONDS = 25
 
 
-def _load_workload(rel_path: str, name: str) -> dict[str, Any]:
-    docs = yaml.safe_load_all((REPO_ROOT / rel_path).read_text())
-    for doc in docs:
-        if not doc:
-            continue
-        if doc.get("kind") in {"Deployment", "DaemonSet"} and doc["metadata"]["name"] == name:
-            return doc
-    raise AssertionError(f"no Deployment/DaemonSet named {name!r} in {rel_path}")
-
-
-def _pod_spec(rel_path: str, name: str) -> dict[str, Any]:
-    return _load_workload(rel_path, name)["spec"]["template"]["spec"]
+def _serving_pod_spec(rel_path: str, name: str) -> dict[str, Any]:
+    return pod_spec(workload(load_docs(rel_path), name))
 
 
 def _serving_container(pod_spec: dict[str, Any]) -> dict[str, Any]:
@@ -55,7 +44,7 @@ def _serving_container(pod_spec: dict[str, Any]) -> dict[str, Any]:
 
 @pytest.mark.parametrize(("rel_path", "name"), SERVING_WORKLOADS, ids=lambda v: str(v))
 def test_has_prestop_hook(rel_path: str, name: str) -> None:
-    container = _serving_container(_pod_spec(rel_path, name))
+    container = _serving_container(_serving_pod_spec(rel_path, name))
     lifecycle = container.get("lifecycle") or {}
     pre_stop = lifecycle.get("preStop")
     assert pre_stop, (
@@ -69,7 +58,7 @@ def test_has_prestop_hook(rel_path: str, name: str) -> None:
 @pytest.mark.parametrize(("rel_path", "name"), SERVING_WORKLOADS, ids=lambda v: str(v))
 def test_grace_period_covers_prestop_plus_drain(rel_path: str, name: str) -> None:
     """The preStop sleep is deducted from the grace period — the drain gets what's left."""
-    pod_spec = _pod_spec(rel_path, name)
+    pod_spec = _serving_pod_spec(rel_path, name)
     grace = pod_spec.get("terminationGracePeriodSeconds")
     assert grace is not None, (
         f"{rel_path}:{name} does not set terminationGracePeriodSeconds explicitly; it would "

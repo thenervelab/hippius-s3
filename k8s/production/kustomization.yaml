@@ -27,6 +27,10 @@ resources:
   - api-local-deployments-production.yaml
   - drain-allocator-deployment.yaml   # singleton; owns the cephor_* schema (deploy first)
   - drain-agent-daemonset.yaml        # one per labelled ingest node
+  # The node-local uploader: consumes arion_upload_requests:<node> and reads the node's NVMe.
+  # Must be Ready BEFORE the drain image that publishes to node queues rolls, or those
+  # queues fill with nobody reading them (the base arion-uploader only reads the global one).
+  - arion-uploader-local-daemonset.yaml
   - mpu-reaper-deployment.yaml
 
 patches:
@@ -37,31 +41,6 @@ patches:
   - path: ingress-patch.yaml
   - path: services-patch.yaml
   - path: postgres-nvme-initwait-patch.yaml
-  # Cutover routing: point the existing `api` Service (the gateway's GATEWAY_BACKEND_URL=
-  # http://api:8000 upstream) at the drain-direct api-local fleet. Base `api` is scaled to 0 in
-  # resource-limits.yaml. Mirrors k8s/staging/kustomization.yaml. This is a FULL SWAP — there is no
-  # safe incremental hybrid (peer review B2: a base-api pod on the new image writes to CephFS, which
-  # the drain never scans → dark uploads). The operator-driven `rollout.sh cutover` does the same
-  # full swap with gates + a dark-upload check; it is NOT an incremental base-api-serving alternative.
-  - target:
-      kind: Service
-      name: api
-    patch: |-
-      - op: replace
-        path: /spec/selector
-        value:
-          app: api-local
-  # Same swap for the gateway alias Service (see k8s/base/services.yaml): the merged
-  # api-local fleet is what answers on gateway:8080 now.
-  - target:
-      kind: Service
-      name: gateway
-    patch: |-
-      - op: replace
-        path: /spec/selector
-        value:
-          app: api-local
-          hippius.io/edge: "true"
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api

@@ -1,7 +1,7 @@
 # The hippius-drain agent: the per-node drain daemon.
-# One pod per ingest node, draining that node's local-SSD ingest dir to
-# the shared CephFS pool, path-preservingly per the api part layout
-# (<object_id>/v<version>/part_<n>/). Parts are discovered from the api's landed-part
+# One pod per ingest node, verifying each part that lands on that node's local-SSD
+# ingest dir (the api part layout <object_id>/v<version>/part_<n>/) and handing it to
+# the node-local uploader (arion_upload_requests:<node>). Parts are discovered from the api's landed-part
 # announcements (cephor:landed:<node> on the queue Redis); the reconciler's SSD scan is the
 # BACKSTOP for an announcement that was never delivered, not the primary trigger.
 #
@@ -15,9 +15,7 @@
 #  * SSD source: the SAME hostPath the api pods write to — the dedicated /s3-data NVMe
 #    on each ingest node (staging uses a different path/disk, local_ingest_staging on the
 #    node root, so they don't collide on shared node2/node3). RW so the agent can unlink a
-#    part after a verified, committed pool copy.
-#  * CephFS pool: object-cache-pvc — ReadWriteMany ceph-filesystem, mounted RW (the api
-#    pods mount it read-only; the agent is the writer into ceph).
+#    part once the backend acks it (the evictor) and reclaim debris.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -29,7 +27,11 @@ spec:
     matchLabels:
       app: drain-agent
   updateStrategy:
-    type: RollingUpdate
+    # OnDelete for this cutover: RollingUpdate would replace a node before
+    # arion-uploader-local is Ready there. production-deploy.yaml deletes the
+    # pods after that gate. Revert to RollingUpdate once the fleet is on this
+    # image.
+    type: OnDelete
   template:
     metadata:
       labels:
@@ -108,9 +110,9 @@ spec:
                    AND EXISTS (SELECT 1 FROM information_schema.columns
                                WHERE table_schema = 'public'
                                  AND table_name = 'cephor_replication_status'
-                                 AND column_name IN ('content_sha256', 'relanded_at', 'reclaimed_at')
-                               HAVING count(DISTINCT column_name) = 3)")" = "t" ]; do
-                echo "waiting for the cephor schema (allocator migrations 0016-0019)"; sleep 3
+                                 AND column_name IN ('content_sha256', 'relanded_at', 'reclaimed_at', 'upload_attempts')
+                               HAVING count(DISTINCT column_name) = 4)")" = "t" ]; do
+                echo "waiting for the cephor schema (allocator migrations 0016-0020)"; sleep 3
               done
           env:
             - name: CEPHOR_DATABASE_URL
@@ -140,26 +142,14 @@ spec:
             # mounted at the same paths the api uses, so the relative part dirs line up.
             - name: CEPHOR_SSD_ROOT
               value: /var/lib/hippius/local_object_cache
-            - name: CEPHOR_POOL_ROOT
-              value: /var/lib/hippius/object_cache
-            # The drain is the sole upload producer (s3-2.1 drain-direct): once a part is
-            # replicated to ceph it pushes an UploadChainRequest to {backend}_upload_requests
-            # for each configured backend. Reuse the api's queue-Redis + upload-backend list.
+            # The drain is the sole upload producer: once a part is verified whole on the
+            # node's SSD it pushes an UploadChainRequest to {backend}_upload_requests:<node>
+            # for each pinned backend (STORAGE_BACKENDS). Reuse the api's queue-Redis.
             - name: REDIS_QUEUES_URL
               valueFrom:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: REDIS_QUEUES_URL
-            # Sourced from the shared secret (like every Python worker), NOT a literal:
-            # the drain is the sole upload producer, so if a backup backend is added to the
-            # secret the drain must fan out to it too — a hardcoded "arion" would silently
-            # under-replicate (never enqueue the new backend, so the janitor replication gate
-            # never clears -> unbounded cache growth).
-            - name: HIPPIUS_UPLOAD_BACKENDS
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_UPLOAD_BACKENDS
             # SSD-ingest reclaim worker: clean up broken/abandoned uploads (failed parts
             # the drain skips forever), replicated crash-orphans (a crash between the
             # mark_replicated commit and the drain's own unlink), and orphan write-temps,
@@ -194,6 +184,13 @@ spec:
               value: "300"
             - name: CEPHOR_RECLAIM_GRACE_SECS
               value: "3600"
+            # ROLLBACK — do not `kubectl rollout undo daemonset/drain-agent` while any
+            # row is status='uploading'. The pre-this-image binary has no uploading
+            # arm (UnknownState) and CrashLoops on reconcile. Before undo:
+            #   UPDATE cephor_replication_status
+            #   SET status = 'pending', claimed_at = NULL
+            #   WHERE status = 'uploading';
+            # SSD copies stay; uploading is never reclaimed.
             # ROLLBACK-LOAD-BEARING — do not delete as manifest hygiene.
             # Read by the CURRENT (pre-retention) binary, which unlinks a replicated part once
             # it ages past this grace. The retention binary ignores it: ssd_reclaim skips
@@ -278,8 +275,6 @@ spec:
           volumeMounts:
             - name: local-ingest
               mountPath: /var/lib/hippius/local_object_cache
-            - name: object-cache
-              mountPath: /var/lib/hippius/object_cache
           resources:
             requests:
               cpu: 100m
@@ -325,6 +320,3 @@ spec:
             # the ingest churn onto the node root disk and filling it.
             path: /s3-data
             type: Directory
-        - name: object-cache
-          persistentVolumeClaim:
-            claimName: object-cache-pvc

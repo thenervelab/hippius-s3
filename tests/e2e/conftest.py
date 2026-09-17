@@ -255,7 +255,6 @@ def docker_services(compose_project_name: str) -> Iterator[None]:
             # tests/unit/test_compose_e2e_worker_env.py.
             for svc in [
                 "api",
-                "arion-downloader",
                 "arion-uploader",
                 "arion-unpinner",
                 "purger",

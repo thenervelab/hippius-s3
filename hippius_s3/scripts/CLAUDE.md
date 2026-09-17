@@ -8,23 +8,17 @@ Operational and migration scripts. Most are invoked manually by an operator duri
 
 | Script | Purpose | Notes |
 |---|---|---|
+| [backfill_arion_hash.py](backfill_arion_hash.py) | Backfill `chunk_backend.backend_identifier` with the Arion `path_hash`. | K8s manifest: [k8s/backfill-arion-hash-job.yaml](../../k8s/backfill-arion-hash-job.yaml). |
 | [migrate.py](migrate.py) | Apply SQL migrations from [../sql/migrations/](../sql/migrations/). | Run on API pod startup via container entrypoint. Idempotent. |
-| [migrate_objects.py](migrate_objects.py) | v4→v5 per-object storage_version migration. | Invoked as a K8s Job via [../../workers/run_migrator_once.py](../../workers/run_migrator_once.py). Env vars: `MIGRATE_BUCKET`, `MIGRATE_KEY`, `DRY_RUN`. |
-| [migrate_public_buckets_to_acl.py](migrate_public_buckets_to_acl.py) | Convert legacy `is_public=true` buckets to explicit `AllUsers` ACL grants. | One-shot, idempotent. Already run in prod. |
-| [migrate_arion_identifiers.py](migrate_arion_identifiers.py) | **New**. Fixes chunk_backend rows that stored `arion_hash` instead of `path_hash`. | Reads mapping CSV from Arion DB dump, loads into memory, updates `chunk_backend.backend_identifier`. **Must complete before delete operations can reliably target the correct Arion files.** K8s manifest: [k8s/migrate-arion-identifiers-job.yaml](../../k8s/migrate-arion-identifiers-job.yaml). Resumable via progress file. |
 | [cleanup_migration_versions.py](cleanup_migration_versions.py) | Purge stale rows from the v4→v5 migration. | |
-| [delete_legacy_object_versions.py](delete_legacy_object_versions.py) | **DANGEROUS**. Remove pre-v5 rows from `object_versions`. | Only run after migration_objects is complete AND verified. |
+| [delete_legacy_object_versions.py](delete_legacy_object_versions.py) | **DANGEROUS**. Remove pre-v5 rows from `object_versions`. | Pre-v5 rows are unreadable (`MIN_SUPPORTED_STORAGE_VERSION = 5`); this is how they are retired. |
 | [purge_source_versions.py](purge_source_versions.py) | **DANGEROUS**. Remove source versions from legacy copy-object rows. | |
-| [dump_migration_worklist.py](dump_migration_worklist.py) | Export a CSV of objects still needing migration. | Read-only; safe. |
-| [export_legacy_unpin_worklist.py](export_legacy_unpin_worklist.py) | Export unpins from the legacy system for re-processing. | Read-only. |
 
 ### DLQ operations
 
 | Script | Purpose |
 |---|---|
 | [dlq_requeue.py](dlq_requeue.py) | CLI to requeue DLQ entries — per-identifier or bulk. Supports `--force` (requeue permanent-classified failures) and `--bypass-billing`. |
-| [dlq_seed.py](dlq_seed.py) | Test helper: push a fake entry to a DLQ for development/debugging. |
-| [resubmit_failed_pins.py](resubmit_failed_pins.py) | Retry failed simple uploads by re-enqueuing pin requests. Access-key auth only (seed-phrase support removed). |
 | [recover_missing_backend.py](recover_missing_backend.py) | Restore accidentally-deleted `chunk_backend` rows from Arion by matching identifiers. |
 
 ### Audits (read-only)
@@ -90,8 +84,3 @@ python -m hippius_s3.scripts.<script_name> --help
 ```
 
 Most take argparse-style flags; some accept env vars (documented inline in the `if __name__ == "__main__"` block).
-
-## Progress files
-
-Long-running migrations use `/tmp/migration_progress.txt` (or similar) as a resumable checkpoint. If a job gets OOM-killed mid-run, restart — it resumes from the last committed batch.
-

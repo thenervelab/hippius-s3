@@ -257,7 +257,7 @@ async def handle_head_object(
         arion_hash = row.get("arion_file_hash", _MISSING)
         if arion_hash is _MISSING:
             arion_hash = await db.fetchval(
-                get_query("get_chunk_backend_identifier"),
+                get_query("get_chunk_arion_hash"),
                 "arion",
                 row["object_id"],
                 object_version,
@@ -267,10 +267,9 @@ async def handle_head_object(
         headers["X-Hippius-Arion-File-Hash"] = arion_hash or "pending"
 
         # A DIFFERENT value from the header above, deliberately, and the two must not be conflated:
-        #   X-Hippius-Arion-File-Hash  chunk_backend.backend_identifier — Arion's id for the first
-        #                              ENCRYPTED chunk. Says where the bytes live on the backend.
-        #   X-Hippius-Body-Blake3      BLAKE3 of the PLAINTEXT. Says what the object contains, and
-        #                              is what ListObjects surfaces in Owner.ID.
+        #   X-Hippius-Arion-File-Hash  chunk_backend.arion_hash — the hash Arion registered the first
+        #                              ENCRYPTED chunk under. What the explorer and indexer know it by.
+        #   X-Hippius-Body-Blake3      BLAKE3 of the PLAINTEXT. Says what the object contains.
         # The paired -Scope header states which bytes the digest covers; see body_blake3_headers.
         headers.update(body_blake3_headers(row))
 

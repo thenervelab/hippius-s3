@@ -7,10 +7,9 @@ Core worker logic. The ENTRY points that actually run in pods live in [/workers/
 | File | Purpose |
 |---|---|
 | [uploader.py](uploader.py) | `BackendClient` ABC + `Uploader` class. Drains upload queue, chunks, retries with DLQ fallback. |
-| [downloader.py](downloader.py) | Per-backend shared downloader loop. Drains download queue, writes chunks to FS, releases coalesce locks, publishes notifications. |
 | [unpinner.py](unpinner.py) | `Unpinner` — drains unpin queue, calls backend `delete_file`, soft-deletes `chunk_backend` rows. |
 
-Each backend ([workers/run_arion_uploader_in_loop.py](../../workers/run_arion_uploader_in_loop.py), etc.) passes a concrete `BackendClient` / `UnpinBackendClient` / `fetch_fn` into these shared loops.
+Each backend ([workers/run_arion_uploader_in_loop.py](../../workers/run_arion_uploader_in_loop.py), etc.) passes a concrete `BackendClient` / `UnpinBackendClient` into these shared loops. There is no download worker: the read path fetches straight from the backend into memory ([../reader/backend_fetch.py](../reader/backend_fetch.py)).
 
 ## `BackendClient` ABC
 
@@ -47,39 +46,11 @@ both layers multiplies the budgets (7 × 4 ≈ 24 requests) at a backend that is
 
 Per-pod request concurrency and the shared Arion-POST ceiling are covered under **Concurrency model** below.
 
-Error classification lives in [errors.py](errors.py) — three path-specific classifiers sharing one rule engine (`classify_upload_error`, `classify_download_error`, `classify_unpin_error`). The key divergence is 404: permanent on upload/download, transient on unpin (pin commit pending upstream). Upload-only: `402` → `billing`. Layers: custom exception class → boto `Error.Code` → HTTP status → exception class/errno → keyword fallback → chained `__cause__`. Unmatched errors return `"unknown"` and go to the DLQ. (`error_classifier.py` is a back-compat re-export shim.)
+Error classification lives in [errors.py](errors.py) — three path-specific classifiers sharing one rule engine (`classify_upload_error`, `classify_download_error`, `classify_unpin_error`). The key divergence is 404: permanent on upload/download, transient on unpin (pin commit pending upstream). Upload-only: `402` → `billing`. Layers: custom exception class → boto `Error.Code` → HTTP status → exception class/errno → keyword fallback → chained `__cause__`. Unmatched errors return `"unknown"` and go to the DLQ.
 
 Transient failures go back to the queue with backoff; permanent failures go to the upload DLQ ([../dlq/upload_dlq.py](../dlq/upload_dlq.py)) for manual intervention.
 
-**Concurrency model**: the uploader runs many replicas, and each pod processes up to `HIPPIUS_UPLOADER_MAX_INFLIGHT` upload requests concurrently (bounded-dispatch loop mirroring the downloader). Total concurrent Arion POSTs **per pod** are capped by a single shared `HIPPIUS_ARION_UPLOAD_CONCURRENCY` semaphore on the `Uploader` instance (the one throttle on the scarce resource). CID assignment is content-deterministic and `insert_chunk_backend` is idempotent (`ON CONFLICT`), so cross-request/cross-pod concurrency is safe. Scale aggregate throughput by raising `MAX_INFLIGHT` + `ARION_UPLOAD_CONCURRENCY` (watch Arion 429/5xx), not just replicas. Transient Arion errors fall back to the existing per-request exponential-backoff retry — ramp concurrency cautiously.
-
-## Downloader
-
-`process_download_request` at [downloader.py:94](downloader.py). Fulfills a `DownloadChainRequest` (list of parts, each with a list of `PartChunkSpec(index, cid?, cipher_size_bytes?)`). Flow:
-
-1. **Eager meta write** ([downloader.py:49-91](downloader.py)): for each part, check if `meta.json` exists; if not, write it from the DB `parts` row. Chunk size defaults to `4 MiB` if DB says 0 ([downloader.py:82](downloader.py)). This makes partial fills readable.
-2. **Chunk-batched processing** ([downloader.py:279-283](downloader.py)): within a part, chunks are batched by `config.downloader_semaphore` (default 20) so a pathological 5 GiB part (up to ~1280 chunks) doesn't spawn thousands of tasks on the semaphore.
-3. **Per-chunk flow** ([downloader.py:143-242](downloader.py)):
-   - Check FS: `fs_store.chunk_exists(...)`. Skip if cached.
-   - Look up `backend_identifier` via `get_chunk_backend_identifier.sql`. Skip if null (this backend doesn't hold the chunk).
-   - Call `fetch_fn(identifier, subaccount)` → ciphertext bytes.
-   - `fs_store.set_chunk(...)` atomically.
-   - `obj_cache.notify_chunk(...)` → publishes `notify:{chunk_key}`.
-   - Retry with exponential backoff + jitter on failure (`DOWNLOADER_CHUNK_RETRIES`, `DOWNLOADER_RETRY_BASE_SECONDS`, `DOWNLOADER_RETRY_JITTER_SECONDS`).
-4. **Release coalesce lock** ([downloader.py:286-292](downloader.py)):
-   ```python
-   lock_key = f"download_in_progress:{download_request.object_id}:v:{int(download_request.object_version)}:part:{part_number}"
-   await obj_cache.redis.delete(lock_key)
-   ```
-   Key format **must** match [../services/object_reader.py:87](../services/object_reader.py) — otherwise streamers hang until the TTL expires.
-5. **Reap + reconnect** ([downloader.py:423-435](downloader.py)): if an inflight task died from a Redis or asyncpg infra error, flag for client rebuild on the next loop iteration. Prevents continued failures against a stale connection.
-
-Key config ([../config.py](../config.py)):
-
-- `DOWNLOADER_SEMAPHORE=20` — concurrent chunk fetches per DCR.
-- `DOWNLOADER_MAX_INFLIGHT=10` — concurrent DCRs per pod. Range-heavy reads produce many single-part DCRs; parallelizing them is what delivers real backend throughput.
-- `DOWNLOADER_CHUNK_RETRIES=3`.
-- `DOWNLOAD_COALESCE_LOCK_TTL=600` — upper bound on how long a streamer can wait for a crashed downloader.
+**Concurrency model**: the uploader runs many replicas, and each pod processes up to `HIPPIUS_UPLOADER_MAX_INFLIGHT` upload requests concurrently (bounded-dispatch loop). Total concurrent Arion POSTs **per pod** are capped by a single shared `HIPPIUS_ARION_UPLOAD_CONCURRENCY` semaphore on the `Uploader` instance (the one throttle on the scarce resource). CID assignment is content-deterministic and `insert_chunk_backend` is idempotent (`ON CONFLICT`), so cross-request/cross-pod concurrency is safe. Scale aggregate throughput by raising `MAX_INFLIGHT` + `ARION_UPLOAD_CONCURRENCY` (watch Arion 429/5xx), not just replicas. Transient Arion errors fall back to the existing per-request exponential-backoff retry — ramp concurrency cautiously.
 
 ## Unpinner
 
@@ -89,5 +60,5 @@ Delete pin on backend → mark `chunk_backend.deleted = true, deleted_at = now()
 
 ## Tracing
 
-All worker operations emit OTel spans with `hippius.ray_id`, `hippius.account.main`, and backend-specific attributes. See [downloader.py:114-123](downloader.py) for the standard span shape.
+All worker operations emit OTel spans with `hippius.ray_id`, `hippius.account.main`, and backend-specific attributes. See [uploader.py](uploader.py) for the standard span shape.
 

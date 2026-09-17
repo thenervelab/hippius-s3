@@ -9,14 +9,12 @@ Entry point is [`ObjectWriter`](object_writer.py); the heavy lifting is in [`put
 | File | Purpose |
 |---|---|
 | [object_writer.py](object_writer.py) | Orchestrator. Simple PUT, MPU part upload, MPU completion, append. |
-| [chunker.py](chunker.py) | `stream_encrypt_to_chunks` — buffers plaintext, yields ciphertext one chunk at a time. |
 | [write_through_writer.py](write_through_writer.py) | `WriteThroughPartsWriter` — FS writes (fatal), then the landed-part announcement (best-effort). |
 | [landed.py](landed.py) | `LandedPartPublisher` — tells this node's drain agent a part is complete, so discovery is a queue pop instead of a whole-disk walk. |
-| [cache_writer.py](cache_writer.py) | **Dead code** — `CacheWriter` not referenced anywhere. Delete candidate in [todo.md](../../todo.md). |
 | [db.py](db.py) | `upsert_object_basic`, `ensure_upload_row` — atomic DB reserves. |
 | [types.py](types.py) | Dataclasses: `PutResult`, `PartResult`, `CompleteResult`, `AppendPreconditionFailed`, etc. |
 
-_(`queue.py` was removed: its `enqueue_upload` was the dead PUT-path upload producer. Since the s3-2.1 drain-direct cutover the Rust drain is the sole producer — it enqueues to `{backend}_upload_requests` only after replicating a part to the pool.)_
+_(`queue.py` was removed: its `enqueue_upload` was the dead PUT-path upload producer. Since the s3-2.1 drain-direct cutover the Rust drain is the sole producer — it publishes to the node-scoped `{backend}_upload_requests:<node>` once the part is verified whole on the node's SSD.)_
 
 ## The core path: `put_simple_stream_full`
 
@@ -54,11 +52,11 @@ streaming consumer's `fs_store.set_chunk` / `stage_chunk` is the sole chunk writ
 `WriteThroughPartsWriter` only lands meta — `write_meta` or `publish_part` (its `redis_cache` arg
 is retained for call-site compatibility but unused; its bulk `write_chunks` was deleted with the
 last non-streaming path). `RedisObjectPartsCache.set_chunks` / `set_meta` remain for the
-downloader/read paths.
+write/promotion paths.
 
 ### Meta.json visibility race (handled)
 
-Uploader writes meta AFTER all chunks. If a concurrent downloader worker races through the cache-miss path, it writes meta EAGERLY for its own consumption. Atomic rename means both writes are safe but we do it twice. [Downloader.py:256-269](../workers/downloader.py) already skips when meta exists.
+The writer persists meta AFTER all chunks — meta.json is the part-complete signal every reader (the drain's completeness gate, the uploader, the streamer) keys on. Nothing writes meta eagerly any more: the downloader that did is gone with the direct-to-Arion read path.
 
 ### DB visibility gating
 
