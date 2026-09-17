@@ -1547,6 +1547,7 @@ mod tests {
         }
         // The worklist only offers parts whose version has an address; the fake enqueuer, not
         // the DB, is what makes part 1's inline enqueue not-ready here.
+        create_object_versions_table(&db).await;
         seed_object_version(&db, &part_at(5, 1), Some("addr"), Some(1), None).await;
 
         let token = CancellationToken::new();
