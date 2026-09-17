@@ -359,6 +359,12 @@ jobs:
       - name: Deploy to staging
         run: |
           kubectl apply -k k8s/staging
+          # Overlay no longer declares these claims; apply does not prune. Delete
+          # after apply so a later deploy cannot recreate them either. ignore-not-found
+          # keeps this a no-op once they are gone. Terminating is fine if an old
+          # janitor pod still holds the volume — the new ReplicaSet does not mount it.
+          kubectl delete pvc object-cache-pvc persist-pvc dlq-pvc \
+            -n hippius-s3-staging --ignore-not-found --wait=false
 
       # STAGING ONLY — the drain chaos matrix (stress-test/faults/) needs Chaos Mesh + toxiproxy.
       # Chaos Mesh is namespace-scoped to hippius-s3-staging (clusterScoped=false + targetNamespace),

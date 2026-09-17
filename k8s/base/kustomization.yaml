@@ -6,7 +6,6 @@ resources:
   - configmap-defaults.yaml
   - configmap-redis.yaml
   - configmap-environment.yaml
-  - pvc-shared.yaml
   - redis-statefulsets.yaml
   - migration-job.yaml
   - workers-deployments.yaml

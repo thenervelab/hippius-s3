@@ -5,6 +5,8 @@ namespace: hippius-s3-prod
 
 resources:
   - ../base
+  # Object-pool CephFS claims live here, not in base: staging unmounted them.
+  - pvc-shared.yaml
   - postgres-nvme-objectstore.yaml
   - postgres-nvme-cluster.yaml
   - postgres-nvme-scheduledbackup.yaml

@@ -17,9 +17,3 @@ spec:
               value: ""
             - name: HIPPIUS_JANITOR_CEPH_POOLS
               value: ""
-          volumeMounts:
-            - $patch: delete
-              mountPath: /var/lib/hippius/object_cache
-      volumes:
-        - $patch: delete
-          name: object-cache
