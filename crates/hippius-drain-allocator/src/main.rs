@@ -109,6 +109,12 @@ async fn main() -> Result<(), StartupError> {
 
 /// Selects the ceiling source — the live mgr probe when a URL is configured (and the
 /// `http` feature is built), else the static ceiling — and runs the allocator on it.
+///
+/// After direct-to-Arion the drain does not write the pool. A configured mgr URL
+/// still classifies that unused pool: NearFull clamps the fleet to
+/// `CEPHOR_CEPH_NEARFULL_RATE_BPS` (~10 MB/s/node in prod) and live PUTs wait
+/// behind a 64 MiB overdraft. Production and staging manifests must leave the
+/// URL unset.
 async fn run_with_ceiling_source(coord: &Coordinator, config: &AllocatorConfig, metrics: &AllocatorMetrics) -> Result<(), StartupError> {
     #[cfg(feature = "http")]
     if let Some(url) = config.ceph_mgr_metrics_url.clone() {
