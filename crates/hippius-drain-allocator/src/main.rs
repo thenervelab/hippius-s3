@@ -34,6 +34,8 @@ enum StartupError {
     Store(#[from] StoreError),
     #[error("cannot connect to the coordination redis")]
     Coord(#[from] CoordError),
+    #[error("cannot write the liveness file")]
+    Liveness(#[from] std::io::Error),
     #[cfg(feature = "http")]
     #[error("cannot build the ceph mgr probe")]
     Probe(#[from] hippius_drain_allocator::probe::ProbeError),
@@ -45,6 +47,13 @@ async fn main() -> Result<(), StartupError> {
 
     let config = AllocatorConfig::from_env()?;
     let store = Store::connect(&config.database_url).await?;
+
+    // Touch before migrate. 0021 VALIDATE CONSTRAINT scans every
+    // cephor_replication_status row (~11M on prod) and can outlast
+    // initialDelaySeconds+failureThreshold (~65s). The probe keys on this
+    // file's mtime; without a pre-migrate touch the kubelet SIGKILLs the
+    // pod mid-VALIDATE, leaving _sqlx_migrations dirty.
+    std::fs::File::create(&config.liveness_file)?;
 
     // The singleton allocator owns schema provisioning: it deploys before the agents
     // (allocator-first), so applying the migrations here means the agents come up
