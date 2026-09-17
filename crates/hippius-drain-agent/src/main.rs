@@ -10,11 +10,11 @@ use hippius_drain_agent::config::{Config, ConfigError};
 use hippius_drain_agent::enqueue::RedisEnqueuer;
 use hippius_drain_agent::landed::LandedQueue;
 use hippius_drain_agent::localfs::LocalSsd;
-use hippius_drain_agent::runtime::{AgentRuntime, RateControl, default_enforcer};
+use hippius_drain_agent::runtime::AgentRuntime;
 use hippius_drain_agent::supervisor::{RunReport, ShutdownTrigger};
-use hippius_drain_core::{Bytes, Coordinator, DEFAULT_REDIS_TIMEOUT, Store, StoreError};
+use hippius_drain_core::{Coordinator, DEFAULT_REDIS_TIMEOUT, Store, StoreError};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -90,40 +90,16 @@ async fn main() -> Result<ExitCode, StartupError> {
     // TODO: delete with the pool (PR 2).
     let pool_enqueuer = Arc::new(RedisEnqueuer::pool(Arc::clone(&store), redis.clone(), config.enqueue_backends()));
 
-    // The Redis-backed coordinator: the heartbeat worker upserts this node's state under
-    // `heartbeat_ttl`, and the allocation-pull worker reads its budget. The agent never
-    // writes allocations, so its alloc TTL is unused (the allocator owns that key's TTL).
-    // Bound before the coordinator takes ownership of the manager. Cloning is cheap — it is a
-    // shared multiplexed handle, the same one the enqueuer holds.
+    // Heartbeat still reports disk pressure (evictor / C8 readiness). The allocator no
+    // longer hands out a write budget; drain runs ungated (concurrency is the only cap).
     let landed = LandedQueue::new(redis.clone(), config.node_id.as_str());
     let coordinator = Arc::new(Coordinator::new(redis, config.heartbeat_ttl, AGENT_ALLOC_TTL_UNUSED));
-
-    // The enforcer starts at the floor (conservative) with a one-second burst of
-    // the node's capability; the allocation-pull worker raises it to the leader's
-    // budget on its first tick.
-    let enforcer = Arc::new(Mutex::new(default_enforcer(
-        config.floor_rate,
-        Bytes::new(config.max_drain_rate.get()),
-        config.drain_concurrency,
-    )));
     let runtime =
         AgentRuntime::new(Arc::new(LocalSsd::new(&config.ssd_root)), store, enqueuer, config.runtime_config()).with_pool_enqueuer(pool_enqueuer);
-
-    // Built after the runtime because the allocation pull publishes this node's eviction
-    // reserve into the runtime's snapshot, which the evictor worker reads on its own poll.
-    let rate_control = RateControl {
-        enforcer: Arc::clone(&enforcer),
-        node: config.node_id.clone(),
-        floor: config.floor_rate,
-        half_life: config.decay_half_life,
-        poll: config.allocation_poll,
-        snapshot: runtime.snapshot(),
-    };
 
     let runtime = runtime
         .with_coordinator(coordinator)
         .with_heartbeat(config.heartbeat_config())
-        .with_rate_control(rate_control)
         // Shares the queue Redis with the upload enqueuer: the api publishes a landed-part
         // announcement there when it finishes writing a part, so discovery is one RPOP instead
         // of a walk of this node's whole replicated shard. An api that does not publish yet
@@ -132,17 +108,16 @@ async fn main() -> Result<ExitCode, StartupError> {
         .with_liveness(config.liveness_file.clone())
         .with_readiness(config.readiness_file.clone());
 
-    // OTLP metrics read the runtime's live snapshot + the shared enforcer (for the breaker
-    // gauge); grabbed before `run` consumes the runtime. Held until after shutdown to flush.
     #[cfg(feature = "otel")]
-    let metrics = hippius_drain_agent::metrics::init("hippius-drain-agent", &runtime.snapshot(), Some(&enforcer));
+    let metrics = hippius_drain_agent::metrics::init("hippius-drain-agent", &runtime.snapshot(), None);
 
     tracing::info!(
         ssd_root = %config.ssd_root.display(),
         upload_backends = ?config.upload_backends,
         backup_backends = ?config.backup_backends,
         enqueue_backends = ?config.enqueue_backends(),
-        "hippius-drain-agent started"
+        drain_concurrency = config.drain_concurrency,
+        "hippius-drain-agent started (ungated; no write budget)"
     );
     let report = runtime.run(shutdown_signal()).await;
     tracing::info!(trigger = ?report.trigger, clean = report.clean, "hippius-drain-agent stopped");

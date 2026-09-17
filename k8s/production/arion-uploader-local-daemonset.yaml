@@ -218,6 +218,16 @@ spec:
             periodSeconds: 30
             timeoutSeconds: 5
             failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - import os, redis; redis.Redis.from_url(os.environ["REDIS_QUEUES_URL"]).ping()
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
           resources:
             requests:
               cpu: 500m

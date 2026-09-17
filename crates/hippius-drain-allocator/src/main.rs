@@ -1,42 +1,25 @@
-//! hippius-drain-allocator: the singleton, leader-elected budget allocator entry point.
+//! hippius-drain-allocator: schema migrate + terminal-row GC.
 //!
-//! Parses [`AllocatorConfig`] from the environment, connects the central Postgres
-//! store, and runs [`run_allocator`] until SIGTERM/SIGINT. The allocation logic
-//! itself lives in `hippius-drain-core` ([`hippius_drain_core::run_tick`]); this binary is the
-//! deploy wrapper. When `CEPHOR_CEPH_MGR_METRICS_URL` is set and the `http` feature
-//! is built, the live Ceph-mgr ceiling probe drives the budget; otherwise a
-//! [`StaticCeiling`](hippius_drain_core::StaticCeiling) from config is the fallback.
+//! After direct-to-Arion the agents drain ungated (no write budget). This binary
+//! still owns `sqlx migrate()` (allocator-first) and the periodic GC of aged
+//! `replicated`/`failed` rows. It does not scrape Ceph mgr or write `cephor:alloc:*`.
 
 use hippius_drain_allocator::config::{AllocatorConfig, ConfigError};
-use hippius_drain_allocator::run::{AllocatorMetrics, Observability, run_allocator};
-use hippius_drain_core::{CephCeilingSource, CoordError, Coordinator, Store, StoreError};
-use std::sync::Arc;
+use hippius_drain_core::{Store, StoreError};
 use std::time::Duration;
 use thiserror::Error;
-
-/// The agents own the heartbeat TTL (`CEPHOR_HEARTBEAT_TTL_SECS`), so the allocator's
-/// coordinator never writes node keys; this value is unused on its side, present only to
-/// satisfy the shared [`Coordinator`] constructor.
-const ALLOCATOR_NODE_TTL: Duration = Duration::from_secs(30);
 
 /// How often the terminal-row GC sweep runs (coarse — the table grows slowly and each
 /// sweep is one bounded DELETE).
 const STATUS_GC_INTERVAL: Duration = Duration::from_hours(1);
 
-/// A failure bringing the allocator up. Each variant maps to a distinct operator
-/// fix: a bad environment, an unreachable store / coordination redis, or an
-/// unbuildable probe client.
+/// A failure bringing the allocator up.
 #[derive(Debug, Error)]
 enum StartupError {
     #[error("invalid configuration")]
     Config(#[from] ConfigError),
     #[error("cannot connect to the state store")]
     Store(#[from] StoreError),
-    #[error("cannot connect to the coordination redis")]
-    Coord(#[from] CoordError),
-    #[cfg(feature = "http")]
-    #[error("cannot build the ceph mgr probe")]
-    Probe(#[from] hippius_drain_allocator::probe::ProbeError),
 }
 
 #[tokio::main]
@@ -46,12 +29,25 @@ async fn main() -> Result<(), StartupError> {
     let config = AllocatorConfig::from_env()?;
     let store = Store::connect(&config.database_url).await?;
 
+    // The probe requires mtime < 30s. 0021 VALIDATE can run for minutes on prod;
+    // a one-shot create would go stale and the kubelet would SIGKILL mid-migrate.
+    let liveness = config.liveness_file.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            ticks.tick().await;
+            let _ = std::fs::write(&liveness, b"ok");
+        }
+    });
+
     // The singleton allocator owns schema provisioning: it deploys before the agents
     // (allocator-first), so applying the migrations here means the agents come up
     // against a ready cephor_* schema and need no DDL rights of their own. Idempotent
     // — sqlx records applied migrations under an advisory lock, so a restart or a
     // brief multi-replica overlap during rollout re-runs nothing.
-    store.migrate().await?;
+    let migrated = store.migrate().await;
+    heartbeat.abort();
+    migrated?;
 
     // Terminal-row GC: a best-effort background sweep pruning aged replicated/failed rows
     // so cephor_replication_status does not grow unbounded and bloat the hot claim/reconcile
@@ -70,79 +66,26 @@ async fn main() -> Result<(), StartupError> {
         }
     });
 
-    // Leadership, the fleet view, and the budgets live in Redis (TTL-keyed, epoch-fenced)
-    // — not Postgres — so the ~2s leader tick never touches the WAL.
-    let coordinator = Coordinator::connect(&config.redis_queues_url, ALLOCATOR_NODE_TTL, config.alloc_ttl).await?;
-
-    // Plain-atomic gauges the tick loop updates; the OTLP exporter (feature `otel`) reads
-    // them. Always created (cheap) so the loop's signature is uniform with or without otel.
-    let alloc_metrics = Arc::new(AllocatorMetrics::default());
-    #[cfg(feature = "otel")]
-    let metrics = hippius_drain_allocator::metrics::init("hippius-drain-allocator", &alloc_metrics);
-
     tracing::info!(
         instance = %config.instance_id,
-        tick_secs = config.tick_interval.as_secs(),
-        "hippius-drain-allocator started"
+        "hippius-drain-allocator started (migrate+gc; no write budget)"
     );
-    run_with_ceiling_source(&coordinator, &config, alloc_metrics.as_ref()).await?;
+
+    let liveness = config.liveness_file.clone();
+    let mut ticks = tokio::time::interval(Duration::from_secs(10));
+    tokio::pin! {
+        let shutdown = shutdown_signal();
+    }
+    loop {
+        tokio::select! {
+            () = &mut shutdown => break,
+            _ = ticks.tick() => {
+                let _ = std::fs::write(&liveness, b"ok");
+            }
+        }
+    }
     tracing::info!("hippius-drain-allocator stopped");
-    #[cfg(feature = "otel")]
-    if let Some(metrics) = metrics {
-        metrics.shutdown();
-    }
     Ok(())
-}
-
-/// Selects the ceiling source — the live mgr probe when a URL is configured (and the
-/// `http` feature is built), else the static ceiling — and runs the allocator on it.
-async fn run_with_ceiling_source(coord: &Coordinator, config: &AllocatorConfig, metrics: &AllocatorMetrics) -> Result<(), StartupError> {
-    #[cfg(feature = "http")]
-    if let Some(url) = config.ceph_mgr_metrics_url.clone() {
-        let probe = hippius_drain_allocator::probe::CephProbe::new(config.probe_settings(url.clone()))?;
-        tracing::info!(
-            mgr_url = %url,
-            pools = config.ceph_pools.join(","),
-            nearfull_rate_bps = config.ceph_nearfull_rate.get(),
-            "driving the budget from the live ceph-mgr ceiling probe"
-        );
-        drive(coord, &probe, config, metrics).await;
-        return Ok(());
-    }
-    if !config.ceph_pools.is_empty() {
-        // The pool fullness gate only exists inside the live probe; pools configured
-        // without a mgr URL is the silent no-protection state that caused the
-        // 2026-07-24 incident, so it must be loud.
-        tracing::warn!(
-            pools = config.ceph_pools.join(","),
-            "CEPHOR_CEPH_POOLS is set but CEPHOR_CEPH_MGR_METRICS_URL is not; the pool fullness gate is INACTIVE on the static ceiling"
-        );
-    }
-    tracing::info!("no ceph mgr url configured; using the static ceiling");
-    drive(coord, &config.ceiling(), config, metrics).await;
-    Ok(())
-}
-
-/// Runs the allocator loop on `ceiling`, logging (not failing on) a shutdown
-/// relinquish error — the lease TTL recovers it, so the process still exits cleanly.
-async fn drive<C: CephCeilingSource>(coord: &Coordinator, ceiling: &C, config: &AllocatorConfig, metrics: &AllocatorMetrics) {
-    let obs = Observability {
-        liveness: Some(config.liveness_file.as_path()),
-        metrics,
-    };
-    if let Err(err) = run_allocator(
-        coord,
-        ceiling,
-        &config.tick_config(),
-        config.initial_total,
-        config.tick_interval,
-        &obs,
-        shutdown_signal(),
-    )
-    .await
-    {
-        tracing::warn!(error = %err, "relinquishing leadership on shutdown failed; the lease TTL will recover it");
-    }
 }
 
 /// Installs the global tracing subscriber, honoring `RUST_LOG` (default `info`).

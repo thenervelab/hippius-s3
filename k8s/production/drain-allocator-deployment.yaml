@@ -98,10 +98,6 @@ spec:
             # fleet from the high one into the low one, permanently.
             # 250 MB/s -> 50 MB/s/node -> 3.1 MB/s/stream -> p99 part ~1.2s, comfortably under
             # the 8s target, so ticks read healthy and the AIMD ramps to the ceiling by itself.
-            # This does NOT weaken the near-full protection: allocate() applies the ceiling AFTER
-            # the floor (`capacity = new_total.min(ceiling.budget())`, alloc.rs), so a NearFull
-            # ceiling still clamps the fleet to CEPHOR_CEPH_NEARFULL_RATE_BPS and Critical still
-            # yields a zero budget, regardless of how high min_total is set.
             - name: CEPHOR_ALLOC_MIN_TOTAL_BPS
               value: "250000000"   # 250 MB/s floor (was 50 MB/s) — above the 16-way-split collapse threshold
             - name: CEPHOR_ALLOC_TARGET_P99_MS
@@ -121,33 +117,13 @@ spec:
             # every second of that is un-drained parts that cross-node GETs cannot read yet.
             - name: CEPHOR_ALLOC_ADDITIVE_INCREASE_BPS
               value: "50000000"    # 50 MB/s per healthy tick — ~25s floor-to-ceiling
-            # Live ceph-mgr ceiling probe — ENABLED. The allocator reads the real Ceph
-            # pool capacity ceiling from the rook-ceph mgr Prometheus endpoint instead of
-            # its static fallback ceiling. Cross-namespace reach to rook-ceph confirmed.
-            - name: CEPHOR_CEPH_MGR_METRICS_URL
-              value: "http://rook-ceph-mgr.rook-ceph.svc.cluster.local:9283/metrics"
-            # Pool-level fullness gate (2026-07-24 incident). The drain's target pool
-            # filled to ~98% while the cluster ratio sat at 72% and no OSD had crossed
-            # near-full, so the ceiling stayed Open all night. Every pool this stack
-            # writes is listed (CephFS data + metadata, and the RBD blockpool backing
-            # the Postgres/Redis PVCs); the fullest one gates: NearFull at 85% caps
-            # the drain at CEPHOR_CEPH_NEARFULL_RATE_BPS, Critical at 95% stops it.
-            - name: CEPHOR_CEPH_POOLS
-              value: "ceph-filesystem-data0,ceph-filesystem-metadata,ceph-blockpool"
-            # 50 MB/s, not the code-default 10 MB/s (2026-07-24 evening lesson): fresh
-            # writes are readable ONLY from their ingest node's SSD until drained, and
-            # this workload reads its writes cross-node within seconds. At 10 MB/s the
-            # cap sat below live ingest — the backlog grew 0->185 GB in 3h and every
-            # cross-node GET of a fresh object 503'd ("parts not ready"). 50 MB/s keeps
-            # the backlog draining under NearFull; the 95% Critical stop (zero budget)
-            # is the actual pool protection, and the janitor's pool-gated eviction has
-            # outpaced a 50 MB/s drain all day. Must stay <= CEPHOR_CEPH_CEILING_BPS
-            # (config-enforced) and should move WITH the ceph watermarks if retuned.
-            # This is ALSO the rate the fleet decays to while the mgr scrape is failing:
-            # a blind probe cannot tell an open pool from a full one, so raising this
-            # loosens the blind fail-safe as well as the known-near-full cap.
-            - name: CEPHOR_CEPH_NEARFULL_RATE_BPS
-              value: "50000000"
+            # Drain no longer writes the pool (direct-to-Arion). The mgr probe was still
+            # classifying the unused pool as NearFull and clamping the fleet to
+            # CEPHOR_CEPH_NEARFULL_RATE_BPS (50 MB/s / 5 nodes ≈ 10 MB/s/node), so a
+            # 64 MiB part paid overdraft debt for ~5s and live PUTs sat behind hours of
+            # backlog. Unset the probe: static Open ceiling, AIMD floor 250 MB/s.
+            - name: CEPHOR_CEPH_CEILING_BPS
+              value: "1000000000"  # 1 GB/s fleet Open ceiling (code default; pinned)
           resources:
             requests:
               cpu: 50m

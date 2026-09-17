@@ -437,6 +437,8 @@ Response shape: `{"status":"success","data":{"resultType":"streams","result":[{"
 
 - **DLQ requeue**: [hippius_s3/scripts/dlq_requeue.py](hippius_s3/scripts/dlq_requeue.py).
 - **Arion hash backfill**: [hippius_s3/scripts/backfill_arion_hash.py](hippius_s3/scripts/backfill_arion_hash.py) + [k8s/backfill-arion-hash-job.yaml](k8s/backfill-arion-hash-job.yaml).
+- **Prod release of the storage rollup** (two-step, step order is load-bearing):
+  [docs/runbooks/prod-release-storage-rollup.md](docs/runbooks/prod-release-storage-rollup.md).
 - **Storage-usage rollup** (the billed byte counter): [docs/runbooks/storage-usage-rollup.md](docs/runbooks/storage-usage-rollup.md)
   — alerts and what to do, why `DISABLE TRIGGER` is not a switch, diagnosing drift, the backfill.
 - **Reserved-name / ownerless bucket audit**: [hippius_s3/scripts/report_reserved_name_buckets.py](hippius_s3/scripts/report_reserved_name_buckets.py). Read-only. Run after any change to the gateway's auth-exempt paths.

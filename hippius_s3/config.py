@@ -448,7 +448,7 @@ class Config:
     # The node-local uploader can dequeue a drain-published request before the drain has
     # committed the row `uploading` (publish precedes commit): how long it polls a `draining`
     # row for the commit, and how far back on the retry ZSET a still-uncommitted part goes.
-    uploader_hand_off_wait_seconds: float = env("HIPPIUS_UPLOADER_HAND_OFF_WAIT_SECONDS:10", convert=float)
+    uploader_hand_off_wait_seconds: float = env("HIPPIUS_UPLOADER_HAND_OFF_WAIT_SECONDS:2", convert=float)
     uploader_hand_off_retry_delay_seconds: float = env("HIPPIUS_UPLOADER_HAND_OFF_RETRY_DELAY_SECONDS:5", convert=float)
 
     # Unpinner configuration

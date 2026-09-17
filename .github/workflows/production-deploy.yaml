@@ -330,6 +330,9 @@ jobs:
       - name: Deploy to production
         run: |
           kubectl apply -k k8s/production
+          # drain-agent is OnDelete: apply stores the new spec but does not
+          # replace running pods. Pods are deleted only after arion-uploader-local
+          # and the allocator are Ready, below.
 
       - name: Wait for rollout
         run: |
@@ -413,20 +416,38 @@ jobs:
           assert_ingest_tier arion-uploader-local
           # Drain stack (allocator-first: it applies the cephor_* migrations on startup). Present
           # only once the drain block is uncommented in kustomization.yaml (at cutover).
-          wait_deploy drain-allocator 5m
+          # 15m: first apply of this image runs 0021 VALIDATE over ~11M
+          # cephor_replication_status rows before the allocator becomes Ready.
+          wait_deploy drain-allocator 15m
           wait_deploy mpu-reaper 5m
+          # OnDelete: running drain-agent pods still have the old image until
+          # deleted. Do this only after the node-local uploader is Ready on
+          # every ingest node, or the new binary publishes to a queue nobody
+          # reads.
+          kubectl delete pods -l app=drain-agent -n "$ns"
+
           # drain-agent is a DaemonSet that MUST cover every node running api-local: a node with
           # api-local but no drain-agent silently drops that node's uploads (never drained) — peer
           # review B3. A partial roll is therefore a FAILURE, not a warning. The s3-ingest-priority
           # class ensures the agent can preempt for a slot, so a partial roll is a real problem now.
           # Require drain-agent numberReady == desiredNumberScheduled AND >= the api-local node count.
           if kubectl get ds/drain-agent -n "$ns" >/dev/null 2>&1; then
-            # 20m for the same per-node-serial reason as api-local. The `|| true` means a timeout
-            # here does not fail directly — it falls through to the ready-count check below, which
-            # would then report a "partial roll" that is really just a roll still in progress.
-            kubectl rollout status daemonset/drain-agent -n "$ns" --timeout=20m || true
-            ready=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
-            desired=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+            # OnDelete: `kubectl rollout status` errors ("only available for RollingUpdate")
+            # and the next sample ran at T+14s while replacements were still starting, so
+            # 2026-09-17 production-deploy failed with ready=0/5 after a successful cutover.
+            echo "waiting for drain-agent replacements to become Ready (OnDelete)"
+            deadline=$((SECONDS + 1200))
+            ready=0
+            desired=1
+            while [ $SECONDS -lt $deadline ]; do
+              ready=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+              desired=$(kubectl get ds drain-agent -n "$ns" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+              echo "drain-agent ready=${ready}/${desired}"
+              if [ "${desired:-0}" -gt 0 ] && [ "${ready:-0}" -ge "${desired}" ]; then
+                break
+              fi
+              sleep 10
+            done
             apiloc=$(kubectl get pods -l app=api-local -n "$ns" --field-selector=status.phase=Running -o json 2>/dev/null | jq -r '[.items[].spec.nodeName]|unique|length' 2>/dev/null || echo 0)
             echo "drain-agent ready=${ready}/${desired}; api-local nodes=${apiloc}"
             if [ "${ready:-0}" -lt "${desired:-1}" ] || [ "${ready:-0}" -lt "${apiloc:-0}" ]; then
@@ -434,7 +455,7 @@ jobs:
               kubectl get pods -l app=drain-agent -n "$ns" -o wide || true
               exit 1
             fi
-            echo "drain-agent covers every api-local node ✅"
+            echo "drain-agent covers every api-local node"
             assert_ingest_tier drain-agent
           else
             echo "daemonset/drain-agent absent — drain block not yet enabled; skipping"

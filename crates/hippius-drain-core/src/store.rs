@@ -2859,7 +2859,7 @@ mod part_tests {
         // B-2 window where an eviction destroys the client's new bytes.
         create_app_schema(&pool).await;
         let store = Store::from_pool(pool.clone()).with_node_id("node-a");
-        let statuses = ["pending", "draining", "replicated", "failed", "corrupt"];
+        let statuses = ["pending", "draining", "uploading", "replicated", "failed", "corrupt"];
         // 0 = never re-landed, 1 = re-landed now (in grace), 2 = re-landed 11 min ago (lapsed).
         let relands = [0i32, 1, 2];
         let mut expected = Vec::new();

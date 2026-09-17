@@ -119,4 +119,7 @@ def test_the_baseline_leaves_this_releases_migrations_in_scope() -> None:
         "_GUARD_FROM has been moved past the rollup migration, which takes ACCESS EXCLUSIVE on both "
         "166M-row tables -- the guard is now covering nothing load-bearing"
     )
-    assert len(in_scope) >= 5, f"only {len(in_scope)} migrations are in scope; the cutoff looks wrong"
+    # Deliberately NOT a count assertion. An earlier version asserted `len(in_scope) >= 5`, true for
+    # the whole release but false once it is sliced into two steps -- step A ships three of these and
+    # step B the rest. The anchor above is the property that matters and does not depend on slicing.
+    assert in_scope, "no migrations are in scope at all; the cutoff or the glob is wrong"

@@ -168,3 +168,29 @@ async def test_transient_retries_back_off_exponentially() -> None:
     with patch("hippius_s3.reader.backend_fetch.asyncio.sleep", fake_sleep), pytest.raises(ChunkUnavailableError):
         await fetcher.fetch([("arion", "id")], "addr")
     assert sleeps == [1.0, 2.0], "base × 2^(attempt-1), and no sleep after the last attempt"
+
+
+@pytest.mark.asyncio
+async def test_transient_backoff_does_not_hold_the_concurrency_slot() -> None:
+    calls = 0
+    sleeping = asyncio.Event()
+
+    async def flaky(identifier: str, address: str) -> bytes:
+        nonlocal calls
+        calls += 1
+        if identifier == "id-1":
+            raise ConnectionError("429")
+        return b"ok"
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeping.set()
+        await asyncio.Event().wait()
+
+    fetcher = BackendChunkFetcher(
+        {"arion": flaky}, concurrency=1, attempts=3, base_sleep=1.0, jitter=0.0, queue_timeout=0.5
+    )
+    with patch("hippius_s3.reader.backend_fetch.asyncio.sleep", fake_sleep):
+        first = asyncio.create_task(fetcher.fetch([("arion", "id-1")], "addr"))
+        await sleeping.wait()
+        assert await fetcher.fetch([("arion", "id-2")], "addr") == b"ok"
+        first.cancel()

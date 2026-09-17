@@ -120,7 +120,7 @@ impl PartDigest {
 pub fn part_digest<S: AsRef<str>>(chunk_hashes: &[S]) -> PartDigest {
     let mut hasher = Sha256::new();
     hasher.update(b"hippius-drain/part-digest/v1\n");
-    hasher.update(chunk_hashes.len().to_le_bytes());
+    hasher.update((chunk_hashes.len() as u64).to_le_bytes());
     for hash in chunk_hashes {
         let raw = hash.as_ref().as_bytes();
         hasher.update(u32::try_from(raw.len()).unwrap_or(u32::MAX).to_le_bytes());

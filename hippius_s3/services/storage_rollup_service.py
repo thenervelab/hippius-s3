@@ -352,6 +352,9 @@ async def _verify_sliced_and_report(
             f"This bucket is too large to recompute in one statement -- repair needs a targeted "
             f"backfill run."
         )
+        from hippius_s3.monitoring import get_metrics_collector
+
+        get_metrics_collector().record_storage_rollup_recompute(sweep.gap_bytes)
         return
 
     logger.info(

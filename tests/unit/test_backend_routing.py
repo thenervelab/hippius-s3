@@ -120,7 +120,6 @@ def _mock_config(upload=None, download=None, delete=None):
     """Return a mock config with configurable backend lists."""
     cfg = AsyncMock()
     cfg.upload_backends = upload or ["arion"]
-    cfg.download_backends = download or ["arion"]
     cfg.delete_backends = delete or ["arion"]
     return cfg
 

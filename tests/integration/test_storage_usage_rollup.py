@@ -1347,6 +1347,7 @@ async def test_a_pathological_size_cannot_abort_a_customer_write(pg_tx: asyncpg.
 
 
 @pytest.mark.parametrize("concurrency", [1, 4, 16, 32])
+@pytest.mark.requires_version_lock
 async def test_same_key_concurrent_two_step_puts_do_not_over_count(
     committed_pool: CommittedPool,
     concurrency: int,
@@ -1377,6 +1378,7 @@ async def test_same_key_concurrent_two_step_puts_do_not_over_count(
         await _assert_matches_oracle(conn, acct)
 
 
+@pytest.mark.requires_version_lock
 async def test_a_reserve_waits_for_an_uncommitted_finalize_of_the_outgoing_version(
     committed_pool: CommittedPool,
 ) -> None:
@@ -1419,6 +1421,7 @@ async def test_a_reserve_waits_for_an_uncommitted_finalize_of_the_outgoing_versi
         assert await _assert_matches_oracle(conn, acct) == 0
 
 
+@pytest.mark.requires_version_lock
 async def test_a_repoint_onto_an_existing_version_waits_for_its_uncommitted_finalize(
     committed_pool: CommittedPool,
 ) -> None:
@@ -1472,6 +1475,7 @@ async def test_a_repoint_onto_an_existing_version_waits_for_its_uncommitted_fina
         assert await _assert_matches_oracle(conn, acct) == 1000
 
 
+@pytest.mark.requires_version_lock
 async def test_an_append_racing_a_repoint_is_counted_at_its_appended_size(
     committed_pool: CommittedPool,
 ) -> None:
@@ -1548,6 +1552,7 @@ async def test_concurrent_appends_alone_are_exact(committed_pool: CommittedPool)
 
 
 @pytest.mark.parametrize("concurrency", [4, 16])
+@pytest.mark.requires_version_lock
 async def test_mpu_completion_alone_under_concurrency_converges(
     committed_pool: CommittedPool,
     concurrency: int,
@@ -1572,6 +1577,7 @@ async def test_mpu_completion_alone_under_concurrency_converges(
 
 
 @pytest.mark.parametrize("concurrency", [4, 16])
+@pytest.mark.requires_version_lock
 async def test_two_step_puts_racing_a_soft_delete_converge(
     committed_pool: CommittedPool,
     concurrency: int,
@@ -1600,6 +1606,7 @@ async def test_two_step_puts_racing_a_soft_delete_converge(
 
 
 @pytest.mark.parametrize("concurrency", [4, 16])
+@pytest.mark.requires_version_lock
 async def test_two_step_puts_racing_a_delete_marker_converge(
     committed_pool: CommittedPool,
     concurrency: int,
@@ -1624,6 +1631,7 @@ async def test_two_step_puts_racing_a_delete_marker_converge(
 
 
 @pytest.mark.parametrize("concurrency", [4, 16])
+@pytest.mark.requires_version_lock
 async def test_aborted_puts_racing_overwrites_converge(
     committed_pool: CommittedPool,
     concurrency: int,
@@ -1656,6 +1664,7 @@ async def test_aborted_puts_racing_overwrites_converge(
 # --------------------------------------------------------------------------------------------
 
 
+@pytest.mark.requires_version_lock
 async def test_taking_the_version_row_before_the_objects_row_deadlocks(
     committed_pool: CommittedPool,
 ) -> None:
@@ -1778,6 +1787,7 @@ async def test_abort_cleanup_locks_the_objects_row_before_the_version_row(
 
 
 @pytest.mark.parametrize("concurrency", [4, 16])
+@pytest.mark.requires_version_lock
 async def test_abort_multipart_racing_an_overwrite_does_not_deadlock(
     committed_pool: CommittedPool,
     concurrency: int,
@@ -1817,6 +1827,7 @@ async def test_abort_multipart_racing_an_overwrite_does_not_deadlock(
         await _assert_matches_oracle(conn, acct)
 
 
+@pytest.mark.requires_version_lock
 async def test_the_locking_read_helper_is_not_stable(pg_conn: asyncpg.Connection) -> None:
     """storage_usage_version_bytes_locked must stay VOLATILE.
 
@@ -1885,6 +1896,7 @@ async def _real_put_tail(
 
 
 @pytest.mark.parametrize("concurrency", [8, 32])
+@pytest.mark.requires_version_lock
 async def test_concurrent_same_key_puts_with_the_real_statement_set_do_not_deadlock(
     committed_pool: CommittedPool, concurrency: int
 ) -> None:
@@ -1928,6 +1940,7 @@ async def test_concurrent_same_key_puts_with_the_real_statement_set_do_not_deadl
         await _assert_matches_oracle(conn, acct)
 
 
+@pytest.mark.requires_version_lock
 async def test_the_objects_lock_is_taken_before_the_version_row_in_the_put_tail(
     committed_pool: CommittedPool,
 ) -> None:
@@ -2458,4 +2471,49 @@ async def test_writes_during_a_sweep_do_not_manufacture_drift(committed_pool: Co
     assert sweep.gap_bytes != 0, "precondition: the late write should make the totals differ"
     assert not sweep.exceeds_tolerance, (
         f"a concurrent write was reported as drift: gap={sweep.gap_bytes} tolerance={sweep.tolerance_bytes}"
+    )
+
+
+async def test_the_schema_is_in_one_of_the_two_intended_release_states(
+    pg_conn: asyncpg.Connection,
+) -> None:
+    """Assert the SAFETY PROPERTY of each release step, not merely skip what step A lacks.
+
+    The version lock ships one step AFTER the code that makes it safe. Step A ships the
+    objects-first code with UNLOCKED triggers; step B installs the lock into a fleet already
+    carrying it. Had the lock arrived in step A, concurrent same-key PUTs would deadlock for the
+    length of the DaemonSet roll -- 4/48 (8%) at concurrency 8, 46/192 (24%) at 32, each a 500
+    returned after the whole request body had been received and staged.
+
+    So in step A "the lock is absent" is the point, not an accident to skip past. This pins BOTH
+    states and fails on anything between them: a half-applied schema, where the trigger calls a
+    helper that does not exist, would otherwise surface only as a runtime error on the next
+    customer write.
+    """
+    installed = bool(
+        await pg_conn.fetchval("SELECT count(*) FROM pg_proc WHERE proname = 'storage_usage_version_bytes_locked'")
+    )
+    locked_reads = await pg_conn.fetchval(
+        "SELECT regexp_count(prosrc, '_bytes_locked') FROM pg_proc"
+        " WHERE proname = 'storage_usage_objects_update_trigger'"
+    )
+
+    if installed:
+        assert locked_reads == 2, (
+            f"the lock helper exists but objects_update calls it {locked_reads} times, not 2. BOTH "
+            f"the outgoing and the incoming version read must be locked -- locking only the outgoing "
+            f"one leaves the mirrored defect, which UNDER-counts."
+        )
+    else:
+        assert locked_reads == 0, (
+            f"the lock helper is absent but objects_update still calls it {locked_reads} times, so "
+            f"the trigger fails at runtime on the next write. The schema is half-applied."
+        )
+
+    assert (
+        await pg_conn.fetchval(
+            "SELECT count(*) FROM pg_trigger t JOIN pg_class k ON k.oid = t.tgrelid"
+            " WHERE NOT t.tgisinternal AND t.tgname LIKE '%storage_delta%'"
+        )
+        == 5
     )

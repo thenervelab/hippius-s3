@@ -27,7 +27,11 @@ spec:
     matchLabels:
       app: drain-agent
   updateStrategy:
-    type: RollingUpdate
+    # OnDelete for this cutover: RollingUpdate would replace a node before
+    # arion-uploader-local is Ready there. production-deploy.yaml deletes the
+    # pods after that gate. Revert to RollingUpdate once the fleet is on this
+    # image.
+    type: OnDelete
   template:
     metadata:
       labels:
@@ -180,6 +184,13 @@ spec:
               value: "300"
             - name: CEPHOR_RECLAIM_GRACE_SECS
               value: "3600"
+            # ROLLBACK — do not `kubectl rollout undo daemonset/drain-agent` while any
+            # row is status='uploading'. The pre-this-image binary has no uploading
+            # arm (UnknownState) and CrashLoops on reconcile. Before undo:
+            #   UPDATE cephor_replication_status
+            #   SET status = 'pending', claimed_at = NULL
+            #   WHERE status = 'uploading';
+            # SSD copies stay; uploading is never reclaimed.
             # ROLLBACK-LOAD-BEARING — do not delete as manifest hygiene.
             # Read by the CURRENT (pre-retention) binary, which unlinks a replicated part once
             # it ages past this grace. The retention binary ignores it: ssd_reclaim skips
