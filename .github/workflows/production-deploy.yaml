@@ -330,6 +330,12 @@ jobs:
       - name: Deploy to production
         run: |
           kubectl apply -k k8s/production
+          # Overlay no longer declares these claims; apply does not prune. Delete
+          # after apply so a later deploy cannot recreate them either. ignore-not-found
+          # keeps this a no-op once they are gone. Terminating is fine if an old
+          # pod still holds the volume — the new ReplicaSet does not mount it.
+          kubectl delete pvc object-cache-pvc persist-pvc dlq-pvc \
+            -n hippius-s3-prod --ignore-not-found --wait=false
           # drain-agent is OnDelete: apply stores the new spec but does not
           # replace running pods. Pods are deleted only after arion-uploader-local
           # and the allocator are Ready, below.

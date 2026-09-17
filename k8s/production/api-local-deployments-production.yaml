@@ -2,9 +2,9 @@
 #
 # One `api-local` DaemonSet — exactly one pod per ingest node (node1..node5). At cutover the
 # base (ceph) `api` deployment scales to 0 and the `api` Service selector points here, so ALL
-# api pods run on local SSD. Each pod writes to its node's /s3-data NVMe and read-falls-back
-# to the shared CephFS pool. Workers run on ceph. The drain-agent DaemonSet (sole upload
-# producer) replicates each node's /s3-data → CephFS and enqueues the backend upload.
+# api pods run on local SSD. Writes land on the node NVMe; cold reads come from Arion; hot
+# reads are local / peer. No shared cache mount. The drain-agent is the sole upload producer
+# (SSD → Arion).
 #
 # Volume: a `hostPath` at /s3-data with `type: Directory` — the dedicated 3.84 TB NVMe is
 # mounted there out-of-band (node prep, not CI). Directory (not DirectoryOrCreate) is the
@@ -24,8 +24,8 @@
 #
 # Routing: the `api` and `gateway` Services (k8s/base/services.yaml) select `app: api-local`.
 #
-# IMPORTANT: with no ceph api pods, every upload stages locally and stays `pending` until the
-# drain replicates local->ceph. The drain stack (allocator + agent) MUST be up first.
+# Uploads stage on the node NVMe; the drain-agent is the sole upload producer
+# (SSD → Arion). The drain stack (allocator + agent) MUST be up first.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -137,11 +137,9 @@ spec:
               value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: HIPPIUS_OBJECT_CACHE_DIR
               value: /var/lib/hippius/local_object_cache
-            - name: HIPPIUS_OBJECT_CACHE_FALLBACK_DIR
-              value: /var/lib/hippius/object_cache
-            # Peer tier: read a chunk from the node holding it on flash before falling back to
-            # the pool. Prod is pod-networked, so unlike the staging overlay it needs neither
-            # HIPPIUS_PEER_ALLOW_NODE_NETWORK nor a UVICORN_HOST override.
+            # Peer tier: read a chunk from the node holding it on flash before falling
+            # through to Arion. Prod is pod-networked, so unlike the staging overlay it
+            # needs neither HIPPIUS_PEER_ALLOW_NODE_NETWORK nor a UVICORN_HOST override.
             - name: POD_IP
               valueFrom:
                 fieldRef:
@@ -165,13 +163,6 @@ spec:
           volumeMounts:
             - name: local-ingest
               mountPath: /var/lib/hippius/local_object_cache
-            - name: object-cache
-              mountPath: /var/lib/hippius/object_cache
-              readOnly: true
-            - name: persist
-              mountPath: /var/lib/hippius/persist
-            - name: dlq
-              mountPath: /tmp/hippius_dlq
             - name: kms-certs
               mountPath: /kms_certs
               readOnly: true
@@ -224,15 +215,6 @@ spec:
             # prepare-ingest-dir initContainer chmods the mount so the (non-root) api can write.
             path: /s3-data
             type: Directory
-        - name: object-cache
-          persistentVolumeClaim:
-            claimName: object-cache-pvc
-        - name: persist
-          persistentVolumeClaim:
-            claimName: persist-pvc
-        - name: dlq
-          persistentVolumeClaim:
-            claimName: dlq-pvc
         - name: kms-certs
           secret:
             secretName: ovh-kms-certs

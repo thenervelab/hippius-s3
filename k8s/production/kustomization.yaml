@@ -5,8 +5,6 @@ namespace: hippius-s3-prod
 
 resources:
   - ../base
-  # Object-pool CephFS claims live here, not in base: staging unmounted them.
-  - pvc-shared.yaml
   - postgres-nvme-objectstore.yaml
   - postgres-nvme-cluster.yaml
   - postgres-nvme-scheduledbackup.yaml
@@ -43,6 +41,31 @@ patches:
   - path: ingress-patch.yaml
   - path: services-patch.yaml
   - path: postgres-nvme-initwait-patch.yaml
+  # Slice 2: unmount the shared cache. Global pool-era uploader off (node-local
+  # remains). Janitor is DB-GC only. Object-pool PVCs are omitted from this overlay
+  # (apply does not prune; production-deploy deletes the live claims). JSON patches
+  # drop leftover mounts — CI's kustomize panics on `$patch: delete`.
+  - path: janitor-db-only.yaml
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: janitor
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/containers/0/volumeMounts
+      - op: remove
+        path: /spec/template/spec/volumes
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: arion-uploader
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/containers/0/volumeMounts/0
+      - op: remove
+        path: /spec/template/spec/volumes/0
 
 images:
   - name: ghcr.io/thenervelab/hippius-s3/api
