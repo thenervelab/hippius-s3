@@ -8,7 +8,7 @@
 #
 # PIN THE IMAGE. `api:latest` is pushed by BOTH the staging and the production workflows, so it is
 # whichever environment built last. Replace it with the SHA production is actually running:
-#   kubectl -n hippius-s3-prod get deploy api -o jsonpath='{.spec.template.spec.containers[0].image}'
+#   kubectl -n hippius-s3-prod get ds api-local -o jsonpath='{.spec.template.spec.containers[0].image}'
 #
 # IMPORTANT: namespace below is hardcoded to production. Edit for staging.
 #

@@ -103,11 +103,15 @@ class BackendChunkFetcher:
             tried += 1
             for attempt in range(1, self._attempts + 1):
                 await self._acquire_slot()
+                data: bytes | None = None
+                retry = False
                 try:
                     data = await fetch_one(identifier, address)
                 except Exception as exc:  # noqa: BLE001 - every backend error is classified below
                     kind = classify_download_error(exc)
-                    if kind != "transient" or attempt == self._attempts:
+                    if kind == "transient" and attempt != self._attempts:
+                        retry = True
+                    else:
                         logger.warning(
                             "backend chunk fetch failed backend=%s id=%s attempt=%s/%s kind=%s: %s",
                             backend,
@@ -117,13 +121,15 @@ class BackendChunkFetcher:
                             kind,
                             exc,
                         )
-                        break
-                    await asyncio.sleep(self._base_sleep * (2 ** (attempt - 1)) + random.uniform(0, self._jitter))
-                    continue
                 finally:
                     self._semaphore.release()
-                _record_backend_read()
-                return data
+                if data is not None:
+                    _record_backend_read()
+                    return data
+                if retry:
+                    await asyncio.sleep(self._base_sleep * (2 ** (attempt - 1)) + random.uniform(0, self._jitter))
+                    continue
+                break
         raise ChunkUnavailableError(f"no backend served the chunk (locations tried: {tried})")
 
 

@@ -31,6 +31,19 @@ DECLARE
     total_versions bigint := 0;
     total_rows bigint := 0;
 BEGIN
+    SELECT count(*) INTO n
+    FROM chunk_backend cb
+    WHERE cb.backend = retired AND NOT cb.deleted
+      AND NOT EXISTS (
+          SELECT 1 FROM chunk_backend o
+          WHERE o.chunk_id = cb.chunk_id AND o.backend <> retired AND NOT o.deleted
+      );
+    IF n > 0 THEN
+        RAISE EXCEPTION
+            'refuse: % live chunk_backend rows for % have no other live backend; run scripts/pool_decommission_audit.sql first',
+            n, retired;
+    END IF;
+
     LOOP
         WITH picked AS (
             SELECT object_id, object_version

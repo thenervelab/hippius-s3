@@ -14,7 +14,6 @@ from hippius_s3.queue_metrics import build_queue_key_sets
 def _config(upload=None, download=None, delete=None):
     return SimpleNamespace(
         upload_backends=upload or ["arion", "ovh"],
-        download_backends=download or ["arion", "ovh"],
         delete_backends=delete or ["arion", "ovh"],
     )
 

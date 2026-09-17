@@ -27,7 +27,11 @@ spec:
     matchLabels:
       app: drain-agent
   updateStrategy:
-    type: RollingUpdate
+    # OnDelete for this cutover: RollingUpdate would replace a node before
+    # arion-uploader-local is Ready there. production-deploy.yaml deletes the
+    # pods after that gate. Revert to RollingUpdate once the fleet is on this
+    # image.
+    type: OnDelete
   template:
     metadata:
       labels:

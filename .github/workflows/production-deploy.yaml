@@ -330,11 +330,9 @@ jobs:
       - name: Deploy to production
         run: |
           kubectl apply -k k8s/production
-          # apply -k updates drain-agent's spec immediately; pause so the
-          # RollingUpdate does not hand parts to arion_upload_requests:<node>
-          # before arion-uploader-local is Ready on that node. Resume after
-          # the local uploader and allocator waits below.
-          kubectl rollout pause daemonset/drain-agent -n hippius-s3-prod || true
+          # drain-agent is OnDelete: apply stores the new spec but does not
+          # replace running pods. Pods are deleted only after arion-uploader-local
+          # and the allocator are Ready, below.
 
       - name: Wait for rollout
         run: |
@@ -421,8 +419,13 @@ jobs:
           # 15m: first apply of this image runs 0021 VALIDATE over ~11M
           # cephor_replication_status rows before the allocator becomes Ready.
           wait_deploy drain-allocator 15m
-          kubectl rollout resume daemonset/drain-agent -n "$ns" || true
           wait_deploy mpu-reaper 5m
+          # OnDelete: running drain-agent pods still have the old image until
+          # deleted. Do this only after the node-local uploader is Ready on
+          # every ingest node, or the new binary publishes to a queue nobody
+          # reads.
+          kubectl delete pods -l app=drain-agent -n "$ns"
+
           # drain-agent is a DaemonSet that MUST cover every node running api-local: a node with
           # api-local but no drain-agent silently drops that node's uploads (never drained) — peer
           # review B3. A partial roll is therefore a FAILURE, not a warning. The s3-ingest-priority

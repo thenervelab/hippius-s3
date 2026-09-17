@@ -605,18 +605,28 @@ impl Store {
     ///
     /// [`StoreError::Database`].
     pub async fn redrive_corrupt_parts(&self, max_attempts: i32) -> Result<u64> {
-        let affected = sqlx::query(
-            "UPDATE cephor_replication_status \
-             SET status = 'pending', corrupt_attempts = corrupt_attempts + 1, \
-                 claimed_at = NULL, deferred_until = NULL, updated_at = now() \
-             WHERE node_id = $1 AND status = 'corrupt' AND corrupt_attempts < $2",
+        let (affected,): (i64,) = sqlx::query_as(
+            "WITH redriven AS ( \
+                 UPDATE cephor_replication_status \
+                 SET status = 'pending', corrupt_attempts = corrupt_attempts + 1, \
+                     claimed_at = NULL, deferred_until = NULL, updated_at = now() \
+                 WHERE node_id = $1 AND status = 'corrupt' AND corrupt_attempts < $2 \
+                 RETURNING object_id, version, part_number \
+             ), retired AS ( \
+                 UPDATE chunk_backend cb SET deleted = true, deleted_at = now() \
+                 FROM part_chunks pc \
+                 JOIN parts p ON p.part_id = pc.part_id \
+                 JOIN redriven r ON p.object_id = r.object_id::uuid \
+                                AND p.object_version = r.version AND p.part_number = r.part_number \
+                 WHERE cb.chunk_id = pc.id AND NOT cb.deleted \
+             ) \
+             SELECT count(*)::bigint FROM redriven",
         )
         .bind(self.node_id.as_deref())
         .bind(max_attempts)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(affected)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(u64::try_from(affected).unwrap_or(0))
     }
 
     /// The count of this node's parts currently held in `corrupt` (the `drain_corrupt_parts`
@@ -2859,7 +2869,7 @@ mod part_tests {
         // B-2 window where an eviction destroys the client's new bytes.
         create_app_schema(&pool).await;
         let store = Store::from_pool(pool.clone()).with_node_id("node-a");
-        let statuses = ["pending", "draining", "replicated", "failed", "corrupt"];
+        let statuses = ["pending", "draining", "uploading", "replicated", "failed", "corrupt"];
         // 0 = never re-landed, 1 = re-landed now (in grace), 2 = re-landed 11 min ago (lapsed).
         let relands = [0i32, 1, 2];
         let mut expected = Vec::new();
