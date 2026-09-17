@@ -605,28 +605,18 @@ impl Store {
     ///
     /// [`StoreError::Database`].
     pub async fn redrive_corrupt_parts(&self, max_attempts: i32) -> Result<u64> {
-        let (affected,): (i64,) = sqlx::query_as(
-            "WITH redriven AS ( \
-                 UPDATE cephor_replication_status \
-                 SET status = 'pending', corrupt_attempts = corrupt_attempts + 1, \
-                     claimed_at = NULL, deferred_until = NULL, updated_at = now() \
-                 WHERE node_id = $1 AND status = 'corrupt' AND corrupt_attempts < $2 \
-                 RETURNING object_id, version, part_number \
-             ), retired AS ( \
-                 UPDATE chunk_backend cb SET deleted = true, deleted_at = now() \
-                 FROM part_chunks pc \
-                 JOIN parts p ON p.part_id = pc.part_id \
-                 JOIN redriven r ON p.object_id = r.object_id::uuid \
-                                AND p.object_version = r.version AND p.part_number = r.part_number \
-                 WHERE cb.chunk_id = pc.id AND NOT cb.deleted \
-             ) \
-             SELECT count(*)::bigint FROM redriven",
+        let affected = sqlx::query(
+            "UPDATE cephor_replication_status \
+             SET status = 'pending', corrupt_attempts = corrupt_attempts + 1, \
+                 claimed_at = NULL, deferred_until = NULL, updated_at = now() \
+             WHERE node_id = $1 AND status = 'corrupt' AND corrupt_attempts < $2",
         )
         .bind(self.node_id.as_deref())
         .bind(max_attempts)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(u64::try_from(affected).unwrap_or(0))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected)
     }
 
     /// The count of this node's parts currently held in `corrupt` (the `drain_corrupt_parts`
