@@ -1,0 +1,10 @@
+# Global pool-era uploader is off on staging (node-local uploader DaemonSet remains).
+# Cache volume is removed by a JSON patch in kustomization.yaml — CI's kustomize
+# (kyaml 0.17) panics on `$patch: delete` of list items.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arion-uploader
+spec:
+  replicas: 0
+

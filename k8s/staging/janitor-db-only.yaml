@@ -1,0 +1,19 @@
+# Slice 2: janitor keeps DB GC (hard-delete, version reap, sentinel, A21, queue
+# gauges) and drops the shared cache mount. Without the flag the process would
+# walk the container overlay and publish that disk as fs_cache:pressure.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: janitor
+spec:
+  template:
+    spec:
+      containers:
+        - name: janitor
+          env:
+            - name: HIPPIUS_JANITOR_FS_GC_ENABLED
+              value: "false"
+            - name: HIPPIUS_JANITOR_CEPH_MGR_METRICS_URL
+              value: ""
+            - name: HIPPIUS_JANITOR_CEPH_POOLS
+              value: ""

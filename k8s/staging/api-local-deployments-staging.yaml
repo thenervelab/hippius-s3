@@ -1,9 +1,8 @@
 # Trial (s3-2.0 prototype): the entire staging api fleet on node-local SSD.
 #
-# A single `api-local` DaemonSet — exactly one pod per ingest node. The base (ceph) `api` deployment
-# is scaled to 0 in resource-limits.yaml, so ALL api pods run on local SSD. Each
-# pod writes to its node's local dir and read-falls-back to the shared CephFS
-# cache. All workers stay on ceph, untouched.
+# A single `api-local` DaemonSet — exactly one pod per ingest node. ALL api pods
+# run on local SSD. Writes land on the node; cold reads come from Arion; hot
+# reads are local / peer. No shared cache mount.
 #
 # Volume: a `hostPath` with `type: DirectoryOrCreate` — the kubelet creates the
 # node path on whatever node the pod lands on (NO manual node prep, so this deploys
@@ -27,9 +26,8 @@
 #
 # Routing: the `api` and `gateway` Services (k8s/base/services.yaml) select `app: api-local`.
 #
-# IMPORTANT: with no ceph api pods, every upload stages locally and stays
-# `pending` until the replicator copies local->ceph. Install + test the replicator
-# when ready. See README-local-ingest-trial.md.
+# Uploads stage on the node SSD; the drain-agent is the sole upload producer
+# (SSD → Arion). See README-local-ingest-trial.md.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -152,7 +150,7 @@ spec:
                 fieldRef:
                   fieldPath: status.hostIP
             # Read a chunk from the peer node holding it on flash (~6 ms + ~1 ms network)
-            # before falling through to the CephFS pool (~40 ms). Staging only.
+            # before falling through to Arion. Staging only.
             - name: HIPPIUS_PEER_FETCH_ENABLED
               value: "true"
             # The other half of the tier: without this the route is not mounted, every peer
@@ -175,7 +173,7 @@ spec:
             #
             # The client cap must be >= HTTP_STREAM_PREFETCH_CHUNKS (16). Every chunk of one
             # PART resolves to the same peer, so at the previous value of 8 a single reader
-            # shed half its own prefetch window to CephFS while the peer sat idle — and booked
+            # shed half its own prefetch window to the remote backend while the peer sat idle — and booked
             # it as `client_cap`, which reads as contention on the dashboard. The api floors
             # this at the prefetch depth anyway (effective_max_inflight); set correctly here
             # so the manifest states the intent rather than relying on the correction.
@@ -191,18 +189,9 @@ spec:
               value: "deployment.environment=$(ENVIRONMENT),service.namespace=$(K8S_NAMESPACE),service.instance.id=$(POD_NAME)"
             - name: HIPPIUS_OBJECT_CACHE_DIR
               value: /var/lib/hippius/local_object_cache
-            - name: HIPPIUS_OBJECT_CACHE_FALLBACK_DIR
-              value: /var/lib/hippius/object_cache
           volumeMounts:
             - name: local-ingest
               mountPath: /var/lib/hippius/local_object_cache
-            - name: object-cache
-              mountPath: /var/lib/hippius/object_cache
-              readOnly: true
-            - name: persist
-              mountPath: /var/lib/hippius/persist
-            - name: dlq
-              mountPath: /tmp/hippius_dlq
             - name: kms-certs
               mountPath: /kms_certs
               readOnly: true
@@ -249,15 +238,6 @@ spec:
           hostPath:
             path: /var/lib/hippius/local_ingest_staging
             type: DirectoryOrCreate
-        - name: object-cache
-          persistentVolumeClaim:
-            claimName: object-cache-pvc
-        - name: persist
-          persistentVolumeClaim:
-            claimName: persist-pvc
-        - name: dlq
-          persistentVolumeClaim:
-            claimName: dlq-pvc
         - name: kms-certs
           secret:
             secretName: ovh-kms-certs
