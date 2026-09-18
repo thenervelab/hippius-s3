@@ -228,8 +228,33 @@ async def test_the_factory_keeps_peer_fetch_when_there_is_no_pool_dir(tmp_path) 
     store = create_fs_store(_Config(), peer_fetch=_peer)
     assert isinstance(store, DualFileSystemPartsStore)
     assert store.fallback is None
+    assert store._promote is False, "no pool meta to copy; promotion stays off"
     assert await store.get_chunk(OBJ, 1, 1, 0) == b"from-peer"
     assert calls == [(OBJ, 1, 1, 0)]
+
+
+def test_the_factory_stays_single_tier_without_a_peer_or_pool(tmp_path) -> None:
+    from hippius_s3.cache import create_fs_store
+
+    class _Config:
+        object_cache_dir = str(tmp_path / "ssd")
+        object_cache_fallback_dir = ""
+
+    store = create_fs_store(_Config())
+    assert type(store) is FileSystemPartsStore
+
+
+@pytest.mark.asyncio
+async def test_a_failing_peer_without_a_pool_returns_none_not_an_error(tmp_path) -> None:
+    """Peer is still best-effort. Without a pool there is nothing to fall through to,
+    but a dead peer must not raise into the streamer (that would 500 instead of 503).
+    """
+
+    async def _peer(*args: object) -> bytes | None:
+        raise OSError("connection refused")
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), None, peer_fetch=_peer)
+    assert await dual.get_chunk(OBJ, 1, 1, 0) is None
 
 
 @pytest.mark.asyncio
