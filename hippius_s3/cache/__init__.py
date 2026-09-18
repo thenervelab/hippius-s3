@@ -20,7 +20,7 @@ def create_fs_store(
     on_local_read: LocalReadRecorder | None = None,
     published_floor: PublishedFloorSource | None = None,
 ) -> FileSystemPartsStore:
-    """Build the parts store: dual-tier when a fallback pool is configured, else single.
+    """Build the parts store: dual-tier when a fallback pool or a peer fetcher is configured.
 
     `on_promote` records a promoted chunk's residency so the local evictor owns the copy.
     Promotion stays off unless BOTH the flag is set and a recorder is supplied — an
@@ -35,10 +35,18 @@ def create_fs_store(
     Optional on purpose: `None` (every caller but the api — the workers do not promote) leaves
     the gate on `promote_min_free_ratio`, which is exactly the pre-publish behaviour.
     """
-    fallback_dir = getattr(config, "object_cache_fallback_dir", "")
+    fallback_dir = getattr(config, "object_cache_fallback_dir", "") or ""
     cache_dir = getattr(config, "object_cache_dir", "")
-    if fallback_dir:
-        promote = bool(getattr(config, "object_cache_promote_on_read", False)) and on_promote is not None
+    # Peer fetch lives on DualFileSystemPartsStore. After the shared-cache unmount there is
+    # no fallback dir, but cross-node GET of an in-flight (`uploading`) part still has to
+    # ask the ingest node — dropping peer_fetch here is what turned those reads into 10s
+    # SlowDown once the pool was gone.
+    if fallback_dir or peer_fetch is not None:
+        promote = (
+            bool(fallback_dir)
+            and bool(getattr(config, "object_cache_promote_on_read", False))
+            and on_promote is not None
+        )
         space_gate = None
         if promote:
             floor = float(getattr(config, "promote_min_free_ratio", 0.175))
@@ -56,7 +64,7 @@ def create_fs_store(
             space_gate = FreeSpaceGate(cache_dir, floor, floor_source=published_floor)
         return DualFileSystemPartsStore(
             cache_dir,
-            fallback_dir,
+            fallback_dir or None,
             promote=promote,
             on_promote=on_promote,
             on_promote_release=on_promote_release,

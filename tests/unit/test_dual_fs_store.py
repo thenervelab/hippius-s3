@@ -204,6 +204,68 @@ async def test_a_local_hit_never_asks_a_peer(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_factory_keeps_peer_fetch_when_there_is_no_pool_dir(tmp_path) -> None:
+    """Unmounting the shared cache must not drop the peer tier.
+
+    `create_fs_store` used to return a bare FileSystemPartsStore whenever
+    HIPPIUS_OBJECT_CACHE_FALLBACK_DIR was empty, discarding the PeerChunkFetcher
+    that already knows how to resolve `uploading` parts. Cross-node GET then
+    waited 10s on empty local disk and 503'd.
+    """
+    from hippius_s3.cache import create_fs_store
+
+    calls: list[tuple[str, int, int, int]] = []
+
+    async def _peer(object_id: str, version: int, part_number: int, chunk_index: int) -> bytes | None:
+        calls.append((object_id, version, part_number, chunk_index))
+        return b"from-peer"
+
+    class _Config:
+        object_cache_dir = str(tmp_path / "ssd")
+        object_cache_fallback_dir = ""
+        object_cache_promote_on_read = True
+
+    store = create_fs_store(_Config(), peer_fetch=_peer)
+    assert isinstance(store, DualFileSystemPartsStore)
+    assert store.fallback is None
+    assert store._promote is False, "no pool meta to copy; promotion stays off"
+    assert await store.get_chunk(OBJ, 1, 1, 0) == b"from-peer"
+    assert calls == [(OBJ, 1, 1, 0)]
+
+
+def test_the_factory_stays_single_tier_without_a_peer_or_pool(tmp_path) -> None:
+    from hippius_s3.cache import create_fs_store
+
+    class _Config:
+        object_cache_dir = str(tmp_path / "ssd")
+        object_cache_fallback_dir = ""
+
+    store = create_fs_store(_Config())
+    assert type(store) is FileSystemPartsStore
+
+
+@pytest.mark.asyncio
+async def test_a_failing_peer_without_a_pool_returns_none_not_an_error(tmp_path) -> None:
+    """Peer is still best-effort. Without a pool there is nothing to fall through to,
+    but a dead peer must not raise into the streamer (that would 500 instead of 503).
+    """
+
+    async def _peer(*args: object) -> bytes | None:
+        raise OSError("connection refused")
+
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), None, peer_fetch=_peer)
+    assert await dual.get_chunk(OBJ, 1, 1, 0) is None
+
+
+@pytest.mark.asyncio
+async def test_a_pool_less_store_does_not_invent_a_fallback_hit(tmp_path) -> None:
+    dual = DualFileSystemPartsStore(str(tmp_path / "ssd"), None)
+    assert dual.fallback is None
+    assert await dual.get_chunk(OBJ, 1, 1, 0) is None
+    assert await dual.chunks_exist_batch(OBJ, 1, [(1, 0)]) == [False]
+
+
+@pytest.mark.asyncio
 async def test_a_failing_peer_falls_through_to_the_pool(tmp_path) -> None:
     """A peer is an optimisation. If it is down, slow, or lying, the pool still serves.
 

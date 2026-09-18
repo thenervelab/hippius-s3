@@ -131,3 +131,21 @@ def test_production_api_local_does_not_mount_cephfs_claims() -> None:
     docs = load_docs("k8s/production/api-local-deployments-production.yaml")
     env = {e["name"]: e.get("value") for e in pod_spec(docs[0])["containers"][0].get("env") or []}
     assert "HIPPIUS_OBJECT_CACHE_FALLBACK_DIR" not in env
+
+
+def _assert_api_local_peer_fetch_is_on_without_a_pool(path: str) -> None:
+    docs = load_docs(path)
+    env = {e["name"]: e.get("value") for e in pod_spec(docs[0])["containers"][0].get("env") or []}
+    assert env.get("HIPPIUS_PEER_FETCH_ENABLED") == "true"
+    assert env.get("HIPPIUS_PEER_SERVE_ENABLED") == "true"
+    assert "HIPPIUS_OBJECT_CACHE_FALLBACK_DIR" not in env, (
+        "a pool fallback on api-local hides a missing peer_fetch; production has no pool"
+    )
+
+
+def test_staging_api_local_peer_fetches_without_a_pool() -> None:
+    _assert_api_local_peer_fetch_is_on_without_a_pool("k8s/staging/api-local-deployments-staging.yaml")
+
+
+def test_production_api_local_peer_fetches_without_a_pool() -> None:
+    _assert_api_local_peer_fetch_is_on_without_a_pool("k8s/production/api-local-deployments-production.yaml")
