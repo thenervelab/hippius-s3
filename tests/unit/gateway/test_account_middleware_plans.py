@@ -22,6 +22,8 @@ from httpx import ASGITransport
 from httpx import AsyncClient
 
 from hippius_s3.models.account import HippiusAccount
+from hippius_s3.services.plans_cache import PLAN_ACCOUNTS_KEY
+from hippius_s3.services.plans_cache import PLAN_INACTIVE_KEY
 from tests.unit.mocks.mock_arion_service import MockArionService
 
 
@@ -46,16 +48,25 @@ def plan_config() -> Any:
 class PlanRedis:
     """redis-accounts stand-in serving the plan hash plus the usage/can_upload string keys."""
 
-    def __init__(self, plan_id: str | None, storage_bytes: int | None, used: int | None) -> None:
+    def __init__(
+        self,
+        plan_id: str | None,
+        storage_bytes: int | None,
+        used: int | None,
+        inactive: dict[str, Any] | None = None,
+    ) -> None:
         self._plan_id = plan_id
         self._storage_bytes = storage_bytes
         self._used = used or 0
+        self._inactive = inactive
 
     async def hget(self, key: str, field: str) -> bytes | None:
-        if key == "hippius_s3_plan_accounts" and self._plan_id:
+        if key == PLAN_ACCOUNTS_KEY and self._plan_id:
             return json.dumps(
                 {"plan": self._plan_id, "storage_limit_bytes": self._storage_bytes, "used_bytes": self._used}
             ).encode()
+        if key == PLAN_INACTIVE_KEY and self._inactive is not None and field == ACCOUNT:
+            return json.dumps(self._inactive).encode()
         return None
 
     async def get(self, key: str) -> bytes | None:
@@ -73,6 +84,8 @@ def build_app(
     storage_bytes: int | None = None,
     used: int | None = 0,
     has_credits: bool = True,
+    inactive: dict[str, Any] | None = None,
+    allow_upload: bool = True,
 ) -> tuple[FastAPI, MockArionService]:
     from hippius_s3.gateway.middlewares import account as account_module
     from hippius_s3.gateway.middlewares.account import account_middleware
@@ -84,10 +97,10 @@ def build_app(
 
     monkeypatch.setattr(account_module, "fetch_account_by_main_address", fake_fetch)
 
-    mock_arion = MockArionService(allow_upload=True)
+    mock_arion = MockArionService(allow_upload=allow_upload)
 
     app = FastAPI()
-    app.state.redis_accounts_client = PlanRedis(plan_id, storage_bytes, used)
+    app.state.redis_accounts_client = PlanRedis(plan_id, storage_bytes, used, inactive=inactive)
     app.state.arion_client = mock_arion
 
     @app.api_route("/test-bucket/test-key", methods=["GET", "PUT", "POST", "DELETE", "HEAD"])
@@ -448,6 +461,314 @@ async def test_a_plain_object_write_is_still_gated_when_over_quota(plan_config: 
     app, _ = build_app(plan_config, monkeypatch, plan_id="pro", storage_bytes=1 * GB, used=500 * GB)
 
     assert (await put(app)).status_code == 402
+
+
+@pytest.mark.asyncio
+async def test_an_expired_plan_with_credits_falls_through_to_payg(plan_config: Any, monkeypatch: Any) -> None:
+    app, arion = build_app(
+        plan_config,
+        monkeypatch,
+        plan_id=None,
+        has_credits=True,
+        inactive={"reason": "expired_plan", "plan": "pro"},
+    )
+
+    response = await put(app)
+
+    assert response.status_code == 200
+    assert response.json()["plan_id"] is None
+    assert len(arion.can_upload_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_expired_plan_without_credits_is_refused_as_plan_expired(plan_config: Any, monkeypatch: Any) -> None:
+    app, arion = build_app(
+        plan_config,
+        monkeypatch,
+        plan_id=None,
+        has_credits=False,
+        inactive={"reason": "expired_plan", "plan": "pro"},
+    )
+
+    response = await put(app)
+
+    assert response.status_code == 402
+    body = response.content.decode()
+    assert "PlanExpired" in body
+    assert "no longer active" in body
+    assert len(arion.can_upload_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_an_inactive_payg_account_is_refused_even_with_credits(plan_config: Any, monkeypatch: Any) -> None:
+    app, arion = build_app(
+        plan_config,
+        monkeypatch,
+        plan_id=None,
+        has_credits=True,
+        inactive={"reason": "payg_inactive"},
+    )
+
+    response = await put(app)
+
+    assert response.status_code == 402
+    body = response.content.decode()
+    assert "AccountInactive" in body
+    assert "not currently active" in body
+    assert len(arion.can_upload_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_inactive_payg_is_not_enforced_while_the_master_switch_is_off(plan_config: Any, monkeypatch: Any) -> None:
+    plan_config.enable_billing_plans = False
+    app, arion = build_app(
+        plan_config,
+        monkeypatch,
+        plan_id=None,
+        has_credits=True,
+        inactive={"reason": "payg_inactive"},
+    )
+
+    assert (await put(app)).status_code == 200
+    assert len(arion.can_upload_calls) == 1
+
+
+# --------------------------------------------------------------------------------------------
+# Exhaustive waterfall: plan × PAYG × active. Plan always wins when it is active. If the plan
+# is inactive we try PAYG. If PAYG is also inactive (no credits, can_upload deny, or the PAYG
+# account itself is marked inactive) the write is refused.
+# --------------------------------------------------------------------------------------------
+
+
+def _case(
+    *,
+    case_id: str,
+    plan_id: str | None = None,
+    used: int = 0,
+    limit: int | None = 10 * GB,
+    inactive: dict[str, Any] | None = None,
+    has_credits: bool = True,
+    allow_upload: bool = True,
+    status: int = 200,
+    error: str | None = None,
+    payg_calls: int = 0,
+    json_plan: str | None = None,
+) -> Any:
+    return pytest.param(
+        plan_id,
+        used,
+        limit,
+        inactive,
+        has_credits,
+        allow_upload,
+        status,
+        error,
+        payg_calls,
+        json_plan,
+        id=case_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "plan_id",
+        "used",
+        "limit",
+        "inactive",
+        "has_credits",
+        "allow_upload",
+        "status",
+        "error",
+        "payg_calls",
+        "json_plan",
+    ),
+    [
+        # Active plan of every catalog type: quota path, PAYG never consulted — even with no
+        # credits, even if can_upload would deny, even if the inactive hash also has them.
+        _case(case_id="active-pro-with-credits", plan_id="pro", used=1 * GB, json_plan="pro"),
+        _case(case_id="active-business-with-credits", plan_id="business", used=1 * GB, json_plan="business"),
+        _case(case_id="active-enterprise-with-credits", plan_id="enterprise", used=1 * GB, json_plan="enterprise"),
+        _case(
+            case_id="active-pro-without-credits-still-plan",
+            plan_id="pro",
+            used=1 * GB,
+            has_credits=False,
+            json_plan="pro",
+        ),
+        _case(
+            case_id="active-pro-can-upload-would-deny-still-plan",
+            plan_id="pro",
+            used=1 * GB,
+            allow_upload=False,
+            json_plan="pro",
+        ),
+        _case(
+            case_id="active-pro-wins-over-payg-inactive-hash",
+            plan_id="pro",
+            used=1 * GB,
+            inactive={"reason": "payg_inactive"},
+            json_plan="pro",
+        ),
+        _case(
+            case_id="active-business-wins-over-expired-hash",
+            plan_id="business",
+            used=1 * GB,
+            inactive={"reason": "expired_plan", "plan": "business"},
+            json_plan="business",
+        ),
+        # Over quota: still the plan, never a PAYG fallback, even with credits.
+        _case(
+            case_id="over-quota-pro-with-credits-still-quota",
+            plan_id="pro",
+            used=500 * GB,
+            limit=1 * GB,
+            status=402,
+            error="QuotaExceeded",
+        ),
+        _case(
+            case_id="over-quota-business-with-credits-still-quota",
+            plan_id="business",
+            used=500 * GB,
+            limit=1 * GB,
+            status=402,
+            error="QuotaExceeded",
+        ),
+        _case(
+            case_id="over-quota-enterprise-with-credits-still-quota",
+            plan_id="enterprise",
+            used=500 * GB,
+            limit=1 * GB,
+            status=402,
+            error="QuotaExceeded",
+        ),
+        _case(
+            case_id="over-quota-pro-without-credits-still-quota-not-payg",
+            plan_id="pro",
+            used=500 * GB,
+            limit=1 * GB,
+            has_credits=False,
+            status=402,
+            error="QuotaExceeded",
+        ),
+        # Expired plan of every catalog type: try PAYG.
+        _case(
+            case_id="expired-pro-with-credits-uses-payg",
+            inactive={"reason": "expired_plan", "plan": "pro"},
+            payg_calls=1,
+        ),
+        _case(
+            case_id="expired-business-with-credits-uses-payg",
+            inactive={"reason": "expired_plan", "plan": "business"},
+            payg_calls=1,
+        ),
+        _case(
+            case_id="expired-enterprise-with-credits-uses-payg",
+            inactive={"reason": "expired_plan", "plan": "enterprise"},
+            payg_calls=1,
+        ),
+        # Both inactive: expired plan AND PAYG refused (no credits, or can_upload deny).
+        _case(
+            case_id="expired-pro-no-credits-both-inactive",
+            inactive={"reason": "expired_plan", "plan": "pro"},
+            has_credits=False,
+            status=402,
+            error="PlanExpired",
+        ),
+        _case(
+            case_id="expired-business-no-credits-both-inactive",
+            inactive={"reason": "expired_plan", "plan": "business"},
+            has_credits=False,
+            status=402,
+            error="PlanExpired",
+        ),
+        _case(
+            case_id="expired-enterprise-no-credits-both-inactive",
+            inactive={"reason": "expired_plan", "plan": "enterprise"},
+            has_credits=False,
+            status=402,
+            error="PlanExpired",
+        ),
+        _case(
+            case_id="expired-pro-can-upload-denied-both-inactive",
+            inactive={"reason": "expired_plan", "plan": "pro"},
+            allow_upload=False,
+            status=402,
+            error="PlanExpired",
+            payg_calls=1,
+        ),
+        # PAYG marked inactive: reject without trying credits, even if they have them.
+        _case(
+            case_id="payg-inactive-with-credits-rejected",
+            inactive={"reason": "payg_inactive"},
+            status=402,
+            error="AccountInactive",
+        ),
+        _case(
+            case_id="payg-inactive-without-credits-rejected",
+            inactive={"reason": "payg_inactive"},
+            has_credits=False,
+            status=402,
+            error="AccountInactive",
+        ),
+        _case(
+            case_id="payg-inactive-can-upload-would-deny-still-account-inactive",
+            inactive={"reason": "payg_inactive"},
+            allow_upload=False,
+            status=402,
+            error="AccountInactive",
+        ),
+        # Ordinary PAYG (no plan row at all).
+        _case(case_id="payg-active-with-credits", payg_calls=1),
+        _case(
+            case_id="payg-active-without-credits",
+            has_credits=False,
+            status=402,
+            error="InsufficientAccountCredit",
+        ),
+        _case(
+            case_id="payg-active-can-upload-denied",
+            allow_upload=False,
+            status=402,
+            error="UploadNotPermitted",
+            payg_calls=1,
+        ),
+    ],
+)
+async def test_plan_beats_payg_and_both_inactive_is_rejected(
+    plan_config: Any,
+    monkeypatch: Any,
+    plan_id: str | None,
+    used: int,
+    limit: int | None,
+    inactive: dict[str, Any] | None,
+    has_credits: bool,
+    allow_upload: bool,
+    status: int,
+    error: str | None,
+    payg_calls: int,
+    json_plan: str | None,
+) -> None:
+    app, arion = build_app(
+        plan_config,
+        monkeypatch,
+        plan_id=plan_id,
+        storage_bytes=limit if plan_id else None,
+        used=used,
+        has_credits=has_credits,
+        inactive=inactive,
+        allow_upload=allow_upload,
+    )
+
+    response = await put(app)
+
+    assert response.status_code == status
+    body = response.content.decode()
+    if error:
+        assert error in body
+    else:
+        assert response.json()["plan_id"] == json_plan
+    assert len(arion.can_upload_calls) == payg_calls
 
 
 # --------------------------------------------------------------------------------------------

@@ -261,43 +261,13 @@ sub-millisecond we could now afford a live read on every request, which would al
    is read by nobody. There is no path that revives a soft-deleted bucket today. If one is ever
    added it must recompute the bucket on the way through.
 
-### P1 — Billing plans: `active` is ignored because upstream returns it false on every row
+### DONE — Billing plans: `active` is consulted again
 
-`_is_enforceable_plan_row` ([workers/run_plans_cacher_in_loop.py](workers/run_plans_cacher_in_loop.py))
-admits a row on `billing == "plan"` plus a plan name, and does NOT consult `active`.
-
-It did originally, on the reading that a lapsed subscription is distinguished only by that flag. The
-live payload said otherwise: `active: false` on **every row** it serves, zero exceptions across the
-two days the endpoint has been up — including the sole real subscriber, whose row carried a real
-subscription id and a `next_charge` date in the FUTURE. A
-cancelled subscription has no future charge date, so the field is not carrying that meaning; it
-looks simply unpopulated. Requiring it admitted nobody, making the gate permanently inert and
-unobservable even in shadow mode.
-
-**Measured blast radius**: exactly ONE row in 3069 carries `billing == "plan"`.
-
-**Accepted risks**, both directions — admission is not purely generous:
-1. A cancelled subscriber keeps their allowance until the check is restored.
-2. Admission also **imposes a cap** and removes the PAYG path: an admitted account over its plan
-   size but holding substrate credits used to upload fine via `can_upload`, and with enforcement on
-   is refused 402 until it deletes data and a cycle re-counts.
-3. An admitted account with an unknown quota (plan absent from the catalog, or null/0/negative
-   `storage_bytes`) resolves to `catalog_miss` → allowed **and** skips `has_credits` + `can_upload`.
-   Unmetered storage, not merely an unenforced quota. Alert on
-   `plan_gate_total{outcome="catalog_miss"}` before the prod flag flips.
-
-None of the three is reachable while `HIPPIUS_ENABLE_BILLING_PLANS` is off (how prod ships). Staging
-has it ON.
-
-**Rolling back needs `DEL hippius_s3_plan_accounts` first** — restoring the check yields an empty
-roll over a live hash, the shrink guard refuses it, and the old roll keeps serving with frozen
-`used_bytes`. Pinned by `test_restoring_the_active_check_is_wedged_by_the_shrink_guard`.
-
-**To close**: confirm with the api team what `active` means and whether it is written. Then either
-restore the check, or switch the liveness signal to `next_charge` being in the future — the field
-that actually tracked reality here. Invert
-`tests/unit/test_plans_cacher_worker.py::test_the_active_flag_is_not_consulted`. The trigger will
-announce itself: every cycle logs `upstream_active=N` over the whole payload.
+Verified 2026-09-18 against live api.hippius.com: every `billing=plan` row is `active=true` with a
+future `next_charge` (3 of 3119 rows). `_is_enforceable_plan_row` again requires `active`. Expired
+plans fall through to PAYG; inactive PAYG is a 402 `AccountInactive`; expired plan + PAYG failure is
+a 402 `PlanExpired`. The shrink guard accounts for `expired_plan` rows so a real cancellation
+publishes rather than wedging the old allowance.
 
 ### P1 — Billing plans: the quota gate keys on the CALLER, but storage is owner-pays
 

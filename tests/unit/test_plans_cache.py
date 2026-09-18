@@ -12,6 +12,7 @@ import pytest
 from hippius_s3.services import plans_cache
 from hippius_s3.services.plans_cache import PLAN_ACCOUNTS_KEY
 from hippius_s3.services.plans_cache import PLAN_CATALOG_KEY
+from hippius_s3.services.plans_cache import PLAN_INACTIVE_KEY
 from hippius_s3.services.plans_cache import PlanMapShrankTooMuch
 from hippius_s3.services.plans_cache import PlanQuota
 
@@ -25,6 +26,9 @@ class FakeRedis:
 
     async def hlen(self, key: str) -> int:
         return len(self.hashes.get(key, {}))
+
+    async def hkeys(self, key: str) -> list[str]:
+        return list(self.hashes.get(key, {}))
 
     async def hget(self, key: str, field: str) -> bytes | None:
         value = self.hashes.get(key, {}).get(field)
@@ -252,3 +256,44 @@ async def test_an_empty_roll_still_records_meta_so_staleness_can_alarm(redis: Fa
 
     meta = await plans_cache.get_meta(redis)
     assert meta["fetched_at"] > 0, "without this the age metric is never recorded"
+
+
+@pytest.mark.asyncio
+async def test_expired_live_accounts_are_not_a_shrink(redis: FakeRedis) -> None:
+    """A real cancellation must drop the quota, not wedge the cacher on the old allowance."""
+    await publish_accounts(redis, {f"acct-{i}": acct("pro") for i in range(3)})
+
+    await plans_cache.publish_plan_roll(
+        redis,
+        {},
+        {},
+        inactive={f"acct-{i}": {"reason": "expired_plan", "plan": "pro"} for i in range(3)},
+    )
+
+    assert await plans_cache.get_plan_for_account(redis, "acct-0") is None
+    leftover = await plans_cache.get_inactive_billing(redis, "acct-0")
+    assert leftover is not None and leftover.reason == "expired_plan"
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_roll_is_still_refused_when_the_missing_are_not_expired(redis: FakeRedis) -> None:
+    await publish_accounts(redis, {f"acct-{i}": acct("pro") for i in range(10)})
+
+    with pytest.raises(PlanMapShrankTooMuch):
+        await plans_cache.publish_plan_roll(
+            redis,
+            {"acct-0": acct("pro")},
+            {},
+            inactive={"acct-1": {"reason": "expired_plan", "plan": "pro"}},
+        )
+
+    assert len(redis.hashes[PLAN_ACCOUNTS_KEY]) == 10
+
+
+@pytest.mark.asyncio
+async def test_inactive_payg_is_published_and_readable(redis: FakeRedis) -> None:
+    await plans_cache.publish_plan_roll(redis, {}, {}, inactive={"acct-x": {"reason": "payg_inactive"}})
+
+    row = await plans_cache.get_inactive_billing(redis, "acct-x")
+    assert row is not None and row.reason == "payg_inactive"
+    assert json.loads(redis.hashes[PLAN_INACTIVE_KEY]["acct-x"]) == {"reason": "payg_inactive"}

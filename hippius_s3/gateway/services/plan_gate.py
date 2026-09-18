@@ -102,6 +102,16 @@ def format_bytes(value: int) -> str:
     return f"{value} bytes"
 
 
+def plan_expired_message() -> str:
+    """402 body when the plan lapsed and pay-as-you-go also refused the write."""
+    return "Your storage plan is no longer active. Add credits to continue on pay-as-you-go, or renew your plan."
+
+
+def account_inactive_message() -> str:
+    """402 body when upstream marked a pay-as-you-go account inactive."""
+    return "This account is not currently active."
+
+
 def quota_exceeded_message(decision: PlanDecision) -> str:
     """The 402 body. Clients surface the S3 <Message> verbatim, so this is the entire UX.
 

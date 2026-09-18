@@ -158,14 +158,14 @@ class S3PlanAccountRow(BaseModel):
     # "plan" | "pay_as_you_go". Anything that is not exactly "plan" is treated as pay-as-you-go.
     billing: str | None = None
     plan: str | None = None
-    # Carried for observability only -- NOT consulted when deciding whether a plan is in force.
-    # Upstream returns false on every row today, including a live subscription with a future
-    # next_charge, so it does not currently mean "lapsed". See _is_enforceable_plan_row.
+    # Liveness bit. Required true (with billing="plan" and a plan name) to admit a quota; an
+    # expired plan keeps billing="plan" and is distinguished by active=false. Explicit false on a
+    # pay_as_you_go row is a hard reject. See _is_enforceable_plan_row / _inactive_entry.
     #
     # NULLABLE ON PURPOSE. `bool = False` rejects an explicit null, and model_validate runs on the
     # WHOLE page -- so one `"active": null` row would fail the page, abort the scrape and freeze the
-    # roll at last-known-good. This field is the one we expect upstream to start populating, which
-    # makes null its most likely next state, and nothing reads it any more.
+    # roll at last-known-good. Null on a plan row denies the quota (falls through to PAYG); null on
+    # a PAYG row is NOT treated as inactive, so an omitted field cannot 402 ordinary PAYG accounts.
     active: bool | None = None
     # The account's OWN allowance, which may differ from the catalog's for a bespoke deal. Preferred
     # over the catalog value when present.
