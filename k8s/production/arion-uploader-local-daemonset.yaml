@@ -195,11 +195,10 @@ spec:
                 secretKeyRef:
                   name: hippius-s3-secrets
                   key: FRONTEND_HMAC_SECRET
-            - name: HIPPIUS_UPLOADER_MAX_INFLIGHT
-              valueFrom:
-                secretKeyRef:
-                  name: hippius-s3-secrets
-                  key: HIPPIUS_UPLOADER_MAX_INFLIGHT
+            # HIPPIUS_UPLOADER_MAX_INFLIGHT / HIPPIUS_ARION_UPLOAD_CONCURRENCY /
+            # HIPPIUS_UPLOADER_DB_POOL_MAX come from hippius-s3-defaults (envFrom).
+            # Do not re-add a secretKeyRef for inflight: the live secret is still "8"
+            # and would pin the pod back under the 1-chunk queue.
           volumeMounts:
             - name: local-ingest
               mountPath: /var/lib/hippius/local_object_cache
@@ -232,7 +231,7 @@ spec:
               cpu: 500m
               memory: 1Gi
             limits:
-              cpu: 2000m
+              cpu: 4000m
               memory: 4Gi
       volumes:
         - name: local-ingest
