@@ -85,9 +85,8 @@ SAMPLE_PAGE = {
             "next_charge": "2026-10-01",
             "subscription_id": 4412,
         },
-        # Shaped after the FIRST REAL payload: a live subscription (a real subscription id, and a
-        # next_charge in the future) that upstream nonetheless reports as active=false. That
-        # combination is why the flag is not consulted. Every id, size and date here is a fixture.
+        # Expired subscription: billing stays "plan" with the old plan name, distinguished by
+        # active=false. Must NOT get a quota; the request path falls through to PAYG.
         {
             "ss58": ACCT_INACTIVE_FLAG,
             "billing": "plan",
@@ -187,33 +186,33 @@ def page(**overrides: object) -> S3PlanAccountsResponse:
 
 
 def test_every_row_billed_as_a_plan_is_published() -> None:
-    accounts, catalog = pc._parse_page(page())
+    accounts, catalog, inactive = pc._parse_page(page())
 
-    assert set(accounts) == {ACCT_BUSINESS, ACCT_INACTIVE_FLAG}, "billing=plan is the whole test"
+    assert set(accounts) == {ACCT_BUSINESS}, "only an active plan is admitted to the quota map"
     assert accounts[ACCT_BUSINESS] == {"plan": "business", "storage_limit_bytes": 50 * TB}
     assert set(catalog) == {"pro", "business", "enterprise"}
+    assert inactive[ACCT_INACTIVE_FLAG] == {"reason": "expired_plan", "plan": "pro"}
 
 
-def test_the_active_flag_is_not_consulted() -> None:
-    """A subscriber reported as active=false STILL gets their allowance.
+def test_an_inactive_plan_row_falls_through_to_payg() -> None:
+    """A subscriber reported as active=false does NOT get a quota.
 
-    Upstream returns active=false on every row it serves, including a subscription with a real id
-    and a next_charge in the future. Requiring the flag admitted nobody at all, which made the gate
-    permanently inert -- a worse failure than the lapsed-subscriber case it was meant to prevent.
-
-    If upstream starts populating the field, this is the test to invert.
+    Expired plans keep billing="plan" and the old plan name; active is the liveness bit. They are
+    published on the inactive hash so the request path can try PAYG and refuse with PlanExpired
+    if that also fails.
     """
-    accounts, _ = pc._parse_page(page())
+    accounts, _, inactive = pc._parse_page(page())
 
-    assert ACCT_INACTIVE_FLAG in accounts
-    assert accounts[ACCT_INACTIVE_FLAG] == {"plan": "pro", "storage_limit_bytes": 10 * TB}
+    assert ACCT_INACTIVE_FLAG not in accounts
+    assert inactive[ACCT_INACTIVE_FLAG] == {"reason": "expired_plan", "plan": "pro"}
 
 
 def test_a_pay_as_you_go_row_is_absent_rather_than_encoded() -> None:
     """An absent field is exactly what the request path already reads as pay-as-you-go, so there is
     nothing to encode for them and nothing to keep in sync."""
-    accounts, _ = pc._parse_page(page())
+    accounts, _, inactive = pc._parse_page(page())
     assert ACCT_PAYG not in accounts
+    assert ACCT_PAYG not in inactive
 
 
 @pytest.mark.parametrize(
@@ -225,18 +224,16 @@ def test_a_pay_as_you_go_row_is_absent_rather_than_encoded() -> None:
     ],
 )
 def test_a_row_missing_any_requirement_gets_no_allowance(row: dict) -> None:
-    accounts, _ = pc._parse_page(page(results=[row]))
+    accounts, _, _ = pc._parse_page(page(results=[row]))
     assert accounts == {}
 
 
 @pytest.mark.asyncio
 async def test_the_cycle_logs_how_many_rows_upstream_marked_active(caplog: Any) -> None:
-    """The trigger condition for restoring the `active` check has to announce itself.
+    """A drop back to upstream_active=0 is the signal that the field has gone dark again.
 
-    Nothing reads the field any more, so this log line is the only thing that would tell us upstream
-    started populating it. Counted over EVERY row, not just plan rows — the question is whether the
-    field is written at all, and today the answer in production is zero across the whole payload.
-    SAMPLE_PAGE has two active=true rows (one plan, one pay-as-you-go).
+    Counted over EVERY row, not just plan rows. SAMPLE_PAGE has two active=true rows (one plan,
+    one pay-as-you-go).
     """
     redis = FakeRedis()
     api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
@@ -249,6 +246,8 @@ async def test_the_cycle_logs_how_many_rows_upstream_marked_active(caplog: Any) 
         assert await pc.run_cycle(redis, FakePool()) is True
 
     assert "upstream_active=2" in caplog.text
+    assert "expired_plan=1" in caplog.text
+    assert "payg_inactive=0" in caplog.text
 
 
 def test_a_null_active_does_not_fail_the_page() -> None:
@@ -258,28 +257,128 @@ def test_a_null_active_does_not_fail_the_page() -> None:
     This is the field we expect upstream to start populating, which makes null its likeliest next
     state, so the model must absorb it rather than crash the worker.
     """
-    accounts, _ = pc._parse_page(
+    accounts, _, inactive = pc._parse_page(
         page(results=[{"ss58": ACCT_BUSINESS, "billing": "plan", "plan": "pro", "active": None}])
     )
 
-    assert accounts[ACCT_BUSINESS] == {"plan": "pro", "storage_limit_bytes": 10 * TB}
+    assert ACCT_BUSINESS not in accounts
+    assert inactive[ACCT_BUSINESS] == {"reason": "expired_plan", "plan": "pro"}
     assert S3PlanAccountRow(ss58=ACCT_BUSINESS).active is None, "the default must stay nullable too"
 
 
-def test_an_omitted_active_field_still_gets_an_allowance() -> None:
-    """`active` defaults to False on the model, and that default must not deny a plan either.
+def test_an_omitted_active_field_does_not_get_an_allowance() -> None:
+    """An omitted flag is not active. The row falls through to PAYG rather than receiving a quota."""
+    accounts, _, inactive = pc._parse_page(page(results=[{"ss58": ACCT_BUSINESS, "billing": "plan", "plan": "pro"}]))
 
-    Sits apart from the parametrised cases above deliberately: it was one of them while the flag was
-    required, and moving it here is the behaviour change this test file exists to pin.
+    assert ACCT_BUSINESS not in accounts
+    assert inactive[ACCT_BUSINESS] == {"reason": "expired_plan", "plan": "pro"}
+
+
+def test_an_inactive_payg_row_is_published_as_inactive() -> None:
+    accounts, _, inactive = pc._parse_page(
+        page(results=[{"ss58": ACCT_PAYG, "billing": "pay_as_you_go", "plan": None, "active": False}])
+    )
+    assert ACCT_PAYG not in accounts
+    assert inactive[ACCT_PAYG] == {"reason": "payg_inactive"}
+
+
+@pytest.mark.parametrize(
+    ("billing", "plan_name", "active", "expect"),
+    [
+        ("plan", "pro", True, "quota"),
+        ("plan", "business", True, "quota"),
+        ("plan", "enterprise", True, "quota"),
+        ("plan", "pro", False, "expired_plan"),
+        ("plan", "business", False, "expired_plan"),
+        ("plan", "enterprise", False, "expired_plan"),
+        ("plan", "pro", None, "expired_plan"),
+        ("plan", "business", None, "expired_plan"),
+        ("plan", "enterprise", None, "expired_plan"),
+        ("plan", None, True, "miss"),
+        ("plan", None, False, "miss"),
+        ("pay_as_you_go", None, True, "miss"),
+        ("pay_as_you_go", None, None, "miss"),
+        ("pay_as_you_go", "pro", True, "miss"),
+        ("pay_as_you_go", None, False, "payg_inactive"),
+        ("pay_as_you_go", "pro", False, "payg_inactive"),
+        ("pay_as_you_go", "business", False, "payg_inactive"),
+        ("unknown", "pro", True, "miss"),
+        (None, "pro", True, "miss"),
+    ],
+    ids=[
+        "plan-pro-active-quota",
+        "plan-business-active-quota",
+        "plan-enterprise-active-quota",
+        "plan-pro-inactive-expired",
+        "plan-business-inactive-expired",
+        "plan-enterprise-inactive-expired",
+        "plan-pro-active-null-expired",
+        "plan-business-active-null-expired",
+        "plan-enterprise-active-null-expired",
+        "plan-no-name-active-miss",
+        "plan-no-name-inactive-miss",
+        "payg-active-miss",
+        "payg-active-null-miss",
+        "payg-with-plan-name-active-miss",
+        "payg-inactive-reject",
+        "payg-pro-inactive-reject",
+        "payg-business-inactive-reject",
+        "unknown-billing-miss",
+        "no-billing-miss",
+    ],
+)
+def test_every_billing_active_combination_is_classified(
+    billing: str | None, plan_name: str | None, active: bool | None, expect: str
+) -> None:
+    """Wire-shape contract for the waterfall.
+
+    Active named plans of every catalog type go to the quota map. Inactive named plans are
+    expired (try PAYG later). Explicitly-false PAYG is a hard reject. Everything else is a
+    miss, which the request path already treats as ordinary PAYG.
     """
-    accounts, _ = pc._parse_page(page(results=[{"ss58": ACCT_BUSINESS, "billing": "plan", "plan": "pro"}]))
+    accounts, _, inactive = pc._parse_page(
+        page(results=[{"ss58": ACCT_BUSINESS, "billing": billing, "plan": plan_name, "active": active}])
+    )
+    if expect == "quota":
+        assert ACCT_BUSINESS in accounts
+        assert ACCT_BUSINESS not in inactive
+        assert accounts[ACCT_BUSINESS]["plan"] == plan_name
+        return
+    assert ACCT_BUSINESS not in accounts
+    if expect == "expired_plan":
+        assert inactive[ACCT_BUSINESS] == {"reason": "expired_plan", "plan": plan_name}
+        return
+    if expect == "payg_inactive":
+        assert inactive[ACCT_BUSINESS] == {"reason": "payg_inactive"}
+        return
+    assert ACCT_BUSINESS not in inactive
 
-    assert accounts[ACCT_BUSINESS] == {"plan": "pro", "storage_limit_bytes": 10 * TB}
+
+def test_a_mixed_page_keeps_plan_priority_and_separates_inactive() -> None:
+    """One scrape with every live combination: active plans must not be crowded out by PAYG rows."""
+    accounts, _, inactive = pc._parse_page(
+        page(
+            results=[
+                {"ss58": ACCT_BUSINESS, "billing": "plan", "plan": "pro", "active": True},
+                {"ss58": ACCT_INACTIVE_FLAG, "billing": "plan", "plan": "business", "active": False},
+                {"ss58": ACCT_PAYG, "billing": "pay_as_you_go", "plan": None, "active": True},
+                {"ss58": _addr(0), "billing": "pay_as_you_go", "plan": None, "active": False},
+                {"ss58": _addr(1), "billing": "plan", "plan": "enterprise", "active": True},
+            ]
+        )
+    )
+    assert set(accounts) == {ACCT_BUSINESS, _addr(1)}
+    assert accounts[ACCT_BUSINESS]["plan"] == "pro"
+    assert accounts[_addr(1)]["plan"] == "enterprise"
+    assert inactive[ACCT_INACTIVE_FLAG] == {"reason": "expired_plan", "plan": "business"}
+    assert inactive[_addr(0)] == {"reason": "payg_inactive"}
+    assert ACCT_PAYG not in accounts
+    assert ACCT_PAYG not in inactive
 
 
 def test_a_bespoke_per_account_allowance_beats_the_catalog_price() -> None:
     """An enterprise account on a negotiated limit must not be silently reset to the list price."""
-    accounts, _ = pc._parse_page(
+    accounts, _, _ = pc._parse_page(
         page(
             results=[
                 {"ss58": ACCT_BUSINESS, "billing": "plan", "plan": "pro", "active": True, "storage_bytes": 999 * TB}
@@ -292,7 +391,7 @@ def test_a_bespoke_per_account_allowance_beats_the_catalog_price() -> None:
 def test_an_unknown_upstream_field_does_not_break_parsing() -> None:
     """The payload will grow. A richer response must not crash the cacher and strand the fleet on
     last-known-good."""
-    accounts, catalog = pc._parse_page(
+    accounts, catalog, _ = pc._parse_page(
         page(
             results=[
                 {
@@ -329,62 +428,75 @@ async def test_a_successful_cycle_publishes_and_records() -> None:
 
     quota = await plans_cache.get_plan_for_account(redis, ACCT_BUSINESS)
     assert quota is not None and quota.plan_id == "business" and quota.storage_bytes == 50 * TB
+    leftover = await plans_cache.get_inactive_billing(redis, ACCT_INACTIVE_FLAG)
+    assert leftover is not None and leftover.reason == "expired_plan"
 
     kwargs = collector.record_plans_cacher_cycle.call_args.kwargs
     assert kwargs["success"] is True
-    assert kwargs["entries"] == 2, "the count is accounts on a plan, not rows seen"
+    assert kwargs["entries"] == 1, "the count is accounts on an active plan, not rows seen"
 
 
 @pytest.mark.asyncio
-async def test_restoring_the_active_check_is_wedged_by_the_shrink_guard() -> None:
-    """The documented rollback does NOT work on its own, and this pins that.
+async def test_a_payload_with_no_active_rows_keeps_last_known_good() -> None:
+    """Explicit active=false on every row is the #502 payload.
 
-    Restoring `active` admits ~nobody (upstream sets it false everywhere), so the next roll is empty
-    over a live hash. publish_plan_roll refuses that, run_cycle swallows the raise, and the OLD wide
-    roll keeps serving with used_bytes frozen — a deploy that looks clean and changes nothing.
-
-    Any rollback must `DEL hippius_s3_plan_accounts` on redis-accounts first.
+    Publishing it would classify the PAYG fleet as payg_inactive and 402 them. The cycle must
+    fail and leave the previous roll serving.
     """
     redis = FakeRedis()
-    # Mirrors production: EVERY row is active=false, so restoring the check admits nobody at all.
-    prod_shaped = page(
-        results=[
-            {
-                "ss58": ACCT_INACTIVE_FLAG,
-                "billing": "plan",
-                "plan": "pro",
-                "active": False,
-                "storage_bytes": 10 * TB,
-            }
-        ]
-    )
-    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=prod_shaped))
-
-    with (
-        patch.object(pc, "HippiusApiClient", api),
-        patch.object(pc, "get_metrics_collector", return_value=MagicMock()),
-    ):
+    good = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
+    with patch.object(pc, "HippiusApiClient", good), patch.object(pc, "get_metrics_collector", MagicMock()):
         assert await pc.run_cycle(redis, FakePool()) is True
-        before = await plans_cache.get_plan_for_account(redis, ACCT_INACTIVE_FLAG)
+    assert await plans_cache.get_plan_for_account(redis, ACCT_BUSINESS) is not None
 
-        # The rollback: put the `active` requirement back.
-        with patch.object(pc, "_is_enforceable_plan_row", lambda r: bool(r.billing == "plan" and r.plan and r.active)):
-            assert await pc.run_cycle(redis, FakePool()) is False, "the guard refuses the smaller roll"
+    dead = page(results=[{**row, "active": False} for row in SAMPLE_PAGE["results"]])
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=dead))
+    with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
+        assert await pc.run_cycle(redis, FakePool()) is False
 
-    after = await plans_cache.get_plan_for_account(redis, ACCT_INACTIVE_FLAG)
-    assert before is not None and after is not None, "the account the rollback meant to drop is still served"
-    assert after == before
+    assert await plans_cache.get_plan_for_account(redis, ACCT_BUSINESS) is not None
+    assert await plans_cache.get_inactive_billing(redis, ACCT_PAYG) is None
 
-    # And the documented escape hatch clears it.
-    await redis.delete(plans_cache.PLAN_ACCOUNTS_KEY)
-    with (
-        patch.object(pc, "HippiusApiClient", api),
-        patch.object(pc, "get_metrics_collector", return_value=MagicMock()),
-        patch.object(pc, "_is_enforceable_plan_row", lambda r: bool(r.billing == "plan" and r.plan and r.active)),
-    ):
+
+@pytest.mark.asyncio
+async def test_an_all_inactive_first_publish_is_also_refused() -> None:
+    redis = FakeRedis()
+    dead = page(results=[{**row, "active": False} for row in SAMPLE_PAGE["results"]])
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=dead))
+    with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
+        assert await pc.run_cycle(redis, FakePool()) is False
+
+    assert "hippius_s3_plan_accounts" not in redis.hashes
+    assert "hippius_s3_billing_inactive" not in redis.hashes
+
+
+@pytest.mark.asyncio
+async def test_expired_plans_are_dropped_from_the_live_map() -> None:
+    """A real cancellation must publish, not wedge the cacher on the old allowance.
+
+    The shrink guard still refuses a truncated scrape; it does not refuse accounts this scrape
+    classified as expired_plan.
+    """
+    redis = FakeRedis()
+    seeded = [
+        {"ss58": _addr(i), "billing": "plan", "plan": "pro", "active": True, "storage_bytes": TB} for i in range(3)
+    ]
+    seed = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page(results=seeded, next=None)))
+    with patch.object(pc, "HippiusApiClient", seed), patch.object(pc, "get_metrics_collector", MagicMock()):
+        assert await pc.run_cycle(redis, FakePool()) is True
+    assert await plans_cache.get_plan_for_account(redis, _addr(0)) is not None
+
+    expired = [{**row, "active": False} for row in seeded]
+    # An active PAYG row keeps upstream_active > 0 so this is a real cancellation, not the
+    # all-false payload the publish circuit-breaker refuses.
+    expired.append({"ss58": ACCT_PAYG, "billing": "pay_as_you_go", "plan": None, "active": True})
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page(results=expired, next=None)))
+    with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
         assert await pc.run_cycle(redis, FakePool()) is True
 
-    assert await plans_cache.get_plan_for_account(redis, ACCT_INACTIVE_FLAG) is None
+    assert await plans_cache.get_plan_for_account(redis, _addr(0)) is None
+    leftover = await plans_cache.get_inactive_billing(redis, _addr(0))
+    assert leftover is not None and leftover.reason == "expired_plan" and leftover.plan_id == "pro"
 
 
 @pytest.mark.asyncio
@@ -589,7 +701,7 @@ def test_an_address_in_the_wrong_network_prefix_is_dropped() -> None:
     """An SS58 in another prefix matches no bucket, so its count comes back 0 and we would publish
     it as "stores nothing" — unlimited headroom, indistinguishable from a genuinely empty account.
     Drop the row instead; that account falls back to pay-as-you-go."""
-    accounts, _ = pc._parse_page(
+    accounts, _, _ = pc._parse_page(
         page(
             results=[
                 {"ss58": "not-an-ss58-address", "billing": "plan", "plan": "pro", "active": True},

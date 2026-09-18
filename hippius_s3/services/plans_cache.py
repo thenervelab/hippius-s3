@@ -1,17 +1,19 @@
 """Redis layer for the S3 billing-plan caches.
 
 Fed by one upstream page — GET /api/s3/plans/accounts/ carries both the catalog and the account
-roll — and split across two hashes on redis-accounts:
+roll — and split across hashes on redis-accounts:
 
-    hippius_s3_plan_accounts   field = account SS58   value = {"plan", "storage_limit_bytes", "used_bytes"}
-    hippius_s3_plans           field = plan name      value = {"h256", "storage_bytes"}   (see below)
-    hippius_s3_plans:meta      JSON {fetched_at, counts}
+    hippius_s3_plan_accounts       field = account SS58   value = {"plan", "storage_limit_bytes", "used_bytes"}
+    hippius_s3_billing_inactive    field = account SS58   value = {"reason": "expired_plan"|"payg_inactive", ...}
+    hippius_s3_plans               field = plan name      value = {"h256", "storage_bytes"}   (see below)
+    hippius_s3_plans:meta          JSON {fetched_at, counts}
 
-Only the FIRST of those is on the serving path. `hippius_s3_plans` is published for operators --
-it answers "what does plan X allow" when someone is debugging a quota decision -- and nothing reads
+The quota hash is on the serving path (one HGET for an active plan). The inactive hash is consulted
+only after a quota miss, on the PAYG path. `hippius_s3_plans` is published for operators -- it
+answers "what does plan X allow" when someone is debugging a quota decision -- and nothing reads
 it in code: the per-account row already carries the resolved limit.
 
-The account row carries everything the quota gate needs, so the request path is ONE `HGET` and a
+The account row carries everything the quota gate needs, so an active-plan write is one `HGET` and a
 comparison -- no catalog lookup, no database. The two halves come from different places and it
 matters which is which:
 
@@ -40,12 +42,19 @@ import json
 import time
 from dataclasses import dataclass
 from typing import Any
+from typing import Literal
 from typing import Mapping
 
 
 PLAN_ACCOUNTS_KEY = "hippius_s3_plan_accounts"
 PLAN_CATALOG_KEY = "hippius_s3_plans"
 PLANS_META_KEY = "hippius_s3_plans:meta"
+# Accounts that are not on an active plan but must not be treated as a silent PAYG miss:
+# expired subscriptions (try PAYG, refuse with PlanExpired if that also fails) and PAYG
+# accounts upstream marked inactive (refuse without trying credits).
+PLAN_INACTIVE_KEY = "hippius_s3_billing_inactive"
+
+InactiveReason = Literal["expired_plan", "payg_inactive"]
 
 _BUILDING_SUFFIX = ":building"
 _HSET_BATCH = 1000
@@ -74,6 +83,12 @@ class PlanQuota:
         # "this plan permits nothing". Treating 0 as a real quota would deny every upload for a
         # paying customer on the strength of a malformed payload.
         return self.storage_bytes is not None and self.storage_bytes > 0
+
+
+@dataclass(frozen=True)
+class InactiveBilling:
+    reason: InactiveReason
+    plan_id: str | None = None
 
 
 def _decode(value: Any) -> str | None:
@@ -106,10 +121,20 @@ async def _publish_hash(redis_client: Any, key: str, entries: Mapping[str, str])
     return len(items)
 
 
+def _live_plan_keys(raw_keys: Any) -> set[str]:
+    keys: set[str] = set()
+    for key in raw_keys or []:
+        decoded = _decode(key)
+        if decoded:
+            keys.add(decoded)
+    return keys
+
+
 async def publish_plan_roll(
     redis_client: Any,
     accounts: Mapping[str, dict[str, Any]],
     catalog: Mapping[str, dict[str, Any]],
+    inactive: Mapping[str, dict[str, Any]] | None = None,
 ) -> tuple[int, int]:
     """Atomically replace both hashes. Returns (accounts_published, plans_published).
 
@@ -118,20 +143,27 @@ async def publish_plan_roll(
     likely to be an upstream bug than most of the roll cancelling at once, and the cost of being
     wrong in the other direction (a fleet-wide 402) is not symmetric.
 
-    ⚠️ THIS GUARD ALSO BLOCKS AN INTENTIONAL SHRINK, INCLUDING A ROLLBACK. Restoring the `active`
-    check in _is_enforceable_plan_row (or any change that legitimately admits far fewer accounts)
-    computes a much smaller roll, trips this, and run_cycle swallows the raise -- so the OLD wide
-    roll keeps serving, with used_bytes frozen at the moment of the revert. The deploy looks clean
-    and nothing changes. Run `DEL hippius_s3_plan_accounts` on redis-accounts as part of any such
-    rollback; an empty live hash short-circuits both checks.
+    Expired subscriptions are not a shrink. An account that left the plan hash because this scrape
+    classified it `expired_plan` is accounted for, so a real cancellation (or every subscriber
+    lapsing) is published rather than wedging the cacher on the old allowance. A truncated scrape
+    that simply omits them still trips the guard. Run `DEL hippius_s3_plan_accounts` on
+    redis-accounts to clear a wedged roll; an empty live hash short-circuits both checks.
     """
-    live_size = int(await redis_client.hlen(PLAN_ACCOUNTS_KEY) or 0)
+    inactive = inactive or {}
+    live_keys = _live_plan_keys(await redis_client.hkeys(PLAN_ACCOUNTS_KEY))
+    live_size = len(live_keys)
+    expired_ss58s = {ss58 for ss58, row in inactive.items() if row.get("reason") == "expired_plan"}
+    accounted = set(accounts) | (expired_ss58s & live_keys)
 
-    if not accounts and live_size:
+    if not accounts and live_size and not (expired_ss58s & live_keys):
         raise PlanMapShrankTooMuch(
             f"refusing to publish an empty account plan map over {live_size} live entries; keeping last known good"
         )
-    if live_size and len(accounts) < live_size * (1 - MAX_ACCOUNT_MAP_SHRINK_RATIO):
+    if (
+        live_size
+        and len(accounts) < live_size * (1 - MAX_ACCOUNT_MAP_SHRINK_RATIO)
+        and len(accounted) < live_size * (1 - MAX_ACCOUNT_MAP_SHRINK_RATIO)
+    ):
         raise PlanMapShrankTooMuch(
             f"refusing to publish account plan map: {len(accounts)} entries vs {live_size} live "
             f"(shrink > {MAX_ACCOUNT_MAP_SHRINK_RATIO:.0%}); keeping last known good"
@@ -151,6 +183,8 @@ async def publish_plan_roll(
         redis_client, PLAN_ACCOUNTS_KEY, {ss58: json.dumps(row) for ss58, row in accounts.items()}
     )
 
+    await _publish_hash(redis_client, PLAN_INACTIVE_KEY, {ss58: json.dumps(row) for ss58, row in inactive.items()})
+
     return published_accounts, published_plans
 
 
@@ -167,15 +201,33 @@ async def get_meta(redis_client: Any) -> dict[str, Any]:
     return json.loads(raw) if raw else {}
 
 
+async def get_inactive_billing(redis_client: Any, account_id: str) -> InactiveBilling | None:
+    """Why this account is not on an active plan, or None when that is just a PAYG miss.
+
+    Consulted only after a plan-hash miss, on the pay-as-you-go path. A miss here is the common
+    case (an ordinary PAYG account) and must not become a new failure mode.
+    """
+    raw = _decode(await redis_client.hget(PLAN_INACTIVE_KEY, account_id))
+    if raw is None:
+        return None
+
+    row = json.loads(raw)
+    reason = row.get("reason")
+    if reason == "expired_plan":
+        plan_id = row.get("plan")
+        return InactiveBilling(reason="expired_plan", plan_id=str(plan_id) if plan_id else None)
+    if reason == "payg_inactive":
+        return InactiveBilling(reason="payg_inactive")
+    return None
+
+
 async def get_plan_for_account(redis_client: Any, account_id: str) -> PlanQuota | None:
     """The account's plan, quota and usage, in one HGET, or None when they are pay-as-you-go.
 
-    Only accounts upstream BILLS as a plan are in the hash at all (see _is_enforceable_plan_row in
-    the plans-cacher), so a miss here covers the pay-as-you-go cases: no subscription, or an account
-    upstream does not know about.
-
-    A lapsed subscription is NOT a miss. `active` is not consulted, so a cancelled subscriber whose
-    row still carries billing="plan" and its old plan name is present here and keeps its allowance.
+    Only accounts with an *active* plan are in the hash (see _is_enforceable_plan_row in the
+    plans-cacher). A miss covers pay-as-you-go, an expired plan, and an account upstream does not
+    know about. Expired / inactive PAYG rows live on PLAN_INACTIVE_KEY and are consulted by the
+    request path after this miss.
     """
     raw = _decode(await redis_client.hget(PLAN_ACCOUNTS_KEY, account_id))
     if raw is None:

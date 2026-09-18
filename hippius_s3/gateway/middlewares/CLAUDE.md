@@ -96,6 +96,9 @@ Two failure postures, deliberately different:
 - **The lookup succeeds but the quota is unknown** (cold catalog, unknown plan id) -> ALLOW, loudly.
   A positively identified paying customer is never blocked because our cache has not warmed up.
 
+Waterfall when enforcement is on: active plan → quota; expired plan → try PAYG, 402 `PlanExpired`
+if PAYG also fails; PAYG marked inactive → 402 `AccountInactive` without trying credits.
+
 **Where the numbers come from.** Both the quota and the usage sit on one cached row published by
 the plans-cacher — quota from upstream, usage counted by that worker in the background. The gate is
 therefore a single Redis `HGET` and a pure comparison, with no database work on the request path.

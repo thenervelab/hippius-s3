@@ -76,64 +76,51 @@ MAX_PAGES = 500
 # Upstream's own name for "this account is on a subscription". Anything else in `billing` — today
 # only "pay_as_you_go" — means exactly that.
 _PLAN_BILLING = "plan"
+_PAYG_BILLING = "pay_as_you_go"
 
 
 def _is_enforceable_plan_row(row: S3PlanAccountRow) -> bool:
     """Whether this account should be gated on a plan quota rather than billed pay-as-you-go.
 
-    Requires billing == "plan" and a plan name. `active` is deliberately NOT consulted.
-
-    It used to be, on the reading that a lapsed subscription keeps billing="plan" and its old plan
-    name and is distinguished only by active=false. The first real payload said otherwise: upstream
-    returns active=false on EVERY row it serves — 3069 of them at the last check, with zero
-    exceptions over two days — including the one genuine subscriber, whose row carried a real
-    subscription id and a next_charge date in the FUTURE. A cancelled
-    subscription does not have a future charge date, so the field is not carrying the meaning we
-    assumed; on present evidence it is simply not populated.
-
-    Honouring it therefore admitted nobody, which is worse than the failure it was guarding against:
-    the gate could never engage, so the feature could not be observed even in shadow mode, and
-    turning enforcement on would have been a silent no-op forever.
-
-    MEASURED BLAST RADIUS: exactly ONE row in 3069 carries billing == "plan" (checked twice, a day
-    apart). This admits that one account, not the lapsed population — re-measure before assuming
-    otherwise, because every risk below scales with that number.
-
-    THE RISKS THIS ACCEPTS, both directions — admission is not purely generous:
-
-    1. A cancelled subscriber keeps their allowance until the check is restored.
-    2. Admission also IMPOSES A CAP and removes the pay-as-you-go path. An admitted account that is
-       over its plan size but has substrate credits used to upload fine via can_upload; with
-       enforcement on it is refused 402 until it deletes data AND a cacher cycle re-counts.
-    3. An admitted account whose quota is unknown (plan absent from the catalog, or a null/0/
-       negative storage_bytes) resolves to catalog_miss, which allows the write AND skips
-       has_credits and can_upload. That is unmetered storage, not merely an unenforced quota.
-
-    None of the three is reachable while HIPPIUS_ENABLE_BILLING_PLANS is off, which is how prod
-    ships. Staging has it ON, so staging is where 2 and 3 would first appear.
-
-    When upstream confirms what `active` means, restore the check (or switch to `next_charge` in the
-    future, which is the field that actually tracked reality here). See todo.md — and note that
-    restoring it needs `DEL hippius_s3_plan_accounts` on redis-accounts first, or the shrink guard
-    refuses the smaller roll and wedges the cacher on the stale one.
+    Requires billing == "plan", a plan name, AND active. None and False both deny the quota
+    path so an expired plan falls through to pay-as-you-go.
     """
-    return bool(row.billing == _PLAN_BILLING and row.plan)
+    return bool(row.billing == _PLAN_BILLING and row.plan and row.active)
 
 
-def _parse_page(page: S3PlanAccountsResponse) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+def _inactive_entry(row: S3PlanAccountRow) -> dict[str, Any] | None:
+    """How the request path should treat a row that is not an active plan.
+
+    expired_plan: subscription lapsed. Try PAYG; refuse with PlanExpired if PAYG also fails.
+    payg_inactive: billed pay-as-you-go but marked inactive. Refuse without trying credits.
+
+    Explicit `active is False` for PAYG, not merely falsy: an omitted/null flag must not start
+    402ing ordinary PAYG accounts if upstream stops writing the field again.
+    """
+    if row.billing == _PLAN_BILLING and row.plan and not row.active:
+        return {"reason": "expired_plan", "plan": row.plan}
+    if row.billing == _PAYG_BILLING and row.active is False:
+        return {"reason": "payg_inactive"}
+    return None
+
+
+def _parse_page(
+    page: S3PlanAccountsResponse,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     """Wire shape -> what we cache. The single place to change if the payload moves.
 
-    Accounts that are not on a plan are simply ABSENT from the map: an absent field is
-    exactly what the request path already treats as pay-as-you-go, so there is nothing to encode
-    for them and nothing to keep in sync.
+    Active plan accounts go in the quota map. Expired plans and inactive PAYG go in the inactive
+    map. Ordinary active PAYG is simply ABSENT from both: an absent field is exactly what the
+    request path already treats as pay-as-you-go, so there is nothing to encode for them.
 
     `results[].storage_bytes` is the account's own MAX QUOTA, and it wins over the plan's list price
     so a negotiated limit is not silently overwritten. Upstream reports NO usage figure -- that is
     filled in afterwards by _attach_usage, from our own count.
     """
     accounts: dict[str, dict[str, Any]] = {}
+    inactive: dict[str, dict[str, Any]] = {}
     for row in page.results:
-        if not row.ss58 or not _is_enforceable_plan_row(row):
+        if not row.ss58:
             continue
         if not is_valid_ss58_address(row.ss58, valid_ss58_format=HIPPIUS_SS58_FORMAT):
             # Every address we key on is network prefix 42 (config._parse_service_accounts pins the
@@ -143,12 +130,17 @@ def _parse_page(page: S3PlanAccountsResponse) -> tuple[dict[str, dict[str, Any]]
             # it from a genuinely empty account. Drop the row; the account falls back to PAYG.
             logger.error(f"PLANS_BAD_ADDRESS skipping row with non-network-42 ss58: {row.ss58!r}")
             continue
-        plan = page.plans.get(row.plan or "")
-        limit = row.storage_bytes if row.storage_bytes is not None else (plan.storage_bytes if plan else None)
-        accounts[row.ss58] = {"plan": row.plan, "storage_limit_bytes": limit}
+        if _is_enforceable_plan_row(row):
+            plan = page.plans.get(row.plan or "")
+            limit = row.storage_bytes if row.storage_bytes is not None else (plan.storage_bytes if plan else None)
+            accounts[row.ss58] = {"plan": row.plan, "storage_limit_bytes": limit}
+            continue
+        entry = _inactive_entry(row)
+        if entry is not None:
+            inactive[row.ss58] = entry
 
     catalog = {name: {"h256": entry.h256, "storage_bytes": entry.storage_bytes} for name, entry in page.plans.items()}
-    return accounts, catalog
+    return accounts, catalog, inactive
 
 
 async def _attach_usage(pool: asyncpg.Pool, accounts: dict[str, dict[str, Any]]) -> None:
@@ -200,12 +192,13 @@ async def refresh_plan_roll_once(redis_client: Redis, pool: asyncpg.Pool) -> tup
 
     accounts: dict[str, dict[str, Any]] = {}
     catalog: dict[str, dict[str, Any]] = {}
+    inactive: dict[str, dict[str, Any]] = {}
     next_url: str | None = None
     pages = 0
     rows_seen = 0
-    # The ONLY signal that upstream has started populating `active`. Nothing else reads the field
-    # any more, so without this the condition for restoring the check in _is_enforceable_plan_row
-    # would never announce itself -- we would have to go and look. Alert on this going non-zero.
+    # Counted over EVERY row, not just plan rows. A drop back to zero is the signal that upstream
+    # has stopped writing `active` again — the condition that made this check a silent no-op in
+    # PR #502.
     active_seen = 0
 
     async with HippiusApiClient() as api_client:
@@ -215,8 +208,9 @@ async def refresh_plan_roll_once(redis_client: Redis, pool: asyncpg.Pool) -> tup
             rows_seen += len(page.results)
             active_seen += sum(1 for row in page.results if row.active)
 
-            page_accounts, page_catalog = _parse_page(page)
+            page_accounts, page_catalog, page_inactive = _parse_page(page)
             accounts.update(page_accounts)
+            inactive.update(page_inactive)
             # The catalog is repeated on every page; later pages simply confirm it.
             catalog.update(page_catalog)
 
@@ -229,17 +223,27 @@ async def refresh_plan_roll_once(redis_client: Redis, pool: asyncpg.Pool) -> tup
                 f"built from a possibly looping cursor"
             )
 
+    # Explicit false on every row is the payload that made requiring `active` a silent no-op.
+    # Publishing it now would classify the PAYG fleet as payg_inactive and 402 them. Keep
+    # last-known-good instead. Null/omitted is fail-open and does not trip this.
+    if rows_seen and active_seen == 0:
+        raise RuntimeError(f"refusing to publish: upstream_active=0 across {rows_seen} rows; keeping last known good")
+
     usage_started = time.monotonic()
     await _attach_usage(pool, accounts)
     usage_seconds = time.monotonic() - usage_started
 
-    published_accounts, published_plans = await plans_cache.publish_plan_roll(redis_client, accounts, catalog)
+    published_accounts, published_plans = await plans_cache.publish_plan_roll(
+        redis_client, accounts, catalog, inactive=inactive
+    )
     await plans_cache.touch_meta(redis_client, published_accounts, published_plans)
 
+    expired = sum(1 for row in inactive.values() if row.get("reason") == "expired_plan")
+    payg_inactive = sum(1 for row in inactive.values() if row.get("reason") == "payg_inactive")
     logger.info(
         f"Published plan roll: {published_accounts} accounts on a plan out of {rows_seen} rows, "
         f"{published_plans} plans, over {pages} page(s); usage counted in {usage_seconds:.1f}s; "
-        f"upstream_active={active_seen}"
+        f"upstream_active={active_seen} expired_plan={expired} payg_inactive={payg_inactive}"
     )
     return published_accounts, published_plans
 
