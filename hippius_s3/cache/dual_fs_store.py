@@ -81,7 +81,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
     def __init__(
         self,
         primary_dir: str,
-        fallback_dir: str,
+        fallback_dir: str | None = None,
         *,
         promote: bool = False,
         on_promote: Optional[PromotionRecorder] = None,
@@ -91,7 +91,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         on_local_read: Optional[LocalReadRecorder] = None,
     ) -> None:
         super().__init__(primary_dir)
-        self.fallback = FileSystemPartsStore(fallback_dir)
+        self.fallback = FileSystemPartsStore(fallback_dir) if fallback_dir else None
         self._promote = promote
         self._on_promote = on_promote
         self._on_promote_release = on_promote_release
@@ -135,6 +135,8 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
                 await self._promote_chunk(object_id, object_version, part_number, chunk_index, peer_bytes)
             return peer_bytes
 
+        if self.fallback is None:
+            return None
         result = await self.fallback.get_chunk(object_id, object_version, part_number, chunk_index)
         if result is not None:
             _record_tier("pool")
@@ -223,6 +225,8 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         self._promoting.add(in_flight)
         claimed = False
         try:
+            if self.fallback is None:
+                return
             meta = await self.fallback.get_meta(object_id, object_version, part_number)
             if meta is None:
                 return
@@ -313,9 +317,10 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         re-write it immediately afterwards; that is self-limiting (the next failed read invalidates
         it again) and not worth serialising against the promotion path.
         """
-        if not durable_elsewhere and not await self.fallback.chunk_exists(
+        pool_copy = self.fallback is not None and await self.fallback.chunk_exists(
             object_id, object_version, part_number, chunk_index
-        ):
+        )
+        if not durable_elsewhere and not pool_copy:
             return False
 
         chunk_path = self._chunk_file(Path(self.part_path(object_id, object_version, part_number)), chunk_index)
@@ -363,13 +368,15 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
 
     async def get_meta(self, object_id: str, object_version: int, part_number: int) -> Optional[dict]:
         result = await super().get_meta(object_id, object_version, part_number)
-        if result is not None:
+        if result is not None or self.fallback is None:
             return result
         return await self.fallback.get_meta(object_id, object_version, part_number)
 
     async def chunk_exists(self, object_id: str, object_version: int, part_number: int, chunk_index: int) -> bool:
         if await super().chunk_exists(object_id, object_version, part_number, chunk_index):
             return True
+        if self.fallback is None:
+            return False
         return await self.fallback.chunk_exists(object_id, object_version, part_number, chunk_index)
 
     async def chunks_exist_batch(
@@ -384,7 +391,7 @@ class DualFileSystemPartsStore(FileSystemPartsStore):
         # misses are re-checked, so the common all-present case stays a single primary pass.
         primary = await super().chunks_exist_batch(object_id, object_version, checks)
         missing = [check for check, present in zip(checks, primary, strict=False) if not present]
-        if not missing:
+        if not missing or self.fallback is None:
             return primary
         fallback = await self.fallback.chunks_exist_batch(object_id, object_version, missing)
         found = {check for check, present in zip(missing, fallback, strict=False) if present}
