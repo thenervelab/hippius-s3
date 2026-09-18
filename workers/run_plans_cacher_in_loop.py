@@ -82,14 +82,8 @@ _PAYG_BILLING = "pay_as_you_go"
 def _is_enforceable_plan_row(row: S3PlanAccountRow) -> bool:
     """Whether this account should be gated on a plan quota rather than billed pay-as-you-go.
 
-    Requires billing == "plan", a plan name, AND active. An expired plan keeps billing="plan" and
-    its old plan name; `active` is the liveness bit. Those rows are not admitted here: the request
-    path falls through to pay-as-you-go, and if that also fails the account is refused.
-
-    `active` is True only when upstream set it true. None and False both deny the quota path —
-    upstream used to return false on every row (including live subscribers), which is why this
-    check was dropped in PR #502; it is populated now (verified 2026-09-18: every billing=plan
-    row is active=true, with a future next_charge).
+    Requires billing == "plan", a plan name, AND active. None and False both deny the quota
+    path so an expired plan falls through to pay-as-you-go.
     """
     return bool(row.billing == _PLAN_BILLING and row.plan and row.active)
 
@@ -228,6 +222,12 @@ async def refresh_plan_roll_once(redis_client: Redis, pool: asyncpg.Pool) -> tup
                 f"account plan pagination exceeded {MAX_PAGES} pages; refusing to publish a map "
                 f"built from a possibly looping cursor"
             )
+
+    # Explicit false on every row is the payload that made requiring `active` a silent no-op.
+    # Publishing it now would classify the PAYG fleet as payg_inactive and 402 them. Keep
+    # last-known-good instead. Null/omitted is fail-open and does not trip this.
+    if rows_seen and active_seen == 0:
+        raise RuntimeError(f"refusing to publish: upstream_active=0 across {rows_seen} rows; keeping last known good")
 
     usage_started = time.monotonic()
     await _attach_usage(pool, accounts)

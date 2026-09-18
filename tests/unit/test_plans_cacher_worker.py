@@ -437,6 +437,40 @@ async def test_a_successful_cycle_publishes_and_records() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_payload_with_no_active_rows_keeps_last_known_good() -> None:
+    """Explicit active=false on every row is the #502 payload.
+
+    Publishing it would classify the PAYG fleet as payg_inactive and 402 them. The cycle must
+    fail and leave the previous roll serving.
+    """
+    redis = FakeRedis()
+    good = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
+    with patch.object(pc, "HippiusApiClient", good), patch.object(pc, "get_metrics_collector", MagicMock()):
+        assert await pc.run_cycle(redis, FakePool()) is True
+    assert await plans_cache.get_plan_for_account(redis, ACCT_BUSINESS) is not None
+
+    dead = page(results=[{**row, "active": False} for row in SAMPLE_PAGE["results"]])
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=dead))
+    with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
+        assert await pc.run_cycle(redis, FakePool()) is False
+
+    assert await plans_cache.get_plan_for_account(redis, ACCT_BUSINESS) is not None
+    assert await plans_cache.get_inactive_billing(redis, ACCT_PAYG) is None
+
+
+@pytest.mark.asyncio
+async def test_an_all_inactive_first_publish_is_also_refused() -> None:
+    redis = FakeRedis()
+    dead = page(results=[{**row, "active": False} for row in SAMPLE_PAGE["results"]])
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=dead))
+    with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
+        assert await pc.run_cycle(redis, FakePool()) is False
+
+    assert "hippius_s3_plan_accounts" not in redis.hashes
+    assert "hippius_s3_billing_inactive" not in redis.hashes
+
+
+@pytest.mark.asyncio
 async def test_expired_plans_are_dropped_from_the_live_map() -> None:
     """A real cancellation must publish, not wedge the cacher on the old allowance.
 
@@ -453,6 +487,9 @@ async def test_expired_plans_are_dropped_from_the_live_map() -> None:
     assert await plans_cache.get_plan_for_account(redis, _addr(0)) is not None
 
     expired = [{**row, "active": False} for row in seeded]
+    # An active PAYG row keeps upstream_active > 0 so this is a real cancellation, not the
+    # all-false payload the publish circuit-breaker refuses.
+    expired.append({"ss58": ACCT_PAYG, "billing": "pay_as_you_go", "plan": None, "active": True})
     api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page(results=expired, next=None)))
     with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
         assert await pc.run_cycle(redis, FakePool()) is True
