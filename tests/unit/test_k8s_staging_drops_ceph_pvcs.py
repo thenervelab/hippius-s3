@@ -126,6 +126,14 @@ def test_deploy_workflows_delete_the_three_claims() -> None:
         assert "kubectl delete pvc object-cache-pvc persist-pvc dlq-pvc" in text
 
 
+def test_production_deploy_deletes_leftover_ceph_postgres_cluster() -> None:
+    production = (REPO_ROOT / ".github/workflows/production-deploy.yaml").read_text()
+    staging = (REPO_ROOT / ".github/workflows/staging-deploy.yaml").read_text()
+    assert "kubectl delete cluster.postgresql.cnpg.io postgres" in production
+    assert "hippius-s3-prod" in production
+    assert "kubectl delete cluster.postgresql.cnpg.io postgres" not in staging
+
+
 def test_production_api_local_does_not_mount_cephfs_claims() -> None:
     _assert_api_local_has_no_cephfs_claims("k8s/production/api-local-deployments-production.yaml")
     docs = load_docs("k8s/production/api-local-deployments-production.yaml")
