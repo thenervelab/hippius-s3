@@ -336,6 +336,15 @@ jobs:
           # pod still holds the volume — the new ReplicaSet does not mount it.
           kubectl delete pvc object-cache-pvc persist-pvc dlq-pvc \
             -n hippius-s3-prod --ignore-not-found --wait=false
+          # Leftover CNPG Cluster `postgres` (CephFS 300Gi, 0/3, no pods). App traffic is
+          # postgres-nvme-rw. Apply does not prune CRs that left the overlay years ago.
+          # Do NOT add this to staging-deploy — staging's Cluster `postgres` is the app DB.
+          kubectl delete cluster.postgresql.cnpg.io postgres \
+            -n hippius-s3-prod --ignore-not-found --wait=false
+          kubectl delete svc postgres-rw postgres-ro postgres-r \
+            -n hippius-s3-prod --ignore-not-found --wait=false
+          kubectl delete pdb postgres \
+            -n hippius-s3-prod --ignore-not-found --wait=false
           # drain-agent is OnDelete: apply stores the new spec but does not
           # replace running pods. Pods are deleted only after arion-uploader-local
           # and the allocator are Ready, below.
