@@ -72,10 +72,13 @@ data:
   API_DB_POOL_MAX_QUERIES: "50000"
   API_DB_POOL_MAX_INACTIVE_LIFETIME: "300"
   API_DB_POOL_COMMAND_TIMEOUT: "30"
-  # Per-uploader-pod DB pool cap. Multiplied by the uploader replica count against
-  # Postgres max_connections (40 pods x 8 = 320). Capped to keep total backends well
-  # under max_connections=1000 and limit per-backend page-table memory. See cnpg.md.
-  HIPPIUS_UPLOADER_DB_POOL_MAX: "8"
+  # Node-local uploader is 1-chunk dominated (harbor/tora). Outer inflight is the
+  # throughput knob; ARION_UPLOAD_CONCURRENCY must be >= inflight or extra requests
+  # wait on the per-pod Arion POST semaphore. DB pool tracks concurrency (5 local
+  # pods × 16 = 80 backends, well under max_connections=1000).
+  HIPPIUS_UPLOADER_MAX_INFLIGHT: "32"
+  HIPPIUS_ARION_UPLOAD_CONCURRENCY: "32"
+  HIPPIUS_UPLOADER_DB_POOL_MAX: "16"
   CACHET_API_URL: "http://cachet.monitoring.svc.cluster.local"
   HIPPIUS_API_BASE_URL: "https://api.hippius.com/api"
   ACL_CACHE_TTL_SECONDS: "600"

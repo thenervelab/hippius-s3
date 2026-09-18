@@ -202,6 +202,12 @@ spec:
             # disk and nothing to reclaim it.
             - name: CEPHOR_REPLICATED_RECLAIM_GRACE_SECS
               value: "3600"
+            # Default is 1h. Node-local uploader queue wait on a burst exceeds that, so the
+            # upload sweep LPUSHes the same `uploading` part again (93k redrives on node4,
+            # 2026-09-18) and the Redis list grows ~3x unique work. 4h is above expected
+            # catch-up wait at 32 inflight; drop back toward 3600 once LLEN is small.
+            - name: CEPHOR_UPLOAD_REDRIVE_SECS
+              value: "14400"
             # Max parts drained concurrently — the in-flight gate that lets the node
             # overlap fsync latency across parts (the AIMD allocator only tunes bytes/s).
             # Safe code default (4); set here for per-node tuning.
