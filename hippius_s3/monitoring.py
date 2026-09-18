@@ -94,6 +94,8 @@ PlanGateOutcome = Literal[
     "deny",
     "catalog_miss",
     "unavailable",
+    "expired",
+    "inactive",
     # enforcement off (HIPPIUS_ENABLE_BILLING_PLANS=false): what the gate WOULD have decided, while
     # the request is actually billed pay-as-you-go. shadow_would_deny is the one to graph before
     # flipping the flag -- it is the count of uploads that would start failing.
