@@ -85,7 +85,7 @@ from hippius_s3.storage_version import UnsupportedStorageVersionError  # noqa: E
 @pytest.mark.parametrize(
     "exc,status,code",
     [
-        (DownloadNotReadyError("Parts not ready"), 503, "SlowDown"),
+        (DownloadNotReadyError("Parts not ready", cause="chunk_unavailable"), 503, "SlowDown"),
         (RuntimeError("initial_stream_timeout"), 503, "SlowDown"),
         (RuntimeError("kms_unavailable"), 503, "SlowDown"),
         (RuntimeError("kek_database_unavailable"), 503, "SlowDown"),

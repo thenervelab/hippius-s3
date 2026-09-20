@@ -9,6 +9,7 @@ handler turns into a 500 InternalError. This is the exact regression vs the old 
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from types import SimpleNamespace
 from typing import Any
@@ -19,12 +20,13 @@ from unittest.mock import patch
 import pytest
 
 from hippius_s3.reader.backend_fetch import ChunkUnavailableError
+from hippius_s3.reader.types import ChunkPlanItem
 from hippius_s3.services import object_reader
 
 
 def _ctx() -> object_reader.StreamContext:
     return object_reader.StreamContext(
-        plan=[object()],
+        plan=[ChunkPlanItem(part_number=1, chunk_index=0)],
         object_version=1,
         storage_version=5,
         source="pipeline",
@@ -103,6 +105,68 @@ def test_download_not_ready_maps_to_503_slowdown() -> None:
     """End-of-chain: the DownloadNotReadyError the peek raises maps to a 503 SlowDown response."""
     from hippius_s3.api.s3.errors import map_read_path_exception
 
-    resp = map_read_path_exception(object_reader.DownloadNotReadyError("Parts not ready"))
+    resp = map_read_path_exception(object_reader.DownloadNotReadyError("Parts not ready", cause="chunk_unavailable"))
     assert resp is not None
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_terminal_miss_carries_cause_chunk_unavailable() -> None:
+    """A tier reported failure before the reader's bound: the 503 must say so, and carry the reason."""
+
+    async def _terminal_miss():
+        raise ChunkUnavailableError("no backend served the chunk (locations tried: 1)")
+        yield b"unreachable"  # pragma: no cover
+
+    cfg = SimpleNamespace(
+        stream_first_chunk_timeout_seconds=5, stream_chunk_timeout_seconds=300, http_stream_prefetch_chunks=0
+    )
+    with _patched(cfg, _terminal_miss):
+        with pytest.raises(object_reader.DownloadNotReadyError) as info:
+            await object_reader.read_response(
+                ctx=_ctx(), redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
+            )
+    assert info.value.cause == "chunk_unavailable"
+    assert str(info.value).startswith("Parts not ready:")
+    assert "locations tried: 1" in str(info.value), "the underlying reason travels with the message"
+
+
+@pytest.mark.asyncio
+async def test_first_chunk_timeout_carries_cause_first_chunk_timeout() -> None:
+    """Nothing reported a failure before the reader's own bound (a stall the httpx bounds do not reach)."""
+
+    async def _never():
+        await asyncio.sleep(3600)
+        yield b"unreachable"  # pragma: no cover
+
+    cfg = SimpleNamespace(
+        stream_first_chunk_timeout_seconds=0.05, stream_chunk_timeout_seconds=300, http_stream_prefetch_chunks=0
+    )
+    with _patched(cfg, _never):
+        with pytest.raises(object_reader.DownloadNotReadyError) as info:
+            await object_reader.read_response(
+                ctx=_ctx(), redis=None, obj_cache=None, info=_info(), read_mode="auto", rng=None, address="a"
+            )
+    assert info.value.cause == "first_chunk_timeout"
+    assert str(info.value).startswith("Parts not ready:")
+
+
+@pytest.mark.asyncio
+async def test_stream_object_bound_peek_carries_cause() -> None:
+    """The CopyObject-source peek carries the same cause and keeps its 'source' wording."""
+
+    async def _terminal_miss():
+        raise ChunkUnavailableError("no backend served the chunk (locations tried: 1)")
+        yield b"unreachable"  # pragma: no cover
+
+    cfg = SimpleNamespace(
+        stream_first_chunk_timeout_seconds=5, stream_chunk_timeout_seconds=300, http_stream_prefetch_chunks=0
+    )
+    with _patched(cfg, _terminal_miss):
+        with pytest.raises(object_reader.DownloadNotReadyError) as info:
+            await object_reader.stream_object(
+                db=None, redis=None, obj_cache=None, info=_info(), rng=None, address="a", bound_first_chunk=True
+            )
+    assert info.value.cause == "chunk_unavailable"
+    assert str(info.value).startswith("Parts not ready: source")
+    assert "locations tried: 1" in str(info.value)

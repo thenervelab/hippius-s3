@@ -76,6 +76,7 @@ split across two hashes on `redis-accounts`:
 | Redis key | Field | Value |
 |---|---|---|
 | `hippius_s3_plan_accounts` | account SS58 | `{"plan", "storage_limit_bytes", "used_bytes"}` |
+| `hippius_s3_billing_inactive` | account SS58 | `{"reason": "expired_plan"\|"payg_inactive", ...}` |
 | `hippius_s3_plans` | plan name | `{"h256": ..., "storage_bytes": ...}` |
 | `hippius_s3_plans:meta` | — | `{fetched_at, accounts, plans}` |
 
@@ -132,57 +133,31 @@ A read failing for ANY account fails the whole cycle and keeps the previous roll
 partial answer would write `used_bytes=0` for the accounts we could not read, silently handing them
 unlimited headroom.
 
-**Only accounts billed as a plan are written.** A row needs `billing == "plan"` and a plan name.
-Everything else is simply absent from the hash, which is exactly what the request path already reads
-as pay-as-you-go.
+**Only an *active* plan is written to the quota hash.** A row needs `billing == "plan"`, a plan
+name, **and** `active` true. Ordinary PAYG is simply absent from both hashes, which is exactly what
+the request path already reads as pay-as-you-go.
 
-⚠️ **`active` is NOT consulted, and that is a deliberate concession to the real payload.** The
-original filter also required `active` true, on the reading that a lapsed subscription keeps
-`billing: "plan"` and its old plan name and is distinguished only by that flag. The live data
-contradicted it: upstream returns `active: false` on **every** row it serves — 3069 at the last
-check, zero exceptions across the two days it has been up (2026-09-08 to -09) — including the one
-genuine subscriber, which carries a real `subscription_id` and a `next_charge` a month in the
-future. A cancelled subscription does not have a future charge date, so the field is not carrying
-that meaning; on present evidence it is simply unpopulated.
+**Expired plans and inactive PAYG go on `hippius_s3_billing_inactive`.** Request-path waterfall
+(gated on `HIPPIUS_ENABLE_BILLING_PLANS`):
 
-Requiring it admitted nobody, which is the worse failure: the gate could never engage, so the
-feature was unobservable even in shadow mode and enforcement would have been a permanent silent
-no-op.
+1. Active plan → quota gate (skips credits / `can_upload`).
+2. Else if PAYG is marked inactive → 402 `AccountInactive`.
+3. Else try PAYG (credits + `can_upload`).
+4. If PAYG also fails and the account had an expired plan → 402 `PlanExpired`.
 
-**Measured blast radius: exactly ONE row in 3069 carries `billing == "plan"`** (checked twice, a day
-apart). Re-measure before assuming otherwise — every risk below scales with that number, and so does
-the "few tens of accounts" cost model this worker's design rests on.
+Pinned by `tests/unit/test_plans_cacher_worker.py::test_an_inactive_plan_row_falls_through_to_payg`
+and the account-middleware tests for `PlanExpired` / `AccountInactive`.
 
-The risks now accepted, **in both directions** — admission is not purely generous:
+The shrink guard still refuses a truncated scrape. Accounts this scrape classified as
+`expired_plan` are accounted for, so a real cancellation publishes rather than wedging the cacher
+on the old allowance. Pinned by `test_expired_plans_are_dropped_from_the_live_map`.
 
-1. A cancelled subscriber keeps their allowance until the check is restored.
-2. Admission also **imposes a cap** and removes the pay-as-you-go path. An admitted account that is
-   over its plan size but holds substrate credits used to upload fine via `can_upload`; with
-   enforcement on it is refused 402 until it deletes data *and* a cacher cycle re-counts.
-3. An admitted account whose quota is unknown — plan absent from the catalog, or a null/0/negative
-   `storage_bytes` — resolves to `catalog_miss`, which allows the write **and** skips `has_credits`
-   and `can_upload`. That is unmetered storage, not merely an unenforced quota.
-
-None of the three is reachable while `HIPPIUS_ENABLE_BILLING_PLANS` is off, which is how prod ships.
-Staging has it ON, so staging is where 2 and 3 would first appear.
-
-**When upstream confirms what `active` means, restore the check** — or switch to `next_charge` in
-the future, which is the field that actually tracked reality here. Pinned by
-`tests/unit/test_plans_cacher_worker.py::test_the_active_flag_is_not_consulted`, which is the test
-to invert.
-
-🚨 **A rollback needs `DEL hippius_s3_plan_accounts` on redis-accounts first.** Restoring the check
-admits ~nobody, so the new roll is empty over a live hash, the shrink guard refuses it, `run_cycle`
-swallows the raise — and the OLD wide roll keeps serving with `used_bytes` frozen at the moment of
-the revert. The deploy looks clean and nothing changes. Pinned by
-`test_restoring_the_active_check_is_wedged_by_the_shrink_guard`.
-
-**How you would know it is time:** every cycle logs `upstream_active=N` counted over every row in
-the payload. Nothing else reads the field, so that line is the only signal that upstream has started
-writing it. Alert on it going non-zero.
+Every cycle logs `upstream_active=N` (every row, not just plans) plus `expired_plan=` and
+`payg_inactive=`. A drop back to `upstream_active=0` is the signal that the field has gone dark
+again — the condition that made this check a silent no-op in PR #502.
 
 ```
-{namespace="hippius-s3-prod",app="plans-cacher"} |= "Published plan roll" != "upstream_active=0"
+{namespace="hippius-s3-prod",app="plans-cacher"} |= "Published plan roll"
 ```
 
 **Caching is unconditional.** This worker does not read `HIPPIUS_ENABLE_BILLING_PLANS` and is not
@@ -200,7 +175,8 @@ and 402ing them on their next upload:
 1. **Publication is a whole-hash build-then-`RENAME`.** `refresh_plan_roll_once` fetches EVERY page
    before publishing; a failure on page 7 of 20 leaves the live hash untouched.
 2. **An empty or heavily-shrunk roll is refused** (`MAX_ACCOUNT_MAP_SHRINK_RATIO`, 50%). One bad
-   upstream deploy returning a truncated-but-valid list must not wipe the fleet's plans.
+   upstream deploy returning a truncated-but-valid list must not wipe the fleet's plans. Accounts
+   this scrape classified as `expired_plan` are accounted for and do not count as a shrink.
 3. **No TTL, ever.** A TTL would delete the last-known-good map during exactly the outage it exists
    to survive.
 

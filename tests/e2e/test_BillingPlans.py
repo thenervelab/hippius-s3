@@ -94,7 +94,7 @@ def test_a_plan_account_still_uploads_while_enforcement_is_off(
                 "ss58": MOCK_ACCOUNT_ADDRESS,
                 "billing": "plan",
                 "plan": "pro",
-                "active": False,
+                "active": True,
                 "storage_bytes": 1,
             }
         ]
@@ -124,7 +124,7 @@ def test_an_over_quota_plan_account_can_still_delete(boto3_client: Any, plan_rol
                 "ss58": MOCK_ACCOUNT_ADDRESS,
                 "billing": "plan",
                 "plan": "pro",
-                "active": False,
+                "active": True,
                 "storage_bytes": 1,
             }
         ]
@@ -142,14 +142,11 @@ def test_an_over_quota_plan_account_can_still_delete(boto3_client: Any, plan_rol
 def test_an_account_reported_inactive_is_served_normally(
     boto3_client: Any, plan_roll: Any
 ) -> None:
-    """`active: false` is what upstream reports for EVERY account, live subscriptions included, so
-    it is not consulted — the account is admitted to the plan roll on billing="plan" alone.
+    """An expired plan (billing=plan, active=false) is not admitted to the quota map.
 
-    What this pins is that the inactive-flag row moves through the whole stack without upsetting
-    anything: it parses, it publishes, and the upload still succeeds. It deliberately does NOT
-    prove the admission decision — enforcement ships off, so an admitted plan account and a
-    pay-as-you-go one reach the same outcome here. That decision is pinned by
-    tests/unit/test_plans_cacher_worker.py::test_the_active_flag_is_not_consulted.
+    Enforcement is off in e2e, so the fallthrough to pay-as-you-go still succeeds. The admission
+    decision itself is pinned by
+    tests/unit/test_plans_cacher_worker.py::test_an_inactive_plan_row_falls_through_to_payg.
     """
     plan_roll(
         [
@@ -188,7 +185,7 @@ def test_the_upstream_endpoint_going_down_does_not_break_uploads(
                 "ss58": MOCK_ACCOUNT_ADDRESS,
                 "billing": "plan",
                 "plan": "pro",
-                "active": False,
+                "active": True,
                 "storage_bytes": 10 * TB,
             }
         ]

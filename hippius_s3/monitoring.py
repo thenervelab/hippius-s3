@@ -26,6 +26,12 @@ tracer = trace.get_tracer(__name__)
 # label cannot drift into unbounded cardinality.
 ChunkReadTier = Literal["local", "peer", "pool", "backend"]
 
+# How one backend chunk fetch ATTEMPT ended. `ok` is the same event as
+# chunk_reads_by_tier{tier=backend}; the failure values are what that counter cannot show: a drop
+# in backend reads is indistinguishable from a drop in demand until the fetches that were attempted
+# and did not complete are visible. Bounded in code so it cannot become a cardinality problem.
+BackendFetchOutcome = Literal["ok", "pool_timeout", "connect_timeout", "read_timeout", "error"]
+
 # Why a peer fetch did not happen, or its answer was not used. Closed by construction, like
 # ChunkReadTier. The reasons demand different responses and must stay distinguishable:
 # `client_cap` and `server_busy` are capacity; `peer_miss` is the peer having evicted the chunk
@@ -94,6 +100,8 @@ PlanGateOutcome = Literal[
     "deny",
     "catalog_miss",
     "unavailable",
+    "expired",
+    "inactive",
     # enforcement off (HIPPIUS_ENABLE_BILLING_PLANS=false): what the gate WOULD have decided, while
     # the request is actually billed pay-as-you-go. shadow_would_deny is the one to graph before
     # flipping the flag -- it is the count of uploads that would start failing.
@@ -131,6 +139,8 @@ class MetricsCollector:
         self._db_pool_size = 0
         self._db_pool_free = 0
         self._db_pool_used = 0
+        self._backend_fetch_inflight = 0
+        self._backend_fetch_waiting = 0
         self._setup_metrics()
 
     def _setup_metrics(self) -> None:
@@ -241,7 +251,13 @@ class MetricsCollector:
 
         self.chunk_reads_by_tier = self.meter.create_counter(
             name="chunk_reads_by_tier_total",
-            description="Chunk reads served, by storage tier (local|peer|pool)",
+            description="Chunk reads served, by storage tier (local|peer|pool|backend)",
+            unit="1",
+        )
+
+        self.backend_fetch_outcomes = self.meter.create_counter(
+            name="backend_fetch_outcomes_total",
+            description="Backend chunk fetch attempts by outcome (ok|pool_timeout|connect_timeout|read_timeout|error)",
             unit="1",
         )
 
@@ -403,6 +419,20 @@ class MetricsCollector:
             name="db_pool_used_connections",
             callbacks=[self._obs_db_pool_used],
             description="Database connection pool used connections",
+        )
+
+        # Per worker process (exported_instance separates them). A wedged worker shows inflight
+        # pinned at read_backend_fetch_concurrency while backend_fetch_outcomes_total{outcome="ok"}
+        # goes flat — the picture that was missing on 2026-09-19.
+        self.meter.create_observable_gauge(
+            name="backend_fetch_inflight",
+            callbacks=[self._obs_backend_fetch_inflight],
+            description="Backend chunk fetches currently holding a concurrency slot",
+        )
+        self.meter.create_observable_gauge(
+            name="backend_fetch_waiting",
+            callbacks=[self._obs_backend_fetch_waiting],
+            description="Backend chunk fetches waiting for a concurrency slot",
         )
 
         self.auth_cache_hits = self.meter.create_counter(
@@ -604,6 +634,16 @@ class MetricsCollector:
         self._db_pool_free = free
         self._db_pool_used = size - free
 
+    def _obs_backend_fetch_inflight(self, _: object) -> list[metrics.Observation]:
+        return [metrics.Observation(self._backend_fetch_inflight, {})]
+
+    def _obs_backend_fetch_waiting(self, _: object) -> list[metrics.Observation]:
+        return [metrics.Observation(self._backend_fetch_waiting, {})]
+
+    def update_backend_fetch_slots(self, inflight: int, waiting: int) -> None:
+        self._backend_fetch_inflight = inflight
+        self._backend_fetch_waiting = waiting
+
     def record_http_request(
         self,
         request: Request,
@@ -751,6 +791,10 @@ class MetricsCollector:
         cannot become a cardinality problem the way a caller-supplied string would.
         """
         self.chunk_reads_by_tier.add(1, attributes={"tier": tier})
+
+    def record_backend_fetch_outcome(self, outcome: BackendFetchOutcome) -> None:
+        """Count how one backend fetch attempt ended. `outcome` is a Literal, so bounded."""
+        self.backend_fetch_outcomes.add(1, attributes={"outcome": outcome})
 
     def record_uploader_operation(
         self,
@@ -952,6 +996,12 @@ class NullMetricsCollector:
         pass
 
     def record_chunk_read_tier(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_backend_fetch_outcome(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def update_backend_fetch_slots(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_aead_failure(self, *args: object, **kwargs: object) -> None:

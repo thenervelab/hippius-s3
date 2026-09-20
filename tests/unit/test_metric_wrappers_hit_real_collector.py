@@ -81,6 +81,19 @@ def _counter_total(reader: InMemoryMetricReader, name: str, attributes: Mapping[
     )
 
 
+def _gauge_value(reader: InMemoryMetricReader, name: str) -> int | None:
+    """Last observed value of gauge `name`, or None if it was never exported."""
+    data = reader.get_metrics_data()
+    if data is None:
+        return None
+    for resource_metric in data.resource_metrics:
+        for scope_metric in resource_metric.scope_metrics:
+            for metric in scope_metric.metrics:
+                if metric.name == name:
+                    return metric.data.data_points[-1].value
+    return None
+
+
 # (wrapper, args, exported counter name, labels the wrapper must attach).
 #
 # Held as a table because the completeness check below compares it against every wrapper in the
@@ -150,6 +163,13 @@ WRAPPERS: list[tuple[str, Callable[..., None], tuple[Any, ...], str, dict[str, s
         "chunk_reads_by_tier_total",
         {"tier": "backend"},
     ),
+    (
+        "hippius_s3/reader/backend_fetch.py::_record_backend_fetch_outcome",
+        backend_fetch._record_backend_fetch_outcome,
+        ("pool_timeout",),
+        "backend_fetch_outcomes_total",
+        {"outcome": "pool_timeout"},
+    ),
 ]
 
 
@@ -191,15 +211,48 @@ def test_a_drifted_collector_method_is_what_this_catches(
     assert _counter_total(reader, "chunk_reads_by_tier_total", {"tier": "pool"}) == before
 
 
+def test_publish_slots_moves_both_gauges(reader: InMemoryMetricReader) -> None:
+    # A gauge setter has the same silent-drift failure mode as the counter wrappers: rename
+    # the collector method and the gauges go quiet with nothing failing. Prove the chain moves.
+    backend_fetch._publish_slots(3, 1)
+    assert _gauge_value(reader, "backend_fetch_inflight") == 3
+    assert _gauge_value(reader, "backend_fetch_waiting") == 1
+
+
+# Gauge setters are covered by their own real-collector test above, not by the counter table.
+GAUGE_SETTERS: set[str] = {"hippius_s3/reader/backend_fetch.py::_publish_slots"}
+
+
+def _swallows_exceptions(fn: ast.FunctionDef) -> bool:
+    return any(
+        isinstance(handler.type, ast.Name) and handler.type.id in {"Exception", "BaseException"}
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Try)
+        for handler in node.handlers
+    )
+
+
+def _calls_collector_method(fn: ast.FunctionDef) -> bool:
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr.startswith(("record", "update", "set"))
+        for node in ast.walk(fn)
+    )
+
+
 def _wrappers_in_tree() -> set[str]:
-    """Every module-level `_record*` function that resolves a metrics collector."""
+    """Every module-level swallow-all wrapper, by structure rather than by name."""
+    # This is the module docstring's definition of a wrapper: it resolves the collector, calls one
+    # record_/update_/set_ method on it, and swallows Exception. Unwrapped call sites
+    # (`get_metrics_collector().record_x(...)` with no try) raise on drift, so they are out of scope.
     found: set[str] = set()
     for path in sorted(pathlib.Path("hippius_s3").rglob("*.py")):
         tree = ast.parse(path.read_text())
         for node in tree.body:
-            if not isinstance(node, ast.FunctionDef) or not node.name.startswith("_record"):
+            if not isinstance(node, ast.FunctionDef) or "get_metrics_collector" not in ast.dump(node):
                 continue
-            if "get_metrics_collector" in ast.dump(node):
+            if _swallows_exceptions(node) and _calls_collector_method(node):
                 found.add(f"{path.as_posix()}::{node.name}")
     return found
 
@@ -211,4 +264,4 @@ def test_every_wrapper_in_the_tree_is_covered() -> None:
     nothing able to observe any of them. Enumerating them by hand only stays honest if adding the
     seventh is what breaks.
     """
-    assert _wrappers_in_tree() == {site for site, *_ in WRAPPERS}
+    assert _wrappers_in_tree() == {site for site, *_ in WRAPPERS} | GAUGE_SETTERS

@@ -455,11 +455,9 @@ async def handle_get_object(
         )
 
     except DownloadNotReadyError as e:
-        error_msg = str(e)
-        if "Parts not ready" in error_msg:
-            logger.warning(f"GET {bucket_name}/{object_key}: parts not ready for download: {error_msg}")
-        else:
-            logger.warning(f"GET {bucket_name}/{object_key}: download not ready: {error_msg}")
+        # `cause=` is a literal key on purpose: it separates a tier that reported failure from a
+        # stall nothing bounded, so it must stay greppable.
+        logger.warning(f"GET {bucket_name}/{object_key}: not ready cause={e.cause}: {e}")
         account = getattr(request.state, "account", None)
         get_metrics_collector().record_error(
             error_type="download_not_ready",

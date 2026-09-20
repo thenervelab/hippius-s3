@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from typing import Any
 from typing import Callable
 
 import httpx
@@ -25,7 +26,9 @@ from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.arion_service import ArionClient
 from hippius_s3.services.arion_service import CanUploadResponse
+from hippius_s3.services.plans_cache import InactiveBilling
 from hippius_s3.services.plans_cache import PlanQuota
+from hippius_s3.services.plans_cache import get_inactive_billing
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 from hippius_s3.services.service_accounts import is_service_account
 from hippius_s3.utils import get_query
@@ -316,8 +319,9 @@ async def _check_plan_quota(
     """Storage-quota gate for accounts on a billing plan.
 
     Returns (handled, error_response). `handled` False means the caller must run the normal
-    pay-as-you-go path (credits + can_upload) -- because the account has no plan, because the caches
-    could not be consulted, or because HIPPIUS_ENABLE_BILLING_PLANS is off.
+    pay-as-you-go path (credits + can_upload) -- because the account has no plan, because the plan
+    expired, because the caches could not be consulted, or because HIPPIUS_ENABLE_BILLING_PLANS is
+    off. `handled` True with an error is a hard refuse (quota exceeded, or PAYG marked inactive).
     """
     redis_accounts = request.app.state.redis_accounts_client
 
@@ -333,6 +337,19 @@ async def _check_plan_quota(
     try:
         resolved = await plan_gate.resolve_plan(redis_accounts, account_address)
         if resolved is None:
+            if not config.enable_billing_plans:
+                return False, None
+            inactive = await _lookup_inactive(redis_accounts, account_address, logger)
+            if inactive is not None and inactive.reason == "payg_inactive":
+                get_metrics_collector().record_plan_gate(outcome="inactive")
+                return True, s3_error_response(
+                    code="AccountInactive",
+                    message=plan_gate.account_inactive_message(),
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    BucketName=first_path_segment(request),
+                )
+            if inactive is not None and inactive.reason == "expired_plan":
+                request.state.expired_plan = True
             return False, None
 
         quota = resolved
@@ -375,6 +392,42 @@ async def _check_plan_quota(
         )
 
     return True, None
+
+
+async def _lookup_inactive(
+    redis_accounts: Any,
+    account_address: str,
+    logger: logging.Logger | logging.LoggerAdapter,
+) -> InactiveBilling | None:
+    """Best-effort. A Redis blip here must not become a new 402 on an ordinary PAYG write."""
+    try:
+        return await get_inactive_billing(redis_accounts, account_address)
+    except Exception as e:
+        logger.warning(f"INACTIVE_LOOKUP unavailable account={account_address}: {e}; falling back to pay-as-you-go")
+        return None
+
+
+def _payg_denied_response(
+    request: Request,
+    account_address: str,
+    logger: logging.Logger | logging.LoggerAdapter,
+) -> Response:
+    if getattr(request.state, "expired_plan", False):
+        logger.warning(f"PLAN_EXPIRED account={account_address}; pay-as-you-go also refused")
+        get_metrics_collector().record_plan_gate(outcome="expired")
+        return s3_error_response(
+            code="PlanExpired",
+            message=plan_gate.plan_expired_message(),
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            BucketName=first_path_segment(request),
+        )
+    logger.warning(f"Access key account lacks credits: {account_address}")
+    return s3_error_response(
+        code="InsufficientAccountCredit",
+        message="The account does not have sufficient credit to perform this operation",
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        BucketName=first_path_segment(request),
+    )
 
 
 async def _check_can_upload(
@@ -567,16 +620,15 @@ async def account_middleware(
                     logger.debug(f"Checking credit for {request.method} operation: {path}")
 
                     if not request.state.account.has_credits:
-                        logger.warning(f"Access key account lacks credits: {account_address}")
-                        return s3_error_response(
-                            code="InsufficientAccountCredit",
-                            message="The account does not have sufficient credit to perform this operation",
-                            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                            BucketName=first_path_segment(request),
-                        )
+                        return _payg_denied_response(request, account_address, logger)
 
                     can_upload_error = await _check_can_upload(request, logger)
                     if can_upload_error is not None:
+                        if (
+                            getattr(request.state, "expired_plan", False)
+                            and can_upload_error.status_code == status.HTTP_402_PAYMENT_REQUIRED
+                        ):
+                            return _payg_denied_response(request, account_address, logger)
                         return can_upload_error
         except Exception as e:
             logger.exception(f"Error in access key account verification: {e}")
