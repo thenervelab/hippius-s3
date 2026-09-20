@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
 from typing import AsyncGenerator
+from typing import Literal
 
 from fastapi import Response
 from fastapi.responses import StreamingResponse
@@ -48,8 +49,24 @@ from hippius_s3.utils import get_query
 logger = logging.getLogger(__name__)
 
 
+# Why a read could not produce its first chunk. Bounded so it can be a log field and, later, a
+# metric label. `chunk_unavailable`: a tier reported failure — no backend location after the
+# wait, fetch budget saturated, a bounded backend timeout (the fetcher's own connect/read/pool
+# bounds sit inside the first-chunk bound, so a hung Arion fetch lands HERE with "timed out" in
+# the message), or every location failed. `first_chunk_timeout`: nothing reported a failure
+# before the reader's own bound — a stall the httpx bounds do not reach (a local tier read,
+# decrypt, or an env override that broke queue + connect + read < first — or a retried sequence
+# of transient Arion errors (5xx, connection reset), each attempt re-paying the slot wait and
+# backoff; check the `backend chunk fetch failed … retry=True` lines first). Rare by design; when
+# it fires, look outside the Arion client. The two need different responders; for 17 h in
+# 2026-09 they logged the same sentence.
+NotReadyCause = Literal["first_chunk_timeout", "chunk_unavailable"]
+
+
 class DownloadNotReadyError(Exception):
-    pass
+    def __init__(self, message: str, *, cause: NotReadyCause) -> None:
+        super().__init__(message)
+        self.cause: NotReadyCause = cause
 
 
 # Where each chunk of the plan can be fetched from when no local tier holds it, keyed by
@@ -307,14 +324,18 @@ async def read_response(
         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=first_timeout)
     except StopAsyncIteration:
         first_chunk = None  # empty (zero-byte) object — nothing to stream
-    except (TimeoutError, asyncio.TimeoutError, ChunkUnavailableError) as exc:
-        # ChunkUnavailableError: no tier could serve the chunk (nothing on a backend yet, or the
-        # backend fetch failed after its retries). Same retryable outcome as a timeout — a 503, not
-        # a 500.
+    except (TimeoutError, asyncio.TimeoutError) as exc:
         await gen.aclose()
         raise DownloadNotReadyError(
-            "Parts not ready: first chunk did not arrive within the initial stream timeout"
+            "Parts not ready: first chunk did not arrive within the initial stream timeout",
+            cause="first_chunk_timeout",
         ) from exc
+    except ChunkUnavailableError as exc:
+        # No tier could serve the chunk (nothing on a backend yet, or the backend fetch failed after
+        # its retries). Same retryable outcome as a timeout — a 503, not a 500 — but a different
+        # cause, and the fetcher's reason travels in the message so the log says which tier gave up.
+        await gen.aclose()
+        raise DownloadNotReadyError(f"Parts not ready: {exc}", cause="chunk_unavailable") from exc
 
     async def _body() -> AsyncGenerator[bytes, None]:
         nonlocal first_chunk
@@ -387,12 +408,16 @@ async def stream_object(
         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=float(cfg.stream_first_chunk_timeout_seconds))
     except StopAsyncIteration:
         first_chunk = None  # empty (zero-byte) source
-    except (TimeoutError, asyncio.TimeoutError, ChunkUnavailableError) as exc:
-        # See read_response: a terminal miss is retryable, so map it to 503 rather than a 500.
+    except (TimeoutError, asyncio.TimeoutError) as exc:
         await gen.aclose()
         raise DownloadNotReadyError(
-            "Parts not ready: source first chunk did not arrive within the initial stream timeout"
+            "Parts not ready: source first chunk did not arrive within the initial stream timeout",
+            cause="first_chunk_timeout",
         ) from exc
+    except ChunkUnavailableError as exc:
+        # See read_response: a terminal miss is retryable, so map it to 503 rather than a 500.
+        await gen.aclose()
+        raise DownloadNotReadyError(f"Parts not ready: source {exc}", cause="chunk_unavailable") from exc
 
     async def _bounded() -> AsyncGenerator[bytes, None]:
         if first_chunk is not None:
