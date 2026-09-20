@@ -75,13 +75,12 @@ class BackendChunkFetcher:
         base_sleep: float,
         jitter: float,
         queue_timeout: float | None = None,
+        attempt_budget_seconds: float = 0.0,
         reset_fn: Callable[[], Awaitable[None]] | None = None,
         reset_after_pool_timeouts: int = 3,
     ) -> None:
-        # reset_fn's contract: perform the client swap SYNCHRONOUSLY when called and return the
-        # deferred cleanup (closing the old client) as an awaitable. The fetcher calls it with no
-        # await between bumping the client generation and the call, which is what guarantees
-        # every attempt started after the bump runs on the new client.
+        # reset_fn's contract: swap the client SYNCHRONOUSLY when called and return the deferred
+        # cleanup (closing the old client) as an awaitable; see `_note_pool_timeout` for why.
         self._fetchers = fetchers
         self._semaphore = asyncio.Semaphore(max(1, int(concurrency)))
         # The semaphore exposes no occupancy, so the fetcher keeps its own count for the gauges.
@@ -92,17 +91,18 @@ class BackendChunkFetcher:
         self._base_sleep = float(base_sleep)
         self._jitter = float(jitter)
         self._queue_timeout = None if queue_timeout is None else float(queue_timeout)
+        # The worst case of one whole attempt (slot wait + pool wait + connect + read); a retry is
+        # only started when this much time, plus its backoff, remains before the caller's deadline.
+        self._attempt_budget = float(attempt_budget_seconds)
 
         self._reset_fn = reset_fn
         self._reset_after_pool_timeouts = max(1, int(reset_after_pool_timeouts))
         self._consecutive_pool_timeouts = 0
         self._reset_lock = asyncio.Lock()
 
-        # Bumped once per rebuild; a PoolTimeout is counted only against the generation of the
-        # client that produced it, so a burst on a wedged pool yields one rebuild, not one per
-        # waiter. Every pending close keeps a strong reference here (asyncio holds tasks weakly);
-        # a set, not a slot, because a second streak inside the 5 s close window would otherwise
-        # drop the first close on the floor.
+        # Bumped once per rebuild (see `_note_pool_timeout`). Every pending close keeps a strong
+        # reference here (asyncio holds tasks weakly); a set, not a slot, because a second streak
+        # inside the close window would otherwise drop the first close on the floor.
         self._generation = 0
         self._reset_tasks: set[asyncio.Task[None]] = set()
 
@@ -143,14 +143,23 @@ class BackendChunkFetcher:
         self._inflight -= 1
         _publish_slots(self._inflight, self._waiting)
 
-    async def fetch(self, locations: Iterable[BackendLocation], address: str) -> bytes:
+    async def fetch(
+        self, locations: Iterable[BackendLocation], address: str, *, deadline: float | None = None
+    ) -> bytes:
         """Return the chunk's ciphertext from the first location that serves it.
 
-        Locations are tried in the order given (the object's download-backend order). A fast
-        transient failure is retried on the same location with exponential backoff (a 429/5xx is
-        ridden out, not burnt through); a permanent one (a 404: the identifier is stale) moves on
-        to the next. A bounded timeout or a pool timeout is terminal for the whole request (see
+        Locations are tried in the order given (the object's download-backend order). A transient
+        failure — a 429/5xx, a connection reset, an httpx connect/read timeout — is retried on the
+        same location with exponential backoff; a permanent one (a 404: the identifier is stale)
+        moves on to the next. A pool timeout is terminal for the whole request (see
         `_attempt_once`). Exhausting every location is `ChunkUnavailableError`.
+
+        `deadline` is a loop-time instant (the caller's own bound on this chunk). No attempt after
+        the first is started unless a whole attempt's worst case (slot wait + pool wait + connect
+        + read, 24 s by default) plus its backoff still fits before it: a retry that the caller
+        would cancel halfway is a silent stall, and the point of the bounds is that a stall leaves
+        a line. With the 25 s first-chunk deadline that means the first chunk gets exactly one
+        attempt by design; later chunks (300 s) retry.
         """
         tried = 0
         for backend, identifier in locations:
@@ -158,26 +167,60 @@ class BackendChunkFetcher:
             if fetch_one is None:
                 continue
             tried += 1
+            if tried > 1:
+                self._require_budget(deadline, 0.0, backend=backend, identifier=identifier, attempt=1)
             for attempt in range(1, self._attempts + 1):
-                data, retry = await self._attempt_once(
+                data, retry, generation = await self._attempt_once(
                     fetch_one, backend=backend, identifier=identifier, address=address, attempt=attempt
                 )
                 if data is not None:
-                    self._consecutive_pool_timeouts = 0
+                    # A success only says something about the client it ran on: a fetch that
+                    # started under the old client must not clear the new client's streak.
+                    if generation == self._generation:
+                        self._consecutive_pool_timeouts = 0
                     _record_backend_read()
                     _record_backend_fetch_outcome("ok")
                     return data
-                if retry:
-                    await asyncio.sleep(self._base_sleep * (2 ** (attempt - 1)) + random.uniform(0, self._jitter))
-                    continue
-                break
+                if not retry:
+                    break
+                backoff = self._base_sleep * (2 ** (attempt - 1)) + random.uniform(0, self._jitter)
+                self._require_budget(deadline, backoff, backend=backend, identifier=identifier, attempt=attempt + 1)
+                await asyncio.sleep(backoff)
         raise ChunkUnavailableError(f"no backend served the chunk (locations tried: {tried})")
+
+    def _require_budget(
+        self, deadline: float | None, backoff: float, *, backend: str, identifier: str, attempt: int
+    ) -> None:
+        """Refuse to start another attempt that cannot finish before the caller's deadline.
+
+        The budget is the whole attempt, slot wait included: on the first chunk (25 s deadline,
+        24 s budget) no retry ever fits, which is the intended single-attempt rule.
+        """
+        if deadline is None:
+            return
+        left = deadline - asyncio.get_running_loop().time()
+        needed = self._attempt_budget + backoff
+        if left >= needed:
+            return
+        logger.warning(
+            "backend chunk fetch failed backend=%s id=%s attempt=%s/%s kind=deadline retry=False: "
+            "%.1fs left, attempt needs %.1fs",
+            backend,
+            identifier,
+            attempt,
+            self._attempts,
+            left,
+            needed,
+        )
+        raise ChunkUnavailableError(f"backend fetch out of time for {backend}: no budget for another attempt")
 
     async def _attempt_once(
         self, fetch_one: FetchOne, *, backend: str, identifier: str, address: str, attempt: int
-    ) -> tuple[bytes | None, bool]:
-        """One attempt under a concurrency slot: `(data, False)` on success, `(None, retry)` on a
-        classified failure, or `ChunkUnavailableError` when the failure is terminal for the request.
+    ) -> tuple[bytes | None, bool, int]:
+        """One attempt under a concurrency slot: `(data, False, generation)` on success,
+        `(None, retry, generation)` on a classified failure, or `ChunkUnavailableError` when the
+        failure is terminal for the request. `generation` is the client generation the attempt
+        ran under.
 
         Every failed attempt is logged at WARNING, retried or not — the point of the bounds is that
         a stall leaves a line.
@@ -187,7 +230,7 @@ class BackendChunkFetcher:
         try:
             data = await fetch_one(identifier, address)
         # PoolTimeout is a subclass of TimeoutException: this clause must come first, or pool
-        # saturation silently becomes a plain timeout and the client is never replaced.
+        # saturation becomes an ordinary retried timeout and the client is never replaced.
         except httpx.PoolTimeout as exc:
             # The pool is sized to the semaphore, so this cannot be "busy": connections are held by
             # something that is not a live fetch. Retrying or trying the next location re-queues
@@ -202,31 +245,26 @@ class BackendChunkFetcher:
             raise ChunkUnavailableError(
                 f"backend connection pool saturated (pool wait exceeded) for {backend}"
             ) from exc
-        except httpx.TimeoutException as exc:
-            # A bounded 4-14 s failure: a second attempt cannot finish inside the reader's
-            # first-chunk bound, so retrying only reproduces the silent cancel.
-            self._release_slot()
-            self._log_failed_attempt(
-                backend=backend, identifier=identifier, attempt=attempt, kind="timed_out", retry=False, exc=exc
-            )
-            _record_backend_fetch_outcome(_outcome_of(exc))
-            raise ChunkUnavailableError(f"backend fetch timed out for {backend}: {exc}") from exc
         except Exception as exc:  # noqa: BLE001 - every backend error is classified below
             self._release_slot()
-            kind = classify_download_error(exc)
-            retry = kind == "transient" and attempt != self._attempts
+            outcome = _outcome_of(exc)
+            classified = classify_download_error(exc)
+            retry = classified == "transient" and attempt != self._attempts
+            # A timeout is logged under its outcome label (connect_timeout / read_timeout) so the
+            # log line and the metric share one vocabulary; everything else under its class.
+            kind = classified if outcome == "error" else outcome
             self._log_failed_attempt(
                 backend=backend, identifier=identifier, attempt=attempt, kind=kind, retry=retry, exc=exc
             )
-            _record_backend_fetch_outcome("error")
-            return None, retry
+            _record_backend_fetch_outcome(outcome)
+            return None, retry, generation
         except BaseException:
             # Cancellation (a client that disconnected mid-fetch) must give the slot back too.
             self._release_slot()
             raise
 
         self._release_slot()
-        return data, False
+        return data, False, generation
 
     def _log_failed_attempt(
         self, *, backend: str, identifier: str, attempt: int, kind: str, retry: bool, exc: Exception
@@ -275,15 +313,17 @@ class BackendChunkFetcher:
             return
 
         logger.error(
-            "backend fetch pool saturated %s times in a row; replaced the Arion client",
+            "backend fetch pool saturated %s times in a row; replaced the Arion client (inflight=%s waiting=%s)",
             self._reset_after_pool_timeouts,
+            self._inflight,
+            self._waiting,
         )
-        await self._finish_reset_detached(pending)
+        self._detach_reset(pending)
 
-    async def _finish_reset_detached(self, pending: Awaitable[None]) -> None:
-        """Run the deferred half of a reset (closing the old client) as its own task so the
-        requester that tripped it cannot abort it: the requester is a GET that may disconnect at
-        any moment, and shielding decouples recovery from it."""
+    def _detach_reset(self, pending: Awaitable[None]) -> None:
+        """Run the deferred half of a reset (closing the old client) as its own task. The requester
+        that tripped it is a GET that may disconnect at any moment and whose 503 must not wait on
+        a wedged pool's close, so nothing awaits the task; the done-callback reports on it."""
 
         async def run() -> None:
             # create_task wants a coroutine; reset_fn only promises an awaitable.
@@ -293,12 +333,6 @@ class BackendChunkFetcher:
         self._reset_tasks.add(task)
         task.add_done_callback(self._reset_tasks.discard)
         task.add_done_callback(_log_reset_failure)
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            raise  # the requester is gone; the reset keeps running
-        except Exception:  # noqa: BLE001 - a failed reset must not mask the fetch failure
-            pass  # logged by the done-callback
 
 
 def _log_reset_failure(task: asyncio.Task[None]) -> None:
@@ -392,19 +426,17 @@ def fetch_client_settings(cfg: Any) -> tuple[httpx.Timeout, httpx.Limits]:
     read = float(cfg.read_backend_fetch_read_timeout_seconds)
     pool = float(cfg.read_backend_fetch_pool_timeout_seconds)
 
-    # The slot wait precedes the httpx bounds, so one attempt's worst case is queue + connect + read.
-    if queue + connect + read >= first:
+    # One attempt's worst case is the slot wait, then httpx's pool wait (a partially wedged pool
+    # waits up to `pool` without raising), then connect + read; all of it must fail before the
+    # reader's first-chunk bound cancels it silently.
+    if queue + pool + connect + read >= first:
         raise ValueError(
             "HIPPIUS_READ_BACKEND_FETCH_QUEUE_TIMEOUT_SECONDS + "
+            "HIPPIUS_READ_BACKEND_FETCH_POOL_TIMEOUT_SECONDS + "
             "HIPPIUS_READ_BACKEND_FETCH_CONNECT_TIMEOUT_SECONDS + "
-            f"HIPPIUS_READ_BACKEND_FETCH_READ_TIMEOUT_SECONDS ({queue} + {connect} + {read}) must be "
+            f"HIPPIUS_READ_BACKEND_FETCH_READ_TIMEOUT_SECONDS ({queue} + {pool} + {connect} + {read}) must be "
             f"below HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS ({first}); otherwise the reader cancels "
             "the fetch before httpx can fail it, and the failure is silent"
-        )
-    if pool >= first:
-        raise ValueError(
-            f"HIPPIUS_READ_BACKEND_FETCH_POOL_TIMEOUT_SECONDS ({pool}) must be below "
-            f"HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS ({first})"
         )
 
     # Pool == semaphore: a healthy process never queues at the pool, so a PoolTimeout can only
@@ -419,15 +451,16 @@ def fetch_client_settings(cfg: Any) -> tuple[httpx.Timeout, httpx.Limits]:
 class _ReplaceableArionClient:
     """Holds the read path's ArionClient so the fetcher can swap it for a fresh one.
 
-    `reset` builds the replacement FIRST and swaps it in synchronously, so every attempt that starts
-    after the fetcher's generation bump sees the new client with no scheduler tick in between. Only
-    the close of the old client is deferred, and it runs under a bound: a wedged pool may not close
-    promptly, and the reason we are here is that waiting on it is not safe.
+    `reset` builds the replacement FIRST and swaps it in synchronously (the fetcher's generation
+    gate relies on that). Only the close of the old client is deferred: it drains first, then
+    closes under a bound, because a wedged pool may not close promptly and waiting on it is the
+    one thing the reset must not do.
     """
 
-    def __init__(self, make: Callable[[], Any]) -> None:
+    def __init__(self, make: Callable[[], Any], *, drain_seconds: float = 17.0) -> None:
         self._make = make
         self._client = make()
+        self._drain_seconds = float(drain_seconds)
 
     @property
     def client(self) -> Any:
@@ -436,12 +469,23 @@ class _ReplaceableArionClient:
     def reset(self) -> Awaitable[None]:
         """Swap in a fresh client now; return the deferred close of the old one.
 
-        A failing `make()` raises here and leaves the previous client installed.
+        A failing `make()` raises here and leaves the previous client installed. The old pool's
+        state is logged before the swap: it is the only evidence of what was holding the
+        connections, and it goes away with the client.
         """
-        old, self._client = self._client, self._make()
+        old = self._client
+        take_snapshot = getattr(old, "pool_snapshot", None)
+        snapshot = take_snapshot() if take_snapshot is not None else "unavailable"
+        self._client = self._make()
+        logger.error("replacing the Arion client; old pool %s", snapshot)
         return self._close_old(old)
 
     async def _close_old(self, old: Any) -> None:
+        # The old client still carries healthy in-flight fetches (only the pool is wedged, not
+        # every connection). The drain covers a pool wait plus one wire attempt (pool + connect
+        # + read + 1); a slow but healthy body can outlive it, which is acceptable: that fetch
+        # fails as a transient error and retries on the new client.
+        await asyncio.sleep(self._drain_seconds)
         try:
             await asyncio.wait_for(old.close(), timeout=_OLD_CLIENT_CLOSE_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001 - the old client is already unreferenced
@@ -453,7 +497,13 @@ def _build_fetcher() -> BackendChunkFetcher:
 
     cfg: Any = get_config()
     timeout, limits = fetch_client_settings(cfg)
-    holder = _ReplaceableArionClient(lambda: ArionClient(timeout=timeout, limits=limits))
+    queue = float(cfg.read_backend_fetch_queue_timeout_seconds)
+    wire = (
+        float(cfg.read_backend_fetch_pool_timeout_seconds)
+        + float(cfg.read_backend_fetch_connect_timeout_seconds)
+        + float(cfg.read_backend_fetch_read_timeout_seconds)
+    )
+    holder = _ReplaceableArionClient(lambda: ArionClient(timeout=timeout, limits=limits), drain_seconds=wire + 1.0)
 
     async def arion_fetch(identifier: str, address: str) -> bytes:
         return b"".join([piece async for piece in holder.client.download_file(identifier, address)])
@@ -465,6 +515,7 @@ def _build_fetcher() -> BackendChunkFetcher:
         base_sleep=float(cfg.read_backend_fetch_retry_base_seconds),
         jitter=float(cfg.read_backend_fetch_retry_jitter_seconds),
         queue_timeout=float(cfg.read_backend_fetch_queue_timeout_seconds),
+        attempt_budget_seconds=queue + wire,
         reset_fn=holder.reset,
         reset_after_pool_timeouts=int(cfg.read_backend_fetch_client_reset_after_pool_timeouts),
     )

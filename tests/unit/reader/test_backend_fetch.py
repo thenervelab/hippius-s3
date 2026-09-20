@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
+from collections.abc import Callable
 from collections.abc import Coroutine
 from typing import Any
 from unittest.mock import patch
@@ -221,21 +222,135 @@ async def test_a_pool_timeout_is_not_retried_and_does_not_try_the_next_location(
     assert calls == ["arion"]
 
 
+def _read_timeout_then_success() -> tuple[Callable[[str, str], Awaitable[bytes]], list[str]]:
+    calls: list[str] = []
+
+    async def flaky(identifier: str, address: str) -> bytes:
+        calls.append("arion")
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("slow")
+        return b"cipher"
+
+    return flaky, calls
+
+
 @pytest.mark.asyncio
-async def test_a_bounded_timeout_is_not_retried_within_the_fetch() -> None:
-    # After a 4-14 s bounded failure a second attempt cannot finish inside the reader's 25 s
-    # first-chunk bound; retrying only reproduces the silent cancel the bounds exist to remove.
-    import httpx
+async def test_a_read_timeout_is_retried_when_the_deadline_allows(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A mid-stream chunk has stream_chunk_timeout_seconds (300 s) of budget: one 10 s read stall
+    # must not truncate a committed 200 body when a second attempt fits comfortably.
+    from hippius_s3.reader import backend_fetch
+
+    seen: list[str] = []
+    monkeypatch.setattr(backend_fetch, "_record_backend_fetch_outcome", seen.append)
+    flaky, calls = _read_timeout_then_success()
+
+    fetcher = BackendChunkFetcher(
+        {"arion": flaky}, concurrency=4, attempts=3, base_sleep=0.0, jitter=0.0, attempt_budget_seconds=24.0
+    )
+    deadline = asyncio.get_running_loop().time() + 300.0
+    assert await fetcher.fetch([("arion", "a")], "addr", deadline=deadline) == b"cipher"
+    assert calls == ["arion", "arion"]
+    assert seen == ["read_timeout", "ok"]
+
+
+@pytest.mark.asyncio
+async def test_a_read_timeout_is_not_retried_when_no_attempt_fits_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The first chunk carries the reader's 25 s bound. A whole attempt is 24 s (slot wait + pool
+    # wait + connect + read), so once anything has failed another attempt cannot finish before it:
+    # retrying would only reproduce the silent cancel the bounds exist to remove, so the fetch
+    # fails now, with a line.
+    import logging
+
+    from hippius_s3.reader import backend_fetch
+
+    seen: list[str] = []
+    monkeypatch.setattr(backend_fetch, "_record_backend_fetch_outcome", seen.append)
+    flaky, calls = _read_timeout_then_success()
+
+    fetcher = BackendChunkFetcher(
+        {"arion": flaky}, concurrency=4, attempts=3, base_sleep=0.0, jitter=0.0, attempt_budget_seconds=24.0
+    )
+    deadline = asyncio.get_running_loop().time() + 20.0
+    with caplog.at_level(logging.WARNING, logger="hippius_s3.reader.backend_fetch"):
+        with pytest.raises(ChunkUnavailableError, match="out of time"):
+            await fetcher.fetch([("arion", "a")], "addr", deadline=deadline)
+    assert calls == ["arion"], "no second attempt was started"
+    assert seen == ["read_timeout"]
+    deadline_lines = [r.getMessage() for r in caplog.records if "kind=deadline" in r.getMessage()]
+    assert len(deadline_lines) == 1
+    assert "retry=False" in deadline_lines[0] and "attempt needs 24.0s" in deadline_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_a_retry_is_refused_when_the_slot_wait_alone_could_overrun_the_deadline(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The budget counts the slot wait, not only the wire: a retry that could sit 8 s in the queue
+    # before its 16 s of httpx bounds even start does not fit in 20 s, whether or not the queue
+    # is busy right now.
+    import logging
 
     calls: list[str] = []
 
-    async def slow(identifier: str, address: str) -> bytes:
+    async def flaky(identifier: str, address: str) -> bytes:
         calls.append("arion")
-        raise httpx.ReadTimeout("slow")
+        if len(calls) == 1:
+            raise ConnectionError("blip")
+        return b"cipher"
 
-    with pytest.raises(ChunkUnavailableError, match="timed out"):
-        await _fetcher({"arion": slow}, attempts=3).fetch([("arion", "a")], "addr")
-    assert calls == ["arion"]
+    fetcher = BackendChunkFetcher(
+        {"arion": flaky},
+        concurrency=1,
+        attempts=3,
+        base_sleep=0.0,
+        jitter=0.0,
+        queue_timeout=8.0,
+        attempt_budget_seconds=24.0,
+    )
+    deadline = asyncio.get_running_loop().time() + 20.0
+    with caplog.at_level(logging.WARNING, logger="hippius_s3.reader.backend_fetch"):
+        with pytest.raises(ChunkUnavailableError, match="out of time"):
+            await fetcher.fetch([("arion", "a")], "addr", deadline=deadline)
+    assert calls == ["arion"], "the transient failure was not retried"
+    assert any("kind=deadline" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_no_deadline_means_the_old_retry_behaviour() -> None:
+    flaky, calls = _read_timeout_then_success()
+
+    fetcher = BackendChunkFetcher(
+        {"arion": flaky}, concurrency=4, attempts=3, base_sleep=0.0, jitter=0.0, attempt_budget_seconds=24.0
+    )
+    assert await fetcher.fetch([("arion", "a")], "addr") == b"cipher"
+    assert calls == ["arion", "arion"]
+
+
+@pytest.mark.asyncio
+async def test_a_second_location_is_not_tried_when_no_attempt_fits_the_deadline() -> None:
+    # Moving to the next location is an attempt too; without budget for it the request fails
+    # with the same "out of time" reason rather than starting a fetch the caller will cancel.
+    from hippius_s3.services.hippius_api_service import HippiusAPIError
+
+    tried: list[str] = []
+
+    async def gone(identifier: str, address: str) -> bytes:
+        tried.append("arion")
+        raise HippiusAPIError("404 not found")
+
+    async def ok(identifier: str, address: str) -> bytes:
+        tried.append("ovh")
+        return b"cipher"
+
+    fetcher = BackendChunkFetcher(
+        {"arion": gone, "ovh": ok}, concurrency=4, attempts=3, base_sleep=0.0, jitter=0.0, attempt_budget_seconds=24.0
+    )
+    deadline = asyncio.get_running_loop().time() + 20.0
+    with pytest.raises(ChunkUnavailableError, match="out of time for ovh"):
+        await fetcher.fetch([("arion", "a"), ("ovh", "o")], "addr", deadline=deadline)
+    assert tried == ["arion"]
 
 
 @pytest.mark.asyncio
@@ -326,6 +441,53 @@ async def test_a_successful_fetch_ends_the_pool_timeout_streak() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_success_from_the_old_client_does_not_clear_the_new_streak() -> None:
+    # A fetch that started on the old client and finishes after the swap says nothing about the
+    # replacement; letting it zero the counter would hide a still-wedged new client.
+    import httpx
+
+    resets: list[int] = []
+
+    def reset() -> Awaitable[None]:
+        resets.append(1)
+        return asyncio.sleep(0)
+
+    gate = asyncio.Event()
+
+    async def arion(identifier: str, address: str) -> bytes:
+        if identifier == "slow":
+            await gate.wait()
+            return b"cipher"
+        raise httpx.PoolTimeout("pool")
+
+    fetcher = BackendChunkFetcher(
+        {"arion": arion},
+        concurrency=4,
+        attempts=1,
+        base_sleep=0.0,
+        jitter=0.0,
+        reset_fn=reset,
+        reset_after_pool_timeouts=2,
+    )
+    slow = asyncio.create_task(fetcher.fetch([("arion", "slow")], "addr"))
+    await asyncio.sleep(0)  # `slow` holds its slot and captured generation 0
+
+    for _ in range(2):
+        with pytest.raises(ChunkUnavailableError):
+            await fetcher.fetch([("arion", "stuck")], "addr")
+    assert resets == [1]
+    with pytest.raises(ChunkUnavailableError):
+        await fetcher.fetch([("arion", "stuck")], "addr")  # first of the new streak
+
+    gate.set()
+    assert await slow == b"cipher"
+
+    with pytest.raises(ChunkUnavailableError):
+        await fetcher.fetch([("arion", "stuck")], "addr")  # second of the new streak
+    assert resets == [1, 1], "the old-generation success did not restart the new client's streak"
+
+
+@pytest.mark.asyncio
 async def test_reset_swaps_in_a_fresh_client_before_closing_the_old_one() -> None:
     from hippius_s3.reader.backend_fetch import _ReplaceableArionClient
 
@@ -341,13 +503,68 @@ async def test_reset_swaps_in_a_fresh_client_before_closing_the_old_one() -> Non
             assert holder.client is not self
             events.append(f"close-{self.n}")
 
+        def pool_snapshot(self) -> str:
+            return f"snapshot-{self.n}"
+
     counter = iter(range(1, 10))
-    holder = _ReplaceableArionClient(lambda: FakeClient(next(counter)))
+    holder = _ReplaceableArionClient(lambda: FakeClient(next(counter)), drain_seconds=0.0)
     first = holder.client
     await holder.reset()
     assert holder.client is not first
     assert holder.client.n == 2
     assert events == ["close-1"]
+
+
+@pytest.mark.asyncio
+async def test_reset_logs_the_old_pool_before_the_swap(caplog: pytest.LogCaptureFixture) -> None:
+    # The snapshot is the only evidence of what was holding the connections; it must be taken
+    # from the client being replaced, not the fresh one.
+    import logging
+
+    from hippius_s3.reader.backend_fetch import _ReplaceableArionClient
+
+    class FakeClient:
+        def __init__(self, n: int) -> None:
+            self.n = n
+
+        async def close(self) -> None:
+            pass
+
+        def pool_snapshot(self) -> str:
+            return f"connections={self.n}"
+
+    counter = iter(range(1, 10))
+    holder = _ReplaceableArionClient(lambda: FakeClient(next(counter)), drain_seconds=0.0)
+    with caplog.at_level(logging.ERROR, logger="hippius_s3.reader.backend_fetch"):
+        await holder.reset()
+    lines = [r.getMessage() for r in caplog.records if "replacing the Arion client" in r.getMessage()]
+    assert lines == ["replacing the Arion client; old pool connections=1"]
+
+
+@pytest.mark.asyncio
+async def test_the_old_client_drains_before_it_is_closed() -> None:
+    # Only the pool is wedged, not every connection: the old client's healthy in-flight fetches
+    # get one attempt's worst case to finish before the close kills them.
+    from hippius_s3.reader.backend_fetch import _ReplaceableArionClient
+
+    closed = asyncio.Event()
+
+    class FakeClient:
+        async def close(self) -> None:
+            closed.set()
+
+        def pool_snapshot(self) -> str:
+            return "fake"
+
+    holder = _ReplaceableArionClient(FakeClient, drain_seconds=0.2)
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    pending = asyncio.ensure_future(holder.reset())
+    await asyncio.sleep(0.05)
+    assert not closed.is_set(), "closed before the drain elapsed"
+    await pending
+    assert closed.is_set()
+    assert loop.time() - t0 >= 0.2
 
 
 @pytest.mark.asyncio
@@ -357,6 +574,9 @@ async def test_a_failed_rebuild_keeps_the_previous_client_and_raises() -> None:
     class Fine:
         async def close(self) -> None:
             raise AssertionError("the old client must not be closed when its replacement failed to build")
+
+        def pool_snapshot(self) -> str:
+            return "fine"
 
     def make() -> Fine:
         if made:
@@ -455,17 +675,15 @@ async def test_a_burst_of_pool_timeouts_rebuilds_the_client_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_requester_cancelled_mid_reset_releases_its_slot_and_the_reset_completes() -> None:
-    # The reset is decoupled from the GET that tripped it: a client disconnecting while the rebuild
-    # runs must neither abort the rebuild nor leak the slot its fetch held.
+async def test_the_tripping_requester_does_not_wait_for_the_old_client_to_close() -> None:
+    # The requester is a GET whose 503 must not wait on a wedged pool's close: the swap is
+    # synchronous and the close is its own task, which outlives the requester.
     import httpx
 
-    started = asyncio.Event()
     release = asyncio.Event()
     events: list[str] = []
 
     async def close_old() -> None:
-        started.set()
         await release.wait()
         events.append("closed")
 
@@ -485,17 +703,15 @@ async def test_a_requester_cancelled_mid_reset_releases_its_slot_and_the_reset_c
         reset_fn=reset,
         reset_after_pool_timeouts=1,
     )
-    task = asyncio.create_task(fetcher.fetch([("arion", "a")], "addr"))
-    await started.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert fetcher._inflight == 0, "the cancelled fetch gave its slot back"
+    with pytest.raises(ChunkUnavailableError, match="pool saturated"):
+        await fetcher.fetch([("arion", "a")], "addr")
+    assert events == ["swapped"], "the requester returned while the old client was still open"
+    assert fetcher._inflight == 0, "the failed fetch gave its slot back"
+    assert len(fetcher._reset_tasks) == 1, "the deferred close is held while it runs"
 
     release.set()
-    assert len(fetcher._reset_tasks) == 1, "the deferred close is held while it runs"
     await asyncio.gather(*fetcher._reset_tasks)
-    assert events == ["swapped", "closed"], "the deferred close outlived the requester that tripped it"
+    assert events == ["swapped", "closed"], "the deferred close completed on its own"
     assert fetcher._reset_tasks == set(), "a finished close is dropped from the store"
 
 
@@ -507,9 +723,15 @@ async def test_reset_does_not_wait_forever_on_a_client_that_will_not_close() -> 
         async def close(self) -> None:
             await asyncio.sleep(3600)
 
+        def pool_snapshot(self) -> str:
+            return "hanging"
+
     class Fresh:
         async def close(self) -> None:
             pass
+
+        def pool_snapshot(self) -> str:
+            return "fresh"
 
     async def gave_up(awaitable: Coroutine[Any, Any, None], **_bound: float) -> None:
         # Stand in for the bound expiring; close the coroutine so the loop does not warn that
@@ -518,7 +740,7 @@ async def test_reset_does_not_wait_forever_on_a_client_that_will_not_close() -> 
         raise asyncio.TimeoutError
 
     made = iter([Hanging(), Fresh()])
-    holder = _ReplaceableArionClient(lambda: next(made))
+    holder = _ReplaceableArionClient(lambda: next(made), drain_seconds=0.0)
     with patch("hippius_s3.reader.backend_fetch.asyncio.wait_for", gave_up):
         await holder.reset()  # must return, not raise
     assert isinstance(holder.client, Fresh)
@@ -548,7 +770,9 @@ async def test_each_attempt_records_its_outcome(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.asyncio
-async def test_terminal_timeouts_record_their_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_timeouts_record_their_outcome_per_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Connect and read timeouts are retried (no deadline here), so each attempt counts under its
+    # own label; a PoolTimeout is terminal, so it counts once.
     import httpx
 
     from hippius_s3.reader import backend_fetch
@@ -568,7 +792,25 @@ async def test_terminal_timeouts_record_their_outcome(monkeypatch: pytest.Monkey
     for fetch_one in (slow, unreachable, stuck):
         with pytest.raises(ChunkUnavailableError):
             await _fetcher({"arion": fetch_one}, attempts=3).fetch([("arion", "a")], "addr")
-    assert seen == ["read_timeout", "connect_timeout", "pool_timeout"]
+    assert seen == ["read_timeout"] * 3 + ["connect_timeout"] * 3 + ["pool_timeout"]
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_attempt_is_logged_under_its_outcome_label(caplog: pytest.LogCaptureFixture) -> None:
+    # The log line and the metric share one vocabulary, so a responder can grep for the label
+    # the dashboard shows.
+    import logging
+
+    import httpx
+
+    async def slow(identifier: str, address: str) -> bytes:
+        raise httpx.ReadTimeout("slow")
+
+    with caplog.at_level(logging.WARNING, logger="hippius_s3.reader.backend_fetch"):
+        with pytest.raises(ChunkUnavailableError):
+            await _fetcher({"arion": slow}, attempts=2).fetch([("arion", "a")], "addr")
+    kinds = [r.getMessage().split("kind=")[1].split(" ")[0] for r in caplog.records if "kind=" in r.getMessage()]
+    assert kinds == ["read_timeout", "read_timeout"]
 
 
 @pytest.mark.parametrize(

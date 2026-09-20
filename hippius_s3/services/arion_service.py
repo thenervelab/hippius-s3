@@ -304,6 +304,33 @@ class ArionClient:
         """Close the HTTP client."""
         await self._client.aclose()
 
+    def pool_snapshot(self) -> str:
+        """One line of the connection pool's state by connection, for the reset log.
+
+        Reads httpx/httpcore private attributes on purpose (`_transport._pool.connections`, pinned
+        httpx 0.28.1 / httpcore 1.0.9): diagnostic only, never load-bearing, and "unavailable"
+        rather than an exception when the shape differs.
+        """
+        try:
+            transport = self._client._transport
+            if not isinstance(transport, httpx.AsyncHTTPTransport):
+                return "unavailable"
+            counts = {"idle": 0, "expired": 0, "closed": 0, "in_use": 0}
+            pool: Any = transport._pool  # httpcore.AsyncConnectionPool; not a declared dependency
+            connections = list(pool.connections)
+            for conn in connections:
+                if conn.is_closed():
+                    counts["closed"] += 1
+                elif conn.has_expired():
+                    counts["expired"] += 1
+                elif conn.is_idle():
+                    counts["idle"] += 1
+                else:
+                    counts["in_use"] += 1
+            return f"connections={len(connections)} " + " ".join(f"{k}={v}" for k, v in counts.items())
+        except Exception:  # noqa: BLE001 - a diagnostic must never fail the reset it describes
+            return "unavailable"
+
     def _get_headers(self, account_ss58: str) -> Dict[str, str]:
         """
         Get HTTP headers with authentication.

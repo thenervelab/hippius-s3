@@ -558,20 +558,17 @@ class Config:
         "HIPPIUS_READ_BACKEND_FETCH_RETRY_JITTER_SECONDS:0.25", convert=float
     )
     # How long a fetch may wait for a slot in the pod's concurrency budget before it gives up
-    # (a retryable 503 on the first chunk). Below the 25 s first-chunk timeout by design, so a
-    # saturated budget fails fast and visibly instead of every queued read timing out in lockstep.
-    # The slot wait runs BEFORE the fetch's own httpx bounds start, so queue + connect + read
-    # together must stay below the first-chunk bound (validated in fetch_client_settings).
+    # (a retryable 503 on the first chunk), so a saturated budget fails fast and visibly instead
+    # of every queued read timing out in lockstep at the first-chunk bound.
     read_backend_fetch_queue_timeout_seconds: float = env(
-        "HIPPIUS_READ_BACKEND_FETCH_QUEUE_TIMEOUT_SECONDS:10", convert=float
+        "HIPPIUS_READ_BACKEND_FETCH_QUEUE_TIMEOUT_SECONDS:8", convert=float
     )
-    # Per-operation bounds for the read path's OWN ArionClient (reader/backend_fetch.py). These
-    # must all finish inside stream_first_chunk_timeout_seconds: a fetch that httpx times out is an
-    # ordinary exception (logged, counted, connection closed on httpx's shielded path), whereas a
-    # fetch the reader has to cancel at 25 s is silent and leaves cleanup to cancellation
-    # semantics — which is how one pod's poisoned pool went unnoticed for 17 h (2026-09-19).
-    # `read` is a per-read-operation stall bound, not a whole-body budget: a healthy 4 MiB chunk
-    # streams in ~0.5 s, so 10 s only trips on a dead connection.
+    # Per-operation bounds for the read path's OWN ArionClient (reader/backend_fetch.py).
+    # Invariant, validated at boot: queue + pool + connect + read < stream_first_chunk_timeout_seconds
+    # (8 + 2 + 4 + 10 = 24 < 25), so one attempt fails as a logged, counted httpx exception before
+    # the reader cancels it silently (how one pod's poisoned pool went unnoticed for 17 h, 2026-09-19).
+    # `read` is a per-read-operation stall bound, not a whole-body budget; pool == semaphore, so a
+    # healthy pool never waits and 2 s is generous.
     read_backend_fetch_connect_timeout_seconds: float = env(
         "HIPPIUS_READ_BACKEND_FETCH_CONNECT_TIMEOUT_SECONDS:4.0", convert=float
     )
@@ -579,7 +576,7 @@ class Config:
         "HIPPIUS_READ_BACKEND_FETCH_READ_TIMEOUT_SECONDS:10.0", convert=float
     )
     read_backend_fetch_pool_timeout_seconds: float = env(
-        "HIPPIUS_READ_BACKEND_FETCH_POOL_TIMEOUT_SECONDS:4.0", convert=float
+        "HIPPIUS_READ_BACKEND_FETCH_POOL_TIMEOUT_SECONDS:2.0", convert=float
     )
     # Consecutive httpx.PoolTimeouts before the fetcher throws its client away and builds a new
     # one. The pool is sized to the semaphore, so a PoolTimeout means connections are stuck, not

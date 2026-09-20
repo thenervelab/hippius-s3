@@ -465,7 +465,7 @@ async def test_a_poisoned_local_chunk_with_no_pool_copy_recovers_from_the_backen
     await _write_part(dual, [POISON_TAG, good[1]])
     fetched: list[tuple[int, int]] = []
 
-    async def fetch_missing(item: ChunkPlanItem) -> bytes:
+    async def fetch_missing(item: ChunkPlanItem, *, deadline: float | None = None) -> bytes:
         fetched.append((int(item.part_number), int(item.chunk_index)))
         return good[int(item.chunk_index)]
 
@@ -504,7 +504,7 @@ async def test_a_poisoned_only_copy_is_never_unlinked(tmp_path: Path) -> None:
     dual = _dual(tmp_path)
     await _write_part(dual, [POISON_TAG, _good()[1]])
 
-    async def fetch_missing(item: ChunkPlanItem) -> bytes:
+    async def fetch_missing(item: ChunkPlanItem, *, deadline: float | None = None) -> bytes:
         raise AssertionError("nothing should be fetched: the local copy was not dropped")
 
     collector = MagicMock()

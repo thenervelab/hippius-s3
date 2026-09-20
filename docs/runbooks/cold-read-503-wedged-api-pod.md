@@ -76,15 +76,18 @@ The line is `GET <bucket>/<key>: not ready cause=<cause>: <message>`. Read `caus
 the part people get backwards:
 
 - `chunk_unavailable`: a tier REPORTED failure. Covers no backend location after the wait, fetch
-  budget saturated (`backend fetch budget saturated for 10s`), a bounded backend timeout, the pool
-  (`backend connection pool saturated`), or every location failed. Because the fetcher's bounds sit
-  inside the 25 s first-chunk bound, **a hung Arion fetch lands here with "timed out" in the
-  message** (`backend fetch timed out for arion: ...`).
+  budget saturated (`backend fetch budget saturated for 8s`), the pool
+  (`backend connection pool saturated`), every location failed, or the fetcher running out of time
+  for another attempt. The first chunk carries the reader's 25 s bound as a deadline into the
+  fetcher, and a retry is started only if a whole attempt (queue + pool + connect + read = 24 s)
+  plus its backoff still fits, so the first chunk gets exactly one attempt and **a hung Arion
+  fetch lands here at 10-14 s with "out of time" in the message** (a read hang fails at the 10 s
+  read bound, a connect hang near 14 s; `backend fetch out of time for arion: no budget for another
+  attempt`), preceded by the attempt's own `kind=read_timeout retry=True` line and a
+  `kind=deadline retry=False` line.
 - `first_chunk_timeout`: nothing reported a failure before the reader's own 25 s bound. That is a
   stall the httpx bounds do not reach: a local tier read, decrypt, or an env override that broke
-  `queue + connect + read < first` — or a retried sequence of transient Arion errors (5xx,
-  connection reset), each attempt re-paying the slot wait and backoff; the invariant bounds one
-  ATTEMPT, not the request. Rare by design. When it fires, check for
+  `queue + pool + connect + read < first`. Rare by design. When it fires, check for
   `backend chunk fetch failed … retry=True` attempt lines first; if none, look outside the Arion
   client.
 
@@ -159,29 +162,41 @@ leak.
 
 The model: a GET serves each 4 MiB chunk from the first tier that has it: this node's SSD, a peer's
 SSD, the pool, then the backend. The backend tier is in-process: one `ArionClient` per uvicorn
-worker, built eagerly in the lifespan with `httpx.Timeout(connect=4, read=10, write=10, pool=4)` and
+worker, built eagerly in the lifespan with `httpx.Timeout(connect=4, read=10, write=10, pool=2)` and
 a connection pool sized to `read_backend_fetch_concurrency` (32), which is also the per-process
 semaphore. Pool == semaphore means a healthy worker never queues at the pool, so an
 `httpx.PoolTimeout` can only mean connections are held by something that is not a live fetch. The
 reader bounds the FIRST chunk at `stream_first_chunk_timeout_seconds` (25 s) and turns a miss into
-the 503. The fetcher's own bounds sit inside that: queue (10) + connect (4) + read (10) = 24 < 25,
-validated at boot, so a hung fetch fails as an ordinary logged, counted exception instead of being
-cancelled silently at 25 s (which is how the incident went unseen for 17 h). Any httpx timeout is
-terminal for the fetch: no retry, no next location.
+the 503. The fetcher's own bounds sit inside that: queue (8) + pool (2) + connect (4) + read (10) =
+24 < 25, validated at boot, so a hung fetch fails as an ordinary logged, counted exception instead
+of being cancelled silently at 25 s (which is how the incident went unseen for 17 h).
+
+A connect/read timeout is a transient failure like a 5xx: it is retried while the chunk's deadline
+allows. The streamer hands each chunk's bound to the fetcher as a deadline (25 s for the first
+chunk, `stream_chunk_timeout_seconds` = 300 s for later ones) and the fetcher starts a retry only if
+a whole attempt (queue + pool + connect + read = 24 s) plus its backoff still fits. Under the 25 s
+first-chunk deadline no retry ever fits, so the first chunk gets exactly one attempt by design and
+a hung Arion fetch on it fails at 10-14 s with `out of time`, while a single read stall on chunk N
+of a large object (300 s deadline) is retried instead of truncating a committed 200 body. A
+PoolTimeout is terminal: no retry, no next location.
 
 Every failed attempt logs one WARNING, `backend chunk fetch failed backend=arion id=... attempt=N/3
 kind=<kind> retry=<bool>: ...`. A wedged pool shows `kind=pool_saturated retry=False`; a hung
-connection shows `kind=timed_out retry=False`. After
-`HIPPIUS_READ_BACKEND_FETCH_CLIENT_RESET_AFTER_POOL_TIMEOUTS`
-(3) consecutive PoolTimeouts the worker logs ERROR `backend fetch pool saturated 3 times in a row;
-replaced the Arion client`, and requests that start after that run on a fresh client; a generation
-gate makes it one rebuild per streak. A failed rebuild logs `Arion client rebuild failed; the next
-PoolTimeout streak retries it`.
+connection shows `kind=read_timeout retry=True` (or `connect_timeout`) followed by
+`kind=deadline retry=False: 15.0s left, attempt needs 25.0s` when the deadline stops the retry.
+After `HIPPIUS_READ_BACKEND_FETCH_CLIENT_RESET_AFTER_POOL_TIMEOUTS` (3) consecutive PoolTimeouts
+the worker logs ERROR `replacing the Arion client; old pool connections=32 idle=0 expired=0 closed=0
+in_use=32` (the old pool's connections by state, taken before the swap) and ERROR `backend fetch
+pool saturated 3 times in a row; replaced the Arion client (inflight=N waiting=M)`. Requests that
+start after that run on a fresh client; a generation gate makes it one rebuild per streak. The old
+client is closed 17 s later (a pool wait plus one wire attempt, so its healthy in-flight fetches
+finish), under a 5 s bound. A failed rebuild logs `Arion client rebuild failed; the next PoolTimeout streak
+retries it`.
 
 Expect the rebuild to clear a poisoned pool. If `pool_timeout` keeps rising after a rebuild, or the
-503s are `kind=timed_out` with no PoolTimeouts at all, the fault is not the client object: something
-on the path (node networking, conntrack, the edge at `162.19.43.25:443`) is eating the connections.
-Grab the evidence above, then delete the pod.
+503s are `out of time` after `read_timeout` attempts with no PoolTimeouts at all, the fault is not
+the client object: something on the path (node networking, conntrack, the edge at
+`162.19.43.25:443`) is eating the connections. Grab the evidence above, then delete the pod.
 
 ## Traps
 
@@ -189,10 +204,9 @@ Grab the evidence above, then delete the pod.
   Tempo are the only history; do not go looking for yesterday's log lines.
 - `rate()` / `increase()` on these OTel series lie across pod restarts. Diff raw counter values.
 - `cause=first_chunk_timeout` does NOT mean "Arion hung". A hung Arion fetch is
-  `cause=chunk_unavailable` with "timed out" in the message. It CAN mean a retried sequence of
-  transient Arion errors (5xx, connection reset) that re-paid the slot wait and backoff up to 3
-  times: check for `backend chunk fetch failed … retry=True` attempt lines first; if none, look
-  outside the Arion client. See above.
+  `cause=chunk_unavailable` with "out of time" in the message, at 10-14 s. When it fires, check for
+  `backend chunk fetch failed … retry=True` attempt lines first; if none, look outside the Arion
+  client. See above.
 - `chunk_reads_by_tier_total{tier="backend"}` is not a health signal: it falls both when fetches
   fail and when demand falls, and it cannot tell the two apart. Use `backend_fetch_outcomes_total`.
 - Fresh `curl`s from inside the sick pod succeed (0.5 s). That does not clear the pod; it proves
@@ -207,13 +221,13 @@ naming the variable.
 |---|---|---|
 | `HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS` | 25 | Reader's bound on the first chunk; a miss is the 503 |
 | `HIPPIUS_READ_BACKEND_FETCH_CONCURRENCY` | 32 | Per-worker semaphore AND httpx pool size |
-| `HIPPIUS_READ_BACKEND_FETCH_QUEUE_TIMEOUT_SECONDS` | 10 | Wait for a semaphore slot before failing the read |
+| `HIPPIUS_READ_BACKEND_FETCH_QUEUE_TIMEOUT_SECONDS` | 8 | Wait for a semaphore slot before failing the read |
 | `HIPPIUS_READ_BACKEND_FETCH_CONNECT_TIMEOUT_SECONDS` | 4.0 | httpx connect bound |
 | `HIPPIUS_READ_BACKEND_FETCH_READ_TIMEOUT_SECONDS` | 10.0 | httpx read AND write bound (per operation, not per body) |
-| `HIPPIUS_READ_BACKEND_FETCH_POOL_TIMEOUT_SECONDS` | 4.0 | httpx pool-acquire bound; a trip is a `pool_timeout` |
+| `HIPPIUS_READ_BACKEND_FETCH_POOL_TIMEOUT_SECONDS` | 2.0 | httpx pool-acquire bound; a trip is a `pool_timeout` |
 | `HIPPIUS_READ_BACKEND_FETCH_CLIENT_RESET_AFTER_POOL_TIMEOUTS` | 3 | Consecutive PoolTimeouts before the client is rebuilt |
-| `HIPPIUS_READ_BACKEND_FETCH_ATTEMPTS` | 3 | Attempts per location (3 = 2 retries) for transient (429/5xx) errors only |
+| `HIPPIUS_READ_BACKEND_FETCH_ATTEMPTS` | 3 | Attempts per location (3 = 2 retries) for transient errors (429/5xx, resets, connect/read timeouts), deadline permitting |
 | `HIPPIUS_READ_BACKEND_FETCH_RETRY_BASE_SECONDS` / `_JITTER_SECONDS` | 1.0 / 0.25 | Backoff between those retries |
 
-Invariant: `QUEUE + CONNECT + READ < FIRST_CHUNK` (24 < 25 by default) and `POOL < FIRST_CHUNK`.
+Invariant: `QUEUE + POOL + CONNECT + READ < FIRST_CHUNK` (8 + 2 + 4 + 10 = 24 < 25 by default).
 Raising any fetch bound without raising the first-chunk bound puts the silent 25 s cancel back.

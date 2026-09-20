@@ -9,6 +9,7 @@ from typing import Awaitable
 from typing import Callable
 from typing import Coroutine
 from typing import Iterable
+from typing import Protocol
 
 from hippius_s3.monitoring import AeadFailureOutcome
 from hippius_s3.monitoring import AeadFailureTier
@@ -29,9 +30,22 @@ DecryptFn = Callable[[bytes, ChunkPlanItem], Awaitable[bytes]]
 # Drops this node's cached copy of a chunk, returning whether one was removed. False means there
 # was nothing local to invalidate, so re-fetching would only return the same bytes.
 InvalidateFn = Callable[[ChunkPlanItem], Awaitable[bool]]
-# The lowest tier: fetch a chunk the local tiers do not hold (from the backend, into memory).
-# Raises `ChunkUnavailableError` when nothing can serve it.
-FetchMissingFn = Callable[[ChunkPlanItem], Awaitable[bytes]]
+
+
+class FetchMissingFn(Protocol):
+    """The lowest tier: fetch a chunk the local tiers do not hold (from the backend, into memory).
+    Raises `ChunkUnavailableError` when nothing can serve it. `deadline` is the loop-time instant
+    the caller gives up on this chunk; the fetcher starts no retry that cannot finish before it."""
+
+    def __call__(self, item: ChunkPlanItem, *, deadline: float | None = None) -> Awaitable[bytes]: ...
+
+
+def _tighter(a: float | None, b: float | None) -> float | None:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return min(float(a), float(b))
 
 
 def _record_aead_failure(tier: AeadFailureTier, outcome: AeadFailureOutcome) -> None:
@@ -216,6 +230,7 @@ async def stream_plan(
     # Fallback only; object_reader passes the wired default HTTP_STREAM_PREFETCH_CHUNKS (16 in prod).
     prefetch_chunks: int = 0,
     chunk_timeout: float | None = None,
+    first_chunk_timeout: float | None = None,
     fetch_missing: FetchMissingFn | None = None,
     has_backend_copy: Callable[[ChunkPlanItem], bool] | None = None,
 ) -> AsyncGenerator[bytes, None]:
@@ -226,9 +241,11 @@ async def stream_plan(
     ciphertext is decrypted here and yielded, never written back. `fetch_missing=None` (a caller
     with no backend, e.g. a test over a bare store) turns a miss into `ChunkUnavailableError`.
     `chunk_timeout` bounds each chunk's fetch so a stalled backend ends the stream in minutes
-    rather than hanging the open response. `has_backend_copy` says whether a chunk has a live
-    backend row: that is what lets a local copy that fails to authenticate be dropped and
-    re-fetched from the backend — without it only a pool copy licenses the drop.
+    rather than hanging the open response; the plan's first chunk takes `first_chunk_timeout`
+    when tighter (the reader's own bound). Each chunk's bound also reaches `fetch_missing` as a
+    deadline, so the fetcher stops retrying before the reader cancels it. `has_backend_copy` says
+    whether a chunk has a live backend row: that is what lets a local copy that fails to
+    authenticate be dropped and re-fetched — without it only a pool copy licenses the drop.
     """
     prefetch = max(0, int(prefetch_chunks))
 
@@ -263,7 +280,7 @@ async def stream_plan(
             )
         )
 
-    async def _fetch(item: ChunkPlanItem) -> bytes:
+    async def _fetch(item: ChunkPlanItem, deadline: float | None) -> bytes:
         cached = await obj_cache.get_chunk(object_id, int(object_version), int(item.part_number), int(item.chunk_index))
         if cached is not None:
             return cached
@@ -272,12 +289,20 @@ async def stream_plan(
                 f"chunk not on any local tier and no backend fetch configured: "
                 f"{object_id} v{int(object_version)} part {int(item.part_number)} chunk {int(item.chunk_index)}"
             )
-        return await fetch_missing(item)
+        return await fetch_missing(item, deadline=deadline)
+
+    # The first call is the plan's first item: `_emit` schedules in plan order, and a reload
+    # after an authentication failure comes strictly later.
+    first_pending = True
 
     async def _wait(item: ChunkPlanItem) -> bytes:
-        if chunk_timeout is None:
-            return await _fetch(item)
-        return await asyncio.wait_for(_fetch(item), timeout=float(chunk_timeout))
+        nonlocal first_pending
+        bound = _tighter(chunk_timeout, first_chunk_timeout) if first_pending else chunk_timeout
+        first_pending = False
+        if bound is None:
+            return await _fetch(item, None)
+        deadline = asyncio.get_running_loop().time() + float(bound)
+        return await asyncio.wait_for(_fetch(item, deadline), timeout=float(bound))
 
     async for out in _emit(
         plan=plan,

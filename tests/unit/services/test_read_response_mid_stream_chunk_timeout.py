@@ -29,7 +29,7 @@ class _CacheServesOnlyChunkZero:
         return b"chunk-zero" if int(ci) == 0 else None
 
 
-async def _backend_never_answers(item: ChunkPlanItem) -> bytes:
+async def _backend_never_answers(item: ChunkPlanItem, *, deadline: float | None = None) -> bytes:
     await asyncio.sleep(3600)
     return b"unreachable"
 
@@ -74,6 +74,8 @@ async def test_mid_stream_chunk_stall_is_bounded_by_per_chunk_timeout() -> None:
                 # abort came from the 0.2s per-chunk bound, not from this 10s ceiling.
                 await asyncio.wait_for(gen.__anext__(), timeout=10.0)
             elapsed = loop.time() - t0
-            assert elapsed < 5.0, f"mid-stream chunk wait was not bounded by the per-chunk timeout (took {elapsed:.2f}s)"
+            assert elapsed < 5.0, (
+                f"mid-stream chunk wait was not bounded by the per-chunk timeout (took {elapsed:.2f}s)"
+            )
         finally:
             await gen.aclose()

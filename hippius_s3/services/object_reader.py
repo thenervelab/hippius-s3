@@ -49,17 +49,13 @@ from hippius_s3.utils import get_query
 logger = logging.getLogger(__name__)
 
 
-# Why a read could not produce its first chunk. Bounded so it can be a log field and, later, a
-# metric label. `chunk_unavailable`: a tier reported failure — no backend location after the
-# wait, fetch budget saturated, a bounded backend timeout (the fetcher's own connect/read/pool
-# bounds sit inside the first-chunk bound, so a hung Arion fetch lands HERE with "timed out" in
-# the message), or every location failed. `first_chunk_timeout`: nothing reported a failure
-# before the reader's own bound — a stall the httpx bounds do not reach (a local tier read,
-# decrypt, or an env override that broke queue + connect + read < first — or a retried sequence
-# of transient Arion errors (5xx, connection reset), each attempt re-paying the slot wait and
-# backoff; check the `backend chunk fetch failed … retry=True` lines first). Rare by design; when
-# it fires, look outside the Arion client. The two need different responders; for 17 h in
-# 2026-09 they logged the same sentence.
+# Why a read could not produce its first chunk; bounded so it can be a log field and a metric label.
+# `chunk_unavailable`: a tier REPORTED failure — no backend location after the wait, fetch budget
+# saturated, the pool, every location failed, or the fetcher out of time before the reader's bound
+# (the first chunk gets ONE attempt; a hung Arion fetch lands HERE, "out of time" at 10-14 s).
+# `first_chunk_timeout`: nothing reported
+# failure before the reader's own 25 s bound — a local tier read, decrypt, or a broken env override;
+# rare, check the `backend chunk fetch failed … retry=True` lines, then look outside the Arion client.
 NotReadyCause = Literal["first_chunk_timeout", "chunk_unavailable"]
 
 
@@ -137,18 +133,18 @@ def make_fetch_missing(ctx: StreamContext, obj_cache: Any, *, object_id: str, ad
     object_version = int(ctx.object_version)
     wait_s = float(getattr(cfg, "read_missing_chunk_wait_seconds", 10.0))
 
-    async def _fetch_missing(item: ChunkPlanItem) -> bytes:
+    async def _fetch_missing(item: ChunkPlanItem, *, deadline: float | None = None) -> bytes:
         key = (int(item.part_number), int(item.chunk_index))
         locations = ctx.locations.get(key, ())
         if locations:
-            return await fetcher.fetch(locations, address)
-        deadline = asyncio.get_running_loop().time() + wait_s
+            return await fetcher.fetch(locations, address, deadline=deadline)
+        give_up_at = asyncio.get_running_loop().time() + wait_s
         while True:
             await asyncio.sleep(1.0)
             cached = await obj_cache.get_chunk(object_id, object_version, key[0], key[1])
             if cached is not None:
                 return cached
-            if asyncio.get_running_loop().time() >= deadline:
+            if asyncio.get_running_loop().time() >= give_up_at:
                 raise ChunkUnavailableError(
                     f"chunk on no backend yet and no local tier served it within {wait_s:.0f}s: "
                     f"{object_id} v{object_version} part {key[0]} chunk {key[1]}"
@@ -288,6 +284,7 @@ def _stream(ctx: StreamContext, obj_cache: Any, info: dict, *, address: str) -> 
         bucket_name=str(info.get("bucket_name", "")),
         prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
         chunk_timeout=float(cfg.stream_chunk_timeout_seconds),
+        first_chunk_timeout=float(cfg.stream_first_chunk_timeout_seconds),
         fetch_missing=make_fetch_missing(ctx, obj_cache, object_id=str(info["object_id"]), address=address),
         has_backend_copy=lambda item: (int(item.part_number), int(item.chunk_index)) in ctx.locations,
     )

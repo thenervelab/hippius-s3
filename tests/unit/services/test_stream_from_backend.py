@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any
+from typing import Iterable
 from unittest.mock import patch
 
 import pytest
@@ -19,6 +20,7 @@ import pytest
 from hippius_s3.reader import backend_fetch
 from hippius_s3.reader import streamer
 from hippius_s3.reader.backend_fetch import BackendChunkFetcher
+from hippius_s3.reader.backend_fetch import BackendLocation
 from hippius_s3.reader.types import ChunkPlanItem
 from hippius_s3.services import object_reader
 
@@ -198,3 +200,40 @@ async def test_backend_fetches_overlap_under_prefetch() -> None:
 
     assert out == b"c0c1c2c3c4c5", "chunks are yielded in plan order regardless of fetch completion order"
     assert peak >= 2, f"backend fetches overlap under prefetch (peak {peak})"
+
+
+@pytest.mark.asyncio
+async def test_each_chunk_hands_its_bound_to_the_fetcher_as_a_deadline() -> None:
+    # The first chunk carries the reader's first-chunk bound, later chunks the per-chunk bound, so
+    # the fetcher stops retrying before the reader's wait_for would cancel it silently.
+    plan = [ChunkPlanItem(part_number=1, chunk_index=i) for i in range(2)]
+    loop = asyncio.get_running_loop()
+    seen: list[tuple[str, float | None]] = []
+
+    class _Recording(BackendChunkFetcher):
+        def __init__(self) -> None:
+            super().__init__({}, concurrency=1, attempts=1, base_sleep=0, jitter=0)
+
+        async def fetch(
+            self, locations: Iterable[BackendLocation], address: str, *, deadline: float | None = None
+        ) -> bytes:
+            (_backend, identifier), *_rest = locations
+            seen.append((identifier, None if deadline is None else deadline - loop.time()))
+            return b"c"
+
+    backend_fetch.set_backend_fetcher(_Recording())
+    try:
+        with (
+            patch.object(streamer, "decrypt_chunk_if_needed", new=_identity_decrypt),
+            patch.object(object_reader, "get_config", return_value=_cfg(http_stream_prefetch_chunks=0)),
+        ):
+            ctx = _ctx(plan, {(1, i): (("arion", f"c{i}"),) for i in range(2)})
+            gen = object_reader._stream(ctx, _Cache({}), {"object_id": OBJ, "bucket_name": "b"}, address="addr")
+            out = b"".join([c async for c in gen])
+    finally:
+        backend_fetch.set_backend_fetcher(None)
+
+    assert out == b"cc"
+    (first_id, first_left), (second_id, second_left) = seen
+    assert first_id == "c0" and first_left == pytest.approx(5.0, abs=0.5), "first chunk: the first-chunk bound"
+    assert second_id == "c1" and second_left == pytest.approx(300.0, abs=0.5), "later chunk: the per-chunk bound"
