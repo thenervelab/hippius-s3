@@ -139,6 +139,8 @@ class MetricsCollector:
         self._db_pool_size = 0
         self._db_pool_free = 0
         self._db_pool_used = 0
+        self._backend_fetch_inflight = 0
+        self._backend_fetch_waiting = 0
         self._setup_metrics()
 
     def _setup_metrics(self) -> None:
@@ -419,6 +421,20 @@ class MetricsCollector:
             description="Database connection pool used connections",
         )
 
+        # Per worker process (exported_instance separates them). A wedged worker shows inflight
+        # pinned at read_backend_fetch_concurrency while backend_fetch_outcomes_total{outcome="ok"}
+        # goes flat — the picture that was missing on 2026-09-19.
+        self.meter.create_observable_gauge(
+            name="backend_fetch_inflight",
+            callbacks=[self._obs_backend_fetch_inflight],
+            description="Backend chunk fetches currently holding a concurrency slot",
+        )
+        self.meter.create_observable_gauge(
+            name="backend_fetch_waiting",
+            callbacks=[self._obs_backend_fetch_waiting],
+            description="Backend chunk fetches waiting for a concurrency slot",
+        )
+
         self.auth_cache_hits = self.meter.create_counter(
             name="auth_cache_hits_total",
             description="Total auth cache hits",
@@ -617,6 +633,16 @@ class MetricsCollector:
         self._db_pool_size = size
         self._db_pool_free = free
         self._db_pool_used = size - free
+
+    def _obs_backend_fetch_inflight(self, _: object) -> list[metrics.Observation]:
+        return [metrics.Observation(self._backend_fetch_inflight, {})]
+
+    def _obs_backend_fetch_waiting(self, _: object) -> list[metrics.Observation]:
+        return [metrics.Observation(self._backend_fetch_waiting, {})]
+
+    def update_backend_fetch_slots(self, inflight: int, waiting: int) -> None:
+        self._backend_fetch_inflight = inflight
+        self._backend_fetch_waiting = waiting
 
     def record_http_request(
         self,
@@ -973,6 +999,9 @@ class NullMetricsCollector:
         pass
 
     def record_backend_fetch_outcome(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def update_backend_fetch_slots(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_aead_failure(self, *args: object, **kwargs: object) -> None:

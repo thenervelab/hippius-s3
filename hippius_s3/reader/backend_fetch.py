@@ -84,6 +84,10 @@ class BackendChunkFetcher:
         # every attempt started after the bump runs on the new client.
         self._fetchers = fetchers
         self._semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+        # The semaphore exposes no occupancy, so the fetcher keeps its own count for the gauges.
+        # The counts are per instance but the gauge is process-global: one fetcher per process.
+        self._inflight = 0
+        self._waiting = 0
         self._attempts = max(1, int(attempts))
         self._base_sleep = float(base_sleep)
         self._jitter = float(jitter)
@@ -109,17 +113,35 @@ class BackendChunkFetcher:
         """Take a slot in the pod's budget, or give up: a saturated budget (a slow backend under
         many cold readers) must surface as a fast retryable failure on the reads that cannot be
         served, not as every queued read timing out in lockstep at the first-chunk bound."""
-        if self._queue_timeout is None:
-            await self._semaphore.acquire()
-            return
+        self._waiting += 1
+        _publish_slots(self._inflight, self._waiting)
+
+        acquired = False
         try:
-            await asyncio.wait_for(self._semaphore.acquire(), timeout=self._queue_timeout)
+            if self._queue_timeout is None:
+                await self._semaphore.acquire()
+            else:
+                await asyncio.wait_for(self._semaphore.acquire(), timeout=self._queue_timeout)
+            acquired = True
         # Identical on 3.11+, but requires-python is >= 3.10 and there the bare form lets
         # asyncio.TimeoutError escape as a 500.
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ChunkUnavailableError(
                 f"backend fetch budget saturated for {self._queue_timeout:.0f}s; the read cannot be served now"
             ) from exc
+        finally:
+            # Slot taken, wait timed out, or cancelled while queued (a client that disconnected):
+            # in every case this requester is no longer waiting. A phantom waiter would pin the
+            # gauge above zero for the life of the process.
+            self._waiting -= 1
+            if acquired:
+                self._inflight += 1
+            _publish_slots(self._inflight, self._waiting)
+
+    def _release_slot(self) -> None:
+        self._semaphore.release()
+        self._inflight -= 1
+        _publish_slots(self._inflight, self._waiting)
 
     async def fetch(self, locations: Iterable[BackendLocation], address: str) -> bytes:
         """Return the chunk's ciphertext from the first location that serves it.
@@ -171,7 +193,7 @@ class BackendChunkFetcher:
             # something that is not a live fetch. Retrying or trying the next location re-queues
             # behind the same pool; fail the request now and, if it keeps happening, replace the
             # client.
-            self._semaphore.release()
+            self._release_slot()
             self._log_failed_attempt(
                 backend=backend, identifier=identifier, attempt=attempt, kind="pool_saturated", retry=False, exc=exc
             )
@@ -183,14 +205,14 @@ class BackendChunkFetcher:
         except httpx.TimeoutException as exc:
             # A bounded 4-14 s failure: a second attempt cannot finish inside the reader's
             # first-chunk bound, so retrying only reproduces the silent cancel.
-            self._semaphore.release()
+            self._release_slot()
             self._log_failed_attempt(
                 backend=backend, identifier=identifier, attempt=attempt, kind="timed_out", retry=False, exc=exc
             )
             _record_backend_fetch_outcome(_outcome_of(exc))
             raise ChunkUnavailableError(f"backend fetch timed out for {backend}: {exc}") from exc
         except Exception as exc:  # noqa: BLE001 - every backend error is classified below
-            self._semaphore.release()
+            self._release_slot()
             kind = classify_download_error(exc)
             retry = kind == "transient" and attempt != self._attempts
             self._log_failed_attempt(
@@ -200,10 +222,10 @@ class BackendChunkFetcher:
             return None, retry
         except BaseException:
             # Cancellation (a client that disconnected mid-fetch) must give the slot back too.
-            self._semaphore.release()
+            self._release_slot()
             raise
 
-        self._semaphore.release()
+        self._release_slot()
         return data, False
 
     def _log_failed_attempt(
@@ -308,6 +330,17 @@ def _record_backend_fetch_outcome(outcome: BackendFetchOutcome) -> None:
         collector = get_metrics_collector()
         if collector is not None:
             collector.record_backend_fetch_outcome(outcome)
+    except Exception:  # noqa: BLE001 - a metrics failure must not fail a read
+        pass
+
+
+def _publish_slots(inflight: int, waiting: int) -> None:
+    """Push the fetcher's slot occupancy to the collector's gauges. Never let observability fail
+    a read."""
+    try:
+        collector = get_metrics_collector()
+        if collector is not None:
+            collector.update_backend_fetch_slots(inflight, waiting)
     except Exception:  # noqa: BLE001 - a metrics failure must not fail a read
         pass
 

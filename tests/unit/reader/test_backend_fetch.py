@@ -451,7 +451,7 @@ async def test_a_burst_of_pool_timeouts_rebuilds_the_client_once() -> None:
     assert all(isinstance(r, ChunkUnavailableError) for r in results)
     assert resets == [1], f"32 PoolTimeouts from one client generation are one rebuild, got {len(resets)}"
     # Every slot came back; the terminal paths release explicitly rather than via finally.
-    assert fetcher._semaphore._value == 32
+    assert fetcher._inflight == 0
 
 
 @pytest.mark.asyncio
@@ -490,7 +490,7 @@ async def test_a_requester_cancelled_mid_reset_releases_its_slot_and_the_reset_c
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert fetcher._semaphore._value == 1, "the cancelled fetch gave its slot back"
+    assert fetcher._inflight == 0, "the cancelled fetch gave its slot back"
 
     release.set()
     assert len(fetcher._reset_tasks) == 1, "the deferred close is held while it runs"
@@ -588,3 +588,92 @@ def test_outcome_of_keeps_the_timeout_subclasses_apart(exc: Exception, outcome: 
     from hippius_s3.reader.backend_fetch import _outcome_of
 
     assert _outcome_of(exc) == outcome
+
+
+@pytest.mark.asyncio
+async def test_slot_gauges_track_inflight_and_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The gauges come from the fetcher's own accounting, not httpx pool internals: a wedged worker
+    # shows inflight pinned at the concurrency cap while the ok-outcome counter goes flat.
+    from hippius_s3.reader import backend_fetch
+
+    snapshots: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        backend_fetch, "_publish_slots", lambda inflight, waiting: snapshots.append((inflight, waiting))
+    )
+
+    gate = asyncio.Event()
+
+    async def blocked(identifier: str, address: str) -> bytes:
+        await gate.wait()
+        return b"cipher"
+
+    fetcher = _fetcher({"arion": blocked}, concurrency=1)
+    t1 = asyncio.create_task(fetcher.fetch([("arion", "a")], "addr"))
+    t2 = asyncio.create_task(fetcher.fetch([("arion", "b")], "addr"))
+    await asyncio.sleep(0.05)
+    assert (1, 1) in snapshots, "one fetch holds the only slot, one is waiting"
+    gate.set()
+    await asyncio.gather(t1, t2)
+    assert snapshots[-1] == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_queue_timeout_leaves_no_waiter_behind(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hippius_s3.reader import backend_fetch
+
+    snapshots: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        backend_fetch, "_publish_slots", lambda inflight, waiting: snapshots.append((inflight, waiting))
+    )
+
+    gate = asyncio.Event()
+
+    async def blocked(identifier: str, address: str) -> bytes:
+        await gate.wait()
+        return b"cipher"
+
+    fetcher = BackendChunkFetcher(
+        {"arion": blocked}, concurrency=1, attempts=1, base_sleep=0.0, jitter=0.0, queue_timeout=0.05
+    )
+    holder = asyncio.create_task(fetcher.fetch([("arion", "a")], "addr"))
+    await asyncio.sleep(0.01)
+    with pytest.raises(ChunkUnavailableError, match="saturated"):
+        await fetcher.fetch([("arion", "b")], "addr")
+    assert snapshots[-1] == (1, 0), "the timed-out waiter is no longer counted; the holder still is"
+    gate.set()
+    await holder
+    assert snapshots[-1] == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_requester_cancelled_while_queued_leaves_no_waiter_behind(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A client that disconnects before its fetch gets a slot is cancelled inside the wait. If that
+    # path skipped the accounting, `backend_fetch_waiting` would read one waiter too many for the
+    # life of the process — a phantom queue in the gauge that exists to show a real one.
+    from hippius_s3.reader import backend_fetch
+
+    snapshots: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        backend_fetch, "_publish_slots", lambda inflight, waiting: snapshots.append((inflight, waiting))
+    )
+
+    gate = asyncio.Event()
+
+    async def blocked(identifier: str, address: str) -> bytes:
+        await gate.wait()
+        return b"cipher"
+
+    fetcher = _fetcher({"arion": blocked}, concurrency=1)
+    holder = asyncio.create_task(fetcher.fetch([("arion", "a")], "addr"))
+    queued = asyncio.create_task(fetcher.fetch([("arion", "b")], "addr"))
+    await asyncio.sleep(0.01)
+    assert snapshots[-1] == (1, 1)
+
+    queued.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+    assert snapshots[-1] == (1, 0), "the cancelled waiter is no longer counted; the holder still is"
+
+    gate.set()
+    await holder
+    assert snapshots[-1] == (0, 0)
