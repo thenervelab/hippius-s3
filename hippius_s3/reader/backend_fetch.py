@@ -27,6 +27,8 @@ from typing import Awaitable
 from typing import Callable
 from typing import Iterable
 
+import httpx
+
 from hippius_s3.config import get_config
 from hippius_s3.workers.errors import classify_download_error
 
@@ -161,6 +163,43 @@ def set_backend_fetcher(fetcher: BackendChunkFetcher | None) -> None:
     """Replace the process-wide fetcher (tests; `None` rebuilds from config on next use)."""
     global _fetcher
     _fetcher = fetcher
+
+
+def fetch_client_settings(cfg: Any) -> tuple[httpx.Timeout, httpx.Limits]:
+    """The read-path ArionClient's per-operation bounds and pool size, derived from config.
+
+    Pure so the derivation is testable without httpx internals. A misconfiguration raises when the
+    fetcher is built, with the offending variable named; the app is expected to build the fetcher
+    at startup so a bad value fails boot rather than the first cold read.
+    """
+    first = float(cfg.stream_first_chunk_timeout_seconds)
+    queue = float(cfg.read_backend_fetch_queue_timeout_seconds)
+    connect = float(cfg.read_backend_fetch_connect_timeout_seconds)
+    read = float(cfg.read_backend_fetch_read_timeout_seconds)
+    pool = float(cfg.read_backend_fetch_pool_timeout_seconds)
+
+    # The slot wait precedes the httpx bounds, so one attempt's worst case is queue + connect + read.
+    if queue + connect + read >= first:
+        raise ValueError(
+            "HIPPIUS_READ_BACKEND_FETCH_QUEUE_TIMEOUT_SECONDS + "
+            "HIPPIUS_READ_BACKEND_FETCH_CONNECT_TIMEOUT_SECONDS + "
+            f"HIPPIUS_READ_BACKEND_FETCH_READ_TIMEOUT_SECONDS ({queue} + {connect} + {read}) must be "
+            f"below HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS ({first}); otherwise the reader cancels "
+            "the fetch before httpx can fail it, and the failure is silent"
+        )
+    if pool >= first:
+        raise ValueError(
+            f"HIPPIUS_READ_BACKEND_FETCH_POOL_TIMEOUT_SECONDS ({pool}) must be below "
+            f"HIPPIUS_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS ({first})"
+        )
+
+    # Pool == semaphore: a healthy process never queues at the pool, so a PoolTimeout can only
+    # mean connections are held by something that is not a live fetch.
+    concurrency = max(1, int(cfg.read_backend_fetch_concurrency))
+    return (
+        httpx.Timeout(connect=connect, read=read, write=read, pool=pool),
+        httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency),
+    )
 
 
 def _build_fetcher() -> BackendChunkFetcher:
