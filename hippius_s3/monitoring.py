@@ -26,6 +26,12 @@ tracer = trace.get_tracer(__name__)
 # label cannot drift into unbounded cardinality.
 ChunkReadTier = Literal["local", "peer", "pool", "backend"]
 
+# How one backend chunk fetch ATTEMPT ended. `ok` is the same event as
+# chunk_reads_by_tier{tier=backend}; the failure values are what that counter cannot show: a drop
+# in backend reads is indistinguishable from a drop in demand until the fetches that were attempted
+# and did not complete are visible. Bounded in code so it cannot become a cardinality problem.
+BackendFetchOutcome = Literal["ok", "pool_timeout", "connect_timeout", "read_timeout", "error"]
+
 # Why a peer fetch did not happen, or its answer was not used. Closed by construction, like
 # ChunkReadTier. The reasons demand different responses and must stay distinguishable:
 # `client_cap` and `server_busy` are capacity; `peer_miss` is the peer having evicted the chunk
@@ -243,7 +249,13 @@ class MetricsCollector:
 
         self.chunk_reads_by_tier = self.meter.create_counter(
             name="chunk_reads_by_tier_total",
-            description="Chunk reads served, by storage tier (local|peer|pool)",
+            description="Chunk reads served, by storage tier (local|peer|pool|backend)",
+            unit="1",
+        )
+
+        self.backend_fetch_outcomes = self.meter.create_counter(
+            name="backend_fetch_outcomes_total",
+            description="Backend chunk fetch attempts by outcome (ok|pool_timeout|connect_timeout|read_timeout|error)",
             unit="1",
         )
 
@@ -754,6 +766,10 @@ class MetricsCollector:
         """
         self.chunk_reads_by_tier.add(1, attributes={"tier": tier})
 
+    def record_backend_fetch_outcome(self, outcome: BackendFetchOutcome) -> None:
+        """Count how one backend fetch attempt ended. `outcome` is a Literal, so bounded."""
+        self.backend_fetch_outcomes.add(1, attributes={"outcome": outcome})
+
     def record_uploader_operation(
         self,
         success: bool,
@@ -954,6 +970,9 @@ class NullMetricsCollector:
         pass
 
     def record_chunk_read_tier(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def record_backend_fetch_outcome(self, *args: object, **kwargs: object) -> None:
         pass
 
     def record_aead_failure(self, *args: object, **kwargs: object) -> None:

@@ -10,6 +10,7 @@ from collections.abc import Coroutine
 from typing import Any
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from hippius_s3.reader.backend_fetch import BackendChunkFetcher
@@ -521,3 +522,69 @@ async def test_reset_does_not_wait_forever_on_a_client_that_will_not_close() -> 
     with patch("hippius_s3.reader.backend_fetch.asyncio.wait_for", gave_up):
         await holder.reset()  # must return, not raise
     assert isinstance(holder.client, Fresh)
+
+
+@pytest.mark.asyncio
+async def test_each_attempt_records_its_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Attempts, not fetches: a wedged client shows up as attempts that do not end in `ok`, which
+    # is the shape a per-success counter cannot show.
+    import httpx
+
+    from hippius_s3.reader import backend_fetch
+
+    seen: list[str] = []
+    monkeypatch.setattr(backend_fetch, "_record_backend_fetch_outcome", seen.append)
+
+    tries = iter([ConnectionError("blip"), httpx.ConnectError("no route"), None])
+
+    async def eventually(identifier: str, address: str) -> bytes:
+        exc = next(tries)
+        if exc is not None:
+            raise exc
+        return b"cipher"
+
+    assert await _fetcher({"arion": eventually}, attempts=3).fetch([("arion", "a")], "addr") == b"cipher"
+    assert seen == ["error", "error", "ok"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_timeouts_record_their_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    from hippius_s3.reader import backend_fetch
+
+    seen: list[str] = []
+    monkeypatch.setattr(backend_fetch, "_record_backend_fetch_outcome", seen.append)
+
+    async def slow(identifier: str, address: str) -> bytes:
+        raise httpx.ReadTimeout("slow")
+
+    async def unreachable(identifier: str, address: str) -> bytes:
+        raise httpx.ConnectTimeout("no")
+
+    async def stuck(identifier: str, address: str) -> bytes:
+        raise httpx.PoolTimeout("pool")
+
+    for fetch_one in (slow, unreachable, stuck):
+        with pytest.raises(ChunkUnavailableError):
+            await _fetcher({"arion": fetch_one}, attempts=3).fetch([("arion", "a")], "addr")
+    assert seen == ["read_timeout", "connect_timeout", "pool_timeout"]
+
+
+@pytest.mark.parametrize(
+    ("exc", "outcome"),
+    [
+        (httpx.PoolTimeout("pool"), "pool_timeout"),
+        (httpx.ConnectTimeout("no"), "connect_timeout"),
+        (httpx.ReadTimeout("slow"), "read_timeout"),
+        (httpx.WriteTimeout("slow"), "read_timeout"),
+        (ConnectionError("blip"), "error"),
+    ],
+    ids=["pool", "connect", "read", "write", "other"],
+)
+def test_outcome_of_keeps_the_timeout_subclasses_apart(exc: Exception, outcome: str) -> None:
+    # PoolTimeout, ConnectTimeout, ReadTimeout and WriteTimeout are all TimeoutException; the
+    # mapping must check the specific classes, or every timeout collapses into one label.
+    from hippius_s3.reader.backend_fetch import _outcome_of
+
+    assert _outcome_of(exc) == outcome

@@ -33,6 +33,8 @@ from typing import Iterable
 import httpx
 
 from hippius_s3.config import get_config
+from hippius_s3.monitoring import BackendFetchOutcome
+from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.workers.errors import classify_download_error
 
 
@@ -141,6 +143,7 @@ class BackendChunkFetcher:
                 if data is not None:
                     self._consecutive_pool_timeouts = 0
                     _record_backend_read()
+                    _record_backend_fetch_outcome("ok")
                     return data
                 if retry:
                     await asyncio.sleep(self._base_sleep * (2 ** (attempt - 1)) + random.uniform(0, self._jitter))
@@ -172,6 +175,7 @@ class BackendChunkFetcher:
             self._log_failed_attempt(
                 backend=backend, identifier=identifier, attempt=attempt, kind="pool_saturated", retry=False, exc=exc
             )
+            _record_backend_fetch_outcome("pool_timeout")
             await self._note_pool_timeout(generation)
             raise ChunkUnavailableError(
                 f"backend connection pool saturated (pool wait exceeded) for {backend}"
@@ -183,6 +187,7 @@ class BackendChunkFetcher:
             self._log_failed_attempt(
                 backend=backend, identifier=identifier, attempt=attempt, kind="timed_out", retry=False, exc=exc
             )
+            _record_backend_fetch_outcome(_outcome_of(exc))
             raise ChunkUnavailableError(f"backend fetch timed out for {backend}: {exc}") from exc
         except Exception as exc:  # noqa: BLE001 - every backend error is classified below
             self._semaphore.release()
@@ -191,6 +196,7 @@ class BackendChunkFetcher:
             self._log_failed_attempt(
                 backend=backend, identifier=identifier, attempt=attempt, kind=kind, retry=retry, exc=exc
             )
+            _record_backend_fetch_outcome("error")
             return None, retry
         except BaseException:
             # Cancellation (a client that disconnected mid-fetch) must give the slot back too.
@@ -289,13 +295,38 @@ def _record_backend_read() -> None:
     """Count a chunk served by the backend tier, next to local/peer/pool. Never let observability
     fail a read."""
     try:
-        from hippius_s3.monitoring import get_metrics_collector
-
         collector = get_metrics_collector()
         if collector is not None:
             collector.record_chunk_read_tier("backend")
     except Exception:  # noqa: BLE001 - a metrics failure must not fail a read
         pass
+
+
+def _record_backend_fetch_outcome(outcome: BackendFetchOutcome) -> None:
+    """Count how one fetch attempt ended. Never let observability fail a read."""
+    try:
+        collector = get_metrics_collector()
+        if collector is not None:
+            collector.record_backend_fetch_outcome(outcome)
+    except Exception:  # noqa: BLE001 - a metrics failure must not fail a read
+        pass
+
+
+def _outcome_of(exc: Exception) -> BackendFetchOutcome:
+    """Map a failed attempt's exception onto the bounded outcome label.
+
+    PoolTimeout is checked first for the same reason the except clauses are ordered: it is a
+    TimeoutException subclass, and folding it into a plain timeout would hide the one failure
+    shape that means the client itself is wedged.
+    """
+    if isinstance(exc, httpx.PoolTimeout):
+        return "pool_timeout"
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "connect_timeout"
+    # Write and read share one bound (`fetch_client_settings` sets write=read), so one outcome.
+    if isinstance(exc, (httpx.ReadTimeout, httpx.WriteTimeout)):
+        return "read_timeout"
+    return "error"
 
 
 _fetcher: BackendChunkFetcher | None = None

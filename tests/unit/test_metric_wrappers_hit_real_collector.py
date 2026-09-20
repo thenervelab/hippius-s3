@@ -150,6 +150,13 @@ WRAPPERS: list[tuple[str, Callable[..., None], tuple[Any, ...], str, dict[str, s
         "chunk_reads_by_tier_total",
         {"tier": "backend"},
     ),
+    (
+        "hippius_s3/reader/backend_fetch.py::_record_backend_fetch_outcome",
+        backend_fetch._record_backend_fetch_outcome,
+        ("pool_timeout",),
+        "backend_fetch_outcomes_total",
+        {"outcome": "pool_timeout"},
+    ),
 ]
 
 
