@@ -452,9 +452,9 @@ Say you're adding a `reconciler` worker that compares DB state with Arion state 
 ### 6.6 Trace down a 500 that reached prod
 
 1. Get the ray id from client or from error tracking (Sentry, if wired).
-2. Check structured logs in Loki: `{service="api"} |= "<ray_id>"`.
+2. Grep the pod's recent logs: `kubectl -n hippius-s3-prod logs <api-local-xxx> --since=15m | grep <ray_id>`. Pod logs hold only ~15 minutes and Loki is not available (CrashLoopBackOff for 150+ days), so anything older lives only in Tempo and Prometheus.
 3. Open Tempo with the same ray id for the span timeline.
-4. Cold reads stream from the backend in-process (there is no download queue). A `ChunkUnavailableError` means the backend fetch could not get a slot in time or the fetch failed — check `rate(backend_fetch_outcomes_total[5m])` by `outcome` per pod and the api-local logs. A rising non-`ok` share is the fetch path failing, not demand falling (`chunk_reads_by_tier_total{tier="backend"}` cannot tell those apart); `pool_timeout` means that pod's Arion client is wedged and is being rebuilt.
+4. Cold reads stream from the backend in-process (there is no download queue). A `ChunkUnavailableError` means the backend fetch could not get a slot in time or the fetch failed — diff `backend_fetch_outcomes_total` by `outcome` per pod between two instants (`rate()` is unreliable on these series — see the runbook) and check the api-local logs. A rising non-`ok` share is the fetch path failing, not demand falling (`chunk_reads_by_tier_total{tier="backend"}` cannot tell those apart); `pool_timeout` means that pod's Arion client is wedged; a streak of them (default 3) rebuilds it — runbook: docs/runbooks/cold-read-503-wedged-api-pod.md.
 5. If it's a timeout, check whether it is upstream (Arion, KMS, chain API).
 
 ### 6.7 Requeue a failed upload
