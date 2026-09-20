@@ -441,6 +441,8 @@ Response shape: `{"status":"success","data":{"resultType":"streams","result":[{"
   [docs/runbooks/prod-release-storage-rollup.md](docs/runbooks/prod-release-storage-rollup.md).
 - **Storage-usage rollup** (the billed byte counter): [docs/runbooks/storage-usage-rollup.md](docs/runbooks/storage-usage-rollup.md)
   — alerts and what to do, why `DISABLE TRIGGER` is not a switch, diagnosing drift, the backfill.
+- **Cold-read 503s from a wedged api pod**: [docs/runbooks/cold-read-503-wedged-api-pod.md](docs/runbooks/cold-read-503-wedged-api-pod.md)
+  — confirm in 60 seconds, the `cause=` semantics, evidence to grab, when to delete the pod.
 - **Reserved-name / ownerless bucket audit**: [hippius_s3/scripts/report_reserved_name_buckets.py](hippius_s3/scripts/report_reserved_name_buckets.py). Read-only. Run after any change to the gateway's auth-exempt paths.
 - **MPU retry**: [scripts/retryable-mpu.py](scripts/retryable-mpu.py) with usage notes in [scripts/retryable-mpu.md](scripts/retryable-mpu.md).
 - **Dangerous scripts** (flagged for a reason):

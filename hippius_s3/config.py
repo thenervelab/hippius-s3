@@ -558,10 +558,30 @@ class Config:
         "HIPPIUS_READ_BACKEND_FETCH_RETRY_JITTER_SECONDS:0.25", convert=float
     )
     # How long a fetch may wait for a slot in the pod's concurrency budget before it gives up
-    # (a retryable 503 on the first chunk). Below the 25 s first-chunk timeout by design, so a
-    # saturated budget fails fast and visibly instead of every queued read timing out in lockstep.
+    # (a retryable 503 on the first chunk), so a saturated budget fails fast and visibly instead
+    # of every queued read timing out in lockstep at the first-chunk bound.
     read_backend_fetch_queue_timeout_seconds: float = env(
-        "HIPPIUS_READ_BACKEND_FETCH_QUEUE_TIMEOUT_SECONDS:15", convert=float
+        "HIPPIUS_READ_BACKEND_FETCH_QUEUE_TIMEOUT_SECONDS:8", convert=float
+    )
+    # Per-operation bounds for the read path's OWN ArionClient (reader/backend_fetch.py).
+    # Invariant, validated at boot: queue + pool + connect + read < stream_first_chunk_timeout_seconds
+    # (8 + 2 + 4 + 10 = 24 < 25), so one attempt fails as a logged, counted httpx exception before
+    # the reader cancels it silently. `read` is a per-read-operation stall bound, not a whole-body
+    # budget; pool == semaphore, so a healthy pool never waits and 2 s is generous.
+    read_backend_fetch_connect_timeout_seconds: float = env(
+        "HIPPIUS_READ_BACKEND_FETCH_CONNECT_TIMEOUT_SECONDS:4.0", convert=float
+    )
+    read_backend_fetch_read_timeout_seconds: float = env(
+        "HIPPIUS_READ_BACKEND_FETCH_READ_TIMEOUT_SECONDS:10.0", convert=float
+    )
+    read_backend_fetch_pool_timeout_seconds: float = env(
+        "HIPPIUS_READ_BACKEND_FETCH_POOL_TIMEOUT_SECONDS:2.0", convert=float
+    )
+    # Consecutive httpx.PoolTimeouts before the fetcher throws its client away and builds a new
+    # one. The pool is sized to the semaphore, so a PoolTimeout means connections are stuck, not
+    # busy; replacing the client is the only in-process recovery.
+    read_backend_fetch_client_reset_after_pool_timeouts: int = env(
+        "HIPPIUS_READ_BACKEND_FETCH_CLIENT_RESET_AFTER_POOL_TIMEOUTS:3", convert=int
     )
     # Streaming prefetch window (chunks fetched ahead of the one being decrypted/sent). On a
     # cold read it is also the per-request backend parallelism.

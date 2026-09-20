@@ -165,6 +165,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
         logger.info("ArionClient initialized")
 
+        from hippius_s3.reader.backend_fetch import get_backend_fetcher
+
+        # Built here rather than on the first cold read so a bad HIPPIUS_READ_BACKEND_FETCH_* value
+        # fails boot with the variable named (see fetch_client_settings), not the first cache miss.
+        get_backend_fetcher()
+        logger.info("Backend chunk fetcher initialized")
+
         # NET-5: one long-lived HippiusApiClient so auth-cache misses reuse a warm connection pool
         # instead of building and tearing down a client per miss.
         app.state.hippius_api_client = HippiusApiClient()

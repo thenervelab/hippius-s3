@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
 from typing import AsyncGenerator
+from typing import Literal
 
 from fastapi import Response
 from fastapi.responses import StreamingResponse
@@ -48,8 +49,20 @@ from hippius_s3.utils import get_query
 logger = logging.getLogger(__name__)
 
 
+# Why a read could not produce its first chunk; bounded so it can be a log field and a metric label.
+# `chunk_unavailable`: a tier REPORTED failure — no backend location after the wait, fetch budget
+# saturated, the pool, every location failed, or the fetcher out of time before the reader's bound
+# (the first chunk gets ONE attempt; a hung Arion fetch lands HERE, "out of time" at 10-14 s).
+# `first_chunk_timeout`: nothing reported
+# failure before the reader's own 25 s bound — a local tier read, decrypt, or a broken env override;
+# rare, check the `backend chunk fetch failed … retry=True` lines, then look outside the Arion client.
+NotReadyCause = Literal["first_chunk_timeout", "chunk_unavailable"]
+
+
 class DownloadNotReadyError(Exception):
-    pass
+    def __init__(self, message: str, *, cause: NotReadyCause) -> None:
+        super().__init__(message)
+        self.cause: NotReadyCause = cause
 
 
 # Where each chunk of the plan can be fetched from when no local tier holds it, keyed by
@@ -120,18 +133,18 @@ def make_fetch_missing(ctx: StreamContext, obj_cache: Any, *, object_id: str, ad
     object_version = int(ctx.object_version)
     wait_s = float(getattr(cfg, "read_missing_chunk_wait_seconds", 10.0))
 
-    async def _fetch_missing(item: ChunkPlanItem) -> bytes:
+    async def _fetch_missing(item: ChunkPlanItem, *, deadline: float | None = None) -> bytes:
         key = (int(item.part_number), int(item.chunk_index))
         locations = ctx.locations.get(key, ())
         if locations:
-            return await fetcher.fetch(locations, address)
-        deadline = asyncio.get_running_loop().time() + wait_s
+            return await fetcher.fetch(locations, address, deadline=deadline)
+        give_up_at = asyncio.get_running_loop().time() + wait_s
         while True:
             await asyncio.sleep(1.0)
             cached = await obj_cache.get_chunk(object_id, object_version, key[0], key[1])
             if cached is not None:
                 return cached
-            if asyncio.get_running_loop().time() >= deadline:
+            if asyncio.get_running_loop().time() >= give_up_at:
                 raise ChunkUnavailableError(
                     f"chunk on no backend yet and no local tier served it within {wait_s:.0f}s: "
                     f"{object_id} v{object_version} part {key[0]} chunk {key[1]}"
@@ -271,6 +284,7 @@ def _stream(ctx: StreamContext, obj_cache: Any, info: dict, *, address: str) -> 
         bucket_name=str(info.get("bucket_name", "")),
         prefetch_chunks=int(getattr(cfg, "http_stream_prefetch_chunks", 0) or 0),
         chunk_timeout=float(cfg.stream_chunk_timeout_seconds),
+        first_chunk_timeout=float(cfg.stream_first_chunk_timeout_seconds),
         fetch_missing=make_fetch_missing(ctx, obj_cache, object_id=str(info["object_id"]), address=address),
         has_backend_copy=lambda item: (int(item.part_number), int(item.chunk_index)) in ctx.locations,
     )
@@ -307,14 +321,18 @@ async def read_response(
         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=first_timeout)
     except StopAsyncIteration:
         first_chunk = None  # empty (zero-byte) object — nothing to stream
-    except (TimeoutError, asyncio.TimeoutError, ChunkUnavailableError) as exc:
-        # ChunkUnavailableError: no tier could serve the chunk (nothing on a backend yet, or the
-        # backend fetch failed after its retries). Same retryable outcome as a timeout — a 503, not
-        # a 500.
+    except (TimeoutError, asyncio.TimeoutError) as exc:
         await gen.aclose()
         raise DownloadNotReadyError(
-            "Parts not ready: first chunk did not arrive within the initial stream timeout"
+            "Parts not ready: first chunk did not arrive within the initial stream timeout",
+            cause="first_chunk_timeout",
         ) from exc
+    except ChunkUnavailableError as exc:
+        # No tier could serve the chunk (nothing on a backend yet, or the backend fetch failed after
+        # its retries). Same retryable outcome as a timeout — a 503, not a 500 — but a different
+        # cause, and the fetcher's reason travels in the message so the log says which tier gave up.
+        await gen.aclose()
+        raise DownloadNotReadyError(f"Parts not ready: {exc}", cause="chunk_unavailable") from exc
 
     async def _body() -> AsyncGenerator[bytes, None]:
         nonlocal first_chunk
@@ -387,12 +405,16 @@ async def stream_object(
         first_chunk = await asyncio.wait_for(gen.__anext__(), timeout=float(cfg.stream_first_chunk_timeout_seconds))
     except StopAsyncIteration:
         first_chunk = None  # empty (zero-byte) source
-    except (TimeoutError, asyncio.TimeoutError, ChunkUnavailableError) as exc:
-        # See read_response: a terminal miss is retryable, so map it to 503 rather than a 500.
+    except (TimeoutError, asyncio.TimeoutError) as exc:
         await gen.aclose()
         raise DownloadNotReadyError(
-            "Parts not ready: source first chunk did not arrive within the initial stream timeout"
+            "Parts not ready: source first chunk did not arrive within the initial stream timeout",
+            cause="first_chunk_timeout",
         ) from exc
+    except ChunkUnavailableError as exc:
+        # See read_response: a terminal miss is retryable, so map it to 503 rather than a 500.
+        await gen.aclose()
+        raise DownloadNotReadyError(f"Parts not ready: source {exc}", cause="chunk_unavailable") from exc
 
     async def _bounded() -> AsyncGenerator[bytes, None]:
         if first_chunk is not None:

@@ -262,6 +262,9 @@ class ArionClient:
         self,
         base_url: str | None = None,
         service_key: str | None = None,
+        *,
+        timeout: httpx.Timeout | None = None,
+        limits: httpx.Limits | None = None,
     ) -> None:
         """
         Initialize the Arion API client.
@@ -269,19 +272,25 @@ class ArionClient:
         Args:
             base_url: Optional Arion base URL. Falls back to config if not provided.
             service_key: Optional API service key. Falls back to config if not provided.
+            timeout: Per-operation (connect/read/write/pool) bounds for this client. The default
+                (60 s, connect 10 s) is sized for the uploader's multi-minute Arion uploads; the
+                read path passes its own, much tighter, bounds (see reader/backend_fetch.py).
+                Never tighten the default here.
+            limits: Connection-pool limits for this client. Default httpx limits unless given.
         """
         self._config = get_config()
         self.api_url = base_url or self._config.arion_base_url
         self._service_key = service_key if service_key is not None else self._config.arion_service_key
-        self._client = httpx.AsyncClient(
-            base_url=self.api_url,
-            timeout=httpx.Timeout(
-                60.0,
-                connect=10.0,
-            ),
-            follow_redirects=True,
-            verify=self._config.arion_verify_ssl,
-        )
+
+        client_kwargs: dict[str, Any] = {
+            "base_url": self.api_url,
+            "timeout": timeout if timeout is not None else httpx.Timeout(60.0, connect=10.0),
+            "follow_redirects": True,
+            "verify": self._config.arion_verify_ssl,
+        }
+        if limits is not None:
+            client_kwargs["limits"] = limits
+        self._client = httpx.AsyncClient(**client_kwargs)
 
     async def __aenter__(self) -> "ArionClient":
         """Async context manager entry."""
@@ -294,6 +303,33 @@ class ArionClient:
     async def close(self) -> None:
         """Close the HTTP client."""
         await self._client.aclose()
+
+    def pool_snapshot(self) -> str:
+        """One line of the connection pool's state by connection, for the reset log.
+
+        Reads httpx/httpcore private attributes on purpose (`_transport._pool.connections`, pinned
+        httpx 0.28.1 / httpcore 1.0.9): diagnostic only, never load-bearing, and "unavailable"
+        rather than an exception when the shape differs.
+        """
+        try:
+            transport = self._client._transport
+            if not isinstance(transport, httpx.AsyncHTTPTransport):
+                return "unavailable"
+            counts = {"idle": 0, "expired": 0, "closed": 0, "in_use": 0}
+            pool: Any = transport._pool  # httpcore.AsyncConnectionPool; not a declared dependency
+            connections = list(pool.connections)
+            for conn in connections:
+                if conn.is_closed():
+                    counts["closed"] += 1
+                elif conn.has_expired():
+                    counts["expired"] += 1
+                elif conn.is_idle():
+                    counts["idle"] += 1
+                else:
+                    counts["in_use"] += 1
+            return f"connections={len(connections)} " + " ".join(f"{k}={v}" for k, v in counts.items())
+        except Exception:  # noqa: BLE001 - a diagnostic must never fail the reset it describes
+            return "unavailable"
 
     def _get_headers(self, account_ss58: str) -> Dict[str, str]:
         """
