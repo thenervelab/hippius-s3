@@ -178,10 +178,23 @@ a whole attempt (queue + pool + connect + read = 24 s) plus its backoff still fi
 first-chunk deadline no retry ever fits, so the first chunk gets exactly one attempt by design and
 a hung Arion fetch on it fails at 10-14 s with `out of time`, while a single read stall on chunk N
 of a large object (300 s deadline) is retried instead of truncating a committed 200 body. A
-PoolTimeout is terminal: no retry, no next location.
+PoolTimeout on the current client is terminal (retrying the same pool is
+useless). If that timeout is the one that replaces the client, the same attempt
+is retried once on the new client so a mid-stream GET that already sent 200
+can continue. A PoolTimeout that does *not* trip the rebuild still fails the
+chunk.
+
+Trap: rebuild is per uvicorn worker PID (`UVICORN_WORKERS=4`). Resetting worker
+A does not unwedge B/C/D — each needs its own streak of 3 PoolTimeouts.
+`trafficDistribution: PreferSameNode` pins in-cluster callers to the *pod*, not
+to one worker; HTTP keepalive can then keep a client on the sick worker.
+Graph `backend_fetch_outcomes_total` by `exported_instance` (pod:pid), not by
+pod. Deleting the pod is still the blast-radius-clear when more than one PID
+on the node is wedged.
 
 Every failed attempt logs one WARNING, `backend chunk fetch failed backend=arion id=... attempt=N/3
-kind=<kind> retry=<bool>: ...`. A wedged pool shows `kind=pool_saturated retry=False`; a hung
+kind=<kind> retry=<bool>: ...`. A wedged pool shows `kind=pool_saturated retry=True` when the rebuild fires (the
+same attempt continues on the new client) and `retry=False` when it does not; a hung
 connection shows `kind=read_timeout retry=True` (or `connect_timeout`) followed by
 `kind=deadline retry=False: 15.0s left, attempt needs 25.0s` when the deadline stops the retry.
 After `HIPPIUS_READ_BACKEND_FETCH_CLIENT_RESET_AFTER_POOL_TIMEOUTS` (3) consecutive PoolTimeouts

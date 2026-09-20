@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from hippius_s3.reader.backend_fetch import fetch_client_settings
 
@@ -68,3 +70,25 @@ def test_zero_concurrency_still_yields_a_usable_pool() -> None:
     # Mirrors the semaphore's own max(1, ...) in BackendChunkFetcher.__init__.
     _, limits = fetch_client_settings(_cfg(read_backend_fetch_concurrency=0))
     assert limits == httpx.Limits(max_connections=1, max_keepalive_connections=1)
+
+
+@given(
+    queue=st.floats(0.1, 20, allow_nan=False, allow_infinity=False),
+    pool=st.floats(0.1, 20, allow_nan=False, allow_infinity=False),
+    connect=st.floats(0.1, 20, allow_nan=False, allow_infinity=False),
+    read=st.floats(0.1, 20, allow_nan=False, allow_infinity=False),
+)
+def test_boot_invariant_is_the_sum_not_any_single_knob(queue: float, pool: float, connect: float, read: float) -> None:
+    first = 25.0
+    cfg = _cfg(
+        read_backend_fetch_queue_timeout_seconds=queue,
+        read_backend_fetch_pool_timeout_seconds=pool,
+        read_backend_fetch_connect_timeout_seconds=connect,
+        read_backend_fetch_read_timeout_seconds=read,
+        stream_first_chunk_timeout_seconds=first,
+    )
+    if queue + pool + connect + read >= first:
+        with pytest.raises(ValueError):
+            fetch_client_settings(cfg)
+    else:
+        fetch_client_settings(cfg)

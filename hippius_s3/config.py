@@ -566,9 +566,8 @@ class Config:
     # Per-operation bounds for the read path's OWN ArionClient (reader/backend_fetch.py).
     # Invariant, validated at boot: queue + pool + connect + read < stream_first_chunk_timeout_seconds
     # (8 + 2 + 4 + 10 = 24 < 25), so one attempt fails as a logged, counted httpx exception before
-    # the reader cancels it silently (how one pod's poisoned pool went unnoticed for 17 h, 2026-09-19).
-    # `read` is a per-read-operation stall bound, not a whole-body budget; pool == semaphore, so a
-    # healthy pool never waits and 2 s is generous.
+    # the reader cancels it silently. `read` is a per-read-operation stall bound, not a whole-body
+    # budget; pool == semaphore, so a healthy pool never waits and 2 s is generous.
     read_backend_fetch_connect_timeout_seconds: float = env(
         "HIPPIUS_READ_BACKEND_FETCH_CONNECT_TIMEOUT_SECONDS:4.0", convert=float
     )

@@ -151,8 +151,9 @@ class BackendChunkFetcher:
         Locations are tried in the order given (the object's download-backend order). A transient
         failure — a 429/5xx, a connection reset, an httpx connect/read timeout — is retried on the
         same location with exponential backoff; a permanent one (a 404: the identifier is stale)
-        moves on to the next. A pool timeout is terminal for the whole request (see
-        `_attempt_once`). Exhausting every location is `ChunkUnavailableError`.
+        moves on to the next. A pool timeout on the current client is terminal (see
+        `_attempt_once`); if that timeout replaces the client, the attempt is retried
+        once on the new one. Exhausting every location is `ChunkUnavailableError`.
 
         `deadline` is a loop-time instant (the caller's own bound on this chunk). No attempt after
         the first is started unless a whole attempt's worst case (slot wait + pool wait + connect
@@ -200,7 +201,7 @@ class BackendChunkFetcher:
             return
         left = deadline - asyncio.get_running_loop().time()
         needed = self._attempt_budget + backoff
-        if left >= needed:
+        if left > needed:
             return
         logger.warning(
             "backend chunk fetch failed backend=%s id=%s attempt=%s/%s kind=deadline retry=False: "
@@ -215,7 +216,14 @@ class BackendChunkFetcher:
         raise ChunkUnavailableError(f"backend fetch out of time for {backend}: no budget for another attempt")
 
     async def _attempt_once(
-        self, fetch_one: FetchOne, *, backend: str, identifier: str, address: str, attempt: int
+        self,
+        fetch_one: FetchOne,
+        *,
+        backend: str,
+        identifier: str,
+        address: str,
+        attempt: int,
+        allow_rebuild_retry: bool = True,
     ) -> tuple[bytes | None, bool, int]:
         """One attempt under a concurrency slot: `(data, False, generation)` on success,
         `(None, retry, generation)` on a classified failure, or `ChunkUnavailableError` when the
@@ -233,18 +241,35 @@ class BackendChunkFetcher:
         # saturation becomes an ordinary retried timeout and the client is never replaced.
         except httpx.PoolTimeout as exc:
             # The pool is sized to the semaphore, so this cannot be "busy": connections are held by
-            # something that is not a live fetch. Retrying or trying the next location re-queues
-            # behind the same pool; fail the request now and, if it keeps happening, replace the
-            # client.
+            # something that is not a live fetch. Retrying the SAME client re-queues behind the
+            # stuck pool. If this timeout is the one that replaces the client, retry this attempt
+            # once on the new one — that is the point of the swap, and mid-stream it keeps a
+            # committed 200 alive. A PoolTimeout that does not trip the rebuild is still terminal.
             self._release_slot()
-            self._log_failed_attempt(
-                backend=backend, identifier=identifier, attempt=attempt, kind="pool_saturated", retry=False, exc=exc
-            )
             _record_backend_fetch_outcome("pool_timeout")
-            await self._note_pool_timeout(generation)
-            raise ChunkUnavailableError(
-                f"backend connection pool saturated (pool wait exceeded) for {backend}"
-            ) from exc
+            if allow_rebuild_retry:
+                await self._note_pool_timeout(generation)
+            rebuilt = allow_rebuild_retry and self._generation != generation
+            self._log_failed_attempt(
+                backend=backend,
+                identifier=identifier,
+                attempt=attempt,
+                kind="pool_saturated",
+                retry=rebuilt,
+                exc=exc,
+            )
+            if not rebuilt:
+                raise ChunkUnavailableError(
+                    f"backend connection pool saturated (pool wait exceeded) for {backend}"
+                ) from exc
+            return await self._attempt_once(
+                fetch_one,
+                backend=backend,
+                identifier=identifier,
+                address=address,
+                attempt=attempt,
+                allow_rebuild_retry=False,
+            )
         except Exception as exc:  # noqa: BLE001 - every backend error is classified below
             self._release_slot()
             outcome = _outcome_of(exc)

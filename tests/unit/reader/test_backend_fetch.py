@@ -222,6 +222,41 @@ async def test_a_pool_timeout_is_not_retried_and_does_not_try_the_next_location(
     assert calls == ["arion"]
 
 
+@pytest.mark.asyncio
+async def test_a_pool_timeout_that_rebuilds_the_client_retries_on_the_new_client() -> None:
+    # Retrying the same wedged pool is useless; retrying the replacement is the point of the swap.
+    # Mid-stream that is what keeps a committed 200 from becoming IncompleteRead after part 1.
+    import httpx
+
+    calls: list[str] = []
+    resets: list[int] = []
+
+    async def flaky(identifier: str, address: str) -> bytes:
+        calls.append("arion")
+        if len(calls) == 1:
+            raise httpx.PoolTimeout("pool")
+        return b"cipher"
+
+    def reset() -> Awaitable[None]:
+        resets.append(1)
+        return asyncio.sleep(0)
+
+    fetcher = BackendChunkFetcher(
+        {"arion": flaky},
+        concurrency=4,
+        attempts=1,
+        base_sleep=0.0,
+        jitter=0.0,
+        reset_fn=reset,
+        reset_after_pool_timeouts=1,
+        attempt_budget_seconds=24.0,
+    )
+    deadline = asyncio.get_running_loop().time() + 300.0
+    assert await fetcher.fetch([("arion", "a")], "addr", deadline=deadline) == b"cipher"
+    assert calls == ["arion", "arion"]
+    assert resets == [1]
+
+
 def _read_timeout_then_success() -> tuple[Callable[[str, str], Awaitable[bytes]], list[str]]:
     calls: list[str] = []
 
@@ -281,6 +316,31 @@ async def test_a_read_timeout_is_not_retried_when_no_attempt_fits_the_deadline(
     deadline_lines = [r.getMessage() for r in caplog.records if "kind=deadline" in r.getMessage()]
     assert len(deadline_lines) == 1
     assert "retry=False" in deadline_lines[0] and "attempt needs 24.0s" in deadline_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_production_first_chunk_deadline_admits_exactly_one_attempt() -> None:
+    # Production: 25 s first-chunk bound, 24 s attempt budget, 1 s base backoff, no jitter.
+    # An instant failure leaves ~25 s; needed is 24 + 1 = 25. Strict `left > needed` refuses
+    # the equality so a retry cannot start and then be cancelled silently by the reader's wait_for.
+    calls: list[str] = []
+
+    async def boom(identifier: str, address: str) -> bytes:
+        calls.append("arion")
+        raise ConnectionError("blip")
+
+    fetcher = BackendChunkFetcher(
+        {"arion": boom},
+        concurrency=4,
+        attempts=3,
+        base_sleep=1.0,
+        jitter=0.0,
+        attempt_budget_seconds=24.0,
+    )
+    deadline = asyncio.get_running_loop().time() + 25.0
+    with pytest.raises(ChunkUnavailableError, match="out of time"):
+        await fetcher.fetch([("arion", "a")], "addr", deadline=deadline)
+    assert calls == ["arion"]
 
 
 @pytest.mark.asyncio
