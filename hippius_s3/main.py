@@ -38,7 +38,6 @@ from hippius_s3.cache import create_fs_store
 from hippius_s3.cache.peers import PEER_PORT
 from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
-from hippius_s3.cache.peers import ReplaceablePeerClient
 from hippius_s3.cache.peers import effective_max_inflight
 from hippius_s3.cache.peers import peer_client_settings
 from hippius_s3.cache.peers import set_active_registry
@@ -64,6 +63,7 @@ from hippius_s3.gateway.middlewares.read_only import read_only_middleware
 from hippius_s3.gateway.middlewares.suspension import suspension_middleware
 from hippius_s3.gateway.middlewares.trailing_slash import trailing_slash_normalizer
 from hippius_s3.gateway.services.acl_service import ACLService
+from hippius_s3.http_client import ReplaceableHttpClient
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
 from hippius_s3.peer_auth import validate_peer_secret
@@ -211,11 +211,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 config.http_stream_prefetch_chunks,
             )
             timeout, limits = peer_client_settings(config, max_inflight=inflight)
-            holder = ReplaceablePeerClient(
+            holder = ReplaceableHttpClient(
                 lambda: httpx.AsyncClient(timeout=timeout, limits=limits),
                 # Cover the wait_for deadline so in-flight old-generation fetches finish
                 # before aclose, instead of being cancelled into a 30s owner-memo poison.
                 drain_seconds=float(config.peer_fetch_deadline_seconds) + 1.0,
+                name="peer HTTP client",
             )
             app.state.peer_http = holder
             app.state.peer_registry = PeerRegistry(

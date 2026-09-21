@@ -40,6 +40,7 @@ import redis.asyncio as async_redis
 
 from hippius_s3.cache.part_memo import PartMemo
 from hippius_s3.config import get_config
+from hippius_s3.http_client import ReplaceableHttpClient
 from hippius_s3.monitoring import PeerShedReason
 from hippius_s3.peer_auth import PEER_AUTH_HEADER
 
@@ -164,10 +165,6 @@ _DEFAULT_MAX_INFLIGHT_PER_PEER = 16
 # doing its job. Reusing the loss-cut here would abort healthy large-chunk fetches.
 _DEFAULT_DEADLINE_SECONDS = 2.0
 
-# How long a replaced client's close() may take before it is abandoned. A wedged pool may not
-# close promptly; nothing waits on the old client once it is swapped out.
-_OLD_CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
-
 # The peer semaphore is per-peer URL; the httpx pool is process-wide. Prod ingest is 5 nodes so
 # a healthy process can have max_inflight * 4 live peer fetches. Sizing the pool to that is what
 # makes a PoolTimeout mean leaked connections, not "four peers busy".
@@ -235,38 +232,8 @@ def peer_client_settings(cfg: Any, *, max_inflight: int) -> tuple[httpx.Timeout,
     )
 
 
-class ReplaceablePeerClient:
-    """Holds the peer httpx client so a PoolTimeout streak can swap it for a fresh one.
-
-    `reset` builds the replacement FIRST and swaps it in synchronously (the fetcher's generation
-    gate relies on that). Only the close of the old client is deferred.
-    """
-
-    def __init__(self, make: Callable[[], Any], *, drain_seconds: float = 2.0) -> None:
-        self._make = make
-        self._client = make()
-        self._drain_seconds = float(drain_seconds)
-
-    @property
-    def client(self) -> Any:
-        return self._client
-
-    def reset(self) -> Awaitable[None]:
-        """Swap in a fresh client now; return the deferred close of the old one."""
-        old = self._client
-        self._client = self._make()
-        logger.error("replacing the peer HTTP client")
-        return self._close_old(old)
-
-    async def _close_old(self, old: Any) -> None:
-        await asyncio.sleep(self._drain_seconds)
-        close = getattr(old, "aclose", None) or getattr(old, "close", None)
-        if close is None:
-            return
-        try:
-            await asyncio.wait_for(close(), timeout=_OLD_CLIENT_CLOSE_TIMEOUT_SECONDS)
-        except Exception as exc:  # noqa: BLE001 - the old client is already unreferenced
-            logger.warning("old peer HTTP client did not close cleanly (%s); dropped", exc)
+# Tests and `isinstance` in this module; the holder is shared with the Arion read client.
+ReplaceablePeerClient = ReplaceableHttpClient
 
 
 def _record_shed(reason: PeerShedReason) -> None:
@@ -508,8 +475,8 @@ class PeerChunkFetcher:
         self._inflight: dict[str, asyncio.Semaphore] = {}
 
     def _http(self) -> Any:
-        """The object with `.stream()`. Only unwrap ReplaceablePeerClient; FakeHttp has no `.client`."""
-        if isinstance(self._client, ReplaceablePeerClient):
+        """The object with `.stream()`. Only unwrap ReplaceableHttpClient; FakeHttp has no `.client`."""
+        if isinstance(self._client, ReplaceableHttpClient):
             return self._client.client
         return self._client
 

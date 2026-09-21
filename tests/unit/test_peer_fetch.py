@@ -1384,7 +1384,7 @@ async def test_a_hanging_old_client_close_is_abandoned(monkeypatch: pytest.Monke
         async def aclose(self) -> None:
             await asyncio.Event().wait()
 
-    monkeypatch.setattr("hippius_s3.cache.peers._OLD_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("hippius_s3.http_client.OLD_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
     holder = ReplaceablePeerClient(lambda: _Hang(), drain_seconds=0.0)
     started = time.monotonic()
     await asyncio.wait_for(holder.reset(), timeout=1.0)

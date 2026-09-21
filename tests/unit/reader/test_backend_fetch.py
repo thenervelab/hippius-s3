@@ -594,8 +594,8 @@ async def test_reset_logs_the_old_pool_before_the_swap(caplog: pytest.LogCapture
             return f"connections={self.n}"
 
     counter = iter(range(1, 10))
-    holder = _ReplaceableArionClient(lambda: FakeClient(next(counter)), drain_seconds=0.0)
-    with caplog.at_level(logging.ERROR, logger="hippius_s3.reader.backend_fetch"):
+    holder = _ReplaceableArionClient(lambda: FakeClient(next(counter)), drain_seconds=0.0, name="Arion client")
+    with caplog.at_level(logging.ERROR, logger="hippius_s3.http_client"):
         await holder.reset()
     lines = [r.getMessage() for r in caplog.records if "replacing the Arion client" in r.getMessage()]
     assert lines == ["replacing the Arion client; old pool connections=1"]
@@ -801,7 +801,7 @@ async def test_reset_does_not_wait_forever_on_a_client_that_will_not_close() -> 
 
     made = iter([Hanging(), Fresh()])
     holder = _ReplaceableArionClient(lambda: next(made), drain_seconds=0.0)
-    with patch("hippius_s3.reader.backend_fetch.asyncio.wait_for", gave_up):
+    with patch("hippius_s3.http_client.asyncio.wait_for", gave_up):
         await holder.reset()  # must return, not raise
     assert isinstance(holder.client, Fresh)
 

@@ -37,7 +37,8 @@ closed on an optimisation costs a cache warm, counted as
 `promotion_skipped_total{reason=residency_failed}`. Two caps bound
 peer fanout — `HIPPIUS_PEER_FETCH_MAX_INFLIGHT` per (pod, peer) on the client, and
 `HIPPIUS_PEER_SERVE_MAX_INFLIGHT` on the serving pod, which sheds with 503. Both shed to the
-pool rather than queueing. The client is a replaceable `httpx.AsyncClient` (`ReplaceablePeerClient`):
+pool rather than queueing. The client is a `ReplaceableHttpClient` (same holder as the Arion read
+client in `hippius_s3/http_client.py`):
 a streak of `PoolTimeout`s rebuilds it, the same recovery as the Arion fetch client. Without that,
 cancelled `wait_for`s leak CLOSE_WAIT and the pod stops asking peers (api-local-xrbng, 2026-09-21).
 
