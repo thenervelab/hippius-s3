@@ -64,6 +64,7 @@ from hippius_s3.gateway.middlewares.suspension import suspension_middleware
 from hippius_s3.gateway.middlewares.trailing_slash import trailing_slash_normalizer
 from hippius_s3.gateway.services.acl_service import ACLService
 from hippius_s3.http_client import ReplaceableHttpClient
+from hippius_s3.http_client import live_client
 from hippius_s3.logging_config import setup_loki_logging
 from hippius_s3.metrics_collector_task import BackgroundMetricsCollector
 from hippius_s3.peer_auth import validate_peer_secret
@@ -376,7 +377,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     finally:
         try:
             holder = getattr(app.state, "peer_http", None)
-            client = getattr(holder, "client", holder)
+            client = live_client(holder)
             if client is not None and hasattr(client, "aclose"):
                 await client.aclose()
                 logger.info("Peer HTTP client closed")

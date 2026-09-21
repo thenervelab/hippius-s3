@@ -41,6 +41,7 @@ import redis.asyncio as async_redis
 from hippius_s3.cache.part_memo import PartMemo
 from hippius_s3.config import get_config
 from hippius_s3.http_client import ReplaceableHttpClient
+from hippius_s3.http_client import live_client
 from hippius_s3.monitoring import PeerShedReason
 from hippius_s3.peer_auth import PEER_AUTH_HEADER
 
@@ -475,10 +476,8 @@ class PeerChunkFetcher:
         self._inflight: dict[str, asyncio.Semaphore] = {}
 
     def _http(self) -> Any:
-        """The object with `.stream()`. Only unwrap ReplaceableHttpClient; FakeHttp has no `.client`."""
-        if isinstance(self._client, ReplaceableHttpClient):
-            return self._client.client
-        return self._client
+        """The object with `.stream()`. Unwrap ReplaceableHttpClient; FakeHttp is used as-is."""
+        return live_client(self._client)
 
     async def _resolve_part(
         self, object_id: str, object_version: int, part_number: int

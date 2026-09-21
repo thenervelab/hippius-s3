@@ -567,7 +567,7 @@ async def test_reset_swaps_in_a_fresh_client_before_closing_the_old_one() -> Non
             return f"snapshot-{self.n}"
 
     counter = iter(range(1, 10))
-    holder = _ReplaceableArionClient(lambda: FakeClient(next(counter)), drain_seconds=0.0)
+    holder = _ReplaceableArionClient(lambda: FakeClient(next(counter)), drain_seconds=0.0, name="Arion client")
     first = holder.client
     await holder.reset()
     assert holder.client is not first
@@ -616,7 +616,7 @@ async def test_the_old_client_drains_before_it_is_closed() -> None:
         def pool_snapshot(self) -> str:
             return "fake"
 
-    holder = _ReplaceableArionClient(FakeClient, drain_seconds=0.2)
+    holder = _ReplaceableArionClient(FakeClient, drain_seconds=0.2, name="Arion client")
     loop = asyncio.get_running_loop()
     t0 = loop.time()
     pending = asyncio.ensure_future(holder.reset())
@@ -645,7 +645,7 @@ async def test_a_failed_rebuild_keeps_the_previous_client_and_raises() -> None:
         return Fine()
 
     made: list[int] = []
-    holder = _ReplaceableArionClient(make)
+    holder = _ReplaceableArionClient(make, drain_seconds=0.0, name="Arion client")
     before = holder.client
     # The swap is synchronous, so a failed build raises from the call itself, not from awaiting.
     with pytest.raises(RuntimeError, match="cannot build"):
@@ -800,7 +800,7 @@ async def test_reset_does_not_wait_forever_on_a_client_that_will_not_close() -> 
         raise asyncio.TimeoutError
 
     made = iter([Hanging(), Fresh()])
-    holder = _ReplaceableArionClient(lambda: next(made), drain_seconds=0.0)
+    holder = _ReplaceableArionClient(lambda: next(made), drain_seconds=0.0, name="Arion client")
     with patch("hippius_s3.http_client.asyncio.wait_for", gave_up):
         await holder.reset()  # must return, not raise
     assert isinstance(holder.client, Fresh)

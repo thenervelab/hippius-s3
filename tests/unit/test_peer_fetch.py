@@ -1241,18 +1241,19 @@ async def test_a_pool_stall_inside_wait_for_is_pool_timeout_not_deadline(
 
 
 @pytest.mark.asyncio
-async def test_wait_for_cancel_releases_the_peer_semaphore_and_rebuilds() -> None:
-    """xrbng: wait_for fires, inner hangs. Slot must drop and a reset_after=1 retry must dial."""
+async def test_wait_for_cancel_releases_the_peer_semaphore_and_rebuilds(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """xrbng: wait_for fires, inner hangs. Slot must drop and holder.reset() retry must dial."""
+    import logging
+
+    shed: list[str] = []
+    monkeypatch.setattr("hippius_s3.cache.peers._record_shed", shed.append)
     blocked = BlockingHttp()
     ok = FakeHttp(200, b"peer-bytes")
-    holder = ReplaceablePeerClient(lambda: blocked)
-    resets: list[int] = []
-
-    def reset() -> Awaitable[None]:
-        resets.append(1)
-        holder._client = ok
-        return asyncio.sleep(0)
-
+    clients = iter([blocked, ok])
+    holder = ReplaceablePeerClient(lambda: next(clients), drain_seconds=0.0, name="peer HTTP client")
     fetcher = PeerChunkFetcher(
         FakePool(residency_row()),
         await _registry(),
@@ -1260,21 +1261,24 @@ async def test_wait_for_cancel_releases_the_peer_semaphore_and_rebuilds() -> Non
         holder,
         auth_secret=SECRET,
         deadline_seconds=0.15,
-        reset_fn=reset,
+        reset_fn=holder.reset,
         reset_after_pool_timeouts=1,
         max_inflight=1,
     )
-    assert await fetcher(OBJ, 1, 1, 0) == b"peer-bytes"
-    assert resets == [1]
+    with caplog.at_level(logging.WARNING):
+        assert await fetcher(OBJ, 1, 1, 0) == b"peer-bytes"
     assert not fetcher._inflight[PEER_URL].locked()
     assert ok.urls == [f"{PEER_URL}/internal/parts/{OBJ}/1/1/chunks/0"]
+    assert shed.count("pool_timeout") >= 1
+    assert any("kind=deadline" in r.getMessage() for r in caplog.records)
+    assert any("replacing the peer HTTP client" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
 async def test_same_part_pool_timeouts_reach_the_rebuild_threshold() -> None:
     """Poisoning the owner memo on the first PoolTimeout would hide chunks 1 and 2."""
     stuck = _StuckPoolTimeout()
-    holder = ReplaceablePeerClient(lambda: stuck)
+    holder = ReplaceablePeerClient(lambda: stuck, drain_seconds=0.0, name="peer HTTP client")
     resets: list[int] = []
 
     def reset() -> Awaitable[None]:
@@ -1302,7 +1306,7 @@ async def test_same_part_pool_timeouts_reach_the_rebuild_threshold() -> None:
 @pytest.mark.asyncio
 async def test_a_burst_of_pool_timeouts_from_one_generation_rebuilds_once() -> None:
     stuck = _StuckPoolTimeout()
-    holder = ReplaceablePeerClient(lambda: stuck)
+    holder = ReplaceablePeerClient(lambda: stuck, drain_seconds=0.0, name="peer HTTP client")
     resets: list[int] = []
 
     def reset() -> Awaitable[None]:
@@ -1328,7 +1332,7 @@ async def test_a_burst_of_pool_timeouts_from_one_generation_rebuilds_once() -> N
 
 @pytest.mark.asyncio
 async def test_the_rebuild_retry_does_not_cascade_and_the_next_part_still_counts() -> None:
-    holder = ReplaceablePeerClient(lambda: _StuckPoolTimeout())
+    holder = ReplaceablePeerClient(lambda: _StuckPoolTimeout(), drain_seconds=0.0, name="peer HTTP client")
     resets: list[int] = []
 
     def reset() -> Awaitable[None]:
@@ -1369,7 +1373,7 @@ async def test_replaceable_client_swaps_before_the_old_one_closes() -> None:
         n["i"] += 1
         return _Probe(f"c{n['i']}")
 
-    holder = ReplaceablePeerClient(make, drain_seconds=0.0)
+    holder = ReplaceablePeerClient(make, drain_seconds=0.0, name="peer HTTP client")
     first = holder.client
     pending = holder.reset()
     assert holder.client is not first, "swap is synchronous; close is deferred"
@@ -1385,7 +1389,7 @@ async def test_a_hanging_old_client_close_is_abandoned(monkeypatch: pytest.Monke
             await asyncio.Event().wait()
 
     monkeypatch.setattr("hippius_s3.http_client.OLD_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
-    holder = ReplaceablePeerClient(lambda: _Hang(), drain_seconds=0.0)
+    holder = ReplaceablePeerClient(lambda: _Hang(), drain_seconds=0.0, name="peer HTTP client")
     started = time.monotonic()
     await asyncio.wait_for(holder.reset(), timeout=1.0)
     assert time.monotonic() - started < 1.0
@@ -1404,7 +1408,7 @@ async def test_failed_make_keeps_the_previous_client() -> None:
             raise RuntimeError("cannot build")
         return _C()
 
-    holder = ReplaceablePeerClient(make, drain_seconds=0.0)
+    holder = ReplaceablePeerClient(make, drain_seconds=0.0, name="peer HTTP client")
     first = holder.client
     with pytest.raises(RuntimeError, match="cannot build"):
         holder.reset()

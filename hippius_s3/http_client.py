@@ -26,8 +26,8 @@ class ReplaceableHttpClient:
         self,
         make: Callable[[], Any],
         *,
-        drain_seconds: float = 0.0,
-        name: str = "HTTP client",
+        drain_seconds: float,
+        name: str,
     ) -> None:
         self._make = make
         self._client = make()
@@ -59,8 +59,20 @@ class ReplaceableHttpClient:
         await asyncio.sleep(self._drain_seconds)
         close = getattr(old, "aclose", None) or getattr(old, "close", None)
         if close is None:
+            logger.warning("old %s has neither aclose nor close; dropped without closing", self._name)
             return
         try:
             await asyncio.wait_for(close(), timeout=OLD_CLIENT_CLOSE_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001 - the old client is already unreferenced
             logger.warning("old %s did not close cleanly (%s); dropped", self._name, exc)
+
+
+def live_client(holder: Any) -> Any:
+    """The object that actually speaks HTTP.
+
+    `ReplaceableHttpClient` wraps that object as `.client`. Fakes used in tests are the
+    object itself. Shutdown and `_http()` must use this, not `getattr(holder, "client")`.
+    """
+    if isinstance(holder, ReplaceableHttpClient):
+        return holder.client
+    return holder
