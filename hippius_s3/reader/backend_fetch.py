@@ -33,6 +33,7 @@ from typing import Iterable
 import httpx
 
 from hippius_s3.config import get_config
+from hippius_s3.http_client import ReplaceableHttpClient
 from hippius_s3.monitoring import BackendFetchOutcome
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.workers.errors import classify_download_error
@@ -46,10 +47,8 @@ BackendLocation = tuple[str, str]
 # Downloads one identifier from one backend, returning the whole ciphertext chunk.
 FetchOne = Callable[[str, str], Awaitable[bytes]]
 
-# How long a replaced client's close() may take before it is abandoned. A wedged pool may not
-# close promptly, and nothing waits on the old client once it is swapped out; the bound only
-# keeps the reset from inheriting the stall it exists to escape.
-_OLD_CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
+# Tests import this name; the holder itself is shared with the peer client.
+_ReplaceableArionClient = ReplaceableHttpClient
 
 
 class ChunkUnavailableError(Exception):
@@ -473,50 +472,6 @@ def fetch_client_settings(cfg: Any) -> tuple[httpx.Timeout, httpx.Limits]:
     )
 
 
-class _ReplaceableArionClient:
-    """Holds the read path's ArionClient so the fetcher can swap it for a fresh one.
-
-    `reset` builds the replacement FIRST and swaps it in synchronously (the fetcher's generation
-    gate relies on that). Only the close of the old client is deferred: it drains first, then
-    closes under a bound, because a wedged pool may not close promptly and waiting on it is the
-    one thing the reset must not do.
-    """
-
-    def __init__(self, make: Callable[[], Any], *, drain_seconds: float = 17.0) -> None:
-        self._make = make
-        self._client = make()
-        self._drain_seconds = float(drain_seconds)
-
-    @property
-    def client(self) -> Any:
-        return self._client
-
-    def reset(self) -> Awaitable[None]:
-        """Swap in a fresh client now; return the deferred close of the old one.
-
-        A failing `make()` raises here and leaves the previous client installed. The old pool's
-        state is logged before the swap: it is the only evidence of what was holding the
-        connections, and it goes away with the client.
-        """
-        old = self._client
-        take_snapshot = getattr(old, "pool_snapshot", None)
-        snapshot = take_snapshot() if take_snapshot is not None else "unavailable"
-        self._client = self._make()
-        logger.error("replacing the Arion client; old pool %s", snapshot)
-        return self._close_old(old)
-
-    async def _close_old(self, old: Any) -> None:
-        # The old client still carries healthy in-flight fetches (only the pool is wedged, not
-        # every connection). The drain covers a pool wait plus one wire attempt (pool + connect
-        # + read + 1); a slow but healthy body can outlive it, which is acceptable: that fetch
-        # fails as a transient error and retries on the new client.
-        await asyncio.sleep(self._drain_seconds)
-        try:
-            await asyncio.wait_for(old.close(), timeout=_OLD_CLIENT_CLOSE_TIMEOUT_SECONDS)
-        except Exception as exc:  # noqa: BLE001 - the old client is already unreferenced
-            logger.warning("old Arion client did not close cleanly (%s); dropped", exc)
-
-
 def _build_fetcher() -> BackendChunkFetcher:
     from hippius_s3.services.arion_service import ArionClient
 
@@ -528,7 +483,11 @@ def _build_fetcher() -> BackendChunkFetcher:
         + float(cfg.read_backend_fetch_connect_timeout_seconds)
         + float(cfg.read_backend_fetch_read_timeout_seconds)
     )
-    holder = _ReplaceableArionClient(lambda: ArionClient(timeout=timeout, limits=limits), drain_seconds=wire + 1.0)
+    holder = _ReplaceableArionClient(
+        lambda: ArionClient(timeout=timeout, limits=limits),
+        drain_seconds=wire + 1.0,
+        name="Arion client",
+    )
 
     async def arion_fetch(identifier: str, address: str) -> bytes:
         return b"".join([piece async for piece in holder.client.download_file(identifier, address)])

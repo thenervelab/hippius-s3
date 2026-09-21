@@ -708,6 +708,16 @@ class Config:
     # abort healthy large-chunk fetches. This is a backstop against a peer that never finishes,
     # not a second loss-cut.
     peer_fetch_deadline_seconds: float = env("HIPPIUS_PEER_FETCH_DEADLINE_SECONDS:2.0", convert=float)
+    # Pool wait for the peer httpx client. Distinct from the 0.5s connect/read loss-cut: a
+    # wedged pool (CLOSE_WAIT held by cancelled fetches) must fail as PoolTimeout before the
+    # 2s wait_for cancels the coroutine, or the cancel leaks the socket and the client goes
+    # dark. Validated at boot: pool + connect < deadline. See cache/peers.py peer_client_settings.
+    peer_fetch_pool_timeout_seconds: float = env("HIPPIUS_PEER_FETCH_POOL_TIMEOUT_SECONDS:0.4", convert=float)
+    # Consecutive httpx.PoolTimeouts before the peer client is thrown away and rebuilt. Same
+    # recovery as the Arion fetch client (HIPPIUS_READ_BACKEND_FETCH_CLIENT_RESET_AFTER_POOL_TIMEOUTS).
+    peer_fetch_client_reset_after_pool_timeouts: int = env(
+        "HIPPIUS_PEER_FETCH_CLIENT_RESET_AFTER_POOL_TIMEOUTS:3", convert=int
+    )
     # Per-peer fanout: concurrent fetches this pod will have in flight to any ONE peer, and
     # concurrent peer requests this pod will SERVE. Both are needed — the client cap bounds
     # what one pod sends, but five pods each within their own cap still add up at the peer,

@@ -28,6 +28,9 @@ import asyncio
 import ipaddress
 import json
 import logging
+from typing import Any
+from typing import Awaitable
+from typing import Callable
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -37,6 +40,8 @@ import redis.asyncio as async_redis
 
 from hippius_s3.cache.part_memo import PartMemo
 from hippius_s3.config import get_config
+from hippius_s3.http_client import ReplaceableHttpClient
+from hippius_s3.http_client import live_client
 from hippius_s3.monitoring import PeerShedReason
 from hippius_s3.peer_auth import PEER_AUTH_HEADER
 
@@ -161,6 +166,11 @@ _DEFAULT_MAX_INFLIGHT_PER_PEER = 16
 # doing its job. Reusing the loss-cut here would abort healthy large-chunk fetches.
 _DEFAULT_DEADLINE_SECONDS = 2.0
 
+# The peer semaphore is per-peer URL; the httpx pool is process-wide. Prod ingest is 5 nodes so
+# a healthy process can have max_inflight * 4 live peer fetches. Sizing the pool to that is what
+# makes a PoolTimeout mean leaked connections, not "four peers busy".
+_PEER_POOL_PEER_COUNT = 4
+
 
 def effective_max_inflight(configured: int, prefetch_chunks: int) -> int:
     """The per-peer cap, raised to at least the read path's prefetch depth.
@@ -194,6 +204,37 @@ def effective_max_inflight(configured: int, prefetch_chunks: int) -> int:
         prefetch_chunks,
     )
     return prefetch_chunks
+
+
+def peer_client_settings(cfg: Any, *, max_inflight: int) -> tuple[httpx.Timeout, httpx.Limits]:
+    """The peer httpx client's per-operation bounds and pool size.
+
+    Pure so a misconfiguration raises at boot (when the fetcher is wired) rather than as a silent
+    hang on the first cross-node GET. `read`/`connect` reuse `peer_fetch_timeout_seconds` (the
+    0.5s loss-cut): 0.5s of silence is a dead peer. `pool` is separate so a wedged pool fails as
+    PoolTimeout before `peer_fetch_deadline_seconds` cancels the coroutine — that cancel is what
+    leaked CLOSE_WAIT and went dark on api-local-xrbng (2026-09-21).
+    """
+    connect = float(cfg.peer_fetch_timeout_seconds)
+    read = float(cfg.peer_fetch_timeout_seconds)
+    pool = float(cfg.peer_fetch_pool_timeout_seconds)
+    deadline = float(cfg.peer_fetch_deadline_seconds)
+    if pool + connect >= deadline:
+        raise ValueError(
+            "HIPPIUS_PEER_FETCH_POOL_TIMEOUT_SECONDS + HIPPIUS_PEER_FETCH_TIMEOUT_SECONDS "
+            f"({pool} + {connect}) must be below HIPPIUS_PEER_FETCH_DEADLINE_SECONDS ({deadline}); "
+            "otherwise wait_for cancels the fetch before httpx can fail it, and the socket leaks"
+        )
+    inflight = max(1, int(max_inflight))
+    connections = inflight * _PEER_POOL_PEER_COUNT
+    return (
+        httpx.Timeout(connect=connect, read=read, write=read, pool=pool),
+        httpx.Limits(max_connections=connections, max_keepalive_connections=connections),
+    )
+
+
+# Tests and `isinstance` in this module; the holder is shared with the Arion read client.
+ReplaceablePeerClient = ReplaceableHttpClient
 
 
 def _record_shed(reason: PeerShedReason) -> None:
@@ -392,20 +433,30 @@ class PeerChunkFetcher:
         pool: asyncpg.Pool,
         registry: PeerRegistry,
         node_name: str,
-        client: httpx.AsyncClient,
+        client: Any,
         *,
         auth_secret: str,
         max_inflight: int = _DEFAULT_MAX_INFLIGHT_PER_PEER,
         deadline_seconds: float = _DEFAULT_DEADLINE_SECONDS,
+        reset_fn: Callable[[], Awaitable[None]] | None = None,
+        reset_after_pool_timeouts: int = 3,
     ) -> None:
         self._pool = pool
         self._registry = registry
         self._node_name = node_name
+        # Either a client with `.stream()` (tests) or a `ReplaceablePeerClient` whose `.client`
+        # is swapped on rebuild. `_http()` picks.
         self._client = client
         # Required, with no default: the peer refuses a request that does not carry it, so a
         # default would only let a caller build a fetcher that silently never fetches.
         self._auth_secret = auth_secret
         self._deadline = deadline_seconds
+        self._reset_fn = reset_fn
+        self._reset_after_pool_timeouts = max(1, int(reset_after_pool_timeouts))
+        self._consecutive_pool_timeouts = 0
+        self._reset_lock = asyncio.Lock()
+        self._generation = 0
+        self._reset_tasks: set[asyncio.Task[None]] = set()
         # Caches the resolved base URL and the part's per-chunk ciphertext sizes, so the one
         # query that yields both is paid once per part rather than once per chunk. A `None`
         # result is cached too — "no peer has this" is just as per-part — but only for
@@ -423,6 +474,10 @@ class PeerChunkFetcher:
         # THIS pod sends; the serving side has its own limiter, because five pods each within
         # their own cap still add up at the peer.
         self._inflight: dict[str, asyncio.Semaphore] = {}
+
+    def _http(self) -> Any:
+        """The object with `.stream()`. Unwrap ReplaceableHttpClient; FakeHttp is used as-is."""
+        return live_client(self._client)
 
     async def _resolve_part(
         self, object_id: str, object_version: int, part_number: int
@@ -557,7 +612,13 @@ class PeerChunkFetcher:
         return node, hinted_sizes, True
 
     async def __call__(
-        self, object_id: str, object_version: int, part_number: int, chunk_index: int
+        self,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        chunk_index: int,
+        *,
+        allow_rebuild_retry: bool = True,
     ) -> Optional[bytes]:
         """The chunk from a peer, or None to fall through to the pool.
 
@@ -627,10 +688,50 @@ class PeerChunkFetcher:
             return None
 
         url = f"{base}/internal/parts/{object_id}/{object_version}/{part_number}/chunks/{chunk_index}"
+        generation = self._generation
         try:
             async with slots:
-                return await asyncio.wait_for(self._fetch_verified(url, expected), self._deadline)
-        except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
+                data = await asyncio.wait_for(self._fetch_verified(url, expected), self._deadline)
+            if data is not None and generation == self._generation:
+                self._consecutive_pool_timeouts = 0
+            return data
+        # PoolTimeout is a subclass of TimeoutException: this clause must come first, or pool
+        # saturation becomes an ordinary timeout, the client is never replaced, and the pod
+        # goes dark (api-local-xrbng, 2026-09-21).
+        except httpx.PoolTimeout as exc:
+            return await self._after_wedge(
+                exc,
+                part_key=part_key,
+                base=base,
+                object_id=object_id,
+                object_version=object_version,
+                part_number=part_number,
+                chunk_index=chunk_index,
+                generation=generation,
+                allow_rebuild_retry=allow_rebuild_retry,
+                from_fresh_hint=from_fresh_hint,
+                kind="pool_saturated",
+                poison_on_miss=False,
+            )
+        # wait_for cancelled _fetch_verified. That is the CLOSE_WAIT leak: the inner task is
+        # done with PoolTimeout/"never retrieved" and THIS except is TimeoutError, not
+        # PoolTimeout. Treating it as an ordinary dead-peer poison skipped the rebuild.
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            return await self._after_wedge(
+                exc,
+                part_key=part_key,
+                base=base,
+                object_id=object_id,
+                object_version=object_version,
+                part_number=part_number,
+                chunk_index=chunk_index,
+                generation=generation,
+                allow_rebuild_retry=allow_rebuild_retry,
+                from_fresh_hint=from_fresh_hint,
+                kind="deadline",
+                poison_on_miss=True,
+            )
+        except (httpx.HTTPError, OSError) as exc:
             # A registered-but-unreachable peer — a drained or cordoned node whose replacement
             # has not re-registered under the same key — stays resolvable until its TTL lapses.
             # Retrying it per chunk pays the full fetch timeout every time before falling
@@ -646,8 +747,106 @@ class PeerChunkFetcher:
             # replicates. A 30s poison there made Harbor startedat wait ~14s for the pool.
             poison_ttl = _NEGATIVE_OWNER_MEMO_TTL_SECONDS if from_fresh_hint else None
             self._owner_url.put(part_key, (None, {}), ttl_seconds=poison_ttl)
-            logger.debug("peer fetch to %s failed, falling through to the pool: %s", base, exc)
+            logger.warning(
+                "peer chunk fetch failed peer=%s object=%s v%s part=%s chunk=%s kind=error retry=False: %s",
+                base,
+                object_id,
+                object_version,
+                part_number,
+                chunk_index,
+                exc,
+            )
             return None
+
+    async def _after_wedge(
+        self,
+        exc: BaseException,
+        *,
+        part_key: tuple[str, int, int],
+        base: str,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        chunk_index: int,
+        generation: int,
+        allow_rebuild_retry: bool,
+        from_fresh_hint: bool,
+        kind: str,
+        poison_on_miss: bool,
+    ) -> Optional[bytes]:
+        """Rebuild-worthy failure: PoolTimeout, or wait_for cancelling the stream."""
+        _record_shed("pool_timeout")
+        if allow_rebuild_retry:
+            await self._note_pool_timeout(generation)
+        rebuilt = allow_rebuild_retry and self._generation != generation
+        logger.warning(
+            "peer chunk fetch failed peer=%s object=%s v%s part=%s chunk=%s kind=%s retry=%s: %s",
+            base,
+            object_id,
+            object_version,
+            part_number,
+            chunk_index,
+            kind,
+            rebuilt,
+            exc,
+        )
+        if rebuilt:
+            return await self.__call__(
+                object_id,
+                object_version,
+                part_number,
+                chunk_index,
+                allow_rebuild_retry=False,
+            )
+        if poison_on_miss or not allow_rebuild_retry:
+            poison_ttl = _NEGATIVE_OWNER_MEMO_TTL_SECONDS if from_fresh_hint or not allow_rebuild_retry else None
+            self._owner_url.put(part_key, (None, {}), ttl_seconds=poison_ttl)
+        return None
+
+    async def _note_pool_timeout(self, generation: int) -> None:
+        """Count a PoolTimeout against the client generation that produced it; at the threshold,
+        replace the client exactly once per streak.
+
+        The generation gate is what makes "once" true. A wedged pool fails its waiters in a burst,
+        and the counter alone would turn a burst of N into N/threshold rebuilds.
+        """
+        async with self._reset_lock:
+            if generation != self._generation:
+                return
+            self._consecutive_pool_timeouts += 1
+            if self._consecutive_pool_timeouts < self._reset_after_pool_timeouts or self._reset_fn is None:
+                return
+            self._consecutive_pool_timeouts = 0
+            self._generation += 1
+
+        try:
+            pending = self._reset_fn()
+        except Exception:  # noqa: BLE001 - a failed rebuild must not mask the fetch failure
+            logger.exception("peer HTTP client rebuild failed; the next PoolTimeout streak retries it")
+            return
+
+        logger.error(
+            "peer fetch pool saturated %s times in a row; replaced the peer HTTP client",
+            self._reset_after_pool_timeouts,
+        )
+        self._detach_reset(pending)
+
+    def _detach_reset(self, pending: Awaitable[None]) -> None:
+        async def run() -> None:
+            await pending
+
+        task = asyncio.create_task(run())
+        self._reset_tasks.add(task)
+        task.add_done_callback(self._reset_tasks.discard)
+
+        def _log_failure(done: asyncio.Task[None]) -> None:
+            if done.cancelled():
+                return
+            exc = done.exception()
+            if exc is not None:
+                logger.warning("old peer HTTP client close failed (%s); dropped", exc)
+
+        task.add_done_callback(_log_failure)
 
     async def _fetch_verified(self, url: str, expected: int) -> Optional[bytes]:
         """One chunk from a peer, returned only if its body is exactly `expected` bytes.
@@ -665,7 +864,7 @@ class PeerChunkFetcher:
         # peer refuses an unauthenticated request with 404, which this method reads as a routine
         # miss — so dropping the header here would not fail loudly, it would shed the entire peer
         # tier to the pool and look like an eviction storm. Pinned by test_peer_handshake.py.
-        async with self._client.stream("GET", url, headers={PEER_AUTH_HEADER: self._auth_secret}) as response:
+        async with self._http().stream("GET", url, headers={PEER_AUTH_HEADER: self._auth_secret}) as response:
             if response.status_code == 503:
                 # The peer shed this request to protect its own ingest. Transient, so it must
                 # NOT poison the memo the way a connect failure does — that would keep the whole

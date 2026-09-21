@@ -53,6 +53,7 @@ PeerShedReason = Literal[
     "unknown_size",
     "peer_miss",
     "peer_error",
+    "pool_timeout",
 ]
 
 # Why a chunk that could have been promoted onto local flash was not. Closed by construction.
