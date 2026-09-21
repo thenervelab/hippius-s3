@@ -10,9 +10,12 @@ The mechanism lives in [`hippius_s3/reader/backend_fetch.py`](../../hippius_s3/r
 in [`get_object_endpoint.py`](../../hippius_s3/api/s3/objects/get_object_endpoint.py), and the
 `backend_fetch_*` metrics in [`hippius_s3/monitoring.py`](../../hippius_s3/monitoring.py). The **peer**
 httpx client (`app.state.peer_http`, [`hippius_s3/cache/peers.py`](../../hippius_s3/cache/peers.py))
-has the same PoolTimeout rebuild: a dark peer shortcut on one pod is `peer_fetch_shed_total{reason="pool_timeout"}`
-and ERROR `replaced the peer HTTP client`, then GETs of just-written MPU parts `IncompleteRead` after
-part 1. This file is only about what to do when it goes wrong; the model of how it works is under
+has the same rebuild: `httpx.PoolTimeout` **and** `wait_for` cancelling the stream (the xrbng
+CLOSE_WAIT shape) both count toward replacing the client. A dark peer shortcut is
+`peer_fetch_shed_total{reason="pool_timeout"}` and ERROR `replaced the peer HTTP client`.
+Just-written MPU GETs `IncompleteRead` after part 1 if the shortcut is still dark. A pod can
+also look dark from `client_cap` alone if 16 fetches are stuck inside `wait_for` — rebuild
+does not reset that semaphore. This file is only about what to do when it goes wrong; the model of how it works is under
 [What the code does on its own now](#what-the-code-does-on-its-own-now).
 
 ## Symptom

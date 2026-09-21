@@ -213,9 +213,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             timeout, limits = peer_client_settings(config, max_inflight=inflight)
             holder = ReplaceablePeerClient(
                 lambda: httpx.AsyncClient(timeout=timeout, limits=limits),
-                drain_seconds=float(config.peer_fetch_pool_timeout_seconds)
-                + float(config.peer_fetch_timeout_seconds)
-                + 1.0,
+                # Cover the wait_for deadline so in-flight old-generation fetches finish
+                # before aclose, instead of being cancelled into a 30s owner-memo poison.
+                drain_seconds=float(config.peer_fetch_deadline_seconds) + 1.0,
             )
             app.state.peer_http = holder
             app.state.peer_registry = PeerRegistry(

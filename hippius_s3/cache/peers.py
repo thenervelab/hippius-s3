@@ -508,9 +508,10 @@ class PeerChunkFetcher:
         self._inflight: dict[str, asyncio.Semaphore] = {}
 
     def _http(self) -> Any:
-        """The object with `.stream()`. A ReplaceablePeerClient exposes the live client as `.client`."""
-        inner = getattr(self._client, "client", None)
-        return inner if inner is not None else self._client
+        """The object with `.stream()`. Only unwrap ReplaceablePeerClient; FakeHttp has no `.client`."""
+        if isinstance(self._client, ReplaceablePeerClient):
+            return self._client.client
+        return self._client
 
     async def _resolve_part(
         self, object_id: str, object_version: int, part_number: int
@@ -732,36 +733,39 @@ class PeerChunkFetcher:
         # saturation becomes an ordinary timeout, the client is never replaced, and the pod
         # goes dark (api-local-xrbng, 2026-09-21).
         except httpx.PoolTimeout as exc:
-            _record_shed("pool_timeout")
-            if allow_rebuild_retry:
-                await self._note_pool_timeout(generation)
-            rebuilt = allow_rebuild_retry and self._generation != generation
-            logger.warning(
-                "peer chunk fetch failed peer=%s object=%s v%s part=%s chunk=%s kind=pool_saturated retry=%s: %s",
-                base,
-                object_id,
-                object_version,
-                part_number,
-                chunk_index,
-                rebuilt,
+            return await self._after_wedge(
                 exc,
+                part_key=part_key,
+                base=base,
+                object_id=object_id,
+                object_version=object_version,
+                part_number=part_number,
+                chunk_index=chunk_index,
+                generation=generation,
+                allow_rebuild_retry=allow_rebuild_retry,
+                from_fresh_hint=from_fresh_hint,
+                kind="pool_saturated",
+                poison_on_miss=False,
             )
-            if rebuilt:
-                return await self.__call__(
-                    object_id,
-                    object_version,
-                    part_number,
-                    chunk_index,
-                    allow_rebuild_retry=False,
-                )
-            # Do not poison while counting toward a rebuild: a 0.25s memo would hide the rest of
-            # the burst and the streak would never reach the threshold. After the inner retry on
-            # a still-wedged replacement, a short poison is enough — a 30s one would hide the
-            # next streak.
-            if not allow_rebuild_retry:
-                self._owner_url.put(part_key, (None, {}), ttl_seconds=_NEGATIVE_OWNER_MEMO_TTL_SECONDS)
-            return None
-        except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
+        # wait_for cancelled _fetch_verified. That is the CLOSE_WAIT leak: the inner task is
+        # done with PoolTimeout/"never retrieved" and THIS except is TimeoutError, not
+        # PoolTimeout. Treating it as an ordinary dead-peer poison skipped the rebuild.
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            return await self._after_wedge(
+                exc,
+                part_key=part_key,
+                base=base,
+                object_id=object_id,
+                object_version=object_version,
+                part_number=part_number,
+                chunk_index=chunk_index,
+                generation=generation,
+                allow_rebuild_retry=allow_rebuild_retry,
+                from_fresh_hint=from_fresh_hint,
+                kind="deadline",
+                poison_on_miss=True,
+            )
+        except (httpx.HTTPError, OSError) as exc:
             # A registered-but-unreachable peer — a drained or cordoned node whose replacement
             # has not re-registered under the same key — stays resolvable until its TTL lapses.
             # Retrying it per chunk pays the full fetch timeout every time before falling
@@ -787,6 +791,51 @@ class PeerChunkFetcher:
                 exc,
             )
             return None
+
+    async def _after_wedge(
+        self,
+        exc: BaseException,
+        *,
+        part_key: tuple[str, int, int],
+        base: str,
+        object_id: str,
+        object_version: int,
+        part_number: int,
+        chunk_index: int,
+        generation: int,
+        allow_rebuild_retry: bool,
+        from_fresh_hint: bool,
+        kind: str,
+        poison_on_miss: bool,
+    ) -> Optional[bytes]:
+        """Rebuild-worthy failure: PoolTimeout, or wait_for cancelling the stream."""
+        _record_shed("pool_timeout")
+        if allow_rebuild_retry:
+            await self._note_pool_timeout(generation)
+        rebuilt = allow_rebuild_retry and self._generation != generation
+        logger.warning(
+            "peer chunk fetch failed peer=%s object=%s v%s part=%s chunk=%s kind=%s retry=%s: %s",
+            base,
+            object_id,
+            object_version,
+            part_number,
+            chunk_index,
+            kind,
+            rebuilt,
+            exc,
+        )
+        if rebuilt:
+            return await self.__call__(
+                object_id,
+                object_version,
+                part_number,
+                chunk_index,
+                allow_rebuild_retry=False,
+            )
+        if poison_on_miss or not allow_rebuild_retry:
+            poison_ttl = _NEGATIVE_OWNER_MEMO_TTL_SECONDS if from_fresh_hint or not allow_rebuild_retry else None
+            self._owner_url.put(part_key, (None, {}), ttl_seconds=poison_ttl)
+        return None
 
     async def _note_pool_timeout(self, generation: int) -> None:
         """Count a PoolTimeout against the client generation that produced it; at the threshold,
