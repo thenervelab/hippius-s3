@@ -12,6 +12,7 @@ import asyncio
 import json
 import time
 from typing import Any
+from typing import Awaitable
 from typing import Optional
 
 import httpx
@@ -1156,3 +1157,165 @@ async def test_a_negative_owner_memo_expires_so_a_late_drain_claim_is_seen(monke
     clock["t"] = 1_000.3
     assert await fetcher(OBJ, 1, 3, 0) == b"peer-bytes"
     assert len(pool.conn.queries) == 2, "the late claim was re-resolved after the negative TTL"
+
+
+class _Slot:
+    """A ReplaceablePeerClient stand-in: `.client` is what `_http()` unwraps."""
+
+    def __init__(self, http: Any) -> None:
+        self.client = http
+
+
+class _PoolTimeoutHttp:
+    """Raises PoolTimeout on every stream() until `then` is swapped in via the slot."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.urls: list[str] = []
+
+    def stream(self, method: str, url: str, headers: dict[str, str] | None = None) -> Any:
+        assert method == "GET"
+        self.calls += 1
+        self.urls.append(url)
+        raise httpx.PoolTimeout("pool")
+
+
+async def _peer_ready() -> tuple[PeerChunkFetcher, _Slot, list[int], FakeRedis]:
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", PEER_URL, 90).register()
+    registry = PeerRegistry(redis, "node-a", SELF_URL, 90)
+    slot = _Slot(_PoolTimeoutHttp())
+    resets: list[int] = []
+
+    def reset() -> Awaitable[None]:
+        resets.append(1)
+        slot.client = FakeHttp(200, b"peer-bytes")
+        return asyncio.sleep(0)
+
+    fetcher = PeerChunkFetcher(
+        FakePool(residency_row()),
+        registry,
+        "node-a",
+        slot,
+        auth_secret=SECRET,
+        reset_fn=reset,
+        reset_after_pool_timeouts=3,
+    )
+    return fetcher, slot, resets, redis
+
+
+@pytest.mark.asyncio
+async def test_a_pool_timeout_that_rebuilds_the_client_retries_on_the_new_client() -> None:
+    """Retrying the same wedged pool is useless; retrying the replacement is the point of the swap."""
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", PEER_URL, 90).register()
+    registry = PeerRegistry(redis, "node-a", SELF_URL, 90)
+    slot = _Slot(_PoolTimeoutHttp())
+    resets: list[int] = []
+
+    def reset() -> Awaitable[None]:
+        resets.append(1)
+        slot.client = FakeHttp(200, b"peer-bytes")
+        return asyncio.sleep(0)
+
+    fetcher = PeerChunkFetcher(
+        FakePool(residency_row()),
+        registry,
+        "node-a",
+        slot,
+        auth_secret=SECRET,
+        reset_fn=reset,
+        reset_after_pool_timeouts=1,
+    )
+    assert await fetcher(OBJ, 1, 1, 0) == b"peer-bytes"
+    assert resets == [1]
+    assert isinstance(slot.client, FakeHttp)
+    assert slot.client.urls == [f"{PEER_URL}/internal/parts/{OBJ}/1/1/chunks/0"]
+
+
+@pytest.mark.asyncio
+async def test_consecutive_pool_timeouts_reset_the_peer_client_once_at_the_threshold() -> None:
+    fetcher, slot, resets, _redis = await _peer_ready()
+    assert await fetcher(OBJ, 1, 1, 0) is None
+    assert await fetcher(OBJ, 1, 2, 0) is None
+    assert resets == []
+    assert await fetcher(OBJ, 1, 3, 0) == b"peer-bytes"
+    assert resets == [1]
+    assert await fetcher(OBJ, 1, 4, 0) == b"peer-bytes"
+    assert resets == [1], "the streak restarts after a reset; one more success is not a second reset"
+
+
+@pytest.mark.asyncio
+async def test_the_rebuild_retry_does_not_count_another_pool_timeout_against_the_new_client() -> None:
+    """allow_rebuild_retry=False on the inner call: a stuck replacement must not cascade rebuilds."""
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", PEER_URL, 90).register()
+    registry = PeerRegistry(redis, "node-a", SELF_URL, 90)
+    slot = _Slot(_PoolTimeoutHttp())
+    resets: list[int] = []
+
+    def reset() -> Awaitable[None]:
+        resets.append(1)
+        slot.client = _PoolTimeoutHttp()
+        return asyncio.sleep(0)
+
+    fetcher = PeerChunkFetcher(
+        FakePool(residency_row()),
+        registry,
+        "node-a",
+        slot,
+        auth_secret=SECRET,
+        reset_fn=reset,
+        reset_after_pool_timeouts=1,
+    )
+    assert await fetcher(OBJ, 1, 1, 0) is None
+    assert resets == [1], "the inner retry on the still-wedged client did not rebuild again"
+
+
+@pytest.mark.asyncio
+async def test_a_burst_of_pool_timeouts_from_one_generation_rebuilds_once() -> None:
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", PEER_URL, 90).register()
+    registry = PeerRegistry(redis, "node-a", SELF_URL, 90)
+    slot = _Slot(_PoolTimeoutHttp())
+    resets: list[int] = []
+
+    def reset() -> Awaitable[None]:
+        resets.append(1)
+        slot.client = FakeHttp(200, b"peer-bytes")
+        return asyncio.sleep(0)
+
+    fetcher = PeerChunkFetcher(
+        FakePool(residency_row()),
+        registry,
+        "node-a",
+        slot,
+        auth_secret=SECRET,
+        reset_fn=reset,
+        reset_after_pool_timeouts=3,
+        max_inflight=32,
+    )
+
+    tasks = [asyncio.create_task(fetcher(OBJ, 1, 1, i % 8)) for i in range(32)]
+    results = await asyncio.gather(*tasks)
+    assert resets == [1], f"32 PoolTimeouts from one client generation are one rebuild, got {len(resets)}"
+    assert any(r == b"peer-bytes" for r in results), "at least the post-rebuild retry served"
+
+
+@pytest.mark.asyncio
+async def test_pool_timeout_is_logged_at_warning(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    redis = FakeRedis()
+    await PeerRegistry(redis, "node-b", PEER_URL, 90).register()
+    registry = PeerRegistry(redis, "node-a", SELF_URL, 90)
+    fetcher = PeerChunkFetcher(
+        FakePool(residency_row()),
+        registry,
+        "node-a",
+        _PoolTimeoutHttp(),
+        auth_secret=SECRET,
+    )
+    with caplog.at_level(logging.WARNING, logger="hippius_s3.cache.peers"):
+        assert await fetcher(OBJ, 1, 1, 0) is None
+    assert any("kind=pool_saturated" in r.getMessage() for r in caplog.records)

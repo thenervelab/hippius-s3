@@ -38,7 +38,9 @@ from hippius_s3.cache import create_fs_store
 from hippius_s3.cache.peers import PEER_PORT
 from hippius_s3.cache.peers import PeerChunkFetcher
 from hippius_s3.cache.peers import PeerRegistry
+from hippius_s3.cache.peers import ReplaceablePeerClient
 from hippius_s3.cache.peers import effective_max_inflight
+from hippius_s3.cache.peers import peer_client_settings
 from hippius_s3.cache.peers import set_active_registry
 from hippius_s3.cache.read_recency import initialize_read_recency_recorder
 from hippius_s3.cache.residency import create_residency_recorder
@@ -204,7 +206,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.peer_registry = None
         peer_fetch = None
         if config.peer_fetch_enabled and node_name and pod_ip:
-            app.state.peer_http = httpx.AsyncClient(timeout=config.peer_fetch_timeout_seconds)
+            inflight = effective_max_inflight(
+                config.peer_fetch_max_inflight,
+                config.http_stream_prefetch_chunks,
+            )
+            timeout, limits = peer_client_settings(config, max_inflight=inflight)
+            holder = ReplaceablePeerClient(
+                lambda: httpx.AsyncClient(timeout=timeout, limits=limits),
+                drain_seconds=float(config.peer_fetch_pool_timeout_seconds)
+                + float(config.peer_fetch_timeout_seconds)
+                + 1.0,
+            )
+            app.state.peer_http = holder
             app.state.peer_registry = PeerRegistry(
                 app.state.redis_client,
                 node_name,
@@ -223,17 +236,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 app.state.postgres_pool,
                 app.state.peer_registry,
                 node_name,
-                app.state.peer_http,
+                holder,
                 # Floored at the prefetch depth: chunks of one part all resolve to the same
                 # peer, so a lower cap has a single reader shedding its own window to the pool.
-                max_inflight=effective_max_inflight(
-                    config.peer_fetch_max_inflight,
-                    config.http_stream_prefetch_chunks,
-                ),
+                max_inflight=inflight,
                 auth_secret=config.internal_peer_secret,
                 # The httpx timeout above bounds each socket operation, never the whole
                 # response; this is what stops a peer that drips bytes forever.
                 deadline_seconds=config.peer_fetch_deadline_seconds,
+                reset_fn=holder.reset,
+                reset_after_pool_timeouts=config.peer_fetch_client_reset_after_pool_timeouts,
             )
             logger.info("Peer chunk fetch enabled for node %s", node_name)
             set_active_registry(app.state.peer_registry)
@@ -361,6 +373,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         yield
 
     finally:
+        try:
+            holder = getattr(app.state, "peer_http", None)
+            client = getattr(holder, "client", holder)
+            if client is not None and hasattr(client, "aclose"):
+                await client.aclose()
+                logger.info("Peer HTTP client closed")
+        except Exception:
+            logger.exception("Error shutting down peer HTTP client")
+
         try:
             if hasattr(app.state, "access_tracker_task"):
                 app.state.access_tracker_task.cancel()

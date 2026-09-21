@@ -8,8 +8,11 @@ The mechanism lives in [`hippius_s3/reader/backend_fetch.py`](../../hippius_s3/r
 [`hippius_s3/config.py`](../../hippius_s3/config.py), the first-chunk peek and `NotReadyCause` in
 [`hippius_s3/services/object_reader.py`](../../hippius_s3/services/object_reader.py), the 503 log line
 in [`get_object_endpoint.py`](../../hippius_s3/api/s3/objects/get_object_endpoint.py), and the
-`backend_fetch_*` metrics in [`hippius_s3/monitoring.py`](../../hippius_s3/monitoring.py). This file
-is only about what to do when it goes wrong; the model of how it works is under
+`backend_fetch_*` metrics in [`hippius_s3/monitoring.py`](../../hippius_s3/monitoring.py). The **peer**
+httpx client (`app.state.peer_http`, [`hippius_s3/cache/peers.py`](../../hippius_s3/cache/peers.py))
+has the same PoolTimeout rebuild: a dark peer shortcut on one pod is `peer_fetch_shed_total{reason="pool_timeout"}`
+and ERROR `replaced the peer HTTP client`, then GETs of just-written MPU parts `IncompleteRead` after
+part 1. This file is only about what to do when it goes wrong; the model of how it works is under
 [What the code does on its own now](#what-the-code-does-on-its-own-now).
 
 ## Symptom
