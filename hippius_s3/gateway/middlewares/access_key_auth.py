@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -160,6 +161,24 @@ async def verify_access_key_signature(
     )
 
 
+# Headers that change what a write is allowed to do rather than what it writes: lock or hold the
+# version, override a GOVERNANCE lock, or grant access to it. A presigned URL is a capability handed
+# to someone else (a backup URL goes to an untrusted host), so its holder must not be able to add
+# any of these the signer did not sign — an added `x-amz-object-lock-legal-hold: ON` would make a
+# backup unprunable. AWS refuses unsigned x-amz-* headers on presigned requests the same way.
+_AUTHORITY_HEADER_PREFIXES = ("x-amz-object-lock-", "x-amz-grant-")
+_AUTHORITY_HEADERS = frozenset({"x-amz-acl", "x-amz-bypass-governance-retention"})
+
+
+def unsigned_authority_headers(headers: Mapping[str, str], signed_headers: list[str]) -> set[str]:
+    """Authority-bearing headers present on the request but absent from X-Amz-SignedHeaders."""
+    signed = {h.strip().lower() for h in signed_headers}
+    present = {name.lower() for name in headers}
+    return {
+        name for name in present - signed if name in _AUTHORITY_HEADERS or name.startswith(_AUTHORITY_HEADER_PREFIXES)
+    }
+
+
 async def verify_access_key_presigned_url(
     request: Request,
     access_key: str,
@@ -245,6 +264,11 @@ async def verify_access_key_presigned_url(
     if "host" not in signed_headers:
         logger.warning("Presigned URL missing required 'host' header in X-Amz-SignedHeaders")
         raise AccessKeyAuthError("Invalid signed headers")
+
+    unsigned = unsigned_authority_headers(request.headers, signed_headers)
+    if unsigned:
+        logger.warning(f"Presigned URL request carries unsigned authority headers: {sorted(unsigned)}")
+        raise AccessKeyAuthError("There were headers present in the request which were not signed")
 
     token_response = await cached_auth(access_key, redis_client, _shared_api_client(request))
 

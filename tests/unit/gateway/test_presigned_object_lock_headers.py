@@ -136,3 +136,37 @@ def test_write_path_applies_the_signed_lock(method: str, path: str) -> None:
     assert outcome == ("COMPLIANCE", RETAIN_UNTIL, False), (
         "explicit signed headers must override the bucket default, in botocore's date format"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method,path", SIGNED_SHAPES)
+@pytest.mark.parametrize(
+    "added",
+    [
+        pytest.param({"x-amz-object-lock-legal-hold": "ON"}, id="legal-hold"),
+        pytest.param({"x-amz-bypass-governance-retention": "true"}, id="governance-bypass"),
+        pytest.param({"x-amz-acl": "public-read-write"}, id="canned-acl"),
+        pytest.param({"x-amz-grant-full-control": "id=hip_other"}, id="grant"),
+    ],
+)
+async def test_url_holder_cannot_add_unsigned_authority_headers(method: str, path: str, added: dict[str, str]) -> None:
+    """The URL goes to someone else — for backups, an untrusted host. An added legal hold would make
+    the backup unprunable; an added ACL or bypass widens what the write may do. None was signed."""
+    url = _presign(method, path, LOCK_HEADERS)
+    with pytest.raises(AccessKeyAuthError, match="not signed"):
+        await _verify(_server_request(method, url, {**LOCK_HEADERS, **added}))
+
+
+@pytest.mark.asyncio
+async def test_an_unsigned_lock_cannot_be_added_to_a_url_signed_without_one() -> None:
+    url = _presign("PUT", "/backups/vm-1/chain/0001.full.raw.zst", {})
+    with pytest.raises(AccessKeyAuthError, match="not signed"):
+        await _verify(_server_request("PUT", url, LOCK_HEADERS))
+
+
+@pytest.mark.asyncio
+async def test_signed_authority_headers_are_accepted() -> None:
+    signed = {**LOCK_HEADERS, "x-amz-object-lock-legal-hold": "ON"}
+    url = _presign("PUT", "/backups/vm-1/chain/0001.full.raw.zst", signed)
+    auth = await _verify(_server_request("PUT", url, signed))
+    assert auth.access_key == ACCESS_KEY
