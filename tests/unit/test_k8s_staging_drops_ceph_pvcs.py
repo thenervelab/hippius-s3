@@ -96,9 +96,7 @@ def test_production_janitor_disables_fs_gc() -> None:
 
 def test_production_global_uploader_replicas_zero() -> None:
     docs = load_docs("k8s/production/resource-limits.yaml")
-    uploader = next(
-        d for d in docs if d.get("kind") == "Deployment" and (d.get("metadata") or {}).get("name") == "arion-uploader"
-    )
+    uploader = next(d for d in docs if d.get("kind") == "Deployment" and (d.get("metadata") or {}).get("name") == "arion-uploader")
     assert uploader["spec"]["replicas"] == 0
 
 

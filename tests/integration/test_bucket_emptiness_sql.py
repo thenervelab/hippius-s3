@@ -315,12 +315,25 @@ class TestApiAbortClaim:
         """A simple PUT commits its serveable version with an OPEN upload row and flips it only
         after the address is written. The row is listed by ListMultipartUploads meanwhile, and
         aborting it cascaded away a finished — possibly Object-Locked — object."""
-        _, upload_id = await _object(
-            ctx, key="k", versions=[{"version": 1, "hold": True}], upload_completed=False
-        )
+        _, upload_id = await _object(ctx, key="k", versions=[{"version": 1, "hold": True}], upload_completed=False)
         assert await ctx.conn.fetchrow(get_query("claim_upload_for_abort"), upload_id) is None
         assert await ctx.conn.fetchval("SELECT count(*) FROM parts WHERE upload_id = $1", upload_id) == 1
 
     async def test_a_completed_upload_is_not_claimed(self, ctx: Ctx) -> None:
         _, upload_id = await _object(ctx, key="k", versions=[{"version": 1, "size": 0, "md5": None}])
         assert await ctx.conn.fetchrow(get_query("claim_upload_for_abort"), upload_id) is None
+
+
+class TestIsVersionServeable:
+    @pytest.mark.parametrize(
+        "version,expected",
+        [
+            ({"version": 1}, True),
+            ({"version": 1, "size": 0, "md5": "d41d8cd98f00b204e9800998ecf8427e"}, True),
+            ({"version": 1, "size": 0, "md5": None}, False),
+            ({"version": 1, "size": 0, "md5": ""}, False),
+        ],
+    )
+    async def test_only_finished_data_is_serveable(self, ctx: Ctx, version: dict[str, Any], expected: bool) -> None:
+        object_id, _ = await _object(ctx, key="k", versions=[version], upload_completed=False)
+        assert await ctx.conn.fetchval(get_query("is_version_serveable"), object_id, 1) is expected

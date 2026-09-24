@@ -293,11 +293,14 @@ async def list_parts_internal(
     except ValueError:
         part_marker = 0
 
-    # Fetch all parts and then apply simple pagination (DB already orders)
-    all_parts = await db.fetch(
-        get_query("list_parts_for_version"),
-        object_id,
-        int(mpu.get("current_object_version") or 1),
+    # Fetch all parts and then apply simple pagination (DB already orders). The version comes from
+    # this upload's own parts, not objects.current_object_version: a later PUT on the key moves the
+    # pointer, and listing under it exposed that other object's parts. No parts yet → nothing to list.
+    version_row = await db.fetchrow(get_query("get_multipart_version_by_upload"), upload_id)
+    all_parts = (
+        await db.fetch(get_query("list_parts_for_version"), object_id, int(version_row["object_version"]))
+        if version_row
+        else []
     )
     visible_parts = [p for p in all_parts if p["part_number"] > part_marker][:max_parts]
 
@@ -634,9 +637,26 @@ async def upload_part(
         except InvalidContentMD5:
             return await utils.respond_before_body(request, errors.invalid_digest_response())
 
-    # Get object_id and current_object_version from multipart upload
     object_id = ongoing_multipart_upload["object_id"]
-    current_object_version = int(ongoing_multipart_upload.get("current_object_version") or 1)
+    # This upload's OWN version: the one its earlier parts live under. objects.current_object_version
+    # is only a stand-in for the first part — any PUT or MPU initiate on the same key since this
+    # upload began moves it, and writing there rewrote that other version's parts in place (a
+    # finished, possibly Object-Locked object) through a plain UploadPart. Complete and Abort
+    # already resolve the version this way.
+    version_row = await pool.fetchrow(get_query("get_multipart_version_by_upload"), upload_id)
+    current_object_version = (
+        int(version_row["object_version"])
+        if version_row
+        else int(ongoing_multipart_upload.get("current_object_version") or 1)
+    )
+    # An upload in progress never has finished data under it. Finding some means the stand-in
+    # above resolved to another write's completed version: refuse rather than overwrite it.
+    if await pool.fetchval(get_query("is_version_serveable"), object_id, current_object_version):
+        return s3_error_response(
+            "InvalidRequest",
+            "The key was overwritten after this upload was initiated; start a new multipart upload.",
+            status_code=409,
+        )
 
     start_time = time.time()
     logger.info(f"Starting part {part_number} upload for upload {upload_id} (object_id={object_id})")
@@ -894,7 +914,7 @@ async def upload_part(
             # Delete meta and any chunk keys
             try:
                 # Delete versioned meta and chunk keys using cache helpers
-                object_version = int(ongoing_multipart_upload.get("current_object_version") or 1)
+                object_version = int(current_object_version)
                 delegate = RedisObjectPartsCache(redis_client)
                 meta_key = delegate.build_meta_key(str(object_id), object_version, int(part_number))
                 await redis_client.delete(meta_key)

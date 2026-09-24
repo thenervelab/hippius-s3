@@ -35,8 +35,10 @@ def _pool() -> Any:
         "bucket_name": "bkt",
         "object_key": "k",
         "bucket_id": str(uuid.uuid4()),
+        # Doubles as the get_multipart_version_by_upload row: the fake answers every fetchrow alike.
+        "object_version": 1,
     }
-    return SimpleNamespace(fetchrow=AsyncMock(return_value=upload))
+    return SimpleNamespace(fetchrow=AsyncMock(return_value=upload), fetchval=AsyncMock(return_value=False))
 
 
 def _patch_part_stream(monkeypatch: Any, captured: dict[str, Any], raise_exc: Exception | None = None) -> None:
@@ -148,4 +150,19 @@ async def test_upload_part_through_another_path_is_no_such_upload(monkeypatch: A
 
     assert resp.status_code == 404
     assert b"<Code>NoSuchUpload</Code>" in resp.body
+    assert captured == {}, "no part may be written"
+
+
+@pytest.mark.asyncio
+async def test_upload_part_refuses_to_write_into_a_finished_version(monkeypatch: Any) -> None:
+    """The version resolved for this upload holds finished data — another write's object, reached
+    through the current-version stand-in. Writing the part would rewrite that object in place."""
+    captured: dict[str, Any] = {}
+    _patch_part_stream(monkeypatch, captured)
+    pool = _pool()
+    pool.fetchval = AsyncMock(return_value=True)
+
+    resp = await multipart.upload_part(_request({}), pool, bucket_name="bkt", object_key="k")
+
+    assert resp.status_code == 409
     assert captured == {}, "no part may be written"

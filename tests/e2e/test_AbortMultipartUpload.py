@@ -79,3 +79,25 @@ def test_abort_through_another_key_is_no_such_upload(
     assert exc.value.response["Error"]["Code"] == "NoSuchUpload"
 
     boto3_client.abort_multipart_upload(Bucket=bucket, Key="real.bin", UploadId=upload_id)
+
+
+def test_first_part_after_the_key_was_overwritten_does_not_rewrite_the_new_object(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    """UploadPart used to target the key's CURRENT version. A PUT between initiate and the first
+    part made that the PUT's finished object, and the part was written into it in place."""
+    bucket = unique_bucket_name("mpu-overwritten")
+    cleanup_buckets(bucket)
+    boto3_client.create_bucket(Bucket=bucket)
+    key = "k.bin"
+
+    upload_id = boto3_client.create_multipart_upload(Bucket=bucket, Key=key)["UploadId"]
+    boto3_client.put_object(Bucket=bucket, Key=key, Body=b"the real object")
+
+    with pytest.raises(ClientError) as exc:
+        boto3_client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=1, Body=b"x" * 1024)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+    assert boto3_client.get_object(Bucket=bucket, Key=key)["Body"].read() == b"the real object"

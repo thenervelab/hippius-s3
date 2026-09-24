@@ -259,13 +259,28 @@ Changes that came with the tier, each of which was a way around it:
   `%2F`-encoded source skipped it. The general ACL check used to decode before cutting, so
   `allowed%3Fsecret` was authorised as key `allowed`.
 - **A scope that cannot be read denies**, cross-account too. Before, a failed read counted as "no
-  scope row", and cross-account that means the grants alone decide. A scope change now invalidates
-  the cache after it commits, not concurrently with it, so a downgrade applies on the next request.
+  scope row", and cross-account that means the grants alone decide.
+- **A scope change invalidates the cache after it commits**, not concurrently with it. A downgrade
+  can still take up to the 60 s cache TTL to apply: a lookup that read the old row just before the
+  commit can write it back into the cache after the invalidation.
+- **UploadPart writes into its upload's own version**, found from the upload's earlier parts, and
+  ListParts lists that version too. Before, both used the key's current version. So after a PUT on
+  the same key, a resumed upload wrote its parts into the PUT's finished object, in place. For the
+  first part there is no earlier part to go by, and the current version is still the stand-in; if
+  that version already holds finished data, UploadPart refuses with 409 rather than write into it.
 
-Known gap, not fixed here: an UploadPart already streaming when CompleteMultipartUpload commits
-can still republish that part's bytes in the cache. The check at the start of UploadPart cannot
-see a completion that lands mid-stream. Closing it needs part publishes to take a lock on the
-upload row that Complete also takes, before it reads the parts.
+Known gaps, not fixed here:
+
+- **UploadPart racing CompleteMultipartUpload.** An UploadPart already streaming when Complete
+  commits still republishes that part: its bytes in the cache, then its `parts` and `part_chunks`
+  rows. So it can change what a completed, even Object-Locked, version serves and replicates. The
+  checks at the start of UploadPart cannot see a completion that lands mid-stream. Closing it
+  needs part publishes to hold a lock on the upload row that Complete also takes, before Complete
+  reads the parts.
+- **The first part of an upload has no reliable version.** `multipart_uploads` does not record the
+  version that initiate reserved. When the current version is another write's reserved row that
+  is still streaming, the refusal above cannot tell it apart from the upload's own. The fix is a
+  version column on `multipart_uploads`, written at initiate.
 
 What the tier cannot express:
 

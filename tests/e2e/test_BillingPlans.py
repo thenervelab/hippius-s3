@@ -79,7 +79,9 @@ def test_an_account_with_no_plan_uploads_normally(boto3_client: Any) -> None:
 
 @pytest.mark.e2e
 @pytest.mark.local
-def test_a_plan_account_still_uploads_while_enforcement_is_off(boto3_client: Any, plan_roll: Any) -> None:
+def test_a_plan_account_still_uploads_while_enforcement_is_off(
+    boto3_client: Any, plan_roll: Any
+) -> None:
     """The shipping configuration. The account IS on a plan and IS wildly over a 1-byte quota, and
     the upload must still succeed, because HIPPIUS_ENABLE_BILLING_PLANS is off.
 
@@ -137,7 +139,9 @@ def test_an_over_quota_plan_account_can_still_delete(boto3_client: Any, plan_rol
 
 @pytest.mark.e2e
 @pytest.mark.local
-def test_an_account_reported_inactive_is_served_normally(boto3_client: Any, plan_roll: Any) -> None:
+def test_an_account_reported_inactive_is_served_normally(
+    boto3_client: Any, plan_roll: Any
+) -> None:
     """An expired plan (billing=plan, active=false) is not admitted to the quota map.
 
     Enforcement is off in e2e, so the fallthrough to pay-as-you-go still succeeds. The admission
@@ -169,7 +173,9 @@ def test_an_account_reported_inactive_is_served_normally(boto3_client: Any, plan
 
 @pytest.mark.e2e
 @pytest.mark.local
-def test_the_upstream_endpoint_going_down_does_not_break_uploads(boto3_client: Any, plan_roll: Any) -> None:
+def test_the_upstream_endpoint_going_down_does_not_break_uploads(
+    boto3_client: Any, plan_roll: Any
+) -> None:
     """The failure this whole design is built around. With the plans endpoint erroring, the cached
     roll keeps serving and uploads are unaffected — a scrape failure must never become an outage.
     """

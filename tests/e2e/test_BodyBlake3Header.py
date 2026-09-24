@@ -95,11 +95,13 @@ def test_multipart_is_labelled_first_chunk_not_whole_body(
     upload_id = boto3_client.create_multipart_upload(Bucket=bucket, Key=key)["UploadId"]
     parts = []
     for number, chunk in ((1, part1), (2, part2)):
-        etag = boto3_client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=number, Body=chunk)[
-            "ETag"
-        ]
+        etag = boto3_client.upload_part(
+            Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=number, Body=chunk
+        )["ETag"]
         parts.append({"ETag": etag, "PartNumber": number})
-    boto3_client.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts})
+    boto3_client.complete_multipart_upload(
+        Bucket=bucket, Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts}
+    )
 
     head = _headers(boto3_client.head_object(Bucket=bucket, Key=key))
     assert head[SCOPE_HDR] == "first-chunk", "an MPU digest must never claim whole-body coverage"

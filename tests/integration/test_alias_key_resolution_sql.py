@@ -178,7 +178,9 @@ async def test_list_object_versions_returns_copied_keys(
     release: HEAD of the copied key returned 200 while ListObjectVersions returned nothing for it.
     """
     conn, ids = aliased
-    rows = await conn.fetch(get_query("list_object_versions"), ids["bucket_id"], None, None, None, 1000, None, False)
+    rows = await conn.fetch(
+        get_query("list_object_versions"), ids["bucket_id"], None, None, None, 1000, None, False
+    )
     keys = {r["object_key"] for r in rows}
     assert PRIMARY_KEY in keys, "the primary key must still be listed"
     assert ALIAS_KEY in keys, "the copied key is invisible to ListObjectVersions"
@@ -194,7 +196,9 @@ async def test_list_object_versions_agrees_with_list_objects_on_which_keys_exist
 ) -> None:
     """The invariant the bug broke: one bucket, two listings, the same set of keys."""
     conn, ids = aliased
-    ver = await conn.fetch(get_query("list_object_versions"), ids["bucket_id"], None, None, None, 1000, None, False)
+    ver = await conn.fetch(
+        get_query("list_object_versions"), ids["bucket_id"], None, None, None, 1000, None, False
+    )
     plain = await conn.fetch(get_query("list_objects"), ids["bucket_id"], None, None, 1000, None)
     assert {r["object_key"] for r in ver} == {r["object_key"] for r in plain}
 
