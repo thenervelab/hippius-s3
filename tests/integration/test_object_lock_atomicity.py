@@ -1,10 +1,15 @@
-"""A new version's Object Lock commits together with the version becoming serveable.
+"""Object Lock writes are atomic with what they protect.
+
+1. A new version's lock commits together with the version becoming serveable.
 
 A sub-token tier that may DELETE ?versionId= (object_read_write_no_delete, for pruning backups) can
 list a fresh version and destroy it permanently if the lock lands in a later transaction. So the
 writer must store the lock inside the tail transaction that makes the version serveable. This
 drives the real ObjectWriter against real Postgres and, at the moment the lock statement runs,
 looks at the version from a SECOND connection: it must still be unserveable there.
+
+2. A retention or legal-hold write that loses a race to a version delete answers 404, not a 200
+   for a lock that landed nowhere.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import uuid
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
+from types import SimpleNamespace
 from typing import Any
 from typing import AsyncGenerator
 from typing import AsyncIterator
@@ -23,6 +29,8 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from hippius_s3.api.s3.objects.object_lock_endpoints import handle_put_object_legal_hold
+from hippius_s3.api.s3.objects.object_lock_endpoints import handle_put_object_retention
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.utils import get_query
 from hippius_s3.writer import object_writer as writer_mod
@@ -141,7 +149,7 @@ async def test_the_lock_commits_with_the_version_becoming_serveable(env: dict[st
         content_type="application/json",
         metadata={},
         body_iter=_body(b'{"seq": 1}'),
-        lock=("COMPLIANCE", RETAIN_UNTIL, None),
+        lock=lambda: ("COMPLIANCE", RETAIN_UNTIL, False),
     )
 
     assert len(seen_from_outside) == 1, "the writer did not store the lock itself"
@@ -170,3 +178,95 @@ async def test_no_lock_leaves_the_lock_columns_untouched(env: dict[str, Any]) ->
     row = await _version_row(env["pool"], res.object_id, res.object_version)
     assert row["object_lock_mode"] is None and row["object_lock_retain_until"] is None
     assert not row["object_lock_legal_hold"]
+
+
+class _DeleteRacingConn:
+    """Delegates to the real connection. When the handler takes the objects row lock, a DELETE
+    ?versionId= has just committed first: the version is tombstoned from a second connection."""
+
+    def __init__(self, conn: Any, pool: Any, object_id: str, object_version: int) -> None:
+        self._conn = conn
+        self._pool = pool
+        self._target = (object_id, object_version)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    async def execute(self, sql: str, *args: Any) -> Any:
+        if sql == get_query("lock_object_row_for_update"):
+            await self._pool.execute(
+                "UPDATE object_versions SET deleted_at = now() WHERE object_id = $1::uuid AND object_version = $2",
+                *self._target,
+            )
+        return await self._conn.execute(sql, *args)
+
+
+def _lock_request() -> Any:
+    return SimpleNamespace(
+        headers={},
+        state=SimpleNamespace(
+            bucket_object_lock={"enabled": True},
+            account=SimpleNamespace(main_account="acct"),
+            bucket_owner_id="acct",
+        ),
+    )
+
+
+_RETENTION_BODY = (
+    f"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>{RETAIN_UNTIL.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+    "</RetainUntilDate></Retention>"
+).encode()
+
+
+@pytest.mark.parametrize("which", ["retention", "legal-hold"])
+async def test_a_lock_write_that_loses_to_a_version_delete_is_a_404(env: dict[str, Any], which: str) -> None:
+    pool = env["pool"]
+    res = await env["writer"].put_simple_stream_full(
+        bucket_id=env["bucket_id"],
+        bucket_name=env["bucket_name"],
+        object_id=str(uuid.uuid4()),
+        object_key="k",
+        account_address="acct",
+        content_type="application/octet-stream",
+        metadata={},
+        body_iter=_body(b"x"),
+    )
+    async with pool.acquire() as conn:
+        racing = _DeleteRacingConn(conn, pool, res.object_id, res.object_version)
+        if which == "retention":
+            resp = await handle_put_object_retention(
+                uuid.UUID(env["bucket_id"]), "k", res.object_version, _lock_request(), racing, _RETENTION_BODY
+            )
+        else:
+            resp = await handle_put_object_legal_hold(
+                uuid.UUID(env["bucket_id"]),
+                "k",
+                res.object_version,
+                _lock_request(),
+                racing,
+                b"<LegalHold><Status>ON</Status></LegalHold>",
+            )
+
+    assert resp.status_code == 404, "a lock that landed on nothing was reported as stored"
+    row = await _version_row(pool, res.object_id, res.object_version)
+    assert row["object_lock_mode"] is None and not row["object_lock_legal_hold"]
+
+
+async def test_a_lock_write_on_a_live_version_is_stored(env: dict[str, Any]) -> None:
+    res = await env["writer"].put_simple_stream_full(
+        bucket_id=env["bucket_id"],
+        bucket_name=env["bucket_name"],
+        object_id=str(uuid.uuid4()),
+        object_key="k",
+        account_address="acct",
+        content_type="application/octet-stream",
+        metadata={},
+        body_iter=_body(b"x"),
+    )
+    async with env["pool"].acquire() as conn:
+        resp = await handle_put_object_retention(
+            uuid.UUID(env["bucket_id"]), "k", res.object_version, _lock_request(), conn, _RETENTION_BODY
+        )
+    assert resp.status_code == 200
+    row = await _version_row(env["pool"], res.object_id, res.object_version)
+    assert row["object_lock_mode"] == "GOVERNANCE"

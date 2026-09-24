@@ -213,10 +213,12 @@ async def store_version_lock(
     mode: str | None,
     retain_until: datetime | None,
     legal_hold: bool | None,
-) -> None:
+) -> bool:
     """Persist lock state. `legal_hold=None` leaves the hold untouched, which is what lets the
-    retention and legal-hold endpoints write independently without clobbering each other."""
-    await db.execute(
+    retention and legal-hold endpoints write independently without clobbering each other.
+
+    Returns whether a live version was updated: the query skips a soft-deleted one."""
+    status = await db.execute(
         get_query("set_object_version_lock"),
         object_id,
         object_version,
@@ -224,6 +226,7 @@ async def store_version_lock(
         retain_until,
         legal_hold,
     )
+    return str(status).split()[-1] != "0"
 
 
 async def _resolve_version(
@@ -277,6 +280,17 @@ async def handle_put_object_retention(
         return _no_such_key(object_key)
     object_id, object_version = resolved
 
+    # One transaction holding the objects row, the lock a versioned DELETE takes first. Without it
+    # a DELETE that already read the version as unlocked could still remove it after this commits,
+    # and two retention writes could each validate against the other's stale state.
+    async with db.transaction():
+        await db.execute(get_query("lock_object_row_for_update"), object_id)
+        return await _put_retention_locked(db, object_id, object_version, object_key, request, parsed)
+
+
+async def _put_retention_locked(
+    db: Any, object_id: str, object_version: int, object_key: str, request: Request, parsed: dict[str, Any]
+) -> Response:
     current = await load_version_lock(db, object_id=object_id, object_version=object_version)
     if current is None:
         return _no_such_key(object_key)
@@ -294,7 +308,7 @@ async def handle_put_object_retention(
 
     # legal_hold=None leaves any hold untouched: the two protections are independent and this
     # endpoint owns only the retention half.
-    await store_version_lock(
+    stored = await store_version_lock(
         db,
         object_id=object_id,
         object_version=object_version,
@@ -302,6 +316,8 @@ async def handle_put_object_retention(
         retain_until=parsed["retain_until"],
         legal_hold=None,
     )
+    if not stored:
+        return _no_such_key(object_key)
     return Response(status_code=200)
 
 
@@ -335,21 +351,26 @@ async def handle_put_object_legal_hold(
         return _no_such_key(object_key)
     object_id, object_version = resolved
 
-    current = await load_version_lock(db, object_id=object_id, object_version=object_version)
-    if current is None:
-        return _no_such_key(object_key)
+    # Same serialisation as the retention write: the objects row, before the version is read.
+    async with db.transaction():
+        await db.execute(get_query("lock_object_row_for_update"), object_id)
+        current = await load_version_lock(db, object_id=object_id, object_version=object_version)
+        if current is None:
+            return _no_such_key(object_key)
 
-    # Retention is passed through unchanged: a legal hold must never clear or alter one. AWS lets
-    # any holder of PutObjectLegalHold remove a hold — there is no bypass and no COMPLIANCE
-    # equivalent here, because a hold has no retention mode.
-    await store_version_lock(
-        db,
-        object_id=object_id,
-        object_version=object_version,
-        mode=current["object_lock_mode"],
-        retain_until=current["object_lock_retain_until"],
-        legal_hold=bool(on),
-    )
+        # Retention is passed through unchanged: a legal hold must never clear or alter one. AWS
+        # lets any holder of PutObjectLegalHold remove a hold — there is no bypass and no
+        # COMPLIANCE equivalent here, because a hold has no retention mode.
+        stored = await store_version_lock(
+            db,
+            object_id=object_id,
+            object_version=object_version,
+            mode=current["object_lock_mode"],
+            retain_until=current["object_lock_retain_until"],
+            legal_hold=bool(on),
+        )
+    if not stored:
+        return _no_such_key(object_key)
     return Response(status_code=200)
 
 
@@ -442,6 +463,19 @@ def lock_for_new_version(request: Request) -> tuple[str | None, datetime | None,
         return (None, None, legal_hold) if legal_hold else None
     default_mode, until = default
     return default_mode, until, legal_hold
+
+
+def resolve_new_version_lock(request: Request) -> tuple[str | None, datetime | None, bool] | None:
+    """`lock_for_new_version` for a write that already ran `validate_lock_intent`.
+
+    The writer calls it in the transaction that makes the version serveable, so a bucket-default
+    retain-until counts from the moment the version exists, not from when the body started to
+    arrive — a slow upload would otherwise spend part of its own retention in transit.
+    """
+    intent = lock_for_new_version(request)
+    if isinstance(intent, Response):
+        raise RuntimeError("Object Lock intent reached the writer without validate_lock_intent")
+    return intent
 
 
 def _bucket_default_retention(config: Any) -> tuple[str, datetime] | None:

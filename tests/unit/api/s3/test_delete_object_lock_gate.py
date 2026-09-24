@@ -57,6 +57,7 @@ class _LockDb:
                 "current_object_version": 1,
                 "object_version": 1,
                 "is_delete_marker": False,
+                "is_serveable": True,
                 "alias_count": 0,
                 **self.lock,
             }

@@ -97,6 +97,15 @@ async def delete_object_version(
 
         object_id = str(row["object_id"])
         is_delete_marker = bool(row["is_delete_marker"])
+
+        # A version with no finished data is a write in flight (a PUT or copy still streaming, an
+        # upload not yet completed) — invisible to every read and listing, so absent as far as
+        # the client is concerned. Deleting it here would race that write: its tail would then
+        # finalise a tombstone and report success for data nobody can read, and the lock it was
+        # about to store would never land. The writer's tail takes this same objects row lock
+        # first, so the answer below cannot go stale before this transaction ends.
+        if not is_delete_marker and not row["is_serveable"]:
+            return Response(status_code=204)
         was_current = int(row["current_object_version"]) == version_id
 
         # OBJECT LOCK: a permanent delete of a locked version is refused with 403, per AWS. The

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import uuid
 from datetime import datetime
@@ -24,7 +25,7 @@ from hippius_s3.api.s3.common import parse_write_if_none_match
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.extensions.append import handle_append
 from hippius_s3.api.s3.object_lock_guard import maybe_object_lock_not_implemented_response
-from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
+from hippius_s3.api.s3.objects.object_lock_endpoints import resolve_new_version_lock
 from hippius_s3.api.s3.objects.object_lock_endpoints import validate_lock_intent
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
@@ -191,13 +192,9 @@ async def handle_put_object(
         candidate_object_id = str(uuid.uuid4())
 
         # OBJECT LOCK: explicit x-amz-object-lock-* headers win over the bucket's default retention,
-        # per AWS; a bucket default is a duration, so its retain-until is computed from now. The
-        # writer stores it in the transaction that makes the version serveable, so the version is
-        # never visible unlocked, and before the response, so a client that got a 200 knows the
-        # lock is real.
-        lock_intent = lock_for_new_version(request)
-        if isinstance(lock_intent, Response):
-            return lock_intent
+        # per AWS. The writer resolves and stores the lock in the transaction that makes the version
+        # serveable, so the version is never visible unlocked, a bucket-default retain-until counts
+        # from the version's creation, and a client that got a 200 knows the lock is real.
 
         # Use ObjectWriter streaming upsert/write (single-part)
         # Note: No transaction wrapper needed here. The upsert_object_basic query is atomic
@@ -228,7 +225,7 @@ async def handle_put_object(
                 body_iter=utils.iter_request_body(request),
                 if_none_match=if_none_match,
                 expected_md5=expected_md5,
-                lock=lock_intent,
+                lock=functools.partial(resolve_new_version_lock, request),
             )
 
             set_span_attributes(
@@ -269,7 +266,11 @@ async def handle_put_object(
                 with contextlib.suppress(Exception):
                     async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
                         await conn.execute(
-                            "UPDATE object_versions SET size_bytes = 0, md5_hash = '' "
+                            # The lock goes too: the client is answered with an error, so no retention was
+                            # promised, and a lock left on the placeholder would withhold its parts from every
+                            # cleanup gate until it expired — forever, for a legal hold.
+                            "UPDATE object_versions SET size_bytes = 0, md5_hash = '', "
+                            "object_lock_mode = NULL, object_lock_retain_until = NULL, object_lock_legal_hold = FALSE "
                             "WHERE object_id = $1 AND object_version = $2",
                             str(put_res.object_id),
                             int(put_res.object_version),

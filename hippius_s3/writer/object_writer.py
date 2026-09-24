@@ -12,6 +12,7 @@ from datetime import datetime
 from datetime import timezone
 from typing import Any
 from typing import AsyncIterator
+from typing import Callable
 
 import asyncpg
 from opentelemetry import trace
@@ -205,7 +206,7 @@ class ObjectWriter:
         body_iter: AsyncIterator[bytes],
         if_none_match: bool = False,
         expected_md5: bytes | None = None,
-        lock: tuple[str | None, datetime | None, bool | None] | None = None,
+        lock: Callable[[], tuple[str | None, datetime | None, bool] | None] | None = None,
     ) -> PutResult:
         """Upsert destination object and write content (single-part) using a streaming iterator.
 
@@ -215,10 +216,11 @@ class ObjectWriter:
         - ``if_none_match`` (If-None-Match: *) makes the write create-only: PreconditionFailed if the
           key already exists at reserve time (before the body is read), or if another writer made it
           exist while this one streamed (re-checked under an exclusive row lock at finalize).
-        - ``lock`` (mode, retain_until, legal_hold) is the new version's Object Lock. It is written
-          in the same transaction that makes the version serveable, so no reader ever sees the
-          version unlocked — a key that may DELETE ?versionId= could otherwise list it and destroy
-          it before a lock applied afterwards landed.
+        - ``lock`` resolves the new version's Object Lock, (mode, retain_until, legal_hold) or None.
+          It is called, and the lock written, in the same transaction that makes the version
+          serveable: no reader ever sees the version unlocked — a key that may DELETE ?versionId=
+          could otherwise list it and destroy it before a lock applied afterwards landed — and a
+          bucket-default retain-until counts from the version's creation, not the request's start.
         """
         chunk_size = self.config.object_chunk_size_bytes
         ttl = self.config.cache_ttl_seconds
@@ -535,8 +537,9 @@ class ObjectWriter:
                         int(object_version),
                         blake3_hex,
                     )
-                    if lock is not None:
-                        lock_mode, lock_until, lock_hold = lock
+                    resolved_lock = lock() if lock is not None else None
+                    if resolved_lock is not None:
+                        lock_mode, lock_until, lock_hold = resolved_lock
                         await conn.execute(
                             get_query("set_object_version_lock"),
                             object_id,

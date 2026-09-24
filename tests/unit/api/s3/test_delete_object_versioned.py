@@ -47,6 +47,7 @@ class _FakeDb:
                 "current_object_version": self.current,
                 "object_version": row["object_version"] if row else None,
                 "is_delete_marker": bool(row.get("is_delete_marker", False)) if row else False,
+                "is_serveable": bool(row.get("is_serveable", True)) if row else False,
                 "alias_count": self.alias_count,
             }
         if query == "soft_delete_object_version":
@@ -541,3 +542,19 @@ async def test_versioned_delete_never_drops_a_name(wiring: dict[str, Any]) -> No
     await mod.handle_delete_object("b", "k", _request("1"), db, None)
 
     assert wiring["name_drop"]["calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_versioned_delete_of_a_write_in_flight_is_a_no_op(wiring: dict[str, Any]) -> None:
+    """A reserved version (no finished data) belongs to a PUT, copy or upload still running. It is
+    invisible to reads and listings, so it is absent to the client — and deleting it would let the
+    writer's tail finalise a tombstone, report success, and never store the lock it carried."""
+    wiring["bucket"]["versioning_status"] = "Enabled"
+    db = _FakeDb(versions=[{"object_version": 1}, {"object_version": 2, "is_serveable": False}], current=2)
+    resp = await mod.handle_delete_object("b", "k", _request("2"), db, None)
+
+    assert resp.status_code == 204
+    assert "soft_delete_object_version" not in db.names()
+    assert "soft_delete_object" not in db.names()
+    assert wiring["enqueued"] == []
+    assert db.current == 2

@@ -292,8 +292,21 @@ Changes that came with the tier, each of which was a way around it:
   it locks the reserved version at initiate, before any data.
 - **S4 append refuses `x-amz-object-lock-*` with 501.** An append mints no version, so there is
   nothing to lock; it used to answer 200 with the headers dropped.
-- **A lock write skips a soft-deleted version** (`set_object_version_lock.sql`), so a retention
-  write racing a version delete cannot pin a lock on the tombstone.
+  A bucket-default retain-until is computed in that same transaction, so it counts from the
+  version's creation rather than from the start of a slow upload.
+- **A version delete ignores a write in flight.** `DELETE ?versionId=` of a version with no
+  finished data (a PUT or copy still streaming, an upload not yet completed) answers 204 and
+  changes nothing, as for an absent version: such a version is invisible to every read and
+  listing. Before, it tombstoned the row, and the writer's tail then finalised the tombstone and
+  answered 200 for data nobody could read, without its lock. The check runs under the objects
+  row lock that the writer's tail also takes first.
+- **Retention and legal-hold writes serialise with version deletes.** Both take the objects row
+  (`FOR UPDATE`) before reading the version, and answer 404 when the version was deleted first;
+  the lock query skips a soft-deleted version. Before, a lock write racing a delete answered 200
+  for a lock that landed on a tombstone or nowhere.
+- **A PUT or copy whose address write fails drops its lock** along with its data (the B4
+  revert). The client gets an error, so nothing was promised, and a lock left on the placeholder
+  would withhold its parts from every cleanup gate until it expired.
 
 Known gaps, not fixed here:
 
@@ -303,6 +316,10 @@ Known gaps, not fixed here:
   checks at the start of UploadPart cannot see a completion that lands mid-stream. Closing it
   needs part publishes to hold a lock on the upload row that Complete also takes, before Complete
   reads the parts.
+- **Why the previous item matters for the write-once tier.** It is the one remaining way a key
+  holding only `object_read_write_no_delete` can change retained bytes: start an UploadPart on
+  the writer's open upload (ListMultipartUploads is a list, which the tier holds) and stream it
+  slowly until after the writer's Complete. **It should be closed before the backup feature ships.**
 - **The first part of an upload has no reliable version.** `multipart_uploads` does not record the
   version that initiate reserved. When the current version is another write's reserved row that
   is still streaming, the refusal above cannot tell it apart from the upload's own. The fix is a

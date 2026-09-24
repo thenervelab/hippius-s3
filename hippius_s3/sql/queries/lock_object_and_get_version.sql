@@ -29,6 +29,10 @@ SELECT o.object_id,
        ov.object_lock_mode,
        ov.object_lock_retain_until,
        ov.object_lock_legal_hold,
+       -- Whether the version holds finished data (the list_objects predicate). A reserved row is a
+       -- write still in flight — its lock, if any, lands in the same transaction that finishes it —
+       -- so the caller treats it as absent rather than let a version delete race that write.
+       (ov.size_bytes > 0 OR (ov.md5_hash IS NOT NULL AND ov.md5_hash != '')) AS is_serveable,
        (SELECT count(*) FROM object_names n WHERE n.object_id = o.object_id)::int AS alias_count
 FROM objects o
 LEFT JOIN object_versions ov

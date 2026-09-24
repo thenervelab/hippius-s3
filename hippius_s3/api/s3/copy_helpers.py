@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Any
+from typing import Callable
 from urllib.parse import parse_qs
 from urllib.parse import unquote
 
@@ -268,12 +269,12 @@ async def handle_streaming_copy(
     object_key: str,
     copy_created_at: datetime,
     config: Config,
-    lock: tuple[str | None, datetime | None, bool | None] | None = None,
+    lock: Callable[[], tuple[str | None, datetime | None, bool] | None] | None = None,
 ) -> Response:
     """Byte-copy the source into a new destination version.
 
-    `lock` is the destination version's Object Lock; the writer stores it in the transaction that
-    makes the version serveable (see ObjectWriter.put_simple_stream_full).
+    `lock` resolves the destination version's Object Lock; the writer stores it in the transaction
+    that makes the version serveable (see ObjectWriter.put_simple_stream_full).
     """
     logger.info("CopyObject assembling bytes via object_reader.stream_object")
 
@@ -349,7 +350,11 @@ async def handle_streaming_copy(
         with contextlib.suppress(Exception):
             async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
                 await conn.execute(
-                    "UPDATE object_versions SET size_bytes = 0, md5_hash = '' "
+                    # The lock goes too: the client is answered with an error, so no retention was
+                    # promised, and a lock left on the placeholder would withhold its parts from every
+                    # cleanup gate until it expired — forever, for a legal hold.
+                    "UPDATE object_versions SET size_bytes = 0, md5_hash = '', "
+                    "object_lock_mode = NULL, object_lock_retain_until = NULL, object_lock_legal_hold = FALSE "
                     "WHERE object_id = $1 AND object_version = $2",
                     str(put_res.object_id),
                     int(put_res.object_version),

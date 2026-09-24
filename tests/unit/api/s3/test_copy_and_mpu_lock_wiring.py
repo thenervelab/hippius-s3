@@ -229,7 +229,7 @@ class TestLockedCopyPath:
         seen = self._wire(monkeypatch, multipart=multipart)
         await mod.handle_copy_object("dst-bucket", "dst", self._request(self.LOCK), None, None)
         assert not seen["fast"], "a locked copy took the v5 fast path"
-        mode, retain_until, legal_hold = seen["stream_lock"]
+        mode, retain_until, legal_hold = seen["stream_lock"]()
         assert mode == "COMPLIANCE"
         assert retain_until == datetime(2036, 1, 1, tzinfo=timezone.utc)
         assert not legal_hold

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 import uuid
 from datetime import datetime
@@ -18,6 +19,7 @@ from hippius_s3.api.s3.copy_helpers import parse_copy_source
 from hippius_s3.api.s3.copy_helpers import resolve_copy_resources
 from hippius_s3.api.s3.copy_helpers import should_use_v5_fast_path
 from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
+from hippius_s3.api.s3.objects.object_lock_endpoints import resolve_new_version_lock
 from hippius_s3.api.s3.objects.object_lock_endpoints import validate_lock_intent
 from hippius_s3.config import get_config
 from hippius_s3.repositories.objects import ObjectRepository
@@ -128,7 +130,7 @@ async def handle_copy_object(
                 object_key=object_key,
                 copy_created_at=copy_created_at,
                 config=config,
-                lock=lock_intent,
+                lock=functools.partial(resolve_new_version_lock, request),
             )
 
         eligible, chunk_rows, reason = await should_use_v5_fast_path(
@@ -172,7 +174,7 @@ async def handle_copy_object(
             object_key=object_key,
             copy_created_at=copy_created_at,
             config=config,
-            lock=lock_intent,
+            lock=functools.partial(resolve_new_version_lock, request),
         )
     except errors.S3Error as e:
         return errors.s3_error_response(
