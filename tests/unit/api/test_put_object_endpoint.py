@@ -415,6 +415,43 @@ async def test_create_only_append_is_judged_inside_append_not_by_a_loose_read(mo
     assert not any("exists_live" in q for q in seen_queries), "no unlocked pre-check may run"
 
 
+@pytest.mark.asyncio
+async def test_append_refuses_object_lock_headers_instead_of_dropping_them(monkeypatch: Any) -> None:
+    """An append mints no version, so there is nothing for x-amz-object-lock-* to lock. A 200 with
+    the headers silently dropped would let a writer believe unretained data is retained."""
+
+    def router(method: str, query: str, args: tuple) -> Any:
+        if "Get bucket by name" in (query or ""):
+            return {"bucket_id": str(uuid.uuid4()), "bucket_name": "bkt", "main_account_id": "acct-main"}
+        return None
+
+    append_calls: list[Any] = []
+
+    async def fake_append(*a: Any, **kw: Any) -> Any:
+        append_calls.append(kw)
+        return Response(status_code=200)
+
+    monkeypatch.setattr(put_object_endpoint, "handle_append", fake_append)
+    request = _fake_request(
+        {
+            "x-amz-meta-append": "true",
+            "x-amz-object-lock-mode": "COMPLIANCE",
+            "x-amz-object-lock-retain-until-date": "2036-01-01T00:00:00Z",
+        }
+    )
+    request.query_params = {}
+    request.state.bucket_object_lock = {"enabled": True}
+    resp = await handle_put_object(
+        bucket_name="bkt",
+        object_key="audit.log",
+        request=request,
+        pool=make_fake_pool(router),
+        redis_client=_FakeRedis(nx_result=None),
+    )
+    assert resp.status_code == 501
+    assert append_calls == [], "the append ran with its lock headers dropped"
+
+
 class _BodyStream:
     """request.stream() stand-in that records how much of the body the endpoint read."""
 

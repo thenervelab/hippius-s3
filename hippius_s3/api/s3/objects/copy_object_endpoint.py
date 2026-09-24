@@ -18,7 +18,6 @@ from hippius_s3.api.s3.copy_helpers import parse_copy_source
 from hippius_s3.api.s3.copy_helpers import resolve_copy_resources
 from hippius_s3.api.s3.copy_helpers import should_use_v5_fast_path
 from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
-from hippius_s3.api.s3.objects.object_lock_endpoints import store_version_lock
 from hippius_s3.api.s3.objects.object_lock_endpoints import validate_lock_intent
 from hippius_s3.config import get_config
 from hippius_s3.repositories.objects import ObjectRepository
@@ -28,54 +27,6 @@ from hippius_s3.storage_version import require_supported_storage_version
 
 logger = logging.getLogger(__name__)
 config = get_config()
-
-
-async def _apply_lock_to_copy(
-    pool: asyncpg.Pool,
-    response: Response,
-    lock_intent: tuple[str | None, datetime | None, bool] | None,
-    object_id: str,
-) -> Response:
-    """Persist the destination copy's lock, once the copy itself has succeeded.
-
-    A copy creates a new object version, so AWS applies the same rules a PUT does: explicit
-    x-amz-object-lock-* headers, else the destination bucket's default retention. Without this a
-    copy into a compliance bucket landed completely unprotected, with a 200 and no signal — the
-    silent variant of the multipart gap, and arguably worse, since copying is often exactly how
-    data is moved INTO a locked bucket in the first place.
-
-    The version comes from the copy's OWN response (`x-amz-version-id`), not from re-reading the
-    destination key. Re-reading is wrong twice over. It resolves whatever is current *now*, so a
-    concurrent PUT to the same key between the copy and the read would leave this copy unlocked
-    while pinning the retention onto the unrelated write — under COMPLIANCE, permanently. And the
-    row `get_by_path` returns projects `object_version`, not `current_object_version`, so reading
-    the latter raised KeyError and 500'd the request *after* the destination had been overwritten
-    and made live: the client is told the copy failed while an unprotected copy sits at the key.
-    Both byte-copy paths already report the version they wrote, so ask them.
-    """
-    if lock_intent is None or response.status_code != 200:
-        return response
-
-    raw_version = response.headers.get("x-amz-version-id")
-    if not raw_version:
-        # Every path that reaches here writes a version and reports it. Missing means a copy path
-        # was added that does not, and the object is live and unprotected — loud, not silent.
-        logger.error(
-            "CopyObject: no x-amz-version-id on a successful copy of %s; Object Lock NOT applied",
-            object_id,
-        )
-        return response
-
-    mode, retain_until, legal_hold = lock_intent
-    await store_version_lock(
-        pool,
-        object_id=object_id,
-        object_version=int(raw_version),
-        mode=mode,
-        retain_until=retain_until,
-        legal_hold=legal_hold,
-    )
-    return response
 
 
 async def handle_copy_object(
@@ -165,58 +116,7 @@ async def handle_copy_object(
         # crypto binding (bucket/object identifiers).
         if src_multipart:
             logger.info("CopyObject multipart source: forcing streaming fallback")
-            return await _apply_lock_to_copy(
-                pool,
-                await handle_streaming_copy(
-                    pool=pool,
-                    redis_client=redis_client,
-                    request=request,
-                    source_bucket=source_bucket,
-                    dest_bucket=dest_bucket,
-                    source_object=source_object,
-                    src_obj_row=src_obj_row,
-                    object_id=object_id,
-                    object_key=object_key,
-                    copy_created_at=copy_created_at,
-                    config=config,
-                ),
-                lock_intent,
-                object_id,
-            )
-
-        eligible, chunk_rows, reason = await should_use_v5_fast_path(
-            db=pool,
-            src_obj_row=src_obj_row,
-            existing_dest=existing_dest,
-            src_storage_version=src_storage_version,
-            src_multipart=src_multipart,
-        )
-
-        if eligible:
-            assert chunk_rows is not None
-            logger.info("CopyObject using v5 fast path (envelope rewrap + CID reuse)")
-            return await _apply_lock_to_copy(
-                pool,
-                await execute_v5_fast_path_copy(
-                    db=pool,
-                    source_bucket=source_bucket,
-                    dest_bucket=dest_bucket,
-                    source_object=source_object,
-                    src_obj_row=src_obj_row,
-                    object_id=object_id,
-                    object_key=object_key,
-                    chunk_rows=chunk_rows,
-                    copy_created_at=copy_created_at,
-                    config=config,
-                ),
-                lock_intent,
-                object_id,
-            )
-
-        logger.info(f"CopyObject using streaming fallback: {reason}")
-        return await _apply_lock_to_copy(
-            pool,
-            await handle_streaming_copy(
+            return await handle_streaming_copy(
                 pool=pool,
                 redis_client=redis_client,
                 request=request,
@@ -228,9 +128,51 @@ async def handle_copy_object(
                 object_key=object_key,
                 copy_created_at=copy_created_at,
                 config=config,
-            ),
-            lock_intent,
-            object_id,
+                lock=lock_intent,
+            )
+
+        eligible, chunk_rows, reason = await should_use_v5_fast_path(
+            db=pool,
+            src_obj_row=src_obj_row,
+            existing_dest=existing_dest,
+            src_storage_version=src_storage_version,
+            src_multipart=src_multipart,
+        )
+
+        # A lock also disqualifies the v5 fast path. Its version is serveable from its first
+        # autocommit statement, so a lock could only be written afterwards — a window in which a
+        # key allowed to DELETE ?versionId= can destroy the copy before it is retained. The
+        # streaming writer stores the lock in the transaction that makes the version serveable.
+        if eligible and lock_intent is None:
+            assert chunk_rows is not None
+            logger.info("CopyObject using v5 fast path (envelope rewrap + CID reuse)")
+            return await execute_v5_fast_path_copy(
+                db=pool,
+                source_bucket=source_bucket,
+                dest_bucket=dest_bucket,
+                source_object=source_object,
+                src_obj_row=src_obj_row,
+                object_id=object_id,
+                object_key=object_key,
+                chunk_rows=chunk_rows,
+                copy_created_at=copy_created_at,
+                config=config,
+            )
+
+        logger.info(f"CopyObject using streaming fallback: {reason if lock_intent is None else 'object lock'}")
+        return await handle_streaming_copy(
+            pool=pool,
+            redis_client=redis_client,
+            request=request,
+            source_bucket=source_bucket,
+            dest_bucket=dest_bucket,
+            source_object=source_object,
+            src_obj_row=src_obj_row,
+            object_id=object_id,
+            object_key=object_key,
+            copy_created_at=copy_created_at,
+            config=config,
+            lock=lock_intent,
         )
     except errors.S3Error as e:
         return errors.s3_error_response(

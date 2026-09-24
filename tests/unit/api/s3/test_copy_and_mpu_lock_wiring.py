@@ -8,7 +8,9 @@ expensive to reach through a real copy:
    caller never named becomes undeletable. The alias must also survive for unlocked copies, which is
    the overwhelmingly common case, so both directions are asserted.
 
-2. The lock is applied only to a copy that actually succeeded, and only when there is intent.
+2. Lock intent sends the copy through the streaming writer, which stores the lock in the same
+   transaction that makes the destination version serveable, and never through the v5 fast path,
+   whose version is serveable before any lock could be written.
 """
 
 from __future__ import annotations
@@ -76,62 +78,6 @@ def test_the_destination_row_does_not_carry_current_object_version() -> None:
         "get_object_by_path now projects current_object_version — the copy path's comment and the "
         "reserve-row contract test both need revisiting together"
     )
-
-
-@pytest.fixture
-def captured(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
-    """Capture every store_version_lock call the copy path makes."""
-    calls: list[dict[str, Any]] = []
-
-    async def _store(_db: Any, **kw: Any) -> None:
-        calls.append(kw)
-
-    monkeypatch.setattr(mod, "store_version_lock", _store)
-    return calls
-
-
-def _copied(version_id: str | None = "7", status: int = 200) -> Response:
-    """A copy response shaped like the real one: the version it wrote, reported as a header."""
-    headers = {"x-amz-version-id": version_id} if version_id is not None else {}
-    return Response(status_code=status, headers=headers)
-
-
-@pytest.mark.asyncio
-class TestApplyLockToCopy:
-    async def test_no_intent_writes_nothing(self, captured: list[dict[str, Any]]) -> None:
-        """The common case: an ordinary copy must not touch the lock columns at all."""
-        resp = _copied()
-        assert await mod._apply_lock_to_copy(None, resp, None, "obj-1") is resp
-        assert captured == []
-
-    @pytest.mark.parametrize("status", [400, 403, 404, 500, 501])
-    async def test_a_failed_copy_is_never_locked(self, status: int, captured: list[dict[str, Any]]) -> None:
-        """Locking a copy that did not happen would pin a retention onto whatever content the
-        destination key already had — including an unrelated object."""
-        await mod._apply_lock_to_copy(None, _copied(status=status), ("GOVERNANCE", FUTURE, False), "obj-1")
-        assert captured == [], f"a {status} copy still wrote a lock"
-
-    async def test_lock_lands_on_the_version_the_copy_wrote(self, captured: list[dict[str, Any]]) -> None:
-        """Not on whatever is current afterwards. A concurrent PUT to the same key between the copy
-        and a re-read would otherwise leave this copy unlocked and pin the retention onto the
-        unrelated write — permanently, under COMPLIANCE."""
-        await mod._apply_lock_to_copy(None, _copied("42"), ("COMPLIANCE", FUTURE, False), "obj-1")
-        assert len(captured) == 1
-        assert captured[0]["object_id"] == "obj-1"
-        assert captured[0]["object_version"] == 42
-        assert captured[0]["mode"] == "COMPLIANCE"
-        assert captured[0]["legal_hold"] is False
-
-    async def test_legal_hold_only_intent_is_applied(self, captured: list[dict[str, Any]]) -> None:
-        await mod._apply_lock_to_copy(None, _copied(), (None, None, True), "obj-1")
-        assert captured[0]["mode"] is None and captured[0]["legal_hold"] is True
-
-    async def test_a_response_without_a_version_does_not_raise(self, captured: list[dict[str, Any]]) -> None:
-        """Fail loudly in the log, not by 500-ing a copy that already succeeded and was returned.
-        The alias path reports no version, and any future path that forgets to must not crash."""
-        resp = _copied(version_id=None)
-        assert await mod._apply_lock_to_copy(None, resp, ("GOVERNANCE", FUTURE, False), "obj-1") is resp
-        assert captured == []
 
 
 @pytest.mark.asyncio
@@ -211,7 +157,7 @@ class TestAliasDisqualification:
         ],
     )
     async def test_any_lock_intent_disqualifies_the_alias(
-        self, headers: dict[str, str], label: str, monkeypatch: pytest.MonkeyPatch, captured: list[dict[str, Any]]
+        self, headers: dict[str, str], label: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         seen = self._wire(monkeypatch, headers)
         await mod.handle_copy_object("same-bucket", "dst", self._request(headers), None, None)
@@ -221,10 +167,75 @@ class TestAliasDisqualification:
         )
         assert seen["streamed"], "expected a real byte copy instead of the alias"
 
-    async def test_unlocked_same_bucket_copy_still_aliases(
-        self, monkeypatch: pytest.MonkeyPatch, captured: list[dict[str, Any]]
-    ) -> None:
+    async def test_unlocked_same_bucket_copy_still_aliases(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The optimisation must survive for the case that is almost all of them."""
         seen = self._wire(monkeypatch, {})
         await mod.handle_copy_object("same-bucket", "dst", self._request({}), None, None)
         assert seen["alias_called"], "an ordinary same-bucket copy lost the alias optimisation"
+
+
+@pytest.mark.asyncio
+class TestLockedCopyPath:
+    """A locked copy must be written by the streaming writer, carrying the lock, so the version is
+    never serveable unlocked. The v5 fast path makes its version serveable from its first autocommit
+    statement, so a lock could only follow it — a window in which a key allowed to DELETE
+    ?versionId= destroys the copy before it is retained."""
+
+    LOCK = {"x-amz-object-lock-mode": "COMPLIANCE", "x-amz-object-lock-retain-until-date": "2036-01-01T00:00:00Z"}
+
+    @staticmethod
+    def _wire(monkeypatch: pytest.MonkeyPatch, *, multipart: bool) -> dict[str, Any]:
+        seen: dict[str, Any] = {"fast": False, "stream_lock": "not called"}
+
+        async def _resolve(**_kw: Any) -> Any:
+            return {"id": "u"}, {"bucket_id": "src-bucket"}, {"bucket_id": "dst-bucket"}, {"storage_version": 5}
+
+        async def _stream(*_a: Any, **kw: Any) -> Any:
+            seen["stream_lock"] = kw.get("lock")
+            return Response(status_code=200)
+
+        async def _fast(*_a: Any, **_k: Any) -> Any:
+            seen["fast"] = True
+            return Response(status_code=200)
+
+        async def _eligible(**_kw: Any) -> Any:
+            return True, [], ""
+
+        class _Repo:
+            def __init__(self, _db: Any) -> None: ...
+
+            async def get_by_path(self, _b: str, _k: str) -> Any:
+                return None
+
+        monkeypatch.setattr(mod, "ObjectRepository", _Repo)
+        monkeypatch.setattr(mod, "resolve_copy_resources", _resolve)
+        monkeypatch.setattr(mod, "handle_streaming_copy", _stream)
+        monkeypatch.setattr(mod, "execute_v5_fast_path_copy", _fast)
+        monkeypatch.setattr(mod, "should_use_v5_fast_path", _eligible)
+        monkeypatch.setattr(mod, "is_multipart_object", lambda _r: multipart)
+        monkeypatch.setattr(mod, "parse_copy_source", lambda _h: ("src-bucket", "src", None))
+        monkeypatch.setattr(mod, "require_supported_storage_version", lambda v: v)
+        return seen
+
+    @staticmethod
+    def _request(headers: dict[str, str]) -> Any:
+        return SimpleNamespace(
+            headers=headers,
+            state=SimpleNamespace(main_account_id="acct", bucket_object_lock={"enabled": True}),
+        )
+
+    @pytest.mark.parametrize("multipart", [False, True])
+    async def test_a_locked_copy_streams_with_the_lock(self, multipart: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen = self._wire(monkeypatch, multipart=multipart)
+        await mod.handle_copy_object("dst-bucket", "dst", self._request(self.LOCK), None, None)
+        assert not seen["fast"], "a locked copy took the v5 fast path"
+        mode, retain_until, legal_hold = seen["stream_lock"]
+        assert mode == "COMPLIANCE"
+        assert retain_until == datetime(2036, 1, 1, tzinfo=timezone.utc)
+        assert not legal_hold
+
+    async def test_an_unlocked_eligible_copy_keeps_the_fast_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen = self._wire(monkeypatch, multipart=False)
+        await mod.handle_copy_object("dst-bucket", "dst", self._request({}), None, None)
+        assert seen["fast"], "an ordinary copy lost the v5 fast path"
+        assert seen["stream_lock"] == "not called"

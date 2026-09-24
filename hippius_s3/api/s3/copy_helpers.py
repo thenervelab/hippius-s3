@@ -268,7 +268,13 @@ async def handle_streaming_copy(
     object_key: str,
     copy_created_at: datetime,
     config: Config,
+    lock: tuple[str | None, datetime | None, bool | None] | None = None,
 ) -> Response:
+    """Byte-copy the source into a new destination version.
+
+    `lock` is the destination version's Object Lock; the writer stores it in the transaction that
+    makes the version serveable (see ObjectWriter.put_simple_stream_full).
+    """
     logger.info("CopyObject assembling bytes via object_reader.stream_object")
 
     metadata = parse_object_metadata(src_obj_row.get("metadata"))
@@ -323,6 +329,7 @@ async def handle_streaming_copy(
         metadata=metadata,
         storage_version=config.target_storage_version,
         body_iter=chunks_iter,
+        lock=lock,
     )
 
     # Drain-direct (s3-2.1 PR-11): same contract as PutObject. Without the address the Rust drain

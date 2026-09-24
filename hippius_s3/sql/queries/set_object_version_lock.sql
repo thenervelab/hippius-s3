@@ -5,8 +5,11 @@
 -- with independent endpoints, so writing one must never silently clear the other — passing FALSE
 -- from the retention path would drop a live legal hold and release an object nobody asked to
 -- release.
+--
+-- Only a live version. A retention write racing a DELETE ?versionId= would otherwise pin a lock on
+-- the tombstone, which DeleteBucket does not count and every SQL gate then withholds until expiry.
 UPDATE object_versions
 SET object_lock_mode = $3,
     object_lock_retain_until = $4,
     object_lock_legal_hold = COALESCE($5, object_lock_legal_hold)
-WHERE object_id = $1 AND object_version = $2;
+WHERE object_id = $1 AND object_version = $2 AND deleted_at IS NULL;

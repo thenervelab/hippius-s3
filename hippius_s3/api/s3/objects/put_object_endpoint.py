@@ -23,8 +23,8 @@ from hippius_s3.api.s3.common import parse_content_md5
 from hippius_s3.api.s3.common import parse_write_if_none_match
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.extensions.append import handle_append
+from hippius_s3.api.s3.object_lock_guard import maybe_object_lock_not_implemented_response
 from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
-from hippius_s3.api.s3.objects.object_lock_endpoints import store_version_lock
 from hippius_s3.api.s3.objects.object_lock_endpoints import validate_lock_intent
 from hippius_s3.config import get_config
 from hippius_s3.db_pool import acquire_with_timeout
@@ -68,17 +68,12 @@ async def handle_put_object(
     try:
         main_account_id = request.state.main_account_id
 
-        # OBJECT LOCK: validate the lock intent BEFORE reading the body.
+        # OBJECT LOCK: validate the lock intent BEFORE reading the body, and before the append
+        # branch below. A 4xx must not leave a side effect: refusing after the write would tell the
+        # client the PUT failed while an unlocked object sits at the key.
         #
-        # The lock is APPLIED further down, after the write, because it has to land on the version
-        # that actually exists. Validation cannot wait that long: refusing there returns a 4xx for
-        # a request whose object has already been written and committed, so the client is told the
-        # PUT failed while an unlocked object sits at that key — and if the PUT overwrote something,
-        # the previous content is already gone. A 4xx must not leave a side effect.
-        #
-        # Pure header + bucket-config parsing, so running it twice is safe and cheap; the
-        # retain-until for a bucket default is still computed at apply time, from the version's
-        # own creation.
+        # Pure header + bucket-config parsing, so running it again where the lock is resolved for
+        # the writer is safe and cheap.
         lock_rejection = validate_lock_intent(request)
         if lock_rejection is not None:
             return lock_rejection
@@ -146,6 +141,15 @@ async def handle_put_object(
             # Append is handled here, where `bucket` is known non-None (meta_append forces
             # needs_bucket_row, so the row was fetched above) and handle_append requires the full row.
             if meta_append:
+                # An append rewrites the current version in place and mints no new one, so there is
+                # no version for x-amz-object-lock-* headers to lock. Refuse rather than answer 200
+                # with the headers silently dropped — a writer relying on them would believe the
+                # data is retained when it is not.
+                lock_headers_refusal = maybe_object_lock_not_implemented_response(
+                    request, object_lock_headers_supported=False
+                )
+                if lock_headers_refusal is not None:
+                    return lock_headers_refusal
                 # if_none_match is judged inside append's own locked CAS transaction, not by a read
                 # here: a key created between an unlocked pre-check and the append would be modified
                 # under a create-only header — the very violation this is meant to stop.
@@ -186,6 +190,15 @@ async def handle_put_object(
         # (WU-3). Overwrites are handled by the upsert; nothing keys off the previous row here.
         candidate_object_id = str(uuid.uuid4())
 
+        # OBJECT LOCK: explicit x-amz-object-lock-* headers win over the bucket's default retention,
+        # per AWS; a bucket default is a duration, so its retain-until is computed from now. The
+        # writer stores it in the transaction that makes the version serveable, so the version is
+        # never visible unlocked, and before the response, so a client that got a 200 knows the
+        # lock is real.
+        lock_intent = lock_for_new_version(request)
+        if isinstance(lock_intent, Response):
+            return lock_intent
+
         # Use ObjectWriter streaming upsert/write (single-part)
         # Note: No transaction wrapper needed here. The upsert_object_basic query is atomic
         # (uses CTEs). Holding a transaction open during the entire upload would cause lock
@@ -215,6 +228,7 @@ async def handle_put_object(
                 body_iter=utils.iter_request_body(request),
                 if_none_match=if_none_match,
                 expected_md5=expected_md5,
+                lock=lock_intent,
             )
 
             set_span_attributes(
@@ -227,26 +241,6 @@ async def handle_put_object(
                     "returned_size_bytes": put_res.size_bytes,
                 },
             )
-
-        # OBJECT LOCK: apply the version's lock before anything can delete it. Explicit
-        # x-amz-object-lock-* headers win over the bucket's default retention, per AWS; a bucket
-        # default is a duration, so its retain-until is computed from this version's creation.
-        # Applied AFTER the write so it lands on the version that actually exists, and before the
-        # response, so a client that got a 200 knows the lock is real.
-        lock_intent = lock_for_new_version(request)
-        if isinstance(lock_intent, Response):
-            return lock_intent
-        if lock_intent is not None:
-            lock_mode, lock_until, lock_hold = lock_intent
-            async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
-                await store_version_lock(
-                    conn,
-                    object_id=str(put_res.object_id),
-                    object_version=int(put_res.object_version),
-                    mode=lock_mode,
-                    retain_until=lock_until,
-                    legal_hold=lock_hold,
-                )
 
         logger.info(f"PUT {bucket_name}/{object_key}: size={put_res.size_bytes}, md5={put_res.etag}")
 
