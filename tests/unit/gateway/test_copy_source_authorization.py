@@ -25,6 +25,7 @@ from httpx import ASGITransport
 from httpx import AsyncClient
 
 from hippius_s3.gateway.middlewares.acl import acl_middleware
+from hippius_s3.api.s3.copy_helpers import parse_copy_source as copy_helpers_parse_copy_source
 from hippius_s3.gateway.middlewares.acl import parse_copy_source
 from hippius_s3.gateway.services.acl_service import BucketLookup
 from hippius_s3.models.acl import Permission
@@ -179,6 +180,16 @@ class TestParserAgreesWithTheHandlers:
     def test_encoded_slash_does_not_hide_the_real_bucket(self) -> None:
         """The specific bypass: decode-last reads `victim%2Fkey`, the handlers read `victim`."""
         assert parse_copy_source("victim%2Fkey") == ("victim", "key")
+
+    @pytest.mark.parametrize(
+        "header",
+        ["/owner-b/allowed%3Fsecret", "/owner-b/allowed%3Fsecret?versionId=3", "/b/dir/k%3Fx%2Fy"],
+    )
+    def test_key_matches_copy_helpers_derivation(self, header: str) -> None:
+        """An encoded `?` is part of the key for the handlers; decoding before cutting the query
+        read `allowed%3Fsecret` as key `allowed` and authorised a copy of `allowed?secret`."""
+        bucket, key, _ = copy_helpers_parse_copy_source(header)
+        assert parse_copy_source(header) == (bucket, key)
 
     def test_arn_form_is_not_special_cased(self) -> None:
         """Neither handler recognises ARNs, so neither may this — see the module docstring."""

@@ -241,16 +241,31 @@ Changes that came with the tier, each of which was a way around it:
   `NoSuchUpload` for a completed upload, or for an upload addressed through a bucket or key other
   than its own. Before, aborting a completed upload deleted its `multipart_uploads` row; `parts`
   cascades from that row, so the committed version's data went with it, past Object Lock.
-  - The abort first claims the upload, by deleting only a row that is still open
-    (`is_completed = FALSE`; NULL fails closed). Only then does it clean anything up.
+  - The abort first claims the upload (`claim_upload_for_abort.sql`) and only then cleans
+    anything up. The claim deletes only a row that is still open (`is_completed = FALSE`; NULL
+    fails closed) and has no serveable version behind it. A simple PUT or streaming CopyObject
+    commits its finished version with an open upload row and flips the row a moment later; before
+    this change, an abort in that window deleted a finished, possibly locked, object.
+  - The abandoned-upload reaper also claims first, so an upload that completes after being
+    listed keeps its replication rows.
   - CompleteMultipartUpload flips `is_completed` under the same condition and rolls back if the
     abort won. The two serialise on the upload row.
   - UploadPart and CompleteMultipartUpload check the path the same way.
 - **S4 append refuses a locked version** with 403. An append rewrites the current version's size,
   ETag and parts in place, so on a locked version it changed retained data. It is checked under
   both of the append's row locks.
-- **The sub-token copy-source check decodes before it splits**, as the handlers do. A
-  `%2F`-encoded source used to skip the check.
+- **Copy sources are parsed exactly as the handlers parse them**: cut the query off the raw
+  header, then decode, then split. The sub-token check used to split before decoding, so a
+  `%2F`-encoded source skipped it. The general ACL check used to decode before cutting, so
+  `allowed%3Fsecret` was authorised as key `allowed`.
+- **A scope that cannot be read denies**, cross-account too. Before, a failed read counted as "no
+  scope row", and cross-account that means the grants alone decide. A scope change now invalidates
+  the cache after it commits, not concurrently with it, so a downgrade applies on the next request.
+
+Known gap, not fixed here: an UploadPart already streaming when CompleteMultipartUpload commits
+can still republish that part's bytes in the cache. The check at the start of UploadPart cannot
+see a completion that lands mid-stream. Closing it needs part publishes to take a lock on the
+upload row that Complete also takes, before it reads the parts.
 
 What the tier cannot express:
 
@@ -292,16 +307,20 @@ A bucket is now non-empty while either of these holds:
 
 - a live object has a live completed version or a delete marker. That is AWS's rule: versions AND
   delete markers must all be gone.
-- an upload is open. A simple PUT still streaming counts as one.
+- a multipart upload is open.
 
 A reserved row with no data is not counted, even a locked one: an aborted upload leaves one on a
 new key, and no client can see it or delete it.
 
 The check and the soft-delete run in one transaction that first takes `FOR UPDATE` on the bucket
 row. An in-flight create holds `FOR KEY SHARE` on that row through its foreign key, so the check
-waits for it, then sees it. **Residual:** a request that resolved the bucket before the delete
-committed, and inserts after, still lands in the soft-deleted bucket, because the write path does
-not re-check `buckets.deleted_at`.
+waits for it, then sees it.
+
+**Residual:** a write that resolved the bucket before the delete committed, and inserts after it,
+still lands in the soft-deleted bucket, because the write path does not re-check
+`buckets.deleted_at`. A simple PUT that is still streaming is one such write: its reserved
+version is not data yet, and it has no upload row until its last transaction. Closing this means
+re-checking bucket liveness under the bucket row lock in every write tail.
 
 ### Billing of retained versions (CURRENT STATE, decision needed)
 

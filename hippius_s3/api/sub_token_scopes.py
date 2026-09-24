@@ -291,18 +291,18 @@ async def put_scope(
     repo: SubTokenScopeRepository = request.app.state.sub_token_scope_repo
     redis_client = request.app.state.redis_client
 
-    # Upsert and cache-invalidate in parallel. The cache delete is best-effort —
-    # see _invalidate_scope_cache for why we don't fail the request on Redis errors.
-    scope, _ = await asyncio.gather(
-        repo.upsert(
-            access_key_id=access_key_id,
-            account_id=body.account_id,
-            permission=body.permission,
-            bucket_scope=body.bucket_scope,
-            bucket_ids=bucket_ids,
-        ),
-        _invalidate_scope_cache(redis_client, access_key_id),
+    # Upsert FIRST, then invalidate. Run concurrently, the delete could land before the upsert
+    # committed and a request in between would re-cache the OLD scope for the full TTL — a
+    # downgrade (say to object_read_write_no_delete) silently not applying for a minute. The cache
+    # delete is best-effort — see _invalidate_scope_cache for why we don't fail on Redis errors.
+    scope = await repo.upsert(
+        access_key_id=access_key_id,
+        account_id=body.account_id,
+        permission=body.permission,
+        bucket_scope=body.bucket_scope,
+        bucket_ids=bucket_ids,
     )
+    await _invalidate_scope_cache(redis_client, access_key_id)
 
     logger.info(
         f"Sub-token scope upserted: access_key={access_key_id[:8]}***, "
@@ -341,10 +341,9 @@ async def delete_scope(
     repo: SubTokenScopeRepository = request.app.state.sub_token_scope_repo
     redis_client = request.app.state.redis_client
 
-    deleted, _ = await asyncio.gather(
-        repo.delete(access_key_id),
-        _invalidate_scope_cache(redis_client, access_key_id),
-    )
+    # Delete first, then invalidate, for the same reason as put_scope.
+    deleted = await repo.delete(access_key_id)
+    await _invalidate_scope_cache(redis_client, access_key_id)
 
     logger.info(f"Sub-token scope deleted: access_key={access_key_id[:8]}***, existed={deleted}")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

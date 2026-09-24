@@ -56,10 +56,12 @@ class FakeDb:
         *,
         sweep_rows: list[dict] | None = None,
         raise_mark_for: str | None = None,
+        completed_upload_ids: set[str] | None = None,
     ) -> None:
         self._fetch_rows = fetch_rows or []
         self._sweep_rows = sweep_rows or []
         self._raise_mark_for = raise_mark_for
+        self._completed_upload_ids = completed_upload_ids or set()
         self.executed: list[tuple[str, tuple]] = []
         self.fetched: list[tuple[str, tuple]] = []
 
@@ -68,6 +70,11 @@ class FakeDb:
         if "cephor_replication_status" in statement_of(query):
             return self._sweep_rows
         return self._fetch_rows
+
+    async def fetchrow(self, query: str, *args: object) -> dict | None:
+        # The reaper's claim: the conditional DELETE of the upload row.
+        self.executed.append((query, args))
+        return None if args[0] in self._completed_upload_ids else {"upload_id": args[0]}
 
     async def execute(self, query: str, *args: object) -> str:
         if self._raise_mark_for is not None and args and args[0] == self._raise_mark_for:
@@ -150,6 +157,22 @@ async def test_reaper_marks_each_abandoned_version_and_deletes_its_mpu_row() -> 
     deleted_mpu_rows = sum(1 for query, _ in db.executed if "DELETE FROM multipart_uploads" in query)
     assert failed == 2, "each abandoned version's replication rows are marked terminal"
     assert deleted_mpu_rows == 2, "each abandoned upload's header row is removed so it is not reaped again"
+
+
+@pytest.mark.asyncio
+async def test_reaper_leaves_an_upload_completed_since_it_was_listed_untouched() -> None:
+    """The claim runs FIRST. An upload that completed between the candidate query and the claim
+    is not deleted (the conditional DELETE matches nothing), and its freshly completed version's
+    replication rows must not be made terminal either — nothing would ever re-drive them."""
+    rows = [
+        {"upload_id": "done", "object_id": "obj-1", "object_version": 1, "age_seconds": 90000.0},
+        {"upload_id": "stale", "object_id": "obj-2", "object_version": 5, "age_seconds": 90000.0},
+    ]
+    db = FakeDb(rows, completed_upload_ids={"done"})
+    result = await mpu_cleanup.reap_abandoned_uploads(db, stale_seconds=86400, dlq_object_ids=set())
+    assert result.count == 1, "only the upload actually claimed counts as reaped"
+    fail_args = [args for query, args in db.executed if "'failed'" in query]
+    assert fail_args == [("obj-2", 5)]
 
 
 @pytest.mark.asyncio

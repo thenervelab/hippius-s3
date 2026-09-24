@@ -10,8 +10,10 @@
 -- The serveable predicate is the one list_objects uses. It skips the zero-byte reserved row an
 -- aborted multipart upload leaves on a brand-new key, which no client can see or delete and would
 -- otherwise wedge the bucket forever — even when the upload locked it at initiate, since a lock on
--- a row with no data protects nothing. An upload still being written is not skipped: it is caught
--- by has_open_uploads (a simple PUT, too, holds an open multipart_uploads row until it finishes).
+-- a row with no data protects nothing. A multipart upload still in progress is caught by
+-- has_open_uploads instead. A simple PUT that is still streaming is visible to neither arm — its
+-- upload row and serveable version appear together in its final transaction — which is the
+-- residual race documented in bucket_delete_endpoint.py.
 --
 -- No arm for locked versions under a soft-deleted object. No API path leaves one — an unversioned
 -- DELETE and a versioned DELETE of a locked version are both refused — only the purger and the ops

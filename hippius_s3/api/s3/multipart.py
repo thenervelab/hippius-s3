@@ -965,14 +965,14 @@ async def abort_multipart_upload(
         )
 
         # CLAIM the upload before anything destructive runs. The delete only matches an upload that
-        # is still open, and it serialises on the upload row with CompleteMultipartUpload's own
-        # conditional flip of is_completed: whichever commits first wins, and the loser changes
-        # nothing. Everything below this point therefore only ever touches an upload that is really
+        # is still in progress (see claim_upload_for_abort.sql), and it serialises on the upload row
+        # with CompleteMultipartUpload's own conditional flip of is_completed: whichever commits
+        # first wins, and the loser changes nothing. Everything below this point therefore only ever touches an upload that is really
         # aborted — the cleanup used to run first, so an abort racing a completion could fail the
         # completed version's replication and drop its cache before discovering it had lost.
         async with db.transaction():
             aborted = await db.fetchrow(
-                get_query("abort_multipart_upload"),
+                get_query("claim_upload_for_abort"),
                 upload_id,
             )
         if not aborted:

@@ -102,8 +102,12 @@ async def reap_abandoned_uploads(db: Any, *, stale_seconds: int, dlq_object_ids:
         if str(object_id) in dlq_object_ids:
             logger.debug("mpu-reaper: skipping DLQ-protected object_id=%s", object_id)
             continue
+        # Claim first: only an upload still open is deleted, so one completed since it was listed
+        # is skipped here — BEFORE its replication rows are made terminal, which would strand the
+        # freshly completed version un-replicated.
+        if await db.fetchrow(get_query("abort_multipart_upload"), row["upload_id"]) is None:
+            continue
         await fail_version_replication(db, object_id=object_id, object_version=row["object_version"])
-        await db.execute(get_query("abort_multipart_upload"), row["upload_id"])
         reaped += 1
         age = row.get("age_seconds")
         if age is not None:

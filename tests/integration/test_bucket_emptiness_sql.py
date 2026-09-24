@@ -301,3 +301,26 @@ class TestAbortCompleteRace:
         _, upload_id = await _object(ctx, key="k", versions=[{"version": 1}])
         await ctx.conn.execute("UPDATE multipart_uploads SET is_completed = NULL WHERE upload_id = $1", upload_id)
         assert await ctx.conn.fetchrow(get_query("abort_multipart_upload"), upload_id) is None
+
+
+class TestApiAbortClaim:
+    async def test_an_upload_in_progress_is_claimed(self, ctx: Ctx) -> None:
+        _, upload_id = await _object(
+            ctx, key="k", versions=[{"version": 1, "size": 0, "md5": None}], upload_completed=False
+        )
+        assert await ctx.conn.fetchrow(get_query("claim_upload_for_abort"), upload_id) is not None
+        assert await ctx.conn.fetchval("SELECT count(*) FROM parts WHERE upload_id = $1", upload_id) == 0
+
+    async def test_a_finished_put_still_in_its_tail_is_not_claimed(self, ctx: Ctx) -> None:
+        """A simple PUT commits its serveable version with an OPEN upload row and flips it only
+        after the address is written. The row is listed by ListMultipartUploads meanwhile, and
+        aborting it cascaded away a finished — possibly Object-Locked — object."""
+        _, upload_id = await _object(
+            ctx, key="k", versions=[{"version": 1, "hold": True}], upload_completed=False
+        )
+        assert await ctx.conn.fetchrow(get_query("claim_upload_for_abort"), upload_id) is None
+        assert await ctx.conn.fetchval("SELECT count(*) FROM parts WHERE upload_id = $1", upload_id) == 1
+
+    async def test_a_completed_upload_is_not_claimed(self, ctx: Ctx) -> None:
+        _, upload_id = await _object(ctx, key="k", versions=[{"version": 1, "size": 0, "md5": None}])
+        assert await ctx.conn.fetchrow(get_query("claim_upload_for_abort"), upload_id) is None

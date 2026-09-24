@@ -377,3 +377,15 @@ async def test_cross_account_token_without_a_scope_keeps_the_contractor_flow() -
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.delete("/shared-bucket/k")
     assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_cross_account_request_is_denied_when_the_scope_cannot_be_read() -> None:
+    """Cross-account, a MISSING scope means "the owner's grants alone decide". A scope that could
+    not be READ must not be mistaken for that, or a Postgres blip lifts every tier ceiling."""
+    app = _make_app(scope=None, bucket_owner_lookup={"shared-bucket": ("bob", "shared-id")})
+    app.state.sub_token_scope_repo.get = AsyncMock(side_effect=OSError("postgres down"))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.delete("/shared-bucket/k")
+    assert r.status_code == 403
+    app.state.acl_service.check_permission.assert_not_awaited()

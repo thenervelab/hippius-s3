@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from enum import Enum
 
 import asyncpg
 from redis.asyncio import Redis
@@ -28,6 +29,15 @@ def scope_cache_key(access_key_id: str) -> str:
     return f"{SCOPE_CACHE_PREFIX}{access_key_id}"
 
 
+class ScopeUnavailable(Enum):
+    """The scope could not be read. Distinct from "no scope row", which is a real answer."""
+
+    UNAVAILABLE = "unavailable"
+
+
+SCOPE_UNAVAILABLE = ScopeUnavailable.UNAVAILABLE
+
+
 async def get_cached_sub_token_scope(
     access_key_id: str,
     repo: SubTokenScopeRepository,
@@ -39,7 +49,21 @@ async def get_cached_sub_token_scope(
     default-denies. The alternative — propagating the exception — surfaces as a
     500 to the S3 client and looks like a write/read outage rather than an auth
     decision; default-deny converts the storage error into the safer 403.
+
+    None is only fail-closed where None means "deny". A caller for which a missing scope row
+    means something permissive must use lookup_sub_token_scope and treat SCOPE_UNAVAILABLE as a
+    denial of its own.
     """
+    scope = await lookup_sub_token_scope(access_key_id, repo, redis_client)
+    return None if scope is SCOPE_UNAVAILABLE else scope
+
+
+async def lookup_sub_token_scope(
+    access_key_id: str,
+    repo: SubTokenScopeRepository,
+    redis_client: Redis,
+) -> SubTokenScope | None | ScopeUnavailable:
+    """As get_cached_sub_token_scope, but a failed Postgres read returns SCOPE_UNAVAILABLE."""
     key = scope_cache_key(access_key_id)
 
     try:
@@ -63,7 +87,7 @@ async def get_cached_sub_token_scope(
         scope = await repo.get(access_key_id)
     except (asyncpg.PostgresError, OSError) as exc:
         logger.error(f"scope cache: postgres lookup failed for {access_key_id[:8]}***, default-denying: {exc}")
-        return None
+        return SCOPE_UNAVAILABLE
 
     try:
         if scope is None:

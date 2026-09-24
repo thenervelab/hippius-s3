@@ -14,7 +14,8 @@ from hippius_s3.gateway.services.sub_token_scope import evaluate as evaluate_sub
 from hippius_s3.gateway.services.sub_token_scope import permission_allows
 from hippius_s3.gateway.services.sub_token_scope import required_op as required_sub_token_op
 from hippius_s3.gateway.services.sub_token_scope import sets_acl
-from hippius_s3.gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
+from hippius_s3.gateway.services.sub_token_scope_cache import SCOPE_UNAVAILABLE
+from hippius_s3.gateway.services.sub_token_scope_cache import lookup_sub_token_scope
 from hippius_s3.gateway.services.suspension import get_account_suspension
 from hippius_s3.gateway.services.suspension import suspension_blocks
 from hippius_s3.gateway.utils.accounts import is_sentinel_account_id
@@ -28,12 +29,14 @@ from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 def parse_copy_source(header_value: str) -> tuple[str | None, str | None]:
     """Split `x-amz-copy-source` into (bucket, key), exactly as the HANDLERS split it.
 
-    This must mirror `copy_helpers.parse_copy_source` and the inline parse in
-    `multipart.upload_part`: **percent-decode first, then strip the leading slash, then split.**
-    Deriving the bucket any other way reintroduces the split-view class one layer up — a header
-    of `victim%2Fkey` reads as the (nonexistent) bucket `victim%2Fkey` under a decode-last
-    parser while both handlers read it as bucket `victim`, so the authorised resource and the
-    accessed resource are different objects.
+    This must mirror `copy_helpers.parse_copy_source`, which CopyObject and UploadPartCopy both
+    use: **cut the query string off the RAW header, then percent-decode the path, then strip the
+    leading slash, then split.** Deriving it any other way reintroduces the split-view class one
+    layer up:
+    - decode-last reads `victim%2Fkey` as the (nonexistent) bucket `victim%2Fkey` while the
+      handlers read bucket `victim`;
+    - decode-before-cut reads `/b/allowed%3Fsecret` as key `allowed` while the handlers read
+      `allowed?secret`, so a READ grant on one key authorised a copy of its sibling.
 
     Note the ARN form is deliberately NOT special-cased here: neither handler recognises it, so
     treating it as unparseable while they treat it as a literal bucket name is itself a
@@ -41,11 +44,12 @@ def parse_copy_source(header_value: str) -> tuple[str | None, str | None]:
     """
     if not header_value:
         return None, None
-    src = unquote(header_value.strip()).lstrip("/")
+    path, _, _ = header_value.strip().partition("?")
+    src = unquote(path).lstrip("/")
     bucket, sep, key = src.partition("/")
     if not sep or not bucket:
         return None, None
-    return bucket, (key.split("?", 1)[0] or None)
+    return bucket, (key or None)
 
 
 def parse_s3_path(path: str) -> tuple[str | None, str | None]:
@@ -314,7 +318,12 @@ async def acl_middleware(
         is_cross_account = bucket_owner_id is not None and bucket_owner_id != account_id
         repo = request.app.state.sub_token_scope_repo
         redis_client = request.app.state.redis_client
-        scope = await get_cached_sub_token_scope(access_key, repo, redis_client)
+        looked_up = await lookup_sub_token_scope(access_key, repo, redis_client)
+        # An unreadable scope denies. Intra-account a missing scope already does; cross-account it
+        # means "grants alone decide", so treating a failed read as missing would fail OPEN there.
+        if looked_up is SCOPE_UNAVAILABLE:
+            return _access_denied()
+        scope = looked_up
         carries_acl = sets_acl(request.headers)
 
         # The tier is a CEILING, whoever's bucket it is. A cross-account request is authorised by

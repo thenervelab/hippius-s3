@@ -49,7 +49,7 @@ class _FakeDb:
             }
         if query == "get_multipart_version_by_upload":
             return {"object_version": self.upload_version} if self.upload_version is not None else None
-        if query == "abort_multipart_upload":
+        if query == "claim_upload_for_abort":
             self.aborted = True
             return {"upload_id": args[0]}
         return None
@@ -182,7 +182,7 @@ async def test_abort_that_loses_the_race_to_complete_touches_nothing(monkeypatch
 
     class _LostRaceDb(_FakeDb):
         async def fetchrow(self, query: str, *args: Any) -> Any:
-            if query == "abort_multipart_upload":
+            if query == "claim_upload_for_abort":
                 return None
             return await super().fetchrow(query, *args)
 

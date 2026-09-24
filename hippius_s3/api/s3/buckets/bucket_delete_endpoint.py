@@ -78,8 +78,9 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
     # an object or upload being created concurrently is either committed before the check sees it
     # or held off until the bucket is gone. See lock_bucket_for_delete.sql.
     #
-    # Residual: a request that resolved the bucket BEFORE this commits and inserts AFTER it still
-    # lands in the soft-deleted bucket — the write path does not re-check buckets.deleted_at.
+    # Residual: a write that resolved the bucket BEFORE this commits and inserts AFTER it still
+    # lands in the soft-deleted bucket — the write path does not re-check buckets.deleted_at. That
+    # includes a simple PUT still streaming, whose reserved version is not counted as data yet.
     async with db.transaction():
         if not await db.fetchrow(get_query("lock_bucket_for_delete"), bucket["bucket_id"]):
             return errors.s3_error_response(
