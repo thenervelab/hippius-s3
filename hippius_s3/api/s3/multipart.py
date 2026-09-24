@@ -50,6 +50,7 @@ from hippius_s3.services.mpu_cleanup import wake_version_replication
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
+from hippius_s3.writer.db import unserve_version_after_address_failure
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.writer.types import BadDigest
 from hippius_s3.writer.types import PreconditionFailed
@@ -1379,12 +1380,31 @@ async def complete_multipart_upload(
         # persists the main-account address (the upload identity); the Rust drain reads
         # it and LPUSHes each part's UploadChainRequest itself, per part, as the part
         # replicates to ceph. The drain is the sole upload producer.
-        await set_object_version_address(
-            request.app.state.postgres_pool,
-            object_id=str(object_id),
-            object_version=int(object_version),
-            address=request.state.main_account_id,
-        )
+        try:
+            await set_object_version_address(
+                request.app.state.postgres_pool,
+                object_id=str(object_id),
+                object_version=int(object_version),
+                address=request.state.main_account_id,
+            )
+        except Exception:
+            # mpu_complete already committed the version serveable, locked, and is_completed.
+            # Leaving it that way makes a retry take the idempotent 200 path and report success
+            # for an object the drain can never upload, and DELETE ?versionId= then 403s on the
+            # lock. Put it back in the reserved shape and reopen the upload so the retry runs
+            # the real complete, and so the abandoned-upload reaper can still see the row.
+            with contextlib.suppress(Exception):
+                async with db.transaction():
+                    await unserve_version_after_address_failure(
+                        db,
+                        object_id=str(object_id),
+                        object_version=int(object_version),
+                    )
+                    await db.execute(
+                        "UPDATE multipart_uploads SET is_completed = FALSE WHERE upload_id = $1",
+                        upload_id,
+                    )
+            raise
 
         # Drain wake: the address write above removes the cause of this version's defer
         # backoff (rationale, incl. the deliberate defer_attempts reset, lives in

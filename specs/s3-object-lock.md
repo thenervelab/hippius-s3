@@ -297,6 +297,9 @@ Changes that came with the tier, each of which was a way around it:
   the bytes were still in transit, and a backup larger than the default was unlocked — or already
   expired — at the moment it became readable. CompleteMultipartUpload writes the default in the
   same transaction that sets the size, and does not overwrite a mode already stored from headers.
+  If the drain address write then fails, Complete marks the version unserveable again and reopens
+  the upload. Leaving `is_completed` set would make the idempotent retry answer 200 for an object
+  the drain can never upload, and a COMPLIANCE lock would refuse `DELETE ?versionId=`.
 - **S4 append refuses `x-amz-object-lock-*` with 501.** An append mints no version, so there is
   nothing to lock; it used to answer 200 with the headers dropped.
 - **A version delete ignores a write in flight.** `DELETE ?versionId=` of a version with no

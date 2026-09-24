@@ -40,6 +40,14 @@ _POINTER_VERSION = 7
 _PARTS_VERSION = 3
 
 
+class _Txn:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *_exc: Any) -> bool:
+        return False
+
+
 class _FakeDb:
     """The handler's DB connection. Routes fetches by query NAME (multipart.get_query is
     monkeypatched to identity) and records/faults `execute` — the wake's only surface."""
@@ -75,6 +83,9 @@ class _FakeDb:
         if self._execute_error is not None and "cephor_replication_status" in query:
             raise self._execute_error
         self.executed.append((query, args))
+
+    def transaction(self) -> _Txn:
+        return _Txn()
 
 
 class _FakeTxn:
@@ -199,3 +210,23 @@ async def test_wake_failure_does_not_fail_committed_complete(monkeypatch: Any, t
     assert warnings, "wake failure must be logged at WARNING"
     assert "obj-1" in warnings[0].getMessage()
     assert str(_PARTS_VERSION) in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_address_failure_unserves_and_reopens_the_upload(monkeypatch: Any, tmp_path: Any) -> None:
+    """Complete commits the version before the drain address. A failed address must not leave a
+    serveable locked object: the idempotent replay would then 200 a retry the drain can never
+    upload, and a COMPLIANCE lock would refuse DELETE ?versionId=."""
+
+    async def _fail(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("address write failed")
+
+    monkeypatch.setattr(multipart, "set_object_version_address", _fail)
+    db = _FakeDb()
+    resp = await _run_complete(monkeypatch, tmp_path, db)
+    assert resp.status_code == 500
+    unserve = [q for q, _a in db.executed if "size_bytes = 0" in q]
+    assert len(unserve) == 1
+    assert "object_lock" not in unserve[0]
+    assert any("is_completed = FALSE" in q for q, _a in db.executed)
+    assert _wake_updates(db) == []
