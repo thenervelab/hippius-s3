@@ -283,6 +283,18 @@ Changes that came with the tier, each of which was a way around it:
   first part there is no earlier part to go by, and the current version is still the stand-in; if
   that version already holds finished data, UploadPart refuses with 409 rather than write into it.
 
+- **A new version's lock commits with the version.** PutObject and a streaming CopyObject store
+  the lock in the writer's tail transaction, the one that makes the version serveable. Before,
+  the lock was written in a later transaction, so a key that may `DELETE ?versionId=` could list
+  the fresh version and destroy it before it was retained. A copy with lock intent no longer
+  takes the v5 fast path, whose version is serveable from its first autocommit statement; it
+  streams instead, as it already did rather than alias. CreateMultipartUpload was already safe:
+  it locks the reserved version at initiate, before any data.
+- **S4 append refuses `x-amz-object-lock-*` with 501.** An append mints no version, so there is
+  nothing to lock; it used to answer 200 with the headers dropped.
+- **A lock write skips a soft-deleted version** (`set_object_version_lock.sql`), so a retention
+  write racing a version delete cannot pin a lock on the tombstone.
+
 Known gaps, not fixed here:
 
 - **UploadPart racing CompleteMultipartUpload.** An UploadPart already streaming when Complete
@@ -295,6 +307,20 @@ Known gaps, not fixed here:
   version that initiate reserved. When the current version is another write's reserved row that
   is still streaming, the refusal above cannot tell it apart from the upload's own. The fix is a
   version column on `multipart_uploads`, written at initiate.
+- **Aborts that leave an empty version current.** A partless abort cannot find its reserved
+  version, and the abandoned-upload reaper does not repoint either, so `current_object_version`
+  can be left on an empty placeholder. An S4 append then extends the placeholder, not the
+  retained version below it. Same root cause as the previous item.
+- **Aborting a higher upload while a lower one completes** can repoint the key to an older
+  version (`abort_cleanup_orphan_version.sql` documents the race).
+- **The reaper can remove a locked simple PUT after a crash.** If the API process dies between
+  the tail transaction and the address write, the version is serveable and locked but has no
+  address and an open upload row, and the reaper deletes that row with its parts. The client
+  never got its 200. Not changed: skipping locked versions there would leave an addressless
+  version that never replicates.
+- **A NULL `multipart_uploads.is_completed`** does not block DeleteBucket. The column defaults to
+  FALSE and no code path writes NULL; counting it would give up the partial index the check uses.
+- **Scope cache after a downgrade.** See above: up to the 60 s TTL.
 
 What the tier cannot express:
 
@@ -322,6 +348,13 @@ and ignores them, as AWS does. **CompleteMultipartUpload answers 501 when it car
 because the lock was fixed at initiate. A presigning writer must therefore sign them on PutObject
 and CreateMultipartUpload only. `tests/unit/gateway/test_presigned_object_lock_headers.py` signs
 with botocore's real `S3SigV4QueryAuth` and verifies with the real canonicalisation code.
+
+**The URL holder cannot ADD authority headers either.** A presigned request carrying any
+`x-amz-object-lock-*`, `x-amz-bypass-governance-retention`, `x-amz-acl` or `x-amz-grant-*` header
+that is not in `X-Amz-SignedHeaders` is refused, as AWS refuses unsigned `x-amz-*` headers.
+Before, only signed headers were checked, so the holder of a backup URL (an untrusted host)
+could add `x-amz-object-lock-legal-hold: ON` and make the backup unprunable, or add a governance
+bypass to a version-delete URL. Other unsigned headers are still accepted.
 
 ### DeleteBucket counts every version (IMPLEMENTED)
 
