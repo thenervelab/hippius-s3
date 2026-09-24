@@ -350,11 +350,7 @@ async def handle_streaming_copy(
         with contextlib.suppress(Exception):
             async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
                 await conn.execute(
-                    # The lock goes too: the client is answered with an error, so no retention was
-                    # promised, and a lock left on the placeholder would withhold its parts from every
-                    # cleanup gate until it expired — forever, for a legal hold.
-                    "UPDATE object_versions SET size_bytes = 0, md5_hash = '', "
-                    "object_lock_mode = NULL, object_lock_retain_until = NULL, object_lock_legal_hold = FALSE "
+                    "UPDATE object_versions SET size_bytes = 0, md5_hash = '' "
                     "WHERE object_id = $1 AND object_version = $2",
                     str(put_res.object_id),
                     int(put_res.object_version),

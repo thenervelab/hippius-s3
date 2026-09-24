@@ -304,9 +304,6 @@ Changes that came with the tier, each of which was a way around it:
   (`FOR UPDATE`) before reading the version, and answer 404 when the version was deleted first;
   the lock query skips a soft-deleted version. Before, a lock write racing a delete answered 200
   for a lock that landed on a tombstone or nowhere.
-- **A PUT or copy whose address write fails drops its lock** along with its data (the B4
-  revert). The client gets an error, so nothing was promised, and a lock left on the placeholder
-  would withhold its parts from every cleanup gate until it expired.
 
 Known gaps, not fixed here:
 
@@ -335,6 +332,11 @@ Known gaps, not fixed here:
   address and an open upload row, and the reaper deletes that row with its parts. The client
   never got its 200. Not changed: skipping locked versions there would leave an addressless
   version that never replicates.
+- **A PUT or copy whose address write fails keeps its lock.** The B4 revert makes the version
+  unserveable but leaves the lock, which then withholds its parts from cleanup until it expires
+  (a legal hold, until an admin lifts it). Clearing it there is wrong too: a retention or hold
+  set by an admin in that window would silently disappear. Needs a compare-and-clear against
+  the lock the write itself stored.
 - **A NULL `multipart_uploads.is_completed`** does not block DeleteBucket. The column defaults to
   FALSE and no code path writes NULL; counting it would give up the partial index the check uses.
 - **Scope cache after a downgrade.** See above: up to the 60 s TTL.
