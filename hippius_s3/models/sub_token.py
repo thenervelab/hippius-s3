@@ -28,6 +28,10 @@ class Permission(str, Enum):
     admin_read_write = "admin_read_write"
     admin_read = "admin_read"
     object_read_write = "object_read_write"
+    # Write-once: may add data and read it back, never remove it. Meant for keys handed to a system
+    # that must not be able to destroy what it wrote (backup targets), so a stolen key cannot erase
+    # history. See PERMISSION_MATRIX for exactly what it withholds.
+    object_read_write_no_delete = "object_read_write_no_delete"
     object_read = "object_read"
 
 
@@ -50,6 +54,9 @@ class Op(str, Enum):
     delete_bucket = "delete_bucket"
     read_bucket_meta = "read_bucket_meta"
     write_bucket_meta = "write_bucket_meta"
+    # PutObjectRetention / PutObjectLegalHold. Separate from write_object because setting, extending
+    # or lifting a lock is authority over WHETHER data can be deleted, not over what data exists.
+    write_object_lock = "write_object_lock"
 
 
 # ---- dataclass ------------------------------------------------------------

@@ -329,3 +329,76 @@ def test_scope_update_invalidates_cache_immediately(
     boto3_sub_token_client.put_object(Bucket=scoped_bucket, Key="cache-test.txt", Body=b"v2")
 
     sub_token_scope_client.delete(test_sub_token_access_key)
+
+
+def test_object_read_write_no_delete_is_write_once(
+    sub_token_scope_client: Any,
+    boto3_master_client: Any,
+    boto3_sub_token_client: Any,
+    test_sub_token_access_key: str,
+    mock_account_ss58: str,
+    cleanup_buckets: Any,
+    unique_bucket_name: Any,
+) -> None:
+    """The backup-writer tier: upload (simple and multipart), read back, abort its own failed
+    upload — and never delete, hide behind a marker, or unlock anything."""
+    bucket = unique_bucket_name("subtok-worm")
+    cleanup_buckets(bucket)
+    boto3_master_client.create_bucket(Bucket=bucket, ObjectLockEnabledForBucket=True)
+
+    sub_token_scope_client.put(
+        test_sub_token_access_key,
+        {
+            "account_id": mock_account_ss58,
+            "permission": "object_read_write_no_delete",
+            "bucket_scope": "specific",
+            "buckets": [bucket],
+        },
+    )
+    try:
+        put = boto3_sub_token_client.put_object(Bucket=bucket, Key="run/1.full", Body=b"backup")
+        assert boto3_sub_token_client.get_object(Bucket=bucket, Key="run/1.full")["Body"].read() == b"backup"
+        assert boto3_sub_token_client.list_objects_v2(Bucket=bucket)["KeyCount"] == 1
+
+        body = b"p" * (5 * 1024 * 1024)
+        upload_id = boto3_sub_token_client.create_multipart_upload(Bucket=bucket, Key="run/1.inc")["UploadId"]
+        part = boto3_sub_token_client.upload_part(
+            Bucket=bucket, Key="run/1.inc", UploadId=upload_id, PartNumber=1, Body=body
+        )
+        boto3_sub_token_client.complete_multipart_upload(
+            Bucket=bucket,
+            Key="run/1.inc",
+            UploadId=upload_id,
+            MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": part["ETag"]}]},
+        )
+        failed = boto3_sub_token_client.create_multipart_upload(Bucket=bucket, Key="run/2.inc")["UploadId"]
+        boto3_sub_token_client.abort_multipart_upload(Bucket=bucket, Key="run/2.inc", UploadId=failed)
+
+        refused = [
+            lambda: boto3_sub_token_client.delete_object(Bucket=bucket, Key="run/1.full"),
+            lambda: boto3_sub_token_client.delete_object(
+                Bucket=bucket, Key="run/1.full", VersionId=put["VersionId"]
+            ),
+            lambda: boto3_sub_token_client.delete_objects(
+                Bucket=bucket, Delete={"Objects": [{"Key": "run/1.full"}, {"Key": "run/1.inc"}]}
+            ),
+            lambda: boto3_sub_token_client.put_object_legal_hold(
+                Bucket=bucket, Key="run/1.full", LegalHold={"Status": "ON"}
+            ),
+            lambda: boto3_sub_token_client.put_object_retention(
+                Bucket=bucket,
+                Key="run/1.full",
+                Retention={"Mode": "GOVERNANCE", "RetainUntilDate": "2030-01-01T00:00:00Z"},
+            ),
+            lambda: boto3_sub_token_client.delete_bucket(Bucket=bucket),
+        ]
+        for call in refused:
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert _is_forbidden(exc.value)
+
+        versions = boto3_master_client.list_object_versions(Bucket=bucket)
+        assert not versions.get("DeleteMarkers"), "a refused DELETE must not have written a marker"
+        assert boto3_master_client.get_object(Bucket=bucket, Key="run/1.inc")["Body"].read() == body
+    finally:
+        sub_token_scope_client.delete(test_sub_token_access_key)

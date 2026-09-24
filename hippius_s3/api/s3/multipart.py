@@ -896,8 +896,8 @@ async def upload_part(
 
 
 async def abort_multipart_upload(
-    _: str,
-    __: str,
+    bucket_name: str,
+    object_key: str,
     request: Request,
     db: Any,
 ) -> Response:
@@ -915,7 +915,18 @@ async def abort_multipart_upload(
             get_query("get_multipart_upload"),
             upload_id,
         )
-        if not multipart_upload:
+        # Only an OPEN upload, addressed through the bucket and key it was initiated on, is
+        # abortable — AWS answers NoSuchUpload otherwise. A completed upload's parts are the
+        # object's data (`parts` cascades from multipart_uploads), so aborting one destroyed a
+        # committed version while bypassing both the DeleteObject permission and Object Lock; the
+        # sub-token scope grades abort as a WRITE on exactly that premise. And the ACL layer
+        # authorised the PATH, so an upload id from another bucket must not be honoured here.
+        if (
+            not multipart_upload
+            or multipart_upload["is_completed"]
+            or multipart_upload["bucket_name"] != bucket_name
+            or multipart_upload["object_key"] != object_key
+        ):
             return s3_error_response(
                 "NoSuchUpload",
                 "The specified upload does not exist",
@@ -977,11 +988,19 @@ async def abort_multipart_upload(
             with contextlib.suppress(Exception):
                 await fail_version_replication(db, object_id=object_id, object_version=object_version)
 
-        # Fully remove the multipart upload (and cascade parts) so it disappears from listings immediately
+        # Fully remove the multipart upload (and cascade parts) so it disappears from listings immediately.
+        # The query only deletes an upload that is still open, so a CompleteMultipartUpload that
+        # committed after the check above keeps its parts; skip the version cleanup below then too.
         async with db.transaction():
-            await db.fetchrow(
+            aborted = await db.fetchrow(
                 get_query("abort_multipart_upload"),
                 upload_id,
+            )
+        if not aborted:
+            return s3_error_response(
+                "NoSuchUpload",
+                "The specified upload does not exist",
+                status_code=404,
             )
 
         # B5: repoint current_object_version off the empty reserved row this aborted upload left

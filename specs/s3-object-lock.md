@@ -205,6 +205,117 @@ Rough effort: 2–4 engineering weeks, tightly coupled to a versioning effort.
 
 ---
 
+## Write-once keys, DeleteBucket and the account lifecycle
+
+Added for the VM-backup use case: a platform writes COMPLIANCE-locked backups into a
+customer-owned bucket with a sub-token, and a stolen key must not be able to erase them.
+
+### The `object_read_write_no_delete` sub-token tier (IMPLEMENTED)
+
+Set through `PUT /user/sub-tokens/{access_key_id}/scope` like any other tier
+(`gateway/services/sub_token_scope.py` holds the matrix).
+
+| Allowed | Refused |
+| --- | --- |
+| PutObject, CopyObject (source must be in scope for reads) | DeleteObject, with or without `versionId` |
+| CreateMultipartUpload, UploadPart, CompleteMultipartUpload, ListParts | DeleteObjects (`POST ?delete`) |
+| AbortMultipartUpload of an upload that has not completed | `PUT ?retention`, `PUT ?legal-hold` |
+| GetObject, HeadObject, ListObjects(V2), ListObjectVersions, GET `?retention` / `?legal-hold` | every bucket-level write, DeleteBucket, ListBuckets |
+
+- **Abort is graded as a write.** It can only discard an upload that never completed. That holds
+  because AbortMultipartUpload now answers `NoSuchUpload` for an upload that already completed, or
+  that is addressed through a bucket or key other than its own. Before this change, aborting a
+  completed upload deleted its `multipart_uploads` row. `parts` cascades from that row, so the
+  committed version's data went with it, past Object Lock, and any tier that could abort could
+  do it. The delete statement itself also refuses a completed upload.
+- **Changing a lock needs `admin_read_write`, on every tier.** `?retention` and `?legal-hold`
+  writes map to a separate op, `write_object_lock`, which only `admin_read_write` holds. Before
+  this change, sub-tokens graded them as ordinary object writes, so `object_read_write` could
+  shorten a GOVERNANCE retention (with the owner bypass) or lift a legal hold. The bucket-ACL path
+  already graded them `WRITE_ACP`.
+- **What the tier cannot express:**
+  - PutObject may carry `x-amz-object-lock-*` headers. A lock only protects the version being
+    created, which is what a backup writer needs. It also means any write-capable key (this tier
+    or `object_read_write`) can create a version that nobody can delete until the lock ends, at
+    most `object_lock_max_retention_days` (3650 days). AWS gates those headers behind
+    `s3:PutObjectRetention`. **Open decision:** cap write-time retention per bucket or per tier?
+  - On an unversioned bucket, an overwrite still makes the previous version unreachable through
+    S3. The tier protects history only on a versioned bucket, and every lock-enabled bucket is
+    versioned.
+- **Pruning.** This tier cannot prune expired backups, because it holds no delete op at all. A
+  writer that also has to prune needs one of these, which is **an open decision**:
+  1. a tier that allows only `DELETE ?versionId=`. That is a permanent delete, and COMPLIANCE
+     already refuses it while the version is locked. It would refuse a DELETE without versionId
+     (the marker-writing one) and DeleteObjects.
+  2. pruning done by the owner's own key or a lifecycle rule.
+
+### Presigned requests carry the lock in signed headers (VERIFIED)
+
+A SigV4 presigned URL can list `x-amz-object-lock-mode` and `x-amz-object-lock-retain-until-date`
+in `X-Amz-SignedHeaders`. The verifier folds them into the canonical request, so whoever holds the
+URL cannot drop them or change them. PutObject and CreateMultipartUpload then apply the lock from
+those headers, and explicit headers override the bucket default. UploadPart verifies the headers
+and ignores them, as AWS does. **CompleteMultipartUpload answers 501 when it carries them**,
+because the lock was fixed at initiate. A presigning writer must therefore sign them on PutObject
+and CreateMultipartUpload only. `tests/unit/gateway/test_presigned_object_lock_headers.py` signs
+with botocore's real `S3SigV4QueryAuth` and verifies with the real canonicalisation code.
+
+### DeleteBucket counts every version (IMPLEMENTED)
+
+`bucket_has_retained_versions.sql` replaced the `list_objects` probe. That probe saw only keys
+whose newest version is live content, so a versioned bucket whose keys were all hidden behind
+delete markers read as empty and could be deleted, which orphaned every non-current version under
+it. The bucket is now non-empty while either of these holds:
+
+- a live object has a live completed version or a delete marker. That is AWS's rule: versions AND
+  delete markers must all be gone. The zero-byte placeholder that an aborted upload leaves on a new
+  key is not counted, because no client can see it or delete it.
+- any version in the bucket is locked, even under a soft-deleted object.
+
+### Billing of retained versions (CURRENT STATE, decision needed)
+
+`bucket_storage_usage` counts only the **current** version of each live object
+(`20260910120000_storage_usage_rollup.sql`: `ov.object_version = o.current_object_version`). So
+these are retained on the backends but **not billed**:
+
+- non-current versions in a versioned bucket, locked or not;
+- a locked version whose key sits behind a delete marker;
+- locked versions under a soft-deleted object or a purged account.
+
+AWS bills every stored version. Counting them means reworking the five ledger triggers, so that
+"which rows count" becomes "every live data version" rather than "the current one". It also
+changes the bill of every versioned bucket, not only locked ones. **This is a pricing decision,
+so it is not made here.** Until it is made, COMPLIANCE retention on a key that is overwritten or
+marker-deleted costs the customer nothing.
+
+### COMPLIANCE across suspension, purge and account deletion (PROPOSED — not implemented)
+
+What the code does today:
+
+| Event | Locked bytes | Billing | Writes into the bucket |
+| --- | --- | --- | --- |
+| Suspension `read_only` | kept | unchanged (current versions only) | refused for every key of the owner's account, including a platform-held sub-token (`suspension_middleware`), and for other accounts (`acl.py` owner-suspension check) |
+| Suspension `full` | kept | unchanged | all access refused |
+| Purge job (`workers/purger.py`) | kept: the unpin resolution and hard-delete SQL gates skip locked versions, but the objects and buckets are soft-deleted around them | drops to 0 (soft-deleted objects stop counting) | n/a |
+| `scripts/nuke_user.py` | **destroyed**: it unpins every CID of the account directly and `DELETE FROM users` cascades, with no lock check | gone | n/a |
+
+Proposed policy, pending an explicit decision:
+
+1. **Suspension never touches locked data.** This is already true.
+2. **A purge keeps locked versions until their retain-until, and they stay billed.** This needs
+   the billing change above, or a dedicated "retained after purge" counter. Once the last lock
+   ends, the purger (or a follow-up sweep) completes the purge.
+3. **`nuke_user.py` refuses an account that holds any locked version** unless it is given an
+   explicit `--i-know-this-breaks-worm`, as handoff §5 #7 already asks. AWS's own answer is that
+   closing the account is the only way to remove COMPLIANCE data, so allowing it is defensible,
+   but it must be deliberate, not a side effect.
+4. **Platform writes into a suspended owner's bucket.** Today they are refused like any other
+   write. For backups that is arguably right: a suspended customer stops accruing new storage.
+   The alternative is to exempt sub-tokens the platform holds. They belong to the customer's
+   account, so that needs a marker on the scope row, not an account allowlist. **Open decision.**
+
+---
+
 ## Test inventory
 
 Tier 0 and Tier 1 tests must pass. Tier 2 tests are

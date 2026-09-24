@@ -218,6 +218,20 @@ ALL_S3_OPS: list[S3Op] = [
     S3Op("GetObjectVersion", "GET", has_key=True, query={"versionId": "v1"}, expected_op=Op.read_object),
     S3Op("DeleteObjectVersion", "DELETE", has_key=True, query={"versionId": "v1"}, expected_op=Op.delete_object),
     S3Op("GetObjectAttributes", "GET", has_key=True, query={"attributes": ""}, expected_op=Op.read_object),
+    # --- Object Lock (per-object) ------------------------------------------
+    # Reads are object reads. Writes decide whether a version may be deleted, so "may upload" must
+    # never imply them — they need write_object_lock, which only admin_read_write holds.
+    S3Op("GetObjectRetention", "GET", has_key=True, query={"retention": ""}, expected_op=Op.read_object),
+    S3Op("PutObjectRetention", "PUT", has_key=True, query={"retention": ""}, expected_op=Op.write_object_lock),
+    S3Op(
+        "PutObjectRetentionVersion",
+        "PUT",
+        has_key=True,
+        query={"retention": "", "versionId": "v1"},
+        expected_op=Op.write_object_lock,
+    ),
+    S3Op("GetObjectLegalHold", "GET", has_key=True, query={"legal-hold": ""}, expected_op=Op.read_object),
+    S3Op("PutObjectLegalHold", "PUT", has_key=True, query={"legal-hold": ""}, expected_op=Op.write_object_lock),
     S3Op("RestoreObject", "POST", has_key=True, query={"restore": ""}, expected_op=Op.write_object),
     S3Op(
         "SelectObjectContent",
@@ -231,7 +245,14 @@ ALL_S3_OPS: list[S3Op] = [
     S3Op("InitiateMultipartUpload", "POST", has_key=True, query={"uploads": ""}, expected_op=Op.write_object),
     S3Op("UploadPart", "PUT", has_key=True, query={"partNumber": "1", "uploadId": "u"}, expected_op=Op.write_object),
     S3Op("CompleteMultipartUpload", "POST", has_key=True, query={"uploadId": "u"}, expected_op=Op.write_object),
-    S3Op("AbortMultipartUpload", "DELETE", has_key=True, query={"uploadId": "u"}, expected_op=Op.delete_object),
+    S3Op(
+        "AbortMultipartUpload",
+        "DELETE",
+        has_key=True,
+        query={"uploadId": "u"},
+        expected_op=Op.write_object,
+        note="discards an upload that never completed; the handler refuses a completed one",
+    ),
     S3Op("ListParts", "GET", has_key=True, query={"uploadId": "u"}, expected_op=Op.read_object),
     S3Op(
         "UploadPartCopy",
@@ -289,6 +310,7 @@ def test_evaluator_returns_no_scope_for_none_input() -> None:
         (Permission.admin_read_write, True),
         (Permission.admin_read, True),
         (Permission.object_read_write, False),
+        (Permission.object_read_write_no_delete, False),
         (Permission.object_read, False),
     ],
 )
@@ -369,6 +391,7 @@ EXPECTED_ALLOW: dict[Permission, set[Op]] = {
         Op.delete_bucket,
         Op.read_bucket_meta,
         Op.write_bucket_meta,
+        Op.write_object_lock,
     },
     Permission.admin_read: {
         Op.read_object,
@@ -380,6 +403,11 @@ EXPECTED_ALLOW: dict[Permission, set[Op]] = {
         Op.read_object,
         Op.write_object,
         Op.delete_object,
+        Op.list_bucket,
+    },
+    Permission.object_read_write_no_delete: {
+        Op.read_object,
+        Op.write_object,
         Op.list_bucket,
     },
     Permission.object_read: {
@@ -723,3 +751,72 @@ def test_no_known_gap_notes_remain_in_matrix() -> None:
     """Once a gap is fixed, drop its KNOWN GAP marker from ALL_S3_OPS."""
     for op in ALL_S3_OPS:
         assert not op.note.startswith("KNOWN GAP:"), f"{op.name}: stale KNOWN GAP note ({op.note})"
+
+
+# ---------------------------------------------------------------------------
+# Section E — the write-once tier, named by what a backup writer does.
+# ---------------------------------------------------------------------------
+
+_NO_DELETE = _scope(Permission.object_read_write_no_delete, BucketScope.specific, ["bkt"])
+
+_WRITE_ONCE_ALLOWED = [
+    "GetObject",
+    "HeadObject",
+    "PutObject",
+    "CopyObject",
+    "ListObjects",
+    "ListObjectsV2",
+    "ListObjectVersions",
+    "GetObjectVersion",
+    "GetObjectRetention",
+    "GetObjectLegalHold",
+    "InitiateMultipartUpload",
+    "UploadPart",
+    "CompleteMultipartUpload",
+    "AbortMultipartUpload",
+    "ListParts",
+]
+
+_WRITE_ONCE_DENIED = [
+    "DeleteObject",
+    "DeleteObjectVersion",
+    "DeleteObjects",
+    "PutObjectRetention",
+    "PutObjectRetentionVersion",
+    "PutObjectLegalHold",
+    "DeleteBucket",
+    "PutBucketObjectLock",
+    "PutBucketVersioning",
+    "PutBucketLifecycle",
+]
+
+_BY_NAME = {op.name: op for op in ALL_S3_OPS}
+
+
+@pytest.mark.parametrize("name", _WRITE_ONCE_ALLOWED)
+def test_no_delete_tier_can_write_and_read(name: str) -> None:
+    op = _BY_NAME[name]
+    allowed, reason = evaluate(
+        scope=_NO_DELETE, bucket_id="bkt", method=op.method, has_key=op.has_key, query_params=op.query
+    )
+    assert allowed, f"object_read_write_no_delete must allow {name} (denied: {reason})"
+
+
+@pytest.mark.parametrize("name", _WRITE_ONCE_DENIED)
+def test_no_delete_tier_can_never_remove_or_unlock(name: str) -> None:
+    """The whole point of the tier: a stolen key cannot destroy, hide or unlock what was written."""
+    op = _BY_NAME[name]
+    allowed, reason = evaluate(
+        scope=_NO_DELETE, bucket_id="bkt", method=op.method, has_key=op.has_key, query_params=op.query
+    )
+    assert not allowed, f"object_read_write_no_delete must deny {name}"
+    assert reason == "op_not_allowed"
+
+
+@pytest.mark.parametrize("permission", [p for p in Permission if p is not Permission.admin_read_write])
+@pytest.mark.parametrize("name", ["PutObjectRetention", "PutObjectRetentionVersion", "PutObjectLegalHold"])
+def test_only_admin_read_write_may_change_an_object_lock(permission: Permission, name: str) -> None:
+    op = _BY_NAME[name]
+    scope = _scope(permission, BucketScope.all, [])
+    allowed, _ = evaluate(scope=scope, bucket_id="bkt", method=op.method, has_key=op.has_key, query_params=op.query)
+    assert not allowed, f"{permission.value} must not be able to {name}"

@@ -62,7 +62,15 @@ class ScopePutBody(BaseModel):
         ),
         examples=["5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"],
     )
-    permission: Permission = Field(..., description="R2-style permission tier.")
+    permission: Permission = Field(
+        ...,
+        description=(
+            "R2-style permission tier. `object_read_write_no_delete` is write-once: PutObject, CopyObject, "
+            "multipart upload (including aborting an incomplete upload), GetObject, HeadObject and ListObjects, "
+            "but never DeleteObject (with or without versionId) or DeleteObjects. Changing an object's "
+            "retention or legal hold (`?retention`, `?legal-hold`) needs `admin_read_write` on every tier."
+        ),
+    )
     bucket_scope: BucketScope = Field(
         ...,
         description="'all' for every bucket owned by account_id, or 'specific' for the buckets listed in `buckets`.",

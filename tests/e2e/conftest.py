@@ -545,6 +545,13 @@ def cleanup_buckets(boto3_client: Any) -> Iterator[Callable[[str], None]]:
                 for obj in objects["Contents"]:
                     boto3_client.delete_object(Bucket=bucket, Key=obj["Key"])
 
+            # DeleteBucket refuses while any version or delete marker remains, so a versioned
+            # bucket needs its history removed too.
+            if boto3_client.get_bucket_versioning(Bucket=bucket).get("Status") == "Enabled":
+                listing = boto3_client.list_object_versions(Bucket=bucket)
+                for entry in listing.get("Versions", []) + listing.get("DeleteMarkers", []):
+                    boto3_client.delete_object(Bucket=bucket, Key=entry["Key"], VersionId=entry["VersionId"])
+
             # Delete bucket
             boto3_client.delete_bucket(Bucket=bucket)
         except Exception as e:

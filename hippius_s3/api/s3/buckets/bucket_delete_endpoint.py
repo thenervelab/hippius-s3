@@ -74,17 +74,9 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
             BucketName=bucket_name,
         )
 
-    # S3 semantics: refuse to delete a non-empty bucket. (prefix, cursor, limit=1):
-    # we only need to know whether any object exists.
-    objects = await db.fetch(
-        get_query("list_objects"),
-        bucket["bucket_id"],
-        None,
-        None,
-        1,
-        None,
-    )
-    if objects:
+    # S3 semantics: refuse to delete a bucket that still holds any version or delete marker — not
+    # merely a listable key. See the query for why ListObjects' view of "empty" was not enough.
+    if await db.fetchval(get_query("bucket_has_retained_versions"), bucket["bucket_id"]):
         return errors.s3_error_response(
             "BucketNotEmpty",
             "The bucket you tried to delete is not empty",

@@ -52,8 +52,14 @@ def _make_mock_pool(
             return mpus_in_bucket
         return []
 
+    async def fetchval(query: str, *args: Any, **kwargs: Any) -> Any:
+        if "AS has_versions" in query:
+            return bool(objects_in_bucket)
+        return None
+
     mock_db.fetchrow = AsyncMock(side_effect=fetchrow)
     mock_db.fetch = AsyncMock(side_effect=fetch)
+    mock_db.fetchval = AsyncMock(side_effect=fetchval)
 
     @asynccontextmanager
     async def acquire() -> Any:

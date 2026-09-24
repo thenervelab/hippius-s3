@@ -1,6 +1,6 @@
 """R2-style sub-token scope evaluation.
 
-Four permission tiers × bucket list. No prefix restrictions, no IP allowlist.
+Five permission tiers × bucket list. No prefix restrictions, no IP allowlist.
 Mirrors Cloudflare R2's model.
 """
 
@@ -22,6 +22,7 @@ OP_CREATE_BUCKET = Op.create_bucket
 OP_DELETE_BUCKET = Op.delete_bucket
 OP_READ_BUCKET_META = Op.read_bucket_meta
 OP_WRITE_BUCKET_META = Op.write_bucket_meta
+OP_WRITE_OBJECT_LOCK = Op.write_object_lock
 
 
 PERMISSION_MATRIX: dict[Permission, frozenset[Op]] = {
@@ -36,6 +37,7 @@ PERMISSION_MATRIX: dict[Permission, frozenset[Op]] = {
             Op.delete_bucket,
             Op.read_bucket_meta,
             Op.write_bucket_meta,
+            Op.write_object_lock,
         }
     ),
     Permission.admin_read: frozenset(
@@ -51,6 +53,20 @@ PERMISSION_MATRIX: dict[Permission, frozenset[Op]] = {
             Op.read_object,
             Op.write_object,
             Op.delete_object,
+            Op.list_bucket,
+        }
+    ),
+    # No delete_object: DeleteObject with or without versionId and DeleteObjects are refused, so the
+    # key can neither destroy a version nor hide one behind a delete marker. AbortMultipartUpload is
+    # still allowed — required_op grades it write_object, because it only discards an upload that
+    # never completed. Two limits the matrix cannot express, both documented in
+    # specs/s3-object-lock.md: on an UNVERSIONED bucket an overwrite still makes the previous
+    # version unreachable through S3, and PutObject may carry x-amz-object-lock-* headers (a lock
+    # only ever protects the version being created, which is the point for a backup writer).
+    Permission.object_read_write_no_delete: frozenset(
+        {
+            Op.read_object,
+            Op.write_object,
             Op.list_bucket,
         }
     ),
@@ -118,13 +134,26 @@ _BUCKET_META_OPS: dict[str, Op] = {
 }
 
 
+# Per-object Object Lock subresources. A write to either changes whether a version may be deleted,
+# so it is graded write_object_lock rather than as the object write its HTTP shape suggests.
+_OBJECT_LOCK_SUBRESOURCES = frozenset({"retention", "legal-hold"})
+
+
 def required_op(method: str, has_key: bool, query_params: dict[str, str]) -> Op:
     """Map an incoming S3 HTTP request to the single op required to authorise it.
 
     Subresource queries (?acl, ?tagging, …) on a bucket map to bucket-meta ops;
-    on an object they're treated as regular reads/writes, same as AWS.
+    on an object they're treated as regular reads/writes, same as AWS — except
+    ?retention / ?legal-hold writes, which need write_object_lock.
     """
     if has_key:
+        if method not in ("GET", "HEAD") and any(q in query_params for q in _OBJECT_LOCK_SUBRESOURCES):
+            return Op.write_object_lock
+        # AbortMultipartUpload discards an upload that never completed; the handler refuses a
+        # completed one. Grading it delete_object would stop a write-only key from cleaning up
+        # its own failed uploads, which it must be able to do.
+        if method == "DELETE" and "uploadId" in query_params:
+            return Op.write_object
         return _OBJECT_OPS.get(method, Op.write_object)
 
     # POST /bucket?delete is the bulk DeleteObjects operation. Its semantic

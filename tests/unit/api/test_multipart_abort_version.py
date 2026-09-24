@@ -32,20 +32,26 @@ class _FakeDb:
     """Routes by query NAME (get_query is monkeypatched to identity), modelling the key fact:
     parts exist ONLY under the upload's own version, while current_object_version points elsewhere."""
 
-    def __init__(self, *, current_version: int, upload_version: int | None) -> None:
+    def __init__(self, *, current_version: int, upload_version: int | None, is_completed: bool = False) -> None:
         self.current_version = current_version
         self.upload_version = upload_version
+        self.is_completed = is_completed
+        self.aborted = False
 
     async def fetchrow(self, query: str, *args: Any) -> Any:
         if query == "get_multipart_upload":
             return {
                 "object_id": "obj-1",
+                "bucket_name": "b",
                 "object_key": "k",
-                "is_completed": False,
+                "is_completed": self.is_completed,
                 "current_object_version": self.current_version,
             }
         if query == "get_multipart_version_by_upload":
             return {"object_version": self.upload_version} if self.upload_version is not None else None
+        if query == "abort_multipart_upload":
+            self.aborted = True
+            return {"upload_id": args[0]}
         return None
 
     async def fetch(self, query: str, *args: Any) -> list[Any]:
@@ -118,3 +124,41 @@ async def test_abort_with_no_parts_skips_destructive_cleanup(monkeypatch: Any) -
     assert resp.status_code == 204
     assert called["fail"] is False, "must not fail-replicate when the upload has no parts of its own"
     assert called["delete"] is False, "must not delete cache when the upload has no parts of its own"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bucket,key,is_completed",
+    [
+        pytest.param("b", "k", True, id="completed-upload"),
+        pytest.param("other-bucket", "k", False, id="upload-from-another-bucket"),
+        pytest.param("b", "other-key", False, id="upload-for-another-key"),
+    ],
+)
+async def test_abort_refuses_an_upload_it_may_not_touch(
+    monkeypatch: Any, bucket: str, key: str, is_completed: bool
+) -> None:
+    """A completed upload's parts ARE the object (they cascade from multipart_uploads), so aborting
+    it would destroy a committed — possibly Object-Locked — version through a WRITE permission.
+    An upload addressed through a path other than its own was never authorised by the ACL layer.
+    Both must answer NoSuchUpload and touch nothing."""
+    monkeypatch.setattr(multipart, "get_query", lambda name: name)
+    called = {"fail": False, "delete": False}
+
+    async def fake_fail(_db: Any, **_: Any) -> None:
+        called["fail"] = True
+
+    async def fake_delete(*_: Any) -> None:
+        called["delete"] = True
+
+    monkeypatch.setattr(multipart, "fail_version_replication", fake_fail)
+
+    db = _FakeDb(current_version=1, upload_version=1, is_completed=is_completed)
+    resp = await multipart.abort_multipart_upload(
+        bucket, key, _fake_request("up-1", fs_delete=fake_delete, redis=_RedisStub()), db
+    )
+
+    assert resp.status_code == 404
+    assert b"NoSuchUpload" in bytes(resp.body)
+    assert db.aborted is False, "the upload row (and its cascaded parts) must not be deleted"
+    assert called == {"fail": False, "delete": False}, "no replication or cache cleanup may run"
