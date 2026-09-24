@@ -61,6 +61,10 @@ class Op(str, Enum):
     # Separate from write_object because an ACL can hand WRITE (and so delete) to another key, and
     # a tag write replaces the whole set — both destroy or delegate rather than add.
     write_object_meta = "write_object_meta"
+    # DELETE ?versionId=<N>: permanently remove ONE named version. Separate from delete_object
+    # because it cannot hide anything (no delete marker) and Object Lock refuses it while the
+    # version is retained — so a write-once key may hold it to prune backups whose lock expired.
+    delete_object_version = "delete_object_version"
 
 
 # ---- dataclass ------------------------------------------------------------

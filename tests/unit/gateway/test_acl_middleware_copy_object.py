@@ -341,7 +341,13 @@ async def test_percent_encoded_copy_source_cannot_skip_the_source_scope() -> Non
     "method,path,params,headers",
     [
         pytest.param("DELETE", "/shared-bucket/k", {}, {}, id="DeleteObject"),
-        pytest.param("DELETE", "/shared-bucket/k", {"versionId": "1"}, {}, id="DeleteObjectVersion"),
+        pytest.param(
+            "DELETE",
+            "/shared-bucket/k",
+            {"versionId": "1"},
+            {"x-amz-bypass-governance-retention": "true"},
+            id="DeleteObjectVersionBypassingGovernance",
+        ),
         pytest.param("POST", "/shared-bucket", {"delete": ""}, {}, id="DeleteObjects"),
         pytest.param("PUT", "/shared-bucket/k", {"legal-hold": ""}, {}, id="PutObjectLegalHold"),
         pytest.param("PUT", "/shared-bucket/k", {"acl": ""}, {}, id="PutObjectAcl"),
@@ -369,6 +375,26 @@ async def test_cross_account_grant_still_authorises_what_the_tier_allows() -> No
         r = await client.put("/shared-bucket/k", content=b"x")
     assert r.status_code == 200
     app.state.acl_service.check_permission.assert_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers,expected",
+    [
+        pytest.param({}, 200, id="prune"),
+        pytest.param({"x-amz-bypass-governance-retention": "true"}, 403, id="prune-bypassing-governance"),
+    ],
+)
+async def test_no_delete_key_may_prune_a_named_version_but_not_bypass_governance(
+    headers: dict[str, str], expected: int
+) -> None:
+    """In its own bucket the write-once key may DELETE ?versionId= (the handler still refuses a
+    retained version), but asking to override a GOVERNANCE lock is a lock change it does not hold."""
+    scope = _scope(Permission.object_read_write_no_delete, BucketScope.specific, ["own-id"])
+    app = _make_app(scope=scope, bucket_owner_lookup={"own-bucket": ("alice", "own-id")})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.delete("/own-bucket/k", params={"versionId": "3"}, headers=headers)
+    assert r.status_code == expected
 
 
 @pytest.mark.asyncio

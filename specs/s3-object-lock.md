@@ -217,7 +217,8 @@ Set through `PUT /user/sub-tokens/{access_key_id}/scope` like any other tier
 
 | Allowed | Refused |
 | --- | --- |
-| PutObject, CopyObject (the source must be in scope for reads) | DeleteObject, with or without `versionId`; DeleteObjects (`POST ?delete`) |
+| PutObject, CopyObject (the source must be in scope for reads) | DeleteObject without a concrete `versionId` (absent, empty, `null`, malformed); DeleteObjects (`POST ?delete`) |
+| `DELETE ?versionId=<N>`: permanent delete of one named version, refused by Object Lock while retained | any delete carrying `x-amz-bypass-governance-retention: true` |
 | CreateMultipartUpload, UploadPart, CompleteMultipartUpload, ListParts | `PUT ?retention`, `PUT ?legal-hold` |
 | AbortMultipartUpload of an upload that has not completed | `PUT ?acl`, `PUT ?tagging`, `DELETE ?tagging`, and any write carrying `x-amz-acl` / `x-amz-grant-*` |
 | GetObject, HeadObject, ListObjects(V2), ListObjectVersions, GET `?retention` / `?legal-hold` | every bucket-level write, DeleteBucket, ListBuckets |
@@ -230,6 +231,19 @@ decide.
 
 Changes that came with the tier, each of which was a way around it:
 
+- **Pruning is a version delete, and only that.** `DELETE ?versionId=<N>` maps to its own op,
+  `delete_object_version`, held by `admin_read_write`, `object_read_write` and this tier. It can
+  hide nothing (no delete marker), and Object Lock refuses it while the version is retained, so
+  a backup writer can prune whole chains once their lock has expired and not before. Only a
+  concrete numeric id counts: the handler reads an empty or `null` id as "the current version"
+  and would write a marker, so those stay `delete_object`. What a stolen key CAN destroy is
+  therefore exactly the versions no lock protects — on a bucket where every write is locked,
+  only expired backups.
+- **A governance bypass needs `admin_read_write`, on every tier.** A delete (or DeleteObjects)
+  carrying `x-amz-bypass-governance-retention: true` maps to `write_object_lock`. A sub-token
+  of the bucket owner's account counts as the owner for the bypass, so without this any
+  delete-capable key, this tier's version delete included, could remove a GOVERNANCE-retained
+  version. AWS gates it behind `s3:BypassGovernanceRetention` for the same reason.
 - **Changing a lock needs `admin_read_write`, on every tier.** `?retention` and `?legal-hold`
   writes map to a separate op, `write_object_lock`, which only `admin_read_write` holds. Before
   this change, sub-tokens graded them as ordinary object writes, so `object_read_write` could lift
@@ -294,12 +308,9 @@ What the tier cannot express:
   `versionId` and from every listing. It stays readable by an explicit `versionId`, which the
   client has to already know. The tier protects history from a stolen key only on a versioned
   bucket, and every lock-enabled bucket is versioned.
-- **Pruning.** The tier cannot prune expired backups, because it holds no delete op at all. A
-  writer that also has to prune needs one of these, which is **an open decision**:
-  1. a tier that allows only `DELETE ?versionId=`. That is a permanent delete, and COMPLIANCE
-     already refuses it while the version is locked. It would refuse a DELETE without versionId
-     (the marker-writing one) and DeleteObjects.
-  2. pruning done by the owner's own key or a lifecycle rule.
+- **Unlocked versions are prunable.** The version delete does not know whether the writer
+  meant a version to be kept; only a lock says so. A write-once key on a bucket without a
+  default retention can permanently delete any version written without lock headers.
 
 ### Presigned requests carry the lock in signed headers (VERIFIED)
 

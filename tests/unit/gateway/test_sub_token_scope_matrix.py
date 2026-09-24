@@ -217,7 +217,32 @@ ALL_S3_OPS: list[S3Op] = [
     S3Op("PutObjectTagging", "PUT", has_key=True, query={"tagging": ""}, expected_op=Op.write_object_meta),
     S3Op("DeleteObjectTagging", "DELETE", has_key=True, query={"tagging": ""}, expected_op=Op.delete_object),
     S3Op("GetObjectVersion", "GET", has_key=True, query={"versionId": "v1"}, expected_op=Op.read_object),
-    S3Op("DeleteObjectVersion", "DELETE", has_key=True, query={"versionId": "v1"}, expected_op=Op.delete_object),
+    S3Op(
+        "DeleteObjectVersion",
+        "DELETE",
+        has_key=True,
+        query={"versionId": "7"},
+        expected_op=Op.delete_object_version,
+        note="permanent delete of one named version; Object Lock refuses it while the version is retained",
+    ),
+    # Only a concrete version id is a version delete. The handler reads empty and "null" as "the
+    # current version" and runs the marker-writing DELETE, and refuses a malformed one with 400.
+    S3Op("DeleteObjectEmptyVersion", "DELETE", has_key=True, query={"versionId": ""}, expected_op=Op.delete_object),
+    S3Op("DeleteObjectNullVersion", "DELETE", has_key=True, query={"versionId": "null"}, expected_op=Op.delete_object),
+    S3Op(
+        "DeleteObjectMalformedVersion",
+        "DELETE",
+        has_key=True,
+        query={"versionId": "v1"},
+        expected_op=Op.delete_object,
+    ),
+    S3Op(
+        "DeleteObjectTaggingVersion",
+        "DELETE",
+        has_key=True,
+        query={"tagging": "", "versionId": "7"},
+        expected_op=Op.delete_object,
+    ),
     S3Op("GetObjectAttributes", "GET", has_key=True, query={"attributes": ""}, expected_op=Op.read_object),
     # --- Object Lock (per-object) ------------------------------------------
     # Reads are object reads. Writes decide whether a version may be deleted, so "may upload" must
@@ -394,6 +419,7 @@ EXPECTED_ALLOW: dict[Permission, set[Op]] = {
         Op.write_bucket_meta,
         Op.write_object_lock,
         Op.write_object_meta,
+        Op.delete_object_version,
     },
     Permission.admin_read: {
         Op.read_object,
@@ -406,11 +432,13 @@ EXPECTED_ALLOW: dict[Permission, set[Op]] = {
         Op.write_object,
         Op.write_object_meta,
         Op.delete_object,
+        Op.delete_object_version,
         Op.list_bucket,
     },
     Permission.object_read_write_no_delete: {
         Op.read_object,
         Op.write_object,
+        Op.delete_object_version,
         Op.list_bucket,
     },
     Permission.object_read: {
@@ -778,6 +806,8 @@ _WRITE_ONCE_ALLOWED = [
     "CompleteMultipartUpload",
     "AbortMultipartUpload",
     "ListParts",
+    # Pruning: a permanent delete of one named version. COMPLIANCE refuses it while retained.
+    "DeleteObjectVersion",
 ]
 
 _WRITE_ONCE_DENIED = [
@@ -785,7 +815,10 @@ _WRITE_ONCE_DENIED = [
     "PutObjectTagging",
     "DeleteObjectTagging",
     "DeleteObject",
-    "DeleteObjectVersion",
+    "DeleteObjectEmptyVersion",
+    "DeleteObjectNullVersion",
+    "DeleteObjectMalformedVersion",
+    "DeleteObjectTaggingVersion",
     "DeleteObjects",
     "PutObjectRetention",
     "PutObjectRetentionVersion",
@@ -849,3 +882,35 @@ def test_a_write_carrying_an_acl_is_an_object_meta_write(method: str, query: dic
         scope=_NO_DELETE, bucket_id="bkt", method=method, has_key=True, query_params=query, carries_acl=True
     )
     assert not allowed
+
+
+@pytest.mark.parametrize(
+    "method,has_key,query",
+    [
+        ("DELETE", True, {"versionId": "7"}),
+        ("DELETE", True, {}),
+        ("POST", False, {"delete": ""}),
+    ],
+)
+def test_a_governance_bypass_needs_the_lock_op(method: str, has_key: bool, query: dict[str, str]) -> None:
+    """x-amz-bypass-governance-retention overrides a lock, so it is graded like changing one.
+
+    Without this, the write-once tier's version delete — and object_read_write's — would remove a
+    GOVERNANCE-retained version whenever the sub-token belongs to the bucket owner's account.
+    """
+    assert required_op(method, has_key, query, bypasses_governance=True) is Op.write_object_lock
+    for permission in Permission:
+        allowed, _ = evaluate(
+            scope=_scope(permission, BucketScope.all, []),
+            bucket_id="bkt",
+            method=method,
+            has_key=has_key,
+            query_params=query,
+            bypasses_governance=True,
+        )
+        assert allowed is (permission is Permission.admin_read_write), permission.value
+
+
+def test_the_bypass_header_does_not_regrade_non_deletes() -> None:
+    assert required_op("PUT", True, {}, bypasses_governance=True) is Op.write_object
+    assert required_op("GET", True, {"versionId": "7"}, bypasses_governance=True) is Op.read_object

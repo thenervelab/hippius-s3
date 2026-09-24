@@ -5,6 +5,7 @@ from urllib.parse import unquote
 from fastapi import Request
 from fastapi import Response
 
+from hippius_s3.api.s3.object_lock_enforcement import is_bypass_requested
 from hippius_s3.config import get_config
 from hippius_s3.gateway.middlewares.auth_probe import is_valid_auth_probe
 from hippius_s3.gateway.services.sub_token_scope import OP_LIST_BUCKETS
@@ -325,6 +326,7 @@ async def acl_middleware(
             return _access_denied()
         scope = looked_up
         carries_acl = sets_acl(request.headers)
+        bypasses_governance = is_bypass_requested(request.headers)
 
         # The tier is a CEILING, whoever's bucket it is. A cross-account request is authorised by
         # the owner's grants below, but those grants must not lift the key past its own tier:
@@ -332,7 +334,13 @@ async def acl_middleware(
         # and one granted WRITE_ACP could lift a legal hold. A token with no scope row keeps the
         # plain contractor behaviour (grants alone), as before.
         if is_cross_account and scope is not None:
-            op = required_sub_token_op(request.method, key is not None, query_params, carries_acl=carries_acl)
+            op = required_sub_token_op(
+                request.method,
+                key is not None,
+                query_params,
+                carries_acl=carries_acl,
+                bypasses_governance=bypasses_governance,
+            )
             if not permission_allows(scope.permission, op):
                 logger.info(
                     f"Sub-token cross-account request above its tier: account={account_id}, bucket={bucket}, "
@@ -367,6 +375,7 @@ async def acl_middleware(
                 has_key=key is not None,
                 query_params=query_params,
                 carries_acl=carries_acl,
+                bypasses_governance=bypasses_governance,
             )
             logger.info(
                 f"Sub-token scope check: account={account_id}, bucket={bucket}, key={key or 'None'}, "

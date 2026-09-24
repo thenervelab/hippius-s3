@@ -11,6 +11,9 @@ full middleware chain + real Postgres + real Redis.
 
 from __future__ import annotations
 
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from typing import Any
 
 import pytest
@@ -341,7 +344,8 @@ def test_object_read_write_no_delete_is_write_once(
     unique_bucket_name: Any,
 ) -> None:
     """The backup-writer tier: upload (simple and multipart), read back, abort its own failed
-    upload — and never delete, hide behind a marker, or unlock anything."""
+    upload, prune a named version nothing retains — and never hide behind a marker, delete a
+    retained version, or unlock anything."""
     bucket = unique_bucket_name("subtok-worm")
     cleanup_buckets(bucket)
     boto3_master_client.create_bucket(Bucket=bucket, ObjectLockEnabledForBucket=True)
@@ -356,7 +360,14 @@ def test_object_read_write_no_delete_is_write_once(
         },
     )
     try:
-        put = boto3_sub_token_client.put_object(Bucket=bucket, Key="run/1.full", Body=b"backup")
+        retain_until = datetime.now(timezone.utc) + timedelta(days=1)
+        put = boto3_sub_token_client.put_object(
+            Bucket=bucket,
+            Key="run/1.full",
+            Body=b"backup",
+            ObjectLockMode="COMPLIANCE",
+            ObjectLockRetainUntilDate=retain_until,
+        )
         assert boto3_sub_token_client.get_object(Bucket=bucket, Key="run/1.full")["Body"].read() == b"backup"
         assert boto3_sub_token_client.list_objects_v2(Bucket=bucket)["KeyCount"] == 1
 
@@ -374,9 +385,19 @@ def test_object_read_write_no_delete_is_write_once(
         failed = boto3_sub_token_client.create_multipart_upload(Bucket=bucket, Key="run/2.inc")["UploadId"]
         boto3_sub_token_client.abort_multipart_upload(Bucket=bucket, Key="run/2.inc", UploadId=failed)
 
+        # Pruning: a named version no lock protects is permanently deletable by this key.
+        expired = boto3_sub_token_client.put_object(Bucket=bucket, Key="run/0.full", Body=b"old")
+        boto3_sub_token_client.delete_object(Bucket=bucket, Key="run/0.full", VersionId=expired["VersionId"])
+        with pytest.raises(ClientError):
+            boto3_master_client.head_object(Bucket=bucket, Key="run/0.full", VersionId=expired["VersionId"])
+
         refused = [
             lambda: boto3_sub_token_client.delete_object(Bucket=bucket, Key="run/1.full"),
+            # Allowed by the tier, refused by COMPLIANCE while retained.
             lambda: boto3_sub_token_client.delete_object(Bucket=bucket, Key="run/1.full", VersionId=put["VersionId"]),
+            lambda: boto3_sub_token_client.delete_object(
+                Bucket=bucket, Key="run/1.full", VersionId=put["VersionId"], BypassGovernanceRetention=True
+            ),
             lambda: boto3_sub_token_client.delete_objects(
                 Bucket=bucket, Delete={"Objects": [{"Key": "run/1.full"}, {"Key": "run/1.inc"}]}
             ),
@@ -403,5 +424,6 @@ def test_object_read_write_no_delete_is_write_once(
         versions = boto3_master_client.list_object_versions(Bucket=bucket)
         assert not versions.get("DeleteMarkers"), "a refused DELETE must not have written a marker"
         assert boto3_master_client.get_object(Bucket=bucket, Key="run/1.inc")["Body"].read() == body
+        assert boto3_master_client.get_object(Bucket=bucket, Key="run/1.full")["Body"].read() == b"backup"
     finally:
         sub_token_scope_client.delete(test_sub_token_access_key)

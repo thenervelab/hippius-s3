@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from hippius_s3.api.s3.common.req import parse_version_id
 from hippius_s3.models.sub_token import BucketScope
 from hippius_s3.models.sub_token import Op
 from hippius_s3.models.sub_token import Permission
@@ -42,6 +43,7 @@ PERMISSION_MATRIX: dict[Permission, frozenset[Op]] = {
             Op.write_bucket_meta,
             Op.write_object_lock,
             Op.write_object_meta,
+            Op.delete_object_version,
         }
     ),
     Permission.admin_read: frozenset(
@@ -58,11 +60,16 @@ PERMISSION_MATRIX: dict[Permission, frozenset[Op]] = {
             Op.write_object,
             Op.write_object_meta,
             Op.delete_object,
+            Op.delete_object_version,
             Op.list_bucket,
         }
     ),
-    # No delete_object: DeleteObject with or without versionId and DeleteObjects are refused, so the
-    # key can neither destroy a version nor hide one behind a delete marker. No write_object_meta
+    # No delete_object: a DELETE without a versionId and DeleteObjects are refused, so the key can
+    # neither hide a version behind a delete marker nor overwrite-by-delete on an unversioned
+    # bucket. It DOES hold delete_object_version — DELETE ?versionId=<N> — so the platform that
+    # holds it can prune backups whose retention ended; Object Lock refuses that delete while the
+    # version is retained, and required_op grades a governance bypass as write_object_lock, which
+    # this tier lacks. So what it can destroy is exactly what no lock protects. No write_object_meta
     # either: an object ACL could grant WRITE to a second key that CAN delete, and a tag write
     # replaces the whole set. AbortMultipartUpload is still allowed — required_op grades it
     # write_object, because it only discards an upload that never completed. Two limits the matrix
@@ -74,6 +81,7 @@ PERMISSION_MATRIX: dict[Permission, frozenset[Op]] = {
         {
             Op.read_object,
             Op.write_object,
+            Op.delete_object_version,
             Op.list_bucket,
         }
     ),
@@ -155,14 +163,42 @@ def sets_acl(headers: Mapping[str, str]) -> bool:
     return any(name.lower() == "x-amz-acl" or name.lower().startswith("x-amz-grant-") for name in headers)
 
 
-def required_op(method: str, has_key: bool, query_params: dict[str, str], *, carries_acl: bool = False) -> Op:
+def names_a_version(raw: str | None) -> bool:
+    """Whether a `versionId` query value addresses ONE concrete version.
+
+    Mirrors the handler's parse: absent, empty and "null" all mean "the current version", and the
+    handler then runs the versionId-less DELETE (a delete marker, or on an unversioned bucket the
+    removal of the live data), so those must stay graded delete_object. A malformed value is
+    refused by the handler with 400; grading it delete_object as well keeps the write-once tier
+    from reaching that code at all.
+    """
+    try:
+        return parse_version_id(raw) is not None
+    except (ValueError, TypeError):
+        return False
+
+
+def required_op(
+    method: str,
+    has_key: bool,
+    query_params: dict[str, str],
+    *,
+    carries_acl: bool = False,
+    bypasses_governance: bool = False,
+) -> Op:
     """Map an incoming S3 HTTP request to the single op required to authorise it.
 
     Subresource queries (?acl, ?tagging, …) on a bucket map to bucket-meta ops;
     on an object they're treated as regular reads/writes, same as AWS — except
-    ?retention / ?legal-hold writes (write_object_lock), and ?acl / ?tagging
-    writes or a write carrying an ACL (`carries_acl`, see sets_acl) — write_object_meta.
+    ?retention / ?legal-hold writes (write_object_lock), ?acl / ?tagging
+    writes or a write carrying an ACL (`carries_acl`, see sets_acl) — write_object_meta,
+    DELETE ?versionId=<N> (delete_object_version), and any delete asking to bypass GOVERNANCE
+    retention (`bypasses_governance`, x-amz-bypass-governance-retention: true) — write_object_lock,
+    because overriding a lock is authority over whether data can be deleted.
     """
+    if bypasses_governance and (method == "DELETE" or (method == "POST" and "delete" in query_params)):
+        return Op.write_object_lock
+
     if has_key:
         if method not in ("GET", "HEAD") and any(q in query_params for q in _OBJECT_LOCK_SUBRESOURCES):
             return Op.write_object_lock
@@ -173,6 +209,12 @@ def required_op(method: str, has_key: bool, query_params: dict[str, str], *, car
         # its own failed uploads, which it must be able to do.
         if method == "DELETE" and "uploadId" in query_params:
             return Op.write_object
+        if (
+            method == "DELETE"
+            and not any(q in query_params for q in _OBJECT_META_SUBRESOURCES)
+            and names_a_version(query_params.get("versionId"))
+        ):
+            return Op.delete_object_version
         return _OBJECT_OPS.get(method, Op.write_object)
 
     # POST /bucket?delete is the bulk DeleteObjects operation. Its semantic
@@ -213,6 +255,7 @@ def evaluate(
     has_key: bool,
     query_params: dict[str, str],
     carries_acl: bool = False,
+    bypasses_governance: bool = False,
 ) -> tuple[bool, str]:
     """Evaluate a sub-token's stored scope against an incoming request.
 
@@ -221,7 +264,7 @@ def evaluate(
     if scope is None:
         return False, "no_scope"
 
-    op = required_op(method, has_key, query_params, carries_acl=carries_acl)
+    op = required_op(method, has_key, query_params, carries_acl=carries_acl, bypasses_governance=bypasses_governance)
     if not permission_allows(scope.permission, op):
         return False, "op_not_allowed"
 

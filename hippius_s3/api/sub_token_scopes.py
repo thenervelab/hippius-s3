@@ -67,8 +67,11 @@ class ScopePutBody(BaseModel):
         description=(
             "R2-style permission tier. `object_read_write_no_delete` is write-once: PutObject, CopyObject, "
             "multipart upload (including aborting an incomplete upload), GetObject, HeadObject and ListObjects, "
-            "but never DeleteObject (with or without versionId) or DeleteObjects. Changing an object's "
-            "retention or legal hold (`?retention`, `?legal-hold`) needs `admin_read_write` on every tier."
+            "and `DeleteObject?versionId=<id>` — a permanent delete of one named version, which Object Lock "
+            "refuses while the version is retained — so the holder can prune backups whose lock expired. "
+            "Never a DeleteObject without a versionId (no delete markers) or DeleteObjects. Changing an "
+            "object's retention or legal hold (`?retention`, `?legal-hold`), or a delete sent with "
+            "`x-amz-bypass-governance-retention: true`, needs `admin_read_write` on every tier."
         ),
     )
     bucket_scope: BucketScope = Field(
