@@ -994,6 +994,7 @@ class ObjectWriter:
         db_parts: list[Any] | None = None,
         if_none_match: bool = False,
         key_existed_at_initiate: bool = False,
+        lock: Callable[[], tuple[str | None, datetime | None, bool] | None] | None = None,
     ) -> CompleteResult:
         # B1: S3 allows completing with a SUBSET of the uploaded parts. `selected_parts` is the
         # client's <Part> list (already validated exists+ETag-matches by the endpoint); the final
@@ -1056,19 +1057,19 @@ class ObjectWriter:
             )
 
         async with self.pool.acquire() as conn, conn.transaction():
-            if if_none_match:
-                # objects row first (lock order objects -> object_versions), exclusively, so a
-                # concurrent PUT tail or completion is either fully visible to the check or not begun.
-                # Raising rolls back: the upload stays open (is_completed FALSE) and can be aborted.
-                #
-                # Two judgements, like the PutObject path: the key's existence when this upload was
-                # initiated (recorded then, because initiate clears a soft delete and destroys the
-                # evidence), OR a version that appeared above ours while the upload was open.
-                await conn.execute(get_query("lock_object_row_for_update"), object_id)
-                if key_existed_at_initiate or await conn.fetchval(
-                    get_query("mpu_conditional_conflict"), object_id, int(object_version)
-                ):
-                    raise PreconditionFailed()
+            # objects row first, exclusively, for the whole finalize. A versioned DELETE takes
+            # this same FOR UPDATE and then reads the version, so it waits until the size and the
+            # retention below have both committed.
+            await conn.execute(get_query("lock_object_row_for_update"), object_id)
+            # Raising rolls back: the upload stays open (is_completed FALSE) and can be aborted.
+            # Two judgements, like the PutObject path: the key's existence when this upload was
+            # initiated (recorded then, because initiate clears a soft delete and destroys the
+            # evidence), OR a version that appeared above ours while the upload was open.
+            if if_none_match and (
+                key_existed_at_initiate
+                or await conn.fetchval(get_query("mpu_conditional_conflict"), object_id, int(object_version))
+            ):
+                raise PreconditionFailed()
             # Update object_versions (record the completed subset so the reader filters to it).
             await conn.execute(
                 """
@@ -1086,6 +1087,21 @@ class ObjectWriter:
                 int(object_version),
                 subset_to_store,
             )
+            # Bucket default, only when initiate did not already store an explicit mode. legal_hold
+            # None leaves a hold stored at initiate in place; passing False would clear it.
+            if lock is not None:
+                existing = await conn.fetchrow(get_query("get_object_version_lock"), object_id, int(object_version))
+                if existing is not None and existing["object_lock_mode"] is None:
+                    resolved = lock()
+                    if resolved is not None and resolved[0] is not None:
+                        await conn.execute(
+                            get_query("set_object_version_lock"),
+                            object_id,
+                            int(object_version),
+                            resolved[0],
+                            resolved[1],
+                            None,
+                        )
 
             # Mark MPU completed — only if it is still open. An abort claims the upload by deleting
             # this row (cascading its parts); the two serialise on the row lock, and if the abort

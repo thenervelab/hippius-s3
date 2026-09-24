@@ -147,6 +147,7 @@ def test_write_path_applies_the_signed_lock(method: str, path: str) -> None:
         pytest.param({"x-amz-bypass-governance-retention": "true"}, id="governance-bypass"),
         pytest.param({"x-amz-acl": "public-read-write"}, id="canned-acl"),
         pytest.param({"x-amz-grant-full-control": "id=hip_other"}, id="grant"),
+        pytest.param({"x-amz-copy-source": "/backups/other-key"}, id="copy-source"),
     ],
 )
 async def test_url_holder_cannot_add_unsigned_authority_headers(method: str, path: str, added: dict[str, str]) -> None:

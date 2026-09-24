@@ -368,6 +368,28 @@ async def test_cross_account_grant_cannot_lift_a_no_delete_key_past_its_tier(
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_cross_account_destination_cannot_read_a_same_account_bucket_outside_scope() -> None:
+    """A WRITE grant on someone else's bucket must not let the key copy out of a bucket it cannot
+    read. The destination is cross-account, so the intra-account scope block never runs; the
+    source check has to run on this path too."""
+    scope = _scope(Permission.object_read_write_no_delete, BucketScope.specific, ["backup-id"])
+    app = _make_app(
+        scope=scope,
+        bucket_owner_lookup={
+            "sink": ("bob", "sink-id"),
+            "secret-bucket": ("alice", "secret-id"),
+            "backup-bucket": ("alice", "backup-id"),
+        },
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        denied = await client.put("/sink/loot", headers={"x-amz-copy-source": "/secret-bucket/private.txt"})
+        allowed = await client.put("/sink/loot", headers={"x-amz-copy-source": "/backup-bucket/vm-1"})
+    assert denied.status_code == 403
+    assert allowed.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_cross_account_grant_still_authorises_what_the_tier_allows() -> None:
     scope = _scope(Permission.object_read_write_no_delete, BucketScope.specific, ["alice-bucket-id"])
     app = _make_app(scope=scope, bucket_owner_lookup={"shared-bucket": ("bob", "shared-id")})

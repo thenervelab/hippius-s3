@@ -34,6 +34,7 @@ from hippius_s3.api.s3.objects.object_lock_endpoints import handle_put_object_re
 from hippius_s3.cache import FileSystemPartsStore
 from hippius_s3.utils import get_query
 from hippius_s3.writer import object_writer as writer_mod
+from hippius_s3.writer.db import unserve_version_after_address_failure
 from hippius_s3.writer.object_writer import ObjectWriter
 
 
@@ -270,3 +271,165 @@ async def test_a_lock_write_on_a_live_version_is_stored(env: dict[str, Any]) -> 
     assert resp.status_code == 200
     row = await _version_row(env["pool"], res.object_id, res.object_version)
     assert row["object_lock_mode"] == "GOVERNANCE"
+
+
+_PARTS = [{"part_number": 1, "etag": "ab" * 16, "size_bytes": 5}]
+
+
+class _ObservedAcquire:
+    def __init__(self, pool: Any, on_lock: Any) -> None:
+        self._pool = pool
+        self._on_lock = on_lock
+        self._ctx: Any = None
+
+    async def __aenter__(self) -> Any:
+        self._ctx = self._pool.acquire()
+        conn = await self._ctx.__aenter__()
+        return _ObservedConn(conn, self._on_lock)
+
+    async def __aexit__(self, *exc: Any) -> Any:
+        return await self._ctx.__aexit__(*exc)
+
+
+class _ObservedPool:
+    """pool.acquire() wrapper. mpu_complete checks out its own connection, not acquire_with_timeout."""
+
+    def __init__(self, pool: Any, on_lock: Any) -> None:
+        self._pool = pool
+        self._on_lock = on_lock
+
+    def acquire(self) -> _ObservedAcquire:
+        return _ObservedAcquire(self._pool, self._on_lock)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._pool, name)
+
+
+async def _reserved(env: dict[str, Any], *, key: str) -> Any:
+    """A simple PUT's version, put back in the reserved shape, with its upload still open."""
+    res = await env["writer"].put_simple_stream_full(
+        bucket_id=env["bucket_id"],
+        bucket_name=env["bucket_name"],
+        object_id=str(uuid.uuid4()),
+        object_key=key,
+        account_address="acct",
+        content_type="application/octet-stream",
+        metadata={},
+        body_iter=_body(b"x"),
+    )
+    await env["pool"].execute(
+        "UPDATE object_versions SET size_bytes = 0, md5_hash = '' WHERE object_id = $1::uuid AND object_version = $2",
+        res.object_id,
+        res.object_version,
+    )
+    return res
+
+
+async def _complete(env: dict[str, Any], res: Any, *, key: str, lock: Any, on_lock: Any = None) -> None:
+    writer = env["writer"]
+    original = writer.pool
+    if on_lock is not None:
+        writer.pool = _ObservedPool(original, on_lock)
+    try:
+        await writer.mpu_complete(
+            bucket_name=env["bucket_name"],
+            object_id=res.object_id,
+            object_key=key,
+            upload_id=res.upload_id,
+            object_version=res.object_version,
+            address="acct",
+            db_parts=_PARTS,
+            lock=lock,
+        )
+    finally:
+        writer.pool = original
+
+
+async def test_mpu_complete_stores_the_default_lock_before_the_version_is_visible(
+    env: dict[str, Any],
+) -> None:
+    """Bucket-default retention is chosen while other sessions still see a reserved version.
+
+    Fails if the lock statement runs after the size commit (the second connection would already
+    see the bytes) or if complete ignores the callback and leaves the version unlocked.
+    """
+    key = "backups/vm-1/disk.raw"
+    res = await _reserved(env, key=key)
+    seen: list[Any] = []
+    chosen = (datetime.now(timezone.utc) + timedelta(days=3)).replace(microsecond=0)
+
+    async def _look(_object_id: Any, _object_version: int) -> None:
+        seen.append(await _version_row(env["pool"], res.object_id, res.object_version))
+
+    await _complete(env, res, key=key, lock=lambda: ("COMPLIANCE", chosen, False), on_lock=_look)
+
+    assert len(seen) == 1, "complete did not write the lock itself"
+    assert int(seen[0]["size_bytes"]) == 0 and not seen[0]["md5_hash"]
+    assert seen[0]["object_lock_mode"] is None
+    row = await _version_row(env["pool"], res.object_id, res.object_version)
+    assert int(row["size_bytes"]) == 5
+    assert row["object_lock_mode"] == "COMPLIANCE"
+    assert row["object_lock_retain_until"] == chosen
+
+
+async def test_mpu_complete_does_not_overwrite_an_explicit_lock_or_clear_a_hold(env: dict[str, Any]) -> None:
+    """Headers stored at initiate are an absolute date. The default applied at complete must not
+    replace them, and the legal_hold argument of that default (False) must not clear a hold."""
+    key = "backups/vm-1/explicit.raw"
+    res = await _reserved(env, key=key)
+    explicit = (datetime.now(timezone.utc) + timedelta(days=30)).replace(microsecond=0)
+    await env["pool"].execute(
+        "UPDATE object_versions SET object_lock_mode = 'COMPLIANCE', object_lock_retain_until = $3, "
+        "object_lock_legal_hold = true WHERE object_id = $1::uuid AND object_version = $2",
+        res.object_id,
+        res.object_version,
+        explicit,
+    )
+    later = explicit + timedelta(days=1)
+
+    def _should_not_be_stored() -> tuple[str, datetime, bool]:
+        return "GOVERNANCE", later, False
+
+    await _complete(env, res, key=key, lock=_should_not_be_stored)
+    row = await _version_row(env["pool"], res.object_id, res.object_version)
+    assert row["object_lock_mode"] == "COMPLIANCE"
+    assert row["object_lock_retain_until"] == explicit
+    assert row["object_lock_legal_hold"] is True
+    assert int(row["size_bytes"]) == 5
+
+
+async def test_mpu_complete_keeps_a_legal_hold_when_it_applies_the_default(env: dict[str, Any]) -> None:
+    key = "backups/vm-1/held.raw"
+    res = await _reserved(env, key=key)
+    await env["pool"].execute(
+        "UPDATE object_versions SET object_lock_legal_hold = true WHERE object_id = $1::uuid AND object_version = $2",
+        res.object_id,
+        res.object_version,
+    )
+    chosen = (datetime.now(timezone.utc) + timedelta(days=2)).replace(microsecond=0)
+    await _complete(env, res, key=key, lock=lambda: ("GOVERNANCE", chosen, False))
+    row = await _version_row(env["pool"], res.object_id, res.object_version)
+    assert row["object_lock_mode"] == "GOVERNANCE"
+    assert row["object_lock_retain_until"] == chosen
+    assert row["object_lock_legal_hold"] is True
+
+
+async def test_address_failure_revert_keeps_the_lock(env: dict[str, Any]) -> None:
+    res = await env["writer"].put_simple_stream_full(
+        bucket_id=env["bucket_id"],
+        bucket_name=env["bucket_name"],
+        object_id=str(uuid.uuid4()),
+        object_key="backups/vm-1/manifest.json",
+        account_address="acct",
+        content_type="application/json",
+        metadata={},
+        body_iter=_body(b'{"seq": 1}'),
+        lock=lambda: ("COMPLIANCE", RETAIN_UNTIL, True),
+    )
+    async with env["pool"].acquire() as conn:
+        await unserve_version_after_address_failure(conn, object_id=res.object_id, object_version=res.object_version)
+    row = await _version_row(env["pool"], res.object_id, res.object_version)
+    assert int(row["size_bytes"]) == 0 and row["md5_hash"] == ""
+    assert row["object_lock_mode"] == "COMPLIANCE"
+    assert row["object_lock_retain_until"] == RETAIN_UNTIL
+    assert row["object_lock_legal_hold"] is True

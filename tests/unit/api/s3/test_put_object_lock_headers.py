@@ -23,6 +23,7 @@ from starlette.datastructures import Headers
 from starlette.responses import Response
 
 from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
+from hippius_s3.api.s3.objects.object_lock_endpoints import lock_stored_at_multipart_initiate
 
 
 def _request(headers: dict[str, str] | None = None, *, bucket_lock: dict[str, Any] | None = None) -> Any:
@@ -236,3 +237,47 @@ class TestBucketDefaultRetention:
         assert not isinstance(result, Response) and result is not None
         mode, retain_until, hold = result
         assert mode == "GOVERNANCE" and hold is True, "the hold and the default retention must compose"
+
+
+class TestMultipartInitiateDoesNotStartTheDefaultClock:
+    """A bucket default is a duration. CreateMultipartUpload must not bake retain-until at initiate.
+
+    CompleteMultipartUpload applies it when the version becomes serveable. Explicit headers are an
+    absolute date and a legal hold has no clock, so those are still stored on the reserved version.
+    """
+
+    def test_bucket_default_is_not_stored_at_initiate(self) -> None:
+        request = _request(bucket_lock={"enabled": True, "mode": "COMPLIANCE", "days": 1})
+        assert lock_for_new_version(request) is not None
+        assert lock_stored_at_multipart_initiate(request) is None
+
+    def test_explicit_retention_is_stored_at_initiate(self) -> None:
+        until = datetime.now(timezone.utc) + timedelta(days=10)
+        request = _enabled(
+            {
+                "x-amz-object-lock-mode": "COMPLIANCE",
+                "x-amz-object-lock-retain-until-date": until.isoformat().replace("+00:00", "Z"),
+            }
+        )
+        stored = lock_stored_at_multipart_initiate(request)
+        assert stored is not None
+        mode, retain_until, hold = stored
+        assert mode == "COMPLIANCE" and hold is False
+        assert abs((retain_until - until).total_seconds()) < 2
+
+    def test_legal_hold_is_stored_without_baking_the_default_clock(self) -> None:
+        request = _request(
+            {"x-amz-object-lock-legal-hold": "ON"},
+            bucket_lock={"enabled": True, "mode": "GOVERNANCE", "days": 7},
+        )
+        stored = lock_stored_at_multipart_initiate(request)
+        assert stored == (None, None, True)
+
+    def test_initiate_uses_that_split_and_complete_supplies_the_default(self) -> None:
+        from pathlib import Path
+
+        source = (Path(__file__).resolve().parents[4] / "hippius_s3/api/s3/multipart.py").read_text()
+        assert "lock_stored_at_multipart_initiate" in source
+        assert "lock=functools.partial(resolve_new_version_lock, request)" in source
+        # lock_for_new_version would store the default at initiate. It must not be called here.
+        assert "lock_for_new_version(" not in source

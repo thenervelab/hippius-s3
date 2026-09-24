@@ -288,12 +288,17 @@ Changes that came with the tier, each of which was a way around it:
   the lock was written in a later transaction, so a key that may `DELETE ?versionId=` could list
   the fresh version and destroy it before it was retained. A copy with lock intent no longer
   takes the v5 fast path, whose version is serveable from its first autocommit statement; it
-  streams instead, as it already did rather than alias. CreateMultipartUpload was already safe:
-  it locks the reserved version at initiate, before any data.
+  streams instead, as it already did rather than alias. A bucket-default retain-until is computed
+  in that same transaction, so it counts from the moment the version exists rather than from the
+  start of a slow upload.
+- **Multipart default retention is applied at Complete, not at initiate.** Explicit
+  `x-amz-object-lock-*` headers are absolute, so CreateMultipartUpload still stores them on the
+  reserved version. A bucket default is a duration. Storing it at initiate started the clock while
+  the bytes were still in transit, and a backup larger than the default was unlocked — or already
+  expired — at the moment it became readable. CompleteMultipartUpload writes the default in the
+  same transaction that sets the size, and does not overwrite a mode already stored from headers.
 - **S4 append refuses `x-amz-object-lock-*` with 501.** An append mints no version, so there is
   nothing to lock; it used to answer 200 with the headers dropped.
-  A bucket-default retain-until is computed in that same transaction, so it counts from the
-  version's creation rather than from the start of a slow upload.
 - **A version delete ignores a write in flight.** `DELETE ?versionId=` of a version with no
   finished data (a PUT or copy still streaming, an upload not yet completed) answers 204 and
   changes nothing, as for an absent version: such a version is invisible to every read and

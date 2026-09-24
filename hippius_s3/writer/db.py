@@ -9,6 +9,14 @@ from typing import Any
 from hippius_s3.utils import get_query
 
 
+async def unserve_version_after_address_failure(db: Any, *, object_id: str, object_version: int) -> None:
+    """Mark a version unserveable after its drain address failed to persist.
+
+    Leaves any Object Lock on the row. See unserve_version_keep_lock.sql.
+    """
+    await db.execute(get_query("unserve_version_keep_lock"), object_id, int(object_version))
+
+
 async def set_object_version_address(
     db: Any,
     *,

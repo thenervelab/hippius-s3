@@ -167,7 +167,7 @@ async def verify_access_key_signature(
 # any of these the signer did not sign — an added `x-amz-object-lock-legal-hold: ON` would make a
 # backup unprunable. AWS refuses unsigned x-amz-* headers on presigned requests the same way.
 _AUTHORITY_HEADER_PREFIXES = ("x-amz-object-lock-", "x-amz-grant-")
-_AUTHORITY_HEADERS = frozenset({"x-amz-acl", "x-amz-bypass-governance-retention"})
+_AUTHORITY_HEADERS = frozenset({"x-amz-acl", "x-amz-bypass-governance-retention", "x-amz-copy-source"})
 
 
 def unsigned_authority_headers(headers: Mapping[str, str], signed_headers: list[str]) -> set[str]:

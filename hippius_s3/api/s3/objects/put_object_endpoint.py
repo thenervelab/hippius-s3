@@ -32,6 +32,7 @@ from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.monitoring import get_metrics_collector
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
+from hippius_s3.writer.db import unserve_version_after_address_failure
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.writer.types import BadDigest
 from hippius_s3.writer.types import PreconditionFailed
@@ -265,11 +266,10 @@ async def handle_put_object(
                 # the failure (is_completed stays FALSE, so DELETE-cascade cleanup also applies).
                 with contextlib.suppress(Exception):
                     async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
-                        await conn.execute(
-                            "UPDATE object_versions SET size_bytes = 0, md5_hash = '' "
-                            "WHERE object_id = $1 AND object_version = $2",
-                            str(put_res.object_id),
-                            int(put_res.object_version),
+                        await unserve_version_after_address_failure(
+                            conn,
+                            object_id=str(put_res.object_id),
+                            object_version=int(put_res.object_version),
                         )
                 raise
 

@@ -1,6 +1,7 @@
 """S3-compatible multipart upload implementation for handling large file uploads."""
 
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -33,7 +34,8 @@ from hippius_s3.api.s3.copy_helpers import parse_copy_source
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.api.s3.object_lock_guard import maybe_object_lock_not_implemented_response
-from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
+from hippius_s3.api.s3.objects.object_lock_endpoints import lock_stored_at_multipart_initiate
+from hippius_s3.api.s3.objects.object_lock_endpoints import resolve_new_version_lock
 from hippius_s3.api.s3.objects.object_lock_endpoints import store_version_lock
 from hippius_s3.api.s3.objects.object_lock_endpoints import validate_lock_intent
 from hippius_s3.cache import RedisObjectPartsCache
@@ -483,21 +485,13 @@ async def initiate_multipart_upload(
         # Use the returned object_id (will be existing one if conflict occurred)
         object_id = str(upsert_result["object_id"])
 
-        # Apply the lock to the reserved version: explicit x-amz-object-lock-* headers if the
-        # request carried them, else the destination bucket's default retention.
-        #
-        # Storing it HERE is what lets the headers stop returning 501. The guard's comment used to
-        # say carrying lock intent from initiate to completion needed the intent persisted on
-        # multipart_uploads — a schema change. It does not: completion resolves its version from
-        # this upload's own parts (get_multipart_version_by_upload), so the row reserved here IS the
-        # one that gets finalised. The bucket-default fix already relied on that; honouring the
-        # headers is the same mechanism with the precedence rules applied.
-        #
-        # Applied at reserve rather than at complete so retain-until runs from the version's
-        # creation, matching the simple-PUT path, and so an upload abandoned mid-flight cannot
-        # leave a live version that never got the lock.
-        lock_intent = lock_for_new_version(request)
-        assert not isinstance(lock_intent, Response)  # validated before any part was accepted
+        # Explicit lock headers are an absolute date (or a hold), so they go on the reserved
+        # version now. A bucket default is a duration and is applied in mpu_complete, in the same
+        # transaction that makes the version serveable — storing it here would start the clock at
+        # initiate, and a backup larger than the default retention would be unlocked when it
+        # finally became readable. Completion still resolves this upload's own version from its
+        # parts, so the row reserved here is the one that gets finalised; no schema change.
+        lock_intent = lock_stored_at_multipart_initiate(request)
         if lock_intent is not None:
             lock_mode, lock_until, lock_hold = lock_intent
             await store_version_lock(
@@ -505,8 +499,7 @@ async def initiate_multipart_upload(
                 object_id=object_id,
                 # upsert_object_multipart returns the version as `current_object_version`, matching
                 # the objects row it upserts — not `object_version`. Reading the wrong key raised
-                # KeyError and turned every CreateMultipartUpload into a 500, but ONLY on a bucket
-                # carrying a default retention, because that is the sole path that reaches here.
+                # KeyError and 500'd every CreateMultipartUpload that stored a lock.
                 object_version=int(upsert_result["current_object_version"]),
                 mode=lock_mode,
                 retain_until=lock_until,
@@ -1366,6 +1359,9 @@ async def complete_multipart_upload(
                 db_parts=db_parts,
                 if_none_match=if_none_match,
                 key_existed_at_initiate=bool(multipart_upload["key_existed_at_initiate"]),
+                # Bucket-default retention, computed now. Explicit headers were stored at initiate;
+                # mpu_complete leaves those alone. Complete itself still 501s on lock headers.
+                lock=functools.partial(resolve_new_version_lock, request),
             )
         except PreconditionFailed:
             # Nothing was committed: the upload stays open and can be aborted, as on S3.

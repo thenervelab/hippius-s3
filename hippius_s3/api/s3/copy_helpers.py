@@ -25,6 +25,7 @@ from hippius_s3.services.object_reader import stream_object
 from hippius_s3.storage_version import require_supported_storage_version
 from hippius_s3.utils import get_query
 from hippius_s3.writer.db import set_object_version_address
+from hippius_s3.writer.db import unserve_version_after_address_failure
 from hippius_s3.writer.object_writer import ObjectWriter
 
 
@@ -45,7 +46,9 @@ def parse_copy_source(copy_source: str | None) -> tuple[str, str, int | None]:
             status_code=400,
         )
 
-    copy_source_path, _, query = copy_source.partition("?")
+    # Strip, matching acl.parse_copy_source and UploadPartCopy. A trailing space otherwise
+    # authorises one key and copies the next one over.
+    copy_source_path, _, query = copy_source.strip().partition("?")
     copy_source_path = unquote(copy_source_path).lstrip("/")
 
     path_parts = copy_source_path.split("/", 1)
@@ -349,11 +352,10 @@ async def handle_streaming_copy(
         # reserved-row shape so reads skip it and the sweep reclaims its parts, then surface.
         with contextlib.suppress(Exception):
             async with acquire_with_timeout(pool, config.db_pool_acquire_timeout) as conn:
-                await conn.execute(
-                    "UPDATE object_versions SET size_bytes = 0, md5_hash = '' "
-                    "WHERE object_id = $1 AND object_version = $2",
-                    str(put_res.object_id),
-                    int(put_res.object_version),
+                await unserve_version_after_address_failure(
+                    conn,
+                    object_id=str(put_res.object_id),
+                    object_version=int(put_res.object_version),
                 )
         raise
 

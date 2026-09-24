@@ -236,6 +236,17 @@ ALL_S3_OPS: list[S3Op] = [
         query={"versionId": "v1"},
         expected_op=Op.delete_object,
     ),
+    # parse_version_id special-cases only the exact string "null". Other casings and non-positive
+    # ids raise, and names_a_version treats that as "not a version" so the write-once tier cannot
+    # reach the handler's 400 — or, if the casing were ever accepted as current, write a marker.
+    S3Op(
+        "DeleteObjectUpperNullVersion",
+        "DELETE",
+        has_key=True,
+        query={"versionId": "NULL"},
+        expected_op=Op.delete_object,
+    ),
+    S3Op("DeleteObjectZeroVersion", "DELETE", has_key=True, query={"versionId": "0"}, expected_op=Op.delete_object),
     S3Op(
         "DeleteObjectTaggingVersion",
         "DELETE",
@@ -818,6 +829,8 @@ _WRITE_ONCE_DENIED = [
     "DeleteObjectEmptyVersion",
     "DeleteObjectNullVersion",
     "DeleteObjectMalformedVersion",
+    "DeleteObjectUpperNullVersion",
+    "DeleteObjectZeroVersion",
     "DeleteObjectTaggingVersion",
     "DeleteObjects",
     "PutObjectRetention",

@@ -95,6 +95,12 @@ class _FakeConn:
     async def execute(self, query: str, *args: Any) -> None:
         self.executed.append((query, args))
 
+    async def fetchrow(self, query: str, *args: Any) -> None:
+        # No explicit lock on the reserved version: complete may apply a bucket default.
+        # This request carries none, so the writer stores nothing.
+        self.executed.append((query, args))
+        return None
+
     async def fetchval(self, query: str, *args: Any) -> Any:
         # The is_completed flip returns the upload id while the upload is still open.
         self.executed.append((query, args))

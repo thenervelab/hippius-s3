@@ -478,6 +478,30 @@ def resolve_new_version_lock(request: Request) -> tuple[str | None, datetime | N
     return intent
 
 
+def lock_stored_at_multipart_initiate(
+    request: Request,
+) -> tuple[str | None, datetime | None, bool] | None:
+    """The lock CreateMultipartUpload may persist on the reserved, not-yet-serveable version.
+
+    An explicit retain-until is an absolute date, and a legal hold has no clock, so both are
+    stored now. A bucket default is a duration. Storing it here would start that clock at
+    initiate, and a multipart upload that runs longer than the default — the path a large backup
+    actually takes — would be unlocked, or already expired, at the moment Complete makes it
+    readable. Complete applies the default in the transaction that publishes the version.
+    """
+    intent = lock_for_new_version(request)
+    if isinstance(intent, Response):
+        raise RuntimeError("Object Lock intent reached multipart initiate without validate_lock_intent")
+    if intent is None:
+        return None
+    mode, until, hold = intent
+    if (request.headers.get("x-amz-object-lock-mode") or "").strip():
+        return mode, until, hold
+    if hold:
+        return None, None, True
+    return None
+
+
 def _bucket_default_retention(config: Any) -> tuple[str, datetime] | None:
     """Turn Tier 1's stored bucket config into a concrete retain-until for a version created now.
 

@@ -135,7 +135,24 @@ async def test_streaming_copy_unserves_dest_and_raises_when_address_write_fails(
     unserve = [e for e in pool.events if e.get("method") == "execute" and "size_bytes = 0" in (e.get("query") or "")]
     assert len(unserve) == 1
     assert unserve[0]["args"] == (DEST_OBJECT_ID, DEST_OBJECT_VERSION)
+    # The revert must not clear a lock. Nulling object_lock_* here drops a retention or legal hold
+    # an admin set in the window after the version became serveable.
+    assert "object_lock" not in unserve[0]["query"]
     assert _completed_queries(pool) == []
+
+
+def test_put_and_copy_share_the_keep_lock_revert() -> None:
+    """Inlining a second UPDATE is how the lock gets cleared on one path and kept on the other."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    for rel in (
+        "hippius_s3/api/s3/objects/put_object_endpoint.py",
+        "hippius_s3/api/s3/copy_helpers.py",
+    ):
+        source = (root / rel).read_text()
+        assert "unserve_version_after_address_failure" in source
+        assert "size_bytes = 0" not in source
 
 
 def _completed_queries(pool: Any) -> list[dict[str, Any]]:

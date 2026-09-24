@@ -1,3 +1,4 @@
+from typing import Any
 from typing import Awaitable
 from typing import Callable
 from urllib.parse import unquote
@@ -23,6 +24,7 @@ from hippius_s3.gateway.utils.accounts import is_sentinel_account_id
 from hippius_s3.gateway.utils.errors import s3_error_response
 from hippius_s3.gateway.utils.paths import routing_path
 from hippius_s3.models.acl import Permission
+from hippius_s3.models.sub_token import SubTokenScope
 from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
@@ -51,6 +53,31 @@ def parse_copy_source(header_value: str) -> tuple[str | None, str | None]:
     if not sep or not bucket:
         return None, None
     return bucket, (key or None)
+
+
+async def same_account_copy_source_out_of_scope(
+    copy_source: str | None,
+    scope: SubTokenScope | None,
+    account_id: str | None,
+    acl_service: Any,
+) -> bool:
+    """Whether a same-account copy source sits outside this sub-token's bucket scope.
+
+    The early READ check treats the account as allowed to read its own buckets. This is the
+    ceiling on which of those buckets the key may touch, including when the destination is
+    someone else's bucket.
+    """
+    if not copy_source or scope is None:
+        return False
+    if not isinstance(account_id, str):
+        return True
+    src_bucket_name, _ = parse_copy_source(copy_source)
+    if not src_bucket_name:
+        return False
+    src_lookup = await acl_service.get_bucket_owner_and_id(src_bucket_name)
+    if src_lookup is None or src_lookup.owner_id != account_id:
+        return False
+    return not (bucket_in_scope(src_lookup.bucket_id, scope) and permission_allows(scope.permission, OP_READ_OBJECT))
 
 
 def parse_s3_path(path: str) -> tuple[str | None, str | None]:
@@ -385,35 +412,27 @@ async def acl_middleware(
             if not allowed:
                 return _access_denied()
 
-            # CopyObject / UploadPartCopy: scope must also cover the source
-            # bucket. The destination check above only validates write access
-            # to the destination — without this second check, a sub-token
-            # scoped to bucket B could copy data from bucket A (which it
-            # cannot read) into B. Cross-account sources fall through to the
-            # backend / bucket-ACL flow (existing contractor pattern).
-            copy_source = request.headers.get("x-amz-copy-source")
-            if copy_source and key is not None and scope is not None:
-                # parse_copy_source, not a local split: it decodes BEFORE splitting, exactly as the
-                # handlers do. A split-first parser read `secret%2Fkey` as the nonexistent bucket
-                # `secret%2Fkey`, skipped this check, and the handler then copied from `secret`.
-                src_bucket_name, _ = parse_copy_source(copy_source)
-                if src_bucket_name:
-                    src_lookup = await acl_service.get_bucket_owner_and_id(src_bucket_name)
-                    src_owner_id = src_lookup.owner_id if src_lookup else None
-                    src_bucket_id = src_lookup.bucket_id if src_lookup else None
-                    if src_owner_id == account_id:
-                        src_allowed = bucket_in_scope(src_bucket_id, scope) and permission_allows(
-                            scope.permission, OP_READ_OBJECT
-                        )
-                        if not src_allowed:
-                            logger.info(
-                                f"Sub-token copy denied: source bucket {src_bucket_name} "
-                                f"(id={src_bucket_id}) not in scope for account={account_id}"
-                            )
-                            return _access_denied()
+            # CopyObject / UploadPartCopy: scope must also cover a same-account source.
+            # The destination check above only validates write access to the destination — without
+            # this, a sub-token scoped to bucket B could copy data from bucket A into B.
+            # Cross-account sources fall through to the READ check above (the contractor pattern).
+            if key is not None and await same_account_copy_source_out_of_scope(
+                request.headers.get("x-amz-copy-source"), scope, account_id, acl_service
+            ):
+                logger.info(f"Sub-token copy denied: source out of scope for account={account_id}")
+                return _access_denied()
 
             request.state.is_anonymous_access = False
             return await call_next(request)
+
+        # Cross-account destination: the tier ceiling above does not cover the source. A grant on
+        # the other account's bucket must not let this key read a same-account bucket outside its
+        # scope and copy it there.
+        if key is not None and await same_account_copy_source_out_of_scope(
+            request.headers.get("x-amz-copy-source"), scope, account_id, acl_service
+        ):
+            logger.info(f"Sub-token copy denied: cross-account dest, source out of scope for account={account_id}")
+            return _access_denied()
         # cross-account sub-token falls through to check_permission below.
 
     # -------------------------------------------------------------------------

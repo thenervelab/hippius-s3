@@ -465,10 +465,13 @@ async def test_key_existed_at_initiate_is_ignored_without_the_header() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unconditional_complete_skips_the_check() -> None:
+async def test_unconditional_complete_locks_the_object_but_skips_the_precondition() -> None:
+    """Every complete takes the objects row so a versioned DELETE waits for the publish.
+    Only If-None-Match consults the conditional-conflict query."""
     pool = _CompletePool(conflict=True)
     await _complete(pool, if_none_match=False)
-    assert not any("Exclusive variant" in q or "CompleteMultipartUpload If-None-Match" in q for _, q in pool.calls)
+    assert any("Exclusive variant" in q for _, q in pool.calls)
+    assert not any("CompleteMultipartUpload If-None-Match" in q for _, q in pool.calls)
 
 
 @pytest.mark.asyncio

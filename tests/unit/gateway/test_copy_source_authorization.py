@@ -36,6 +36,13 @@ OWNER = "5EvT2ccmmY6t3q1U3PXwjzwFBjE2KzvWdC6mMsCvBbiBDs55"
 ATTACKER = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 
 
+def test_acl_and_handler_parse_the_same_key_when_the_header_has_trailing_space() -> None:
+    header = "/victim/key "
+    acl_bucket, acl_key = parse_copy_source(header)
+    handler_bucket, handler_key, _version = copy_helpers_parse_copy_source(header)
+    assert (acl_bucket, acl_key) == (handler_bucket, handler_key) == ("victim", "key")
+
+
 def _handler_parse(header: str) -> str | None:
     """Reproduction of the handlers' own bucket derivation (multipart.py / copy_helpers.py)."""
     src = unquote(header.strip())
