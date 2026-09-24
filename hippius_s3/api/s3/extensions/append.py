@@ -29,6 +29,7 @@ from hippius_s3.writer.types import AppendPreconditionFailed
 from hippius_s3.writer.types import BadDigest
 from hippius_s3.writer.types import EmptyAppendError
 from hippius_s3.writer.types import ObjectNotFound
+from hippius_s3.writer.types import ObjectVersionLocked
 from hippius_s3.writer.types import PreconditionFailed
 
 
@@ -168,6 +169,15 @@ async def handle_append(
                 code="InvalidRequest",
                 message="Empty append not allowed",
                 status_code=400,
+            )
+        except ObjectVersionLocked:
+            # Same answer as a permanent delete of a locked version: AccessDenied, without saying
+            # which protection applied.
+            return errors.s3_error_response(
+                code="AccessDenied",
+                message="Access Denied",
+                status_code=403,
+                Key=object_key,
             )
         object_id = result["object_id"]
         next_part = int(result["part_number"])

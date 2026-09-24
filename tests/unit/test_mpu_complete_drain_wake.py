@@ -52,6 +52,7 @@ class _FakeDb:
         if query == "get_multipart_upload":
             return {
                 "object_id": "obj-1",
+                "bucket_name": "b",
                 "object_key": "k",
                 "is_completed": False,
                 "current_object_version": _POINTER_VERSION,
@@ -93,6 +94,11 @@ class _FakeConn:
 
     async def execute(self, query: str, *args: Any) -> None:
         self.executed.append((query, args))
+
+    async def fetchval(self, query: str, *args: Any) -> Any:
+        # The is_completed flip returns the upload id while the upload is still open.
+        self.executed.append((query, args))
+        return args[0]
 
 
 class _FakeAcquire:

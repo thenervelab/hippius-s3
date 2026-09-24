@@ -33,6 +33,7 @@ def _pool() -> Any:
         "object_id": str(uuid.uuid4()),
         "current_object_version": 1,
         "bucket_name": "bkt",
+        "object_key": "k",
         "bucket_id": str(uuid.uuid4()),
     }
     return SimpleNamespace(fetchrow=AsyncMock(return_value=upload))
@@ -54,7 +55,9 @@ async def test_malformed_content_md5_is_invalid_digest(monkeypatch: Any) -> None
     _patch_part_stream(monkeypatch, captured)
     pool = _pool()
 
-    resp = await multipart.upload_part(_request({"Content-MD5": "@@not-base64@@"}), pool)
+    resp = await multipart.upload_part(
+        _request({"Content-MD5": "@@not-base64@@"}), pool, bucket_name="bkt", object_key="k"
+    )
 
     assert resp.status_code == 400
     assert b"<Code>InvalidDigest</Code>" in resp.body
@@ -68,7 +71,9 @@ async def test_unknown_upload_id_beats_a_malformed_digest(monkeypatch: Any) -> N
     _patch_part_stream(monkeypatch, captured)
     pool = SimpleNamespace(fetchrow=AsyncMock(return_value=None))
 
-    resp = await multipart.upload_part(_request({"Content-MD5": "@@not-base64@@"}), pool)
+    resp = await multipart.upload_part(
+        _request({"Content-MD5": "@@not-base64@@"}), pool, bucket_name="bkt", object_key="k"
+    )
 
     assert resp.status_code == 404
     assert b"<Code>NoSuchUpload</Code>" in resp.body
@@ -81,7 +86,9 @@ async def test_content_md5_reaches_the_part_writer(monkeypatch: Any) -> None:
     _patch_part_stream(monkeypatch, captured)
     digest = hashlib.md5(b"part").digest()
 
-    resp = await multipart.upload_part(_request({"Content-MD5": base64.b64encode(digest).decode()}), _pool())
+    resp = await multipart.upload_part(
+        _request({"Content-MD5": base64.b64encode(digest).decode()}), _pool(), bucket_name="bkt", object_key="k"
+    )
 
     assert resp.status_code == 200
     assert captured["expected_md5"] == digest
@@ -92,7 +99,9 @@ async def test_digest_mismatch_is_bad_digest(monkeypatch: Any) -> None:
     digest = hashlib.md5(b"claimed").digest()
     _patch_part_stream(monkeypatch, {}, raise_exc=BadDigest(expected=digest, actual=hashlib.md5(b"got").digest()))
 
-    resp = await multipart.upload_part(_request({"Content-MD5": base64.b64encode(digest).decode()}), _pool())
+    resp = await multipart.upload_part(
+        _request({"Content-MD5": base64.b64encode(digest).decode()}), _pool(), bucket_name="bkt", object_key="k"
+    )
 
     assert resp.status_code == 400
     assert b"<Code>BadDigest</Code>" in resp.body
@@ -104,7 +113,7 @@ async def test_upload_part_copy_ignores_content_md5(monkeypatch: Any) -> None:
     then fails on its (deliberately unresolvable) copy source — anything but InvalidDigest."""
     pool = _pool()
     req = _request({"Content-MD5": "@@not-base64@@", "x-amz-copy-source": "/"})
-    resp = await multipart.upload_part(req, pool)
+    resp = await multipart.upload_part(req, pool, bucket_name="bkt", object_key="k")
     assert b"InvalidDigest" not in resp.body
 
 
@@ -122,6 +131,21 @@ async def test_malformed_content_md5_drains_the_body_before_answering(monkeypatc
     _patch_part_stream(monkeypatch, {})
     req = _request({"Content-MD5": "@@not-base64@@"})
     req.stream = stream
-    resp = await multipart.upload_part(req, _pool())
+    resp = await multipart.upload_part(req, _pool(), bucket_name="bkt", object_key="k")
     assert resp.status_code == 400
     assert read == [b"part"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket,key", [("other-bucket", "k"), ("bkt", "other-key")])
+async def test_upload_part_through_another_path_is_no_such_upload(monkeypatch: Any, bucket: str, key: str) -> None:
+    """The ACL layer authorised the PATH. Writing parts into an upload that belongs to another
+    bucket or key would let a grant on one bucket feed data into another's upload."""
+    captured: dict[str, Any] = {}
+    _patch_part_stream(monkeypatch, captured)
+
+    resp = await multipart.upload_part(_request({}), _pool(), bucket_name=bucket, object_key=key)
+
+    assert resp.status_code == 404
+    assert b"<Code>NoSuchUpload</Code>" in resp.body
+    assert captured == {}, "no part may be written"

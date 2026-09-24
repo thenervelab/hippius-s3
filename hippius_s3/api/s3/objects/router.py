@@ -184,7 +184,7 @@ async def put_object(
     upload_id = request.query_params.get("uploadId")
     part_number = request.query_params.get("partNumber")
     if upload_id and part_number:
-        response = await upload_part(request, pool)
+        response = await upload_part(request, pool, bucket_name=bucket_name, object_key=object_key)
     elif "tagging" in request.query_params:
         if (rejected := _reject_version_id(request, object_key, "tagging")) is not None:
             return rejected

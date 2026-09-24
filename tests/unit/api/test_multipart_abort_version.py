@@ -162,3 +162,34 @@ async def test_abort_refuses_an_upload_it_may_not_touch(
     assert b"NoSuchUpload" in bytes(resp.body)
     assert db.aborted is False, "the upload row (and its cascaded parts) must not be deleted"
     assert called == {"fail": False, "delete": False}, "no replication or cache cleanup may run"
+
+
+@pytest.mark.asyncio
+async def test_abort_that_loses_the_race_to_complete_touches_nothing(monkeypatch: Any) -> None:
+    """The upload looked open, but a CompleteMultipartUpload committed before the abort's claim:
+    the conditional delete matches nothing. The destructive cleanup runs only AFTER the claim, so
+    the completed version's replication and cache must be left alone."""
+    monkeypatch.setattr(multipart, "get_query", lambda name: name)
+    called = {"fail": False, "delete": False}
+
+    async def fake_fail(_db: Any, **_: Any) -> None:
+        called["fail"] = True
+
+    async def fake_delete(*_: Any) -> None:
+        called["delete"] = True
+
+    monkeypatch.setattr(multipart, "fail_version_replication", fake_fail)
+
+    class _LostRaceDb(_FakeDb):
+        async def fetchrow(self, query: str, *args: Any) -> Any:
+            if query == "abort_multipart_upload":
+                return None
+            return await super().fetchrow(query, *args)
+
+    db = _LostRaceDb(current_version=1, upload_version=1)
+    resp = await multipart.abort_multipart_upload(
+        "b", "k", _fake_request("up-1", fs_delete=fake_delete, redis=_RedisStub()), db
+    )
+
+    assert resp.status_code == 404
+    assert called == {"fail": False, "delete": False}

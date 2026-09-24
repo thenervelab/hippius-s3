@@ -149,7 +149,7 @@ skipping.
 | 3 | `POST ?delete` (DeleteObjects) | Per key, same rules; locked entries come back in `<Error>` with `AccessDenied`, unlocked ones still succeed |
 | 4 | `enqueue_object_unpin` | Never enqueue for a locked version. The `object_version=None` ("all versions") form must resolve and skip locked ones |
 | 5 | `find_objects_ready_for_hard_delete` | Exclude locked versions |
-| 6 | `DELETE /bucket` | **Done**: `bucket_has_retained_versions.sql` counts every live version, delete marker and locked version — see `s3-object-lock.md` "DeleteBucket counts every version" |
+| 6 | `DELETE /bucket` | **Done**: `bucket_emptiness.sql` counts every live version, delete marker and open upload — see `s3-object-lock.md` "DeleteBucket counts every version" |
 | 7 | Ops scripts | Refuse locked versions unless given an explicit `--i-know-this-breaks-worm` flag |
 
 **#2 is the one people get wrong.** A simple DELETE on a locked object must return `200`, not

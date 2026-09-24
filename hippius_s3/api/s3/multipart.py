@@ -51,6 +51,7 @@ from hippius_s3.writer.db import set_object_version_address
 from hippius_s3.writer.object_writer import ObjectWriter
 from hippius_s3.writer.types import BadDigest
 from hippius_s3.writer.types import PreconditionFailed
+from hippius_s3.writer.types import UploadNoLongerOpen
 from hippius_s3.xml_helpers import add_subelement
 from hippius_s3.xml_helpers import create_element
 from hippius_s3.xml_helpers import parse_untrusted_xml
@@ -153,6 +154,16 @@ router = APIRouter(tags=["s3-multipart"])
 
 config = get_config()
 tracer = trace.get_tracer(__name__)
+
+
+def upload_addressed_by(multipart_upload: Any, bucket_name: str, object_key: str) -> bool:
+    """Whether the request PATH names this upload's own bucket and key.
+
+    The ACL layer authorised the path, not the upload id, and an upload id is not a capability
+    (ListMultipartUploads hands them out). Acting on an upload through any other path would let a
+    grant on one bucket write parts into, complete, or abort another bucket's upload.
+    """
+    return multipart_upload["bucket_name"] == bucket_name and multipart_upload["object_key"] == object_key
 
 
 async def get_request_body(request: Request) -> bytes:
@@ -561,6 +572,9 @@ async def get_all_cached_chunks(
 async def upload_part(
     request: Request,
     pool: asyncpg.Pool,
+    *,
+    bucket_name: str,
+    object_key: str,
 ) -> Response:
     """Upload a part for a multipart upload (PUT with partNumber & uploadId)."""
     # These two parameters are required for multipart upload parts
@@ -595,7 +609,7 @@ async def upload_part(
         get_query("get_multipart_upload"),
         upload_id,
     )
-    if not ongoing_multipart_upload:
+    if not ongoing_multipart_upload or not upload_addressed_by(ongoing_multipart_upload, bucket_name, object_key):
         return s3_error_response(
             "NoSuchUpload",
             "The specified upload does not exist",
@@ -919,13 +933,12 @@ async def abort_multipart_upload(
         # abortable — AWS answers NoSuchUpload otherwise. A completed upload's parts are the
         # object's data (`parts` cascades from multipart_uploads), so aborting one destroyed a
         # committed version while bypassing both the DeleteObject permission and Object Lock; the
-        # sub-token scope grades abort as a WRITE on exactly that premise. And the ACL layer
-        # authorised the PATH, so an upload id from another bucket must not be honoured here.
+        # sub-token scope grades abort as a WRITE on exactly that premise. A NULL is_completed is
+        # not known to be open, so it is refused too (fail closed).
         if (
             not multipart_upload
-            or multipart_upload["is_completed"]
-            or multipart_upload["bucket_name"] != bucket_name
-            or multipart_upload["object_key"] != object_key
+            or multipart_upload["is_completed"] is not False
+            or not upload_addressed_by(multipart_upload, bucket_name, object_key)
         ):
             return s3_error_response(
                 "NoSuchUpload",
@@ -944,53 +957,19 @@ async def abort_multipart_upload(
         version_row = await db.fetchrow(get_query("get_multipart_version_by_upload"), upload_id)
         object_version = int(version_row["object_version"]) if version_row else None
 
-        # Clean up Redis keys for cached parts (meta + chunks) — only for our own version.
-        if object_version is not None:
-            parts = await db.fetch(
-                get_query("list_parts_for_version"),
-                object_id,
-                object_version,
-            )
-            if parts:
-                redis_client = request.app.state.redis_client
-                delegate = RedisObjectPartsCache(redis_client)
-                for part in parts:
-                    part_num = int(part["part_number"])
-                    meta_key = delegate.build_meta_key(str(object_id), object_version, part_num)
-                    base_key = delegate.build_key(str(object_id), object_version, part_num)
-                    # MPU-4: delete the meta + chunk keys by computed name in one pipelined UNLINK
-                    # instead of a per-part keyspace SCAN. num_chunks comes from the FS meta; if it's
-                    # absent (nothing to compute from), fall back to the SCAN.
-                    fs_meta = await request.app.state.fs_store.get_meta(str(object_id), int(object_version), part_num)
-                    num_chunks = int(fs_meta.get("num_chunks", 0)) if fs_meta else 0
-                    if num_chunks > 0:
-                        keys = [meta_key] + [f"{base_key}:chunk:{i}" for i in range(num_chunks)]
-                        await redis_client.unlink(*keys)
-                    else:
-                        await redis_client.delete(meta_key)
-                        async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
-                            await redis_client.delete(key)
+        # Read before the claim below: `parts` cascades from the upload row it deletes.
+        parts = (
+            await db.fetch(get_query("list_parts_for_version"), object_id, object_version)
+            if object_version is not None
+            else []
+        )
 
-        # Stop the drain churn BEFORE deleting the upload header. This aborted version's
-        # address will never be written, so its parts and the drain's
-        # cephor_replication_status rows would otherwise leak: the reconciler keeps
-        # re-recording them and the drain keeps re-claiming + re-copying + re-deferring the
-        # enqueue forever, on every node. Marking the version's replication rows terminal
-        # makes the reconciler skip them and claim_part never re-claim them, fleet-wide.
-        # Order matters: mark first so the churn-stop is durable even if we die before the
-        # delete below. The backstop for a thrown mark is the cephor-orphan SWEEP
-        # (list_orphan_replication_versions) — NOT the abandoned-upload reaper: the reaper
-        # keys on multipart_uploads, which the delete below removes, so it could never see
-        # this version again. The sweep keys on cephor_replication_status, which survives
-        # the delete, so it still finds and terminates the orphan.
-        # Skipped when the upload had no parts of its own (object_version is None).
-        if object_version is not None:
-            with contextlib.suppress(Exception):
-                await fail_version_replication(db, object_id=object_id, object_version=object_version)
-
-        # Fully remove the multipart upload (and cascade parts) so it disappears from listings immediately.
-        # The query only deletes an upload that is still open, so a CompleteMultipartUpload that
-        # committed after the check above keeps its parts; skip the version cleanup below then too.
+        # CLAIM the upload before anything destructive runs. The delete only matches an upload that
+        # is still open, and it serialises on the upload row with CompleteMultipartUpload's own
+        # conditional flip of is_completed: whichever commits first wins, and the loser changes
+        # nothing. Everything below this point therefore only ever touches an upload that is really
+        # aborted — the cleanup used to run first, so an abort racing a completion could fail the
+        # completed version's replication and drop its cache before discovering it had lost.
         async with db.transaction():
             aborted = await db.fetchrow(
                 get_query("abort_multipart_upload"),
@@ -1002,6 +981,42 @@ async def abort_multipart_upload(
                 "The specified upload does not exist",
                 status_code=404,
             )
+
+        # Clean up Redis keys for cached parts (meta + chunks) — only for our own version.
+        if object_version is not None and parts:
+            redis_client = request.app.state.redis_client
+            delegate = RedisObjectPartsCache(redis_client)
+            for part in parts:
+                part_num = int(part["part_number"])
+                meta_key = delegate.build_meta_key(str(object_id), object_version, part_num)
+                base_key = delegate.build_key(str(object_id), object_version, part_num)
+                # MPU-4: delete the meta + chunk keys by computed name in one pipelined UNLINK
+                # instead of a per-part keyspace SCAN. num_chunks comes from the FS meta; if it's
+                # absent (nothing to compute from), fall back to the SCAN.
+                fs_meta = await request.app.state.fs_store.get_meta(str(object_id), int(object_version), part_num)
+                num_chunks = int(fs_meta.get("num_chunks", 0)) if fs_meta else 0
+                if num_chunks > 0:
+                    keys = [meta_key] + [f"{base_key}:chunk:{i}" for i in range(num_chunks)]
+                    await redis_client.unlink(*keys)
+                else:
+                    await redis_client.delete(meta_key)
+                    async for key in redis_client.scan_iter(f"{base_key}:chunk:*"):
+                        await redis_client.delete(key)
+
+        # Stop the drain churn. This aborted version's address will never be written, so its
+        # parts and the drain's cephor_replication_status rows would otherwise leak: the
+        # reconciler keeps re-recording them and the drain keeps re-claiming + re-copying +
+        # re-deferring the enqueue forever, on every node. Marking the version's replication rows
+        # terminal makes the reconciler skip them and claim_part never re-claim them, fleet-wide.
+        # This runs after the claim, so dying in between leaves the rows unmarked; the backstop is
+        # the cephor-orphan SWEEP (list_orphan_replication_versions) — NOT the abandoned-upload
+        # reaper, which keys on the multipart_uploads row the claim removed. The sweep keys on
+        # cephor_replication_status, which survives the delete, so it still finds and terminates
+        # the orphan (the same backstop a thrown mark has always relied on).
+        # Skipped when the upload had no parts of its own (object_version is None).
+        if object_version is not None:
+            with contextlib.suppress(Exception):
+                await fail_version_replication(db, object_id=object_id, object_version=object_version)
 
         # B5: repoint current_object_version off the empty reserved row this aborted upload left
         # behind. The row itself is RETAINED — deleting it let MAX(object_version) drop, so the
@@ -1166,7 +1181,7 @@ async def complete_multipart_upload(
     try:
         # Validate the multipart upload exists
         multipart_upload = await db.fetchrow(get_query("get_multipart_upload"), upload_id)
-        if not multipart_upload:
+        if not multipart_upload or not upload_addressed_by(multipart_upload, bucket_name, object_key):
             return s3_error_response(
                 "NoSuchUpload",
                 "The specified upload does not exist",
@@ -1336,6 +1351,13 @@ async def complete_multipart_upload(
             # Nothing was committed: the upload stays open and can be aborted, as on S3.
             logger.info(f"CompleteMultipartUpload {bucket_name}/{object_key}: If-None-Match: * and the key exists")
             return errors.precondition_failed_response()
+        except UploadNoLongerOpen:
+            # An abort claimed the upload first; its parts are gone and nothing was committed here.
+            return s3_error_response(
+                "NoSuchUpload",
+                "The specified upload does not exist",
+                status_code=404,
+            )
 
         # Drain-direct (s3-2.1 PR-11): the api does NOT enqueue the backend upload. It
         # persists the main-account address (the upload identity); the Rust drain reads

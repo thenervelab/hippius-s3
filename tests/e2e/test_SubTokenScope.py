@@ -376,9 +376,7 @@ def test_object_read_write_no_delete_is_write_once(
 
         refused = [
             lambda: boto3_sub_token_client.delete_object(Bucket=bucket, Key="run/1.full"),
-            lambda: boto3_sub_token_client.delete_object(
-                Bucket=bucket, Key="run/1.full", VersionId=put["VersionId"]
-            ),
+            lambda: boto3_sub_token_client.delete_object(Bucket=bucket, Key="run/1.full", VersionId=put["VersionId"]),
             lambda: boto3_sub_token_client.delete_objects(
                 Bucket=bucket, Delete={"Objects": [{"Key": "run/1.full"}, {"Key": "run/1.inc"}]}
             ),
@@ -391,6 +389,11 @@ def test_object_read_write_no_delete_is_write_once(
                 Retention={"Mode": "GOVERNANCE", "RetainUntilDate": "2030-01-01T00:00:00Z"},
             ),
             lambda: boto3_sub_token_client.delete_bucket(Bucket=bucket),
+            lambda: boto3_sub_token_client.put_object_acl(Bucket=bucket, Key="run/1.full", ACL="public-read-write"),
+            lambda: boto3_sub_token_client.put_object_tagging(Bucket=bucket, Key="run/1.full", Tagging={"TagSet": []}),
+            lambda: boto3_sub_token_client.put_object(
+                Bucket=bucket, Key="run/3.full", Body=b"x", ACL="public-read-write"
+            ),
         ]
         for call in refused:
             with pytest.raises(ClientError) as exc:

@@ -94,3 +94,23 @@ def test_a_tombstoned_finalize_cleans_up_rather_than_leaking_the_part() -> None:
         r"except ObjectNotFound:(?:.|\n){0,600}?await _delete_part_row\(\)",
         source,
     ), "finalize must also remove the parts row when the version was tombstoned mid-append"
+
+
+def test_an_append_never_rewrites_a_locked_version() -> None:
+    """An append changes THIS version's size, ETag and parts in place, so on an Object-Locked
+    version it is an overwrite of retained data — reachable with nothing more than write access.
+    Both row locks must judge the lock (the first before the body is read, the second because a
+    hold can land while it streams), and the commit-time refusal must clean up the written part."""
+    source = _append_stream_source()
+    locking_reads = [stmt for stmt in _version_scoped_statements(source) if "FOR UPDATE" in stmt]
+
+    assert len(locking_reads) == 2, f"expected the reservation lock and the finalize lock, found {len(locking_reads)}"
+    for stmt in locking_reads:
+        assert "object_lock_legal_hold" in stmt and "object_lock_retain_until" in stmt, (
+            "a locking read that does not select the lock columns cannot judge the lock:\n" + stmt.strip()
+        )
+    assert source.count("if is_version_locked(locked):") == 2
+    assert re.search(
+        r"except ObjectVersionLocked:\s*\n(?:\s*#.*\n)*\s*await _cleanup_part\((?:.|\n){0,200}?await _delete_part_row\(\)",
+        source,
+    ), "a lock found at commit time must clean up the part written for the refused append"

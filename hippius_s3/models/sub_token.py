@@ -57,6 +57,10 @@ class Op(str, Enum):
     # PutObjectRetention / PutObjectLegalHold. Separate from write_object because setting, extending
     # or lifting a lock is authority over WHETHER data can be deleted, not over what data exists.
     write_object_lock = "write_object_lock"
+    # PutObjectAcl, PutObjectTagging, and an object write carrying x-amz-acl / x-amz-grant-*.
+    # Separate from write_object because an ACL can hand WRITE (and so delete) to another key, and
+    # a tag write replaces the whole set — both destroy or delegate rather than add.
+    write_object_meta = "write_object_meta"
 
 
 # ---- dataclass ------------------------------------------------------------

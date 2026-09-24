@@ -29,6 +29,7 @@ from hippius_s3.gateway.services.sub_token_scope import bucket_in_scope
 from hippius_s3.gateway.services.sub_token_scope import evaluate
 from hippius_s3.gateway.services.sub_token_scope import permission_allows
 from hippius_s3.gateway.services.sub_token_scope import required_op
+from hippius_s3.gateway.services.sub_token_scope import sets_acl
 from hippius_s3.models.sub_token import BucketScope
 from hippius_s3.models.sub_token import Op
 from hippius_s3.models.sub_token import Permission
@@ -211,9 +212,9 @@ ALL_S3_OPS: list[S3Op] = [
     ),
     # --- Object subresources ---------------------------------------------
     S3Op("GetObjectAcl", "GET", has_key=True, query={"acl": ""}, expected_op=Op.read_object),
-    S3Op("PutObjectAcl", "PUT", has_key=True, query={"acl": ""}, expected_op=Op.write_object),
+    S3Op("PutObjectAcl", "PUT", has_key=True, query={"acl": ""}, expected_op=Op.write_object_meta),
     S3Op("GetObjectTagging", "GET", has_key=True, query={"tagging": ""}, expected_op=Op.read_object),
-    S3Op("PutObjectTagging", "PUT", has_key=True, query={"tagging": ""}, expected_op=Op.write_object),
+    S3Op("PutObjectTagging", "PUT", has_key=True, query={"tagging": ""}, expected_op=Op.write_object_meta),
     S3Op("DeleteObjectTagging", "DELETE", has_key=True, query={"tagging": ""}, expected_op=Op.delete_object),
     S3Op("GetObjectVersion", "GET", has_key=True, query={"versionId": "v1"}, expected_op=Op.read_object),
     S3Op("DeleteObjectVersion", "DELETE", has_key=True, query={"versionId": "v1"}, expected_op=Op.delete_object),
@@ -392,6 +393,7 @@ EXPECTED_ALLOW: dict[Permission, set[Op]] = {
         Op.read_bucket_meta,
         Op.write_bucket_meta,
         Op.write_object_lock,
+        Op.write_object_meta,
     },
     Permission.admin_read: {
         Op.read_object,
@@ -402,6 +404,7 @@ EXPECTED_ALLOW: dict[Permission, set[Op]] = {
     Permission.object_read_write: {
         Op.read_object,
         Op.write_object,
+        Op.write_object_meta,
         Op.delete_object,
         Op.list_bucket,
     },
@@ -778,6 +781,9 @@ _WRITE_ONCE_ALLOWED = [
 ]
 
 _WRITE_ONCE_DENIED = [
+    "PutObjectAcl",
+    "PutObjectTagging",
+    "DeleteObjectTagging",
     "DeleteObject",
     "DeleteObjectVersion",
     "DeleteObjects",
@@ -820,3 +826,26 @@ def test_only_admin_read_write_may_change_an_object_lock(permission: Permission,
     scope = _scope(permission, BucketScope.all, [])
     allowed, _ = evaluate(scope=scope, bucket_id="bkt", method=op.method, has_key=op.has_key, query_params=op.query)
     assert not allowed, f"{permission.value} must not be able to {name}"
+
+
+@pytest.mark.parametrize(
+    "headers,expected",
+    [
+        ({"x-amz-acl": "public-read-write"}, True),
+        ({"x-amz-grant-write": "id=hip_other"}, True),
+        ({"X-Amz-Grant-Full-Control": "id=hip_other"}, True),
+        ({"x-amz-object-lock-mode": "COMPLIANCE", "content-type": "a/b"}, False),
+    ],
+)
+def test_sets_acl_detects_canned_and_explicit_grants(headers: dict[str, str], expected: bool) -> None:
+    assert sets_acl(headers) is expected
+
+
+@pytest.mark.parametrize("method,query", [("PUT", {}), ("POST", {"uploads": ""})])
+def test_a_write_carrying_an_acl_is_an_object_meta_write(method: str, query: dict[str, str]) -> None:
+    """PutObject / CreateMultipartUpload with x-amz-acl can grant WRITE — and so delete — to others."""
+    assert required_op(method, True, query, carries_acl=True) is Op.write_object_meta
+    allowed, _ = evaluate(
+        scope=_NO_DELETE, bucket_id="bkt", method=method, has_key=True, query_params=query, carries_acl=True
+    )
+    assert not allowed

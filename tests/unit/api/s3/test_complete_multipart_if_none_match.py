@@ -29,6 +29,8 @@ def _db(key_existed_at_initiate: bool = False) -> Any:
     rows = {
         get_query("get_multipart_upload"): {
             "object_id": object_id,
+            "bucket_name": "bkt",
+            "object_key": "big.bin",
             "is_completed": False,
             "current_object_version": 1,
             "key_existed_at_initiate": key_existed_at_initiate,

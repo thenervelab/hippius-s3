@@ -136,4 +136,3 @@ def test_write_path_applies_the_signed_lock(method: str, path: str) -> None:
     assert outcome == ("COMPLIANCE", RETAIN_UNTIL, False), (
         "explicit signed headers must override the bucket default, in botocore's date format"
     )
-

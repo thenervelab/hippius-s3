@@ -40,6 +40,14 @@ class EmptyAppendError(Exception):
     pass
 
 
+class UploadNoLongerOpen(Exception):
+    """CompleteMultipartUpload found its upload aborted (or completed) under it; nothing was committed."""
+
+
+class ObjectVersionLocked(Exception):
+    """An append would change an Object-Locked version in place, which a lock forbids."""
+
+
 class PreconditionFailed(Exception):
     """A conditional write (If-None-Match: *) found the key already existing."""
 

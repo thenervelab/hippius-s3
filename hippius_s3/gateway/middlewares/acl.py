@@ -12,6 +12,8 @@ from hippius_s3.gateway.services.sub_token_scope import OP_READ_OBJECT
 from hippius_s3.gateway.services.sub_token_scope import bucket_in_scope
 from hippius_s3.gateway.services.sub_token_scope import evaluate as evaluate_sub_token_scope
 from hippius_s3.gateway.services.sub_token_scope import permission_allows
+from hippius_s3.gateway.services.sub_token_scope import required_op as required_sub_token_op
+from hippius_s3.gateway.services.sub_token_scope import sets_acl
 from hippius_s3.gateway.services.sub_token_scope_cache import get_cached_sub_token_scope
 from hippius_s3.gateway.services.suspension import get_account_suspension
 from hippius_s3.gateway.services.suspension import suspension_blocks
@@ -21,27 +23,6 @@ from hippius_s3.gateway.utils.paths import routing_path
 from hippius_s3.models.acl import Permission
 from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
-
-
-def _parse_copy_source_bucket(header_value: str) -> str | None:
-    """Extract the source bucket from an `x-amz-copy-source` header.
-
-    Accepted formats (per AWS S3 SDKs):
-      - `/sourcebucket/sourcekey`
-      - `sourcebucket/sourcekey`
-      - `sourcebucket/sourcekey?versionId=v1`
-
-    The ARN form (`arn:aws:s3:::bucket/key`) is not supported and returns None.
-    The bucket portion is never URL-encoded in real-world traffic — only the
-    key — so we don't need to decode.
-    """
-    if not header_value or header_value.startswith("arn:"):
-        return None
-    val = header_value.lstrip("/").split("?", 1)[0]
-    parts = val.split("/", 1)
-    if not parts or not parts[0]:
-        return None
-    return parts[0]
 
 
 def parse_copy_source(header_value: str) -> tuple[str | None, str | None]:
@@ -331,11 +312,26 @@ async def acl_middleware(
     # -------------------------------------------------------------------------
     if auth_method in ("access_key", "bearer_access_key") and token_type == "sub" and access_key:
         is_cross_account = bucket_owner_id is not None and bucket_owner_id != account_id
-        if not is_cross_account:
-            repo = request.app.state.sub_token_scope_repo
-            redis_client = request.app.state.redis_client
-            scope = await get_cached_sub_token_scope(access_key, repo, redis_client)
+        repo = request.app.state.sub_token_scope_repo
+        redis_client = request.app.state.redis_client
+        scope = await get_cached_sub_token_scope(access_key, repo, redis_client)
+        carries_acl = sets_acl(request.headers)
 
+        # The tier is a CEILING, whoever's bucket it is. A cross-account request is authorised by
+        # the owner's grants below, but those grants must not lift the key past its own tier:
+        # otherwise a write-once key granted WRITE on another account's bucket could delete there,
+        # and one granted WRITE_ACP could lift a legal hold. A token with no scope row keeps the
+        # plain contractor behaviour (grants alone), as before.
+        if is_cross_account and scope is not None:
+            op = required_sub_token_op(request.method, key is not None, query_params, carries_acl=carries_acl)
+            if not permission_allows(scope.permission, op):
+                logger.info(
+                    f"Sub-token cross-account request above its tier: account={account_id}, bucket={bucket}, "
+                    f"method={request.method}, permission={scope.permission.value}, op={op.value}"
+                )
+                return _access_denied()
+
+        if not is_cross_account:
             # ListBuckets: no bucket in play.
             if bucket is None:
                 if scope is None or not permission_allows(scope.permission, OP_LIST_BUCKETS):
@@ -361,6 +357,7 @@ async def acl_middleware(
                 method=request.method,
                 has_key=key is not None,
                 query_params=query_params,
+                carries_acl=carries_acl,
             )
             logger.info(
                 f"Sub-token scope check: account={account_id}, bucket={bucket}, key={key or 'None'}, "
@@ -378,7 +375,10 @@ async def acl_middleware(
             # backend / bucket-ACL flow (existing contractor pattern).
             copy_source = request.headers.get("x-amz-copy-source")
             if copy_source and key is not None and scope is not None:
-                src_bucket_name = _parse_copy_source_bucket(copy_source)
+                # parse_copy_source, not a local split: it decodes BEFORE splitting, exactly as the
+                # handlers do. A split-first parser read `secret%2Fkey` as the nonexistent bucket
+                # `secret%2Fkey`, skipped this check, and the handler then copied from `secret`.
+                src_bucket_name, _ = parse_copy_source(copy_source)
                 if src_bucket_name:
                     src_lookup = await acl_service.get_bucket_owner_and_id(src_bucket_name)
                     src_owner_id = src_lookup.owner_id if src_lookup else None

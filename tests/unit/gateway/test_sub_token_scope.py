@@ -13,6 +13,7 @@ from hippius_s3.gateway.services.sub_token_scope import OP_READ_BUCKET_META
 from hippius_s3.gateway.services.sub_token_scope import OP_READ_OBJECT
 from hippius_s3.gateway.services.sub_token_scope import OP_WRITE_BUCKET_META
 from hippius_s3.gateway.services.sub_token_scope import OP_WRITE_OBJECT
+from hippius_s3.gateway.services.sub_token_scope import OP_WRITE_OBJECT_META
 from hippius_s3.gateway.services.sub_token_scope import bucket_in_scope
 from hippius_s3.gateway.services.sub_token_scope import evaluate
 from hippius_s3.gateway.services.sub_token_scope import permission_allows
@@ -36,8 +37,8 @@ from hippius_s3.repositories.sub_token_scope_repository import SubTokenScope
         ("GET", True, {"tagging": ""}, OP_READ_OBJECT),
         ("GET", True, {"acl": ""}, OP_READ_OBJECT),
         # Object subresource writes are still object writes
-        ("PUT", True, {"tagging": ""}, OP_WRITE_OBJECT),
-        ("PUT", True, {"acl": ""}, OP_WRITE_OBJECT),
+        ("PUT", True, {"tagging": ""}, OP_WRITE_OBJECT_META),
+        ("PUT", True, {"acl": ""}, OP_WRITE_OBJECT_META),
         # Bucket-level, no subresource
         ("GET", False, {}, OP_LIST_BUCKET),
         ("HEAD", False, {}, OP_LIST_BUCKET),

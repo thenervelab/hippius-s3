@@ -74,36 +74,51 @@ async def handle_delete_bucket(bucket_name: str, request: Request, db: Any, redi
             BucketName=bucket_name,
         )
 
-    # S3 semantics: refuse to delete a bucket that still holds any version or delete marker — not
-    # merely a listable key. See the query for why ListObjects' view of "empty" was not enough.
-    if await db.fetchval(get_query("bucket_has_retained_versions"), bucket["bucket_id"]):
-        return errors.s3_error_response(
-            "BucketNotEmpty",
-            "The bucket you tried to delete is not empty",
-            status_code=409,
-            BucketName=bucket_name,
-        )
+    # One transaction around the check and the soft-delete, with the bucket row locked first, so
+    # an object or upload being created concurrently is either committed before the check sees it
+    # or held off until the bucket is gone. See lock_bucket_for_delete.sql.
+    #
+    # Residual: a request that resolved the bucket BEFORE this commits and inserts AFTER it still
+    # lands in the soft-deleted bucket — the write path does not re-check buckets.deleted_at.
+    async with db.transaction():
+        if not await db.fetchrow(get_query("lock_bucket_for_delete"), bucket["bucket_id"]):
+            return errors.s3_error_response(
+                "NoSuchBucket",
+                f"The specified bucket {bucket_name} does not exist",
+                status_code=404,
+                BucketName=bucket_name,
+            )
 
-    # Block deletion if there are ongoing multipart uploads (S3 spec).
-    ongoing_uploads = await db.fetch(get_query("list_multipart_uploads"), bucket["bucket_id"], None)
-    if ongoing_uploads:
-        return errors.s3_error_response(
-            "BucketNotEmpty",
-            "The bucket has ongoing multipart uploads",
-            status_code=409,
-            BucketName=bucket_name,
-        )
+        # S3 semantics: refuse while any version or delete marker remains — not merely a listable
+        # key — and while an upload is open. See the query for why ListObjects' view of "empty"
+        # was not enough.
+        emptiness = await db.fetchrow(get_query("bucket_emptiness"), bucket["bucket_id"])
+        if emptiness["has_versions"]:
+            return errors.s3_error_response(
+                "BucketNotEmpty",
+                "The bucket you tried to delete is not empty",
+                status_code=409,
+                BucketName=bucket_name,
+            )
+        if emptiness["has_open_uploads"]:
+            return errors.s3_error_response(
+                "BucketNotEmpty",
+                "The bucket has ongoing multipart uploads",
+                status_code=409,
+                BucketName=bucket_name,
+            )
 
-    # Soft-delete: set deleted_at. Idempotent — a concurrent caller may have
-    # already won this race; an empty result means the bucket is already gone
-    # (return 404 NoSuchBucket per S3 spec, NOT 403 — auth is enforced upstream).
-    soft_deleted = await db.fetchrow(get_query("soft_delete_bucket"), bucket["bucket_id"])
-    if not soft_deleted:
-        return errors.s3_error_response(
-            "NoSuchBucket",
-            f"The specified bucket {bucket_name} does not exist",
-            status_code=404,
-            BucketName=bucket_name,
-        )
+        # Soft-delete: set deleted_at. Idempotent — the row lock above makes a concurrent
+        # DeleteBucket wait and then find nothing to lock, so an empty result here is unexpected
+        # but still means the bucket is gone (404 NoSuchBucket per S3 spec, NOT 403 — auth is
+        # enforced upstream).
+        soft_deleted = await db.fetchrow(get_query("soft_delete_bucket"), bucket["bucket_id"])
+        if not soft_deleted:
+            return errors.s3_error_response(
+                "NoSuchBucket",
+                f"The specified bucket {bucket_name} does not exist",
+                status_code=404,
+                BucketName=bucket_name,
+            )
 
     return Response(status_code=204)

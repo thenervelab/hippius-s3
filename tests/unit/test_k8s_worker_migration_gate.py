@@ -87,7 +87,9 @@ def test_the_exception_list_does_not_rot() -> None:
     names = {(d.get("metadata") or {})["name"] for d in _worker_docs()}
     gated = {(d.get("metadata") or {})["name"] for d in _worker_docs() if _gates_on_migrations(d)}
 
-    assert not (UNGATED_BY_DESIGN - names), f"UNGATED_BY_DESIGN names workers that no longer exist: {UNGATED_BY_DESIGN - names}"
+    assert not (UNGATED_BY_DESIGN - names), (
+        f"UNGATED_BY_DESIGN names workers that no longer exist: {UNGATED_BY_DESIGN - names}"
+    )
     assert not (UNGATED_BY_DESIGN & gated), (
         f"These are listed as ungated by design but now have the gate; drop them from the list: "
         f"{sorted(UNGATED_BY_DESIGN & gated)}"

@@ -1,6 +1,6 @@
-"""DeleteBucket's emptiness check and the abort query, against real Postgres.
+"""DeleteBucket's emptiness check and the multipart abort/complete claims, against real Postgres.
 
-`bucket_has_retained_versions` replaced a `list_objects` probe that only saw keys whose newest
+`bucket_emptiness` replaced a `list_objects` probe that only saw keys whose newest
 version is live content. A versioned bucket whose keys were all hidden behind delete markers read as
 empty, so DeleteBucket soft-deleted it and orphaned every non-current version under it — Object-Locked
 ones included. Each case below is a bucket state that probe got wrong or that the fix must not
@@ -12,6 +12,8 @@ non-delete permission: a completed upload's parts cascade from its multipart_upl
 
 from __future__ import annotations
 
+import asyncio
+import os
 import uuid
 from datetime import datetime
 from datetime import timedelta
@@ -117,7 +119,8 @@ async def _object(
 
 
 async def _has_versions(ctx: Ctx) -> bool:
-    return bool(await ctx.conn.fetchval(get_query("bucket_has_retained_versions"), ctx.bucket_id))
+    row = await ctx.conn.fetchrow(get_query("bucket_emptiness"), ctx.bucket_id)
+    return bool(row["has_versions"])
 
 
 async def _list_objects_sees_any(ctx: Ctx) -> bool:
@@ -129,7 +132,7 @@ LATER = datetime.now(timezone.utc) + timedelta(days=30)
 EARLIER = datetime.now(timezone.utc) - timedelta(days=1)
 
 
-class TestBucketHasRetainedVersions:
+class TestBucketEmptiness:
     async def test_empty_bucket_is_empty(self, ctx: Ctx) -> None:
         assert await _has_versions(ctx) is False
 
@@ -153,10 +156,12 @@ class TestBucketHasRetainedVersions:
         await _object(ctx, key="k", versions=[{"version": 1, "deleted": True}, {"version": 2, "marker": True}])
         assert await _has_versions(ctx) is True
 
-    async def test_locked_version_under_a_soft_deleted_object_counts(self, ctx: Ctx) -> None:
-        """The SQL gates keep these bytes until the lock ends; the bucket must outlive them."""
-        await _object(ctx, key="k", versions=[{"version": 1, "hold": True}], object_deleted=True)
-        assert await _has_versions(ctx) is True
+    async def test_a_locked_aborted_upload_placeholder_does_not_count(self, ctx: Ctx) -> None:
+        """CreateMultipartUpload applies the lock to its reserved row; an abort then leaves that row
+        with no data. Counting it would let any key that can initiate an upload make the bucket
+        undeletable for the full retention, with nothing S3-visible the owner could remove."""
+        await _object(ctx, key="k", versions=[{"version": 1, "size": 0, "md5": None, "hold": True}])
+        assert await _has_versions(ctx) is False
 
     async def test_a_soft_deleted_object_without_a_lock_does_not_count(self, ctx: Ctx) -> None:
         """What an unversioned DELETE leaves behind until the hard-delete ring runs. Counting it
@@ -164,9 +169,13 @@ class TestBucketHasRetainedVersions:
         await _object(ctx, key="k", versions=[{"version": 1}], object_deleted=True)
         assert await _has_versions(ctx) is False
 
-    async def test_an_expired_lock_under_a_soft_deleted_object_does_not_count(self, ctx: Ctx) -> None:
-        await _object(ctx, key="k", versions=[{"version": 1, "retain_until": EARLIER}], object_deleted=True)
-        assert await _has_versions(ctx) is False
+    async def test_open_upload_is_reported_separately(self, ctx: Ctx) -> None:
+        """A PUT or MPU still being written holds an open upload row; it must block DeleteBucket
+        even though its reserved version is not yet serveable."""
+        await _object(ctx, key="k", versions=[{"version": 1, "size": 0, "md5": None}], upload_completed=False)
+        row = await ctx.conn.fetchrow(get_query("bucket_emptiness"), ctx.bucket_id)
+        assert row["has_versions"] is False
+        assert row["has_open_uploads"] is True
 
     async def test_every_version_deleted_by_version_id_does_not_count(self, ctx: Ctx) -> None:
         await _object(ctx, key="k", versions=[{"version": 1, "deleted": True}, {"version": 2, "deleted": True}])
@@ -192,17 +201,18 @@ class TestBucketHasRetainedVersions:
             f"emptiness-{ctx.bucket_id}",
         )
         try:
-            await _object(
-                Ctx(ctx.conn, other), key="k", versions=[{"version": 1, "hold": True}], object_deleted=True
-            )
-            assert await _has_versions(ctx) is False
+            await _object(Ctx(ctx.conn, other), key="k", versions=[{"version": 1}], upload_completed=False)
+            row = await ctx.conn.fetchrow(get_query("bucket_emptiness"), ctx.bucket_id)
+            assert (row["has_versions"], row["has_open_uploads"]) == (False, False)
         finally:
             await ctx.conn.execute("DELETE FROM buckets WHERE bucket_id = $1", other)
 
 
 class TestAbortMultipartUploadQuery:
     async def test_open_upload_is_deleted_with_its_parts(self, ctx: Ctx) -> None:
-        _, upload_id = await _object(ctx, key="k", versions=[{"version": 1, "size": 0, "md5": None}], upload_completed=False)
+        _, upload_id = await _object(
+            ctx, key="k", versions=[{"version": 1, "size": 0, "md5": None}], upload_completed=False
+        )
         assert await ctx.conn.fetchrow(get_query("abort_multipart_upload"), upload_id) is not None
         assert await ctx.conn.fetchval("SELECT count(*) FROM parts WHERE upload_id = $1", upload_id) == 0
 
@@ -212,3 +222,82 @@ class TestAbortMultipartUploadQuery:
         _, upload_id = await _object(ctx, key="k", versions=[{"version": 1, "retain_until": LATER}])
         assert await ctx.conn.fetchrow(get_query("abort_multipart_upload"), upload_id) is None
         assert await ctx.conn.fetchval("SELECT count(*) FROM parts WHERE upload_id = $1", upload_id) == 1
+
+
+async def _second_connection() -> asyncpg.Connection:
+    return await asyncpg.connect(dsn=os.environ["DATABASE_URL"])
+
+
+class TestDeleteBucketLock:
+    async def test_the_bucket_lock_waits_for_an_in_flight_create(self, ctx: Ctx) -> None:
+        """A create still in its transaction holds FOR KEY SHARE on the bucket through its foreign
+        key. DeleteBucket's FOR UPDATE must wait for it, and the emptiness check that follows must
+        see the committed row — not the empty bucket it would have seen a moment earlier."""
+        writer = await _second_connection()
+        try:
+            tx = writer.transaction()
+            await tx.start()
+            await writer.execute(
+                "INSERT INTO multipart_uploads (upload_id, bucket_id, object_key, initiated_at, is_completed) "
+                "VALUES ($1, $2, 'in-flight', now(), FALSE)",
+                uuid.uuid4(),
+                ctx.bucket_id,
+            )
+
+            async def delete_bucket_check() -> Any:
+                async with ctx.conn.transaction():
+                    assert await ctx.conn.fetchrow(get_query("lock_bucket_for_delete"), ctx.bucket_id)
+                    return await ctx.conn.fetchrow(get_query("bucket_emptiness"), ctx.bucket_id)
+
+            check = asyncio.create_task(delete_bucket_check())
+            await asyncio.sleep(0.3)
+            assert not check.done(), "the bucket lock must wait for the in-flight create"
+            await tx.commit()
+            row = await asyncio.wait_for(check, timeout=5)
+            assert row["has_open_uploads"] is True
+        finally:
+            await writer.close()
+
+
+class TestAbortCompleteRace:
+    async def test_complete_first_leaves_abort_nothing_to_claim(self, ctx: Ctx) -> None:
+        _, upload_id = await _object(
+            ctx, key="k", versions=[{"version": 1, "size": 0, "md5": None}], upload_completed=False
+        )
+        completer = await _second_connection()
+        try:
+            tx = completer.transaction()
+            await tx.start()
+            flipped = await completer.fetchval(
+                "UPDATE multipart_uploads SET is_completed = TRUE "
+                "WHERE upload_id = $1 AND is_completed = FALSE RETURNING upload_id",
+                upload_id,
+            )
+            assert flipped == upload_id
+
+            abort = asyncio.create_task(ctx.conn.fetchrow(get_query("abort_multipart_upload"), upload_id))
+            await asyncio.sleep(0.3)
+            assert not abort.done(), "the abort must queue behind the completion's row lock"
+            await tx.commit()
+            assert await asyncio.wait_for(abort, timeout=5) is None
+            assert await ctx.conn.fetchval("SELECT count(*) FROM parts WHERE upload_id = $1", upload_id) == 1
+        finally:
+            await completer.close()
+
+    async def test_abort_first_makes_the_completion_flip_find_nothing(self, ctx: Ctx) -> None:
+        _, upload_id = await _object(
+            ctx, key="k", versions=[{"version": 1, "size": 0, "md5": None}], upload_completed=False
+        )
+        assert await ctx.conn.fetchrow(get_query("abort_multipart_upload"), upload_id) is not None
+        flipped = await ctx.conn.fetchval(
+            "UPDATE multipart_uploads SET is_completed = TRUE "
+            "WHERE upload_id = $1 AND is_completed = FALSE RETURNING upload_id",
+            upload_id,
+        )
+        assert flipped is None, "mpu_complete raises UploadNoLongerOpen on this and rolls back"
+
+    async def test_a_null_is_completed_row_is_not_aborted(self, ctx: Ctx) -> None:
+        """Not known to be open, so not deleted: its parts may be a committed object's data."""
+        _, upload_id = await _object(ctx, key="k", versions=[{"version": 1}])
+        await ctx.conn.execute("UPDATE multipart_uploads SET is_completed = NULL WHERE upload_id = $1", upload_id)
+        assert await ctx.conn.fetchrow(get_query("abort_multipart_upload"), upload_id) is None

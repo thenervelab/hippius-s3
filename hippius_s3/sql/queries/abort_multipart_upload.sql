@@ -3,5 +3,5 @@
 -- Parameters: $1: upload_id
 DELETE FROM multipart_uploads
 WHERE upload_id = $1
-  AND is_completed IS NOT TRUE
+  AND is_completed = FALSE
 RETURNING upload_id

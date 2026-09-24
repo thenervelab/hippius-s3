@@ -17,6 +17,7 @@ import asyncpg
 from opentelemetry import trace
 
 from hippius_s3.api.middlewares.tracing import set_span_attributes
+from hippius_s3.api.s3.object_lock_enforcement import is_version_locked
 from hippius_s3.blake3_hash import new_hasher as new_blake3
 from hippius_s3.blake3_hash import persist_version_hash
 from hippius_s3.cache import FileSystemPartsStore
@@ -39,9 +40,11 @@ from hippius_s3.writer.types import BadDigest
 from hippius_s3.writer.types import CompleteResult
 from hippius_s3.writer.types import EmptyAppendError
 from hippius_s3.writer.types import ObjectNotFound
+from hippius_s3.writer.types import ObjectVersionLocked
 from hippius_s3.writer.types import PartResult
 from hippius_s3.writer.types import PreconditionFailed
 from hippius_s3.writer.types import PutResult
+from hippius_s3.writer.types import UploadNoLongerOpen
 from hippius_s3.writer.write_through_writer import WriteThroughPartsWriter
 
 
@@ -1066,11 +1069,17 @@ class ObjectWriter:
                 subset_to_store,
             )
 
-            # Mark MPU completed
-            await conn.execute(
-                "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
+            # Mark MPU completed — only if it is still open. An abort claims the upload by deleting
+            # this row (cascading its parts); the two serialise on the row lock, and if the abort
+            # won, raising here rolls back the version finalize above instead of committing a
+            # version whose parts are gone.
+            flipped = await conn.fetchval(
+                "UPDATE multipart_uploads SET is_completed = TRUE "
+                "WHERE upload_id = $1 AND is_completed = FALSE RETURNING upload_id",
                 upload_id,
             )
+            if flipped is None:
+                raise UploadNoLongerOpen()
 
         return CompleteResult(etag=final_md5, size_bytes=int(total_size))
 
@@ -1128,7 +1137,7 @@ class ObjectWriter:
             # while the DELETE's unpin destroys the rest of it.
             locked = await conn.fetchrow(
                 """
-                SELECT append_version
+                SELECT append_version, object_lock_legal_hold, object_lock_retain_until
                   FROM object_versions
                  WHERE object_id = $1 AND object_version = $2 AND deleted_at IS NULL
                  FOR UPDATE
@@ -1138,6 +1147,11 @@ class ObjectWriter:
             )
             if not locked:
                 raise ObjectNotFound("NoSuchKey")
+            # An append rewrites THIS version's size, ETag and parts in place, so on a locked version
+            # it is an overwrite of retained data. Refused here, before the body is read; re-checked
+            # under the commit's lock below, since a hold can land while the body streams.
+            if is_version_locked(locked):
+                raise ObjectVersionLocked()
             if if_none_match:
                 # Create-only, judged under the same lock the CAS uses rather than by a read before
                 # the call: reaching here means the key exists and is live (an absent or tombstoned
@@ -1300,7 +1314,9 @@ class ObjectWriter:
                     """
                     SELECT append_version,
                            md5_hash,
-                           (append_etag_md5s IS NOT NULL AND octet_length(append_etag_md5s) > 0) AS has_etag_md5s
+                           (append_etag_md5s IS NOT NULL AND octet_length(append_etag_md5s) > 0) AS has_etag_md5s,
+                           object_lock_legal_hold,
+                           object_lock_retain_until
                       FROM object_versions
                      WHERE object_id = $1 AND object_version = $2 AND deleted_at IS NULL
                      FOR UPDATE
@@ -1317,6 +1333,8 @@ class ObjectWriter:
                 # while the DELETE's unpin destroys everything around them.
                 if not locked:
                     raise ObjectNotFound("NoSuchKey")
+                if is_version_locked(locked):
+                    raise ObjectVersionLocked()
                 current_version = int(locked["append_version"])
                 if expected_version != current_version:
                     raise AppendPreconditionFailed(current_version)
@@ -1410,6 +1428,11 @@ class ObjectWriter:
             # tombstoned mid-stream, so the part we just wrote belongs to nothing: without this the
             # parts row and its FS directory are orphaned by the very filter that stops the bad
             # write — trading a silent-success bug for a silent leak.
+            await _cleanup_part(num_chunks)
+            await _delete_part_row()
+            raise
+        except ObjectVersionLocked:
+            # A hold or retention landed while the body streamed: the part belongs to nothing.
             await _cleanup_part(num_chunks)
             await _delete_part_row()
             raise

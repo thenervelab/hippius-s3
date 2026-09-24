@@ -60,6 +60,11 @@ class _FakeConn:
     async def execute(self, query: str, *args: Any) -> None:
         self.executed.append((query, args))
 
+    async def fetchval(self, query: str, *args: Any) -> Any:
+        # The is_completed flip returns the upload id while the upload is still open.
+        self.executed.append((query, args))
+        return args[0]
+
 
 class _FakeAcquire:
     def __init__(self, conn: _FakeConn) -> None:

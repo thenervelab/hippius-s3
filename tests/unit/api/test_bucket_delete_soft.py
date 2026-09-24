@@ -39,6 +39,8 @@ def _make_mock_pool(
     mock_db = AsyncMock()
 
     async def fetchrow(query: str, *args: Any, **kwargs: Any) -> Any:
+        if "AS has_versions" in query:
+            return {"has_versions": bool(objects_in_bucket), "has_open_uploads": bool(mpus_in_bucket)}
         if "FROM buckets" in query and "deleted_at IS NULL" in query and "RETURNING" not in query:
             return bucket_row
         if "UPDATE buckets" in query and "RETURNING" in query:
@@ -52,14 +54,13 @@ def _make_mock_pool(
             return mpus_in_bucket
         return []
 
-    async def fetchval(query: str, *args: Any, **kwargs: Any) -> Any:
-        if "AS has_versions" in query:
-            return bool(objects_in_bucket)
-        return None
+    @asynccontextmanager
+    async def transaction() -> Any:
+        yield None
 
     mock_db.fetchrow = AsyncMock(side_effect=fetchrow)
     mock_db.fetch = AsyncMock(side_effect=fetch)
-    mock_db.fetchval = AsyncMock(side_effect=fetchval)
+    mock_db.transaction = transaction
 
     @asynccontextmanager
     async def acquire() -> Any:

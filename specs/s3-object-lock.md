@@ -217,32 +217,54 @@ Set through `PUT /user/sub-tokens/{access_key_id}/scope` like any other tier
 
 | Allowed | Refused |
 | --- | --- |
-| PutObject, CopyObject (source must be in scope for reads) | DeleteObject, with or without `versionId` |
-| CreateMultipartUpload, UploadPart, CompleteMultipartUpload, ListParts | DeleteObjects (`POST ?delete`) |
-| AbortMultipartUpload of an upload that has not completed | `PUT ?retention`, `PUT ?legal-hold` |
+| PutObject, CopyObject (the source must be in scope for reads) | DeleteObject, with or without `versionId`; DeleteObjects (`POST ?delete`) |
+| CreateMultipartUpload, UploadPart, CompleteMultipartUpload, ListParts | `PUT ?retention`, `PUT ?legal-hold` |
+| AbortMultipartUpload of an upload that has not completed | `PUT ?acl`, `PUT ?tagging`, `DELETE ?tagging`, and any write carrying `x-amz-acl` / `x-amz-grant-*` |
 | GetObject, HeadObject, ListObjects(V2), ListObjectVersions, GET `?retention` / `?legal-hold` | every bucket-level write, DeleteBucket, ListBuckets |
 
-- **Abort is graded as a write.** It can only discard an upload that never completed. That holds
-  because AbortMultipartUpload now answers `NoSuchUpload` for an upload that already completed, or
-  that is addressed through a bucket or key other than its own. Before this change, aborting a
-  completed upload deleted its `multipart_uploads` row. `parts` cascades from that row, so the
-  committed version's data went with it, past Object Lock, and any tier that could abort could
-  do it. The delete statement itself also refuses a completed upload.
+The tier is a **ceiling**. It also caps a request that another account's bucket ACL authorises:
+when a sub-token with a scope row acts on someone else's bucket, the owner's grants decide, but
+never beyond the token's tier. Before this change, cross-account requests skipped the tier
+entirely. A token with no scope row keeps the plain contractor behaviour, where the grants alone
+decide.
+
+Changes that came with the tier, each of which was a way around it:
+
 - **Changing a lock needs `admin_read_write`, on every tier.** `?retention` and `?legal-hold`
   writes map to a separate op, `write_object_lock`, which only `admin_read_write` holds. Before
-  this change, sub-tokens graded them as ordinary object writes, so `object_read_write` could
-  shorten a GOVERNANCE retention (with the owner bypass) or lift a legal hold. The bucket-ACL path
-  already graded them `WRITE_ACP`.
-- **What the tier cannot express:**
-  - PutObject may carry `x-amz-object-lock-*` headers. A lock only protects the version being
-    created, which is what a backup writer needs. It also means any write-capable key (this tier
-    or `object_read_write`) can create a version that nobody can delete until the lock ends, at
-    most `object_lock_max_retention_days` (3650 days). AWS gates those headers behind
-    `s3:PutObjectRetention`. **Open decision:** cap write-time retention per bucket or per tier?
-  - On an unversioned bucket, an overwrite still makes the previous version unreachable through
-    S3. The tier protects history only on a versioned bucket, and every lock-enabled bucket is
-    versioned.
-- **Pruning.** This tier cannot prune expired backups, because it holds no delete op at all. A
+  this change, sub-tokens graded them as ordinary object writes, so `object_read_write` could lift
+  a legal hold. The bucket-ACL path already graded them `WRITE_ACP`.
+- **Object ACL and tag writes are a separate op, `write_object_meta`.** It is held by
+  `admin_read_write` and `object_read_write`, so their behaviour is unchanged. An object ACL can
+  grant WRITE, and so delete, to a second key; a tag write replaces the whole set.
+- **Abort is graded as a write, and can only abort.** AbortMultipartUpload now answers
+  `NoSuchUpload` for a completed upload, or for an upload addressed through a bucket or key other
+  than its own. Before, aborting a completed upload deleted its `multipart_uploads` row; `parts`
+  cascades from that row, so the committed version's data went with it, past Object Lock.
+  - The abort first claims the upload, by deleting only a row that is still open
+    (`is_completed = FALSE`; NULL fails closed). Only then does it clean anything up.
+  - CompleteMultipartUpload flips `is_completed` under the same condition and rolls back if the
+    abort won. The two serialise on the upload row.
+  - UploadPart and CompleteMultipartUpload check the path the same way.
+- **S4 append refuses a locked version** with 403. An append rewrites the current version's size,
+  ETag and parts in place, so on a locked version it changed retained data. It is checked under
+  both of the append's row locks.
+- **The sub-token copy-source check decodes before it splits**, as the handlers do. A
+  `%2F`-encoded source used to skip the check.
+
+What the tier cannot express:
+
+- **Write-time lock headers.** PutObject and CreateMultipartUpload may carry
+  `x-amz-object-lock-*`. A lock only protects the version being created, which is what a backup
+  writer needs. It also means any write-capable key can create a version that nobody can delete
+  until the lock ends, at most `object_lock_max_retention_days` (3650 days). AWS gates these
+  headers behind `s3:PutObjectRetention`, and a legal-hold header behind `s3:PutObjectLegalHold`.
+  **Open decision:** cap write-time retention per bucket or per tier?
+- **Unversioned buckets.** An overwrite hides the previous version from GET without a
+  `versionId` and from every listing. It stays readable by an explicit `versionId`, which the
+  client has to already know. The tier protects history from a stolen key only on a versioned
+  bucket, and every lock-enabled bucket is versioned.
+- **Pruning.** The tier cannot prune expired backups, because it holds no delete op at all. A
   writer that also has to prune needs one of these, which is **an open decision**:
   1. a tier that allows only `DELETE ?versionId=`. That is a permanent delete, and COMPLIANCE
      already refuses it while the version is locked. It would refuse a DELETE without versionId
@@ -262,15 +284,24 @@ with botocore's real `S3SigV4QueryAuth` and verifies with the real canonicalisat
 
 ### DeleteBucket counts every version (IMPLEMENTED)
 
-`bucket_has_retained_versions.sql` replaced the `list_objects` probe. That probe saw only keys
-whose newest version is live content, so a versioned bucket whose keys were all hidden behind
-delete markers read as empty and could be deleted, which orphaned every non-current version under
-it. The bucket is now non-empty while either of these holds:
+`bucket_emptiness.sql` replaced the `list_objects` probe. That probe saw only keys whose newest
+version is live content, so a versioned bucket whose keys were all hidden behind delete markers
+read as empty and could be deleted, which orphaned every non-current version under it.
+
+A bucket is now non-empty while either of these holds:
 
 - a live object has a live completed version or a delete marker. That is AWS's rule: versions AND
-  delete markers must all be gone. The zero-byte placeholder that an aborted upload leaves on a new
-  key is not counted, because no client can see it or delete it.
-- any version in the bucket is locked, even under a soft-deleted object.
+  delete markers must all be gone.
+- an upload is open. A simple PUT still streaming counts as one.
+
+A reserved row with no data is not counted, even a locked one: an aborted upload leaves one on a
+new key, and no client can see it or delete it.
+
+The check and the soft-delete run in one transaction that first takes `FOR UPDATE` on the bucket
+row. An in-flight create holds `FOR KEY SHARE` on that row through its foreign key, so the check
+waits for it, then sees it. **Residual:** a request that resolved the bucket before the delete
+committed, and inserts after, still lands in the soft-deleted bucket, because the write path does
+not re-check `buckets.deleted_at`.
 
 ### Billing of retained versions (CURRENT STATE, decision needed)
 

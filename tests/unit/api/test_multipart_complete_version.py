@@ -16,6 +16,7 @@ import pytest
 from lxml import etree
 
 from hippius_s3.api.s3 import multipart
+from hippius_s3.writer.types import UploadNoLongerOpen
 
 
 def _parse(body: bytes) -> Any:
@@ -30,14 +31,17 @@ def _text(root: Any, tag: str) -> str | None:
 
 
 class _FakeDb:
-    def __init__(self, *, current_version: int, upload_version: int | None) -> None:
+    def __init__(self, *, current_version: int, upload_version: int | None, object_key: str = "k") -> None:
         self.current_version = current_version
         self.upload_version = upload_version
+        self.object_key = object_key
 
     async def fetchrow(self, query: str, *args: Any) -> Any:
         if query == "get_multipart_upload":
             return {
                 "object_id": "obj-1",
+                "bucket_name": "b",
+                "object_key": self.object_key,
                 "is_completed": False,
                 "current_object_version": self.current_version,
                 "key_existed_at_initiate": False,
@@ -467,7 +471,7 @@ async def test_complete_response_parses_with_ampersand_key(monkeypatch: Any) -> 
     completed: dict[str, Any] = {"ok": False}
     _completing_writer(monkeypatch, completed)
 
-    db = _FakeDb(current_version=1, upload_version=1)
+    db = _FakeDb(current_version=1, upload_version=1, object_key="a&b.txt")
     resp = await multipart.complete_multipart_upload("b", "a&b.txt", "up-1", _request(), db)
 
     assert resp.status_code == 200, bytes(resp.body)
@@ -502,7 +506,13 @@ async def test_complete_idempotent_replay_is_wellformed_and_uses_host(monkeypatc
     class _CompletedDb(_FakeDb):
         async def fetchrow(self, query: str, *args: Any) -> Any:
             if query == "get_multipart_upload":
-                return {"object_id": "obj-1", "is_completed": True, "current_object_version": 1}
+                return {
+                    "object_id": "obj-1",
+                    "bucket_name": "b",
+                    "object_key": "a&b.txt",
+                    "is_completed": True,
+                    "current_object_version": 1,
+                }
             if query == "get_object_by_path":
                 return {"md5_hash": "m"}
             return await super().fetchrow(query, *args)
@@ -558,7 +568,13 @@ async def test_complete_success_and_replay_agree_on_location(monkeypatch: Any) -
     class _CompletedDb(_FakeDb):
         async def fetchrow(self, query: str, *args: Any) -> Any:
             if query == "get_multipart_upload":
-                return {"object_id": "obj-1", "is_completed": True, "current_object_version": 1}
+                return {
+                    "object_id": "obj-1",
+                    "bucket_name": "b",
+                    "object_key": "k",
+                    "is_completed": True,
+                    "current_object_version": 1,
+                }
             if query == "get_object_by_path":
                 return {"md5_hash": "abc"}
             return await super().fetchrow(query, *args)
@@ -661,7 +677,13 @@ async def test_idempotent_replay_does_not_set_created_flag(monkeypatch: Any) -> 
     class _CompletedDb(_FakeDb):
         async def fetchrow(self, query: str, *args: Any) -> Any:
             if query == "get_multipart_upload":
-                return {"object_id": "obj-1", "is_completed": True, "current_object_version": 1}
+                return {
+                    "object_id": "obj-1",
+                    "bucket_name": "b",
+                    "object_key": "k",
+                    "is_completed": True,
+                    "current_object_version": 1,
+                }
             if query == "get_object_by_path":
                 return {"md5_hash": "m"}
             return await super().fetchrow(query, *args)
@@ -672,3 +694,39 @@ async def test_idempotent_replay_does_not_set_created_flag(monkeypatch: Any) -> 
 
     assert resp.status_code == 200
     assert getattr(request.state, "ats_object_created", False) is False
+
+
+@pytest.mark.asyncio
+async def test_complete_through_another_key_is_no_such_upload(monkeypatch: Any) -> None:
+    """The ACL layer authorised the path; an upload id initiated on another key is not that upload."""
+    _patch_common(monkeypatch)
+    completed: dict[str, Any] = {"ok": False}
+    _completing_writer(monkeypatch, completed)
+
+    db = _FakeDb(current_version=1, upload_version=1, object_key="real.bin")
+    resp = await multipart.complete_multipart_upload("b", "other.bin", "up-1", _request(), db)
+
+    assert resp.status_code == 404
+    assert b"NoSuchUpload" in bytes(resp.body)
+    assert completed["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_complete_that_loses_the_race_to_abort_is_no_such_upload(monkeypatch: Any) -> None:
+    """The abort claimed the upload between Complete's read and its commit: the writer's
+    conditional flip finds nothing, rolls back, and the client is told the upload is gone."""
+    _patch_common(monkeypatch)
+
+    class _AbortedUnderUs:
+        def __init__(self, **_: Any) -> None: ...
+
+        async def mpu_complete(self, **_: Any) -> Any:
+            raise UploadNoLongerOpen()
+
+    monkeypatch.setattr(multipart, "ObjectWriter", _AbortedUnderUs)
+
+    db = _FakeDb(current_version=1, upload_version=1)
+    resp = await multipart.complete_multipart_upload("b", "k", "up-1", _request(), db)
+
+    assert resp.status_code == 404
+    assert b"NoSuchUpload" in bytes(resp.body)

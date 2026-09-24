@@ -25,7 +25,6 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
-from hippius_s3.gateway.middlewares.acl import _parse_copy_source_bucket
 from hippius_s3.gateway.middlewares.acl import acl_middleware
 from hippius_s3.gateway.services.acl_service import BucketLookup
 from hippius_s3.models.sub_token import BucketScope
@@ -100,27 +99,6 @@ def _make_app(
     app.middleware("http")(stub_auth)
 
     return app
-
-
-# ---- Header parsing --------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "header,expected",
-    [
-        ("/srcbucket/srckey", "srcbucket"),
-        ("srcbucket/srckey", "srcbucket"),
-        ("/srcbucket/folder/file.txt", "srcbucket"),
-        ("srcbucket/folder/sub/file.txt?versionId=v1", "srcbucket"),
-        ("/srcbucket/srckey?versionId=v1", "srcbucket"),
-        ("/onlyonepart", "onlyonepart"),  # degenerate but extractable
-        ("", None),
-        ("/", None),
-        ("arn:aws:s3:::bucket/key", None),  # ARN form not supported
-    ],
-)
-def test_parse_copy_source_bucket(header: str, expected: str | None) -> None:
-    assert _parse_copy_source_bucket(header) == expected
 
 
 # ---- Source-bucket scope check (the actual bug we're fixing) --------------
@@ -334,4 +312,68 @@ async def test_master_token_copy_object_bypasses_source_scope_check() -> None:
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.put("/dest-bucket/dest-key", headers={"x-amz-copy-source": "/src-bucket/src-key"})
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_percent_encoded_copy_source_cannot_skip_the_source_scope() -> None:
+    """`secret-bucket%2Fprivate.txt` decodes to bucket `secret-bucket` in the handlers. The scope
+    pass used to split BEFORE decoding, saw a nonexistent bucket, skipped the check, and let a
+    token scoped to the destination copy out of a bucket it cannot read."""
+    scope = _scope(Permission.object_read_write, BucketScope.specific, ["dest-id"])
+    app = _make_app(
+        scope=scope,
+        bucket_owner_lookup={
+            "dest-bucket": ("alice", "dest-id"),
+            "secret-bucket": ("alice", "secret-id"),
+        },
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.put("/dest-bucket/dest-key", headers={"x-amz-copy-source": "secret-bucket%2Fprivate.txt"})
+    assert r.status_code == 403
+
+
+# ---- The tier is a ceiling on cross-account grants -------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,path,params,headers",
+    [
+        pytest.param("DELETE", "/shared-bucket/k", {}, {}, id="DeleteObject"),
+        pytest.param("DELETE", "/shared-bucket/k", {"versionId": "1"}, {}, id="DeleteObjectVersion"),
+        pytest.param("POST", "/shared-bucket", {"delete": ""}, {}, id="DeleteObjects"),
+        pytest.param("PUT", "/shared-bucket/k", {"legal-hold": ""}, {}, id="PutObjectLegalHold"),
+        pytest.param("PUT", "/shared-bucket/k", {"acl": ""}, {}, id="PutObjectAcl"),
+        pytest.param("PUT", "/shared-bucket/k", {}, {"x-amz-grant-full-control": "id=hip_other"}, id="PutWithGrant"),
+    ],
+)
+async def test_cross_account_grant_cannot_lift_a_no_delete_key_past_its_tier(
+    method: str, path: str, params: dict[str, str], headers: dict[str, str]
+) -> None:
+    """bob's bucket grants alice's write-once key everything (check_permission is True). The grant
+    authorises the request, but the key's own tier still caps what it may do."""
+    scope = _scope(Permission.object_read_write_no_delete, BucketScope.specific, ["alice-bucket-id"])
+    app = _make_app(scope=scope, bucket_owner_lookup={"shared-bucket": ("bob", "shared-id")})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.request(method, path, params=params, headers=headers)
+    assert r.status_code == 403
+    app.state.acl_service.check_permission.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cross_account_grant_still_authorises_what_the_tier_allows() -> None:
+    scope = _scope(Permission.object_read_write_no_delete, BucketScope.specific, ["alice-bucket-id"])
+    app = _make_app(scope=scope, bucket_owner_lookup={"shared-bucket": ("bob", "shared-id")})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.put("/shared-bucket/k", content=b"x")
+    assert r.status_code == 200
+    app.state.acl_service.check_permission.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cross_account_token_without_a_scope_keeps_the_contractor_flow() -> None:
+    app = _make_app(scope=None, bucket_owner_lookup={"shared-bucket": ("bob", "shared-id")})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.delete("/shared-bucket/k")
     assert r.status_code == 200

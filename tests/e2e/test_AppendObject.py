@@ -334,3 +334,28 @@ def test_append_idempotency_append_id(
     # Validate only one append was applied
     body = boto3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
     assert body == b"base" + delta
+
+
+@pytest.mark.s4
+def test_append_refuses_a_locked_version(boto3_client: Any, unique_bucket_name: Any, cleanup_buckets: Any) -> None:
+    """An append rewrites the current version in place — size, ETag and parts — so on a locked
+    version it would alter retained data with nothing more than write access."""
+    bucket = unique_bucket_name("append-locked")
+    boto3_client.create_bucket(Bucket=bucket, ObjectLockEnabledForBucket=True)
+    cleanup_buckets(bucket)
+    key = "log/held.txt"
+
+    boto3_client.put_object(Bucket=bucket, Key=key, Body=b"hello\n", ObjectLockLegalHoldStatus="ON")
+    head = boto3_client.head_object(Bucket=bucket, Key=key)
+    version = head["ResponseMetadata"]["HTTPHeaders"].get("x-amz-meta-append-version", "0")
+
+    try:
+        with pytest.raises(ClientError) as exc:
+            _put_object(
+                boto3_client, bucket, key, b"world\n", metadata={"append": "true", "append-if-version": version}
+            )
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        assert boto3_client.get_object(Bucket=bucket, Key=key)["Body"].read() == b"hello\n"
+        assert boto3_client.head_object(Bucket=bucket, Key=key)["ETag"] == head["ETag"]
+    finally:
+        boto3_client.put_object_legal_hold(Bucket=bucket, Key=key, LegalHold={"Status": "OFF"})
