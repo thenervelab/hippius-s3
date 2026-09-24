@@ -364,6 +364,22 @@ changes the bill of every versioned bucket, not only locked ones. **This is a pr
 so it is not made here.** Until it is made, COMPLIANCE retention on a key that is overwritten or
 marker-deleted costs the customer nothing.
 
+The gap is also a lever: an owner can put a delete marker over a locked backup (a plain DELETE,
+which Object Lock allows) and stop paying for bytes we are obliged to keep until the lock ends.
+
+**Proposal** (nothing in this PR changes billing):
+
+1. **Minimum:** bill every version that is under an active retention or legal hold, current or
+   not — in particular a locked version hidden behind a delete marker. This closes the lever
+   without touching the bill of unlocked versioned buckets. The ledger triggers would add a
+   version to usage when it gains a lock or loses current-ness while locked, and remove it when
+   the lock ends or the version is deleted; the lock expiring is a time event, so it needs a
+   periodic sweep, not only a trigger.
+2. **Full AWS parity, later:** bill every live data version. Needs a customer-facing notice,
+   since every versioned bucket's bill goes up.
+3. Whichever is chosen, locked versions under a soft-deleted object or a purged account follow
+   the same rule (see the next section), so a purge cannot be used to stop paying either.
+
 ### COMPLIANCE across suspension, purge and account deletion (PROPOSED — not implemented)
 
 What the code does today:
