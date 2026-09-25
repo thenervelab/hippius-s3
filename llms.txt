@@ -1,0 +1,86 @@
+# Hippius S3
+
+> S3-compatible object storage at https://s3.hippius.com. Standard clients (AWS CLI, boto3, minio, the AWS SDK, rclone) work after you change the endpoint, the region, and the keys.
+
+Part of the Hippius docs for agents. Start at https://docs.hippius.com/llms.txt
+
+## What it is and what it does
+
+An S3 API in front of Hippius distributed storage. Credentials are Hippius access keys. The access key id starts with `hip_`. Crypto wallets are not S3 credentials.
+
+Drive (the encrypted folder in the console, desktop app, and mobile app) is a different product. Files in one do not appear in the other.
+
+## When to use it
+
+Use S3 for application data, backups, public files, and presigned links.
+
+Use Drive when a person wants a synced folder. Use Hub (https://github.com/thenervelab/hippius-hub/blob/main/llms.txt) for models and container images.
+
+## How to get credentials
+
+1. Sign in at https://console.hippius.com (Google, GitHub, or Apple).
+2. Add credits on Billing if the account balance is empty. Paying is covered in https://docs.hippius.com/use/console/billing
+3. Open the S3 page and create a master token: https://console.hippius.com/dashboard/storage/s3
+4. Copy the access key and the secret. The secret is shown once.
+
+Hand an application a sub token scoped to the buckets it needs, not the master token. The console guide is https://docs.hippius.com/use/console/s3
+
+## Connection
+
+- Endpoint: `https://s3.hippius.com` (this host only)
+- Region: `decentralized`
+- Signature: AWS Signature V4
+- Addressing: path-style (`https://s3.hippius.com/<bucket>/<key>`)
+
+## First example
+
+```bash
+export AWS_ACCESS_KEY_ID="hip_..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_DEFAULT_REGION="decentralized"
+
+aws s3 mb s3://my-bucket --endpoint-url https://s3.hippius.com
+aws s3 cp file.txt s3://my-bucket/ --endpoint-url https://s3.hippius.com
+aws s3 ls s3://my-bucket/ --endpoint-url https://s3.hippius.com
+```
+
+```python
+import boto3
+from botocore.config import Config
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="https://s3.hippius.com",
+    aws_access_key_id="hip_...",
+    aws_secret_access_key="...",
+    region_name="decentralized",
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+)
+s3.put_object(Bucket="my-bucket", Key="file.txt", Body=b"hello")
+```
+
+## Go deeper
+
+The pages below are the full reference. Prefer them over this file for anything past the first upload.
+
+- Getting started: https://docs.hippius.com/use/quickstart
+- Advanced usage (presigned URLs, public buckets, ACLs, sub tokens, multipart): https://docs.hippius.com/storage/s3/advanced
+- Compatibility matrix: https://docs.hippius.com/storage/s3/compatibility
+- Object Lock: https://docs.hippius.com/storage/s3/object-lock
+- Python: https://docs.hippius.com/storage/s3/python
+- JavaScript: https://docs.hippius.com/storage/s3/javascript
+- AWS CLI: https://docs.hippius.com/storage/s3/aws-cli
+- rclone: https://docs.hippius.com/storage/s3/rclone
+- Troubleshooting: https://docs.hippius.com/use/troubleshooting
+- Nextcloud: https://docs.hippius.com/storage/s3/examples/nextcloud
+- Duplicati: https://docs.hippius.com/storage/s3/examples/duplicati
+- Console S3 page: https://docs.hippius.com/use/console/s3
+- Migrations from another provider: https://docs.hippius.com/use/console/migrations
+- Full S3 ingest for agents: https://docs.hippius.com/llms-full.txt
+- This repository's README (server architecture, not a client guide): https://github.com/thenervelab/hippius-s3/blob/staging/README.md
+
+## Links
+
+- Documentation home: https://docs.hippius.com
+- Pricing: https://hippius.com/pricing
+- Account and billing: https://docs.hippius.com/use/console/billing
