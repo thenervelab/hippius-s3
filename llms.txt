@@ -14,7 +14,7 @@ Drive (the encrypted folder in the console, desktop app, and mobile app) is a di
 
 Use S3 for application data, backups, public files, and presigned links.
 
-Use Drive when a person wants a synced folder. Use Hub (https://github.com/thenervelab/hippius-hub/blob/main/llms.txt) for models and container images.
+Use Drive when a person wants a synced folder. Use Hub (https://raw.githubusercontent.com/thenervelab/hippius-hub/main/llms.txt) for models and container images.
 
 ## How to get credentials
 
