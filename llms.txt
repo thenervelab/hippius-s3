@@ -77,7 +77,7 @@ The pages below are the full reference. Prefer them over this file for anything 
 - Console S3 page: https://docs.hippius.com/use/console/s3
 - Migrations from another provider: https://docs.hippius.com/use/console/migrations
 - Full S3 ingest for agents: https://docs.hippius.com/llms-full.txt
-- This repository's README (server architecture, not a client guide): https://github.com/thenervelab/hippius-s3/blob/staging/README.md
+- This repository's README (server architecture, not a client guide): https://raw.githubusercontent.com/thenervelab/hippius-s3/staging/README.md
 
 ## Links
 
