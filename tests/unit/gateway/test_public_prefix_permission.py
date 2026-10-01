@@ -138,6 +138,33 @@ async def test_a_dot_segment_alias_still_sees_the_private_acl_on_the_stored_key(
 
 
 @pytest.mark.asyncio
+async def test_a_leading_slash_key_is_not_published_by_the_prefix_it_does_not_name() -> None:
+    """Anonymous GET `/bucket//public/secret` is object key `/public/secret`.
+
+    The route keeps the empty segment, so this is not the public child
+    `public/secret`. Authorizing the stripped name reads the other object.
+    `/bucket///public/secret` is `//public/secret` and takes the same path
+    once the collapse runs twice.
+    """
+    svc, _fetched = _service(_acl(OWNER, _owner_grant()), rows_for={"bid-a": ["public"]})
+    looked_up: list[str] = []
+
+    async def get_object_acl(_bucket: str, key: str) -> ACL | None:
+        looked_up.append(key)
+        return None
+
+    svc.acl_repo.get_object_acl = get_object_acl  # type: ignore[method-assign]
+
+    assert await _read(svc, "/public/secret") is False
+    assert await _read(svc, "//public/secret") is False
+    # Effective ACL and the prefix seal each see the key the router stored.
+    # The stripped name `public/secret` is the public child and must not be consulted.
+    assert looked_up.count("/public/secret") == 2
+    assert looked_up.count("//public/secret") == 2
+    assert "public/secret" not in looked_up
+
+
+@pytest.mark.asyncio
 async def test_an_object_acl_row_hides_the_prefix() -> None:
     svc, fetched = _service(
         _acl(OWNER, _owner_grant()),

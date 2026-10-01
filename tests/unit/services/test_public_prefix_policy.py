@@ -25,6 +25,7 @@ from hippius_s3.services.public_prefix_policy import bucket_grants_anonymous_rea
 from hippius_s3.services.public_prefix_policy import key_matches_public_prefix
 from hippius_s3.services.public_prefix_policy import parse_bucket_policy
 from hippius_s3.services.public_prefix_policy import policy_document
+from hippius_s3.services.public_prefix_policy import stored_object_key
 from hippius_s3.utils import get_query
 
 
@@ -256,10 +257,27 @@ def test_unknown_top_level_key_is_rejected() -> None:
         ("foo/../public/a", True),
         ("public/./open", True),
         ("public/../../other/x", False),
+        # `/bucket//public/a` is a different object from `public/a`. The router
+        # stores the leading slash; stripping it publishes that object.
+        ("/public/a", False),
+        ("//public/a", False),
     ],
 )
 def test_matcher_is_a_literal_child_prefix(key: str, matches: bool) -> None:
     assert key_matches_public_prefix(key, ["public"]) is matches
+
+
+def test_slash_collapse_is_idempotent_and_keeps_a_leading_slash() -> None:
+    """check_permission collapses, then the matcher collapses again.
+
+    One strip turns `/public/a` into the public child. A second strip does the
+    same to `//public/a`, the key `/bucket///public/a` stores.
+    """
+    for key in ("/public/a", "//public/a", "foo/../public/a"):
+        assert stored_object_key(stored_object_key(key)) == stored_object_key(key)
+    assert stored_object_key("/public/a") == "/public/a"
+    assert stored_object_key("//public/a") == "//public/a"
+    assert stored_object_key("foo/../sealed/x") == "sealed/x"
 
 
 def test_matcher_does_not_treat_nfc_and_nfd_as_the_same_prefix() -> None:
@@ -292,6 +310,35 @@ def test_anonymous_read_detects_full_control_and_not_write() -> None:
     assert bucket_grants_anonymous_read(acl(Permission.WRITE)) is False
     assert bucket_grants_anonymous_read(acl(Permission.READ_ACP)) is False
     assert bucket_grants_anonymous_read(None) is False
+
+
+def test_importing_acl_lookup_does_not_load_gateway_config() -> None:
+    """Integration conftest imports BucketLookup before it loads dotenv.
+
+    The prefix policy used to import input_validation to share the avoid-char
+    list. That module calls get_config() at import, so the suite died with
+    FRONTEND_HMAC_SECRET missing before a single test ran.
+    """
+    import os
+    import subprocess
+    import sys
+
+    env = os.environ.copy()
+    env.pop("FRONTEND_HMAC_SECRET", None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from hippius_s3.gateway.services.acl_service import BucketLookup",
+        ],
+        cwd="/tmp",
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
 
 
 def test_list_query_is_scoped_to_the_live_bucket() -> None:

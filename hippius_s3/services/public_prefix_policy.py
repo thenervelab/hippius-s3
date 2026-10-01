@@ -21,11 +21,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from hippius_s3.gateway.middlewares.input_validation import OBJECT_KEY_AVOID_CHARS
 from hippius_s3.gateway.utils.paths import collapse_dot_segments
 from hippius_s3.models.acl import ACL
 from hippius_s3.models.acl import Permission
 from hippius_s3.models.acl import WellKnownGroups
+from hippius_s3.object_key_chars import OBJECT_KEY_AVOID_CHARS
 
 
 _ARN = "arn:aws:s3:::"
@@ -130,11 +130,16 @@ def stored_object_key(key: str) -> str:
     A copy-source header is not collapsed before the ACL check. The prefix test
     and the object-ACL lookup both have to use this form, or ``foo/../sealed/x``
     matches a public prefix while the private ACL on ``sealed/x`` is never read.
+
+    A leading slash stays. ``path_normalization`` does not collapse empty
+    segments, and the object route captures them: ``/bucket//public/a`` is
+    stored and served as ``/public/a``, a different object from ``public/a``.
+    Stripping the slash would publish that object under the prefix ``public``.
+    The matcher collapses again, so the strip also has to be idempotent —
+    ``/bucket///public/a`` is the key ``//public/a``, and a second strip of a
+    one-slash result is ``public/a``.
     """
-    normalized = collapse_dot_segments(key)
-    if normalized.startswith("/"):
-        normalized = normalized[1:]
-    return normalized
+    return collapse_dot_segments(key)
 
 
 def key_matches_public_prefix(key: str, prefixes: list[str] | tuple[str, ...]) -> bool:
