@@ -58,7 +58,14 @@ def _make_service(*, lookup: BucketLookup | None, primary_permits: bool = True, 
     service.get_bucket_owner_and_id = AsyncMock(return_value=lookup)
 
     async def check_permission(
-        *, account_id: str | None, bucket: str, key: str | None, permission: Any, access_key: Any, bucket_owner_id: Any
+        *,
+        account_id: str | None,
+        bucket: str,
+        key: str | None,
+        permission: Any,
+        access_key: Any,
+        bucket_owner_id: Any,
+        **_extra: Any,
     ) -> bool:
         if account_id is None:
             return anon_permits

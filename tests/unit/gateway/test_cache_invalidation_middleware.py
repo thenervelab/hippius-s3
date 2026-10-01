@@ -92,6 +92,19 @@ class TestIsSuccessfulBucketDelete:
             self._make_response(204),
         )
 
+    def test_policy_query_skipped(self) -> None:
+        # DELETE /<bucket>?policy clears prefixes; the bucket, and its object ACL cache, stay.
+        assert not _is_successful_bucket_delete(
+            self._make_request("DELETE", {"policy": ""}),
+            self._make_response(204),
+        )
+
+    def test_any_query_param_is_not_a_bucket_delete(self) -> None:
+        assert not _is_successful_bucket_delete(
+            self._make_request("DELETE", {"cors": ""}),
+            self._make_response(204),
+        )
+
 
 class TestIsSuccessfulBucketCreate:
     def _make_request(self, method: str, query: dict[str, str] | None = None) -> Any:
@@ -144,6 +157,7 @@ def _make_acl_service(repo: Any) -> Any:
     service = MagicMock()
     service.acl_repo = repo
     service.invalidate_bucket_meta = AsyncMock()
+    service.invalidate_public_prefixes_by_name = AsyncMock()
     return service
 
 
@@ -160,6 +174,7 @@ async def test_fires_on_delete_bucket_204() -> None:
     repo.invalidate_bucket_acl.assert_awaited_once_with("alpha")
     repo.invalidate_all_bucket_objects.assert_awaited_once_with("alpha")
     service.invalidate_bucket_meta.assert_awaited_once_with("alpha")
+    service.invalidate_public_prefixes_by_name.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -261,6 +276,49 @@ async def test_purges_the_name_the_client_actually_sent() -> None:
 
     assert resp.status_code == 204
     service.invalidate_bucket_meta.assert_awaited_once_with("legacy#bucket")
+
+
+@pytest.mark.asyncio
+async def test_policy_delete_drops_prefix_cache_only() -> None:
+    """A 204 from DeleteBucketPolicy must not SCAN-invalidate every object ACL."""
+    repo = _make_cached_acl_repo()
+    service = _make_acl_service(repo)
+    app = _make_app(service, Response(status_code=204))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/alpha?policy")
+
+    assert resp.status_code == 204
+    service.invalidate_public_prefixes_by_name.assert_awaited_once_with("alpha")
+    repo.invalidate_bucket_acl.assert_not_awaited()
+    repo.invalidate_all_bucket_objects.assert_not_awaited()
+    service.invalidate_bucket_meta.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_policy_on_an_object_path_invalidates_nothing() -> None:
+    repo = _make_cached_acl_repo()
+    service = _make_acl_service(repo)
+    app = _make_app(service, Response(status_code=204))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/alpha/key?policy")
+
+    assert resp.status_code == 204
+    service.invalidate_public_prefixes_by_name.assert_not_awaited()
+    repo.invalidate_all_bucket_objects.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rejected_policy_write_invalidates_nothing() -> None:
+    service = _make_acl_service(_make_cached_acl_repo())
+    app = _make_app(service, Response(status_code=400))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.put("/alpha?policy")
+
+    assert resp.status_code == 400
+    service.invalidate_public_prefixes_by_name.assert_not_awaited()
 
 
 @pytest.mark.asyncio

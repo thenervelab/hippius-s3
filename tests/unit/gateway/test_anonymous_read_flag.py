@@ -62,7 +62,14 @@ def _make_service(*, primary_permits: bool = True, anon_permits: bool = False) -
     )
 
     async def check_permission(
-        *, account_id: str | None, bucket: str, key: str | None, permission: Any, access_key: Any, bucket_owner_id: Any
+        *,
+        account_id: str | None,
+        bucket: str,
+        key: str | None,
+        permission: Any,
+        access_key: Any,
+        bucket_owner_id: Any,
+        **_extra: Any,
     ) -> bool:
         if account_id is None:
             return anon_permits
@@ -148,13 +155,19 @@ async def test_authenticated_get_on_private_object_sets_flag_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_authenticated_check_permission_called_twice() -> None:
-    """Authenticated GET should trigger two check_permission calls: caller + anon probe."""
+async def test_authenticated_check_permission_probes_anonymous_read() -> None:
+    """Authenticated GET probes anonymous read, then again without the prefix grant.
+
+    The second probe is how a prefix-only object is told apart from a bucket ACL grant.
+    The caller's own check is the third.
+    """
     service = _make_service(primary_permits=True, anon_permits=True)
     app = _build_app(service, account_id="alice")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         await client.get("/public-bucket/foo.txt")
-    assert service.check_permission.await_count == 2
+    assert service.check_permission.await_count == 3
+    anon_calls = [call.kwargs for call in service.check_permission.await_args_list if call.kwargs["account_id"] is None]
+    assert [call["allow_public_prefix"] for call in anon_calls] == [True, False]
     seen_account_ids = {call.kwargs["account_id"] for call in service.check_permission.await_args_list}
     assert seen_account_ids == {"alice", None}
 

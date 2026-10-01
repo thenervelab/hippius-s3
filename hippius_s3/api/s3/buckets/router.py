@@ -20,6 +20,7 @@ from hippius_s3.api.s3.buckets.bucket_lifecycle_endpoint import handle_get_bucke
 from hippius_s3.api.s3.buckets.bucket_location_endpoint import handle_get_bucket_location
 from hippius_s3.api.s3.buckets.bucket_object_lock_endpoint import handle_get_bucket_object_lock
 from hippius_s3.api.s3.buckets.bucket_object_lock_endpoint import handle_put_bucket_object_lock
+from hippius_s3.api.s3.buckets.bucket_policy_endpoint import delete_bucket_policy
 from hippius_s3.api.s3.buckets.bucket_policy_endpoint import get_bucket_policy as policy_get_bucket_policy
 from hippius_s3.api.s3.buckets.bucket_tagging_endpoint import delete_bucket_tags as tags_delete_bucket_tags
 from hippius_s3.api.s3.buckets.bucket_tagging_endpoint import get_bucket_tags as tags_get_bucket_tags
@@ -164,6 +165,11 @@ async def delete_bucket_tags_route(
     if "tagging" in request.query_params:
         async with pool.acquire() as conn:
             return await tags_delete_bucket_tags(bucket_name, conn, request.state.main_account_id)
+    if "policy" in request.query_params:
+        # Prefixes only. This must stay ahead of the NotImplemented below and ahead of
+        # handle_delete_bucket: a 204 from DeleteBucketPolicy is not a deleted bucket.
+        async with pool.acquire() as conn:
+            return await delete_bucket_policy(bucket_name, conn, request)
     # DeleteBucket takes no subresource. Treating every unrecognised one as a bucket delete
     # meant an ordinary DeleteBucketPolicy / DeleteBucketCors call destroyed the bucket, and
     # `?acl` arrived graded WRITE_ACP rather than WRITE.

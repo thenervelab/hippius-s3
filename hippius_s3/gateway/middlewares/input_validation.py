@@ -18,6 +18,7 @@ from hippius_s3.gateway.utils.errors import s3_error_response
 from hippius_s3.gateway.utils.paths import collapse_dot_segments
 from hippius_s3.gateway.utils.paths import decoded_path
 from hippius_s3.gateway.utils.paths import forwarded_path
+from hippius_s3.object_key_chars import OBJECT_KEY_AVOID_CHARS
 from hippius_s3.peer_auth import is_authorized_peer_fetch
 from hippius_s3.reserved_bucket_names import RESERVED_BUCKET_SEGMENTS
 
@@ -45,11 +46,9 @@ IP_ADDRESS_PATTERN = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
 # delimiters there. A key sent as `report%3Fv1.txt` arrives at the api as `report` — so
 # `report%3Fv1.txt` and `report%3Fv2.txt` are two distinct keys that both answer 200 and land on
 # one object. `#` was already covered; `?` behaves identically and was not.
-OBJECT_KEY_AVOID_CHARS = (
-    ["\\", "{", "}", "^", "%", "`", "[", "]", '"', "<", ">", "~", "#", "?", "|"]
-    + [chr(i) for i in range(0, 32)]
-    + [chr(127)]
-)
+#
+# Defined in object_key_chars so the prefix policy can share the list without importing this
+# module. Importing it calls get_config() above, which the integration conftest has not loaded yet.
 
 # Prohibited bucket name prefixes and suffixes (AWS S3 standard)
 PROHIBITED_BUCKET_PREFIXES = ["xn--", "sthree-", "amzn-s3-demo-"]
