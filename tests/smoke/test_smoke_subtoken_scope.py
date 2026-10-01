@@ -31,8 +31,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import time
 import uuid
 from dataclasses import dataclass
+from dataclasses import field
 from datetime import datetime
 from datetime import timezone
 from typing import Any
@@ -99,6 +101,11 @@ def _http_status(exc: ClientError) -> int:
     return int(exc.response["ResponseMetadata"]["HTTPStatusCode"])
 
 
+# api.hippius.com pushes empty bucket_grants as two scope DELETEs about 2s
+# apart once the key exists. Wait that burst out before the test writes scope.
+_ACCOUNT_API_SCOPE_SYNC_SECONDS = 3
+
+
 # ---- Per-file fixtures ----------------------------------------------------
 
 
@@ -117,6 +124,7 @@ def provisioned_sub_token(hippius_user_token, scope_http_client) -> Any:
             return await client.create_sub_token(name=name)
 
     created = asyncio.run(_create())
+    time.sleep(_ACCOUNT_API_SCOPE_SYNC_SECONDS)
     yield (created.access_key_id, created.secret, created.token_id)
 
     # Teardown: scope DELETE first (cheap, no api dep), then revoke. Both idempotent.
@@ -135,17 +143,21 @@ def provisioned_sub_token(hippius_user_token, scope_http_client) -> Any:
         print(f"teardown: revoke failed for token_id={created.token_id}: {e}")
 
 
-@pytest.fixture
-def sub_token_s3_client(provisioned_sub_token, hippius_endpoint) -> Any:
-    access_key_id, secret_key, _ = provisioned_sub_token
+def _sub_token_client(endpoint: str, access_key_id: str, secret_key: str) -> Any:
     return boto3.client(
         "s3",
-        endpoint_url=hippius_endpoint,
+        endpoint_url=endpoint,
         aws_access_key_id=access_key_id,
         aws_secret_access_key=secret_key,
         region_name="us-east-1",
         config=Config(s3={"addressing_style": "path"}, signature_version="s3v4"),
     )
+
+
+@pytest.fixture
+def sub_token_s3_client(provisioned_sub_token, hippius_endpoint) -> Any:
+    access_key_id, secret_key, _ = provisioned_sub_token
+    return _sub_token_client(hippius_endpoint, access_key_id, secret_key)
 
 
 @pytest.fixture
@@ -192,6 +204,49 @@ def _install_scope(
     assert resp.status_code == 200, f"scope PUT failed: {resp.status_code} {resp.text}"
 
 
+@dataclass
+class _GrantedScope:
+    """A scope the test just installed, plus one retry when the account API deletes it."""
+
+    endpoint: str
+    access_key_id: str
+    secret_key: str
+    http: ScopeHttpClient
+    account_id: str
+    permission: str
+    bucket_scope: str
+    buckets: list[str]
+    s3: Any = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.s3 = _sub_token_client(self.endpoint, self.access_key_id, self.secret_key)
+
+    def install(self) -> None:
+        _install_scope(
+            self.http,
+            self.access_key_id,
+            self.account_id,
+            self.permission,
+            self.bucket_scope,
+            self.buckets,
+        )
+
+    def call(self, fn: Any) -> Any:
+        # 403 between install and the call is the account API deleting the row.
+        # Reinstall once. A body-bearing 403 is answered before the body is read,
+        # which poisons this client's kept-alive connection, so the retry is a new client.
+        try:
+            return fn(self.s3)
+        except ClientError as exc:
+            if _http_status(exc) != 403:
+                raise
+        print(f"sub-token scope {self.permission} got 403; reinstalling scope and retrying on a new client")
+        self.install()
+        self.s3.close()
+        self.s3 = _sub_token_client(self.endpoint, self.access_key_id, self.secret_key)
+        return fn(self.s3)
+
+
 # ---- Tests ----------------------------------------------------------------
 
 
@@ -224,18 +279,29 @@ def test_object_read_allows_get_denies_writes(
     provisioned_sub_token,
     scope_test_buckets,
     hippius_master_account_ss58,
+    hippius_endpoint,
     file_generator,
 ):
     """object_read tier on bucket A: GET works, DELETE/PUT 403."""
     bucket_a, _ = scope_test_buckets
-    access_key_id, _, _ = provisioned_sub_token
+    access_key_id, secret_key, _ = provisioned_sub_token
     data, expected_md5 = file_generator(64 * 1024)
     key = "scope-test/readable.bin"
 
     production_s3_client.put_object(Bucket=bucket_a, Key=key, Body=data)
-    _install_scope(scope_http_client, access_key_id, hippius_master_account_ss58, "object_read", "specific", [bucket_a])
+    granted = _GrantedScope(
+        hippius_endpoint,
+        access_key_id,
+        secret_key,
+        scope_http_client,
+        hippius_master_account_ss58,
+        "object_read",
+        "specific",
+        [bucket_a],
+    )
+    granted.install()
 
-    got = sub_token_s3_client.get_object(Bucket=bucket_a, Key=key)
+    got = granted.call(lambda s3: s3.get_object(Bucket=bucket_a, Key=key))
     assert hashlib.md5(got["Body"].read()).hexdigest() == expected_md5, (
         "An object_read sub-token read back the wrong content — a scoped read either served the wrong object or corrupted it."
     )
@@ -255,29 +321,37 @@ def test_object_read_allows_get_denies_writes(
 
 
 def test_object_read_write_full_object_crud(
-    sub_token_s3_client,
     scope_http_client,
     provisioned_sub_token,
     scope_test_buckets,
     hippius_master_account_ss58,
+    hippius_endpoint,
     file_generator,
 ):
     """object_read_write on bucket A: PUT, GET, DELETE all succeed."""
     bucket_a, _ = scope_test_buckets
-    access_key_id, _, _ = provisioned_sub_token
+    access_key_id, secret_key, _ = provisioned_sub_token
     data, expected_md5 = file_generator(32 * 1024)
     key = "scope-test/rw.bin"
 
-    _install_scope(
-        scope_http_client, access_key_id, hippius_master_account_ss58, "object_read_write", "specific", [bucket_a]
+    granted = _GrantedScope(
+        hippius_endpoint,
+        access_key_id,
+        secret_key,
+        scope_http_client,
+        hippius_master_account_ss58,
+        "object_read_write",
+        "specific",
+        [bucket_a],
     )
+    granted.install()
 
-    sub_token_s3_client.put_object(Bucket=bucket_a, Key=key, Body=data)
-    got = sub_token_s3_client.get_object(Bucket=bucket_a, Key=key)
+    granted.call(lambda s3: s3.put_object(Bucket=bucket_a, Key=key, Body=data))
+    got = granted.call(lambda s3: s3.get_object(Bucket=bucket_a, Key=key))
     assert hashlib.md5(got["Body"].read()).hexdigest() == expected_md5, (
         "An object_read_write sub-token read back different content than it just wrote — the scoped write/read round-trip is corrupting data."
     )
-    sub_token_s3_client.delete_object(Bucket=bucket_a, Key=key)
+    granted.call(lambda s3: s3.delete_object(Bucket=bucket_a, Key=key))
 
 
 def test_specific_bucket_scope_excludes_other_bucket(
@@ -331,7 +405,8 @@ def test_scope_update_is_immediate(
         f"Under a freshly-installed object_read scope, DELETE was allowed (got HTTP {_http_status(exc.value)}, expected 403) — read-only scope is not being enforced immediately after install."
     )
 
-    # Upgrade: subsequent PUT must succeed on the very next request.
+    # Upgrade: the very next PUT must succeed. Not retried — a retry would hide
+    # a stale scope-cache 403, which is what this test guards.
     _install_scope(
         scope_http_client, access_key_id, hippius_master_account_ss58, "object_read_write", "specific", [bucket_a]
     )
@@ -344,15 +419,24 @@ def test_revoke_scope_resumes_default_deny(
     provisioned_sub_token,
     scope_test_buckets,
     hippius_master_account_ss58,
+    hippius_endpoint,
 ):
     """Install scope → write succeeds; DELETE the scope row → next write 403."""
     bucket_a, _ = scope_test_buckets
-    access_key_id, _, _ = provisioned_sub_token
+    access_key_id, secret_key, _ = provisioned_sub_token
 
-    _install_scope(
-        scope_http_client, access_key_id, hippius_master_account_ss58, "object_read_write", "specific", [bucket_a]
+    granted = _GrantedScope(
+        hippius_endpoint,
+        access_key_id,
+        secret_key,
+        scope_http_client,
+        hippius_master_account_ss58,
+        "object_read_write",
+        "specific",
+        [bucket_a],
     )
-    sub_token_s3_client.put_object(Bucket=bucket_a, Key="before-revoke.bin", Body=b"ok")
+    granted.install()
+    granted.call(lambda s3: s3.put_object(Bucket=bucket_a, Key="before-revoke.bin", Body=b"ok"))
 
     delete_resp = scope_http_client.delete(access_key_id)
     assert delete_resp.status_code == 204, (
@@ -367,16 +451,26 @@ def test_revoke_scope_resumes_default_deny(
 
 
 def test_admin_read_allows_list_buckets(
-    sub_token_s3_client,
     scope_http_client,
     provisioned_sub_token,
     hippius_master_account_ss58,
+    hippius_endpoint,
 ):
     """admin_read with bucket_scope='all' → ListBuckets succeeds."""
-    access_key_id, _, _ = provisioned_sub_token
-    _install_scope(scope_http_client, access_key_id, hippius_master_account_ss58, "admin_read", "all", [])
+    access_key_id, secret_key, _ = provisioned_sub_token
+    granted = _GrantedScope(
+        hippius_endpoint,
+        access_key_id,
+        secret_key,
+        scope_http_client,
+        hippius_master_account_ss58,
+        "admin_read",
+        "all",
+        [],
+    )
+    granted.install()
 
-    listing = sub_token_s3_client.list_buckets()
+    listing = granted.call(lambda s3: s3.list_buckets())
     assert listing["ResponseMetadata"]["HTTPStatusCode"] == 200, (
         f"An admin_read sub-token was denied ListBuckets (got HTTP {listing['ResponseMetadata']['HTTPStatusCode']}, expected 200) — the admin_read tier is not granting account-wide bucket listing."
     )
@@ -403,11 +497,11 @@ def test_object_read_denies_list_buckets(
 
 def test_object_read_write_can_bulk_delete(
     production_s3_client,
-    sub_token_s3_client,
     scope_http_client,
     provisioned_sub_token,
     scope_test_buckets,
     hippius_master_account_ss58,
+    hippius_endpoint,
 ):
     """Regression guard for the resolver fix: POST /bucket?delete (bulk
     DeleteObjects) must require `delete_object`, not `write_bucket_meta`.
@@ -415,18 +509,28 @@ def test_object_read_write_can_bulk_delete(
     own files even though it can DELETE them one-by-one.
     """
     bucket_a, _ = scope_test_buckets
-    access_key_id, _, _ = provisioned_sub_token
+    access_key_id, secret_key, _ = provisioned_sub_token
 
     production_s3_client.put_object(Bucket=bucket_a, Key="bulk-1.bin", Body=b"a")
     production_s3_client.put_object(Bucket=bucket_a, Key="bulk-2.bin", Body=b"b")
 
-    _install_scope(
-        scope_http_client, access_key_id, hippius_master_account_ss58, "object_read_write", "specific", [bucket_a]
+    granted = _GrantedScope(
+        hippius_endpoint,
+        access_key_id,
+        secret_key,
+        scope_http_client,
+        hippius_master_account_ss58,
+        "object_read_write",
+        "specific",
+        [bucket_a],
     )
+    granted.install()
 
-    resp = sub_token_s3_client.delete_objects(
-        Bucket=bucket_a,
-        Delete={"Objects": [{"Key": "bulk-1.bin"}, {"Key": "bulk-2.bin"}]},
+    resp = granted.call(
+        lambda s3: s3.delete_objects(
+            Bucket=bucket_a,
+            Delete={"Objects": [{"Key": "bulk-1.bin"}, {"Key": "bulk-2.bin"}]},
+        )
     )
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200, (
         f"An object_read_write sub-token was denied bulk DeleteObjects (got HTTP {resp['ResponseMetadata']['HTTPStatusCode']}, expected 200) — POST /bucket?delete is mis-mapped to a bucket-meta permission instead of delete_object (resolver regression)."
@@ -443,13 +547,14 @@ def test_copy_object_source_bucket_must_be_in_scope(
     provisioned_sub_token,
     scope_test_buckets,
     hippius_master_account_ss58,
+    hippius_endpoint,
 ):
     """Regression guard for the middleware fix: CopyObject's source bucket is
     enforced against the sub-token's scope. A token scoped only to bucket B
     cannot use copy as a back-door to read bucket A.
     """
     bucket_a, bucket_b = scope_test_buckets
-    access_key_id, _, _ = provisioned_sub_token
+    access_key_id, secret_key, _ = provisioned_sub_token
 
     # Put a "secret" file in bucket A (only reachable by master).
     production_s3_client.put_object(Bucket=bucket_a, Key="secret.txt", Body=b"private data")
@@ -469,16 +574,21 @@ def test_copy_object_source_bucket_must_be_in_scope(
     )
 
     # When scope covers BOTH buckets, the copy succeeds.
-    _install_scope(
-        scope_http_client,
+    granted = _GrantedScope(
+        hippius_endpoint,
         access_key_id,
+        secret_key,
+        scope_http_client,
         hippius_master_account_ss58,
         "object_read_write",
         "specific",
         [bucket_a, bucket_b],
     )
-    resp = sub_token_s3_client.copy_object(
-        Bucket=bucket_b, Key="legit.txt", CopySource={"Bucket": bucket_a, "Key": "secret.txt"}
+    granted.install()
+    resp = granted.call(
+        lambda s3: s3.copy_object(
+            Bucket=bucket_b, Key="legit.txt", CopySource={"Bucket": bucket_a, "Key": "secret.txt"}
+        )
     )
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200, (
         f"A sub-token scoped to BOTH buckets was denied a cross-bucket CopyObject (got HTTP {resp['ResponseMetadata']['HTTPStatusCode']}, expected 200) — copy is over-restricting even when both source and destination are in scope."
