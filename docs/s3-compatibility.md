@@ -146,10 +146,11 @@ Notes:
   - `PUT /{bucket}?tagging` — Set/replace bucket tags (XML)
   - `DELETE /{bucket}?tagging` — Delete all bucket tags
 
-- **Bucket policy (public-read helper)**
+- **Bucket policy**
 
-  - `PUT /{bucket}?policy` — Accepts a standard public-read JSON policy; marks bucket public
-  - `GET /{bucket}?policy` — Returns policy JSON for public buckets; 404 `NoSuchBucketPolicy` for private buckets
+  - `PUT /{bucket}?policy` — Accepts either the whole-bucket public-read document (`arn:aws:s3:::{bucket}/*`, Allow, Principal `*`, `s3:GetObject`), which sets the bucket ACL to public-read, or the same statement aimed at `arn:aws:s3:::{bucket}/{prefix}/*`. A prefix publishes anonymous `GET`/`HEAD` of the current version of keys strictly under it (`public` matches `public/a`, not `public` or `publicity`). It does not publish the rest of the bucket, `ListBucket`, writes, ACP, or a `versionId` read. Overlapping prefixes are a union; there is no Deny to carve out a child. A prefix policy is rejected with 409 when the bucket ACL already grants anonymous read, because it would not narrow that grant. A whole-bucket document replaces any stored prefixes. Any other statement (Deny, another action, another bucket, a condition, a specific principal) is `InvalidPolicyDocument`.
+  - `GET /{bucket}?policy` — Returns the whole-bucket document when the bucket ACL grants anonymous read, one statement per stored prefix, or both when a later ACL change made the bucket public without clearing prefixes. 404 `NoSuchBucketPolicy` when neither is set. A mixed document does not round-trip through Put.
+  - `DELETE /{bucket}?policy` — Clears stored prefixes and leaves the bucket ACL unchanged. Idempotent 204. `PutBucketAcl` private does not clear prefixes; a prefix that is still returned by Get is still anonymously readable. Making a public-read bucket private remains `PutBucketAcl` private.
 
 Notes:
 

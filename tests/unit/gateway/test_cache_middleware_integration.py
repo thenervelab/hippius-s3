@@ -39,7 +39,14 @@ def _make_service(*, primary: bool = True, anon: bool = False) -> Any:
     )
 
     async def check_permission(
-        *, account_id: str | None, bucket: str, key: str | None, permission: Any, access_key: Any, bucket_owner_id: Any
+        *,
+        account_id: str | None,
+        bucket: str,
+        key: str | None,
+        permission: Any,
+        access_key: Any,
+        bucket_owner_id: Any,
+        **_extra: Any,
     ) -> bool:
         if account_id is None:
             return anon

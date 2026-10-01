@@ -45,11 +45,13 @@ async def cache_invalidation_middleware(
     """
     response = await call_next(request)
 
-    if not (
+    policy_change = _is_successful_policy_change(request, response)
+    bucket_identity_change = (
         _is_successful_bucket_delete(request, response)
         or _is_successful_bucket_create(request, response)
         or _is_successful_object_lock_write(request, response)
-    ):
+    )
+    if not policy_change and not bucket_identity_change:
         return response
 
     # Dot-segments collapsed, but NOT truncated at `#`. Both halves are load-bearing:
@@ -70,10 +72,19 @@ async def cache_invalidation_middleware(
     # 204 into a 500 (the upstream API has already committed the soft-delete).
     # Cache TTL (600s) bounds staleness if invalidation fails.
     try:
-        await _invalidate_bucket_acl_cache(acl_service, bucket_name)
+        if policy_change:
+            # Prefix rows only. This must not take the DeleteBucket path below:
+            # that SCAN-deletes every cached object ACL for the bucket.
+            await acl_service.invalidate_public_prefixes_by_name(bucket_name)
+        else:
+            await _invalidate_bucket_acl_cache(acl_service, bucket_name)
     except Exception:
-        logger.exception(f"Failed to invalidate ACL cache for soft-deleted bucket {bucket_name}")
+        logger.exception(f"Failed to invalidate ACL cache for bucket {bucket_name}")
     return response
+
+
+def _is_successful_policy_change(request: Request, response: Response) -> bool:
+    return request.method in ("PUT", "DELETE") and response.status_code == 204 and "policy" in request.query_params
 
 
 def _is_successful_bucket_delete(request: Request, response: Response) -> bool:
@@ -81,8 +92,10 @@ def _is_successful_bucket_delete(request: Request, response: Response) -> bool:
         return False
     if response.status_code != 204:
         return False
-    # DELETE /<bucket>?tagging removes only tags; bucket itself stays.
-    return "tagging" not in request.query_params
+    # Any query param is a subresource. DELETE /<bucket>?tagging removes tags and
+    # DELETE /<bucket>?policy clears public prefixes; neither deletes the bucket.
+    # Treating either as DeleteBucket would SCAN-invalidate every cached object ACL.
+    return not request.query_params
 
 
 def _is_successful_object_lock_write(request: Request, response: Response) -> bool:
