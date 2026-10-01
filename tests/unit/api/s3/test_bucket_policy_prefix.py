@@ -391,7 +391,6 @@ async def test_get_for_another_account_is_404(monkeypatch: pytest.MonkeyPatch) -
 async def test_delete_clears_prefixes_and_leaves_the_acl(monkeypatch: pytest.MonkeyPatch) -> None:
     _install(monkeypatch)
     db = _DB()
-    db.acl = _acl(Permission.READ)
     caches = _Caches()
 
     response = await policy.delete_bucket_policy(BUCKET, db, _Request(b"", caches))
@@ -405,6 +404,44 @@ async def test_delete_clears_prefixes_and_leaves_the_acl(monkeypatch: pytest.Mon
     assert db.set_acls == []
     assert caches.prefixes == ["bid-1"]
     assert caches.buckets == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("perm", [Permission.READ, Permission.FULL_CONTROL])
+async def test_delete_refuses_while_the_acl_grants_anonymous_read(
+    monkeypatch: pytest.MonkeyPatch, perm: Permission
+) -> None:
+    _install(monkeypatch)
+    db = _DB(prefixes=["public"])
+    db.acl = _acl(perm)
+    caches = _Caches()
+
+    response = await policy.delete_bucket_policy(BUCKET, db, _Request(b"", caches))
+
+    assert response.status_code == 409
+    assert _code(response) == "InvalidBucketState"
+    assert db.lock_calls == 1
+    assert db.execs == []
+    assert db.set_acls == []
+    assert db.events == ["begin", "commit"]
+    assert caches.prefixes == []
+    assert caches.buckets == []
+
+
+@pytest.mark.asyncio
+async def test_delete_clears_prefixes_when_all_users_has_only_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch)
+    db = _DB()
+    db.acl = _acl(Permission.WRITE)
+    caches = _Caches()
+
+    response = await policy.delete_bucket_policy(BUCKET, db, _Request(b"", caches))
+
+    assert response.status_code == 204
+    assert len(db.execs) == 1
+    assert "DELETE FROM bucket_public_prefixes" in db.execs[0][0]
+    assert db.set_acls == []
+    assert caches.prefixes == ["bid-1"]
 
 
 @pytest.mark.asyncio

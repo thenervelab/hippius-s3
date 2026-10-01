@@ -121,8 +121,10 @@ async def test_a_dot_segment_alias_still_sees_the_private_acl_on_the_stored_key(
     """
     private = _acl(OWNER, _owner_grant())
     svc, fetched = _service(_acl(OWNER, _owner_grant()), rows_for={"bid-a": ["sealed"]})
+    looked_up: list[str] = []
 
     async def get_object_acl(_bucket: str, key: str) -> ACL | None:
+        looked_up.append(key)
         if key == "sealed/x":
             return private
         return None
@@ -132,9 +134,13 @@ async def test_a_dot_segment_alias_still_sees_the_private_acl_on_the_stored_key(
     assert await _read(svc, "foo/../sealed/x") is False
     assert await _read(svc, "sealed/./x") is False
     assert await _read(svc, "sealed/x") is False
-    assert fetched == []
+    assert fetched == ["bid-a", "bid-a", "bid-a"]
     assert await _read(svc, "foo/../sealed/y") is True
-    assert fetched == ["bid-a"]
+    assert fetched == ["bid-a", "bid-a", "bid-a", "bid-a"]
+    # The alias is sealed by the collapsed key. The direct key reuses the
+    # effective-ACL read, so `sealed/x` is not looked up a fourth time.
+    assert looked_up.count("sealed/x") == 3
+    assert looked_up.count("foo/../sealed/x") == 1
 
 
 @pytest.mark.asyncio
@@ -157,10 +163,11 @@ async def test_a_leading_slash_key_is_not_published_by_the_prefix_it_does_not_na
 
     assert await _read(svc, "/public/secret") is False
     assert await _read(svc, "//public/secret") is False
-    # Effective ACL and the prefix seal each see the key the router stored.
-    # The stripped name `public/secret` is the public child and must not be consulted.
-    assert looked_up.count("/public/secret") == 2
-    assert looked_up.count("//public/secret") == 2
+    # The prefix does not match, so the seal lookup is skipped. The effective ACL
+    # still sees the key the router stored. The stripped name `public/secret` is
+    # the public child and must not be consulted.
+    assert looked_up.count("/public/secret") == 1
+    assert looked_up.count("//public/secret") == 1
     assert "public/secret" not in looked_up
 
 
@@ -173,7 +180,26 @@ async def test_an_object_acl_row_hides_the_prefix() -> None:
     )
 
     assert await _read(svc, "public/a") is False
-    assert fetched == []
+    assert fetched == ["bid-a"]
+    assert svc.acl_repo.get_object_acl.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_private_bucket_with_no_prefixes_reads_the_object_acl_once() -> None:
+    svc, fetched = _service(_acl(OWNER, _owner_grant()), rows_for={"bid-a": []})
+
+    assert await _read(svc, "public/a") is False
+    assert fetched == ["bid-a"]
+    assert svc.acl_repo.get_object_acl.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_matching_prefix_reuses_the_object_acl_read() -> None:
+    svc, fetched = _service(_acl(OWNER, _owner_grant()), rows_for={"bid-a": ["public"]})
+
+    assert await _read(svc, "public/a") is True
+    assert fetched == ["bid-a"]
+    assert svc.acl_repo.get_object_acl.await_count == 1
 
 
 @pytest.mark.asyncio

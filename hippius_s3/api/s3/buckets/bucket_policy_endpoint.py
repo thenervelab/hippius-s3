@@ -127,11 +127,15 @@ async def delete_bucket_policy(bucket_name: str, db: Any, request: Request) -> R
             BucketName=bucket_name,
         )
     # Prefixes only. The bucket ACL is how a whole-bucket public grant is stored,
-    # and clearing it here would make DeleteBucketPolicy a silent PutBucketAcl private.
+    # and clearing it here would make DeleteBucketPolicy a silent PutBucketAcl private,
+    # including for a bucket made public with PutBucketAcl. While that grant is what
+    # Get still returns, a 204 would tell the client the policy is gone. Refuse
+    # instead, and write nothing, so a retry stays a refusal until PutBucketAcl private.
     # The same bucket-row lock as Put: without it a put that has already deleted the
     # old rows and not yet inserted the new ones commits after this delete, and the
     # 204 leaves the prefix published.
     bucket_id = bucket["bucket_id"]
+    refused = False
     async with db.transaction():
         locked = await db.fetchrow(get_query("lock_bucket_by_id"), bucket_id)
         if locked is None:
@@ -141,7 +145,20 @@ async def delete_bucket_policy(bucket_name: str, db: Any, request: Request) -> R
                 status_code=404,
                 BucketName=bucket_name,
             )
-        await db.execute(get_query("delete_bucket_public_prefixes"), bucket_id)
+        acl = await ACLRepository(db).get_bucket_acl(bucket_name)
+        if bucket_grants_anonymous_read(acl):
+            refused = True
+        else:
+            await db.execute(get_query("delete_bucket_public_prefixes"), bucket_id)
+    if refused:
+        return errors.s3_error_response(
+            "InvalidBucketState",
+            "The bucket ACL still grants anonymous read. "
+            "DeleteBucketPolicy would leave that grant in place. "
+            "Make the bucket private with PutBucketAcl first.",
+            status_code=409,
+            BucketName=bucket_name,
+        )
     await _invalidate_policy_caches(request, bucket_name, str(bucket_id), acl_changed=False)
     return Response(status_code=204)
 

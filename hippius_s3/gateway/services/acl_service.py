@@ -226,7 +226,7 @@ class ACLService:
     ) -> bool:
         """Check if account or access key has permission for bucket/object."""
 
-        acl = await self.get_effective_acl(bucket, key, bucket_owner_id)
+        acl, object_acl = await self._load_effective_acl(bucket, key, bucket_owner_id)
 
         grants_summary = [
             f"{{type={g.grantee.type.value}, id={g.grantee.id or 'None'}, uri={g.grantee.uri or 'None'}, perm={g.permission.value}}}"
@@ -289,21 +289,30 @@ class ACLService:
         # `x-amz-copy-source` must not hide the private ACL of the object it names.
         # `bucket_id` is the bucket being authorized. CopyObject must pass the source
         # bucket's id — the destination's prefixes must not publish the source.
+        #
+        # The prefix list comes first. Object-ACL misses are not cached, and a bucket
+        # with no matching prefix would otherwise pay that query on every denied read.
+        # When this key is already the stored key, the effective-ACL read above is the
+        # seal lookup and is not repeated.
         stored_key = stored_object_key(key) if key is not None else ""
         if (
             allow_public_prefix
             and stored_key
             and stored_key != "/"
             and permission == Permission.READ
-            and await self.acl_repo.get_object_acl(bucket, stored_key) is None
             and await self._prefix_read_allows(bucket, stored_key, bucket_id)
         ):
-            logger.info(
-                f"ACL check: account={account_id}, access_key={access_key or 'None'}, bucket={bucket}, "
-                f"key={key or 'None'}, required_perm={permission.value}, owner={acl.owner.id}, "
-                f"grants={len(acl.grants)}{grants_summary}, result=GRANTED (public prefix)"
-            )
-            return True
+            if stored_key == key:
+                sealed = object_acl is not None
+            else:
+                sealed = await self.acl_repo.get_object_acl(bucket, stored_key) is not None
+            if not sealed:
+                logger.info(
+                    f"ACL check: account={account_id}, access_key={access_key or 'None'}, bucket={bucket}, "
+                    f"key={key or 'None'}, required_perm={permission.value}, owner={acl.owner.id}, "
+                    f"grants={len(acl.grants)}{grants_summary}, result=GRANTED (public prefix)"
+                )
+                return True
 
         logger.info(
             f"ACL check: account={account_id}, access_key={access_key or 'None'}, bucket={bucket}, "
@@ -377,16 +386,22 @@ class ACLService:
             return
         await self.invalidate_public_prefixes(lookup.bucket_id)
 
-    async def get_effective_acl(self, bucket: str, key: str | None, bucket_owner_id: str | None = None) -> ACL:
-        """Get effective ACL with inheritance (direct DB queries)."""
+    async def _load_effective_acl(
+        self, bucket: str, key: str | None, bucket_owner_id: str | None = None
+    ) -> tuple[ACL, ACL | None]:
+        """Effective ACL, and the object ACL row when this key has one.
+
+        The object ACL is None when the key was looked up and has no row. Callers
+        that authorize a different stored key still have to read that key.
+        """
         if key:
-            acl = await self.acl_repo.get_object_acl(bucket, key)
-            if acl:
-                return acl
+            object_acl = await self.acl_repo.get_object_acl(bucket, key)
+            if object_acl:
+                return object_acl, object_acl
 
         acl = await self.acl_repo.get_bucket_acl(bucket)
         if acl:
-            return acl
+            return acl, None
 
         if bucket_owner_id is None:
             owner_id = await self.get_bucket_owner(bucket)
@@ -395,7 +410,12 @@ class ACLService:
         else:
             owner_id = bucket_owner_id
 
-        return await self.canned_acl_to_acl("private", owner_id, bucket)
+        return await self.canned_acl_to_acl("private", owner_id, bucket), None
+
+    async def get_effective_acl(self, bucket: str, key: str | None, bucket_owner_id: str | None = None) -> ACL:
+        """Get effective ACL with inheritance (direct DB queries)."""
+        acl, _object_acl = await self._load_effective_acl(bucket, key, bucket_owner_id)
+        return acl
 
     async def invalidate_cache(self, bucket: str, key: str | None = None) -> None:
         """Invalidate ACL cache for bucket or object."""
