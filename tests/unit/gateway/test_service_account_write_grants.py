@@ -7,7 +7,6 @@ exist and total over any path that reaches the acl tables another way.
 """
 
 from typing import Any
-from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
 import pytest
@@ -113,7 +112,13 @@ def test_only_the_offending_grants_are_returned() -> None:
 def _service(monkeypatch: Any, acl: ACL, allowlist: frozenset[str] = ALLOWLIST) -> ACLService:
     monkeypatch.setattr(acl_service_mod, "get_config", lambda: MagicMock(service_account_ids=allowlist))
     svc = ACLService.__new__(ACLService)
-    svc.get_effective_acl = AsyncMock(return_value=acl)  # ty: ignore[invalid-assignment]
+
+    async def load(_bucket: str, _key: str | None, _owner: str | None = None) -> tuple[ACL, None]:
+        return acl, None
+
+    # check_permission loads through this, not get_effective_acl. The instance is
+    # built with __new__, so the real loader would touch an acl_repo that is not there.
+    svc._load_effective_acl = load  # type: ignore[method-assign]
     return svc
 
 
