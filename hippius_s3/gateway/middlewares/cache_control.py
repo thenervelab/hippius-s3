@@ -10,7 +10,11 @@ from hippius_s3.config import get_config
 from hippius_s3.gateway.middlewares.acl import parse_s3_path
 
 
-PUBLIC_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=60"
+# 6h fresh + 1m stale-while-revalidate. Default for a whole-bucket anonymous read.
+PUBLIC_CACHE_CONTROL = "public, max-age=21600, stale-while-revalidate=60"
+# Prefix grants stay at 5 minutes. Revoking a prefix does not PURGE every child key,
+# so this is the window a revoke can still promise.
+PREFIX_PUBLIC_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=60"
 # 30d fresh + 1d stale-while-revalidate. Effectively indefinite — used for buckets
 # the cache-control service has flagged as is_cache_warm. Combined with PURGE on
 # write, ATS holds bodies until either the next write or LRU eviction.
@@ -24,7 +28,7 @@ PUBLIC_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=60"
 #    gated by ATS authproxy → gateway /__authcheck probe.
 WARM_PUBLIC_CACHE_CONTROL = "public, max-age=2592000, stale-while-revalidate=86400"
 # 7d fresh + 1d stale-while-revalidate. Ops exception for HIPPIUS_PINNED_BUCKETS.
-# Replaces the 5-minute public header only — private and prefix-grant reads stay as
+# Replaces the 6-hour public header only — private and prefix-grant reads stay as
 # they are, so a listed name cannot widen who may read or how long a prefix revoke takes.
 PINNED_CACHE_CONTROL = "public, max-age=604800, stale-while-revalidate=86400"
 PRIVATE_CACHE_CONTROL = "private, no-store"
@@ -87,13 +91,13 @@ async def cache_control_middleware(
         response.headers["Cache-Control"] = PRIVATE_CACHE_CONTROL
         return response
 
-    # A prefix grant is one slice of a private bucket. The 30-day warm header would
-    # keep a just-revoked prefix readable at ATS until LRU eviction. Five minutes is
-    # the bound a revoke can actually promise. A whole-bucket ACL still takes the
-    # warm header below; `anonymous_read_via_prefix` is set only when the ACL alone
-    # would not have allowed the read.
+    # A prefix grant is one slice of a private bucket. The 30-day warm header and the
+    # 6-hour public default would keep a just-revoked prefix readable at ATS for that
+    # whole window. Five minutes is the bound a revoke can actually promise. A
+    # whole-bucket ACL still takes the warm header below; `anonymous_read_via_prefix`
+    # is set only when the ACL alone would not have allowed the read.
     if getattr(request.state, "anonymous_read_via_prefix", False):
-        response.headers["Cache-Control"] = PUBLIC_CACHE_CONTROL
+        response.headers["Cache-Control"] = PREFIX_PUBLIC_CACHE_CONTROL
         return response
 
     if bucket_is_cache_warm:

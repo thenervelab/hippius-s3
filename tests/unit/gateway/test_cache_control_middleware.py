@@ -14,6 +14,7 @@ from hippius_s3 import config as gateway_config
 from hippius_s3.config import get_config
 from hippius_s3.gateway.middlewares import cache_control as cache_control_mod
 from hippius_s3.gateway.middlewares.cache_control import PINNED_CACHE_CONTROL
+from hippius_s3.gateway.middlewares.cache_control import PREFIX_PUBLIC_CACHE_CONTROL
 from hippius_s3.gateway.middlewares.cache_control import PRIVATE_CACHE_CONTROL
 from hippius_s3.gateway.middlewares.cache_control import PUBLIC_CACHE_CONTROL
 from hippius_s3.gateway.middlewares.cache_control import VISIBILITY_HEADER
@@ -65,6 +66,7 @@ async def test_private_bucket_gets_no_store(app: Any) -> None:
 async def test_public_bucket_gets_cacheable_policy(app: Any) -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.get("/public-bucket/foo.txt", headers={"x-test-anon-read": "true"})
+    assert PUBLIC_CACHE_CONTROL == "public, max-age=21600, stale-while-revalidate=60"
     assert r.headers["Cache-Control"] == PUBLIC_CACHE_CONTROL
 
 
@@ -75,7 +77,8 @@ async def test_prefix_public_on_a_warm_bucket_stays_on_the_short_ttl(app: Any) -
             "/warm-bucket/public/a",
             headers={"x-test-anon-read": "true", "x-test-warm": "true", "x-test-via-prefix": "true"},
         )
-    assert r.headers["Cache-Control"] == PUBLIC_CACHE_CONTROL
+    assert PREFIX_PUBLIC_CACHE_CONTROL == "public, max-age=300, stale-while-revalidate=60"
+    assert r.headers["Cache-Control"] == PREFIX_PUBLIC_CACHE_CONTROL
     assert VISIBILITY_HEADER not in r.headers
 
 
@@ -187,7 +190,7 @@ def _with_pinned(monkeypatch: pytest.MonkeyPatch, names: frozenset[str]) -> None
 
 @pytest.mark.asyncio
 async def test_pinned_bucket_gets_seven_day_ttl(app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A listed public bucket replaces the 5-minute header. Unlisted neighbors stay on it."""
+    """A listed public bucket replaces the 6-hour header. Unlisted neighbors stay on it."""
     _with_pinned(monkeypatch, frozenset({"pg-inventory"}))
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         pinned = await client.get("/pg-inventory/current.json", headers={"x-test-anon-read": "true"})
@@ -231,7 +234,7 @@ async def test_pinned_private_prefix_and_errors_stay_short(app: Any, monkeypatch
             headers={"x-test-status": "404", "x-test-anon-read": "true"},
         )
     assert private.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
-    assert prefix.headers["Cache-Control"] == PUBLIC_CACHE_CONTROL
+    assert prefix.headers["Cache-Control"] == PREFIX_PUBLIC_CACHE_CONTROL
     assert listing.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
     assert missing.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
 
