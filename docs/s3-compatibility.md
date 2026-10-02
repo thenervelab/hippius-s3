@@ -30,7 +30,7 @@ Notes:
 | DeleteBucketMetadataTableConfiguration          |           |                                                             |                                               |                                                                      |
 | DeleteBucketMetricsConfiguration                |           |                                                             |                                               |                                                                      |
 | DeleteBucketOwnershipControls                   |           |                                                             |                                               |                                                                      |
-| DeleteBucketPolicy                              |           |                                                             |                                               |                                                                      |
+| DeleteBucketPolicy                              | ✔         | Clears prefixes. 409 InvalidBucketState while the bucket ACL grants anonymous read; the ACL is left unchanged | DELETE /{bucket}?policy                       | test_PublicPrefixPolicy.py                                           |
 | DeleteBucketReplication                         |           |                                                             |                                               |                                                                      |
 | DeleteBucketTagging                             | ✔         | Deletes all tags                                            | DELETE /{bucket}?tagging                      | test_BucketTagging.py                                                |
 | DeleteBucketWebsite                             |           |                                                             |                                               |                                                                      |
@@ -146,10 +146,11 @@ Notes:
   - `PUT /{bucket}?tagging` — Set/replace bucket tags (XML)
   - `DELETE /{bucket}?tagging` — Delete all bucket tags
 
-- **Bucket policy (public-read helper)**
+- **Bucket policy**
 
-  - `PUT /{bucket}?policy` — Accepts a standard public-read JSON policy; marks bucket public
-  - `GET /{bucket}?policy` — Returns policy JSON for public buckets; 404 `NoSuchBucketPolicy` for private buckets
+  - `PUT /{bucket}?policy` — Accepts either the whole-bucket public-read document (`arn:aws:s3:::{bucket}/*`, Allow, Principal `*`, `s3:GetObject`), which sets the bucket ACL to public-read, or the same statement aimed at `arn:aws:s3:::{bucket}/{prefix}/*`. A prefix publishes anonymous `GET`/`HEAD` of the current version of keys strictly under it (`public` matches `public/a`, not `public` or `publicity`). It does not publish the rest of the bucket, `ListBucket`, writes, ACP, or a `versionId` read. Overlapping prefixes are a union; there is no Deny to carve out a child. Any object ACL row seals the key from the prefix, including a row an upload wrote with `x-amz-acl`; the prefix Allow does not combine with that row. A prefix policy is rejected with 409 when the bucket ACL already grants anonymous read, because it would not narrow that grant. A whole-bucket document replaces any stored prefixes. Any other statement (Deny, another action, another bucket, a condition, a specific principal) is `InvalidPolicyDocument`.
+  - `GET /{bucket}?policy` — Returns the whole-bucket document when the bucket ACL grants anonymous read, one statement per stored prefix, or both when a later ACL change made the bucket public without clearing prefixes. 404 `NoSuchBucketPolicy` when neither is set. A mixed document does not round-trip through Put.
+  - `DELETE /{bucket}?policy` — Clears stored prefixes when the bucket ACL does not grant anonymous read, and leaves that ACL unchanged. Idempotent 204 in that case. While the ACL grants anonymous read (AllUsers `READ` or `FULL_CONTROL`), Delete returns 409 `InvalidBucketState` and writes nothing, prefixes included: a 204 would leave the document Get still returns. `PutBucketAcl` private does not clear prefixes; a prefix that is still returned by Get is still anonymously readable. Making a public-read bucket private remains `PutBucketAcl` private, after which Delete can clear any prefixes.
 
 Notes:
 

@@ -169,12 +169,13 @@ class TestCreateBucketShapeMatchesTheRouter:
 class TestDeleteBucketDispatch:
     """DeleteBucket takes no subresource, so an unrecognised one must not fall through to it.
 
-    `DELETE /{b}?policy` (DeleteBucketPolicy) and `?cors` are ordinary S3 calls that every SDK
-    can emit; routing them to handle_delete_bucket destroyed the bucket. `?acl` was worse: it
-    arrives graded WRITE_ACP, so an ACL-admin grantee could delete an empty bucket.
+    `DELETE /{b}?cors` is an ordinary S3 call every SDK can emit; routing it to
+    handle_delete_bucket destroyed the bucket. `?acl` was worse: it arrives graded
+    WRITE_ACP, so an ACL-admin grantee could delete an empty bucket. `?policy` is
+    implemented and clears public prefixes only — it still must not delete the bucket.
     """
 
-    @pytest.mark.parametrize("query", ["policy", "cors", "lifecycle", "acl", "website", "x"])
+    @pytest.mark.parametrize("query", ["cors", "lifecycle", "acl", "website", "x"])
     @pytest.mark.asyncio
     async def test_unknown_subresource_is_not_a_bucket_delete(self, query: str) -> None:
         from unittest.mock import AsyncMock
@@ -207,6 +208,47 @@ class TestDeleteBucketDispatch:
 
         assert called == [], f"?{query} must not reach handle_delete_bucket"
         assert resp.status_code == 501
+
+    @pytest.mark.asyncio
+    async def test_delete_policy_clears_prefixes_and_does_not_delete_the_bucket(self) -> None:
+        from unittest.mock import AsyncMock
+        from unittest.mock import MagicMock
+
+        from fastapi import Request
+        from fastapi import Response
+
+        called: list[str] = []
+
+        async def _fail(*a: object, **k: object) -> None:
+            called.append("delete_bucket")
+
+        async def _policy(*a: object, **k: object) -> Response:
+            called.append("policy")
+            return Response(status_code=204)
+
+        req = MagicMock(spec=Request)
+        req.query_params = {"policy": ""}
+        req.state = MagicMock()
+
+        pool = MagicMock()
+        pool.acquire = MagicMock()
+
+        import hippius_s3.api.s3.buckets.router as r
+
+        original_delete = r.handle_delete_bucket
+        original_policy = r.delete_bucket_policy
+        r.handle_delete_bucket = _fail  # type: ignore[assignment]
+        r.delete_bucket_policy = _policy  # type: ignore[assignment]
+        try:
+            resp = await r.delete_bucket_tags_route(
+                bucket_name="victim", request=req, pool=pool, redis_client=AsyncMock()
+            )
+        finally:
+            r.handle_delete_bucket = original_delete  # type: ignore[assignment]
+            r.delete_bucket_policy = original_policy  # type: ignore[assignment]
+
+        assert called == ["policy"]
+        assert resp.status_code == 204
 
 
 class TestWormSubresourcesCannotTakeTheCreateBypass:

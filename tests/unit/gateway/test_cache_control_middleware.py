@@ -37,6 +37,7 @@ def app() -> Any:
         status = int(request.headers.get("x-test-status", "200"))
         # Simulate acl_middleware wiring
         request.state.anonymous_read_allowed = request.headers.get("x-test-anon-read") == "true"
+        request.state.anonymous_read_via_prefix = request.headers.get("x-test-via-prefix") == "true"
         request.state.bucket_is_cache_warm = request.headers.get("x-test-warm") == "true"
         # Simulate auth_router wiring
         request.state.auth_method = request.headers.get("x-test-auth-method", "anonymous")
@@ -63,6 +64,24 @@ async def test_public_bucket_gets_cacheable_policy(app: Any) -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.get("/public-bucket/foo.txt", headers={"x-test-anon-read": "true"})
     assert r.headers["Cache-Control"] == PUBLIC_CACHE_CONTROL
+
+
+@pytest.mark.asyncio
+async def test_prefix_public_on_a_warm_bucket_stays_on_the_short_ttl(app: Any) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get(
+            "/warm-bucket/public/a",
+            headers={"x-test-anon-read": "true", "x-test-warm": "true", "x-test-via-prefix": "true"},
+        )
+    assert r.headers["Cache-Control"] == PUBLIC_CACHE_CONTROL
+    assert VISIBILITY_HEADER not in r.headers
+
+
+@pytest.mark.asyncio
+async def test_via_prefix_flag_alone_does_not_publish(app: Any) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get("/bucket/public/a", headers={"x-test-via-prefix": "true"})
+    assert r.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
 
 
 @pytest.mark.asyncio

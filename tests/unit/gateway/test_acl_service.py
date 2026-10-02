@@ -258,6 +258,17 @@ class TestSentinelOwnerNeverGrants:
         """The production shape: no stored ACL rows, so the owner column IS the entire ACL."""
         acl_service.acl_repo.get_object_acl = AsyncMock(return_value=None)
         acl_service.acl_repo.get_bucket_acl = AsyncMock(return_value=None)
+        # No public prefixes either. The READ of a key consults that table, and an
+        # unconfigured mock must not be what the denial depends on.
+        mock_db_pool.fetchrow = AsyncMock(
+            return_value={
+                "main_account_id": "anonymous",
+                "bucket_id": "bid-health",
+                "is_cache_warm": False,
+                "object_lock": None,
+            }
+        )
+        mock_db_pool.fetch = AsyncMock(return_value=[])
 
         for permission in (Permission.READ, Permission.WRITE):
             assert (

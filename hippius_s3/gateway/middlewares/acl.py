@@ -67,6 +67,24 @@ def parse_copy_source(header_value: str) -> tuple[str | None, str | None]:
     return bucket, (key.split("?", 1)[0] or None)
 
 
+def _request_version_pinned(request: Request) -> bool:
+    """A version id selects s3:GetObjectVersion, which a prefix policy does not grant."""
+    return any(name.lower() == "versionid" for name in request.query_params)
+
+
+def _copy_source_version_pinned(copy_source: str) -> bool:
+    """Same pin for ``x-amz-copy-source``, judged after the decode the handlers apply.
+
+    ``parse_copy_source`` drops the query before the READ check, so the version id has
+    to be read from the header itself. An encoded ``?`` still counts: the handlers
+    unquote before they split.
+    """
+    _src, sep, query = unquote(copy_source.strip()).partition("?")
+    if not sep:
+        return False
+    return any(unquote(part.split("=", 1)[0]).lower() == "versionid" for part in query.split("&"))
+
+
 def parse_s3_path(path: str) -> tuple[str | None, str | None]:
     """
     Parse S3 path into bucket and key components.
@@ -145,9 +163,9 @@ def get_required_permission(
     if "acl" in query_params:
         return Permission.READ_ACP if method == "GET" else Permission.WRITE_ACP
 
-    # `policy` is an access-control operation, not a data one: PUT ?policy replaces the bucket
-    # ACL (see bucket_policy_endpoint.set_bucket_policy). Falling through to the method-only
-    # mapping below graded it WRITE, so a write-only grantee could publish a bucket to AllUsers.
+    # `policy` is an access-control operation, not a data one. The whole-bucket document
+    # replaces the bucket ACL with public-read; a prefix document publishes anonymous GET
+    # of those keys. Either one graded WRITE would let a write-only grantee publish objects.
     if "policy" in query_params:
         return Permission.READ_ACP if method in ("GET", "HEAD") else Permission.WRITE_ACP
 
@@ -317,6 +335,8 @@ async def acl_middleware(
                     permission=Permission.READ,
                     access_key=access_key,
                     bucket_owner_id=src_lookup.owner_id,
+                    bucket_id=src_lookup.bucket_id,
+                    allow_public_prefix=not _copy_source_version_pinned(copy_source),
                 )
                 if not src_allowed:
                     logger.info(
@@ -438,6 +458,8 @@ async def acl_middleware(
     # master-token and presigned-URL reads of public objects also populate ATS cache.
     # Gated on ATS being active to avoid a Redis round-trip when there's no consumer.
     request.state.anonymous_read_allowed = False
+    request.state.anonymous_read_via_prefix = False
+    version_pinned = key is not None and _request_version_pinned(request)
     if get_config().ats_cache_endpoints and request.method in ("GET", "HEAD") and key is not None:
         request.state.anonymous_read_allowed = await acl_service.check_permission(
             account_id=None,
@@ -446,7 +468,24 @@ async def acl_middleware(
             permission=Permission.READ,
             access_key=None,
             bucket_owner_id=bucket_owner_id,
+            bucket_id=bucket_id,
+            allow_public_prefix=not version_pinned,
         )
+        # The second call is what distinguishes "the bucket ACL publishes this object"
+        # from "only a prefix does". Prefix responses stay on the short public TTL even
+        # when the bucket is warm; a whole-bucket ACL keeps the warm header.
+        if request.state.anonymous_read_allowed and not version_pinned:
+            allowed_without_prefix = await acl_service.check_permission(
+                account_id=None,
+                bucket=bucket,
+                key=key,
+                permission=Permission.READ,
+                access_key=None,
+                bucket_owner_id=bucket_owner_id,
+                bucket_id=bucket_id,
+                allow_public_prefix=False,
+            )
+            request.state.anonymous_read_via_prefix = not allowed_without_prefix
 
     if (
         auth_method == "access_key"
@@ -472,6 +511,8 @@ async def acl_middleware(
             permission=permission,
             access_key=access_key,
             bucket_owner_id=bucket_owner_id,
+            bucket_id=bucket_id,
+            allow_public_prefix=not version_pinned,
         )
     except ValueError as e:
         if "Bucket not found" in str(e):

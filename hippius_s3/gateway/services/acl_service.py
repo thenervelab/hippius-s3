@@ -16,11 +16,20 @@ from hippius_s3.models.acl import GranteeType
 from hippius_s3.models.acl import Permission
 from hippius_s3.models.acl import WellKnownGroups
 from hippius_s3.repositories.acl_repository import ACLRepository
+from hippius_s3.services.public_prefix_policy import key_matches_public_prefix
+from hippius_s3.services.public_prefix_policy import stored_object_key
 from hippius_s3.services.service_accounts import WRITE_PERMISSIONS
 from hippius_s3.services.service_accounts import is_service_account
+from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
+
+# Negative-cache TTL for "this bucket has no public prefixes". Allow lists are not
+# cached: a stale allow list is an anonymous read of a prefix the owner just revoked.
+# A stale empty entry is only an under-grant, and it expires.
+_PREFIX_NEGATIVE_TTL_SECONDS = 60
+_PREFIX_EMPTY = "[]"
 
 
 class BucketLookup(BaseModel):
@@ -212,10 +221,12 @@ class ACLService:
         permission: Permission,
         access_key: str | None = None,
         bucket_owner_id: str | None = None,
+        allow_public_prefix: bool = True,
+        bucket_id: str | None = None,
     ) -> bool:
         """Check if account or access key has permission for bucket/object."""
 
-        acl = await self.get_effective_acl(bucket, key, bucket_owner_id)
+        acl, object_acl = await self._load_effective_acl(bucket, key, bucket_owner_id)
 
         grants_summary = [
             f"{{type={g.grantee.type.value}, id={g.grantee.id or 'None'}, uri={g.grantee.uri or 'None'}, perm={g.permission.value}}}"
@@ -270,6 +281,39 @@ class ACLService:
                 )
                 return True
 
+        # A public prefix grants READ of the current object only, and only when no
+        # object ACL row exists. An object ACL replaces the bucket ACL; appending the
+        # prefix onto that object (or onto the cached ACL object) would publish a key
+        # the owner sealed, and would poison the ACL cache for every later request.
+        # The lookup uses the stored key, not the raw copy-source string: `../` in
+        # `x-amz-copy-source` must not hide the private ACL of the object it names.
+        # `bucket_id` is the bucket being authorized. CopyObject must pass the source
+        # bucket's id — the destination's prefixes must not publish the source.
+        #
+        # The prefix list comes first. Object-ACL misses are not cached, and a bucket
+        # with no matching prefix would otherwise pay that query on every denied read.
+        # When this key is already the stored key, the effective-ACL read above is the
+        # seal lookup and is not repeated.
+        stored_key = stored_object_key(key) if key is not None else ""
+        if (
+            allow_public_prefix
+            and stored_key
+            and stored_key != "/"
+            and permission == Permission.READ
+            and await self._prefix_read_allows(bucket, stored_key, bucket_id)
+        ):
+            if stored_key == key:
+                sealed = object_acl is not None
+            else:
+                sealed = await self.acl_repo.get_object_acl(bucket, stored_key) is not None
+            if not sealed:
+                logger.info(
+                    f"ACL check: account={account_id}, access_key={access_key or 'None'}, bucket={bucket}, "
+                    f"key={key or 'None'}, required_perm={permission.value}, owner={acl.owner.id}, "
+                    f"grants={len(acl.grants)}{grants_summary}, result=GRANTED (public prefix)"
+                )
+                return True
+
         logger.info(
             f"ACL check: account={account_id}, access_key={access_key or 'None'}, bucket={bucket}, "
             f"key={key or 'None'}, required_perm={permission.value}, owner={acl.owner.id}, "
@@ -277,16 +321,87 @@ class ACLService:
         )
         return False
 
-    async def get_effective_acl(self, bucket: str, key: str | None, bucket_owner_id: str | None = None) -> ACL:
-        """Get effective ACL with inheritance (direct DB queries)."""
+    async def _prefix_read_allows(self, bucket: str, key: str, bucket_id: str | None) -> bool:
+        resolved = bucket_id
+        if resolved is None:
+            lookup = await self.get_bucket_owner_and_id(bucket)
+            if lookup is None:
+                return False
+            resolved = lookup.bucket_id
+        prefixes = await self.list_public_prefixes(resolved)
+        return key_matches_public_prefix(key, prefixes)
+
+    def _prefix_cache_key(self, bucket_id: str) -> str:
+        # Keyed by bucket id, not name. A name is reusable the moment the previous
+        # bucket is soft-deleted; a name-keyed allow list would publish the next
+        # tenant's objects under the previous tenant's prefixes.
+        return f"hippius_acl:prefixes:{bucket_id}"
+
+    async def list_public_prefixes(self, bucket_id: str) -> list[str]:
+        bucket_id = str(bucket_id)
+        if await self._prefix_negative_cached(bucket_id):
+            return []
+        rows = await self.acl_repo.db.fetch(get_query("list_bucket_public_prefixes"), bucket_id)
+        prefixes = [str(row["prefix"]) for row in rows]
+        if not prefixes:
+            # SETEX runs after the read. A PutBucketPolicy that committed and deleted
+            # this key in between can be overwritten by this empty sentinel. That is
+            # an under-grant until the TTL, which is the direction this cache allows.
+            await self._cache_empty_prefixes(bucket_id)
+        return prefixes
+
+    async def _prefix_negative_cached(self, bucket_id: str) -> bool:
+        if self._redis is None:
+            return False
+        try:
+            cached = await self._redis.get(self._prefix_cache_key(bucket_id))
+        except RedisError as exc:
+            logger.warning(f"prefix cache: redis GET failed, falling through to DB: {exc}")
+            return False
+        if isinstance(cached, bytes):
+            cached = cached.decode("utf-8", "replace")
+        # Anything other than the empty sentinel — including a list a future bug
+        # might store — is not an allow. Fall through and read the table.
+        return cached == _PREFIX_EMPTY
+
+    async def _cache_empty_prefixes(self, bucket_id: str) -> None:
+        if self._redis is None:
+            return
+        try:
+            await self._redis.setex(self._prefix_cache_key(bucket_id), _PREFIX_NEGATIVE_TTL_SECONDS, _PREFIX_EMPTY)
+        except RedisError as exc:
+            logger.warning(f"prefix cache: redis SETEX failed (best-effort, continuing): {exc}")
+
+    async def invalidate_public_prefixes(self, bucket_id: str) -> None:
+        if self._redis is None:
+            return
+        try:
+            await self._redis.delete(self._prefix_cache_key(str(bucket_id)))
+        except RedisError as exc:
+            logger.warning(f"prefix cache: redis DELETE failed for {bucket_id} (best-effort, continuing): {exc}")
+
+    async def invalidate_public_prefixes_by_name(self, bucket: str) -> None:
+        lookup = await self.get_bucket_owner_and_id(bucket)
+        if lookup is None:
+            return
+        await self.invalidate_public_prefixes(lookup.bucket_id)
+
+    async def _load_effective_acl(
+        self, bucket: str, key: str | None, bucket_owner_id: str | None = None
+    ) -> tuple[ACL, ACL | None]:
+        """Effective ACL, and the object ACL row when this key has one.
+
+        The object ACL is None when the key was looked up and has no row. Callers
+        that authorize a different stored key still have to read that key.
+        """
         if key:
-            acl = await self.acl_repo.get_object_acl(bucket, key)
-            if acl:
-                return acl
+            object_acl = await self.acl_repo.get_object_acl(bucket, key)
+            if object_acl:
+                return object_acl, object_acl
 
         acl = await self.acl_repo.get_bucket_acl(bucket)
         if acl:
-            return acl
+            return acl, None
 
         if bucket_owner_id is None:
             owner_id = await self.get_bucket_owner(bucket)
@@ -295,7 +410,12 @@ class ACLService:
         else:
             owner_id = bucket_owner_id
 
-        return await self.canned_acl_to_acl("private", owner_id, bucket)
+        return await self.canned_acl_to_acl("private", owner_id, bucket), None
+
+    async def get_effective_acl(self, bucket: str, key: str | None, bucket_owner_id: str | None = None) -> ACL:
+        """Get effective ACL with inheritance (direct DB queries)."""
+        acl, _object_acl = await self._load_effective_acl(bucket, key, bucket_owner_id)
+        return acl
 
     async def invalidate_cache(self, bucket: str, key: str | None = None) -> None:
         """Invalidate ACL cache for bucket or object."""

@@ -8,142 +8,187 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.api.s3 import errors
-from hippius_s3.models.acl import Permission
-from hippius_s3.models.acl import WellKnownGroups
 from hippius_s3.repositories.acl_repository import ACLRepository
 from hippius_s3.repositories.buckets import BucketRepository
+from hippius_s3.services.public_prefix_policy import MAX_POLICY_BYTES
+from hippius_s3.services.public_prefix_policy import PolicyDocumentError
+from hippius_s3.services.public_prefix_policy import PolicyKind
+from hippius_s3.services.public_prefix_policy import bucket_grants_anonymous_read
+from hippius_s3.services.public_prefix_policy import parse_bucket_policy
+from hippius_s3.services.public_prefix_policy import policy_document
+from hippius_s3.utils import get_query
 
 
 logger = logging.getLogger(__name__)
 
 
 async def get_bucket_policy(bucket_name: str, db: Any, main_account_id: str) -> Response:
-    try:
-        bucket = await BucketRepository(db).get_by_name_and_owner(bucket_name, main_account_id)
-        if not bucket:
-            return errors.s3_error_response(
-                "NoSuchBucket",
-                f"The specified bucket {bucket_name} does not exist",
-                status_code=404,
-                BucketName=bucket_name,
-            )
-
-        acl_repo = ACLRepository(db)
-        acl = await acl_repo.get_bucket_acl(bucket_name)
-
-        if not acl:
-            return errors.s3_error_response(
-                "NoSuchBucketPolicy",
-                "The bucket policy does not exist",
-                status_code=404,
-                BucketName=bucket_name,
-            )
-
-        has_public_read = any(
-            grant.grantee.uri == WellKnownGroups.ALL_USERS and grant.permission == Permission.READ
-            for grant in acl.grants
-        )
-
-        if not has_public_read:
-            return errors.s3_error_response(
-                "NoSuchBucketPolicy",
-                "The bucket policy does not exist",
-                status_code=404,
-                BucketName=bucket_name,
-            )
-
-        policy = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Principal": "*",
-                    "Action": ["s3:GetObject"],
-                    "Resource": [f"arn:aws:s3:::{bucket_name}/*"],
-                }
-            ],
-        }
-        return Response(content=json.dumps(policy, indent=2), media_type="application/json", status_code=200)
-    except Exception as e:
-        logger.exception(f"Error getting bucket policy: {e}")
+    bucket = await BucketRepository(db).get_by_name_and_owner(bucket_name, main_account_id)
+    if not bucket:
         return errors.s3_error_response(
-            "InternalError", "We encountered an internal error. Please try again.", status_code=500
+            "NoSuchBucket",
+            f"The specified bucket {bucket_name} does not exist",
+            status_code=404,
+            BucketName=bucket_name,
         )
+
+    acl = await ACLRepository(db).get_bucket_acl(bucket_name)
+    rows = await db.fetch(get_query("list_bucket_public_prefixes"), bucket["bucket_id"])
+    document = policy_document(
+        bucket_name,
+        public_acl=bucket_grants_anonymous_read(acl),
+        prefixes=[str(row["prefix"]) for row in rows],
+    )
+    if document is None:
+        return errors.s3_error_response(
+            "NoSuchBucketPolicy",
+            "The bucket policy does not exist",
+            status_code=404,
+            BucketName=bucket_name,
+        )
+    return Response(content=json.dumps(document, indent=2), media_type="application/json", status_code=200)
 
 
 async def set_bucket_policy(bucket_name: str, request: Request, db: Any) -> Response:
-    try:
-        bucket = await BucketRepository(db).get_by_name(bucket_name)
-        if not bucket:
+    bucket = await BucketRepository(db).get_by_name(bucket_name)
+    if not bucket:
+        return errors.s3_error_response(
+            "NoSuchBucket",
+            f"The specified bucket {bucket_name} does not exist",
+            status_code=404,
+            BucketName=bucket_name,
+        )
+
+    parsed_or_error = _read_policy(await request.body(), bucket_name)
+    if isinstance(parsed_or_error, Response):
+        return parsed_or_error
+    parsed = parsed_or_error
+
+    bucket_id = bucket["bucket_id"]
+    owner_id = str(bucket["main_account_id"])
+    acl_repo = ACLRepository(db)
+    conflict = False
+    acl_changed = False
+    async with db.transaction():
+        locked = await db.fetchrow(get_query("lock_bucket_by_id"), bucket_id)
+        if locked is None:
             return errors.s3_error_response(
                 "NoSuchBucket",
                 f"The specified bucket {bucket_name} does not exist",
                 status_code=404,
                 BucketName=bucket_name,
             )
+        # Re-read under the bucket lock. A prefix document must not be stored while
+        # the ACL already grants anonymous read of every key: the prefix would look
+        # like it narrowed a bucket that is still public.
+        acl = await acl_repo.get_bucket_acl(bucket_name)
+        if bucket_grants_anonymous_read(acl):
+            conflict = True
+        elif parsed.kind is PolicyKind.WHOLE:
+            from hippius_s3.services.acl_helper import canned_acl_to_acl
 
-        acl_repo = ACLRepository(db)
-        existing_acl = await acl_repo.get_bucket_acl(bucket_name)
+            public_acl = await canned_acl_to_acl("public-read", owner_id, db, bucket_name)
+            await acl_repo.set_bucket_acl(bucket_name, owner_id, public_acl)
+            await db.execute(get_query("delete_bucket_public_prefixes"), bucket_id)
+            acl_changed = True
+        else:
+            await db.execute(get_query("delete_bucket_public_prefixes"), bucket_id)
+            await db.execute(get_query("insert_bucket_public_prefixes"), bucket_id, list(parsed.prefixes))
 
-        if existing_acl:
-            has_public_read = any(
-                grant.grantee.uri == WellKnownGroups.ALL_USERS and grant.permission == Permission.READ
-                for grant in existing_acl.grants
-            )
-            if has_public_read:
-                return errors.s3_error_response(
-                    "PolicyAlreadyExists",
-                    "The bucket policy already exists and bucket is public",
-                    status_code=409,
-                    BucketName=bucket_name,
-                )
-
-        body = await request.body()
-        if not body:
-            return errors.s3_error_response("MalformedPolicy", "Policy document is empty", status_code=400)
-        try:
-            policy_json = json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError:
-            return errors.s3_error_response("MalformedPolicy", "Policy document is not valid JSON", status_code=400)
-        if not _validate_public_policy(policy_json, bucket_name):
-            return errors.s3_error_response(
-                "InvalidPolicyDocument",
-                "Policy document is invalid or not a public read policy",
-                status_code=400,
-            )
-
-        from hippius_s3.services.acl_helper import canned_acl_to_acl
-
-        owner_id = str(bucket["main_account_id"])
-        public_acl = await canned_acl_to_acl("public-read", owner_id, db, bucket_name)
-        await acl_repo.set_bucket_acl(bucket_name, owner_id, public_acl)
-
-        logger.info(f"Set public-read ACL for bucket '{bucket_name}' via bucket policy")
-        return Response(status_code=204)
-    except Exception as e:
-        logger.exception(f"Error setting bucket policy: {e}")
+    if conflict:
+        if parsed.kind is PolicyKind.PREFIX:
+            message = "The bucket is already public, so a prefix policy would not narrow it"
+        else:
+            message = "The bucket policy already exists and bucket is public"
         return errors.s3_error_response(
-            "InternalError", "We encountered an internal error. Please try again.", status_code=500
+            "PolicyAlreadyExists",
+            message,
+            status_code=409,
+            BucketName=bucket_name,
         )
 
+    await _invalidate_policy_caches(request, bucket_name, str(bucket_id), acl_changed=acl_changed)
+    logger.info(
+        "Set bucket policy for '%s' kind=%s prefixes=%d",
+        bucket_name,
+        parsed.kind.value,
+        len(parsed.prefixes),
+    )
+    return Response(status_code=204)
 
-def _validate_public_policy(policy: dict, bucket_name: str) -> bool:
+
+async def delete_bucket_policy(bucket_name: str, db: Any, request: Request) -> Response:
+    bucket = await BucketRepository(db).get_by_name(bucket_name)
+    if not bucket:
+        return errors.s3_error_response(
+            "NoSuchBucket",
+            f"The specified bucket {bucket_name} does not exist",
+            status_code=404,
+            BucketName=bucket_name,
+        )
+    # Prefixes only. The bucket ACL is how a whole-bucket public grant is stored,
+    # and clearing it here would make DeleteBucketPolicy a silent PutBucketAcl private,
+    # including for a bucket made public with PutBucketAcl. While that grant is what
+    # Get still returns, a 204 would tell the client the policy is gone. Refuse
+    # instead, and write nothing, so a retry stays a refusal until PutBucketAcl private.
+    # The same bucket-row lock as Put: without it a put that has already deleted the
+    # old rows and not yet inserted the new ones commits after this delete, and the
+    # 204 leaves the prefix published.
+    bucket_id = bucket["bucket_id"]
+    refused = False
+    async with db.transaction():
+        locked = await db.fetchrow(get_query("lock_bucket_by_id"), bucket_id)
+        if locked is None:
+            return errors.s3_error_response(
+                "NoSuchBucket",
+                f"The specified bucket {bucket_name} does not exist",
+                status_code=404,
+                BucketName=bucket_name,
+            )
+        acl = await ACLRepository(db).get_bucket_acl(bucket_name)
+        if bucket_grants_anonymous_read(acl):
+            refused = True
+        else:
+            await db.execute(get_query("delete_bucket_public_prefixes"), bucket_id)
+    if refused:
+        return errors.s3_error_response(
+            "InvalidBucketState",
+            "The bucket ACL still grants anonymous read. "
+            "DeleteBucketPolicy would leave that grant in place. "
+            "Make the bucket private with PutBucketAcl first.",
+            status_code=409,
+            BucketName=bucket_name,
+        )
+    await _invalidate_policy_caches(request, bucket_name, str(bucket_id), acl_changed=False)
+    return Response(status_code=204)
+
+
+def _read_policy(body: bytes, bucket_name: str) -> Any:
+    if len(body) > MAX_POLICY_BYTES:
+        return errors.s3_error_response("MalformedPolicy", "Policy document is too large", status_code=400)
+    if not body:
+        return errors.s3_error_response("MalformedPolicy", "Policy document is empty", status_code=400)
     try:
-        if policy.get("Version") != "2012-10-17":
-            return False
-        statements = policy.get("Statement", [])
-        if not statements or not isinstance(statements, list):
-            return False
-        expected_resource = f"arn:aws:s3:::{bucket_name}/*"
-        for statement in statements:
-            if (
-                statement.get("Effect") == "Allow"
-                and statement.get("Principal") == "*"
-                and "s3:GetObject" in statement.get("Action", [])
-                and expected_resource in statement.get("Resource", [])
-            ):
-                return True
-        return False
-    except Exception:
-        logger.exception("Error validating policy")
-        return False
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return errors.s3_error_response("MalformedPolicy", "Policy document is not valid JSON", status_code=400)
+    try:
+        policy_json = json.loads(text)
+    except json.JSONDecodeError:
+        return errors.s3_error_response("MalformedPolicy", "Policy document is not valid JSON", status_code=400)
+    try:
+        return parse_bucket_policy(policy_json, bucket_name)
+    except PolicyDocumentError as exc:
+        return errors.s3_error_response(exc.code, str(exc), status_code=400)
+
+
+async def _invalidate_policy_caches(request: Request, bucket_name: str, bucket_id: str, *, acl_changed: bool) -> None:
+    acl_service = getattr(request.app.state, "acl_service", None)
+    if acl_service is None:
+        return
+    # After commit. A reader that loaded the empty set before this write can still
+    # SETEX the negative entry back; that window is an under-grant bounded by the
+    # prefix-cache TTL. Allow lists are not cached, so a revoke is not served from Redis.
+    await acl_service.invalidate_public_prefixes(bucket_id)
+    if acl_changed:
+        await acl_service.invalidate_cache(bucket_name)
