@@ -410,9 +410,9 @@ class Config:
     ats_purge_host: str = env("ATS_PURGE_HOST:s3.hippius.com")
 
     # Anonymous object downloads of these buckets get a 7-day Cache-Control instead of
-    # the 5-minute default. Comma-separated. Empty = nobody. Both deploy workflows copy
+    # the 6-hour default. Comma-separated. Empty = nobody. Both deploy workflows copy
     # the HIPPIUS_PINNED_BUCKETS GitHub secret into hippius-s3-secrets; an unset secret
-    # interpolates to "" and leaves every bucket on the 5-minute header.
+    # interpolates to "" and leaves every bucket on the 6-hour header.
     #
     # This is freshness only. ATS still LRU-evicts the body under disk pressure — a
     # response header cannot express cache.config `pin-in-cache`.

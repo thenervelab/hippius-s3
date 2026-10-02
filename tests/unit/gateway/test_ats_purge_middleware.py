@@ -115,7 +115,7 @@ async def test_batch_delete_does_not_purge_in_v1(app: Any, captured_purges: list
 async def test_bucket_acl_flip_does_not_fire_wildcard_purge(app: Any, captured_purges: list[tuple[str, str]]) -> None:
     """Stock ATS HTTP PURGE doesn't support globs — bucket-level invalidation is a no-op.
 
-    Objects age out within the 5-min TTL; regex_revalidate plugin could close this gap later.
+    Objects age out within the 6-hour TTL; regex_revalidate plugin could close this gap later.
     """
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://s3.hippius.com") as client:
         r = await client.put("/mybucket?acl", content=b"<AccessControlPolicy/>")
