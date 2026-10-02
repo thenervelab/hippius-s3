@@ -23,6 +23,10 @@ PUBLIC_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=60"
 #    X-Hippius-Visibility: private sentinel set below). Per-request access is
 #    gated by ATS authproxy → gateway /__authcheck probe.
 WARM_PUBLIC_CACHE_CONTROL = "public, max-age=2592000, stale-while-revalidate=86400"
+# 7d fresh + 1d stale-while-revalidate. Ops exception for HIPPIUS_PINNED_BUCKETS.
+# Replaces the 5-minute public header only — private and prefix-grant reads stay as
+# they are, so a listed name cannot widen who may read or how long a prefix revoke takes.
+PINNED_CACHE_CONTROL = "public, max-age=604800, stale-while-revalidate=86400"
 PRIVATE_CACHE_CONTROL = "private, no-store"
 VISIBILITY_HEADER = "X-Hippius-Visibility"
 
@@ -94,6 +98,10 @@ async def cache_control_middleware(
 
     if bucket_is_cache_warm:
         response.headers["Cache-Control"] = WARM_PUBLIC_CACHE_CONTROL
+        return response
+
+    if bucket in get_config().pinned_buckets:
+        response.headers["Cache-Control"] = PINNED_CACHE_CONTROL
         return response
 
     response.headers["Cache-Control"] = PUBLIC_CACHE_CONTROL

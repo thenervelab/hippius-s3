@@ -247,6 +247,7 @@ jobs:
             --from-literal=HIPPIUS_OVH_KMS_DEFAULT_KEY_ID="${{ secrets.HIPPIUS_OVH_KMS_DEFAULT_KEY_ID }}" \
             --from-literal=HIPPIUS_OVH_KMS_OKMS_ID="${{ secrets.HIPPIUS_OVH_KMS_OKMS_ID }}" \
             --from-literal=ATS_CACHE_ENDPOINT="${{ secrets.ATS_CACHE_ENDPOINT }}" \
+            --from-literal=HIPPIUS_PINNED_BUCKETS="${{ secrets.HIPPIUS_PINNED_BUCKETS }}" \
             --from-literal=HIPPIUS_AUTH_PROBE_SECRET="${{ secrets.HIPPIUS_AUTH_PROBE_SECRET }}" \
             --from-literal=HIPPIUS_UPLOADER_MAX_INFLIGHT="${{ secrets.HIPPIUS_UPLOADER_MAX_INFLIGHT || '4' }}" \
             --from-literal=HIPPIUS_UNPINNER_MAX_INFLIGHT="${{ secrets.HIPPIUS_UNPINNER_MAX_INFLIGHT || '4' }}" \

@@ -10,8 +10,10 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
+from hippius_s3 import config as gateway_config
 from hippius_s3.config import get_config
 from hippius_s3.gateway.middlewares import cache_control as cache_control_mod
+from hippius_s3.gateway.middlewares.cache_control import PINNED_CACHE_CONTROL
 from hippius_s3.gateway.middlewares.cache_control import PRIVATE_CACHE_CONTROL
 from hippius_s3.gateway.middlewares.cache_control import PUBLIC_CACHE_CONTROL
 from hippius_s3.gateway.middlewares.cache_control import VISIBILITY_HEADER
@@ -23,7 +25,7 @@ from hippius_s3.gateway.middlewares.cache_control import cache_control_middlewar
 def ats_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     """All warm-* tests assume ATS is in front (which gates the warm-private
     branch). Tests that need ATS unset opt out by re-patching themselves."""
-    cfg = dataclasses.replace(get_config(), ats_cache_endpoints=["http://ats.test"])
+    cfg = dataclasses.replace(get_config(), ats_cache_endpoints=["http://ats.test"], pinned_buckets=frozenset())
     monkeypatch.setattr(cache_control_mod, "get_config", lambda: cfg)
 
 
@@ -172,6 +174,75 @@ async def test_missing_flag_defaults_to_private(app: Any) -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         r = await client.get("/public-bucket/foo.txt")  # no x-test-anon-read header
     assert r.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
+
+
+def _with_pinned(monkeypatch: pytest.MonkeyPatch, names: frozenset[str]) -> None:
+    cfg = dataclasses.replace(
+        get_config(),
+        ats_cache_endpoints=["http://ats.test"],
+        pinned_buckets=names,
+    )
+    monkeypatch.setattr(cache_control_mod, "get_config", lambda: cfg)
+
+
+@pytest.mark.asyncio
+async def test_pinned_bucket_gets_seven_day_ttl(app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A listed public bucket replaces the 5-minute header. Unlisted neighbors stay on it."""
+    _with_pinned(monkeypatch, frozenset({"pg-inventory"}))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        pinned = await client.get("/pg-inventory/current.json", headers={"x-test-anon-read": "true"})
+        other = await client.get("/other-bucket/current.json", headers={"x-test-anon-read": "true"})
+    assert pinned.headers["Cache-Control"] == PINNED_CACHE_CONTROL
+    assert other.headers["Cache-Control"] == PUBLIC_CACHE_CONTROL
+    assert VISIBILITY_HEADER not in pinned.headers
+
+
+@pytest.mark.asyncio
+async def test_pinned_head_206_304_keep_seven_day_ttl(app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    _with_pinned(monkeypatch, frozenset({"pg-inventory"}))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        head = await client.head("/pg-inventory/current.json", headers={"x-test-anon-read": "true"})
+        partial = await client.get(
+            "/pg-inventory/current.json",
+            headers={"x-test-status": "206", "x-test-anon-read": "true"},
+        )
+        revalidated = await client.get(
+            "/pg-inventory/current.json",
+            headers={"x-test-status": "304", "x-test-anon-read": "true"},
+        )
+    assert head.headers["Cache-Control"] == PINNED_CACHE_CONTROL
+    assert partial.headers["Cache-Control"] == PINNED_CACHE_CONTROL
+    assert revalidated.headers["Cache-Control"] == PINNED_CACHE_CONTROL
+
+
+@pytest.mark.asyncio
+async def test_pinned_private_prefix_and_errors_stay_short(app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The list does not widen a private object, a prefix grant, a listing, or an error."""
+    _with_pinned(monkeypatch, frozenset({"pg-inventory"}))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        private = await client.get("/pg-inventory/secret.bin")
+        prefix = await client.get(
+            "/pg-inventory/public/a",
+            headers={"x-test-anon-read": "true", "x-test-via-prefix": "true"},
+        )
+        listing = await client.get("/pg-inventory", headers={"x-test-anon-read": "true"})
+        missing = await client.get(
+            "/pg-inventory/missing.bin",
+            headers={"x-test-status": "404", "x-test-anon-read": "true"},
+        )
+    assert private.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
+    assert prefix.headers["Cache-Control"] == PUBLIC_CACHE_CONTROL
+    assert listing.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
+    assert missing.headers["Cache-Control"] == PRIVATE_CACHE_CONTROL
+
+
+def test_pinned_bucket_list_parses(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HIPPIUS_PINNED_BUCKETS", " pg-inventory, ,other ")
+    gateway_config.reset_config()
+    try:
+        assert get_config().pinned_buckets == frozenset({"pg-inventory", "other"})
+    finally:
+        gateway_config.reset_config()
 
 
 @pytest.mark.asyncio
