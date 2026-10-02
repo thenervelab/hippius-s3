@@ -32,7 +32,7 @@ async def ats_purge_middleware(
     if not bucket or not key:
         # Bucket-level invalidation (ACL flip, bucket delete) isn't supported:
         # stock ATS HTTP PURGE takes a literal cache key, not a glob. Objects
-        # age out naturally within the 5-min TTL. Revisit via regex_revalidate
+        # age out naturally within the 6-hour TTL. Revisit via regex_revalidate
         # plugin if that turns out to be too long a window.
         return response
 
@@ -54,11 +54,11 @@ async def ats_purge_middleware(
     # DELETE's purge; and warm buckets never skip — they cache for 30 days on a purge-on-write
     # contract (cache_control.py), and version 1 recurs when the objects row was removed wholesale
     # (bucket name reused after delete, janitor hard-delete), where a dropped delete-time purge
-    # could have left a stale entry. For normal buckets that corner is bounded by max-age=300, the
+    # could have left a stale entry. For normal buckets that corner is bounded by max-age=21600, the
     # staleness any dropped purge already costs. Pinned buckets (HIPPIUS_PINNED_BUCKETS) are the
     # same contract at 7 days, so they never take the skip either.
     #
-    # MPU adds one more corner, for the same 300s: a completion can lag arbitrarily far behind the
+    # MPU adds one more corner, for the same 6 hours: a completion can lag arbitrarily far behind the
     # CreateMultipartUpload that allocated its version, so two uploads racing on a brand-new key
     # (v1 and v2) can complete out of order. If v2 completes first and a GET caches its body, v1's
     # later completion still resolves version 1 and skips its purge. Last-writer-wins is already

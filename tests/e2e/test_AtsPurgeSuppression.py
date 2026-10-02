@@ -84,7 +84,7 @@ def test_recreate_after_delete_still_skips_purge(
     """A re-PUT of a (soft-)deleted key revives the surviving objects row at version >= 2, so it
     does NOT count as a creation and the purge fires. Covers the ordinary delete-then-recreate
     lifecycle; the row-removed corners (bucket name reuse, janitor hard-delete) are handled by the
-    warm-bucket exclusion in the middleware and bounded by the 5-min TTL otherwise."""
+    warm-bucket exclusion in the middleware and bounded by the 6-hour TTL otherwise."""
     bucket_name = unique_bucket_name("ats-repurge")
     cleanup_buckets(bucket_name)
     boto3_client.create_bucket(Bucket=bucket_name)
