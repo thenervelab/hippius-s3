@@ -295,6 +295,22 @@ async def test_delete_still_purges(app_with_create_flag: Any, captured_purges: l
 
 
 @pytest.mark.asyncio
+async def test_pinned_bucket_creation_still_purges(
+    app_with_create_flag: Any, captured_purges: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinned buckets stay fresh for 7 days, so a skipped create-purge would serve a stale body
+    for that long after a bucket-name reuse. The creation skip must not apply."""
+    monkeypatch.setenv("HIPPIUS_PINNED_BUCKETS", "pg-inventory")
+    gateway_config.reset_config()
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_create_flag), base_url="http://s3.hippius.com"
+    ) as client:
+        r = await client.put("/pg-inventory/new.bin", content=b"data", headers={"x-test-created": "1"})
+    assert r.status_code == 200
+    assert captured_purges == [("s3.hippius.com", "pg-inventory/new.bin")]
+
+
+@pytest.mark.asyncio
 async def test_warm_bucket_creation_still_purges(
     app_with_create_flag: Any, captured_purges: list[tuple[str, str]]
 ) -> None:
