@@ -55,7 +55,8 @@ async def ats_purge_middleware(
     # contract (cache_control.py), and version 1 recurs when the objects row was removed wholesale
     # (bucket name reused after delete, janitor hard-delete), where a dropped delete-time purge
     # could have left a stale entry. For normal buckets that corner is bounded by max-age=300, the
-    # staleness any dropped purge already costs.
+    # staleness any dropped purge already costs. Pinned buckets (HIPPIUS_PINNED_BUCKETS) are the
+    # same contract at 7 days, so they never take the skip either.
     #
     # MPU adds one more corner, for the same 300s: a completion can lag arbitrarily far behind the
     # CreateMultipartUpload that allocated its version, so two uploads racing on a brand-new key
@@ -69,6 +70,7 @@ async def ats_purge_middleware(
         (method == "PUT" or is_complete_mpu)
         and getattr(request.state, "ats_object_created", False)
         and not getattr(request.state, "bucket_is_cache_warm", False)
+        and bucket not in get_config().pinned_buckets
     ):
         return response
 

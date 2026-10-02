@@ -8,6 +8,21 @@ from hippius_s3.utils import env
 dotenv.load_dotenv()
 
 
+def _parse_bucket_list(value: str | None) -> frozenset[str]:
+    """Comma-separated bucket names. Empty and blank entries are ignored.
+
+    Bucket names cannot contain commas, so this split is unambiguous. Matching is
+    exact: S3 names are case-sensitive and the gateway compares the name it already
+    parsed off the request.
+    """
+    names: set[str] = set()
+    for part in str(value or "").split(","):
+        name = part.strip().strip('"').strip("'")
+        if name:
+            names.add(name)
+    return frozenset(names)
+
+
 def _parse_csv_urls(value: str | None) -> list[str]:
     out: list[str] = []
     for part in str(value or "").split(","):
@@ -393,6 +408,15 @@ class Config:
     # internal callers (JuiceFS service DNS, NodePort writers) carry an
     # unmappable Host that ATS rejects as ERR_INVALID_URL.
     ats_purge_host: str = env("ATS_PURGE_HOST:s3.hippius.com")
+
+    # Anonymous object downloads of these buckets get a 7-day Cache-Control instead of
+    # the 5-minute default. Comma-separated. Empty = nobody. Both deploy workflows copy
+    # the HIPPIUS_PINNED_BUCKETS GitHub secret into hippius-s3-secrets; an unset secret
+    # interpolates to "" and leaves every bucket on the 5-minute header.
+    #
+    # This is freshness only. ATS still LRU-evicts the body under disk pressure — a
+    # response header cannot express cache.config `pin-in-cache`.
+    pinned_buckets: frozenset[str] = env("HIPPIUS_PINNED_BUCKETS:", convert=_parse_bucket_list)
 
     # Shared secret stamped on the X-Hippius-Auth-Probe header by an ATS header_rewrite
     # rule on the auth-host remap. The app short-circuits with 200 OK when the
