@@ -1,0 +1,29 @@
+# Ingress only, production only. hippius-s3-internal's importer reads the
+# Python catalog through postgres-nvme-ro. That service selects the same
+# labels as this policy, so the allow follows a failover onto whichever
+# pods are replicas.
+#
+# Do not add hippius-s3-internal to allow-internal. That rule has no port
+# limit and would open every pod in this namespace. The replica URL uses
+# the postgres superuser password, the same one as postgres-nvme-rw, so
+# the primary stays out of this policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-s3-internal-postgres-ro
+  namespace: hippius-s3-prod
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: postgres-nvme
+      cnpg.io/instanceRole: replica
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: hippius-s3-internal
+      ports:
+        - port: 5432
+          protocol: TCP

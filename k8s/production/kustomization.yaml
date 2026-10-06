@@ -8,6 +8,9 @@ resources:
   - postgres-nvme-objectstore.yaml
   - postgres-nvme-cluster.yaml
   - postgres-nvme-scheduledbackup.yaml
+  # Replica-only read from hippius-s3-internal. Not in base: staging has
+  # no postgres-nvme, and allow-internal must stay namespace-wide.
+  - allow-s3-internal-postgres-ro.yaml
   - gateway-nodeport.yaml
   # Scheduling priority for the ingest tier (used by api-local + drain-agent; harmless before they
   # deploy). Created here so it exists ahead of the ingest pods that reference it. See peer-review B3.
