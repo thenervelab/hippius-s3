@@ -163,7 +163,10 @@ async def _attach_usage(pool: asyncpg.Pool, accounts: dict[str, dict[str, Any]])
         # The pool IS the concurrency limiter -- it is sized to plans_usage_concurrency, so
         # acquire() blocks past that many in flight. A semaphore in front of it would be a second
         # knob for one limit, and could only ever disagree with the pool.
-        async with pool.acquire() as conn:
+        # The query timeout does not cover this wait. A connection that never comes
+        # back leaves acquire() pending, the cycle never raises, and the loop never
+        # reaches its retry sleep. 120s is far above an ok checkout.
+        async with pool.acquire(timeout=config.plans_acquire_timeout_seconds) as conn:
             return account_id, await usage_service.get_account_storage_bytes(
                 conn,
                 account_id,
@@ -188,7 +191,7 @@ async def refresh_plan_roll_once(redis_client: Redis, pool: asyncpg.Pool) -> tup
     # retry sleeping 60s instead of plans_loop_sleep, that put the rollout window at roughly 10x the
     # steady-state request rate against an endpoint we do not own, precisely when the rollup is not
     # usable anyway. One local SELECT now decides it.
-    await usage_service.require_rollup_ready(pool)
+    await usage_service.require_rollup_ready(pool, timeout=config.plans_acquire_timeout_seconds)
 
     accounts: dict[str, dict[str, Any]] = {}
     catalog: dict[str, dict[str, Any]] = {}

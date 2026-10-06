@@ -8,6 +8,7 @@ Second, the semantics of the upstream row — which accounts get an allowance an
 pay-as-you-go. Getting that wrong hands free storage to lapsed subscribers, or 402s paying ones.
 """
 
+import asyncio
 import logging
 import pathlib
 from typing import Any
@@ -138,17 +139,31 @@ class FakePool:
         usage: dict[str, int] | None = None,
         fail: Exception | None = None,
         ready: bool = True,
+        fail_acquire_on: int | None = None,
     ) -> None:
         self.usage = usage or {}
         self.fail = fail
         self.ready = ready
+        self.fail_acquire_on = fail_acquire_on
         self.acquired = 0
+        self.acquire_calls = 0
+        self.acquire_timeouts: list[float | None] = []
 
-    def acquire(self):
+    def acquire(self, *, timeout: float | None = None):
         pool = self
+        pool.acquire_calls += 1
+        call = pool.acquire_calls
+        pool.acquire_timeouts.append(timeout)
 
         class _Ctx:
             async def __aenter__(self):
+                # asyncpg waits forever when timeout is omitted. Mirror that, so a
+                # test that expects the worker to pass one fails instead of hanging
+                # the suite only when the worker forgot.
+                if pool.fail_acquire_on == call:
+                    if timeout is None:
+                        await asyncio.Event().wait()
+                    raise TimeoutError
                 pool.acquired += 1
                 return pool
 
@@ -652,6 +667,49 @@ async def test_a_usage_read_failure_publishes_nothing() -> None:
         assert await pc.run_cycle(redis, FakePool(fail=RuntimeError("statement timeout"))) is False
 
     assert redis.hashes["hippius_s3_plan_accounts"] == before
+
+
+def test_the_acquire_timeout_default_is_above_an_ok_query() -> None:
+    """A healthy checkout is sub-millisecond and one in-flight usage query is at most 30s.
+
+    The acquire bound has to sit above that. Dropping it toward the query timeout would fail a
+    busy-but-healthy cycle and, on the 60s failure sleep, re-scrape upstream for nothing.
+    """
+    assert pc.config.plans_acquire_timeout_seconds >= 120
+    assert pc.config.plans_acquire_timeout_seconds > pc.config.plans_usage_timeout_seconds
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_usage_acquire_fails_the_cycle_and_the_next_one_publishes() -> None:
+    """The 2026-10-03 hang: the scrape returned, then acquire() never came back.
+
+    The query timeout never started, so the cycle did not fail and the loop did not retry. A
+    timed-out checkout must publish nothing and leave the previous roll in place. The next cycle,
+    the one the loop runs after the failure sleep, publishes.
+    """
+    redis = FakeRedis()
+    api = api_client_returning(get_s3_plan_accounts=AsyncMock(return_value=page()))
+    # Probe is acquire 1. The one plan account's usage read is acquire 2.
+    wedged = FakePool(usage={ACCT_BUSINESS: 7 * TB}, fail_acquire_on=2)
+
+    with patch.object(pc, "HippiusApiClient", api), patch.object(pc, "get_metrics_collector", MagicMock()):
+        await pc.run_cycle(redis, FakePool(usage={ACCT_BUSINESS: 7 * TB}))
+        before = dict(redis.hashes["hippius_s3_plan_accounts"])
+
+        failed = await asyncio.wait_for(pc.run_cycle(redis, wedged), timeout=2)
+        during = dict(redis.hashes["hippius_s3_plan_accounts"])
+
+        retried = await pc.run_cycle(redis, FakePool(usage={ACCT_BUSINESS: 7 * TB}))
+
+    assert failed is False
+    assert during == before, "a timed-out checkout must leave the previous roll serving"
+    assert wedged.acquire_timeouts == [
+        pc.config.plans_acquire_timeout_seconds,
+        pc.config.plans_acquire_timeout_seconds,
+    ]
+    assert retried is True
+    quota = await plans_cache.get_plan_for_account(redis, ACCT_BUSINESS)
+    assert quota is not None and quota.used_bytes == 7 * TB
 
 
 @pytest.mark.asyncio

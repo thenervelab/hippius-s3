@@ -307,6 +307,16 @@ class Config:
     # connection, and every plan account's usage would silently freeze at its last good value while
     # the gate kept enforcing it.
     plans_usage_timeout_seconds: float = env("HIPPIUS_PLANS_USAGE_TIMEOUT_SECONDS:30.0", convert=float)
+    # Bound on waiting for a pool connection. Distinct from plans_usage_timeout_seconds,
+    # which starts only after a connection is in hand. asyncpg's acquire() waits forever
+    # when this is unset: on 2026-10-03 the plans-cacher finished the upstream scrape and
+    # then sat in acquire() with no socket and no exception, so the 30s query timeout
+    # never started and new plan rows were never published. A healthy checkout is
+    # sub-millisecond; the worst ok wait is one in-flight usage query (30s) with the
+    # pool already full. 120s sits above that, so a slow replica still finishes and only
+    # a wedged acquire fails the cycle. The failure path keeps the last roll and the
+    # loop retries.
+    plans_acquire_timeout_seconds: float = env("HIPPIUS_PLANS_ACQUIRE_TIMEOUT_SECONDS:120", convert=float)
     # Per-attempt bound on the scrape. Retry COUNTS cannot bound latency when the per-attempt cost
     # is unbounded, and this worker holds no request.
     plans_api_timeout_seconds: float = env("HIPPIUS_PLANS_API_TIMEOUT_SECONDS:30.0", convert=float)
