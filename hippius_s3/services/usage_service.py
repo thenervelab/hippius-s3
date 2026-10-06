@@ -40,7 +40,7 @@ _NOT_BACKFILLED = (
 )
 
 
-async def require_rollup_ready(db: Any) -> None:
+async def require_rollup_ready(db: Any, *, timeout: float | None = None) -> None:  # noqa: ASYNC109
     """Raise unless the backfill has run, i.e. unless the counters are totals rather than deltas.
 
     One indexed single-row SELECT. Exists so a caller can ask BEFORE doing expensive work it would
@@ -49,8 +49,11 @@ async def require_rollup_ready(db: Any) -> None:
 
     Raising rather than returning a bool keeps ONE copy of the message -- the two call sites had
     near-verbatim duplicates of it.
+
+    `timeout` bounds waiting for a pool connection, the same way Pool.acquire does. Left unset,
+    that wait is forever and a wedged checkout stalls the caller before this SELECT runs.
     """
-    async with db.acquire() as conn:
+    async with db.acquire(timeout=timeout) as conn:
         if not await conn.fetchval(get_query("get_storage_usage_rollup_ready")):
             raise StorageRollupNotBackfilled(_NOT_BACKFILLED)
 
