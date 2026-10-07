@@ -212,6 +212,11 @@ _EXPECTED_TRIGGERS = {
     # Not ours. Listed so this test fails loudly if someone else adds a trigger to these tables
     # without thinking about how it interacts with byte accounting.
     ("objects", "objects_reject_duplicate_live_name"): _ROW | _BEFORE | _INSERT | _UPDATE,
+    # Notice triggers for the Rust import. zz_ sorts after the storage_delta
+    # names so the byte trigger locks the version before the notice row is
+    # locked. They emit nothing into the ledger.
+    ("objects", "zz_import_dirty_objects"): _ROW | _INSERT | _UPDATE | _DELETE,
+    ("object_versions", "zz_import_dirty_object_versions"): _ROW | _INSERT | _UPDATE | _DELETE,
 }
 
 
@@ -235,13 +240,14 @@ async def test_trigger_set_is_exactly_as_designed(pg_conn: asyncpg.Connection) -
     actual = {(r["relname"], r["tgname"]): int(r["tgtype"]) for r in rows}
     assert actual == _EXPECTED_TRIGGERS
 
-    # And nothing on `buckets`: liveness and ownership are applied at read time, so a bucket being
-    # soft-deleted or transferred needs no counter maintenance at all.
+    # And nothing on `buckets` that maintains the counter: liveness and ownership are applied at
+    # read time, so a bucket being soft-deleted or transferred needs no counter maintenance at all.
+    # import_dirty_buckets records a notice for the importer and emits nothing.
     bucket_triggers = await pg_conn.fetch(
         "SELECT t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid"
         " WHERE NOT t.tgisinternal AND c.relname = 'buckets'"
     )
-    assert [r["tgname"] for r in bucket_triggers] == []
+    assert [r["tgname"] for r in bucket_triggers] == ["import_dirty_buckets"]
 
 
 # --------------------------------------------------------------------------------------------

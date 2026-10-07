@@ -21,8 +21,8 @@ _MIGRATION = (
 # Every writer that can change what the importer copies. chunk_backend is the
 # one that retries a key skipped because its file was still on an ingest SSD.
 _TRIGGERS = (
-    "import_dirty_objects",
-    "import_dirty_object_versions",
+    "zz_import_dirty_objects",
+    "zz_import_dirty_object_versions",
     "import_dirty_object_names",
     "import_dirty_object_acls",
     "import_dirty_parts",
@@ -49,6 +49,11 @@ def test_import_dirty_records_every_writer_and_bounds_the_lock() -> None:
     assert "SET search_path = pg_catalog, public" in up
     for name in _TRIGGERS:
         assert f"CREATE TRIGGER {name}" in up, name
+    # AFTER ROW triggers fire in name order. These two have to run after the
+    # storage-delta triggers, which lock the version. Locking the notice first
+    # deadlocks two finalizes of one key.
+    assert "zz_import_dirty_objects" > "objects_storage_delta_upd"
+    assert "zz_import_dirty_object_versions" > "object_versions_storage_delta_upd"
     for table in (
         "objects",
         "object_versions",

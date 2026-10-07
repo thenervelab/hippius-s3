@@ -166,26 +166,28 @@ SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
-    cid bigint;
-    oid uuid;
+    noted_chunk bigint;
+    noted_object uuid;
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        cid := OLD.chunk_id;
+        noted_chunk := OLD.chunk_id;
         IF OLD.backend IS DISTINCT FROM 'arion' THEN
             RETURN NULL;
         END IF;
     ELSE
-        cid := NEW.chunk_id;
+        noted_chunk := NEW.chunk_id;
         IF NEW.backend IS DISTINCT FROM 'arion' THEN
             RETURN NULL;
         END IF;
     END IF;
-    SELECT p.object_id INTO oid
+    -- noted_chunk, not cid: part_chunks.cid is a column, and a variable of
+    -- that name makes this lookup abort the chunk write.
+    SELECT p.object_id INTO noted_object
     FROM part_chunks pc
     JOIN parts p ON p.part_id = pc.part_id
-    WHERE pc.id = cid AND p.object_id IS NOT NULL;
-    IF oid IS NOT NULL THEN
-        PERFORM import_note_object(oid);
+    WHERE pc.id = noted_chunk AND p.object_id IS NOT NULL;
+    IF noted_object IS NOT NULL THEN
+        PERFORM import_note_object(noted_object);
     END IF;
     RETURN NULL;
 END;
@@ -204,11 +206,14 @@ BEGIN
 END;
 $$;
 
-CREATE TRIGGER import_dirty_objects
+-- zz_ sorts after the storage_delta triggers. AFTER ROW triggers fire in
+-- name order, and those lock the version while this one locks the notice.
+-- The other order deadlocks two finalizes of the same key.
+CREATE TRIGGER zz_import_dirty_objects
     AFTER INSERT OR UPDATE OR DELETE ON objects
     FOR EACH ROW EXECUTE FUNCTION import_dirty_object_row();
 
-CREATE TRIGGER import_dirty_object_versions
+CREATE TRIGGER zz_import_dirty_object_versions
     AFTER INSERT OR UPDATE OR DELETE ON object_versions
     FOR EACH ROW EXECUTE FUNCTION import_dirty_version_row();
 
@@ -251,8 +256,8 @@ DROP TRIGGER IF EXISTS import_dirty_chunk_backend ON chunk_backend;
 DROP TRIGGER IF EXISTS import_dirty_parts ON parts;
 DROP TRIGGER IF EXISTS import_dirty_object_acls ON object_acls;
 DROP TRIGGER IF EXISTS import_dirty_object_names ON object_names;
-DROP TRIGGER IF EXISTS import_dirty_object_versions ON object_versions;
-DROP TRIGGER IF EXISTS import_dirty_objects ON objects;
+DROP TRIGGER IF EXISTS zz_import_dirty_object_versions ON object_versions;
+DROP TRIGGER IF EXISTS zz_import_dirty_objects ON objects;
 
 DROP FUNCTION IF EXISTS import_dirty_bucket_row();
 DROP FUNCTION IF EXISTS import_dirty_chunk_row();
