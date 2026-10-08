@@ -11,6 +11,7 @@ from fastapi import Request
 from fastapi import Response
 
 from hippius_s3.api.s3 import errors
+from hippius_s3.api.s3.copy_helpers import copy_replaces_metadata
 from hippius_s3.api.s3.copy_helpers import handle_same_bucket_copy
 from hippius_s3.api.s3.copy_helpers import handle_streaming_copy
 from hippius_s3.api.s3.copy_helpers import is_multipart_object
@@ -119,7 +120,15 @@ async def handle_copy_object(
         )
 
         existing_dest = await ObjectRepository(pool).get_by_path(dest_bucket["bucket_id"], object_key)
-        object_id = str(existing_dest["object_id"]) if existing_dest else str(uuid.uuid4())
+        replaces_metadata = copy_replaces_metadata(request)
+        # get_by_path follows aliases, so a hit can be the source object under another name.
+        # Versioning that id would change the source key. REPLACE onto a non-primary name gets
+        # its own object; a primary (in-place, or an overwrite of a different key) keeps its id.
+        dest_is_primary = existing_dest is not None and str(existing_dest.get("object_key")) == object_key
+        if existing_dest is not None and (not replaces_metadata or dest_is_primary):
+            object_id = str(existing_dest["object_id"])
+        else:
+            object_id = str(uuid.uuid4())
         copy_created_at = datetime.now(timezone.utc)
 
         src_obj_row = source_object
@@ -136,8 +145,14 @@ async def handle_copy_object(
         # apply it to the source as well, locking an object the caller never named. Falling through
         # to a real byte copy gives the destination its own version, which is the only thing a
         # per-version lock can attach to.
+        #
+        # REPLACE cannot alias either. The alias shares the source version's content_type and user
+        # metadata, so a success return stores nothing and a write onto that object_id would change
+        # every name. The byte copy below stores the request's Content-Type and x-amz-meta-* on the
+        # destination only.
         if (
-            lock_intent is None
+            not replaces_metadata
+            and lock_intent is None
             and source_version_id is None
             and str(source_bucket["bucket_id"]) == str(dest_bucket["bucket_id"])
         ):
@@ -192,7 +207,7 @@ async def handle_copy_object(
             src_multipart=src_multipart,
         )
 
-        if eligible:
+        if eligible and not replaces_metadata:
             assert chunk_rows is not None
             logger.info("CopyObject using v5 fast path (envelope rewrap + CID reuse)")
             return await _apply_lock_to_copy(
