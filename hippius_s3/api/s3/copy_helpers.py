@@ -154,6 +154,59 @@ def parse_object_metadata(raw_meta: Any) -> dict[str, Any]:
     return {}
 
 
+# Same keys PutObject refuses to persist: they are append control, not user metadata.
+_APPEND_CONTROL_META_KEYS = frozenset({"append", "append-id", "append-if-version"})
+
+
+def user_metadata_from_headers(headers: Any) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    for key, value in headers.items():
+        if key.lower().startswith("x-amz-meta-"):
+            meta_key = key[11:]
+            if meta_key not in _APPEND_CONTROL_META_KEYS:
+                metadata[meta_key] = value
+    return metadata
+
+
+def copy_replaces_metadata(request: Any) -> bool:
+    """True only for MetadataDirective=REPLACE. Absent and COPY keep the source.
+
+    Header-only, so the alias decision can run before the source row is known to carry
+    content_type. Anything else is InvalidArgument rather than a silent COPY.
+    """
+    raw = request.headers.get("x-amz-metadata-directive")
+    directive = raw.strip() if isinstance(raw, str) else None
+    if directive is None or directive == "COPY":
+        return False
+    if directive != "REPLACE":
+        raise errors.S3Error(
+            code="InvalidArgument",
+            message="x-amz-metadata-directive must be COPY or REPLACE",
+            status_code=400,
+        )
+    return True
+
+
+def resolve_copy_metadata(
+    request: Any,
+    source_object: dict[str, Any],
+    src_obj_row: Any,
+) -> tuple[str, dict[str, Any]]:
+    """Content-Type and user metadata to store on the destination.
+
+    REPLACE takes the request Content-Type (PutObject's application/octet-stream when the
+    header is absent) and only the request's x-amz-meta-* values — not a merge, and not
+    Cache-Control or the other system headers this gateway does not store.
+    """
+    if not copy_replaces_metadata(request):
+        return (
+            str(source_object["content_type"]),
+            parse_object_metadata(src_obj_row.get("metadata")),
+        )
+    content_type = request.headers.get("Content-Type", "application/octet-stream")
+    return content_type, user_metadata_from_headers(request.headers)
+
+
 async def handle_same_bucket_copy(
     db: Any,
     *,
@@ -271,7 +324,10 @@ async def handle_streaming_copy(
 ) -> Response:
     logger.info("CopyObject assembling bytes via object_reader.stream_object")
 
-    metadata = parse_object_metadata(src_obj_row.get("metadata"))
+    # The reader still needs the source metadata (multipart and friends). The destination
+    # row stores whatever resolve_copy_metadata chose, which is the source on COPY.
+    source_metadata = parse_object_metadata(src_obj_row.get("metadata"))
+    content_type, stored_metadata = resolve_copy_metadata(request, source_object, src_obj_row)
     src_multipart = is_multipart_object(src_obj_row)
 
     # Reuse the lifespan-built cache: it carries the standalone queues client used for
@@ -298,7 +354,7 @@ async def handle_streaming_copy(
             "object_version": int(src_obj_row.get("object_version") or 1),
             "is_public": bool(source_bucket.get("is_public", False)),
             "multipart": src_multipart,
-            "metadata": metadata,
+            "metadata": source_metadata,
             "encryption_version": src_obj_row.get("encryption_version"),
             "enc_suite_id": src_obj_row.get("enc_suite_id"),
             "enc_chunk_size_bytes": src_obj_row.get("enc_chunk_size_bytes"),
@@ -311,7 +367,6 @@ async def handle_streaming_copy(
         bound_first_chunk=True,  # A2: fail fast (503) if the source is still draining, before writing the destination
     )
 
-    content_type = str(source_object["content_type"])
     ow = ObjectWriter(pool=pool, redis_client=redis_client, fs_store=request.app.state.fs_store)
     put_res = await ow.put_simple_stream_full(
         bucket_id=str(dest_bucket["bucket_id"]),
@@ -320,7 +375,7 @@ async def handle_streaming_copy(
         object_key=object_key,
         account_address=request.state.main_account_id,
         content_type=content_type,
-        metadata=metadata,
+        metadata=stored_metadata,
         storage_version=config.target_storage_version,
         body_iter=chunks_iter,
     )
