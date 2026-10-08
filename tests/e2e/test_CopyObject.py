@@ -242,3 +242,81 @@ def test_gc_repush_same_digest_promotes_over_soft_deleted_dest(
     boto3_client.delete_object(Bucket=bucket, Key="uploads/u2/data")
 
     assert boto3_client.get_object(Bucket=bucket, Key=dest)["Body"].read() == second
+
+
+def test_copy_replace_updates_content_type_and_user_metadata(
+    docker_services: Any,
+    boto3_client: Any,
+    unique_bucket_name: Callable[[str], str],
+    cleanup_buckets: Callable[[str], None],
+) -> None:
+    """REPLACE stores the request Content-Type and user metadata. COPY leaves the source's."""
+    bucket = unique_bucket_name("copy-replace")
+    cleanup_buckets(bucket)
+    boto3_client.create_bucket(Bucket=bucket)
+
+    body = b"<html>hi</html>"
+    key = "page.html"
+    boto3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=body,
+        ContentType="application/octet-stream",
+        Metadata={"original": "keep-me", "role": "source"},
+    )
+
+    boto3_client.copy_object(
+        Bucket=bucket,
+        Key=key,
+        CopySource=f"/{bucket}/{key}",
+        MetadataDirective="REPLACE",
+        ContentType="text/html; charset=utf-8",
+        Metadata={"replaced": "yes", "role": "dest"},
+    )
+
+    head = boto3_client.head_object(Bucket=bucket, Key=key)
+    assert head["ContentType"] == "text/html; charset=utf-8"
+    assert head["Metadata"]["replaced"] == "yes"
+    assert head["Metadata"]["role"] == "dest"
+    assert "original" not in head["Metadata"]
+    got = boto3_client.get_object(Bucket=bucket, Key=key)
+    assert got["Body"].read() == body
+    assert got["ContentType"] == "text/html; charset=utf-8"
+
+    boto3_client.put_object(
+        Bucket=bucket,
+        Key="src.txt",
+        Body=b"abc",
+        ContentType="text/plain",
+        Metadata={"k": "source"},
+    )
+    boto3_client.copy_object(
+        Bucket=bucket,
+        Key="dst.txt",
+        CopySource=f"/{bucket}/src.txt",
+        MetadataDirective="REPLACE",
+        ContentType="application/json",
+        Metadata={"k": "dest"},
+    )
+    src_head = boto3_client.head_object(Bucket=bucket, Key="src.txt")
+    dst_head = boto3_client.head_object(Bucket=bucket, Key="dst.txt")
+    assert src_head["ContentType"] == "text/plain"
+    assert src_head["Metadata"]["k"] == "source"
+    assert dst_head["ContentType"] == "application/json"
+    assert dst_head["Metadata"]["k"] == "dest"
+    assert "original" not in dst_head["Metadata"]
+    assert boto3_client.get_object(Bucket=bucket, Key="src.txt")["Body"].read() == b"abc"
+    assert boto3_client.get_object(Bucket=bucket, Key="dst.txt")["Body"].read() == b"abc"
+
+    boto3_client.copy_object(
+        Bucket=bucket,
+        Key="copied.txt",
+        CopySource=f"/{bucket}/src.txt",
+        MetadataDirective="COPY",
+        ContentType="image/png",
+        Metadata={"k": "nope"},
+    )
+    copied = boto3_client.head_object(Bucket=bucket, Key="copied.txt")
+    assert copied["ContentType"] == "text/plain"
+    assert copied["Metadata"]["k"] == "source"
+    assert boto3_client.get_object(Bucket=bucket, Key="src.txt")["ContentType"] == "text/plain"

@@ -26,6 +26,7 @@ def _fake_request() -> Any:
             ray_id="ray-1",
         ),
         app=SimpleNamespace(state=SimpleNamespace(fs_store=SimpleNamespace(), obj_cache=SimpleNamespace())),
+        headers={},
     )
 
 
