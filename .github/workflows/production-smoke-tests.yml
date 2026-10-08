@@ -1,5 +1,8 @@
 name: production-smoke-tests
 
+# production-smoke-tests-internal.yml runs the core suite against
+# http://162.19.43.25:18080 on this same schedule, as its own workflow run.
+
 on:
   schedule:
     - cron: '0 * * * *'
