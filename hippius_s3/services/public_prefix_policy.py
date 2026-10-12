@@ -1,7 +1,9 @@
 """The two bucket-policy documents this gateway stores.
 
-A whole-bucket document is the existing public-read helper: Allow, Principal *,
-s3:GetObject, ``arn:aws:s3:::<bucket>/*``. It is implemented by the bucket ACL.
+A whole-bucket document is Allow, Principal *, s3:GetObject,
+``arn:aws:s3:::<bucket>/*``. It publishes anonymous GET and HEAD of every
+current key. It is not a bucket ACL: AllUsers READ is also ListBucket, and
+this document does not grant that. The canned public-read ACL still does.
 
 A prefix document is one or more of the same statement aimed at
 ``arn:aws:s3:::<bucket>/<prefix>/*``. Each prefix publishes anonymous GET and HEAD
@@ -72,6 +74,21 @@ def bucket_grants_anonymous_read(acl: ACL | None) -> bool:
     )
 
 
+def without_anonymous_read(acl: ACL) -> ACL:
+    """Drop AllUsers READ. FULL_CONTROL and WRITE stay.
+
+    FULL_CONTROL still implies READ, so a caller that still sees anonymous read
+    on the result must not store a GetObject document beside it: Get would show
+    a policy narrower than the listing that grant still allows.
+    """
+    grants = [
+        grant
+        for grant in acl.grants
+        if not (grant.grantee.uri == WellKnownGroups.ALL_USERS and grant.permission == Permission.READ)
+    ]
+    return ACL(owner=acl.owner, grants=grants)
+
+
 def parse_bucket_policy(policy: Any, bucket_name: str) -> ParsedBucketPolicy:
     if not isinstance(policy, dict) or set(policy) - _TOP_KEYS:
         raise PolicyDocumentError("InvalidPolicyDocument", "Policy document is not a supported bucket policy")
@@ -109,14 +126,24 @@ def parse_bucket_policy(policy: Any, bucket_name: str) -> ParsedBucketPolicy:
     return ParsedBucketPolicy(kind=PolicyKind.PREFIX, prefixes=tuple(sorted(set(prefixes))))
 
 
-def policy_document(bucket_name: str, *, public_acl: bool, prefixes: list[str]) -> dict[str, Any] | None:
+def policy_document(
+    bucket_name: str,
+    *,
+    public_acl: bool,
+    prefixes: list[str],
+    public_objects: bool = False,
+) -> dict[str, Any] | None:
     """The GetBucketPolicy body. A mixed document is what a later ACL change produces.
 
     PutBucketPolicy rejects that mixed shape. Get still returns it, so making the
     bucket ACL private again cannot hide prefixes that are still in force.
+
+    ``public_acl`` and ``public_objects`` both emit the one whole-bucket statement.
+    The ACL grant is ListBucket as well; the marker is object read only. Get does
+    not have a second statement that would tell them apart.
     """
     statements: list[dict[str, Any]] = []
-    if public_acl:
+    if public_acl or public_objects:
         statements.append(_statement(f"{_ARN}{bucket_name}/*"))
     statements.extend(_statement(f"{_ARN}{bucket_name}/{prefix}/*") for prefix in sorted(prefixes))
     if not statements:

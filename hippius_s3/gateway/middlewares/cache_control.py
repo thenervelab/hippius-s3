@@ -91,11 +91,12 @@ async def cache_control_middleware(
         response.headers["Cache-Control"] = PRIVATE_CACHE_CONTROL
         return response
 
-    # A prefix grant is one slice of a private bucket. The 30-day warm header and the
-    # 6-hour public default would keep a just-revoked prefix readable at ATS for that
-    # whole window. Five minutes is the bound a revoke can actually promise. A
-    # whole-bucket ACL still takes the warm header below; `anonymous_read_via_prefix`
-    # is set only when the ACL alone would not have allowed the read.
+    # A policy grant (a prefix, or whole-bucket object read) is not the bucket ACL.
+    # The 30-day warm header and the 6-hour public default would keep a just-revoked
+    # policy readable at ATS for that whole window. Five minutes is the bound a revoke
+    # can actually promise. A whole-bucket ACL still takes the warm header below;
+    # `anonymous_read_via_prefix` is set only when the ACL alone would not have
+    # allowed the read.
     if getattr(request.state, "anonymous_read_via_prefix", False):
         response.headers["Cache-Control"] = PREFIX_PUBLIC_CACHE_CONTROL
         return response

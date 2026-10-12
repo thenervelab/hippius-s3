@@ -16,6 +16,7 @@ from hippius_s3.services.public_prefix_policy import PolicyKind
 from hippius_s3.services.public_prefix_policy import bucket_grants_anonymous_read
 from hippius_s3.services.public_prefix_policy import parse_bucket_policy
 from hippius_s3.services.public_prefix_policy import policy_document
+from hippius_s3.services.public_prefix_policy import without_anonymous_read
 from hippius_s3.utils import get_query
 
 
@@ -33,11 +34,13 @@ async def get_bucket_policy(bucket_name: str, db: Any, main_account_id: str) -> 
         )
 
     acl = await ACLRepository(db).get_bucket_acl(bucket_name)
-    rows = await db.fetch(get_query("list_bucket_public_prefixes"), bucket["bucket_id"])
+    bucket_id = bucket["bucket_id"]
+    rows = await db.fetch(get_query("list_bucket_public_prefixes"), bucket_id)
     document = policy_document(
         bucket_name,
         public_acl=bucket_grants_anonymous_read(acl),
         prefixes=[str(row["prefix"]) for row in rows],
+        public_objects=await _bucket_public_objects(db, bucket_id),
     )
     if document is None:
         return errors.s3_error_response(
@@ -79,21 +82,34 @@ async def set_bucket_policy(bucket_name: str, request: Request, db: Any) -> Resp
                 BucketName=bucket_name,
             )
         # Re-read under the bucket lock. A prefix document must not be stored while
-        # the ACL already grants anonymous read of every key: the prefix would look
-        # like it narrowed a bucket that is still public.
+        # anonymous read of every key is already in force, whether that is the bucket
+        # ACL or the whole-bucket object-read marker: the prefix would look like it
+        # narrowed a grant that is still public.
+        #
+        # A whole-bucket GetObject document is that marker, not AllUsers READ. READ on
+        # the bucket ACL is also ListBucket. Re-putting the document on a bucket that
+        # already has AllUsers READ drops only that grant and stores the marker, so
+        # listing stops and object GET stays. FULL_CONTROL still implies READ; storing
+        # the marker beside it would show a narrower policy than the listing it allows,
+        # so that put writes nothing.
         acl = await acl_repo.get_bucket_acl(bucket_name)
-        if bucket_grants_anonymous_read(acl):
+        anonymous_read = bucket_grants_anonymous_read(acl)
+        if parsed.kind is PolicyKind.PREFIX and (anonymous_read or await _bucket_public_objects(db, bucket_id)):
             conflict = True
-        elif parsed.kind is PolicyKind.WHOLE:
-            from hippius_s3.services.acl_helper import canned_acl_to_acl
-
-            public_acl = await canned_acl_to_acl("public-read", owner_id, db, bucket_name)
-            await acl_repo.set_bucket_acl(bucket_name, owner_id, public_acl)
+        elif parsed.kind is PolicyKind.PREFIX:
             await db.execute(get_query("delete_bucket_public_prefixes"), bucket_id)
-            acl_changed = True
-        else:
-            await db.execute(get_query("delete_bucket_public_prefixes"), bucket_id)
+            await db.execute(get_query("delete_bucket_public_objects"), bucket_id)
             await db.execute(get_query("insert_bucket_public_prefixes"), bucket_id, list(parsed.prefixes))
+        else:
+            stripped = without_anonymous_read(acl) if acl is not None else None
+            if anonymous_read and (stripped is None or bucket_grants_anonymous_read(stripped)):
+                conflict = True
+            else:
+                if stripped is not None and stripped != acl:
+                    await acl_repo.set_bucket_acl(bucket_name, owner_id, stripped)
+                    acl_changed = True
+                await db.execute(get_query("delete_bucket_public_prefixes"), bucket_id)
+                await db.execute(get_query("insert_bucket_public_objects"), bucket_id)
 
     if conflict:
         if parsed.kind is PolicyKind.PREFIX:
@@ -126,10 +142,10 @@ async def delete_bucket_policy(bucket_name: str, db: Any, request: Request) -> R
             status_code=404,
             BucketName=bucket_name,
         )
-    # Prefixes only. The bucket ACL is how a whole-bucket public grant is stored,
-    # and clearing it here would make DeleteBucketPolicy a silent PutBucketAcl private,
-    # including for a bucket made public with PutBucketAcl. While that grant is what
-    # Get still returns, a 204 would tell the client the policy is gone. Refuse
+    # Prefixes and the whole-bucket object-read marker. The bucket ACL is a separate
+    # grant, and clearing it here would make DeleteBucketPolicy a silent PutBucketAcl
+    # private, including for a bucket made public with PutBucketAcl. While that grant
+    # is what Get still returns, a 204 would tell the client the policy is gone. Refuse
     # instead, and write nothing, so a retry stays a refusal until PutBucketAcl private.
     # The same bucket-row lock as Put: without it a put that has already deleted the
     # old rows and not yet inserted the new ones commits after this delete, and the
@@ -150,6 +166,7 @@ async def delete_bucket_policy(bucket_name: str, db: Any, request: Request) -> R
             refused = True
         else:
             await db.execute(get_query("delete_bucket_public_prefixes"), bucket_id)
+            await db.execute(get_query("delete_bucket_public_objects"), bucket_id)
     if refused:
         return errors.s3_error_response(
             "InvalidBucketState",
@@ -180,6 +197,11 @@ def _read_policy(body: bytes, bucket_name: str) -> Any:
         return parse_bucket_policy(policy_json, bucket_name)
     except PolicyDocumentError as exc:
         return errors.s3_error_response(exc.code, str(exc), status_code=400)
+
+
+async def _bucket_public_objects(db: Any, bucket_id: Any) -> bool:
+    row = await db.fetchrow(get_query("bucket_has_public_objects"), bucket_id)
+    return row is not None
 
 
 async def _invalidate_policy_caches(request: Request, bucket_name: str, bucket_id: str, *, acl_changed: bool) -> None:

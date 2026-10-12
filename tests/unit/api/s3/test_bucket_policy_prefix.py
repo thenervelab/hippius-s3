@@ -1,5 +1,6 @@
-"""Put/Get/Delete bucket policy: prefix rows never become a bucket ACL, and a
-public bucket never stores a prefix that would look like it narrowed the grant.
+"""Put/Get/Delete bucket policy: a prefix or a whole-bucket object-read marker
+never becomes a bucket ACL, and a narrower document is not stored while a wider
+anonymous read is still in force.
 """
 
 from __future__ import annotations
@@ -50,12 +51,13 @@ class _Caches:
 
 
 class _DB:
-    def __init__(self, *, locked: bool = True, prefixes: list[str] | None = None) -> None:
+    def __init__(self, *, locked: bool = True, prefixes: list[str] | None = None, public_objects: bool = False) -> None:
         self.bucket: dict[str, str] | None = {"bucket_id": "bid-1", "main_account_id": OWNER}
         self.acl: ACL | None = _acl()
         self.owner_mismatch = False
         self.locked = locked
         self.prefix_rows = prefixes or []
+        self.public_objects = public_objects
         self.execs: list[tuple[str, tuple[Any, ...], bool]] = []
         self.set_acls: list[ACL] = []
         self.in_tx = False
@@ -65,7 +67,10 @@ class _DB:
     def transaction(self) -> _Tx:
         return _Tx(self)
 
-    async def fetchrow(self, _query: str, *_args: Any) -> dict[str, str] | None:
+    async def fetchrow(self, query: str, *_args: Any) -> dict[str, str] | None:
+        # GetBucketPolicy reads the marker outside the bucket lock.
+        if "bucket_public_objects" in query:
+            return {"published": 1} if self.public_objects else None
         assert self.in_tx
         self.lock_calls += 1
         return {"bucket_id": "bid-1"} if self.locked else None
@@ -169,11 +174,12 @@ async def test_prefix_put_replaces_prefixes_and_does_not_touch_the_acl(monkeypat
 
     assert response.status_code == 204
     assert db.set_acls == []
-    assert len(db.execs) == 2
+    assert len(db.execs) == 3
     assert db.execs[0][2] is True
     assert "DELETE FROM bucket_public_prefixes" in db.execs[0][0]
-    assert "unnest" in db.execs[1][0]
-    assert db.execs[1][1][1] == ["public"]
+    assert "DELETE FROM bucket_public_objects" in db.execs[1][0]
+    assert "unnest" in db.execs[2][0]
+    assert db.execs[2][1][1] == ["public"]
     assert db.events == ["begin", "commit"]
     assert caches.prefixes == ["bid-1"]
     assert caches.buckets == []
@@ -187,7 +193,7 @@ async def test_a_second_prefix_put_replaces_the_set(monkeypatch: pytest.MonkeyPa
     response = await policy.set_bucket_policy(BUCKET, _Request(_prefix("weights")), db)
 
     assert response.status_code == 204
-    assert db.execs[1][1][1] == ["weights"]
+    assert db.execs[2][1][1] == ["weights"]
 
 
 @pytest.mark.asyncio
@@ -229,11 +235,13 @@ async def test_all_users_write_alone_can_still_take_a_prefix(monkeypatch: pytest
 
     assert response.status_code == 204
     assert db.set_acls == []
-    assert db.execs[1][1][1] == ["public"]
+    assert db.execs[2][1][1] == ["public"]
 
 
 @pytest.mark.asyncio
-async def test_whole_bucket_put_sets_the_acl_and_clears_prefixes(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_whole_bucket_put_stores_object_read_and_does_not_open_the_acl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _install(monkeypatch)
     db = _DB()
     caches = _Caches()
@@ -241,29 +249,66 @@ async def test_whole_bucket_put_sets_the_acl_and_clears_prefixes(monkeypatch: py
     response = await policy.set_bucket_policy(BUCKET, _Request(_whole(), caches), db)
 
     assert response.status_code == 204
-    assert len(db.set_acls) == 1
-    assert any(
-        grant.grantee.uri == WellKnownGroups.ALL_USERS and grant.permission == Permission.READ
-        for grant in db.set_acls[0].grants
-    )
-    assert len(db.execs) == 1
+    assert db.set_acls == []
+    assert len(db.execs) == 2
     assert "DELETE FROM bucket_public_prefixes" in db.execs[0][0]
+    assert "INSERT INTO bucket_public_objects" in db.execs[1][0]
     assert caches.prefixes == ["bid-1"]
-    assert caches.buckets == [BUCKET]
+    assert caches.buckets == []
 
 
 @pytest.mark.asyncio
-async def test_whole_bucket_put_on_a_public_bucket_keeps_prefixes(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_whole_bucket_put_on_all_users_read_strips_that_grant(monkeypatch: pytest.MonkeyPatch) -> None:
     _install(monkeypatch)
-    db = _DB()
-    db.acl = _acl(Permission.READ)
+    db = _DB(prefixes=["public"])
+    db.acl = _acl(Permission.READ, Permission.WRITE)
+    caches = _Caches()
 
-    response = await policy.set_bucket_policy(BUCKET, _Request(_whole()), db)
+    response = await policy.set_bucket_policy(BUCKET, _Request(_whole(), caches), db)
+
+    assert response.status_code == 204
+    assert len(db.set_acls) == 1
+    public = [grant.permission for grant in db.set_acls[0].grants if grant.grantee.uri == WellKnownGroups.ALL_USERS]
+    assert public == [Permission.WRITE]
+    assert "DELETE FROM bucket_public_prefixes" in db.execs[0][0]
+    assert "INSERT INTO bucket_public_objects" in db.execs[1][0]
+    assert caches.buckets == [BUCKET]
+    assert caches.prefixes == ["bid-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("perms", [(Permission.FULL_CONTROL,), (Permission.READ, Permission.FULL_CONTROL)])
+async def test_whole_bucket_put_on_all_users_full_control_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, perms: tuple[Permission, ...]
+) -> None:
+    _install(monkeypatch)
+    db = _DB(prefixes=["public"])
+    db.acl = _acl(*perms)
+    caches = _Caches()
+
+    response = await policy.set_bucket_policy(BUCKET, _Request(_whole(), caches), db)
 
     assert response.status_code == 409
     assert "already exists" in response.body.decode()
     assert db.execs == []
     assert db.set_acls == []
+    assert caches.prefixes == []
+    assert caches.buckets == []
+
+
+@pytest.mark.asyncio
+async def test_prefix_put_on_public_objects_writes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch)
+    db = _DB(public_objects=True)
+    caches = _Caches()
+
+    response = await policy.set_bucket_policy(BUCKET, _Request(_prefix(), caches), db)
+
+    assert response.status_code == 409
+    assert _code(response) == "PolicyAlreadyExists"
+    assert db.execs == []
+    assert db.set_acls == []
+    assert caches.prefixes == []
 
 
 @pytest.mark.asyncio
@@ -358,13 +403,31 @@ async def test_get_returns_prefixes_without_a_public_acl(monkeypatch: pytest.Mon
 @pytest.mark.asyncio
 async def test_get_shows_both_when_the_acl_was_opened_later(monkeypatch: pytest.MonkeyPatch) -> None:
     _install(monkeypatch)
-    db = _DB(prefixes=["public"])
+    db = _DB(prefixes=["public"], public_objects=True)
     db.acl = _acl(Permission.READ)
 
     response = await policy.get_bucket_policy(BUCKET, db, OWNER)
 
     resources = [item["Resource"][0] for item in json.loads(response.body)["Statement"]]
     assert resources == [f"arn:aws:s3:::{BUCKET}/*", f"arn:aws:s3:::{BUCKET}/public/*"]
+
+
+@pytest.mark.asyncio
+async def test_get_returns_the_whole_statement_from_the_marker_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch)
+    db = _DB(public_objects=True)
+
+    response = await policy.get_bucket_policy(BUCKET, db, OWNER)
+
+    document = json.loads(response.body)
+    assert document["Statement"] == [
+        {
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": ["s3:GetObject"],
+            "Resource": [f"arn:aws:s3:::{BUCKET}/*"],
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -397,9 +460,11 @@ async def test_delete_clears_prefixes_and_leaves_the_acl(monkeypatch: pytest.Mon
 
     assert response.status_code == 204
     assert db.lock_calls == 1
-    assert len(db.execs) == 1
+    assert len(db.execs) == 2
     assert "DELETE FROM bucket_public_prefixes" in db.execs[0][0]
+    assert "DELETE FROM bucket_public_objects" in db.execs[1][0]
     assert db.execs[0][2] is True
+    assert db.execs[1][2] is True
     assert db.events == ["begin", "commit"]
     assert db.set_acls == []
     assert caches.prefixes == ["bid-1"]
@@ -438,8 +503,9 @@ async def test_delete_clears_prefixes_when_all_users_has_only_write(monkeypatch:
     response = await policy.delete_bucket_policy(BUCKET, db, _Request(b"", caches))
 
     assert response.status_code == 204
-    assert len(db.execs) == 1
+    assert len(db.execs) == 2
     assert "DELETE FROM bucket_public_prefixes" in db.execs[0][0]
+    assert "DELETE FROM bucket_public_objects" in db.execs[1][0]
     assert db.set_acls == []
     assert caches.prefixes == ["bid-1"]
 

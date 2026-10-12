@@ -164,8 +164,9 @@ def get_required_permission(
         return Permission.READ_ACP if method == "GET" else Permission.WRITE_ACP
 
     # `policy` is an access-control operation, not a data one. The whole-bucket document
-    # replaces the bucket ACL with public-read; a prefix document publishes anonymous GET
-    # of those keys. Either one graded WRITE would let a write-only grantee publish objects.
+    # publishes anonymous GET of every current key and does not grant ListBucket; a prefix
+    # document publishes anonymous GET of those keys. Either one graded WRITE would let a
+    # write-only grantee publish objects.
     if "policy" in query_params:
         return Permission.READ_ACP if method in ("GET", "HEAD") else Permission.WRITE_ACP
 
@@ -472,8 +473,9 @@ async def acl_middleware(
             allow_public_prefix=not version_pinned,
         )
         # The second call is what distinguishes "the bucket ACL publishes this object"
-        # from "only a prefix does". Prefix responses stay on the short public TTL even
-        # when the bucket is warm; a whole-bucket ACL keeps the warm header.
+        # from "only a policy does" (a prefix, or the whole-bucket object-read grant).
+        # Policy responses stay on the short public TTL even when the bucket is warm; a
+        # whole-bucket ACL keeps the warm header. Delete of a policy has no wildcard purge.
         if request.state.anonymous_read_allowed and not version_pinned:
             allowed_without_prefix = await acl_service.check_permission(
                 account_id=None,

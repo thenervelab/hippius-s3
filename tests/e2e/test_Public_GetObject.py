@@ -170,14 +170,6 @@ def test_signed_get_object_still_works(
     assert content == body
 
 
-@pytest.mark.skip(
-    reason="Known limitation: bucket policies translate to public-read bucket ACLs which grant "
-    "both ListBucket AND GetObject permissions. In S3 ACL semantics, READ permission on a bucket "
-    "grants listing access, not just object access. This differs from bucket policies which can "
-    "distinguish between s3:GetObject (objects only) and s3:ListBucket (bucket listing). "
-    "To support this distinction, we would need a full policy evaluation engine instead of "
-    "translating policies to ACLs."
-)
 def test_public_bucket_list_anonymous_fails(
     docker_services: Any,
     boto3_client: Any,
@@ -185,11 +177,7 @@ def test_public_bucket_list_anonymous_fails(
     cleanup_buckets: Callable[[str], None],
     s3_base_url: str,
 ) -> None:
-    """Test that anonymous GET on bucket list (no object key) still returns 403.
-
-    NOTE: This test is skipped because our implementation translates bucket policies to ACLs,
-    and bucket-level READ permission grants both listing and object access. See skip reason for details.
-    """
+    """Anonymous GET of the bucket is ListBucket, which s3:GetObject does not grant."""
     bucket_name = unique_bucket_name("public-list")
     cleanup_buckets(bucket_name)
 
@@ -290,21 +278,14 @@ def test_private_bucket_anonymous_access_fully_denied(
     assert "AccessDenied" in bucket_response.text
 
 
-def test_public_bucket_anonymous_access_fully_allowed(
+def test_public_policy_allows_object_get_and_denies_listing(
     docker_services: Any,
     boto3_client: Any,
     unique_bucket_name: Callable[[str], str],
     cleanup_buckets: Callable[[str], None],
     s3_base_url: str,
 ) -> None:
-    """Test that public buckets allow both object access and bucket listing for anonymous users.
-
-    This test documents the actual behavior: when a bucket policy is set for public read,
-    it creates a public-read bucket ACL which grants READ permission. In S3 ACL semantics,
-    READ on a bucket grants both ListBucket and GetObject permissions. This is a known
-    limitation - we cannot distinguish between object-only access and bucket listing access
-    without implementing a full policy evaluation engine.
-    """
+    """A whole-bucket s3:GetObject policy publishes the object and does not list the bucket."""
     bucket_name = unique_bucket_name("public-full")
     cleanup_buckets(bucket_name)
 
@@ -335,8 +316,7 @@ def test_public_bucket_anonymous_access_fully_allowed(
     assert object_response.content == body
     assert object_response.headers.get("x-hippius-access-mode") == "anon"
 
-    # Anonymous bucket listing should also succeed (this is the quirk)
     bucket_url = f"{s3_base_url}/{bucket_name}"
     bucket_response = requests.get(bucket_url, timeout=10)
-    assert bucket_response.status_code == 200
-    assert "<ListBucketResult" in bucket_response.text or "ListBucketResult" in bucket_response.text
+    assert bucket_response.status_code == 403
+    assert "AccessDenied" in bucket_response.text

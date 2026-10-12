@@ -26,6 +26,7 @@ from hippius_s3.services.public_prefix_policy import key_matches_public_prefix
 from hippius_s3.services.public_prefix_policy import parse_bucket_policy
 from hippius_s3.services.public_prefix_policy import policy_document
 from hippius_s3.services.public_prefix_policy import stored_object_key
+from hippius_s3.services.public_prefix_policy import without_anonymous_read
 from hippius_s3.utils import get_query
 
 
@@ -341,6 +342,38 @@ def test_importing_acl_lookup_does_not_load_gateway_config() -> None:
     assert probe.returncode == 0, probe.stderr
 
 
+def test_public_objects_marker_emits_one_whole_statement() -> None:
+    marker = policy_document(BUCKET, public_acl=False, prefixes=[], public_objects=True)
+    acl = policy_document(BUCKET, public_acl=True, prefixes=[])
+    assert marker == acl
+    both = policy_document(BUCKET, public_acl=True, prefixes=["public"], public_objects=True)
+    assert [item["Resource"][0] for item in both["Statement"]] == [
+        f"arn:aws:s3:::{BUCKET}/*",
+        f"arn:aws:s3:::{BUCKET}/public/*",
+    ]
+
+
+def _acl(*perms: Permission) -> ACL:
+    grants = [
+        Grant(grantee=Grantee(type=GranteeType.CANONICAL_USER, id="owner"), permission=Permission.FULL_CONTROL),
+    ]
+    grants.extend(
+        Grant(grantee=Grantee(type=GranteeType.GROUP, uri=WellKnownGroups.ALL_USERS), permission=perm) for perm in perms
+    )
+    return ACL(owner=Owner(id="owner"), grants=grants)
+
+
+def test_without_anonymous_read_drops_only_all_users_read() -> None:
+    stripped = without_anonymous_read(_acl(Permission.READ, Permission.WRITE))
+    assert bucket_grants_anonymous_read(stripped) is False
+    public = [grant.permission for grant in stripped.grants if grant.grantee.uri == WellKnownGroups.ALL_USERS]
+    assert public == [Permission.WRITE]
+
+    still_public = without_anonymous_read(_acl(Permission.READ, Permission.FULL_CONTROL))
+    assert bucket_grants_anonymous_read(still_public) is True
+    assert still_public == _acl(Permission.FULL_CONTROL)
+
+
 def test_list_query_is_scoped_to_the_live_bucket() -> None:
     sql = get_query("list_bucket_public_prefixes").lower()
     assert "deleted_at is null" in sql
@@ -355,3 +388,16 @@ def test_migration_is_a_new_table_with_a_bounded_lock() -> None:
     assert "lock_timeout" in text
     assert "DISABLE TRIGGER" not in text
     assert MAX_POLICY_BYTES == 20 * 1024
+
+
+def test_public_objects_migration_is_a_marker_table_with_a_bounded_lock() -> None:
+    text = (ROOT / "hippius_s3/sql/migrations/20261012130000_bucket_public_objects.sql").read_text()
+    assert "REFERENCES buckets" in text
+    assert "ON DELETE CASCADE" in text
+    assert "lock_timeout" in text
+    assert "DISABLE TRIGGER" not in text
+    assert "bucket_acls" not in text
+    sql = get_query("bucket_has_public_objects").lower()
+    assert "as published" in sql
+    assert "deleted_at is null" in sql
+    assert "bucket_id = $1" in sql
