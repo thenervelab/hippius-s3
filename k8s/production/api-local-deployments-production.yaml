@@ -58,7 +58,7 @@ spec:
       # A DaemonSet rolls with no surge pod, so each node loses its only api-local for the
       # duration — draining rather than being killed is what keeps in-flight requests alive.
       terminationGracePeriodSeconds: 45
-      # Outrank general workloads for the node1-5 slots (below system-*-critical; never preempts
+      # Outrank general workloads for the ingest slots (below system-*-critical; never preempts
       # Ceph/system). See s3-ingest-priorityclass.yaml + peer-review B3.
       priorityClassName: s3-ingest-priority
       nodeSelector:
@@ -77,11 +77,11 @@ spec:
                       # The prod ingest nodes: dedicated /s3-data NVMe, labeled
                       # s3-prod-local-ingest=true. Keep in sync with
                       # ingest-node-labels-production.yaml + the drain-agent DaemonSet.
-                      # Overlaps staging's node2/node3 but on a different disk (staging uses
+                      # Overlaps staging's node2 but on a different disk (staging uses
                       # the node-root local_ingest_staging path). See s3-2.1-todo.md.
+                      # k8s-v3-node3 left this list; staging ingest on that node stays.
                       - k8s-v3-node1
                       - k8s-v3-node2
-                      - k8s-v3-node3
                       - k8s-v3-node4
                       - k8s-v3-node5
       initContainers:
