@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 # A stale empty entry is only an under-grant, and it expires.
 _PREFIX_NEGATIVE_TTL_SECONDS = 60
 _PREFIX_EMPTY = "[]"
+# Same window for "this bucket has no whole-bucket object-read grant". A stored
+# "present" flag would be an anonymous read after DeleteBucketPolicy.
+_PUBLIC_OBJECTS_ABSENT = "0"
 
 
 class BucketLookup(BaseModel):
@@ -281,27 +284,29 @@ class ACLService:
                 )
                 return True
 
-        # A public prefix grants READ of the current object only, and only when no
-        # object ACL row exists. An object ACL replaces the bucket ACL; appending the
-        # prefix onto that object (or onto the cached ACL object) would publish a key
-        # the owner sealed, and would poison the ACL cache for every later request.
+        # A public prefix, or the whole-bucket object-read marker, grants READ of the
+        # current object only, and only when no object ACL row exists. An object ACL
+        # replaces the bucket ACL; appending the policy onto that object (or onto the
+        # cached ACL object) would publish a key the owner sealed, and would poison
+        # the ACL cache for every later request. Neither grant is ListBucket: this
+        # block does not run when the request has no key.
         # The lookup uses the stored key, not the raw copy-source string: `../` in
         # `x-amz-copy-source` must not hide the private ACL of the object it names.
         # `bucket_id` is the bucket being authorized. CopyObject must pass the source
-        # bucket's id — the destination's prefixes must not publish the source.
+        # bucket's id — the destination's policy must not publish the source.
         #
-        # The prefix list comes first. Object-ACL misses are not cached, and a bucket
-        # with no matching prefix would otherwise pay that query on every denied read.
-        # When this key is already the stored key, the effective-ACL read above is the
-        # seal lookup and is not repeated.
+        # The prefix list comes first, then the marker. Object-ACL misses are not
+        # cached, and a bucket with neither grant would otherwise pay the object-ACL
+        # query on every denied read. When this key is already the stored key, the
+        # effective-ACL read above is the seal lookup and is not repeated.
         stored_key = stored_object_key(key) if key is not None else ""
-        if (
-            allow_public_prefix
-            and stored_key
-            and stored_key != "/"
-            and permission == Permission.READ
-            and await self._prefix_read_allows(bucket, stored_key, bucket_id)
-        ):
+        policy_reason = ""
+        if allow_public_prefix and stored_key and stored_key != "/" and permission == Permission.READ:
+            if await self._prefix_read_allows(bucket, stored_key, bucket_id):
+                policy_reason = "public prefix"
+            elif await self._public_objects_allow(bucket, bucket_id):
+                policy_reason = "public objects"
+        if policy_reason:
             if stored_key == key:
                 sealed = object_acl is not None
             else:
@@ -310,7 +315,7 @@ class ACLService:
                 logger.info(
                     f"ACL check: account={account_id}, access_key={access_key or 'None'}, bucket={bucket}, "
                     f"key={key or 'None'}, required_perm={permission.value}, owner={acl.owner.id}, "
-                    f"grants={len(acl.grants)}{grants_summary}, result=GRANTED (public prefix)"
+                    f"grants={len(acl.grants)}{grants_summary}, result=GRANTED ({policy_reason})"
                 )
                 return True
 
@@ -372,13 +377,70 @@ class ACLService:
         except RedisError as exc:
             logger.warning(f"prefix cache: redis SETEX failed (best-effort, continuing): {exc}")
 
-    async def invalidate_public_prefixes(self, bucket_id: str) -> None:
+    def _public_objects_cache_key(self, bucket_id: str) -> str:
+        # Bucket id, same as the prefix key: a reused name must not publish the
+        # previous tenant's objects.
+        return f"hippius_acl:public_objects:{bucket_id}"
+
+    async def _public_objects_allow(self, bucket: str, bucket_id: str | None) -> bool:
+        resolved = bucket_id
+        if resolved is None:
+            lookup = await self.get_bucket_owner_and_id(bucket)
+            if lookup is None:
+                return False
+            resolved = lookup.bucket_id
+        resolved = str(resolved)
+        if await self._public_objects_negative_cached(resolved):
+            return False
+        row = await self.acl_repo.db.fetchrow(get_query("bucket_has_public_objects"), resolved)
+        # The column is the signal. `row is not None` would treat a bucket-lookup
+        # row (this connection also serves get_bucket_owner_and_id) as a grant.
+        if row is None or "published" not in row:
+            if row is None:
+                await self._cache_public_objects_absent(resolved)
+            return False
+        return True
+
+    async def _public_objects_negative_cached(self, bucket_id: str) -> bool:
+        if self._redis is None:
+            return False
+        try:
+            cached = await self._redis.get(self._public_objects_cache_key(bucket_id))
+        except RedisError as exc:
+            logger.warning(f"public objects cache: redis GET failed, falling through to DB: {exc}")
+            return False
+        if isinstance(cached, bytes):
+            cached = cached.decode("utf-8", "replace")
+        # Only the absence sentinel is a cache hit. A stored "present" value is not
+        # an allow: that would keep serving anonymous reads after the row is gone.
+        return cached == _PUBLIC_OBJECTS_ABSENT
+
+    async def _cache_public_objects_absent(self, bucket_id: str) -> None:
         if self._redis is None:
             return
         try:
-            await self._redis.delete(self._prefix_cache_key(str(bucket_id)))
+            await self._redis.setex(
+                self._public_objects_cache_key(bucket_id),
+                _PREFIX_NEGATIVE_TTL_SECONDS,
+                _PUBLIC_OBJECTS_ABSENT,
+            )
+        except RedisError as exc:
+            logger.warning(f"public objects cache: redis SETEX failed (best-effort, continuing): {exc}")
+
+    async def invalidate_public_prefixes(self, bucket_id: str) -> None:
+        if self._redis is None:
+            return
+        bucket_id = str(bucket_id)
+        try:
+            await self._redis.delete(self._prefix_cache_key(bucket_id))
         except RedisError as exc:
             logger.warning(f"prefix cache: redis DELETE failed for {bucket_id} (best-effort, continuing): {exc}")
+        try:
+            await self._redis.delete(self._public_objects_cache_key(bucket_id))
+        except RedisError as exc:
+            logger.warning(
+                f"public objects cache: redis DELETE failed for {bucket_id} (best-effort, continuing): {exc}"
+            )
 
     async def invalidate_public_prefixes_by_name(self, bucket: str) -> None:
         lookup = await self.get_bucket_owner_and_id(bucket)

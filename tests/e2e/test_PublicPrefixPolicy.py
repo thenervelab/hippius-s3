@@ -166,6 +166,12 @@ def test_whole_bucket_policy_still_publishes_every_key(
     )
     boto3_client.put_bucket_policy(Bucket=bucket, Policy=whole)
     assert _anon(s3_base_url, bucket, "sealed/secret.txt").content == b"sealed"
+    grants = boto3_client.get_bucket_acl(Bucket=bucket)["Grants"]
+    assert not any(grant.get("Grantee", {}).get("URI") == _ALL_USERS for grant in grants)
+    listed = requests.get(f"{s3_base_url}/{bucket}", params={"list-type": "2"}, timeout=10)
+    assert listed.status_code == 403
+    stored = json.loads(boto3_client.get_bucket_policy(Bucket=bucket)["Policy"])
+    assert stored["Statement"][0]["Resource"] == [f"arn:aws:s3:::{bucket}/*"]
     with pytest.raises(ClientError) as again:
         boto3_client.put_bucket_policy(Bucket=bucket, Policy=_prefix_policy(bucket, "public"))
     assert again.value.response["Error"]["Code"] == "PolicyAlreadyExists"

@@ -48,19 +48,26 @@ def _service(
     object_acl: ACL | None = None,
     rows_for: dict[str, list[str]] | None = None,
     redis: Any = None,
+    public_objects: set[str] | None = None,
 ) -> tuple[ACLService, list[str]]:
     fetched: list[str] = []
+    published = public_objects if public_objects is not None else set()
 
     async def fetch(_query: str, bucket_id: str) -> list[dict[str, str]]:
         fetched.append(str(bucket_id))
         prefixes = (rows_for or {}).get(str(bucket_id), [])
         return [{"prefix": prefix} for prefix in prefixes]
 
+    async def fetchrow(_query: str, bucket_id: str) -> dict[str, int] | None:
+        if str(bucket_id) in published:
+            return {"published": 1}
+        return None
+
     svc = ACLService(AsyncMock())
     svc.acl_repo = SimpleNamespace(  # type: ignore[assignment]
         get_object_acl=AsyncMock(return_value=object_acl),
         get_bucket_acl=AsyncMock(return_value=acl),
-        db=SimpleNamespace(fetch=AsyncMock(side_effect=fetch)),
+        db=SimpleNamespace(fetch=AsyncMock(side_effect=fetch), fetchrow=AsyncMock(side_effect=fetchrow)),
     )
     svc._redis = redis
     return svc, fetched
@@ -313,6 +320,7 @@ async def test_a_cached_allow_list_is_ignored() -> None:
 async def test_invalidate_by_name_deletes_the_id_key() -> None:
     redis = _Redis()
     redis.store["hippius_acl:prefixes:bid-a"] = "[]"
+    redis.store["hippius_acl:public_objects:bid-a"] = "0"
     svc, _fetched = _service(_acl(OWNER, _owner_grant()), redis=redis)
     svc.get_bucket_owner_and_id = AsyncMock(  # type: ignore[method-assign]
         return_value=BucketLookup(owner_id=OWNER, bucket_id="bid-a", is_cache_warm=False)
@@ -321,3 +329,110 @@ async def test_invalidate_by_name_deletes_the_id_key() -> None:
     await svc.invalidate_public_prefixes_by_name("bucket-a")
 
     assert "hippius_acl:prefixes:bid-a" not in redis.store
+    assert "hippius_acl:public_objects:bid-a" not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_public_objects_grant_read_of_a_key_and_not_a_list() -> None:
+    published = {"bid-a"}
+    redis = _Redis()
+    svc, _fetched = _service(_acl(OWNER, _owner_grant()), redis=redis, public_objects=published)
+
+    assert await _read(svc, "any-key") is True
+    assert await _read(svc, "/leading") is True
+    assert all(key != "hippius_acl:public_objects:bid-a" for key, _ttl, _value in redis.setexes)
+    assert await svc.check_permission(None, "bucket-a", None, Permission.READ, bucket_id="bid-a") is False
+    assert await svc.check_permission(None, "bucket-a", "any-key", Permission.WRITE, bucket_id="bid-a") is False
+    assert await _read(svc, "any-key", allow_public_prefix=False) is False
+
+    published.clear()
+    assert await _read(svc, "any-key") is False
+    assert ("hippius_acl:public_objects:bid-a", 60, "0") in redis.setexes
+
+
+@pytest.mark.asyncio
+async def test_a_sealed_prefix_child_is_not_reopened_by_public_objects() -> None:
+    svc, _fetched = _service(
+        _acl(OWNER, _owner_grant()),
+        object_acl=_acl(OWNER, _owner_grant()),
+        rows_for={"bid-a": ["public"]},
+        public_objects={"bid-a"},
+    )
+
+    assert await _read(svc, "public/a") is False
+
+
+@pytest.mark.asyncio
+async def test_an_object_acl_seals_a_public_objects_key() -> None:
+    svc, _fetched = _service(
+        _acl(OWNER, _owner_grant()),
+        object_acl=_acl(OWNER, _owner_grant()),
+        public_objects={"bid-a"},
+    )
+
+    assert await _read(svc, "sealed") is False
+    assert svc.acl_repo.get_object_acl.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_public_objects_collapses_before_the_object_acl_seal() -> None:
+    private = _acl(OWNER, _owner_grant())
+    svc, _fetched = _service(_acl(OWNER, _owner_grant()), public_objects={"bid-a"})
+    looked_up: list[str] = []
+
+    async def get_object_acl(_bucket: str, key: str) -> ACL | None:
+        looked_up.append(key)
+        if key == "sealed/x":
+            return private
+        return None
+
+    svc.acl_repo.get_object_acl = get_object_acl  # type: ignore[method-assign]
+
+    assert await _read(svc, "foo/../sealed/x") is False
+    assert "sealed/x" in looked_up
+    assert await _read(svc, "open") is True
+
+
+@pytest.mark.asyncio
+async def test_all_users_read_still_lists_the_bucket() -> None:
+    svc, fetched = _service(_acl(OWNER, _owner_grant(), _all_users(Permission.READ)))
+
+    assert await svc.check_permission(None, "bucket-a", None, Permission.READ, bucket_id="bid-a") is True
+    assert fetched == []
+    assert svc.acl_repo.db.fetchrow.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_cached_public_objects_flag_is_not_an_allow() -> None:
+    redis = _Redis()
+    redis.store["hippius_acl:public_objects:bid-a"] = "1"
+    svc, _fetched = _service(_acl(OWNER, _owner_grant()), redis=redis)
+
+    assert await _read(svc, "any-key") is False
+    assert ("hippius_acl:public_objects:bid-a", 60, "0") in redis.setexes
+
+
+@pytest.mark.asyncio
+async def test_a_bucket_lookup_row_is_not_a_public_objects_grant() -> None:
+    svc, _fetched = _service(_acl(OWNER, _owner_grant()), public_objects={"bid-a"})
+
+    async def fetchrow(_query: str, _bucket_id: str) -> dict[str, str]:
+        return {"bucket_id": "bid-a", "main_account_id": OWNER}
+
+    svc.acl_repo.db.fetchrow = AsyncMock(side_effect=fetchrow)
+
+    assert await _read(svc, "any-key") is False
+
+
+@pytest.mark.asyncio
+async def test_absent_public_objects_is_negative_cached() -> None:
+    redis = _Redis()
+    svc, _fetched = _service(_acl(OWNER, _owner_grant()), redis=redis)
+
+    assert await _read(svc, "any-key") is False
+    assert redis.setexes == [
+        ("hippius_acl:prefixes:bid-a", 60, "[]"),
+        ("hippius_acl:public_objects:bid-a", 60, "0"),
+    ]
+    assert await _read(svc, "other-key") is False
+    assert svc.acl_repo.db.fetchrow.await_count == 1
