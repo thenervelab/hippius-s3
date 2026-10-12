@@ -50,9 +50,9 @@ spec:
                     values:
                       # Keep in sync with drain-agent-daemonset.yaml +
                       # api-local-deployments-production.yaml.
+                      # k8s-v3-node3 left this list; staging ingest on that node stays.
                       - k8s-v3-node1
                       - k8s-v3-node2
-                      - k8s-v3-node3
                       - k8s-v3-node4
                       - k8s-v3-node5
       # run_worker() bounds cleanup at HIPPIUS_WORKER_DRAIN_TIMEOUT_SECONDS (20s); 40 leaves

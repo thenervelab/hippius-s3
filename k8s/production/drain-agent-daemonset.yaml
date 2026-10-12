@@ -58,11 +58,11 @@ spec:
                       # The prod ingest nodes: dedicated /s3-data NVMe, labeled
                       # s3-prod-local-ingest=true. Keep in sync with
                       # ingest-node-labels-production.yaml + api-local-deployments-production.yaml.
-                      # Overlaps staging's node2/node3 but on a different disk (staging uses the
+                      # Overlaps staging's node2 but on a different disk (staging uses the
                       # node-root local_ingest_staging path). See s3-2.1-todo.md.
+                      # k8s-v3-node3 left this list; staging ingest on that node stays.
                       - k8s-v3-node1
                       - k8s-v3-node2
-                      - k8s-v3-node3
                       - k8s-v3-node4
                       - k8s-v3-node5
       # > the agent's shutdown grace (CEPHOR_GRACE_SECS default 30s): a burst winds
