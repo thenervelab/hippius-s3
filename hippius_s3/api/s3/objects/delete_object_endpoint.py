@@ -73,6 +73,39 @@ async def enqueue_object_unpin(
     )
 
 
+async def enqueue_unversioned_overwrite_unpin(
+    db: Any,
+    *,
+    object_id: str,
+    object_version: int,
+    address: str,
+    ray_id: str | None,
+) -> None:
+    """Unpin the single version an unversioned overwrite replaced.
+
+    `object_version` is the version just finalized. It is never NULL: NULL means every
+    non-current version, and one prod object has 646,993 of them. Version 1 replaced
+    nothing. The query returns at most one older version, and only while this version is
+    still current on a bucket whose versioning_status IS NULL.
+    """
+    finalized = int(object_version)
+    if finalized <= 1:
+        return
+    row = await db.fetchrow(get_query("get_unversioned_superseded_version"), object_id, finalized)
+    if row is None:
+        return
+    previous = row["object_version"]
+    if previous is None:
+        return
+    await enqueue_object_unpin(
+        db,
+        object_id=object_id,
+        object_version=int(previous),
+        address=address,
+        ray_id=ray_id,
+    )
+
+
 async def delete_object_version(
     bucket_id: Any,
     object_key: str,
