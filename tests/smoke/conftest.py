@@ -36,7 +36,7 @@ def production_s3_client():
 @pytest.fixture(scope="session")
 def session_tracker(production_s3_client):
     session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    bucket = "hippius-smoke-tests"
+    bucket = "hippius-smoke-tests-robot"
 
     tracker = SessionTracker(s3_client=production_s3_client, session_id=session_id, bucket_name=bucket)
 
@@ -55,7 +55,7 @@ def file_generator():
 
 @pytest.fixture(scope="session", autouse=True)
 def cleanup_old_files(production_s3_client):
-    bucket = "hippius-smoke-tests"
+    bucket = "hippius-smoke-tests-robot"
     prefix = "smoke-test/"
     retention_days = 30
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
