@@ -30,6 +30,7 @@ from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import HTTPException
 from fastapi import Path as FPath
+from fastapi import Query
 from fastapi import Request
 from fastapi import status
 from fastapi.responses import JSONResponse
@@ -57,6 +58,13 @@ router = APIRouter(tags=["admin"], default_response_class=JSONResponse)
 # Bound on the status endpoint's bucket/bytes aggregate — a 10+ TB account can push the
 # SUM into tens of seconds; the endpoint degrades to null counts instead of 500ing.
 STATS_QUERY_TIMEOUT_SECONDS = 15.0
+
+# Bound on GET /admin/usage. A timeout is 503 so the reporter retries, not a partial total.
+USAGE_PAGE_TIMEOUT_SECONDS = 15.0
+_USAGE_LIMIT_DEFAULT = 1000
+_USAGE_LIMIT_MAX = 10000
+# Starlette 1.6 renamed the 422 reason phrase. The integer is the contract either way.
+_HTTP_422 = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
 
 
 # --- request / response models ----------------------------------------------
@@ -105,6 +113,20 @@ class ErrorDetail(BaseModel):
     message: str
 
 
+class AdminUsageAccount(BaseModel):
+    account_id: str
+    buckets: int
+    bytes: int
+
+
+class AdminUsagePage(BaseModel):
+    accounts: list[AdminUsageAccount]
+    next_after: str | None = Field(
+        ...,
+        description="Last account id on this page when another page exists; null on the last page.",
+    )
+
+
 # --- helpers ---------------------------------------------------------------
 
 
@@ -134,6 +156,26 @@ def _refuse_service_account(account_id: str, operation: str) -> None:
 def _validate_account_id(account_id: str) -> None:
     if not SS58_PATTERN.match(account_id):
         _raise("InvalidArgument", f"Invalid account_id (must be SS58): {account_id}", status.HTTP_400_BAD_REQUEST)
+
+
+def _parse_usage_limit(raw: str | None) -> int:
+    if raw is None:
+        return _USAGE_LIMIT_DEFAULT
+    digits = raw[1:] if raw.startswith("-") else raw
+    if digits == "" or not digits.isascii() or not digits.isdigit():
+        _raise(
+            "InvalidArgument",
+            "limit must be an integer from 1 to 10000",
+            _HTTP_422,
+        )
+    value = int(raw)
+    if value < 1 or value > _USAGE_LIMIT_MAX:
+        _raise(
+            "InvalidArgument",
+            "limit must be an integer from 1 to 10000",
+            _HTTP_422,
+        )
+    return value
 
 
 def _mode_to_state(mode: str | None) -> Literal["active", "suspended", "read_only"]:
@@ -345,4 +387,71 @@ async def purge_job_status(
         deleted_objects=int(row["deleted_objects"]),
         deleted_bytes=int(row["deleted_bytes"]),
         error=row["error"],
+    )
+
+
+@router.get(
+    "/usage",
+    response_model=AdminUsagePage,
+    responses={
+        422: {"model": ErrorDetail, "description": "limit is not an integer from 1 to 10000."},
+        503: {"model": ErrorDetail, "description": "Rollup is not backfilled, or the query timed out."},
+    },
+    summary="Paged billable storage usage",
+    description=(
+        "One page of accounts that own a live bucket, ordered by account id byte order. "
+        "`bytes` is the rollup total: each live bucket contributes GREATEST(0, bytes_used), "
+        "then those are summed — the same per-bucket clamp as the per-account rollup read. "
+        "A live bucket with no rollup row counts as one bucket and zero bytes. This is not a "
+        "scan of objects.\n\n"
+        "`after` is an exclusive cursor. `limit` defaults to 1000 and must be an integer from "
+        "1 to 10000. `next_after` is the last account id on this page when another page exists, "
+        "otherwise null.\n\n"
+        "**503** when the rollup has not been backfilled (the counters are deltas since "
+        "migration, not totals) or when the statement times out. Retry. Not a billable number.\n\n"
+        "**Auth**: admin HMAC layer (`X-HMAC-Signature` with the admin secret). The query "
+        "string is part of the signature."
+    ),
+)
+async def account_usage(
+    after: str | None = Query(default=None, description="Exclusive account-id cursor."),
+    limit: str | None = Query(default=None, description="Page size. Default 1000, maximum 10000."),
+    db: DBConnection = Depends(get_postgres),
+) -> AdminUsagePage:
+    page_limit = _parse_usage_limit(limit)
+    try:
+        rows = await db.fetch(
+            get_query("list_admin_usage_accounts"),
+            after,
+            page_limit + 1,
+            timeout=USAGE_PAGE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("admin usage: statement timed out")
+        _raise(
+            "UsageQueryTimeout",
+            "Storage usage query timed out; retry",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    if not rows or not rows[0]["ready"]:
+        logger.warning("admin usage: rollup is not backfilled; refusing to bill deltas as totals")
+        _raise(
+            "RollupNotReady",
+            (
+                "bucket_storage_usage has not been backfilled "
+                "(storage_usage_rollup_state.backfilled_at is NULL), so its rows are deltas rather than totals"
+            ),
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    visible = [row for row in rows if row["account_id"] is not None]
+    page = visible[:page_limit]
+    next_after = page[-1]["account_id"] if len(visible) > page_limit else None
+    return AdminUsagePage(
+        accounts=[
+            AdminUsageAccount(account_id=row["account_id"], buckets=int(row["buckets"]), bytes=int(row["bytes"]))
+            for row in page
+        ],
+        next_after=next_after,
     )

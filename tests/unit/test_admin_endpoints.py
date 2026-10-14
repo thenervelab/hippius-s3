@@ -11,8 +11,10 @@ from fastapi import Response
 from httpx import ASGITransport
 from httpx import AsyncClient
 
+from hippius_s3.api.admin import USAGE_PAGE_TIMEOUT_SECONDS
 from hippius_s3.api.admin import router as admin_router
 from hippius_s3.dependencies import get_postgres
+from hippius_s3.utils import get_query
 
 
 ACCOUNT = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
@@ -24,17 +26,21 @@ class FakeDB:
     def __init__(self, router: Callable[[str, tuple], Any]) -> None:
         self.router = router
         self.calls: list[tuple[str, str, tuple]] = []
+        self.kwarg_calls: list[dict[str, Any]] = []
 
     async def fetchrow(self, query: str, *args: Any, **kwargs: Any) -> Any:
         self.calls.append(("fetchrow", query, args))
+        self.kwarg_calls.append(kwargs)
         return self.router(query, args)
 
     async def fetch(self, query: str, *args: Any, **kwargs: Any) -> Any:
         self.calls.append(("fetch", query, args))
+        self.kwarg_calls.append(kwargs)
         return self.router(query, args)
 
     async def execute(self, query: str, *args: Any, **kwargs: Any) -> Any:
         self.calls.append(("execute", query, args))
+        self.kwarg_calls.append(kwargs)
         return self.router(query, args)
 
 
@@ -267,3 +273,161 @@ async def test_purge_job_status_invalid_uuid_returns_400() -> None:
     async with _client(app) as client:
         response = await client.get("/admin/purge-jobs/not-a-uuid")
     assert response.status_code == 400
+
+
+def _usage_row(account_id: str | None, buckets: int | None, total_bytes: int | None, *, ready: bool = True) -> dict:
+    return {"ready": ready, "account_id": account_id, "buckets": buckets, "bytes": total_bytes}
+
+
+def test_usage_route_lives_under_admin_prefix() -> None:
+    app, _ = _make_app(FakeDB(lambda q, a: None))
+    assert app.url_path_for("account_usage") == "/admin/usage"
+
+
+def test_usage_sql_clamps_per_bucket_excludes_deleted_and_orders_c() -> None:
+    sql = " ".join(get_query("list_admin_usage_accounts").split())
+    assert "COALESCE(SUM(GREATEST(0, bsu.bytes_used)), 0)::bigint AS bytes" in sql
+    assert "GREATEST(0, SUM" not in sql
+    assert "b.deleted_at IS NULL" in sql
+    assert "main_account_id > COALESCE($1::text, '')" in sql
+    assert "main_account_id >=" not in sql
+    assert 'ORDER BY b.main_account_id COLLATE "C"' in sql
+    assert "storage_usage_rollup_state" in sql
+    assert "account_suspensions" not in sql
+
+
+@pytest.mark.asyncio
+async def test_usage_page_sets_next_after_when_an_extra_row_exists() -> None:
+    def route(query: str, args: tuple) -> Any:
+        assert "bucket_storage_usage" in query
+        assert args == (None, 3)
+        return [
+            _usage_row("acct-a", 1, 5),
+            _usage_row("acct-b", 2, 10),
+            _usage_row("acct-c", 1, 1),
+        ]
+
+    db = FakeDB(route)
+    app, _ = _make_app(db)
+    async with _client(app) as client:
+        response = await client.get("/admin/usage", params={"limit": "2"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "accounts": [
+            {"account_id": "acct-a", "buckets": 1, "bytes": 5},
+            {"account_id": "acct-b", "buckets": 2, "bytes": 10},
+        ],
+        "next_after": "acct-b",
+    }
+    assert db.kwarg_calls[0]["timeout"] == USAGE_PAGE_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_usage_last_page_has_null_next_after() -> None:
+    def route(query: str, args: tuple) -> Any:
+        assert args == ("acct-b", 3)
+        return [_usage_row("acct-c", 1, 1)]
+
+    app, _ = _make_app(FakeDB(route))
+    async with _client(app) as client:
+        response = await client.get("/admin/usage", params={"limit": "2", "after": "acct-b"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "accounts": [{"account_id": "acct-c", "buckets": 1, "bytes": 1}],
+        "next_after": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_usage_default_limit_is_1000_and_empty_page_stays_200_when_ready() -> None:
+    def route(query: str, args: tuple) -> Any:
+        assert args == (None, 1001)
+        return [_usage_row(None, None, None, ready=True)]
+
+    app, _ = _make_app(FakeDB(route))
+    async with _client(app) as client:
+        response = await client.get("/admin/usage")
+
+    assert response.status_code == 200
+    assert response.json() == {"accounts": [], "next_after": None}
+
+
+@pytest.mark.asyncio
+async def test_usage_after_cursor_is_exclusive_in_the_query() -> None:
+    def route(query: str, args: tuple) -> Any:
+        assert "main_account_id > COALESCE($1::text, '')" in " ".join(query.split())
+        assert args[0] == "acct-b"
+        return [_usage_row("acct-c", 1, 4)]
+
+    app, _ = _make_app(FakeDB(route))
+    async with _client(app) as client:
+        response = await client.get("/admin/usage", params={"after": "acct-b", "limit": "10"})
+
+    assert response.status_code == 200
+    ids = [row["account_id"] for row in response.json()["accounts"]]
+    assert ids == ["acct-c"]
+    assert "acct-b" not in ids
+
+
+@pytest.mark.asyncio
+async def test_usage_rollup_not_ready_is_503_even_with_account_rows() -> None:
+    def route(query: str, args: tuple) -> Any:
+        return [_usage_row("acct-a", 2, 7, ready=False)]
+
+    app, _ = _make_app(FakeDB(route))
+    async with _client(app) as client:
+        response = await client.get("/admin/usage")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["detail"]["code"] == "RollupNotReady"
+    assert "accounts" not in body
+    assert "acct-a" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_usage_rollup_not_ready_on_empty_page_is_503() -> None:
+    def route(query: str, args: tuple) -> Any:
+        return [_usage_row(None, None, None, ready=False)]
+
+    app, _ = _make_app(FakeDB(route))
+    async with _client(app) as client:
+        response = await client.get("/admin/usage")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "RollupNotReady"
+
+
+def _usage_db_must_not_run(query: str, args: tuple) -> Any:
+    raise AssertionError(f"db must not be queried: {query}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["0", "-1", "10001", "abc", "1.5", "1e3", "+2", ""])
+async def test_usage_bad_limit_is_422(limit: str) -> None:
+    db = FakeDB(_usage_db_must_not_run)
+    app, _ = _make_app(db)
+    async with _client(app) as client:
+        response = await client.get("/admin/usage", params={"limit": limit})
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "InvalidArgument"
+    assert db.calls == []
+
+
+@pytest.mark.asyncio
+async def test_usage_timeout_is_503() -> None:
+    def route(query: str, args: tuple) -> Any:
+        raise asyncio.TimeoutError()
+
+    app, _ = _make_app(FakeDB(route))
+    async with _client(app) as client:
+        response = await client.get("/admin/usage")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["detail"]["code"] == "UsageQueryTimeout"
+    assert body["detail"]["message"]
+    assert "bytes" not in body
