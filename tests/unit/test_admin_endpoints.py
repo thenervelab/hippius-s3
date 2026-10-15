@@ -297,14 +297,13 @@ def test_usage_sql_clamps_per_bucket_excludes_deleted_and_orders_c() -> None:
 
 
 @pytest.mark.asyncio
-async def test_usage_page_sets_next_after_when_an_extra_row_exists() -> None:
+async def test_usage_full_page_sets_next_after_to_the_last_account() -> None:
     def route(query: str, args: tuple) -> Any:
         assert "bucket_storage_usage" in query
-        assert args == (None, 3)
+        assert args == (None, 2)
         return [
             _usage_row("acct-a", 1, 5),
             _usage_row("acct-b", 2, 10),
-            _usage_row("acct-c", 1, 1),
         ]
 
     db = FakeDB(route)
@@ -326,7 +325,7 @@ async def test_usage_page_sets_next_after_when_an_extra_row_exists() -> None:
 @pytest.mark.asyncio
 async def test_usage_last_page_has_null_next_after() -> None:
     def route(query: str, args: tuple) -> Any:
-        assert args == ("acct-b", 3)
+        assert args == ("acct-b", 2)
         return [_usage_row("acct-c", 1, 1)]
 
     app, _ = _make_app(FakeDB(route))
@@ -343,7 +342,7 @@ async def test_usage_last_page_has_null_next_after() -> None:
 @pytest.mark.asyncio
 async def test_usage_default_limit_is_1000_and_empty_page_stays_200_when_ready() -> None:
     def route(query: str, args: tuple) -> Any:
-        assert args == (None, 1001)
+        assert args == (None, 1000)
         return [_usage_row(None, None, None, ready=True)]
 
     app, _ = _make_app(FakeDB(route))
@@ -419,7 +418,7 @@ async def test_usage_bad_limit_is_422(limit: str) -> None:
 @pytest.mark.parametrize("limit", ["+2", " 2", "2 ", "0002"])
 async def test_usage_limit_accepts_trimmed_integers(limit: str) -> None:
     def route(query: str, args: tuple) -> Any:
-        assert args == (None, 3)
+        assert args == (None, 2)
         return [_usage_row("acct-a", 1, 5)]
 
     app, _ = _make_app(FakeDB(route))

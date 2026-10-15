@@ -12,7 +12,8 @@
 -- visible.
 --
 -- Parameters: $1 exclusive main_account_id cursor (NULL starts at the beginning),
---             $2 maximum rows (the caller passes limit+1 and drops the extra row).
+--             $2 page size. A page of exactly this many rows is full: the handler
+--             sets next_after to the last account even when no further row exists.
 --
 -- Plan: one read of every live bucket (thousands, not objects) plus the rollup
 -- rows, grouped by account, then LIMIT. A cursor does not make the aggregate

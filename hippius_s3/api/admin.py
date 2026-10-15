@@ -123,7 +123,7 @@ class AdminUsagePage(BaseModel):
     accounts: list[AdminUsageAccount]
     next_after: str | None = Field(
         ...,
-        description="Last account id on this page when another page exists; null on the last page.",
+        description="Last account id of a full page. Null when the page is short.",
     )
 
 
@@ -409,7 +409,7 @@ async def purge_job_status(
         "with no live bucket is absent and stores 0. This is not a scan of objects.\n\n"
         "`after` is an exclusive cursor. An empty `after` starts at the beginning. `limit` "
         "defaults to 1000 and must be an integer from 1 to 10000. `next_after` is the last "
-        "account id on this page when another page exists, otherwise null.\n\n"
+        "account id of a full page, and null when the page is short.\n\n"
         "**422** detail is the string `limit must be an integer from 1 to 10000`.\n\n"
         "**503** detail is the string `usage unavailable; retry` when the rollup has not "
         "been backfilled (the counters are deltas since migration, not totals) or when the "
@@ -428,7 +428,7 @@ async def account_usage(
         rows = await db.fetch(
             get_query("list_admin_usage_accounts"),
             after,
-            page_limit + 1,
+            page_limit,
             timeout=USAGE_PAGE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
@@ -440,12 +440,14 @@ async def account_usage(
         _usage_error("usage unavailable; retry", status.HTTP_503_SERVICE_UNAVAILABLE)
 
     visible = [row for row in rows if row["account_id"] is not None]
-    page = visible[:page_limit]
-    next_after = page[-1]["account_id"] if len(visible) > page_limit else None
+    # A full page always carries next_after. The following request is empty
+    # when this page already held the last account.
+    full = len(visible) == page_limit
+    next_after = visible[-1]["account_id"] if full else None
     return AdminUsagePage(
         accounts=[
             AdminUsageAccount(account_id=row["account_id"], buckets=int(row["buckets"]), bytes=int(row["bytes"]))
-            for row in page
+            for row in visible
         ],
         next_after=next_after,
     )
