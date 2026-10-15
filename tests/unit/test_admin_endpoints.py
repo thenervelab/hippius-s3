@@ -381,9 +381,7 @@ async def test_usage_rollup_not_ready_is_503_even_with_account_rows() -> None:
         response = await client.get("/admin/usage")
 
     assert response.status_code == 503
-    body = response.json()
-    assert body["detail"]["code"] == "RollupNotReady"
-    assert "accounts" not in body
+    assert response.json() == {"detail": "usage unavailable; retry"}
     assert "acct-a" not in response.text
 
 
@@ -397,7 +395,7 @@ async def test_usage_rollup_not_ready_on_empty_page_is_503() -> None:
         response = await client.get("/admin/usage")
 
     assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "RollupNotReady"
+    assert response.json() == {"detail": "usage unavailable; retry"}
 
 
 def _usage_db_must_not_run(query: str, args: tuple) -> Any:
@@ -405,7 +403,7 @@ def _usage_db_must_not_run(query: str, args: tuple) -> Any:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("limit", ["0", "-1", "10001", "abc", "1.5", "1e3", "+2", ""])
+@pytest.mark.parametrize("limit", ["0", "-1", "10001", "abc", "1.5", "1e3", "++2", "", " "])
 async def test_usage_bad_limit_is_422(limit: str) -> None:
     db = FakeDB(_usage_db_must_not_run)
     app, _ = _make_app(db)
@@ -413,8 +411,24 @@ async def test_usage_bad_limit_is_422(limit: str) -> None:
         response = await client.get("/admin/usage", params={"limit": limit})
 
     assert response.status_code == 422
-    assert response.json()["detail"]["code"] == "InvalidArgument"
+    assert response.json() == {"detail": "limit must be an integer from 1 to 10000"}
     assert db.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["+2", " 2", "2 ", "0002"])
+async def test_usage_limit_accepts_trimmed_integers(limit: str) -> None:
+    def route(query: str, args: tuple) -> Any:
+        assert args == (None, 3)
+        return [_usage_row("acct-a", 1, 5)]
+
+    app, _ = _make_app(FakeDB(route))
+    async with _client(app) as client:
+        response = await client.get("/admin/usage", params={"limit": limit})
+
+    assert response.status_code == 200
+    assert response.json()["accounts"] == [{"account_id": "acct-a", "buckets": 1, "bytes": 5}]
+    assert response.json()["next_after"] is None
 
 
 @pytest.mark.asyncio
@@ -427,7 +441,4 @@ async def test_usage_timeout_is_503() -> None:
         response = await client.get("/admin/usage")
 
     assert response.status_code == 503
-    body = response.json()
-    assert body["detail"]["code"] == "UsageQueryTimeout"
-    assert body["detail"]["message"]
-    assert "bytes" not in body
+    assert response.json() == {"detail": "usage unavailable; retry"}

@@ -134,6 +134,12 @@ def _raise(code: str, message: str, http_status: int) -> NoReturn:
     raise HTTPException(status_code=http_status, detail={"code": code, "message": message})
 
 
+def _usage_error(message: str, http_status: int) -> NoReturn:
+    # GET /admin/usage speaks the Rust gateway's error body: {"detail": "<string>"}.
+    # The other admin routes keep {"detail": {"code", "message"}}.
+    raise HTTPException(status_code=http_status, detail=message)
+
+
 def _refuse_service_account(account_id: str, operation: str) -> None:
     """403 before anything is written when an admin action targets one of our own accounts.
 
@@ -161,20 +167,16 @@ def _validate_account_id(account_id: str) -> None:
 def _parse_usage_limit(raw: str | None) -> int:
     if raw is None:
         return _USAGE_LIMIT_DEFAULT
-    digits = raw[1:] if raw.startswith("-") else raw
+    # Same acceptance as the Rust page bound: trim, then an integer. A leading
+    # "+" survives when the client percent-encodes it; a raw "+" in the query
+    # string is a space and trim removes it.
+    text = raw.strip()
+    digits = text[1:] if text.startswith(("+", "-")) else text
     if digits == "" or not digits.isascii() or not digits.isdigit():
-        _raise(
-            "InvalidArgument",
-            "limit must be an integer from 1 to 10000",
-            _HTTP_422,
-        )
-    value = int(raw)
+        _usage_error("limit must be an integer from 1 to 10000", _HTTP_422)
+    value = int(text)
     if value < 1 or value > _USAGE_LIMIT_MAX:
-        _raise(
-            "InvalidArgument",
-            "limit must be an integer from 1 to 10000",
-            _HTTP_422,
-        )
+        _usage_error("limit must be an integer from 1 to 10000", _HTTP_422)
     return value
 
 
@@ -394,21 +396,24 @@ async def purge_job_status(
     "/usage",
     response_model=AdminUsagePage,
     responses={
-        422: {"model": ErrorDetail, "description": "limit is not an integer from 1 to 10000."},
-        503: {"model": ErrorDetail, "description": "Rollup is not backfilled, or the query timed out."},
+        422: {"description": "detail is the string: limit must be an integer from 1 to 10000."},
+        503: {"description": "detail is the string: usage unavailable; retry."},
     },
     summary="Paged billable storage usage",
     description=(
         "One page of accounts that own a live bucket, ordered by account id byte order. "
+        "The body has `accounts` (each `account_id`, `buckets`, `bytes`) and `next_after`. "
         "`bytes` is the rollup total: each live bucket contributes GREATEST(0, bytes_used), "
         "then those are summed — the same per-bucket clamp as the per-account rollup read. "
-        "A live bucket with no rollup row counts as one bucket and zero bytes. This is not a "
-        "scan of objects.\n\n"
-        "`after` is an exclusive cursor. `limit` defaults to 1000 and must be an integer from "
-        "1 to 10000. `next_after` is the last account id on this page when another page exists, "
-        "otherwise null.\n\n"
-        "**503** when the rollup has not been backfilled (the counters are deltas since "
-        "migration, not totals) or when the statement times out. Retry. Not a billable number.\n\n"
+        "A live bucket with no rollup row counts as one bucket and zero bytes. An account "
+        "with no live bucket is absent and stores 0. This is not a scan of objects.\n\n"
+        "`after` is an exclusive cursor. An empty `after` starts at the beginning. `limit` "
+        "defaults to 1000 and must be an integer from 1 to 10000. `next_after` is the last "
+        "account id on this page when another page exists, otherwise null.\n\n"
+        "**422** detail is the string `limit must be an integer from 1 to 10000`.\n\n"
+        "**503** detail is the string `usage unavailable; retry` when the rollup has not "
+        "been backfilled (the counters are deltas since migration, not totals) or when the "
+        "statement times out. Retry. Not a billable number.\n\n"
         "**Auth**: admin HMAC layer (`X-HMAC-Signature` with the admin secret). The query "
         "string is part of the signature."
     ),
@@ -428,22 +433,11 @@ async def account_usage(
         )
     except asyncio.TimeoutError:
         logger.warning("admin usage: statement timed out")
-        _raise(
-            "UsageQueryTimeout",
-            "Storage usage query timed out; retry",
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
+        _usage_error("usage unavailable; retry", status.HTTP_503_SERVICE_UNAVAILABLE)
 
     if not rows or not rows[0]["ready"]:
         logger.warning("admin usage: rollup is not backfilled; refusing to bill deltas as totals")
-        _raise(
-            "RollupNotReady",
-            (
-                "bucket_storage_usage has not been backfilled "
-                "(storage_usage_rollup_state.backfilled_at is NULL), so its rows are deltas rather than totals"
-            ),
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
+        _usage_error("usage unavailable; retry", status.HTTP_503_SERVICE_UNAVAILABLE)
 
     visible = [row for row in rows if row["account_id"] is not None]
     page = visible[:page_limit]
