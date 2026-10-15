@@ -15,6 +15,7 @@ from lxml import etree as ET  # ty: ignore[unresolved-import]
 
 from hippius_s3.api.s3 import errors
 from hippius_s3.api.s3.common import parse_version_id
+from hippius_s3.api.s3.objects.delete_object_endpoint import enqueue_unversioned_overwrite_unpin
 from hippius_s3.config import Config
 from hippius_s3.db_pool import acquire_with_timeout
 from hippius_s3.repositories.buckets import BucketRepository
@@ -411,6 +412,16 @@ async def handle_streaming_copy(
         await conn.execute(
             "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
             str(put_res.upload_id),
+        )
+
+    # NULL versioning only. An alias copy never reaches here; it shares the source version.
+    if dest_bucket.get("versioning_status") is None:
+        await enqueue_unversioned_overwrite_unpin(
+            pool,
+            object_id=str(put_res.object_id),
+            object_version=int(put_res.object_version),
+            address=request.state.main_account_id,
+            ray_id=getattr(request.state, "ray_id", None),
         )
 
     return build_copy_success_response(
