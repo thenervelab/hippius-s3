@@ -11,6 +11,9 @@
 -- not bill the page. An empty page still returns one row (account_id NULL) so `ready` is
 -- visible.
 --
+-- The owner id `bypass` is omitted. It is not an account id, and one such row makes the
+-- chain reporter reject the whole page.
+--
 -- Parameters: $1 exclusive main_account_id cursor (NULL starts at the beginning),
 --             $2 page size. A page of exactly this many rows is full: the handler
 --             sets next_after to the last account even when no further row exists.
@@ -35,6 +38,7 @@ LEFT JOIN LATERAL (
     FROM buckets b
     LEFT JOIN bucket_storage_usage bsu ON bsu.bucket_id = b.bucket_id
     WHERE b.deleted_at IS NULL
+      AND b.main_account_id <> 'bypass'
       AND b.main_account_id > COALESCE($1::text, '')
     GROUP BY b.main_account_id
     ORDER BY b.main_account_id COLLATE "C"

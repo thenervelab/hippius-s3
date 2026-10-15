@@ -289,6 +289,7 @@ def test_usage_sql_clamps_per_bucket_excludes_deleted_and_orders_c() -> None:
     assert "COALESCE(SUM(GREATEST(0, bsu.bytes_used)), 0)::bigint AS bytes" in sql
     assert "GREATEST(0, SUM" not in sql
     assert "b.deleted_at IS NULL" in sql
+    assert "b.main_account_id <> 'bypass'" in sql
     assert "main_account_id > COALESCE($1::text, '')" in sql
     assert "main_account_id >=" not in sql
     assert 'ORDER BY b.main_account_id COLLATE "C"' in sql
