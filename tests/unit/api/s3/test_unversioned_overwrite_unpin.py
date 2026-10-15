@@ -160,6 +160,8 @@ def test_superseded_sql_is_one_indexed_probe() -> None:
     assert "object_lock_legal_hold" in sql
     assert "object_lock_retain_until > now()" in sql
     assert "COALESCE(mu.is_completed, false) = false" in sql
+    assert "JOIN parts p ON p.upload_id = mu.upload_id" in sql
+    assert "p.object_id" not in sql
     assert "ORDER BY v.object_version DESC" in sql
     assert sql.count("LIMIT 1") == 1
     assert "object_version IS NULL" not in sql
@@ -177,6 +179,7 @@ async def test_helper_enqueues_only_the_greatest_eligible_version(monkeypatch: p
     _assert_specific(enqueued, [4])
     assert enqueued[0].object_id == "obj-1"
     assert enqueued[0].address == "acct-main"
+    assert enqueued[0].delete_backends is None
     assert len(db.queries) == 1
 
 

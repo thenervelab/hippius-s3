@@ -97,12 +97,18 @@ async def enqueue_unversioned_overwrite_unpin(
     previous = row["object_version"]
     if previous is None:
         return
-    await enqueue_object_unpin(
-        db,
-        object_id=object_id,
-        object_version=int(previous),
-        address=address,
-        ray_id=ray_id,
+    # get_object_backends walks every live chunk of this version. A superseded
+    # multipart object can be tens of thousands of chunks, and this runs before
+    # the response. Null delete_backends fans out to the configured delete
+    # backends; the unpinner loads the identifiers on its own.
+    await enqueue_unpin_request(
+        payload=UnpinChainRequest(
+            address=address,
+            object_id=object_id,
+            object_version=int(previous),
+            ray_id=ray_id,
+            delete_backends=None,
+        )
     )
 
 

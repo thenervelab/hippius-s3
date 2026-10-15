@@ -39,13 +39,17 @@ JOIN LATERAL (
           v.object_lock_legal_hold
           OR (v.object_lock_retain_until IS NOT NULL AND v.object_lock_retain_until > now())
       )
+      -- Incomplete uploads via idx_multipart_uploads_object_id, then their parts
+      -- via idx_parts_upload. Constraining the part row by object as well makes
+      -- the planner scan every part of this version on the request path.
+      -- upload_id is the multipart primary key, so the upload already names it.
       AND NOT EXISTS (
           SELECT 1
-          FROM parts p
-          JOIN multipart_uploads mu ON mu.upload_id = p.upload_id
-          WHERE p.object_id = v.object_id
-            AND p.object_version = v.object_version
+          FROM multipart_uploads mu
+          JOIN parts p ON p.upload_id = mu.upload_id
+          WHERE mu.object_id = v.object_id
             AND COALESCE(mu.is_completed, false) = false
+            AND p.object_version = v.object_version
       )
     ORDER BY v.object_version DESC
     LIMIT 1
