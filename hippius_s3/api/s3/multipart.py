@@ -33,6 +33,7 @@ from hippius_s3.api.s3.copy_helpers import parse_copy_source
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.errors import s3_error_response
 from hippius_s3.api.s3.object_lock_guard import maybe_object_lock_not_implemented_response
+from hippius_s3.api.s3.objects.delete_object_endpoint import enqueue_unversioned_overwrite_unpin
 from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
 from hippius_s3.api.s3.objects.object_lock_endpoints import store_version_lock
 from hippius_s3.api.s3.objects.object_lock_endpoints import validate_lock_intent
@@ -1328,6 +1329,17 @@ async def complete_multipart_upload(
             object_version=int(object_version),
             address=request.state.main_account_id,
         )
+
+        # mpu_complete already marked this upload completed. NULL versioning only;
+        # the query re-reads buckets.versioning_status and refuses a moved pointer.
+        if bucket.get("versioning_status") is None:
+            await enqueue_unversioned_overwrite_unpin(
+                db,
+                object_id=str(object_id),
+                object_version=int(object_version),
+                address=request.state.main_account_id,
+                ray_id=getattr(request.state, "ray_id", None),
+            )
 
         # Drain wake: the address write above removes the cause of this version's defer
         # backoff (rationale, incl. the deliberate defer_attempts reset, lives in

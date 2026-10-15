@@ -1,0 +1,96 @@
+name: production-smoke-tests-internal
+
+on:
+  schedule:
+    # Same minute as production-smoke-tests.yml. This is its own workflow so a
+    # failure here does not fail the s3.hippius.com run.
+    - cron: '0 * * * *'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-tests:
+    name: Smoke Tests (162.19.43.25:18080)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: production-smoke-tests-internal
+      cancel-in-progress: false
+
+    steps:
+      # Scheduled runs read this file from the default branch (staging), so without an
+      # explicit ref they would smoke-test using staging's unreleased test code.
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r tests/smoke/requirements.txt
+
+      # Core S3 suite only. Regional caches are other hostnames, and the sub-token
+      # scope suite talks to the Python gateway's HMAC API plus api.hippius.com.
+      # Those stay on production-smoke-tests.yml. Same prod key and secret.
+      - name: Run smoke tests against 162.19.43.25:18080
+        timeout-minutes: 8
+        env:
+          AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
+          AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
+          HIPPIUS_ENDPOINT: http://162.19.43.25:18080
+        run: |
+          mkdir -p reports
+          pytest tests/smoke/test_smoke_production.py \
+            -v \
+            --tb=short \
+            -W "ignore::DeprecationWarning:botocore" \
+            -W "ignore::DeprecationWarning:dateutil" \
+            --json-report \
+            --json-report-file=reports/smoke-internal.json
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-results-internal-${{ github.run_id }}
+          path: reports/
+          retention-days: 90
+
+      - name: Notify Mattermost on failure
+        if: failure()
+        env:
+          WEBHOOK_URL: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python scripts/extract_failure_details.py \
+            reports/smoke-internal.json \
+            --run-url "$RUN_URL" > /tmp/smoke-internal-alert.txt
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import urllib.request
+
+          details = pathlib.Path("/tmp/smoke-internal-alert.txt").read_text()
+          text = (
+              ":rotating_light: **http://162.19.43.25:18080 smoke tests failed**\n"
+              f"[View run]({os.environ['RUN_URL']})\n\n"
+              f"{details}"
+          )
+          req = urllib.request.Request(
+              os.environ["WEBHOOK_URL"],
+              data=json.dumps({"text": text}).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(req) as resp:
+              resp.read()
+          PY

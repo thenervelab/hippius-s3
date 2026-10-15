@@ -50,6 +50,13 @@ def write_report(tmp_path: Path, name: str, report: dict) -> Path:
     return path
 
 
+def test_internal_endpoint_suite_is_named_in_the_alert(tmp_path):
+    message = mod.build_alert_message([write_report(tmp_path, "smoke-internal", make_report(TIMEOUT_TEST))])
+
+    assert "core S3 suite (http://162.19.43.25:18080)" in message
+    assert "s3.hippius.com smoke tests failed" not in message
+
+
 def test_read_timeout_is_explained_in_plain_language():
     failures = mod.extract_failures(make_report(TIMEOUT_TEST), "smoke-regional")
     message = mod.format_failures_for_alert(failures)

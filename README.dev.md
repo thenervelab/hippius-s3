@@ -570,7 +570,7 @@ We don't nitpick style (ruff handles that). We don't block on taste.
 
 - Staging: merge your PR into `staging`. Auto-deploys.
 - Production: merge `staging` → `main`. That merge *is* the release — it auto-deploys to prod. Don't skip staging.
-- Smoke tests are **not** chained to a deploy. Dispatch them manually (`staging-smoke-tests.yml` / `production-smoke-tests.yml` are `workflow_dispatch`; production also runs hourly on cron).
+- Smoke tests are **not** chained to a deploy. Dispatch them manually (`staging-smoke-tests.yml` / `production-smoke-tests.yml` are `workflow_dispatch`; production also runs hourly on cron). `production-smoke-tests-internal.yml` is that same hourly core suite pointed at `http://162.19.43.25:18080` with the prod credentials.
 - Rollbacks: revert the merge on `main`, CI re-deploys.
 
 ---

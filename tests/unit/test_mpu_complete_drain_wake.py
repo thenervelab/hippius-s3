@@ -61,6 +61,10 @@ class _FakeDb:
             return {"bucket_id": "bkt-1"}
         if query == "get_multipart_version_by_upload":
             return {"object_version": _PARTS_VERSION}
+        # Real SQL (the helper does not use the identity get_query patch). No previous
+        # version in this fixture, so the overwrite unpin enqueues nothing.
+        if "get_unversioned_superseded_version" in query:
+            return None
         raise AssertionError(f"unexpected fetchrow in complete flow: {query!r}")
 
     async def fetch(self, query: str, *args: Any) -> list[Any]:
