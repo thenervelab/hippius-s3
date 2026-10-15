@@ -76,6 +76,8 @@ def _router(live: dict[str, str] | None) -> Any:
     def route(method: str, query: str | None, _args: tuple) -> Any:
         if method != "fetchrow" or not query:
             return None
+        if "get_unversioned_superseded_version" in query:
+            return None
         if "INSERT INTO object_names" in query:
             return {"object_id": SRC_ID}
         if "FROM objects" in query:
