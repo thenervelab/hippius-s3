@@ -86,7 +86,8 @@ async def enqueue_unversioned_overwrite_unpin(
     `object_version` is the version just finalized. It is never NULL: NULL means every
     non-current version, and one prod object has 646,993 of them. Version 1 replaced
     nothing. The query returns at most one older version, and only while this version is
-    still current on a bucket whose versioning_status IS NULL.
+    still current on a bucket whose versioning_status IS NULL. An object_names alias
+    shares this object_id, so the query returns nothing and the old ciphertext stays.
     """
     finalized = int(object_version)
     if finalized <= 1:

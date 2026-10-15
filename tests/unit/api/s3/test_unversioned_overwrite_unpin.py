@@ -60,9 +60,10 @@ def _choose(
     versioning_status: str | None,
     current: int,
     object_deleted: bool = False,
+    has_alias: bool = False,
 ) -> int | None:
     """Mirror of get_unversioned_superseded_version.sql. The SQL text test locks the same clauses."""
-    if object_deleted or versioning_status is not None or current != finalized:
+    if object_deleted or has_alias or versioning_status is not None or current != finalized:
         return None
     eligible: list[int] = []
     for v in versions:
@@ -86,12 +87,14 @@ class _Catalog:
         finalized_is_current: int,
         versioning_status: str | None = None,
         object_deleted: bool = False,
+        has_alias: bool = False,
         row_version: Any = "auto",
     ) -> None:
         self.versions = versions
         self.current = finalized_is_current
         self.versioning_status = versioning_status
         self.object_deleted = object_deleted
+        self.has_alias = has_alias
         self.row_version = row_version
         self.queries: list[str] = []
 
@@ -107,6 +110,7 @@ class _Catalog:
             versioning_status=self.versioning_status,
             current=self.current,
             object_deleted=self.object_deleted,
+            has_alias=self.has_alias,
         )
         return None if chosen is None else {"object_version": chosen}
 
@@ -166,6 +170,8 @@ def test_superseded_sql_is_one_indexed_probe() -> None:
     assert sql.count("LIMIT 1") == 1
     assert "object_version IS NULL" not in sql
     assert "object_versions_pkey" in sql
+    assert "FROM object_names n" in sql
+    assert "n.object_id = o.object_id" in sql
 
 
 @pytest.mark.asyncio
@@ -239,6 +245,14 @@ async def test_helper_expired_retention_is_eligible(monkeypatch: pytest.MonkeyPa
     db = _Catalog([_Ver(4, retain=_NOW - timedelta(days=1))], finalized_is_current=5)
     await _unpin(db, 5)
     _assert_specific(enqueued, [4])
+
+
+@pytest.mark.asyncio
+async def test_helper_alias_enqueues_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    enqueued = _install_unpin(monkeypatch)
+    db = _Catalog([_Ver(4)], finalized_is_current=5, has_alias=True)
+    await _unpin(db, 5)
+    assert enqueued == []
 
 
 @pytest.mark.asyncio

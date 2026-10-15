@@ -8,6 +8,10 @@
 -- Enabled and Suspended keep history. A concurrent writer that has already advanced
 -- current_object_version unpins when it finishes; this statement does nothing.
 --
+-- A row in object_names is a second key on this object_id (same-bucket CopyObject).
+-- Unpinning the replaced version deletes ciphertext that key can still read, so an
+-- aliased object returns no row. object_names_object_id_idx serves the probe.
+--
 -- An open multipart upload has no version column. Initiate bumps the counter and the
 -- upload's parts carry the reserved version (parts.upload_id; get_multipart_version_by_upload
 -- resolves it the same way). That version is still accepting parts, so it is not the
@@ -24,6 +28,7 @@ WITH live AS MATERIALIZED (
       AND o.deleted_at IS NULL
       AND o.current_object_version = $2
       AND b.versioning_status IS NULL
+      AND NOT EXISTS (SELECT 1 FROM object_names n WHERE n.object_id = o.object_id)
 )
 SELECT ov.object_version
 FROM live
