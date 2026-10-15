@@ -93,6 +93,16 @@ async def test_per_bucket_clamp_and_deleted_buckets(conn: asyncpg.Connection) ->
     assert all(row["ready"] for row in rows)
 
 
+async def test_bypass_owner_is_absent(conn: asyncpg.Connection) -> None:
+    await _ready(conn)
+    await _bucket(conn, "bypass", 50)
+    await _bucket(conn, "acct", 4)
+
+    rows = await conn.fetch(_SQL, None, 10)
+    assert [row["account_id"] for row in rows] == ["acct"]
+    assert rows[0]["bytes"] == 4
+
+
 async def test_live_bucket_without_rollup_row_is_zero_bytes(conn: asyncpg.Connection) -> None:
     await _ready(conn)
     await _bucket(conn, "acct", 0, rollup=False)
