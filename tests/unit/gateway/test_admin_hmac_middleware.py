@@ -36,6 +36,10 @@ def admin_app(monkeypatch: pytest.MonkeyPatch) -> Any:
     async def status(account_id: str) -> dict[str, str]:
         return {"account_id": account_id}
 
+    @app.get("/admin/usage")
+    async def usage() -> dict[str, bool]:
+        return {"ok": True}
+
     @app.get("/other/endpoint")
     async def other() -> dict[str, str]:
         return {"message": "ok"}
@@ -107,6 +111,21 @@ async def test_query_string_is_part_of_signed_message(admin_app: Any) -> None:
     sig_with_query = _signature(SECRET, "GET", path, "x=1")
     async with AsyncClient(transport=ASGITransport(app=admin_app), base_url="http://test") as client:
         response = await client.get(path, params={"x": "1"}, headers={"X-HMAC-Signature": sig_with_query})
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_usage_query_string_must_be_signed(admin_app: Any) -> None:
+    path = "/admin/usage"
+    query = "limit=2&after=abc"
+    sig_without_query = _signature(SECRET, "GET", path)
+    async with AsyncClient(transport=ASGITransport(app=admin_app), base_url="http://test") as client:
+        response = await client.get(f"{path}?{query}", headers={"X-HMAC-Signature": sig_without_query})
+    assert response.status_code == 403
+
+    sig_with_query = _signature(SECRET, "GET", path, query)
+    async with AsyncClient(transport=ASGITransport(app=admin_app), base_url="http://test") as client:
+        response = await client.get(f"{path}?{query}", headers={"X-HMAC-Signature": sig_with_query})
     assert response.status_code == 200
 
 
