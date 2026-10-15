@@ -14,12 +14,12 @@
 -- Parameters: $1 exclusive main_account_id cursor (NULL starts at the beginning),
 --             $2 maximum rows (the caller passes limit+1 and drops the extra row).
 --
--- Plan: storage_usage_rollup_state singleton, then idx_buckets_main_account range on
--- main_account_id > $1 for live buckets, PK lookup into bucket_storage_usage, group by
--- account, order by account COLLATE "C", limit.
--- Do not put COLLATE "C" on the range comparison. idx_buckets_main_account uses the column
--- collation, and an explicit COLLATE will not use it. Deployed primaries are locale C,
--- which is that byte order. ORDER BY names COLLATE "C".
+-- Plan: one read of every live bucket (thousands, not objects) plus the rollup
+-- rows, grouped by account, then LIMIT. A cursor does not make the aggregate
+-- smaller; the page is already the whole account set at limit 1000. Do not put
+-- COLLATE "C" on the range comparison. idx_buckets_main_account uses the column
+-- collation, and an explicit COLLATE will not use it. Deployed databases are
+-- locale C, which is that byte order. ORDER BY names COLLATE "C".
 SELECT
     COALESCE((SELECT s.backfilled_at IS NOT NULL FROM storage_usage_rollup_state s), false) AS ready,
     page.account_id,
