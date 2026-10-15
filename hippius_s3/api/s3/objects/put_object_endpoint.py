@@ -23,6 +23,7 @@ from hippius_s3.api.s3.common import parse_content_md5
 from hippius_s3.api.s3.common import parse_write_if_none_match
 from hippius_s3.api.s3.errors import CLIENT_CLOSED_REQUEST
 from hippius_s3.api.s3.extensions.append import handle_append
+from hippius_s3.api.s3.objects.delete_object_endpoint import enqueue_unversioned_overwrite_unpin
 from hippius_s3.api.s3.objects.object_lock_endpoints import lock_for_new_version
 from hippius_s3.api.s3.objects.object_lock_endpoints import store_version_lock
 from hippius_s3.api.s3.objects.object_lock_endpoints import validate_lock_intent
@@ -289,6 +290,17 @@ async def handle_put_object(
             await conn.execute(
                 "UPDATE multipart_uploads SET is_completed = TRUE WHERE upload_id = $1",
                 str(put_res.upload_id),
+            )
+
+        # NULL versioning only. Enabled and Suspended keep every version. A forwarded PUT
+        # never loaded the bucket row; the query reads buckets.versioning_status itself.
+        if bucket is None or bucket.get("versioning_status") is None:
+            await enqueue_unversioned_overwrite_unpin(
+                pool,
+                object_id=str(put_res.object_id),
+                object_version=int(put_res.object_version),
+                address=request.state.main_account_id,
+                ray_id=getattr(request.state, "ray_id", None),
             )
 
         get_metrics_collector().record_s3_operation(
