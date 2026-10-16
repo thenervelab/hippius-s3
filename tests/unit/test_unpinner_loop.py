@@ -272,6 +272,7 @@ def _fake_db_pool(rows: list) -> MagicMock:
     conn.fetchval = AsyncMock(return_value=1)
     pool = MagicMock()
     pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=conn), __aexit__=AsyncMock()))
+    pool._conn = conn
     return pool
 
 
@@ -346,6 +347,7 @@ async def test_failing_identifier_fails_the_request_for_retry():
     tracker = _DeleteTracker()
     rows = [{"backend_identifier": f"id-{i}", "chunk_id": i} for i in range(4)]
     dlq_manager = AsyncMock()
+    pool = _fake_db_pool(rows)
 
     with (
         patch.object(un, "get_config", return_value=_make_config(max_inflight=4, parallelism=4)),
@@ -361,11 +363,13 @@ async def test_failing_identifier_fails_the_request_for_retry():
             backend_client_factory=_client_factory(tracker, fail_on="id-2"),
             worker_logger=MagicMock(),
             dlq_manager=dlq_manager,
-            db_pool=_fake_db_pool(rows),
+            db_pool=pool,
             sem=asyncio.Semaphore(4),
         )
 
     assert len(tracker.calls) == 4, "all identifiers attempted despite one failing"
+    soft = [c.args[2] for c in pool._conn.fetch.await_args_list if len(c.args) >= 3 and isinstance(c.args[2], list)]
+    assert soft == [[0, 1, 3]], "the still-pinned chunk must not be soft-deleted"
     # The request was surfaced as failed via exactly one of the two terminal routes (retry or DLQ).
     routed = retry_mock.await_count + dlq_manager.push.await_count
     assert routed >= 1, "a failed unpin must route the request to retry or DLQ, not silently succeed"
@@ -427,7 +431,6 @@ async def test_process_uses_passed_client_and_never_calls_factory():
     rows = [{"backend_identifier": f"id-{i}", "chunk_id": i} for i in range(3)]
     conn = AsyncMock()
     conn.fetch = AsyncMock(return_value=rows)
-    conn.fetchval = AsyncMock(return_value=1)
     pool = MagicMock()
     pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=conn), __aexit__=AsyncMock()))
 
@@ -449,7 +452,72 @@ async def test_process_uses_passed_client_and_never_calls_factory():
 
     factory.assert_not_called()
     assert len(tracker.calls) == 3, "DELETE must run once per chunk on the reused client"
-    assert conn.fetchval.await_count == 3, "soft-delete must run once per chunk"
+    soft = [c.args[2] for c in conn.fetch.await_args_list if len(c.args) >= 3 and isinstance(c.args[2], list)]
+    assert soft == [[0, 1, 2]], "succeeded chunks go out in one soft-delete statement"
+
+
+@pytest.mark.asyncio
+async def test_per_file_soft_delete_error_does_not_ack():
+    rows = [{"backend_identifier": "id-0", "chunk_id": 7}]
+    conn = AsyncMock()
+
+    async def _fetch(query, backend, third=None, fourth=None):
+        if isinstance(third, list):
+            raise TimeoutError("lock timeout")
+        return rows
+
+    conn.fetch = AsyncMock(side_effect=_fetch)
+    pool = MagicMock()
+    pool.acquire = MagicMock(
+        return_value=MagicMock(__aenter__=AsyncMock(return_value=conn), __aexit__=AsyncMock(return_value=False))
+    )
+    metrics = MagicMock()
+    with (
+        patch.object(un, "get_config", return_value=_make_config(max_inflight=1, parallelism=1)),
+        patch.object(un, "get_query", return_value="SQL"),
+        patch.object(un, "get_metrics_collector", return_value=metrics),
+        patch.object(un, "enqueue_unpin_retry_request", new=AsyncMock()) as retry_mock,
+    ):
+        await un.process_unpin_request(
+            _req("o"),
+            backend_name="arion",
+            backend_client_factory=_client_factory(_DeleteTracker()),
+            worker_logger=MagicMock(),
+            dlq_manager=AsyncMock(),
+            db_pool=pool,
+            sem=asyncio.Semaphore(1),
+        )
+
+    assert retry_mock.await_count == 1
+    assert not any(call.kwargs.get("success") is True for call in metrics.record_unpinner_operation.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_per_file_soft_delete_splits_at_1000_ids():
+    rows = [{"backend_identifier": f"id-{i}", "chunk_id": i} for i in range(1001)]
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(return_value=rows)
+    pool = MagicMock()
+    pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=conn), __aexit__=AsyncMock()))
+    metrics = MagicMock()
+    with (
+        patch.object(un, "get_config", return_value=_make_config(max_inflight=1, parallelism=4)),
+        patch.object(un, "get_query", return_value="SQL"),
+        patch.object(un, "get_metrics_collector", return_value=metrics),
+    ):
+        await un.process_unpin_request(
+            _req("o"),
+            backend_name="arion",
+            backend_client_factory=_client_factory(_DeleteTracker()),
+            worker_logger=MagicMock(),
+            dlq_manager=AsyncMock(),
+            db_pool=pool,
+            sem=asyncio.Semaphore(4),
+        )
+
+    soft = [c.args[2] for c in conn.fetch.await_args_list if len(c.args) >= 3 and isinstance(c.args[2], list)]
+    assert [len(statement) for statement in soft] == [1000, 1]
+    assert any(call.kwargs.get("success") is True for call in metrics.record_unpinner_operation.call_args_list)
 
 
 # --------------------------------------------------------------------------- #
