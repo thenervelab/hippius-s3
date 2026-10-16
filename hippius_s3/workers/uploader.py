@@ -255,13 +255,17 @@ class Uploader:
         HCFS returns the real one as ``arion_hash``; servers that predate that field return the same
         value as ``upload_id`` (``cid`` here), which falls back to the S3 hash — the BLAKE3 of the same
         ciphertext, so identical to what Arion content-addresses it by.
+
+        An empty ``arion_hash`` is the normal case for an S3-gateway upload: HCFS stores to S3 first
+        and pushes to Arion in the background, so the hash is not known when /upload answers, and
+        HCFS never reports it back. ``upload_id`` is then the S3 hash, which is the value Arion
+        will register the blob under; taking it keeps the version from staying hashless forever.
         """
         if self.backend_name != "arion":
             return None
         explicit = getattr(upload_result, "arion_hash", None)
-        if explicit is not None:
-            # An empty value is HCFS saying it has no Arion copy; upload_id would then be the S3 hash.
-            return str(explicit) or None
+        if explicit:
+            return str(explicit)
         value = getattr(upload_result, "cid", None)
         return str(value) if value else None
 
