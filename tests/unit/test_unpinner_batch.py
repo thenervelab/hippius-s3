@@ -24,6 +24,7 @@ from hippius_s3.services.arion_service import BatchDeleteError
 from hippius_s3.services.arion_service import BatchDeleteItem
 from hippius_s3.services.arion_service import BatchDeleteResult
 from hippius_s3.services.arion_service import BatchEndpointUnavailable
+from hippius_s3.utils import get_query
 from hippius_s3.workers import unpinner as un
 
 
@@ -87,20 +88,26 @@ def _group(specs, *, folder_hash: str = "", address: str = "5Addr") -> un._Batch
     return g
 
 
-def _pool(rows_by_object=None, fail_chunk_ids=frozenset()):
+def _pool(rows_by_object=None, fail_chunk_ids=frozenset(), *, overlap: dict | None = None):
     rows_by_object = rows_by_object or {}
     conn = AsyncMock()
+    statements: list[list[int]] = []
 
-    async def _fetch(query, backend, object_id, object_version):
-        return rows_by_object.get(object_id, [])
-
-    async def _fetchval(query, backend, chunk_id):
-        if chunk_id in fail_chunk_ids:
-            raise RuntimeError("db down")
-        return chunk_id
+    async def _fetch(query, backend, third=None, fourth=None):
+        if isinstance(third, list):
+            chunk_ids = list(third)
+            if overlap is not None:
+                overlap["cur"] += 1
+                overlap["peak"] = max(overlap["peak"], overlap["cur"])
+                await asyncio.sleep(0.02)
+                overlap["cur"] -= 1
+            if any(chunk_id in fail_chunk_ids for chunk_id in chunk_ids):
+                raise RuntimeError("db down")
+            statements.append(chunk_ids)
+            return []
+        return rows_by_object.get(third, [])
 
     conn.fetch = AsyncMock(side_effect=_fetch)
-    conn.fetchval = AsyncMock(side_effect=_fetchval)
     pool = MagicMock()
     # __aexit__ MUST return False, else a truthy AsyncMock return suppresses exceptions raised in the
     # `async with db_pool.acquire()` body (which is exactly what the A9/soft-delete-failure test needs).
@@ -108,11 +115,19 @@ def _pool(rows_by_object=None, fail_chunk_ids=frozenset()):
         return_value=MagicMock(__aenter__=AsyncMock(return_value=conn), __aexit__=AsyncMock(return_value=False))
     )
     pool._conn = conn
+    pool._statements = statements
     return pool
 
 
 def _softdeleted(pool) -> set[int]:
-    return {c.args[2] for c in pool._conn.fetchval.await_args_list}
+    ids: set[int] = set()
+    for statement in pool._statements:
+        ids.update(statement)
+    return ids
+
+
+def _statement_lengths(pool) -> list[int]:
+    return [len(statement) for statement in pool._statements]
 
 
 def _success_count(metrics) -> int:
@@ -338,6 +353,31 @@ async def test_404_falls_back_to_per_file():
     dlq.push.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_fallback_soft_deletes_do_not_overlap():
+    """A 404 gathers one request per object. Those chunk_backend statements share one gate."""
+    req_a = _ureq("oa")
+    req_b = _ureq("ob")
+    g = _group([(req_a, [("fa", 1)]), (req_b, [("fb", 2)])])
+    client = _BatchClient(raise_exc=BatchEndpointUnavailable("no endpoint"))
+    overlap = {"cur": 0, "peak": 0}
+    pool = _pool(
+        rows_by_object={
+            "oa": [{"backend_identifier": "fa", "chunk_id": 1}],
+            "ob": [{"backend_identifier": "fb", "chunk_id": 2}],
+        },
+        overlap=overlap,
+    )
+
+    retry, dlq, metrics = await _run_batch(g, client, pool)
+
+    assert overlap["peak"] == 1
+    assert _softdeleted(pool) == {1, 2}
+    assert _success_count(metrics) == 2
+    retry.assert_not_called()
+    dlq.push.assert_not_called()
+
+
 # --------------------------------------------------------------------------- #
 # 9. Duplicate file_id (same backend_identifier on 2 chunks across 2 requests)
 #    -> sent ONCE; on success BOTH chunk_ids soft-deleted and BOTH requests acked
@@ -425,9 +465,116 @@ async def test_over_1000_file_ids_split_into_1000_caps():
 
     assert [len(c[0]) for c in client.calls] == [1000, 1000, 100]
     assert all(len(c[0]) <= 1000 for c in client.calls)
+    assert _statement_lengths(pool) == [1000, 1000, 100]
     assert len(_softdeleted(pool)) == 2100
     assert _success_count(metrics) == 1
     retry.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Soft-delete statement: one slice at a time, empty RETURNING still acks,
+# a split file is not acked when a later slice fails.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_empty_returning_still_acks_request():
+    """A committed retry matches zero rows (AND NOT deleted). That statement must still ack."""
+    req = _ureq("obj")
+    g = _group([(req, [("fa", 1), ("fb", 2)])])
+    client = _BatchClient()
+    pool = _pool()
+
+    retry, dlq, metrics = await _run_batch(g, client, pool)
+
+    assert pool._statements == [[1, 2]]
+    assert _success_count(metrics) == 1
+    retry.assert_not_called()
+    dlq.push.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_statements_do_not_overlap():
+    """The outage was a gather of single-row updates. Slices of one batch must not run together."""
+    req = _ureq("obj")
+    rows = [("fa", i) for i in range(1001)]
+    g = _group([(req, rows)])
+    overlap = {"cur": 0, "peak": 0}
+    pool = _pool(overlap=overlap)
+    client = _BatchClient()
+
+    retry, _dlq, metrics = await _run_batch(g, client, pool)
+
+    assert overlap["peak"] == 1
+    assert _statement_lengths(pool) == [1000, 1]
+    assert _success_count(metrics) == 1
+    retry.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_split_file_later_slice_failure_does_not_ack():
+    """The first 1000 ids can commit. The file stays unacked until the rest commit too."""
+    req = _ureq("obj")
+    rows = [("fa", i) for i in range(1, 1501)]
+    g = _group([(req, rows)])
+    pool = _pool(fail_chunk_ids=set(range(1001, 1501)))
+    client = _BatchClient()
+
+    retry, dlq, metrics = await _run_batch(g, client, pool)
+
+    assert _softdeleted(pool) == set(range(1, 1001))
+    assert _statement_lengths(pool) == [1000]
+    assert _success_count(metrics) == 0
+    assert retry.await_count == 1
+    assert retry.await_args.args[0] is req
+    dlq.push.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_statement_error_retries_every_file_in_the_slice():
+    """One statement is atomic. A DB error rolls the slice back, so neither file is acked."""
+    req_a = _ureq("a")
+    req_b = _ureq("b")
+    g = _group([(req_a, [("fa", 1)]), (req_b, [("fb", 2)])])
+    pool = _pool(fail_chunk_ids={2})
+    client = _BatchClient()
+
+    retry, dlq, metrics = await _run_batch(g, client, pool)
+
+    assert _softdeleted(pool) == set()
+    assert _success_count(metrics) == 0
+    assert retry.await_count == 2
+    dlq.push.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_failed_slice_does_not_block_an_earlier_file():
+    req_ok = _ureq("ok")
+    req_bad = _ureq("bad")
+    g = _group(
+        [
+            (req_ok, [("fa", i) for i in range(1, 1001)]),
+            (req_bad, [("fb", 10000)]),
+        ]
+    )
+    pool = _pool(fail_chunk_ids={10000})
+    client = _BatchClient()
+
+    retry, dlq, metrics = await _run_batch(g, client, pool)
+
+    assert _softdeleted(pool) == set(range(1, 1001))
+    assert _success_count(metrics) == 1
+    assert retry.await_count == 1
+    assert retry.await_args.args[0] is req_bad
+    dlq.push.assert_not_called()
+
+
+def test_batch_soft_delete_sql_skips_rows_already_deleted():
+    sql = get_query("soft_delete_chunk_backend_by_chunk_ids").lower()
+    assert "unnest($2::bigint[])" in sql
+    assert "distinct" in sql
+    assert "not cb.deleted" in sql
+    assert "returning cb.chunk_id" in sql
 
 
 # --------------------------------------------------------------------------- #
@@ -528,19 +675,18 @@ class _BatchHarness:
     async def run(self) -> None:
         conn = AsyncMock()
 
-        async def _fetch(query, backend, object_id, object_version):
-            if object_id in self.fail_fetch_objects:
+        async def _fetch(query, backend, third=None, fourth=None):
+            if isinstance(third, list):
+                chunk_ids = list(third)
+                if any(chunk_id in self.fail_chunk_ids for chunk_id in chunk_ids):
+                    raise RuntimeError("db down")
+                self.softdeleted.extend(chunk_ids)
+                return []
+            if third in self.fail_fetch_objects:
                 raise RuntimeError("db down during assembly")
-            return self.rows_by_object.get(object_id, [])
-
-        async def _fetchval(query, backend, chunk_id):
-            if chunk_id in self.fail_chunk_ids:
-                raise RuntimeError("db down")
-            self.softdeleted.append(chunk_id)
-            return chunk_id
+            return self.rows_by_object.get(third, [])
 
         conn.fetch = AsyncMock(side_effect=_fetch)
-        conn.fetchval = AsyncMock(side_effect=_fetchval)
         pool = MagicMock()
         pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=conn), __aexit__=AsyncMock()))
         pool.close = AsyncMock()
