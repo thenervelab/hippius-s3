@@ -152,10 +152,12 @@ async def _fallback_per_file(
     dlq_manager: UnpinDLQManager,
     db_pool: asyncpg.Pool,
     sem: asyncio.Semaphore,
+    soft_delete_gate: asyncio.Semaphore,
 ) -> None:
     """Batch endpoint 404'd → run the existing per-file path for every request in the group. Each
     process_unpin_request re-fetches its rows and owns its own DELETE + soft-delete + retry/DLQ
-    routing, so the group's requests get exactly the legacy semantics."""
+    routing, so the group's requests get exactly the legacy semantics. They share
+    soft_delete_gate so the gathered requests do not run chunk_backend updates together."""
     worker_logger.warning(
         f"Batch endpoint unavailable (404) for {backend_name}; falling back to per-file unpin for "
         f"{len(group.entries)} request(s)"
@@ -170,6 +172,7 @@ async def _fallback_per_file(
                 dlq_manager=dlq_manager,
                 db_pool=db_pool,
                 sem=sem,
+                soft_delete_gate=soft_delete_gate,
             )
             for entry in group.entries
         ]
@@ -210,15 +213,19 @@ async def _mark_chunk_ids_deleted(
     db_pool: asyncpg.Pool,
     backend_name: str,
     chunk_ids: list[int],
+    gate: asyncio.Semaphore,
 ) -> None:
     """Soft-delete one slice. Statement completion clears every id in it.
 
     RETURNING is ignored on purpose. `AND NOT deleted` makes a second call return no
     rows, and that retry still has to ack or the request loops into the DLQ.
+    `gate` is acquired only around this statement, never across the HCFS call. A 404
+    fallback gathers one request per object; without a shared gate those statements
+    run together.
     """
     if not chunk_ids:
         return
-    async with db_pool.acquire() as conn:
+    async with gate, db_pool.acquire() as conn:
         await conn.fetch(
             get_query("soft_delete_chunk_backend_by_chunk_ids"),
             backend_name,
@@ -232,6 +239,7 @@ async def _soft_delete_resolved_files(
     file_chunk_ids: dict[str, set[int]],
     resolved_ok: set[str],
     worker_logger: logging.LoggerAdapter,
+    gate: asyncio.Semaphore,
 ) -> set[str]:
     """Mark chunks for file_ids HCFS already deleted. Returns the file_ids fully marked.
 
@@ -250,7 +258,7 @@ async def _soft_delete_resolved_files(
             pending[file_id] = pending.get(file_id, 0) + 1
         chunk_ids = sorted({chunk_id for _file_id, chunk_id in sl})
         try:
-            await _mark_chunk_ids_deleted(db_pool, backend_name, chunk_ids)
+            await _mark_chunk_ids_deleted(db_pool, backend_name, chunk_ids, gate)
         except Exception as db_err:
             failed.update(file_ids)
             worker_logger.warning(f"Failed to soft-delete {len(chunk_ids)} {backend_name} chunk_backend rows: {db_err}")
@@ -286,6 +294,9 @@ async def process_unpin_batch(
     """
     all_file_ids = list(group.file_id_chunk_ids.keys())
     cap = max(1, min(int(max_files), _HCFS_BATCH_HARD_CAP))
+    # One chunk_backend statement at a time for this group, including the 404 fallback's
+    # gathered per-file requests. Not held across the HCFS call.
+    soft_delete_gate = asyncio.Semaphore(1)
 
     resolved_ok: set[str] = set()
     errored: dict[str, str] = {}  # file_id -> error_class
@@ -307,6 +318,7 @@ async def process_unpin_batch(
                     dlq_manager=dlq_manager,
                     db_pool=db_pool,
                     sem=sem,
+                    soft_delete_gate=soft_delete_gate,
                 )
                 return
             except Exception as batch_err:
@@ -350,6 +362,7 @@ async def process_unpin_batch(
         group.file_id_chunk_ids,
         resolved_ok,
         worker_logger,
+        soft_delete_gate,
     )
 
     for entry in group.entries:
@@ -403,6 +416,7 @@ async def process_unpin_request(
     dlq_manager: UnpinDLQManager,
     db_pool: asyncpg.Pool,
     sem: asyncio.Semaphore | None = None,
+    soft_delete_gate: asyncio.Semaphore | None = None,
 ) -> None:
     """Process a single unpin request for a specific backend.
 
@@ -417,6 +431,8 @@ async def process_unpin_request(
     config = get_config()
     if sem is None:
         sem = asyncio.Semaphore(max(1, int(config.unpinner_parallelism)))
+    if soft_delete_gate is None:
+        soft_delete_gate = asyncio.Semaphore(1)
 
     with tracer.start_as_current_span(
         "unpinner.process_unpin",
@@ -506,7 +522,7 @@ async def process_unpin_request(
                     try:
                         for start in range(0, len(unique_ids), _SOFT_DELETE_IDS_PER_STATEMENT):
                             sl = unique_ids[start : start + _SOFT_DELETE_IDS_PER_STATEMENT]
-                            await _mark_chunk_ids_deleted(db_pool, backend_name, sl)
+                            await _mark_chunk_ids_deleted(db_pool, backend_name, sl, soft_delete_gate)
                             worker_logger.info(f"Soft-deleted {len(sl)} {backend_name} chunk_backend rows")
                     except Exception as db_err:
                         worker_logger.warning(f"Failed to soft-delete {backend_name} chunk_backend rows: {db_err}")

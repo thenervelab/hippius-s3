@@ -353,6 +353,31 @@ async def test_404_falls_back_to_per_file():
     dlq.push.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_fallback_soft_deletes_do_not_overlap():
+    """A 404 gathers one request per object. Those chunk_backend statements share one gate."""
+    req_a = _ureq("oa")
+    req_b = _ureq("ob")
+    g = _group([(req_a, [("fa", 1)]), (req_b, [("fb", 2)])])
+    client = _BatchClient(raise_exc=BatchEndpointUnavailable("no endpoint"))
+    overlap = {"cur": 0, "peak": 0}
+    pool = _pool(
+        rows_by_object={
+            "oa": [{"backend_identifier": "fa", "chunk_id": 1}],
+            "ob": [{"backend_identifier": "fb", "chunk_id": 2}],
+        },
+        overlap=overlap,
+    )
+
+    retry, dlq, metrics = await _run_batch(g, client, pool)
+
+    assert overlap["peak"] == 1
+    assert _softdeleted(pool) == {1, 2}
+    assert _success_count(metrics) == 2
+    retry.assert_not_called()
+    dlq.push.assert_not_called()
+
+
 # --------------------------------------------------------------------------- #
 # 9. Duplicate file_id (same backend_identifier on 2 chunks across 2 requests)
 #    -> sent ONCE; on success BOTH chunk_ids soft-deleted and BOTH requests acked
