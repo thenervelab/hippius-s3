@@ -16,7 +16,7 @@ concurrency:
 jobs:
   lint-and-format:
     name: Lint & Format (ruff)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON || 'hippius-medium' }}
     steps:
       # No `ref:` override — every job in this workflow must check out the SAME tree, and on a
       # pull_request that is actions/checkout's default: refs/pull/N/merge, i.e. the PR merged into
@@ -64,7 +64,7 @@ jobs:
 
   type-check:
     name: Type Check (ty)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON || 'hippius-medium' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -94,7 +94,7 @@ jobs:
 
   dep-audit:
     name: Dependency Audit (pip-audit)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON || 'hippius-medium' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -124,7 +124,7 @@ jobs:
 
   unit-integration:
     name: Unit & Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON || 'hippius-medium' }}
     timeout-minutes: 10
     services:
       # Without this, every real-Postgres test in tests/integration self-skipped: the pg_conn
@@ -229,7 +229,7 @@ jobs:
 
   e2e:
     name: E2E Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON || 'hippius-medium' }}
     timeout-minutes: 10
     env:
       DOCKER_BUILDKIT: "1"
@@ -309,7 +309,7 @@ jobs:
 
   rust:
     name: Rust (fmt, clippy, tests)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON || 'hippius-medium' }}
     timeout-minutes: 20
     services:
       postgres:
@@ -359,7 +359,7 @@ jobs:
 
   rust-deny:
     name: Rust (cargo-deny supply chain)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON || 'hippius-medium' }}
     steps:
       - uses: actions/checkout@v4
       # Run cargo-deny on the runner's gnu toolchain (installed per rust-toolchain.toml)
