@@ -771,7 +771,7 @@ async def test_part_chunk_upload_failure_propagates(mock_config, mock_db_pool, m
     [
         ("37e055f0" * 8, "37e055f0" * 8),  # HCFS names the hash explicitly
         (None, "up-hash"),  # older HCFS: upload_id carries the same value
-        ("", "up-hash"),  # Arion push still in the background: upload_id is the S3 hash, the same value
+        ("", None),  # empty is not an ACK; upload_id would be the S3 hash
     ],
 )
 def test_arion_hash_comes_from_hcfs_not_the_file_id(mock_config, mock_db_pool, arion_hash, expected):

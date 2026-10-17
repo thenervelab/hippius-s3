@@ -256,16 +256,17 @@ class Uploader:
         value as ``upload_id`` (``cid`` here), which falls back to the S3 hash — the BLAKE3 of the same
         ciphertext, so identical to what Arion content-addresses it by.
 
-        An empty ``arion_hash`` is the normal case for an S3-gateway upload: HCFS stores to S3 first
-        and pushes to Arion in the background, so the hash is not known when /upload answers, and
-        HCFS never reports it back. ``upload_id`` is then the S3 hash, which is the value Arion
-        will register the blob under; taking it keeps the version from staying hashless forever.
+        An empty ``arion_hash`` is not an ACK. Dual-write answers 200 once S3 has the blob and leaves
+        the field empty until Arion confirms; ``upload_id`` is then only the S3 hash. Storing it
+        publishes the chunk as registered, and the NULL-only backfill cannot replace it if the ACK
+        differs.
         """
         if self.backend_name != "arion":
             return None
         explicit = getattr(upload_result, "arion_hash", None)
-        if explicit:
-            return str(explicit)
+        if explicit is not None:
+            # "" is not an ACK. upload_id is the S3 hash, and a stored guess is sticky.
+            return str(explicit) or None
         value = getattr(upload_result, "cid", None)
         return str(value) if value else None
 
