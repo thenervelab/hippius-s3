@@ -47,8 +47,7 @@ _HCFS_BATCH_HARD_CAP = 1000
 _SOFT_DELETE_IDS_PER_STATEMENT = 1000
 # Short brpop timeout used to non-blockingly drain extra requests into one batch after the first
 # blocking dequeue, and the wall-clock ceiling on that assembly window.
-# The window is Redis drain time only. A chunk_backend lookup inside it capped a queued
-# page at about ten files, because each fetch ate the deadline.
+# The ceiling counts Redis wait only. An identifier lookup inside it ate the deadline.
 _ASSEMBLY_DRAIN_TIMEOUT = 0.05
 _ASSEMBLY_WINDOW_SECONDS = 0.25
 
@@ -727,14 +726,11 @@ async def run_unpinner_loop(
         return req
 
     async def _assemble_batch(first: UnpinChainRequest) -> dict[tuple[str, str], _BatchGroup]:
-        # Group by (address, folder_hash). folder_hash is effectively constant, so one
-        # address is one group. The first request is resolved before the window: a lone
-        # delete still does one lookup and one short brpop, and a fat request seals the
-        # batch before siblings are popped. Siblings already queued are drained for
-        # _ASSEMBLY_WINDOW_SECONDS with no identifier fetch, then looked up. An empty
-        # brpop ends the wait, so a trickle stays one request. File-cap overflow is
-        # LPUSHed back; those requests were already popped.
+        # Lookups stay outside the Redis wait. Anything brpop removed and this
+        # function does not hand back is LPUSHed back, including on cancel.
         groups: dict[tuple[str, str], _BatchGroup] = {}
+        holding: list[UnpinChainRequest] = [first]
+        released: set[int] = set()
 
         async def _consume(req: UnpinChainRequest) -> bool:
             ray_id = req.ray_id or "no-ray-id"
@@ -754,6 +750,7 @@ async def run_unpinner_loop(
                     )
                 if not rows:
                     await _handle_no_identifiers(req, req_logger)
+                    released.add(id(req))
                     return False
                 key = (req.address, folder_hash)
                 group = groups.get(key)
@@ -776,6 +773,7 @@ async def run_unpinner_loop(
                     )
                 except Exception as route_err:
                     req_logger.error(f"Failed to route unpin {req.name} after assembly error: {route_err}")
+                released.add(id(req))
                 return False
 
         async def _requeue(req: UnpinChainRequest) -> None:
@@ -784,7 +782,7 @@ async def run_unpinner_loop(
                 await enqueue_unpin_request(req, queue_name=queue_name)
             except Exception as requeue_err:
                 req_logger.warning(
-                    f"Failed to return unpin {req.name} to the queue after the file cap, "
+                    f"Failed to return unpin {req.name} to the queue after assembly stopped, "
                     f"routing to retry: {requeue_err}"
                 )
                 try:
@@ -800,37 +798,35 @@ async def run_unpinner_loop(
                 except Exception as route_err:
                     req_logger.error(f"Failed to route unpin {req.name} after requeue error: {route_err}")
 
-        if await _consume(first):
+        delivered = False
+        try:
+            if not await _consume(first):
+                spent = 0.0
+                while spent < _ASSEMBLY_WINDOW_SECONDS:
+                    timeout = min(_ASSEMBLY_DRAIN_TIMEOUT, _ASSEMBLY_WINDOW_SECONDS - spent)
+                    started = _assembly_now()
+                    try:
+                        nxt = await _dequeue_one(timeout)
+                    except Exception as drain_err:
+                        logger.error(f"Stopped {backend_name} unpin assembly drain: {drain_err}")
+                        break
+                    spent += _assembly_now() - started
+                    if nxt is None:
+                        break
+                    holding.append(nxt)
+                    if await _consume(nxt):
+                        break
+            delivered = True
             return groups
-
-        # How many siblings can still land before some group hits the file cap. A request
-        # already near the cap must not pop a thousand queue items we would only LPUSH back.
-        # One extra slot lets the request that crosses the cap stay in this batch, as before.
-        room = batch_max_files
-        if groups:
-            room = 1 + min(batch_max_files - len(g.file_id_chunk_ids) for g in groups.values())
-        deadline = _assembly_now() + _ASSEMBLY_WINDOW_SECONDS
-        siblings: list[UnpinChainRequest] = []
-        while len(siblings) < room and _assembly_now() < deadline:
-            try:
-                nxt = await _dequeue_one(_ASSEMBLY_DRAIN_TIMEOUT)
-            except Exception as drain_err:
-                logger.error(f"Stopped {backend_name} unpin assembly drain: {drain_err}")
-                break
-            if nxt is None:
-                break
-            siblings.append(nxt)
-
-        overflow: list[UnpinChainRequest] = []
-        sealed = False
-        for req in siblings:
-            if sealed:
-                overflow.append(req)
-                continue
-            sealed = await _consume(req)
-        for req in overflow:
-            await _requeue(req)
-        return groups
+        finally:
+            if not delivered:
+                task = asyncio.current_task()
+                if task is not None:
+                    while task.cancelling():
+                        task.uncancel()
+                for req in holding:
+                    if id(req) not in released:
+                        await _requeue(req)
 
     async def _handle_batch(group: _BatchGroup, client: Any) -> None:
         ray_id = group.entries[0].request.ray_id or "no-ray-id" if group.entries else "no-ray-id"
