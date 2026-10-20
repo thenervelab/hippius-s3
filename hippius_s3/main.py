@@ -505,7 +505,6 @@ def factory() -> FastAPI:
         description="Hippius S3 Gateway",
         docs_url="/docs" if config.enable_api_docs else None,
         redoc_url="/redoc" if config.enable_api_docs else None,
-        swagger_favicon_url="/static/favicon.ico",
         lifespan=lifespan,
         debug=config.debug,
         default_response_class=Response,
