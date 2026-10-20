@@ -1,30 +1,50 @@
--- migrate:up transaction:false
+-- migrate:up
 
--- The Rust import's catch-up reads the notices written since its last cycle: `txid` past a saved
--- snapshot. With only the (bucket_id, object_key) primary key, every cycle walks all of
--- `import_dirty` (24.7M rows, 13 GB on 2026-10-20) to find the few thousand new ones, which takes
--- 25-30 minutes. That scan sets the length of the cutover's write freeze, which needs one cycle and
--- one parity check inside it. With this index both read only the notices past the snapshot's
--- xmin: the freeze drops from about 45-60 minutes of failed writes to about 15.
+-- The Rust import's catch-up and its parity check read the notices written since a saved snapshot:
+-- `txid` from the snapshot's xmin up. With only the (bucket_id, object_key) primary key, every
+-- catch-up cycle walks all of `import_dirty` (24.7M rows, 13 GB on 2026-10-20), 25-30 minutes,
+-- and that walk sets the length of the cutover's write freeze. With this index the Rust side pages
+-- through only the new notices, in (txid, bucket_id, object_key) order, an index-only scan per
+-- page (hippius-s3-internal #381): the freeze drops from about 45-60 minutes to about 15.
 --
--- Cost: the notice triggers upsert one row per changed key, setting `txid`, so those updates are
--- no longer HOT and maintain this index too. One small index entry per object write.
+-- On production the index is built OUT OF BAND, before this deploys, and this file does nothing:
 --
--- Built CONCURRENTLY: a plain CREATE INDEX takes a SHARE lock that blocks the notice triggers, and
--- so every object write, for the whole build. Postgres forbids CONCURRENTLY inside a transaction,
--- hence the directive, and it must stay a SINGLE statement: dbmate runs a transaction:false body as
--- one simple query, and a multi-statement string runs in an implicit transaction.
+--   1. On the primary, with no long transaction open (check pg_stat_activity for old xact_start or
+--      backend_xmin in this database), from a session with a statement_timeout:
+--        SET statement_timeout = '2h';
+--        CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_import_dirty_txid
+--            ON import_dirty (txid, bucket_id, object_key);
+--   2. Check it: SELECT indisvalid, indisready FROM pg_index
+--                WHERE indexrelid = 'idx_import_dirty_txid'::regclass;   -- both true
+--      A build that failed leaves an INVALID index that IF NOT EXISTS then skips. Drop it with
+--      DROP INDEX CONCURRENTLY idx_import_dirty_txid and run step 1 again.
 --
--- Recovery: a build that fails midway leaves an INVALID index, which `IF NOT EXISTS` then SKIPS on
--- the next run, leaving an index that is never read but still maintained on every write. Check it,
--- and drop the leftover before re-running:
---     SELECT indisvalid, indisready FROM pg_index
---     WHERE indexrelid = 'idx_import_dirty_txid'::regclass;   -- both must be true
---     DROP INDEX CONCURRENTLY idx_import_dirty_txid;
--- A long-running transaction elsewhere is the usual cause: check pg_stat_activity for old
--- xact_start values before retrying.
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_import_dirty_txid ON import_dirty (txid);
+-- Why not here: every API pod (start-api.sh) and the migrations Job run `dbmate up` at once, with
+-- no migration lock. Two CONCURRENTLY builds of one index can deadlock at their end, and the loser
+-- leaves an invalid index that the next run skips and records as applied. A build this size also
+-- outlasts the API startup probe. A plain CREATE INDEX would block every object write (the notice
+-- triggers write this table) for the whole build.
+--
+-- So this builds the index only on a table too small for any of that to matter: a fresh database,
+-- CI, local. On a large table without the index it does nothing; the Rust side reads the notices
+-- without it (slower, as before) until step 1 is done, so no order of the two is unsafe.
+--
+-- Cost once built: each notice upsert from a new transaction sets `txid`, an indexed column, so
+-- it is not a HOT update and writes this index and the primary key's. Those upserts come per
+-- separately committed chunk write (`import_dirty_chunk_row`), for every key and alias of the
+-- object, not once per object write.
+SET LOCAL lock_timeout = '3s';
+DO $$
+BEGIN
+    -- A count capped at 100k: exact, and a short index scan however large the table is.
+    IF to_regclass('idx_import_dirty_txid') IS NULL
+       AND (SELECT count(*) FROM (SELECT 1 FROM import_dirty LIMIT 100000) t) < 100000 THEN
+        CREATE INDEX idx_import_dirty_txid ON import_dirty (txid, bucket_id, object_key);
+    END IF;
+END $$;
 
--- migrate:down
+-- migrate:down transaction:false
 
-DROP INDEX IF EXISTS idx_import_dirty_txid;
+-- CONCURRENTLY: a plain DROP INDEX takes ACCESS EXCLUSIVE on import_dirty, which queues every
+-- object write behind it. One statement, as a transaction:false body must be.
+DROP INDEX CONCURRENTLY IF EXISTS idx_import_dirty_txid;

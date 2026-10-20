@@ -33,6 +33,7 @@ _HOT_TABLES = (
     "part_chunks",  # ~208.7M rows / 40 GB
     "chunk_backend",  # ~413.1M rows / 77 GB
     "multipart_uploads",  # ~216.8M rows / 68 GB, ~8.5 writes/s
+    "import_dirty",  # ~24.7M rows / 13 GB; every object write's notice trigger writes it
 )
 
 # Statements that take a table-level lock strong enough to queue the data plane behind them.
