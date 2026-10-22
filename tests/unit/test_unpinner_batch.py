@@ -649,16 +649,32 @@ class _LoopClient:
 
 class _BatchHarness:
     def __init__(
-        self, *, config, client=None, rows_by_object=None, fail_chunk_ids=frozenset(), fail_fetch_objects=frozenset()
+        self,
+        *,
+        config,
+        client=None,
+        rows_by_object=None,
+        fail_chunk_ids=frozenset(),
+        fail_fetch_objects=frozenset(),
+        clock=None,
+        dequeue_tick=0.0,
+        fetch_tick=0.0,
+        cancel_fetch_objects=frozenset(),
     ) -> None:
         self.config = config
         self.client = client or _LoopClient()
         self.rows_by_object = rows_by_object or {}
         self.fail_chunk_ids = fail_chunk_ids
         self.fail_fetch_objects = fail_fetch_objects
+        self.cancel_fetch_objects = cancel_fetch_objects
+        self.clock = clock
+        self.dequeue_tick = dequeue_tick
+        self.fetch_tick = fetch_tick
         self.dequeue_sequence: list = []
         self.softdeleted: list[int] = []
         self.retry_calls: list = []
+        self.requeued: list = []
+        self.requeue_queues: list = []
 
     async def _dequeue(self, queue_name, block_timeout=3):
         await asyncio.sleep(0)
@@ -666,8 +682,19 @@ class _BatchHarness:
             item = self.dequeue_sequence.pop(0)
             if isinstance(item, BaseException):
                 raise item
+            if item is None:
+                if self.clock is not None:
+                    self.clock["t"] += block_timeout
+                return None
+            if self.clock is not None:
+                self.clock["t"] += self.dequeue_tick
             return item
         raise KeyboardInterrupt()
+
+    async def _enqueue(self, payload, queue_name=None):
+        self.requeued.append(payload)
+        self.requeue_queues.append(queue_name)
+        self.dequeue_sequence.append(payload)
 
     async def _with_redis_retry(self, func, client, url, name, **kw):
         return await func(client), client
@@ -682,13 +709,25 @@ class _BatchHarness:
                     raise RuntimeError("db down")
                 self.softdeleted.extend(chunk_ids)
                 return []
+            if self.clock is not None:
+                self.clock["t"] += self.fetch_tick
+            if third in self.cancel_fetch_objects:
+                task = asyncio.current_task()
+                assert task is not None
+                task.cancel()
+                await asyncio.sleep(0)
             if third in self.fail_fetch_objects:
                 raise RuntimeError("db down during assembly")
             return self.rows_by_object.get(third, [])
 
         conn.fetch = AsyncMock(side_effect=_fetch)
         pool = MagicMock()
-        pool.acquire = MagicMock(return_value=MagicMock(__aenter__=AsyncMock(return_value=conn), __aexit__=AsyncMock()))
+        pool.acquire = MagicMock(
+            return_value=MagicMock(
+                __aenter__=AsyncMock(return_value=conn),
+                __aexit__=AsyncMock(return_value=False),
+            )
+        )
         pool.close = AsyncMock()
 
         async def _create_pool(*a, **k):
@@ -696,6 +735,11 @@ class _BatchHarness:
 
         async def _retry(request, **kw):
             self.retry_calls.append((request, kw))
+
+        def _now() -> float:
+            if self.clock is not None:
+                return self.clock["t"]
+            return asyncio.get_running_loop().time()
 
         with (
             patch.object(un, "get_config", return_value=self.config),
@@ -708,6 +752,8 @@ class _BatchHarness:
             patch.object(un, "initialize_metrics_collector"),
             patch.object(un, "get_metrics_collector", return_value=MagicMock()),
             patch.object(un, "enqueue_unpin_retry_request", side_effect=_retry),
+            patch.object(un, "enqueue_unpin_request", side_effect=self._enqueue),
+            patch.object(un, "_assembly_now", side_effect=_now),
             patch.object(un, "UnpinDLQManager", return_value=MagicMock(push=AsyncMock())),
             patch.object(un, "get_logger_with_ray_id", return_value=MagicMock()),
             patch.object(un, "get_query", return_value="SQL"),
@@ -883,3 +929,181 @@ async def test_unknown_echoed_file_id_is_ignored_not_crashing_group():
     retry.assert_not_called()
     dlq.push.assert_not_called()
     assert _success_count(metrics) == 1, "the request is acked; unknown echoed id does not affect it"
+
+
+# --------------------------------------------------------------------------- #
+# Assembly window: identifier lookups must not shrink a queued page, and the
+# old wait rules still hold (empty brpop ends it, the deadline still bites,
+# the file cap still bounds one group).
+# --------------------------------------------------------------------------- #
+
+
+def _page(n: int, *, files_each: int = 1):
+    reqs = []
+    rows = {}
+    for i in range(n):
+        oid = f"o{i}"
+        reqs.append(_ureq(oid))
+        rows[oid] = [{"backend_identifier": f"f{i}-{j}", "chunk_id": i * files_each + j + 1} for j in range(files_each)]
+    return reqs, rows
+
+
+@pytest.mark.asyncio
+async def test_slow_identifier_lookup_does_not_shrink_a_queued_page():
+    """30 requests are already queued. Each lookup costs 50ms on the assembly clock.
+
+    The deadline is 250ms. Counting that lookup inside the window would stop
+    the page at about five files. The drain must take the whole page.
+    """
+    reqs, rows = _page(30)
+    h = _BatchHarness(
+        config=_loop_config(),
+        rows_by_object=rows,
+        clock={"t": 0.0},
+        fetch_tick=0.05,
+    )
+    h.dequeue_sequence = [*reqs, None, KeyboardInterrupt()]
+
+    await asyncio.wait_for(h.run(), timeout=5.0)
+
+    assert len(h.client.batch_calls) == 1
+    assert len(h.client.batch_calls[0][0]) == 30
+    assert h.requeued == []
+
+
+@pytest.mark.asyncio
+async def test_empty_brpop_does_not_hold_a_lone_delete():
+    req, rows = _page(1)
+    h = _BatchHarness(config=_loop_config(), rows_by_object=rows, clock={"t": 0.0})
+    h.dequeue_sequence = [req[0], None, KeyboardInterrupt()]
+
+    await asyncio.wait_for(h.run(), timeout=5.0)
+
+    assert h.clock["t"] < 0.2
+    assert len(h.client.batch_calls) == 1
+    assert h.client.batch_calls[0][0] == ["f0-0"]
+
+
+@pytest.mark.asyncio
+async def test_trickle_stays_one_request_per_batch():
+    reqs, rows = _page(2)
+    h = _BatchHarness(config=_loop_config(), rows_by_object=rows, clock={"t": 0.0})
+    h.dequeue_sequence = [reqs[0], None, reqs[1], None, KeyboardInterrupt()]
+
+    await asyncio.wait_for(h.run(), timeout=5.0)
+
+    assert [c[0] for c in h.client.batch_calls] == [["f0-0"], ["f1-0"]]
+    assert h.clock["t"] < 0.2
+
+
+@pytest.mark.asyncio
+async def test_slow_drip_still_stops_at_the_assembly_deadline():
+    """A sibling every 100ms of assembly time. The 250ms ceiling still applies."""
+    reqs, rows = _page(10)
+    h = _BatchHarness(
+        config=_loop_config(),
+        rows_by_object=rows,
+        clock={"t": 0.0},
+        dequeue_tick=0.1,
+    )
+    h.dequeue_sequence = [*reqs, None, KeyboardInterrupt()]
+
+    await asyncio.wait_for(h.run(), timeout=5.0)
+
+    assert [len(c[0]) for c in h.client.batch_calls] == [4, 4, 2]
+    assert h.requeued == []
+
+
+@pytest.mark.asyncio
+async def test_sibling_lookup_error_keeps_the_rest_of_the_page():
+    reqs, rows = _page(3)
+    h = _BatchHarness(
+        config=_loop_config(),
+        rows_by_object=rows,
+        fail_fetch_objects={"o1"},
+    )
+    h.dequeue_sequence = [*reqs, None, KeyboardInterrupt()]
+
+    await asyncio.wait_for(h.run(), timeout=5.0)
+
+    assert len(h.client.batch_calls) == 1
+    assert h.client.batch_calls[0][0] == ["f0-0", "f2-0"]
+    assert [c[0].object_id for c in h.retry_calls] == ["o1"]
+    assert h.requeued == []
+
+
+@pytest.mark.asyncio
+async def test_drain_error_still_batches_the_request_already_popped():
+    reqs, rows = _page(2)
+    h = _BatchHarness(config=_loop_config(), rows_by_object=rows)
+    h.dequeue_sequence = [reqs[0], reqs[1], RuntimeError("redis blip"), None, KeyboardInterrupt()]
+
+    await asyncio.wait_for(h.run(), timeout=5.0)
+
+    assert h.client.batch_calls[0][0] == ["f0-0", "f1-0"]
+    assert h.retry_calls == []
+    assert h.requeued == []
+
+
+@pytest.mark.asyncio
+async def test_file_cap_stops_before_popping_past_the_sealing_request():
+    """Cap of three. The sibling that crosses it stays in this batch. The next
+    request is still on the queue and leaves as its own batch, not an LPUSH
+    of a page popped on a one-file guess.
+    """
+    specs = [("o0", 1), ("o1", 3), ("o2", 1)]
+    reqs = [_ureq(oid) for oid, _n in specs]
+    rows = {}
+    chunk = 1
+    for oid, n in specs:
+        rows[oid] = [{"backend_identifier": f"{oid}-{j}", "chunk_id": chunk + j} for j in range(n)]
+        chunk += n
+    h = _BatchHarness(config=_loop_config(batch_max_files=3), rows_by_object=rows)
+    h.dequeue_sequence = [*reqs, None, KeyboardInterrupt()]
+
+    await asyncio.wait_for(h.run(), timeout=5.0)
+
+    assert h.requeued == []
+    calls = [c[0] for c in h.client.batch_calls]
+    sent = {fid for call in calls for fid in call}
+    assert {"o0-0", "o1-0", "o1-1", "o1-2", "o2-0"} <= sent
+    assert all(len(call) <= 3 for call in calls)
+    for call in calls:
+        if "o0-0" in call or "o1-0" in call:
+            assert "o2-0" not in call
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_sibling_lookup_requeues_the_popped_page():
+    """Shutdown cancels the loop while a sibling lookup is in flight. Every
+    request already brpop'd, including ones already grouped, goes back to the
+    same queue with attempts unchanged. Nothing is dispatched.
+    """
+    reqs, rows = _page(3)
+    h = _BatchHarness(
+        config=_loop_config(),
+        rows_by_object=rows,
+        cancel_fetch_objects={"o1"},
+    )
+    h.dequeue_sequence = [*reqs, None, KeyboardInterrupt()]
+
+    await asyncio.wait_for(h.run(), timeout=5.0)
+
+    assert h.client.batch_calls == []
+    assert [r.object_id for r in h.requeued] == ["o0", "o1"]
+    assert h.requeue_queues == ["arion_unpin_requests", "arion_unpin_requests"]
+    assert all(r.attempts == 0 for r in h.requeued)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_unpin_request_does_not_bump_attempts():
+    from hippius_s3.queue import enqueue_unpin_request
+
+    client = AsyncMock()
+    req = _ureq("o0", attempts=0)
+    with patch("hippius_s3.queue.get_queue_client", return_value=client):
+        await enqueue_unpin_request(req, queue_name="arion_unpin_requests")
+
+    assert req.attempts == 0
+    assert req.first_enqueued_at is not None
+    assert client.lpush.await_args.args[0] == "arion_unpin_requests"
