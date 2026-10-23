@@ -15,7 +15,7 @@ env:
 
 jobs:
   build-base:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON || 'hippius-medium' }}
     outputs:
       base_image: ${{ steps.base-image.outputs.image }}
     steps:
@@ -59,7 +59,7 @@ jobs:
           echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/base:$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
   build-images:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON || 'hippius-medium' }}
     needs: build-base
     strategy:
       matrix:
@@ -113,7 +113,7 @@ jobs:
     # (audit F2). Fast checks only -- fmt + clippy + supply chain; the full
     # Postgres-backed test suite runs in the PR workflow (test-and-lint.yml).
     name: Rust gate (fmt, clippy, cargo-deny)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON || 'hippius-medium' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust 1.95.0
@@ -139,7 +139,7 @@ jobs:
     # rust-gate so a clippy/fmt/advisory failure blocks building+deploying the drain.
     # (Prod parity with staging-deploy.yaml; no chaos-mesh/toxiproxy here — that is staging-only.)
     needs: rust-gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON || 'hippius-medium' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -174,7 +174,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   deploy-production:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNS_ON || 'hippius-medium' }}
     needs: [build-images, build-drain]
     environment: production
     # Serialize against the staging deploy: both target the SAME cluster and the same
