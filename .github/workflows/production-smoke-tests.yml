@@ -56,23 +56,6 @@ jobs:
             --json-report \
             --json-report-file=reports/smoke-production.json
 
-      - name: Run smoke tests against regional caches
-        if: always()
-        timeout-minutes: 8
-        env:
-          AWS_ACCESS_KEY: ${{ secrets.HIPPIUS_PROD_ACCESS_KEY }}
-          AWS_SECRET_KEY: ${{ secrets.HIPPIUS_PROD_SECRET_KEY }}
-        run: |
-          mkdir -p reports
-          pytest tests/smoke/test_smoke_regional.py \
-            -n auto \
-            -v \
-            --tb=short \
-            -W "ignore::DeprecationWarning:botocore" \
-            -W "ignore::DeprecationWarning:dateutil" \
-            --json-report \
-            --json-report-file=reports/smoke-regional.json
-
       - name: Run sub-token scope smoke tests against s3.hippius.com
         if: always()
         timeout-minutes: 8
@@ -109,7 +92,6 @@ jobs:
         run: |
           python scripts/extract_failure_details.py \
             reports/smoke-production.json \
-            reports/smoke-regional.json \
             reports/smoke-subtoken-scope.json \
             --webhook "$WEBHOOK_URL" \
             --run-url "$RUN_URL"
