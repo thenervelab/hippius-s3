@@ -23,7 +23,6 @@ from typing import Optional
 SUITE_LABELS = {
     "smoke-production": "core S3 suite (s3.hippius.com)",
     "smoke-internal": "core S3 suite (http://162.19.43.25:18080)",
-    "smoke-regional": "regional cache suite",
     "smoke-subtoken-scope": "sub-token scope suite",
 }
 
