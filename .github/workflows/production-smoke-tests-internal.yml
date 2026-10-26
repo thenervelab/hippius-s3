@@ -38,9 +38,9 @@ jobs:
           pip install --upgrade pip
           pip install -r tests/smoke/requirements.txt
 
-      # Core S3 suite only. Regional caches are other hostnames, and the sub-token
-      # scope suite talks to the Python gateway's HMAC API plus api.hippius.com.
-      # Those stay on production-smoke-tests.yml. Same prod key and secret.
+      # Core S3 suite only. The sub-token scope suite talks to the Python gateway's
+      # HMAC API plus api.hippius.com, so it stays on production-smoke-tests.yml.
+      # Same prod key and secret.
       - name: Run smoke tests against 162.19.43.25:18080
         timeout-minutes: 8
         env:
