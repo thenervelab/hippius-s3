@@ -21,8 +21,9 @@ does not reset that semaphore. This file is only about what to do when it goes w
 ## Symptom
 
 - `download_not_ready` 503s (`SlowDown`, `Retry-After: 1`) on GETs, concentrated on ONE pod.
-- Smoke `test_04` / `test_05` flapping, always on the 24 MiB multipart object: a cold multipart read
-  needs ~10 backend fetches, so it has ~10x the exposure of the 1 MiB simple object.
+- While the smoke suite ran against this stack: `test_04` / `test_05` flapping, always on the 24 MiB
+  multipart object. A cold multipart read needs ~10 backend fetches, so it has ~10x the exposure of
+  the 1 MiB simple object. The suite now runs from hippius-s3-rust, against what serves s3.hippius.com.
 - Clients report three shapes of the same event, depending on where their own 60 s read timeout
   lands relative to the server's bounds: `SlowDown` before headers; botocore `ReadTimeoutError`
   when the stall is mid-body; `IncompleteRead(5242880 read, ...)` when the server ends the stream
@@ -37,7 +38,7 @@ does not reset that semaphore. This file is only about what to do when it goes w
 
 The two rules below are **pending**: they are added in `hippius-otel` (process in
 [`docs/grafana-alerting.md`](../grafana-alerting.md)). Until they land, this runbook is reached
-from smoke failures or from the queries in the next section.
+from the queries in the next section.
 
 | Alert | Means | First action |
 |---|---|---|
