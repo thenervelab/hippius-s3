@@ -48,8 +48,8 @@ The pipeline is deliberately split so the user-facing path (gateway + API) is fa
 │   └── main.py              # API factory + lifespan
 ├── workers/                 # Worker ENTRY points (run_*_in_loop.py) — invoked by k8s
 ├── cacher/                  # Substrate account data cacher service
-├── scripts/                 # Top-level ops scripts (migration gate, smoke helpers, MPU retry)
-├── tests/                   # unit/, integration/, e2e/, smoke/
+├── scripts/                 # Top-level ops scripts (migration gate, MPU retry)
+├── tests/                   # unit/, integration/, e2e/
 ├── docs/                    # Architecture and spec docs (s4.md, s3-compatibility.md)
 ├── k8s/                     # Kustomize manifests: base/, staging/, production/, otel/
 ├── monitoring/              # Grafana dashboards, observability config
@@ -252,7 +252,7 @@ Canonicalization uses `request.scope["raw_path"]` (bytes) rather than `request.u
 
 ### Scripts
 - [hippius_s3/scripts/CLAUDE.md](hippius_s3/scripts/CLAUDE.md) — operational and migration scripts.
-- [scripts/CLAUDE.md](scripts/CLAUDE.md) — top-level ops scripts (migration gate, smoke helpers, SQL one-offs).
+- [scripts/CLAUDE.md](scripts/CLAUDE.md) — top-level ops scripts (migration gate, SQL one-offs).
 
 ### Tests
 - [tests/unit/CLAUDE.md](tests/unit/CLAUDE.md), [tests/integration/CLAUDE.md](tests/integration/CLAUDE.md), [tests/e2e/CLAUDE.md](tests/e2e/CLAUDE.md).
@@ -457,7 +457,7 @@ Response shape: `{"status":"success","data":{"resultType":"streams","result":[{"
 - **Unit** ([tests/unit/](tests/unit/)) — pure; mocks DB/Redis/services. Fast, run on every save.
 - **Integration** ([tests/integration/](tests/integration/)) — real DB and Redis via docker-compose; mocks external services (Arion, Hippius API, KMS).
 - **E2E** ([tests/e2e/](tests/e2e/)) — real API stack with [docker-compose.e2e.yml](docker-compose.e2e.yml): `mock-arion`, `mock-kms`, `mock-hippius-api`, `toxiproxy` (fault injection for resilience tests).
-- **Smoke** ([tests/smoke/](tests/smoke/)) — post-deploy verification, run as part of the k8s pipeline.
+- **Smoke** — the hourly production smoke suite lives in `thenervelab/hippius-s3-rust` (`tests/smoke/`), which serves `s3.hippius.com`.
 
 Test env flags: `HIPPIUS_BYPASS_CREDIT_CHECK=true` is enforced in test env at [config.py:538](hippius_s3/config.py). `RUN_REAL_AWS=1` (or `AWS=1`) routes e2e tests against real AWS for parity checks.
 

@@ -20,8 +20,8 @@ from __future__ import annotations
 from hippius_s3.config import get_config
 
 
-# botocore's default read_timeout, which is what an un-configured boto3/aws-cli client uses, and
-# what tests/smoke passes explicitly. Anything at or above this makes the 503 unreachable.
+# botocore's default read_timeout, which is what an un-configured boto3/aws-cli client uses.
+# Anything at or above this makes the 503 unreachable.
 BOTO3_DEFAULT_READ_TIMEOUT_SECONDS = 60
 
 
