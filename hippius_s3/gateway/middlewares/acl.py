@@ -262,9 +262,7 @@ async def acl_middleware(
     auth_method = getattr(request.state, "auth_method", None)
     token_type = getattr(request.state, "token_type", None)
     account_id = getattr(request.state, "account_id", None)
-    access_key = (
-        getattr(request.state, "access_key", None) if auth_method in ("access_key", "bearer_access_key") else None
-    )
+    access_key = getattr(request.state, "access_key", None) if auth_method == "access_key" else None
 
     acl_service = request.app.state.acl_service
 
@@ -350,7 +348,7 @@ async def acl_middleware(
     # Sub-token branch (R2-style): authoritative for intra-account requests,
     # falls through to bucket ACL grants for cross-account (contractor) access.
     # -------------------------------------------------------------------------
-    if auth_method in ("access_key", "bearer_access_key") and token_type == "sub" and access_key:
+    if auth_method == "access_key" and token_type == "sub" and access_key:
         is_cross_account = bucket_owner_id is not None and bucket_owner_id != account_id
         if not is_cross_account:
             repo = request.app.state.sub_token_scope_repo

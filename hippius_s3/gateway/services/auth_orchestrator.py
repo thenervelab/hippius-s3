@@ -8,11 +8,11 @@ from fastapi import Response
 from starlette import status
 
 from hippius_s3.gateway.middlewares.access_key_auth import AccessKeyAuthError
+from hippius_s3.gateway.middlewares.access_key_auth import RequestTimeTooSkewedError
 from hippius_s3.gateway.middlewares.access_key_auth import verify_access_key_presigned_url
 from hippius_s3.gateway.middlewares.access_key_auth import verify_access_key_signature
 from hippius_s3.gateway.middlewares.sigv4 import AuthParsingError
 from hippius_s3.gateway.middlewares.sigv4 import extract_credential_from_auth_header
-from hippius_s3.gateway.services.auth_cache import cached_auth
 from hippius_s3.gateway.utils.errors import s3_error_response
 from hippius_s3.services.hippius_api_service import HippiusAPIError
 from hippius_s3.services.ray_id_service import get_logger_with_ray_id
@@ -20,7 +20,7 @@ from hippius_s3.services.ray_id_service import get_logger_with_ray_id
 
 logger = logging.getLogger(__name__)
 
-AuthMethod = Literal["access_key", "anonymous", "bearer_access_key"]
+AuthMethod = Literal["access_key", "anonymous"]
 
 
 @dataclass
@@ -41,7 +41,8 @@ async def authenticate_request(request: Request) -> AuthResult:
     Flow:
     1. Check for Presigned URL (query params) -> Access Key Auth
     2. Check for Authorization Header
-       - If starts with "Bearer " -> Bearer Access Key Auth
+       - If starts with "Bearer " -> refused (an access key ID is public: it is in
+         every presigned URL and SigV4 header, so it never authenticates alone)
        - If starts with "hip_" -> Access Key Auth
        - Else -> Invalid (seed phrase auth no longer supported)
     3. No credentials -> Anonymous (if GET/HEAD)
@@ -74,7 +75,15 @@ async def authenticate_request(request: Request) -> AuthResult:
 
     # 3. Bearer Token Detection
     if auth_header.startswith("Bearer "):
-        return await _authenticate_bearer(request, auth_header, logger)
+        logger.warning("Bearer authorization refused: requests must be signed with AWS SigV4")
+        return AuthResult(
+            error_response=s3_error_response(
+                code="InvalidRequest",
+                message="Bearer authorization is not supported. Sign requests with AWS Signature Version 4 "
+                "using your access key and secret.",
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        )
 
     try:
         credential, _, _, _ = extract_credential_from_auth_header(auth_header)
@@ -165,75 +174,6 @@ async def _authenticate_presigned_url(request: Request, logger: Any) -> AuthResu
     )
 
 
-async def _authenticate_bearer(request: Request, auth_header: str, logger: Any) -> AuthResult:
-    token = auth_header.replace("Bearer ", "").strip()
-
-    if not token.startswith("hip_"):
-        return AuthResult(
-            error_response=s3_error_response(
-                code="InvalidAccessKeyId",
-                message="Bearer token must be a valid access key starting with 'hip_'",
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-        )
-
-    try:
-        token_response = await cached_auth(
-            token, request.app.state.redis_client, getattr(request.app.state, "hippius_api_client", None)
-        )
-
-        if not token_response.valid or token_response.status != "active":
-            logger.warning(f"Invalid or inactive Bearer access key: {token[:8]}***, status={token_response.status}")
-            return AuthResult(
-                error_response=s3_error_response(
-                    code="InvalidAccessKeyId",
-                    message="Invalid or inactive access key",
-                    status_code=status.HTTP_403_FORBIDDEN,
-                )
-            )
-
-        if not token_response.account_address:
-            logger.error(f"API returned empty account_address for Bearer key: {token[:8]}***")
-            return AuthResult(
-                error_response=s3_error_response(
-                    code="InvalidAccessKeyId",
-                    message="Invalid API response",
-                    status_code=status.HTTP_403_FORBIDDEN,
-                )
-            )
-
-        logger.info(
-            f"Bearer access key auth successful: {token[:8]}***, account={token_response.account_address}, type={token_response.token_type}"
-        )
-        return AuthResult(
-            is_valid=True,
-            auth_method="bearer_access_key",
-            access_key=token,
-            account_address=token_response.account_address,
-            account_id=token_response.account_address,
-            token_type=token_response.token_type,
-        )
-
-    except HippiusAPIError as e:
-        logger.error(f"Hippius API error during Bearer auth: {e}")
-        return AuthResult(
-            error_response=s3_error_response(
-                code="ServiceUnavailable",
-                message="Authentication service temporarily unavailable",
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-        )
-    except Exception as e:
-        logger.exception(f"Unexpected Bearer auth error: {e}")
-        return AuthResult(
-            error_response=s3_error_response(
-                code="InternalError",
-                message="An internal error occurred",
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-        )
-
-
 async def _authenticate_access_key_header(request: Request, credential: str, logger: Any) -> AuthResult:
     logger.debug(f"Detected access key authentication: {credential[:8]}***")
 
@@ -242,6 +182,15 @@ async def _authenticate_access_key_header(request: Request, credential: str, log
             request=request,
             access_key=credential,
             redis_client=request.app.state.redis_client,
+        )
+    except RequestTimeTooSkewedError as e:
+        logger.warning(f"Access key auth error: {e}")
+        return AuthResult(
+            error_response=s3_error_response(
+                code="RequestTimeTooSkewed",
+                message="The difference between the request time and the server's time is too large.",
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
         )
     except AccessKeyAuthError as e:
         logger.warning(f"Access key auth error: {e}")

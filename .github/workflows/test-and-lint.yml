@@ -37,7 +37,7 @@ jobs:
       - name: Set up Python 3.12.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12.11"
+          python-version: "3.12"
 
       - name: Install Ruff 0.13.0
         run: |
@@ -71,7 +71,7 @@ jobs:
       - name: Set up Python 3.12.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12.11"
+          python-version: "3.12"
 
       - name: Install uv
         run: |
@@ -101,7 +101,7 @@ jobs:
       - name: Set up Python 3.12.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12.11"
+          python-version: "3.12"
 
       - name: Install uv
         run: |
