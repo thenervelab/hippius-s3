@@ -519,19 +519,9 @@ def factory() -> FastAPI:
             description=app.description,
             routes=app.routes,
         )
-        openapi_schema["components"]["securitySchemes"] = {
-            "Access Key": {
-                "type": "http",
-                "scheme": "bearer",
-                "description": (
-                    "Bearer token authentication using Hippius access keys. "
-                    "Format: 'hip_' followed by alphanumeric characters. "
-                    "Example: hip_abc123def456ghi789. "
-                    "Obtain from https://console.hippius.com/dashboard/settings"
-                ),
-            }
-        }
-        openapi_schema["security"] = [{"Access Key": []}]
+        # No security scheme: requests are signed with AWS SigV4 (an S3 SDK or
+        # presigned URL), which OpenAPI cannot describe. Bearer access keys are
+        # refused (an access key ID alone is public).
         app.openapi_schema = openapi_schema
         return app.openapi_schema
 

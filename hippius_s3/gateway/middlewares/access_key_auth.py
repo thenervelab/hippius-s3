@@ -36,6 +36,28 @@ class AccessKeyAuthError(Exception):
     pass
 
 
+class RequestTimeTooSkewedError(AccessKeyAuthError):
+    """The signed x-amz-date is too far from the gateway clock (AWS: 15 minutes)."""
+
+
+# AWS refuses a header-signed request whose x-amz-date is more than 15 minutes
+# from the server clock (RequestTimeTooSkewed): a captured signed request can
+# then only be replayed inside that window. Presigned URLs keep X-Amz-Expires.
+MAX_REQUEST_SKEW = datetime.timedelta(minutes=15)
+
+
+def check_request_time(amz_date: str, *, now: datetime.datetime | None = None) -> None:
+    """Raise unless amz_date (ISO 8601 basic, UTC: 20261109T120000Z) is within
+    MAX_REQUEST_SKEW of now."""
+    try:
+        signed_at = datetime.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
+    except ValueError as exc:
+        raise AccessKeyAuthError("Invalid x-amz-date format") from exc
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if abs(now - signed_at) > MAX_REQUEST_SKEW:
+        raise RequestTimeTooSkewedError("x-amz-date is too far from the server time")
+
+
 @dataclass(frozen=True)
 class TokenAuth:
     access_key: str
@@ -76,6 +98,10 @@ async def verify_access_key_signature(
     if not auth_header or not amz_date:
         logger.warning("Missing required auth headers for access key verification")
         raise AccessKeyAuthError("Missing required auth headers")
+
+    # Before any key lookup: a stale or future-dated request is refused on its
+    # own, whatever the key.
+    check_request_time(amz_date)
 
     provided_signature = extract_signature_from_auth_header(auth_header)
     signed_headers = extract_signed_headers(auth_header)
@@ -118,6 +144,8 @@ async def verify_access_key_signature(
     date_scope = credential_match.group(1)
     region = credential_match.group(2)
     service = credential_match.group(3)
+    if date_scope != amz_date[:8]:
+        raise AccessKeyAuthError("Credential scope date does not match x-amz-date")
 
     # Use the canonical path derived from raw_path so that we match exactly
     # what the AWS client signed (including percent-encoding).

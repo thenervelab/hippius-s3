@@ -88,13 +88,6 @@ async def auth_router_middleware(
         request.state.token_type = auth_result.token_type
         if auth_result.access_key:
             logger.debug(f"Authenticated with access key: {auth_result.access_key[:8]}***")
-    elif auth_result.auth_method == "bearer_access_key":
-        request.state.access_key = auth_result.access_key
-        request.state.account_address = auth_result.account_address
-        request.state.token_type = auth_result.token_type
-        request.state.account_id = auth_result.account_id
-        if auth_result.access_key:
-            logger.debug(f"Authenticated with Bearer access key: {auth_result.access_key[:8]}***")
     elif auth_result.auth_method == "anonymous":
         logger.debug("Anonymous request")
 

@@ -212,7 +212,7 @@ async def _write_suspension_cache(redis_client: Any, account_id: str, mode: str 
     summary="Suspend an account",
     description=(
         "Immediately blocks access for EVERY credential of the account (master token, all "
-        "sub-tokens, presigned URLs, bearer), regardless of installed scopes.\n\n"
+        "sub-tokens, presigned URLs), regardless of installed scopes.\n\n"
         "`mode='full'` blocks everything, including anonymous reads of the account's public "
         "buckets. `mode='read_only'` allows downloads but blocks all writes.\n\n"
         "Idempotent; repeat calls (including mode changes) return the resulting state.\n\n"

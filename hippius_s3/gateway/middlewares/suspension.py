@@ -20,8 +20,8 @@ async def suspension_middleware(
 
     Runs immediately inner to auth_router so identity is resolved but nothing has been
     clobbered: keyed on request.state.account_address (the main-account SS58, identical
-    for master tokens, sub-tokens, bearer and presigned auth — account_id is NOT usable
-    here, account_middleware rewrites it to "anonymous" for bearer). Must stay OUTER to
+    for master tokens, sub-tokens and presigned auth — account_id is NOT usable
+    here). Must stay OUTER to
     acl_middleware: master tokens bypass ACL on their own buckets, so a check inside ACL
     would never see them.
 

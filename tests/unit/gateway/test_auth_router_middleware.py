@@ -1,6 +1,7 @@
 """Unit tests for auth_router middleware"""
 
 import base64
+import datetime
 from typing import Any
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -16,6 +17,11 @@ from nacl.secret import SecretBox
 from hippius_s3.gateway.middlewares.auth_router import ALL_EXEMPT_SEGMENTS
 from hippius_s3.gateway.middlewares.input_validation import RESERVED_BUCKET_SEGMENTS
 from hippius_s3.gateway.utils.paths import first_path_segment
+
+
+# Header-signed requests must carry a current x-amz-date (RequestTimeTooSkewed after 15 min).
+_AMZ_DATE = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+_AMZ_SCOPE = _AMZ_DATE[:8]
 
 
 @pytest.fixture  # type: ignore[misc]
@@ -221,7 +227,7 @@ async def test_access_key_detection_and_routing(auth_router_app: Any) -> None:
     mock_token_response.encrypted_secret = encrypted_b64
     mock_token_response.nonce = nonce_b64
 
-    auth_header = f"AWS4-HMAC-SHA256 Credential={test_access_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123def456"
+    auth_header = f"AWS4-HMAC-SHA256 Credential={test_access_key}/{_AMZ_SCOPE}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123def456"
 
     with patch(
         "hippius_s3.gateway.middlewares.access_key_auth.cached_auth",
@@ -244,7 +250,7 @@ async def test_access_key_detection_and_routing(auth_router_app: Any) -> None:
                             "/test",
                             headers={
                                 "Authorization": auth_header,
-                                "x-amz-date": "20250101T000000Z",
+                                "x-amz-date": _AMZ_DATE,
                                 "x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                             },
                         )
@@ -315,7 +321,7 @@ async def test_access_key_with_invalid_signature_returns_403(auth_router_app: An
     mock_token_response.encrypted_secret = encrypted_b64
     mock_token_response.nonce = nonce_b64
 
-    auth_header = f"AWS4-HMAC-SHA256 Credential={test_access_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    auth_header = f"AWS4-HMAC-SHA256 Credential={test_access_key}/{_AMZ_SCOPE}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
     with patch(
         "hippius_s3.gateway.middlewares.access_key_auth.cached_auth",
@@ -338,7 +344,7 @@ async def test_access_key_with_invalid_signature_returns_403(auth_router_app: An
                             "/test",
                             headers={
                                 "Authorization": auth_header,
-                                "x-amz-date": "20250101T000000Z",
+                                "x-amz-date": _AMZ_DATE,
                                 "x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                             },
                             content=b"test data",

@@ -1,4 +1,3 @@
-
 import pytest
 import requests
 
@@ -53,4 +52,13 @@ def test_bearer_token_auth_with_invalid_token():
     response = requests.get(f"{BASE_URL}/test-bucket", headers={"Authorization": "Bearer invalid_not_base64!@#$"})
 
     assert response.status_code == 403
-    assert b"InvalidAccessKeyId" in response.content
+    assert b"InvalidRequest" in response.content
+
+
+@pytest.mark.e2e
+def test_bearer_access_key_is_refused():
+    """An access key ID is public (presigned URLs, SigV4 headers): alone it never authenticates."""
+    response = requests.get(f"{BASE_URL}/test-bucket", headers={"Authorization": "Bearer hip_anything123"})
+
+    assert response.status_code == 403
+    assert b"InvalidRequest" in response.content

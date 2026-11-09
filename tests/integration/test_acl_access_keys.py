@@ -1,5 +1,6 @@
 """Simplified integration tests for access key ACL enforcement"""
 
+import datetime
 from typing import Any
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -15,6 +16,11 @@ from hippius_s3.gateway.middlewares.account import account_middleware
 from hippius_s3.gateway.middlewares.acl import acl_middleware
 from hippius_s3.gateway.middlewares.auth_router import auth_router_middleware
 from hippius_s3.gateway.services.acl_service import BucketLookup
+
+
+# Header-signed requests must carry a current x-amz-date (RequestTimeTooSkewed after 15 min).
+_AMZ_DATE = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+_AMZ_SCOPE = _AMZ_DATE[:8]
 
 
 @pytest.fixture  # type: ignore[misc]
@@ -96,7 +102,7 @@ async def test_bucket_metadata_fetched_in_single_query(integration_app: Any) -> 
     )
     integration_app.state.acl_service.check_permission = AsyncMock(return_value=True)
 
-    auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
+    auth_header = f"AWS4-HMAC-SHA256 Credential=hip_bob_sub1/{_AMZ_SCOPE}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
     with patch("hippius_s3.gateway.services.auth_orchestrator.verify_access_key_signature", mock_verify):
@@ -104,7 +110,7 @@ async def test_bucket_metadata_fetched_in_single_query(integration_app: Any) -> 
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 await client.get(
                     "/alice-bucket/test.txt",
-                    headers={"Authorization": auth_header, "x-amz-date": "20250101T000000Z"},
+                    headers={"Authorization": auth_header, "x-amz-date": _AMZ_DATE},
                 )
 
     integration_app.state.acl_service.get_bucket_owner_and_id.assert_awaited_once_with("alice-bucket")
@@ -119,7 +125,7 @@ async def test_sub_token_denied_without_grants(integration_app: Any) -> None:
     integration_app.state.acl_service.get_bucket_owner = AsyncMock(return_value=alice_id)
     integration_app.state.acl_service.check_permission = AsyncMock(return_value=False)
 
-    auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
+    auth_header = f"AWS4-HMAC-SHA256 Credential=hip_bob_sub1/{_AMZ_SCOPE}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
     # Patch verify function as AsyncMock
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
@@ -129,7 +135,7 @@ async def test_sub_token_denied_without_grants(integration_app: Any) -> None:
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
                     "/alice-bucket/test.txt",
-                    headers={"Authorization": auth_header, "x-amz-date": "20250101T000000Z"},
+                    headers={"Authorization": auth_header, "x-amz-date": _AMZ_DATE},
                 )
 
     assert response.status_code == 403
@@ -145,7 +151,7 @@ async def test_sub_token_allowed_with_access_key_grant(integration_app: Any) -> 
     integration_app.state.acl_service.get_bucket_owner = AsyncMock(return_value=alice_id)
     integration_app.state.acl_service.check_permission = AsyncMock(return_value=True)
 
-    auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
+    auth_header = f"AWS4-HMAC-SHA256 Credential=hip_bob_sub1/{_AMZ_SCOPE}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
@@ -154,7 +160,7 @@ async def test_sub_token_allowed_with_access_key_grant(integration_app: Any) -> 
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
                     "/alice-bucket/test.txt",
-                    headers={"Authorization": auth_header, "x-amz-date": "20250101T000000Z"},
+                    headers={"Authorization": auth_header, "x-amz-date": _AMZ_DATE},
                 )
 
     assert response.status_code == 200
@@ -171,7 +177,7 @@ async def test_sub_token_denied_with_different_key_grant(integration_app: Any) -
     integration_app.state.acl_service.get_bucket_owner = AsyncMock(return_value=alice_id)
     integration_app.state.acl_service.check_permission = AsyncMock(return_value=False)
 
-    auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_sub1/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
+    auth_header = f"AWS4-HMAC-SHA256 Credential=hip_bob_sub1/{_AMZ_SCOPE}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
@@ -180,7 +186,7 @@ async def test_sub_token_denied_with_different_key_grant(integration_app: Any) -
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
                     "/alice-bucket/test.txt",
-                    headers={"Authorization": auth_header, "x-amz-date": "20250101T000000Z"},
+                    headers={"Authorization": auth_header, "x-amz-date": _AMZ_DATE},
                 )
 
     assert response.status_code == 403
@@ -193,7 +199,7 @@ async def test_master_token_bypasses_acl_for_owned_bucket(integration_app: Any) 
 
     integration_app.state.acl_service.get_bucket_owner = AsyncMock(return_value=alice_id)
 
-    auth_header = "AWS4-HMAC-SHA256 Credential=hip_alice_master/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
+    auth_header = f"AWS4-HMAC-SHA256 Credential=hip_alice_master/{_AMZ_SCOPE}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
     mock_verify = AsyncMock(
         return_value=TokenAuth(access_key="hip_alice_master", account_address=alice_id, token_type="master")
@@ -204,7 +210,7 @@ async def test_master_token_bypasses_acl_for_owned_bucket(integration_app: Any) 
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.put(
                     "/alice-bucket/test.txt",
-                    headers={"Authorization": auth_header, "x-amz-date": "20250101T000000Z"},
+                    headers={"Authorization": auth_header, "x-amz-date": _AMZ_DATE},
                     content=b"data",
                 )
 
@@ -221,7 +227,7 @@ async def test_account_grant_allows_all_keys(integration_app: Any) -> None:
     integration_app.state.acl_service.check_permission = AsyncMock(return_value=True)
 
     for bob_key in ["hip_bob_key1", "hip_bob_key2", "hip_bob_key99"]:
-        auth_header = f"AWS4-HMAC-SHA256 Credential={bob_key}/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
+        auth_header = f"AWS4-HMAC-SHA256 Credential={bob_key}/{_AMZ_SCOPE}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
         mock_verify = AsyncMock(
             return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub")
@@ -232,7 +238,7 @@ async def test_account_grant_allows_all_keys(integration_app: Any) -> None:
                 async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                     response = await client.get(
                         "/alice-bucket/test.txt",
-                        headers={"Authorization": auth_header, "x-amz-date": "20250101T000000Z"},
+                        headers={"Authorization": auth_header, "x-amz-date": _AMZ_DATE},
                     )
 
         assert response.status_code == 200, f"Failed for {bob_key}"
@@ -247,7 +253,7 @@ async def test_cross_account_access_key_grant(integration_app: Any) -> None:
     integration_app.state.acl_service.get_bucket_owner = AsyncMock(return_value=alice_id)
     integration_app.state.acl_service.check_permission = AsyncMock(return_value=True)
 
-    auth_header = "AWS4-HMAC-SHA256 Credential=hip_bob_contractor/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
+    auth_header = f"AWS4-HMAC-SHA256 Credential=hip_bob_contractor/{_AMZ_SCOPE}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc"
 
     mock_verify = AsyncMock(return_value=TokenAuth(access_key="hip_bob_sub1", account_address=bob_id, token_type="sub"))
 
@@ -256,7 +262,7 @@ async def test_cross_account_access_key_grant(integration_app: Any) -> None:
             async with AsyncClient(transport=ASGITransport(app=integration_app), base_url="http://test") as client:
                 response = await client.get(
                     "/alice-bucket/test.txt",
-                    headers={"Authorization": auth_header, "x-amz-date": "20250101T000000Z"},
+                    headers={"Authorization": auth_header, "x-amz-date": _AMZ_DATE},
                 )
 
     assert response.status_code == 200
