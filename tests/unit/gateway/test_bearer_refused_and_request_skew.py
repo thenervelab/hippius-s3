@@ -152,15 +152,14 @@ async def test_orchestrator_answers_request_time_too_skewed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_credential_scope_date_must_match_amz_date() -> None:
+async def test_credential_scope_date_must_match_amz_date_before_the_key_lookup() -> None:
     now = datetime.datetime.now(datetime.timezone.utc)
     headers = _signed_headers(_amz(now), scope_date=_amz(now - datetime.timedelta(days=2))[:8])
-    with (
-        patch("hippius_s3.gateway.middlewares.access_key_auth.cached_auth", AsyncMock(return_value=_active_master())),
-        patch("hippius_s3.gateway.middlewares.access_key_auth.decrypt_secret", return_value="secret"),
-    ):
+    lookup = AsyncMock(return_value=_active_master())
+    with patch("hippius_s3.gateway.middlewares.access_key_auth.cached_auth", lookup):
         with pytest.raises(AccessKeyAuthError, match="scope date"):
             await verify_access_key_signature(_request(headers), KEY, AsyncMock())
+    lookup.assert_not_called()
 
 
 @pytest.mark.asyncio

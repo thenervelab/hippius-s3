@@ -102,6 +102,9 @@ async def verify_access_key_signature(
     # Before any key lookup: a stale or future-dated request is refused on its
     # own, whatever the key.
     check_request_time(amz_date)
+    scope_match = re.search(r"Credential=[^/]+/([^/]+)/", auth_header)
+    if not scope_match or scope_match.group(1) != amz_date[:8]:
+        raise AccessKeyAuthError("Credential scope date does not match x-amz-date")
 
     provided_signature = extract_signature_from_auth_header(auth_header)
     signed_headers = extract_signed_headers(auth_header)
@@ -144,8 +147,6 @@ async def verify_access_key_signature(
     date_scope = credential_match.group(1)
     region = credential_match.group(2)
     service = credential_match.group(3)
-    if date_scope != amz_date[:8]:
-        raise AccessKeyAuthError("Credential scope date does not match x-amz-date")
 
     # Use the canonical path derived from raw_path so that we match exactly
     # what the AWS client signed (including percent-encoding).
