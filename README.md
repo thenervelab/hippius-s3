@@ -209,6 +209,8 @@ Four methods, evaluated in priority order:
 3. **Access Key** - `hip_*` credentials in AWS SigV4 Authorization header
 4. **Anonymous** - GET/HEAD on public buckets (no Authorization header)
 
+New buckets block public access by default (as on AWS). To serve files publicly, see [Make a bucket or object public](https://docs.hippius.com/storage/s3/advanced#make-a-bucket-or-object-public).
+
 Get access keys at: https://console.hippius.com/dashboard/settings
 
 ## GitHub Actions Secrets
